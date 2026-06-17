@@ -12,7 +12,6 @@ import structlog
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
@@ -36,7 +35,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _completion_contract_unknown_due_to_policy_fallback,
     _goal_likely_needs_more_blocks,
 )
-from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -2108,10 +2106,7 @@ async def _update_workflow(
         )
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
-        steps_handler = None
-        if settings.WORKFLOW_COPILOT_CODE_BLOCK_STEP_DESCRIPTIONS_LLM:
-            steps_handler = await resolve_main_copilot_handler(ctx.workflow_permanent_id, ctx.organization_id)
-        workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml, handler=steps_handler)
+        workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
         workflow = _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,

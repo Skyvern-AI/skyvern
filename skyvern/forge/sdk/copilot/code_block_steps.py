@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import ast
-import asyncio
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Iterator
 
 import structlog
 import yaml
-
-from skyvern.config import settings
-from skyvern.forge.prompts import prompt_engine
 
 LOG = structlog.get_logger()
 
@@ -181,77 +176,11 @@ def _iter_code_block_dicts(node: Any) -> Iterator[dict[str, Any]]:
             yield from _iter_code_block_dicts(item)
 
 
-_STEP_DESC_PROMPT = "workflow-copilot-code-block-steps"
-_STEP_DESC_TIMEOUT_SECONDS = 20
-
-
-async def refine_step_descriptions(
-    code: str,
-    goal: str | None,
-    steps: list[dict[str, Any]],
-    handler: Any | None,
-) -> list[dict[str, Any]]:
-    """Rewrite only the `description` of each step via an LLM; return steps unchanged on any failure."""
-    if not steps or handler is None:
-        return steps
-    actions_json = json.dumps([{"line_start": s["line_start"], "action_type": s["action_type"]} for s in steps])
-    try:
-        prompt = prompt_engine.load_prompt(
-            template=_STEP_DESC_PROMPT,
-            goal=(goal or "").strip(),
-            code=code,
-            actions_json=actions_json,
-        )
-        raw = await asyncio.wait_for(
-            handler(prompt=prompt, prompt_name=_STEP_DESC_PROMPT),
-            timeout=_STEP_DESC_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        LOG.info("code-block step description pass failed; keeping templated descriptions", error=str(exc))
-        return steps
-
-    overrides = _parse_description_overrides(raw)
-    if not overrides:
-        return steps
-    return [{**s, "description": overrides.get(s["line_start"], s["description"])} for s in steps]
-
-
-def _parse_description_overrides(raw: Any) -> dict[int, str]:
-    """Parse the LLM response into {line_start: description}; tolerant of dict/str/list shapes."""
-    payload = raw
-    if isinstance(raw, dict):
-        payload = raw.get("content") or raw.get("response") or raw
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError:
-            return {}
-    if not isinstance(payload, list):
-        return {}
-    result: dict[int, str] = {}
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        raw_line = item.get("line_start")
-        # LLMs occasionally stringify the integer; accept "2" as 2 but reject bools/non-numerics.
-        if isinstance(raw_line, bool) or not isinstance(raw_line, (int, str)):
-            continue
-        try:
-            line_start = int(raw_line)
-        except (TypeError, ValueError):
-            continue
-        description = str(item.get("description") or "").strip()
-        if description:
-            result[line_start] = description
-    return result
-
-
 def derive_code_block_steps_in_yaml(workflow_yaml: str) -> str:
     """Return workflow_yaml with each code block's `steps` filled from its `code` when absent.
 
-    Deterministic, sync, and refinement-safe: a block that already carries steps
-    (e.g. an LLM description pass) is left untouched, so this can run on the shared
-    YAML->Workflow seam without clobbering richer steps produced upstream."""
+    Deterministic and sync: a block that already carries steps is left untouched, so this
+    can run on the shared YAML->Workflow seam without clobbering steps produced upstream."""
     try:
         data = yaml.safe_load(workflow_yaml)
     except yaml.YAMLError:
@@ -322,7 +251,7 @@ def fill_code_block_prompts_in_yaml(
     return yaml.safe_dump(data, sort_keys=False)
 
 
-async def apply_derived_code_block_steps(workflow_yaml: str, handler: Any | None = None) -> str:
+async def apply_derived_code_block_steps(workflow_yaml: str) -> str:
     """Return workflow_yaml with each code block's `steps` recomputed from its `code`."""
     try:
         data = yaml.safe_load(workflow_yaml)
@@ -331,13 +260,9 @@ async def apply_derived_code_block_steps(workflow_yaml: str, handler: Any | None
     if not isinstance(data, (dict, list)):
         return workflow_yaml
 
-    use_llm = settings.WORKFLOW_COPILOT_CODE_BLOCK_STEP_DESCRIPTIONS_LLM and handler is not None
     changed = False
     for block in _iter_code_block_dicts(data):
-        steps = derive_code_block_steps(block["code"], block.get("prompt"))
-        if use_llm:
-            steps = await refine_step_descriptions(block["code"], block.get("prompt"), steps, handler)
-        block["steps"] = steps
+        block["steps"] = derive_code_block_steps(block["code"], block.get("prompt"))
         changed = True
 
     if not changed:

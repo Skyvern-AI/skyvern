@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -618,10 +617,7 @@ class TestCompiledAuthoringImposition:
     async def test_imposition_forwards_reached_target_and_emits_download_terminal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from skyvern.config import settings
-
         _stub_successful_update(monkeypatch)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         ctx = self._download_ctx()
         submitted = _yaml(
             """
@@ -648,10 +644,7 @@ class TestCompiledAuthoringImposition:
 
     @pytest.mark.asyncio
     async def test_imposed_download_terminal_clears_binding_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.config import settings
-
         _stub_successful_update(monkeypatch)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         ctx = self._download_ctx()
         ctx.flow_evidence = [
             {
@@ -681,7 +674,6 @@ class TestCompiledAuthoringImposition:
     async def test_imposition_carries_reached_download_target_to_synthesized_code(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         ctx = _code_only_ctx()
         _enable_imposition(ctx)
         ctx.scout_trajectory = [

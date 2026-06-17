@@ -775,11 +775,8 @@ async def _maybe_steer_evaluate_to_action(
         if signature != ctx.last_auto_acted_signature and ctx.last_auto_acted_signature is not None:
             ctx.last_auto_acted_signature = None
         targets = _actionable_targets_for_result(identities)
-        if (
-            settings.COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED
-            and is_repeat
-            and ctx.last_auto_acted_signature != signature
-        ):
+        # Generic evaluate-loop breaker: intentionally fires for all v2 policies, not only code-first.
+        if is_repeat and ctx.last_auto_acted_signature != signature:
             candidate = _auto_act_candidate(parsed)
             if candidate is not None:
                 ctx.last_auto_acted_signature = signature
@@ -842,10 +839,12 @@ async def _maybe_attach_reached_download_target(
 ) -> None:
     """Attach a typed reached-download target + guidance when the page exposes exactly one same-host
     download affordance, matched on the captured selector (never URL — a download does not change the SPA URL)."""
-    if not settings.COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
-        return
     data = result.get("data")
     if not isinstance(data, dict):
+        return
+    # Code-first only: the guidance steers toward an expect_download code block (ADR 0010), which
+    # standard-mode v2 does not author.
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return
     try:
         parsed = (
@@ -860,7 +859,7 @@ async def _maybe_attach_reached_download_target(
             return
         data["reached_download_target"] = target.to_dict()
         data["reached_download_guidance"] = _reached_download_guidance_for(target)
-        if settings.COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED and not target.already_registered:
+        if not target.already_registered:
             # The pure synthesizer compiles the terminal expect_download step from this typed object.
             ctx.reached_download_target = target
             if ctx.synthesized_block_offered and not ctx.update_workflow_called:
@@ -868,10 +867,7 @@ async def _maybe_attach_reached_download_target(
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
                 ctx.synthesized_block_offered = False
                 LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
-        if (
-            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-            and not target.already_registered
-        ):
+        if not target.already_registered:
             _register_reached_download_scout_interaction(ctx, target, url=url)
         LOG.info(
             "copilot_reached_download_target_steer",

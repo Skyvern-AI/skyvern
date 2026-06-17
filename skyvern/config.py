@@ -162,16 +162,6 @@ class Settings(BaseSettings):
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
     COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
-    # On a repeat evaluate of an unchanged page with exactly one safe target, click it in-process
-    # instead of only advising. Off (default) leaves the advisory steer as the only response.
-    COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED: bool = False
-    # After a correct click reaches a same-host download affordance (or a browser download has
-    # already registered into a block output), attach a typed reached-download target and steer
-    # the agent to author one terminal download code block. Off (default) restores today's behavior.
-    COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED: bool = False
-    # On, a reached-download affordance compiles into the expect_download idiom in the code-block
-    # synthesizer; off (default) restores today's bare-click synthesis. Per-rung gate.
-    COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED: bool = False
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
@@ -183,12 +173,6 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    # Default-off companion to code-block mode. When enabled, Copilot can impose
-    # strict scout-trajectory synthesis at the persist seam for the narrow PR-1 envelope.
-    WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS: bool = False
-    # Flag-gate for the optional LLM pass that rewrites code-block step descriptions.
-    # Off (default) = deterministic templated descriptions; On = LLM rewrites descriptions only.
-    WORKFLOW_COPILOT_CODE_BLOCK_STEP_DESCRIPTIONS_LLM: bool = False
     # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
     # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
     # already-authenticated session (the first run and every login-replaying repair re-run alike).
