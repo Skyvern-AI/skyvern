@@ -75,6 +75,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     is_remote_url,
     parse_uri_to_path,
+    resolve_run_download_id,
     validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -509,11 +510,15 @@ class Block(BaseModel, abc.ABC):
                 adopted_browser = adopted_context.browser if adopted_context else None
                 if adopted_browser is not None:
                     try:
-                        await rebind_download_dir(adopted_browser, run_id=workflow_run_id)
+                        rebind_run_id = resolve_run_download_id(
+                            skyvern_context.current(), fallback_run_id=workflow_run_id
+                        )
+                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
                         LOG.info(
                             "Rebound download dir on adopted persistent session",
                             browser_session_id=browser_session_id,
                             workflow_run_id=workflow_run_id,
+                            run_id=rebind_run_id,
                         )
                     except Exception:
                         LOG.warning(
@@ -4645,7 +4650,7 @@ class UploadToS3Block(Block):
             context = skyvern_context.current()
             self.path = str(
                 get_path_for_workflow_download_directory(
-                    context.run_id if context and context.run_id else workflow_run_id
+                    resolve_run_download_id(context, fallback_run_id=workflow_run_id)
                 ).absolute()
             )
 
@@ -4723,6 +4728,13 @@ class FileUploadBlock(Block):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     path: str | None = None
+    continue_on_empty: bool = Field(
+        default=False,
+        description=(
+            "When the run download directory has no files, fail the block (False, default) instead "
+            "of reporting success. Set True to allow an empty upload (success with no files uploaded)."
+        ),
+    )
 
     def get_all_parameters(
         self,
@@ -4909,7 +4921,7 @@ class FileUploadBlock(Block):
         context = skyvern_context.current()
         download_files_path = str(
             get_path_for_workflow_download_directory(
-                context.run_id if context and context.run_id else workflow_run_id
+                resolve_run_download_id(context, fallback_run_id=workflow_run_id)
             ).absolute()
         )
 
@@ -4931,8 +4943,21 @@ class FileUploadBlock(Block):
                         LOG.warning("FileUploadBlock Skipping directory", file=file)
                         continue
                     files_to_upload.append(os.path.join(download_files_path, file))
-            else:
-                files_to_upload.append(download_files_path)
+
+            if not files_to_upload and not self.continue_on_empty:
+                # Never green on a zero-file upload by default: a download-dir/scan-dir desync
+                # would otherwise be silent data loss (SKY-11153). Opt out with continue_on_empty.
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        f"No files found to upload in the run download directory ({download_files_path}); "
+                        f"nothing was sent to {self.storage_type}."
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
             if self.storage_type == FileStorageType.S3:
                 actual_aws_access_key_id = (

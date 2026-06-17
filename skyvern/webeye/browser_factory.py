@@ -41,7 +41,7 @@ from skyvern.exceptions import (
     UnknownErrorWhileCreatingBrowserContext,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
+from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
@@ -278,9 +278,7 @@ def set_download_file_listener(
 
 def initialize_download_dir() -> str:
     context = ensure_context()
-    return get_download_dir(
-        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
-    )
+    return get_download_dir(resolve_run_download_id(context))
 
 
 async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
@@ -315,8 +313,7 @@ async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
 
 async def _apply_download_behaviour(browser: Browser) -> None:
     context = ensure_context()
-    run_id = context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
-    await rebind_download_dir(browser, run_id)
+    await rebind_download_dir(browser, resolve_run_download_id(context))
 
 
 class BrowserContextCreator(Protocol):
