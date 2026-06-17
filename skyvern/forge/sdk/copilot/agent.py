@@ -771,6 +771,11 @@ _FAILURE_FOLLOW_UP = {
 }
 
 
+def _join_capped_labels(labels: list[str], cap: int = 6) -> str:
+    shown = ", ".join(labels[:cap])
+    return f"{shown}, ..." if len(labels) > cap else shown
+
+
 def _partial_verification_response(ctx: CopilotContext) -> str | None:
     evidence = ctx.workflow_verification_evidence
     if not evidence.has_evidence():
@@ -778,16 +783,34 @@ def _partial_verification_response(ctx: CopilotContext) -> str | None:
     if evidence.full_workflow_verified:
         return None
 
+    coverage_complete = (
+        bool(evidence.block_verified) and not evidence.unverified_block_labels and not evidence.per_tool_budget_on_block
+    )
+    if coverage_complete:
+        count = len(evidence.block_verified)
+        block_word = "block" if count == 1 else "blocks"
+        labels = _join_capped_labels(evidence.block_verified)
+        failure_reason = (evidence.failure_reason or "").strip()
+        if failure_reason:
+            return (
+                f"I saved a draft workflow and ran all {count} {block_word} ({labels}), but the run did not "
+                f"confirm the workflow end-to-end: {failure_reason}. Keep the draft to iterate on, or discard."
+            )
+        return (
+            f"I saved a draft workflow and ran all {count} {block_word} ({labels}), but I couldn't confirm the "
+            "workflow end-to-end this turn. Keep the draft to iterate on, or discard."
+        )
+
     detail_parts: list[str] = []
     if evidence.block_verified:
-        detail_parts.append("verified block(s): " + ", ".join(evidence.block_verified[:6]))
+        detail_parts.append("verified block(s): " + _join_capped_labels(evidence.block_verified))
     if evidence.live_page_state_verified:
         page = evidence.page_title or evidence.current_url or "the current browser page"
         detail_parts.append(f"verified current browser state: {page}")
     if evidence.per_tool_budget_on_block:
-        detail_parts.append("per-tool budget hit on: " + ", ".join(evidence.per_tool_budget_on_block[:6]))
+        detail_parts.append("per-tool budget hit on: " + _join_capped_labels(evidence.per_tool_budget_on_block))
     if evidence.unverified_block_labels:
-        detail_parts.append("unverified block(s): " + ", ".join(evidence.unverified_block_labels[:6]))
+        detail_parts.append("unverified block(s): " + _join_capped_labels(evidence.unverified_block_labels))
 
     details = " ".join(detail_parts)
     if details:
