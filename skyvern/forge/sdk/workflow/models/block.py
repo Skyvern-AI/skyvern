@@ -5904,31 +5904,40 @@ class FileParserBlock(Block):
 
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
-        if self.file_type == FileType.CSV:
-            parsed_data = await self._parse_csv_file(file_path)
-        elif self.file_type == FileType.EXCEL:
-            parsed_data = await self._parse_excel_file(file_path)
-        elif self.file_type == FileType.PDF:
-            parsed_data = await self._parse_pdf_file(
-                file_path,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-        elif self.file_type == FileType.IMAGE:
-            parsed_data = await self._parse_image_file(
-                file_path,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-        elif self.file_type == FileType.DOCX:
-            parsed_data = await self._parse_docx_file(file_path)
-        else:
+        try:
+            if self.file_type == FileType.CSV:
+                parsed_data = await self._parse_csv_file(file_path)
+            elif self.file_type == FileType.EXCEL:
+                parsed_data = await self._parse_excel_file(file_path)
+            elif self.file_type == FileType.PDF:
+                parsed_data = await self._parse_pdf_file(
+                    file_path,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            elif self.file_type == FileType.IMAGE:
+                parsed_data = await self._parse_image_file(
+                    file_path,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            elif self.file_type == FileType.DOCX:
+                parsed_data = await self._parse_docx_file(file_path)
+            else:
+                return await self._record_failure(
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    f"Unsupported file type: {self.file_type}",
+                )
+        except Exception as e:
             return await self._record_failure(
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
-                f"Unsupported file type: {self.file_type}",
+                f"Failed to parse {self.file_type} file: {str(e)}",
             )
 
         # If json_schema is provided, use AI to extract structured data

@@ -129,6 +129,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
     derive_response_kind,
+    with_copilot_code_mode_diagnostics,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
@@ -949,6 +950,8 @@ def _make_agent_result(
         if payload_updates:
             kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
+    if ctx is not None and result.turn_outcome is not None:
+        result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
     if ctx is not None and result.completion_criteria_turn_state is None:
         result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     return result

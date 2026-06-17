@@ -9,7 +9,7 @@ direction allowed.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -20,6 +20,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
 LOG = structlog.get_logger()
 
 IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
+CopilotComposerMode = Literal["ask", "build", "code"]
 
 REPEATED_REPLY_ESCALATION_TEMPLATES: dict[ResponseKind, str] = {
     ResponseKind.BUILD: (
@@ -160,6 +161,43 @@ def derive_response_kind(turn_intent: TurnIntent | None) -> ResponseKind:
 
 def _dedup_signatures(signatures: Iterable[str]) -> list[str]:
     return sorted({sig for sig in signatures if isinstance(sig, str) and sig})
+
+
+def _string_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def derive_copilot_code_mode_diagnostics(ctx: Any) -> dict[str, bool | str | None]:
+    turn_halt_kind = getattr(getattr(ctx, "turn_halt", None), "kind", None)
+    turn_halt_kind_value = getattr(turn_halt_kind, "value", turn_halt_kind)
+    pending_capability = _string_or_none(getattr(ctx, "code_native_pending_capability", None))
+    return {
+        "copilot_last_code_build_failed": bool(
+            getattr(ctx, "last_test_ok", None) is False or getattr(ctx, "last_failed_workflow_yaml", None)
+        ),
+        "copilot_repair_ceiling_hit": turn_halt_kind_value == "repair_ceiling_reached",
+        "copilot_pending_capability": pending_capability,
+    }
+
+
+def with_copilot_code_mode_diagnostics(outcome: TurnOutcome, ctx: Any) -> TurnOutcome:
+    return outcome.model_copy(update=derive_copilot_code_mode_diagnostics(ctx))
+
+
+def with_copilot_code_mode_metadata(
+    outcome: TurnOutcome,
+    *,
+    effective_mode: CopilotComposerMode,
+    code_available: bool,
+    turn_id: str | None,
+) -> TurnOutcome:
+    return outcome.model_copy(
+        update={
+            "copilot_effective_mode": effective_mode,
+            "copilot_code_available": code_available,
+            "copilot_turn_id": turn_id,
+        }
+    )
 
 
 def build_minimal_turn_outcome(

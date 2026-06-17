@@ -408,6 +408,7 @@ class CopilotContext(AgentContext):
     code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     last_failed_workflow_yaml: str | None = None
+    code_native_pending_capability: str | None = None
     # Set when a block-running tool timed out and the run's true outcome
     # could not be reconciled (post-drain row was ``canceled``, non-final, or
     # unreadable). Blocks further block-running tool calls until the LLM
