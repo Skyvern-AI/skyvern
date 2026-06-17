@@ -29,7 +29,10 @@ LOG = structlog.get_logger()
 
 PROMPT_TEMPLATE_NAME = "workflow-copilot-completion-verification"
 _EVIDENCE_VALUE_MAX_CHARS = 2000
+_EVIDENCE_REF_MAX_CHARS = 240
+_MISSING_EVIDENCE_MAX_CHARS = 500
 _MAX_BLOCK_OUTPUTS = 20
+_MAX_TRACE_VERDICTS = 8
 _REASON_CODES = frozenset({"evidence_confirms", "no_evidence", "evidence_contradicts", "unknown"})
 _PAGE_EVIDENCE_KEYS = (
     "current_url",
@@ -59,6 +62,7 @@ class CriterionVerdict:
     state: CriterionState
     reason_code: str
     evidence_ref: str | None = None
+    missing_evidence: str | None = None
 
     @property
     def satisfied(self) -> bool:
@@ -78,7 +82,13 @@ class CompletionVerificationResult:
         return all(criterion_id in satisfied for criterion_id in self.criterion_ids)
 
     def to_trace_data(self) -> dict[str, Any]:
-        return {
+        unmet = [verdict for verdict in self.verdicts if not verdict.satisfied]
+        missing_evidence: list[str] = []
+        for verdict in unmet:
+            detail = verdict_missing_evidence(verdict)
+            if detail:
+                missing_evidence.append(f"{verdict.criterion_id}: {detail}")
+        data: dict[str, Any] = {
             "status": self.status,
             "criterion_count": len(self.criterion_ids),
             "satisfied_count": sum(1 for verdict in self.verdicts if verdict.state == "satisfied"),
@@ -86,7 +96,21 @@ class CompletionVerificationResult:
             "unknown_count": sum(1 for verdict in self.verdicts if verdict.state == "unknown"),
             "fully_satisfied": self.is_fully_satisfied(),
             "reason_codes": [verdict.reason_code for verdict in self.verdicts],
+            "unmet_criterion_ids": [verdict.criterion_id for verdict in unmet],
+            "missing_evidence": missing_evidence,
         }
+        for index, verdict in enumerate(self.verdicts[:_MAX_TRACE_VERDICTS]):
+            prefix = f"verdict_{index}"
+            data[f"{prefix}_criterion_id"] = verdict.criterion_id
+            data[f"{prefix}_satisfied"] = verdict.satisfied
+            data[f"{prefix}_reason_code"] = verdict.reason_code
+            evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
+            if evidence_ref:
+                data[f"{prefix}_evidence_ref"] = evidence_ref
+            detail = verdict_missing_evidence(verdict)
+            if detail:
+                data[f"{prefix}_missing_evidence"] = detail
+        return data
 
     def verdict_state_counts(self) -> dict[str, int]:
         return {
@@ -142,6 +166,40 @@ class RunEvidenceSnapshot:
 
 
 _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
+_MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
+
+
+def _clean_optional_text(value: Any, *, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(redact_raw_secrets_for_prompt(value).split())[:max_chars].strip()
+    return cleaned or None
+
+
+def _default_missing_evidence(reason_code: str) -> str:
+    if reason_code == "evidence_contradicts":
+        return "produced evidence contradicted this criterion"
+    if reason_code == "unknown":
+        return "judge could not determine this criterion from the produced evidence"
+    if reason_code == "no_evidence":
+        return "run output did not include evidence for this criterion"
+    return "judge did not mark this criterion satisfied"
+
+
+def verdict_missing_evidence(verdict: CriterionVerdict) -> str | None:
+    if verdict.satisfied:
+        return None
+    cleaned = _clean_optional_text(verdict.missing_evidence, max_chars=_MISSING_EVIDENCE_MAX_CHARS)
+    return cleaned or _default_missing_evidence(verdict.reason_code)
+
+
+def _missing_verdict(criterion_id: str) -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=criterion_id,
+        state="unknown",
+        reason_code="unknown",
+        missing_evidence=_MISSING_VERDICT_EVIDENCE,
+    )
 
 
 def summarize_unsatisfied_outcomes(result: CompletionVerificationResult, criteria: list[CompletionCriterion]) -> str:
@@ -193,23 +251,21 @@ def _coerce_result(raw: Any, criterion_ids: list[str]) -> CompletionVerification
             state = "unsatisfied"
         else:
             state = "unknown"
-        evidence_ref_raw = item.get("evidence_ref")
-        evidence_ref = (
-            evidence_ref_raw.strip() if isinstance(evidence_ref_raw, str) and evidence_ref_raw.strip() else None
-        )
+        evidence_ref = _clean_optional_text(item.get("evidence_ref"), max_chars=_EVIDENCE_REF_MAX_CHARS)
+        missing_evidence = None
+        if state != "satisfied":
+            missing_evidence = _clean_optional_text(
+                item.get("missing_evidence"), max_chars=_MISSING_EVIDENCE_MAX_CHARS
+            ) or _default_missing_evidence(reason_code)
         by_id[criterion_id] = CriterionVerdict(
             criterion_id=criterion_id,
             state=state,
             reason_code=reason_code,
             evidence_ref=evidence_ref,
+            missing_evidence=missing_evidence,
         )
 
-    # A criterion the judge never returned a verdict for was not evaluated —
-    # that is absent signal (unknown), not affirmative no_evidence.
-    verdicts = [
-        by_id.get(criterion_id, CriterionVerdict(criterion_id=criterion_id, state="unknown", reason_code="unknown"))
-        for criterion_id in criterion_ids
-    ]
+    verdicts = [by_id.get(criterion_id, _missing_verdict(criterion_id)) for criterion_id in criterion_ids]
     return CompletionVerificationResult(status="evaluated", criterion_ids=list(criterion_ids), verdicts=verdicts)
 
 

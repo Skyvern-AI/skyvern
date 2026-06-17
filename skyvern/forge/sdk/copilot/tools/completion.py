@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_definition_criteria,
     grade_present_value_criteria,
     summarize_unsatisfied_outcomes,
+    verdict_missing_evidence,
 )
 from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
@@ -345,19 +346,21 @@ def _outcome_unverified_reason(
         if completion_verification.is_fully_satisfied():
             return None
         policy = getattr(copilot_ctx, "request_policy", None)
-        criteria = list(policy.completion_criteria) if policy is not None else []
+        criteria: list[CompletionCriterion] = list(policy.completion_criteria) if policy is not None else []
+        known_good = _known_good_revision_hint(copilot_ctx)
+        missing_detail = _missing_evidence_detail(completion_verification, criteria)
+        if missing_detail:
+            return (
+                "The run completed but did not demonstrate the goal outcome(s). "
+                f"Missing evidence: {missing_detail}. "
+                f"Add or fix the block that produces the missing outcome evidence, then re-run.{known_good}"
+            )
         unmet = summarize_unsatisfied_outcomes(completion_verification, criteria)
         detail = f": {unmet}" if unmet else ""
-        turn_state = getattr(copilot_ctx, "completion_criteria_turn_state", None)
-        known_good = (
-            " A previously tested revision of this workflow satisfied every criterion; if repairs regress "
-            "working blocks, prefer restoring that revision over rewriting them."
-            if turn_state is not None and getattr(turn_state, "known_good_yaml_available", False)
-            else ""
-        )
+        # Keep the legacy fallback live for malformed evaluated results with no unmet verdict details.
         return (
             f"The run completed but did not demonstrate the goal outcome(s){detail}. "
-            "Add an end-state confirmation (an extraction or validation block) that observes the outcome, "
+            "Add or fix the block that produces the missing outcome evidence, "
             f"then re-run.{known_good}"
         )
     # An 'unavailable' result reaches here only when verification was required;
@@ -366,6 +369,35 @@ def _outcome_unverified_reason(
         "The run completed but the goal outcome could not be verified (verification was unavailable). "
         "Re-run to verify the outcome before reporting success."
     )
+
+
+def _known_good_revision_hint(copilot_ctx: Any) -> str:
+    turn_state = getattr(copilot_ctx, "completion_criteria_turn_state", None)
+    if turn_state is not None and getattr(turn_state, "known_good_yaml_available", False):
+        return (
+            " A previously tested revision of this workflow satisfied every criterion; if repairs regress "
+            "working blocks, prefer restoring that revision over rewriting them."
+        )
+    return ""
+
+
+def _missing_evidence_detail(
+    completion_verification: CompletionVerificationResult, criteria: list[CompletionCriterion]
+) -> str | None:
+    outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
+    parts: list[str] = []
+    for verdict in completion_verification.verdicts:
+        if verdict.satisfied:
+            continue
+        missing_evidence = verdict_missing_evidence(verdict)
+        if not missing_evidence:
+            continue
+        outcome = outcome_by_id.get(verdict.criterion_id)
+        if isinstance(outcome, str) and outcome.strip():
+            parts.append(f"{outcome}: {missing_evidence}")
+        else:
+            parts.append(f"{verdict.criterion_id}: {missing_evidence}")
+    return "; ".join(parts) if parts else None
 
 
 def _outcome_failure_warrants_repair(
