@@ -811,6 +811,10 @@ _FILL_CLAIM_ID = "claim:<fill>"
 _FILL_CLAIM_TEXT = "<fill: the user-facing outcome this block claims>"
 _FILL_CRITERION_ID = "criterion:<fill>"
 _FILL_CRITERION_TEXT = "<fill: the terminal completion criterion>"
+_FILL_EXTRACTION_SCHEMA = (
+    "<fill: JSON Schema string of the fields to extract, e.g. "
+    '{"type":"object","properties":{"field_a":{"type":"string"}},"required":["field_a"]}>'
+)
 
 
 def artifact_dependency_id(block_label: str) -> str:
@@ -868,6 +872,7 @@ def build_artifact_metadata_skeleton(
                 "depends_on": [dependency_id],
                 "covered_criteria": [_FILL_CRITERION_ID],
                 "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
+                "extraction_schema": _FILL_EXTRACTION_SCHEMA,
                 "observation_refs": [observation_ref_id],
             }
         ],
@@ -981,9 +986,13 @@ def render_synthesized_offer_text(
         parts.append(_render_artifact_metadata_block(metadata))
         parts.append("```")
         parts.append(
-            "Shape the data-capture `return` so each `goal_value_paths` entry resolves to a named scalar field. "
-            "For `records[].field` paths, return an array of objects; for a single record, return a keyed dict. "
-            "Bind each `<fill: ...>` to the page text you captured. For example:"
+            "`extraction_schema` is the typed shape (named fields + types) of what this block extracts. "
+            "Propose it from the goal and the page text you scouted, surface the proposed fields to the user, "
+            "and ASK_QUESTION to confirm or adjust which fields to grab before committing the block. Carry the "
+            "confirmed JSON Schema back as `extraction_schema`; `goal_value_paths` index into it. Shape the "
+            "data-capture `return` so it conforms: each schema field is a named scalar key. For an array schema "
+            "return an array of objects; for a single record return a keyed dict. Bind each `<fill: ...>` to the "
+            "page text you captured. For example:"
         )
         parts.append("```python")
         parts.append('return {"records": [{"field_a": "...", "field_b": "..."}]}')

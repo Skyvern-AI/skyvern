@@ -256,6 +256,10 @@ Runtime facts:
   `fill_credential_field`, never embed literal secrets.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
+- For an extraction-intent `code` block, propose a typed `extraction_schema` (named
+  fields with types) from the goal and the scouted page, ASK_QUESTION to confirm or
+  adjust which fields to grab, then carry the confirmed JSON Schema as
+  `extraction_schema` on `code_artifact_metadata` and conform the block's `return` to it.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 

@@ -9,6 +9,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -1101,6 +1102,42 @@ def _goal_value_paths_for_code_block(copilot_ctx: Any | None, label: Any) -> lis
     return paths
 
 
+def _parse_metadata_extraction_schema(value: Any) -> dict[str, Any] | None:
+    # Keep in sync with workflow_update._parse_extraction_schema; duplicated locally
+    # so runtime blockers do not import the authoring validator.
+    if isinstance(value, dict):
+        return value or None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.casefold() in {"null", "none"} or text.casefold().startswith("<fill"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def _extraction_schema_for_code_block(copilot_ctx: Any | None, label: Any) -> dict[str, Any] | None:
+    if copilot_ctx is None or not isinstance(label, str):
+        return None
+    metadata = getattr(copilot_ctx, "code_artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    entry = metadata.get(label)
+    if not isinstance(entry, dict):
+        return None
+    # claimed_outcomes wins when both groups declare a schema; they are expected to carry the same value.
+    for row_group in (entry.get("claimed_outcomes"), entry.get("terminal_verifier_expectations")):
+        rows = [row for row in row_group if isinstance(row, dict)] if isinstance(row_group, list) else []
+        for row in rows:
+            schema = _parse_metadata_extraction_schema(row.get("extraction_schema"))
+            if schema is not None:
+                return schema
+    return None
+
+
 _GOAL_PATH_INDEX_PATTERN = re.compile(r"\[\d+\]")
 
 
@@ -1599,6 +1636,15 @@ def _analyze_run_blocks(
                 )
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)
+                extraction_schema = _extraction_schema_for_code_block(copilot_ctx, block.get("label"))
+                # Array-typed schemas would coerce the keyed dict return to [] (fill_missing_fields), making the
+                # goal-path check below read a real extraction as empty; the keyed-return floor guarantees a dict.
+                if (
+                    extraction_schema is not None
+                    and isinstance(extracted, dict)
+                    and extraction_schema.get("type") != "array"
+                ):
+                    extracted = validate_and_fill_extraction_result(extracted, extraction_schema)
                 goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
                 if goal_value_paths:
                     has_data_blocks = True

@@ -3,6 +3,7 @@ import { useReactFlow } from "@xyflow/react";
 import { useMemo, useState } from "react";
 import type { Extension } from "@uiw/react-codemirror";
 
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
@@ -17,6 +18,7 @@ import { deepEqualStringArrays } from "@/util/equality";
 import { cn } from "@/util/utils";
 
 import { type AppNode, isWorkflowBlockNode } from "..";
+import { dataSchemaExampleValue } from "../types";
 import { CodeBlockPlainCard } from "./CodeBlockPlainCard";
 import type { CodeBlockView } from "./CodeBlockViewToggle";
 import type { CodeBlockNode, CodeBlockNodeData } from "./types";
@@ -172,6 +174,18 @@ function CodeBlockEditorBody({
     </div>
   );
 
+  const dataSchemaField = (
+    <WorkflowDataSchemaInputGroup
+      value={data.dataSchema ?? "null"}
+      onChange={(value) => update({ dataSchema: value })}
+      exampleValue={dataSchemaExampleValue}
+      suggestionContext={{
+        data_extraction_goal: data.prompt ?? "",
+        current_schema: data.dataSchema ?? "null",
+      }}
+    />
+  );
+
   if (isCodeFirst && view === "plain") {
     return (
       <div data-testid="code-block-block-form" className="space-y-4">
@@ -189,6 +203,7 @@ function CodeBlockEditorBody({
     return (
       <div data-testid="code-block-block-form" className="space-y-4">
         {inputsField}
+        {dataSchemaField}
         {codeEditorElement}
       </div>
     );
@@ -259,6 +274,7 @@ function CodeBlockEditorBody({
         </div>
       )}
       {inputsField}
+      {isCodeFirst && dataSchemaField}
       <div className="space-y-2">
         <Label className="text-xs text-slate-300">Code Input</Label>
         {codeEditorElement}

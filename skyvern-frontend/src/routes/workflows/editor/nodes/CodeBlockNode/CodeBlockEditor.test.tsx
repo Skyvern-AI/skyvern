@@ -17,6 +17,7 @@ const baseData: CodeBlockNodeData = {
   parameterKeys: [],
   prompt: null,
   steps: null,
+  dataSchema: "null",
   model: null,
 };
 
@@ -45,6 +46,15 @@ vi.mock("..", () => ({
 vi.mock("@/components/WorkflowBlockInputSet", () => ({
   WorkflowBlockInputSet: () => null,
 }));
+
+vi.mock(
+  "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup",
+  () => ({
+    WorkflowDataSchemaInputGroup: () => (
+      <div data-testid="data-schema-input-group" />
+    ),
+  }),
+);
 
 vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: ({

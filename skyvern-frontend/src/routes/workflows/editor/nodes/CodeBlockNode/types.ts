@@ -10,6 +10,7 @@ export type CodeBlockNodeData = NodeBaseData & {
   parameterKeys: Array<string> | null;
   prompt: string | null;
   steps: Array<CodeBlockStep> | null;
+  dataSchema: string;
 };
 
 export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;
@@ -34,5 +35,6 @@ export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   parameterKeys: null,
   prompt: "",
   steps: null,
+  dataSchema: "null",
   model: null,
 } as const;
