@@ -132,7 +132,7 @@ class TestLocatorSynthesis:
         assert 'await page.locator(".results .item").click()' in result.code
         assert not any("low-confidence" in note for note in result.notes)
 
-    def test_never_emits_first_or_last_callables(self) -> None:
+    def test_positional_role_name_anchor_does_not_emit_first(self) -> None:
         result = synthesize_code_block(
             [
                 _interaction(
@@ -145,6 +145,107 @@ class TestLocatorSynthesis:
         assert result is not None
         assert ".first" not in result.code
         assert ".last" not in result.code
+
+    def test_bare_tag_selector_disambiguated_to_first(self) -> None:
+        result = synthesize_code_block(
+            [_interaction("click", selector="button", source_url="https://example.com/login")]
+        )
+        assert result is not None
+        assert 'await page.locator("button").first.click()' in result.code
+        assert any("disambiguated a bare" in note for note in result.notes)
+        assert any(p.get("source") == "first_fallback" for p in result.diagnostics.locator_provenance)
+
+    def test_bare_role_no_name_disambiguated_to_first(self) -> None:
+        result = synthesize_code_block(
+            [_interaction("click", selector="role=button", source_url="https://example.com/login")]
+        )
+        assert result is not None
+        assert 'await page.get_by_role("button").first.click()' in result.code
+
+    def test_bare_selector_with_role_name_anchors_on_get_by_role(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="button",
+                    source_url="https://example.com/login",
+                    role="button",
+                    accessible_name="Continue",
+                )
+            ]
+        )
+        assert result is not None
+        assert 'await page.get_by_role("button", name="Continue").click()' in result.code
+        assert ".first" not in result.code
+
+    def test_stable_selector_not_disambiguated_to_first(self) -> None:
+        for selector in ("#submit", '[name="email"]', '[data-testid="go"]', ".results .item"):
+            result = synthesize_code_block(
+                [_interaction("click", selector=selector, source_url="https://example.com/")]
+            )
+            assert result is not None
+            assert ".first" not in result.code, selector
+
+    def test_strict_imposed_refuses_ambiguous_bare_selector(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open-login", source_url="https://example.com/home"),
+            _interaction("click", selector="button", source_url="https://example.com/login"),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert ".first" not in result.code
+        assert 'await page.locator("button").click()' not in result.code
+        dropped = [
+            d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
+        ]
+        assert dropped
+
+    def test_strict_imposed_refuses_bare_role_no_name(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open-login", source_url="https://example.com/home"),
+            _interaction("click", selector="role=button", source_url="https://example.com/login"),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert ".first" not in result.code
+        dropped = [
+            d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
+        ]
+        assert dropped
+
+    def test_two_bare_button_login_first_clicks_both_emit_first(self) -> None:
+        trajectory = [
+            _interaction("click", selector="button", source_url="https://example.com/login"),
+            _interaction("click", selector="button", source_url="https://example.com/login"),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        assert result.code.count('await page.locator("button").first.click()') == 2
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_universal_selector_offered_with_first(self) -> None:
+        result = synthesize_code_block([_interaction("click", selector="*", source_url="https://example.com/p")])
+        assert result is not None
+        assert 'await page.locator("*").first.click()' in result.code
+        assert 'await page.locator("*").click()' not in result.code
+
+    def test_strict_imposed_refuses_universal_selector(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction("click", selector="*", source_url="https://example.com/p"),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'page.locator("*")' not in result.code
+        assert [d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"]
+
+    def test_attribute_qualified_universal_selector_not_disambiguated(self) -> None:
+        result = synthesize_code_block(
+            [_interaction("click", selector="*[data-id]", source_url="https://example.com/p")]
+        )
+        assert result is not None
+        assert 'await page.locator("*[data-id]").click()' in result.code
+        assert ".first" not in result.code
 
 
 class TestActionSynthesis:
