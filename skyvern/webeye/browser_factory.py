@@ -108,6 +108,29 @@ def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrow
     )
 
 
+# RFC 7230 field-name token: the only characters Chromium accepts in a header name.
+_VALID_HEADER_NAME_RE = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+# Chromium rejects the whole batch if any value carries these header-injection chars.
+_INVALID_HEADER_VALUE_RE = re.compile(r"[\r\n\x00]")
+
+
+def sanitize_browser_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
+    """Drop entries whose name or value is malformed, so one bad header can't make Chromium
+    reject the whole Network.setExtraHTTPHeaders batch and fail the launch."""
+    if not headers:
+        return None
+    sanitized: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not _VALID_HEADER_NAME_RE.fullmatch(name):
+            LOG.warning("Dropping invalid extra HTTP header name before browser launch", header_name=name)
+            continue
+        if not isinstance(value, str) or _INVALID_HEADER_VALUE_RE.search(value):
+            LOG.warning("Dropping extra HTTP header with invalid value before browser launch", header_name=name)
+            continue
+        sanitized[name] = value
+    return sanitized or None
+
+
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     if browser_artifacts.browser_console_log_path is None:
         log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
@@ -384,7 +407,7 @@ class BrowserContextFactory:
                 "width": settings.BROWSER_WIDTH,
                 "height": settings.BROWSER_HEIGHT,
             },
-            "extra_http_headers": extra_http_headers,
+            "extra_http_headers": sanitize_browser_headers(extra_http_headers),
         }
         if settings.BROWSER_RECORDING_WIDTH and settings.BROWSER_RECORDING_HEIGHT:
             args["record_video_size"] = {
