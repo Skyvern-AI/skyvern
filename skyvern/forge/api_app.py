@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from starlette.requests import HTTPConnection, Request
+from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
@@ -390,6 +390,13 @@ def create_api_app() -> FastAPI:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": detail},
         )
+
+    @fastapi_app.exception_handler(ClientDisconnect)
+    async def handle_client_disconnect(request: Request, exc: ClientDisconnect) -> Response:
+        # Client closed the connection mid-request (e.g. while a route reads the body).
+        # There is no one to respond to, so return a quiet 499 instead of letting it
+        # fall through to the 500 handler and pollute error tracking.
+        return Response(status_code=499)
 
     @fastapi_app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:

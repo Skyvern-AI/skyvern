@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from skyvern.forge import request_logging
 from skyvern.forge.request_logging import (
@@ -458,3 +459,37 @@ class TestMiddlewareLogVolume:
         client = TestClient(_make_app())
         client.post("/tasks")
         log_mock.info.assert_not_called()
+
+
+class TestClientDisconnectDuringBodyRead:
+    """A client closing the connection mid-body must not surface as an unhandled error."""
+
+    @pytest.mark.asyncio
+    async def test_disconnect_short_circuits_without_error_log(self, log_mock: MagicMock) -> None:
+        request = MagicMock()
+        request.method = "POST"
+        request.url.path = "/v1/tasks"
+        request.body = AsyncMock(side_effect=ClientDisconnect())
+        call_next = AsyncMock()
+
+        response = await log_raw_request_middleware(request, call_next)
+
+        assert response.status_code == 499
+        call_next.assert_not_awaited()
+        log_mock.error.assert_not_called()
+        log_mock.exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_when_logging_disabled_still_calls_downstream(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", False)
+        request = MagicMock()
+        request.body = AsyncMock(side_effect=ClientDisconnect())
+        sentinel = MagicMock()
+        call_next = AsyncMock(return_value=sentinel)
+
+        response = await log_raw_request_middleware(request, call_next)
+
+        assert response is sentinel
+        request.body.assert_not_awaited()
