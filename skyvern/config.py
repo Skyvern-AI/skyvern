@@ -189,6 +189,11 @@ class Settings(BaseSettings):
     # Flag-gate for the optional LLM pass that rewrites code-block step descriptions.
     # Off (default) = deterministic templated descriptions; On = LLM rewrites descriptions only.
     WORKFLOW_COPILOT_CODE_BLOCK_STEP_DESCRIPTIONS_LLM: bool = False
+    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
+    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
+    # already-authenticated session (the first run and every login-replaying repair re-run alike).
+    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
+    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]

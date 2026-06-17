@@ -23,6 +23,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_blocker_signal_for_reason_codes,
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    code_contains_credential_fill,
+    trajectory_has_credential_fill,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
 )
@@ -663,6 +667,32 @@ def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> Workfl
     return workflow if _workflow_covers_labels(workflow, labels) else None
 
 
+def _should_use_fresh_session_for_login_first_replay(
+    ctx: AgentContext,
+    labels_to_execute: list[str],
+    workflow: Workflow | None,
+) -> bool:
+    """Fresh session when this run replays a login fill into the scout's authenticated session.
+
+    Keyed on two planes the agent cannot edit between runs — the scout trajectory authenticated
+    via a credential fill and this run's leading block fills one; frontier re-runs seeded past
+    login carry no leading credential fill and keep reusing the scout session.
+    """
+    if not SettingsManager.get_settings().COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN:
+        return False
+    if not trajectory_has_credential_fill(ctx.scout_trajectory):
+        return False
+    return _labels_replay_login_fill(labels_to_execute, workflow)
+
+
+def _labels_replay_login_fill(labels_to_execute: list[str], workflow: Workflow | None) -> bool:
+    if not labels_to_execute:
+        return False
+    by_label = _blocks_by_label(workflow.workflow_definition if workflow else None)
+    code = getattr(by_label.get(labels_to_execute[0]), "code", None)
+    return isinstance(code, str) and code_contains_credential_fill(code)
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -806,11 +836,35 @@ async def _run_blocks_and_collect_debug(
                     parameter_type=str(wp.workflow_parameter_type),
                 )
 
+    use_fresh_session = _should_use_fresh_session_for_login_first_replay(ctx, labels_to_execute, workflow)
+    # True when the run was threaded into a fresh session rather than the scout's debug session;
+    # gates the post-run rebind (~:1135) so the ephemeral run session is not adopted as the
+    # context session.
+    used_fresh_run_session = False
+
     # Without a session, the workflow service launches the browser in-process,
     # which only works in worker pods (cloakbrowser isn't in the API image).
-    session_err = await ensure_browser_session(ctx)
-    if session_err is not None:
-        return session_err
+    if use_fresh_session:
+        # The scout authenticated its debug session, so replaying the login-first
+        # synthesized block into it meets a rehydrated authenticated view and the
+        # login fill() waits out its full element timeout. Mint a fresh session for
+        # this run only, then restore the scout's debug session as the context
+        # session so the rest of the turn (scouting, narration, SKY-9328 reuse)
+        # keeps it; the fresh id is threaded into the run calls explicitly.
+        debug_session_id = ctx.browser_session_id
+        ctx.browser_session_id = None
+        session_err = await ensure_browser_session(ctx)
+        if session_err is not None:
+            ctx.browser_session_id = debug_session_id
+            return session_err
+        run_session_id = ctx.browser_session_id
+        ctx.browser_session_id = debug_session_id
+        used_fresh_run_session = True
+    else:
+        session_err = await ensure_browser_session(ctx)
+        if session_err is not None:
+            return session_err
+        run_session_id = ctx.browser_session_id
 
     seeded_runtime_workflow = await _workflow_with_runtime_frontier_starter_url_seed(
         runtime_workflow,
@@ -823,7 +877,7 @@ async def _run_blocks_and_collect_debug(
 
     workflow_request = WorkflowRequestBody(
         data=data if data else None,
-        browser_session_id=ctx.browser_session_id,
+        browser_session_id=run_session_id,
         # Copilot test runs don't need scrolling post-action screenshots;
         # the ForgeAgent's split screenshots (used for LLM context) are unaffected.
         max_screenshot_scrolls=0,
@@ -852,7 +906,7 @@ async def _run_blocks_and_collect_debug(
             workflow_run_id=workflow_run.workflow_run_id,
             api_key="copilot-agent",
             organization=organization,
-            browser_session_id=ctx.browser_session_id,
+            browser_session_id=run_session_id,
             block_labels=labels_to_execute,
             block_outputs=block_outputs_to_seed or None,
             workflow_override=runtime_workflow,
@@ -1034,7 +1088,7 @@ async def _run_blocks_and_collect_debug(
                 exit_reason, workflow_run.workflow_run_id, budget_seconds, run
             )
             user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
-            current_url, page_title = await _fallback_page_info(ctx)
+            current_url, page_title = await _fallback_page_info(ctx, session_id_override=run_session_id)
             if exit_reason == "active_run_terminal_evidence" and active_run_terminal_evidence is not None:
                 result: dict[str, Any] = _active_run_terminal_evidence_result(
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -1101,7 +1155,9 @@ async def _run_blocks_and_collect_debug(
         if not run_task.done():
             run_task.cancel()
 
-    if run and run.browser_session_id:
+    # Skip the rebind when a fresh run session was used so the scout's restored
+    # debug session stays the context session for the rest of the turn.
+    if not used_fresh_run_session and run and run.browser_session_id:
         ctx.browser_session_id = run.browser_session_id
 
     blocks = await app.DATABASE.observer.get_workflow_run_blocks(
@@ -1160,13 +1216,13 @@ async def _run_blocks_and_collect_debug(
     for entry in results:
         entry.pop("action_trace", None)
 
-    current_url, page_title = await _fallback_page_info(ctx)
+    current_url, page_title = await _fallback_page_info(ctx, session_id_override=run_session_id)
 
     screenshot_b64: str | None = None
-    if not run_ok and ctx.browser_session_id:
+    if not run_ok and run_session_id:
         try:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                session_id=ctx.browser_session_id,
+                session_id=run_session_id,
                 organization_id=ctx.organization_id,
             )
             if browser_state:
@@ -1190,7 +1246,7 @@ async def _run_blocks_and_collect_debug(
 
     result_data: dict[str, Any] = {
         "workflow_run_id": workflow_run.workflow_run_id,
-        "browser_session_id": ctx.browser_session_id,
+        "browser_session_id": run_session_id,
         "overall_status": final_status,
         "requested_block_labels": list(block_labels),
         "executed_block_labels": list(labels_to_execute),

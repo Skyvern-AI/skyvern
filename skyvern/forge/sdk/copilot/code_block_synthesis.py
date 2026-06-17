@@ -39,6 +39,10 @@ _DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
 
 CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
 _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+
+# Shape of a synthesized credential fill, ``.fill(<param>.<field>)`` — distinguishes a login
+# fill from a plain ``.fill(str(<key>))`` text input.
+CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\([A-Za-z_]\w*\.\w+\)")
 _ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
 
@@ -886,6 +890,19 @@ def build_artifact_metadata_skeleton(
             }
         ],
     }
+
+
+def code_contains_credential_fill(code: str) -> bool:
+    return CREDENTIAL_FILL_CODE_PATTERN.search(code) is not None
+
+
+def trajectory_has_credential_fill(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    for interaction in trajectory:
+        if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        if str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS:
+            return True
+    return False
 
 
 def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
