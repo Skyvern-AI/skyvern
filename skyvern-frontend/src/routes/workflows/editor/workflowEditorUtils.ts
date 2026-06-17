@@ -904,6 +904,7 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
+          dataSchema: "null",
         },
       };
     }
