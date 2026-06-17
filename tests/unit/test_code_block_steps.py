@@ -32,6 +32,38 @@ def test_analyze_maps_playwright_calls_to_action_types_with_line_ranges():
     ]
 
 
+def test_analyze_maps_page_evaluate_and_other_recorder_calls_to_action_types():
+    # The static editor preview must surface the same calls the runtime recorder
+    # records (code_block_recorder._PAGE_ACTION_MAP / _LOCATOR_ACTION_MAP), so the
+    # editor step count matches the timeline. page.evaluate was previously dropped.
+    code = (
+        "async def run(page):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    await page.evaluate('() => document.title')\n"
+        "    await page.get_by_role('link', name='Docs').hover()\n"
+        "    await page.go_forward()\n"
+    )
+    spans = analyze_code_actions(code)
+    assert [(s.action_type, s.line_start) for s in spans] == [
+        ("goto_url", 2),
+        ("execute_js", 3),
+        ("hover", 4),
+        ("go_forward", 5),
+    ]
+
+
+def test_derive_steps_surfaces_page_evaluate_with_a_label():
+    code = (
+        "async def run(page):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    await page.evaluate('() => document.title')\n"
+    )
+    steps = derive_code_block_steps(code)
+    # Step count must match the number of actions actually in the script (2, not 1).
+    assert [s["action_type"] for s in steps] == ["goto_url", "execute_js"]
+    assert steps[1]["description"]  # surfaced with a non-empty, human label, not dropped
+
+
 def test_analyze_skips_noise_and_returns_empty_on_syntax_error():
     # wait_for_load_state is paired sync noise, never its own step.
     assert analyze_code_actions("async def run(page):\n    await page.wait_for_load_state('load')\n") == []
