@@ -408,6 +408,9 @@ class WorkflowRunsRepository(BaseRepository):
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).one()
             await save_workflow_run_logs(workflow_run_id)
+            # save_workflow_run_logs reuses this session and commits, expiring `refreshed`.
+            # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
+            await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
     @db_operation("bulk_update_workflow_runs")
