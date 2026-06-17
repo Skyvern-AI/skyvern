@@ -12,11 +12,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "@/components/ui/use-toast";
+import { cn } from "@/util/utils";
 import CloudContext from "@/store/CloudContext";
-import { Cross2Icon } from "@radix-ui/react-icons";
-import { useContext, useState } from "react";
+import { CodeIcon, Cross2Icon } from "@radix-ui/react-icons";
+import { useContext, useEffect, useRef, useState } from "react";
 import { CredentialParameterSourceSelector } from "../../components/CredentialParameterSourceSelector";
+import { OnePasswordItemSelector } from "../../components/OnePasswordItemSelector";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
+import { useOnePasswordItemsQuery } from "../../hooks/useOnePasswordItemsQuery";
 import {
   WorkflowEditorParameterType,
   WorkflowParameterValueType,
@@ -253,6 +256,15 @@ function WorkflowParameterEditPanel({
   const [opItemId, setOpItemId] = useState(
     isOnePasswordCredential ? initialValues.itemId : "",
   );
+  const [opManualEntry, setOpManualEntry] = useState(
+    isOnePasswordCredential &&
+      (initialValues.vaultId.includes("{{") ||
+        initialValues.itemId.includes("{{")),
+  );
+  const opEditModeInitializedRef = useRef(false);
+  const opUserTouchedRef = useRef(false);
+  const savedOpVaultId = isOnePasswordCredential ? initialValues.vaultId : "";
+  const savedOpItemId = isOnePasswordCredential ? initialValues.itemId : "";
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
     useState(isBitwardenCredential ? (initialValues?.itemId ?? "") : "");
@@ -273,6 +285,8 @@ function WorkflowParameterEditPanel({
   // Handle credential data type change - reset source to first available
   const handleCredentialDataTypeChange = (newDataType: CredentialDataType) => {
     setCredentialDataType(newDataType);
+    setOpVaultId("");
+    setOpItemId("");
     const availableSources = getAvailableSourcesForDataType(
       newDataType,
       isCloud,
@@ -315,6 +329,45 @@ function WorkflowParameterEditPanel({
     showCredentialFields &&
     credentialSource === "custom" &&
     hasCustomCredentialService;
+  const onePasswordItemsQuery = useOnePasswordItemsQuery({
+    enabled: showOnePasswordFields,
+  });
+
+  useEffect(() => {
+    if (
+      !showOnePasswordFields ||
+      !isOnePasswordCredential ||
+      opEditModeInitializedRef.current ||
+      opUserTouchedRef.current
+    ) {
+      return;
+    }
+
+    // Keep the saved vault/item IDs visible (manual mode) when the item list can't load.
+    if (onePasswordItemsQuery.isError) {
+      opEditModeInitializedRef.current = true;
+      setOpManualEntry(true);
+      return;
+    }
+
+    if (!onePasswordItemsQuery.data) {
+      return;
+    }
+
+    opEditModeInitializedRef.current = true;
+    const savedItemExists = onePasswordItemsQuery.data.items.some(
+      (item) =>
+        item.vault_id === savedOpVaultId && item.item_id === savedOpItemId,
+    );
+    setOpManualEntry(!savedItemExists);
+  }, [
+    isOnePasswordCredential,
+    onePasswordItemsQuery.data,
+    onePasswordItemsQuery.isError,
+    savedOpItemId,
+    savedOpVaultId,
+    showOnePasswordFields,
+  ]);
 
   return (
     <ScrollArea>
@@ -653,28 +706,94 @@ function WorkflowParameterEditPanel({
           {showOnePasswordFields && (
             <>
               <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    1Password Vault ID
-                  </Label>
-                  <HelpTooltip content="Find this in the 1Password vault URL. Supports agent inputs." />
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Label className="text-xs text-slate-300">
+                      1Password Item
+                    </Label>
+                    <HelpTooltip
+                      content={
+                        "Pick an item from your connected 1Password account. Click the </> button to pass in a custom value instead — for example a dynamic {{ input }} reference or a raw vault/item ID."
+                      }
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    aria-pressed={opManualEntry}
+                    title={
+                      opManualEntry
+                        ? "Pick from your 1Password items"
+                        : "Enter a custom value"
+                    }
+                    className={cn(
+                      "rounded p-1 text-slate-400 transition-colors hover:text-slate-200",
+                      opManualEntry && "bg-slate-700 text-slate-100",
+                    )}
+                    onClick={() => {
+                      opUserTouchedRef.current = true;
+                      if (opManualEntry) {
+                        const items = onePasswordItemsQuery.data?.items ?? [];
+                        const matches = items.some(
+                          (item) =>
+                            item.vault_id === opVaultId &&
+                            item.item_id === opItemId,
+                        );
+                        if (!matches) {
+                          setOpVaultId("");
+                          setOpItemId("");
+                        }
+                      }
+                      setOpManualEntry((prev) => !prev);
+                    }}
+                  >
+                    <CodeIcon className="size-4" />
+                  </button>
                 </div>
-                <Input
-                  value={opVaultId}
-                  onChange={(e) => setOpVaultId(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    1Password Item ID
-                  </Label>
-                  <HelpTooltip content="Find this in the 1Password item URL. Supports agent inputs." />
-                </div>
-                <Input
-                  value={opItemId}
-                  onChange={(e) => setOpItemId(e.target.value)}
-                />
+                {opManualEntry ? (
+                  <div className="space-y-3">
+                    <div className="space-y-1">
+                      <div className="flex gap-2">
+                        <Label className="text-xs text-slate-300">
+                          1Password Vault ID
+                        </Label>
+                        <HelpTooltip content="Find this in the 1Password vault URL. Supports dynamic agent inputs like {{ my_input }}." />
+                      </div>
+                      <Input
+                        value={opVaultId}
+                        onChange={(e) => {
+                          opUserTouchedRef.current = true;
+                          setOpVaultId(e.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex gap-2">
+                        <Label className="text-xs text-slate-300">
+                          1Password Item ID
+                        </Label>
+                        <HelpTooltip content="Find this in the 1Password item URL. Supports dynamic agent inputs like {{ my_input }}." />
+                      </div>
+                      <Input
+                        value={opItemId}
+                        onChange={(e) => {
+                          opUserTouchedRef.current = true;
+                          setOpItemId(e.target.value);
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <OnePasswordItemSelector
+                    vaultId={opVaultId}
+                    itemId={opItemId}
+                    credentialDataType={credentialDataType}
+                    onSelect={(vaultId, itemId) => {
+                      opUserTouchedRef.current = true;
+                      setOpVaultId(vaultId);
+                      setOpItemId(itemId);
+                    }}
+                  />
+                )}
               </div>
               {credentialDataType === "creditCard" && (
                 <div className="rounded-md bg-slate-800 p-2">

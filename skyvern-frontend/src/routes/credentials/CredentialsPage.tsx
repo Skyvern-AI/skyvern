@@ -9,6 +9,7 @@ import {
 } from "./useCredentialModalState";
 import { CredentialsModal } from "./CredentialsModal";
 import { CredentialsList } from "./CredentialsList";
+import { OnePasswordCredentialsList } from "./OnePasswordCredentialsList";
 import { useBackgroundCredentialTest } from "./useBackgroundCredentialTest";
 import {
   DropdownMenu,
@@ -316,6 +317,10 @@ function CredentialsPage() {
             folderId={selectedFolderId}
             isResolvingFolder={isResolvingFolder}
             onStartBackgroundTest={startBackgroundTest}
+          />
+          <OnePasswordCredentialsList
+            search={debouncedSearch}
+            folderId={selectedFolderId}
           />
         </TabsContent>
 

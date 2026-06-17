@@ -35,6 +35,7 @@ export function useOnePasswordToken() {
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["onePasswordToken"] });
+      void queryClient.invalidateQueries({ queryKey: ["onepasswordItems"] });
       toast({
         title: "Success",
         description: "1Password service account token updated successfully",
@@ -57,6 +58,7 @@ export function useOnePasswordToken() {
   const clearTokenMutation = useClearOrganizationAuthToken({
     providerPath: "onepassword",
     queryKey: "onePasswordToken",
+    invalidateQueryKeys: ["onepasswordItems"],
     successDescription: "1Password service account token cleared successfully",
     errorDescription: "Failed to clear 1Password token",
   });
