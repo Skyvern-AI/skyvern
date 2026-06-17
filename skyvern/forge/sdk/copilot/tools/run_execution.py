@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
@@ -95,6 +96,7 @@ from ._shared import (
     _valid_runtime_anchor_url,
     _workflow_verification_evidence,
 )
+from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import (
     _active_block_run_budget_seconds,
     _active_run_terminal_evidence_detected,
@@ -1256,11 +1258,16 @@ async def _run_blocks_and_collect_debug(
         "page_title": page_title,
         "action_trace_summary": action_trace_summary,
     }
-    if SettingsManager.get_settings().COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
-        reached_download = _derive_reached_download_from_block_outputs(block_outputs_by_label)
-        if reached_download is not None:
-            result_data["reached_download_target"] = reached_download.to_dict()
-            result_data["reached_download_guidance"] = _reached_download_guidance_for(reached_download)
+    # Code-first only: the guidance steers toward an expect_download code block (ADR 0010), which
+    # standard-mode v2 does not author.
+    reached_download = (
+        _derive_reached_download_from_block_outputs(block_outputs_by_label)
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        else None
+    )
+    if reached_download is not None:
+        result_data["reached_download_target"] = reached_download.to_dict()
+        result_data["reached_download_guidance"] = _reached_download_guidance_for(reached_download)
     if runtime_frontier_anchor_url is not None:
         result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
     if runtime_frontier_starter_url_seeded:
