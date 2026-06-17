@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_visible_result_after_completion_verification,
     _watchdog_exit_allows_terminal_promotion,
 )
+from skyvern.forge.sdk.copilot.tools.completion import _artifact_health_blocker_from_result
 
 
 def _criterion(cid: str, outcome: str, *, method_mandated: bool = False) -> CompletionCriterion:
@@ -267,8 +268,12 @@ async def test_evaluate_happy_path_returns_evaluated() -> None:
 
 def test_snapshot_has_evidence() -> None:
     assert RunEvidenceSnapshot().has_evidence() is False
+    assert RunEvidenceSnapshot(run_terminal_status="failed").has_evidence() is False
     assert RunEvidenceSnapshot(current_url="https://example.com").has_evidence() is True
     assert RunEvidenceSnapshot(block_outputs={"a": 1}).has_evidence() is True
+    assert RunEvidenceSnapshot(failed_block_labels=["extract"]).has_evidence() is True
+    assert RunEvidenceSnapshot(failure_classes=["SyntaxError"]).has_evidence() is True
+    assert RunEvidenceSnapshot(failure_reasons=["SyntaxError: bad generated code"]).has_evidence() is True
     assert RunEvidenceSnapshot(page_evidence={"visible_text_excerpt": "cart item PART-001-TEST"}).has_evidence() is True
 
 
@@ -299,6 +304,25 @@ def test_snapshot_renders_bounded_page_evidence() -> None:
     assert "PART-001-TEST" in rendered
     assert rendered.index("visual_evidence_summary") < rendered.index("visible_text_excerpt")
     assert "raw_html" not in rendered
+
+
+def test_snapshot_renders_failed_run_artifact_health_signal() -> None:
+    snapshot = RunEvidenceSnapshot(
+        workflow_run_id="wr_failed",
+        block_outputs={"extract_results": {"extracted_information": ["goal text"]}},
+        current_url="https://example.com/results",
+        run_terminal_status="failed",
+        failed_block_labels=["extract_results"],
+        failure_classes=["SyntaxError"],
+        failure_reasons=["Page.evaluate: SyntaxError: Unexpected token ')'"],
+    )
+
+    rendered = snapshot.render_prompt_block()
+
+    assert "run_terminal_status: failed" in rendered
+    assert "failed_block_labels: extract_results" in rendered
+    assert "failure_classes: SyntaxError" in rendered
+    assert "Page.evaluate: SyntaxError" in rendered
 
 
 def test_active_run_terminal_visual_fallback_uses_screenshot_when_missing() -> None:
@@ -460,7 +484,7 @@ def test_gate_withholds_on_evaluated_unconfirmed_even_with_clean_run_status() ->
 
 
 def test_completion_contract_not_violated() -> None:
-    ctx = SimpleNamespace(completion_verification_result=None)
+    ctx = SimpleNamespace(completion_verification_result=None, last_artifact_health_blocker_reason=None)
     assert _completion_contract_not_violated(ctx) is True  # type: ignore[arg-type]
     ctx.completion_verification_result = _evaluated(("c0", True))
     assert _completion_contract_not_violated(ctx) is True  # type: ignore[arg-type]
@@ -829,6 +853,118 @@ def _canceled_gate_ctx() -> CopilotContext:
     return ctx
 
 
+def _failed_generated_code_result() -> dict:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed_code",
+            "overall_status": "failed",
+            "executed_block_labels": ["extract_results"],
+            "current_url": "https://example.com/results",
+            "blocks": [
+                {
+                    "label": "extract_results",
+                    "block_type": "EXTRACTION",
+                    "status": "failed",
+                    "extracted_data": {"extracted_information": ["goal text from partial output"]},
+                    "failure_reason": "Page.evaluate: SyntaxError: Unexpected token ')'",
+                }
+            ],
+        },
+    }
+
+
+def test_artifact_health_type_error_is_not_masked_by_timeout_category() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed_code",
+            "overall_status": "failed",
+            "failure_categories": [
+                {
+                    "category": "PAGE_LOAD_TIMEOUT",
+                    "confidence_float": 0.8,
+                    "reasoning": "Timeout in failure reason",
+                }
+            ],
+            "blocks": [
+                {
+                    "label": "wait_for_results",
+                    "block_type": "ACTION",
+                    "status": "failed",
+                    "failure_reason": (
+                        "TypeError: Page.wait_for_function() got an unexpected keyword argument 'timeout_ms'"
+                    ),
+                }
+            ],
+        },
+    }
+
+    reason, failed_labels, failure_classes = _artifact_health_blocker_from_result(result)
+
+    assert reason is not None
+    assert "TypeError" in reason
+    assert failed_labels == ["wait_for_results"]
+    assert failure_classes == ["TypeError"]
+
+
+def test_artifact_health_not_masked_by_mixed_excluded_category() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed_code",
+            "overall_status": "failed",
+            "failure_categories": [
+                {"category": "AUTH_FAILURE", "confidence_float": 0.8},
+                {"category": "SCRIPT_ERROR", "confidence_float": 0.9},
+            ],
+            "blocks": [
+                {
+                    "label": "extract_results",
+                    "block_type": "EXTRACTION",
+                    "status": "failed",
+                    "failure_reason": "Page.evaluate: SyntaxError: Unexpected token ')'",
+                }
+            ],
+        },
+    }
+
+    reason, failed_labels, failure_classes = _artifact_health_blocker_from_result(result)
+
+    assert reason is not None
+    assert "SyntaxError" in reason
+    assert failed_labels == ["extract_results"]
+    assert failure_classes == ["SyntaxError"]
+
+
+def test_artifact_health_skips_when_all_categories_are_excluded() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_auth_failed",
+            "overall_status": "failed",
+            "failure_categories": [
+                {"category": "AUTH_FAILURE", "confidence_float": 0.8},
+                {"category": "CREDENTIAL_ERROR", "confidence_float": 0.7},
+            ],
+            "blocks": [
+                {
+                    "label": "extract_results",
+                    "block_type": "EXTRACTION",
+                    "status": "failed",
+                    "failure_reason": "Page.evaluate: SyntaxError: Unexpected token ')'",
+                }
+            ],
+        },
+    }
+
+    reason, failed_labels, failure_classes = _artifact_health_blocker_from_result(result)
+
+    assert reason is None
+    assert failed_labels == []
+    assert failure_classes == []
+
+
 def test_unfinished_run_verification_candidate_admits_canceled_with_evidence() -> None:
     ctx = _run_ctx()
     assert _is_unfinished_run_verification_candidate(ctx, _canceled_budget_result()) is True
@@ -836,6 +972,29 @@ def test_unfinished_run_verification_candidate_admits_canceled_with_evidence() -
     assert _is_unfinished_run_verification_candidate(ctx, _clean_success_result()) is False
     # ok=False with no reached runtime URL leaves nothing to judge.
     assert _is_unfinished_run_verification_candidate(ctx, {"ok": False, "data": {}}) is False
+
+
+def test_artifact_health_blocks_fully_satisfied_failed_run() -> None:
+    result = _failed_generated_code_result()
+    ctx = _run_ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+    ctx.last_workflow_yaml = "workflow: {}"
+
+    snapshot = _build_run_evidence_snapshot(ctx, result)
+    rendered = snapshot.render_prompt_block()
+    assert "run_terminal_status: failed" in rendered
+    assert "failure_classes: SyntaxError" in rendered
+    assert "failed_block_labels: extract_results" in rendered
+
+    _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("c0", True)))
+
+    assert ctx.last_artifact_health_blocker_reason is not None
+    assert "SyntaxError" in ctx.last_artifact_health_blocker_reason
+    assert ctx.last_artifact_health_blocker_labels == ["extract_results"]
+    assert ctx.last_artifact_health_failure_classes == ["SyntaxError"]
+    assert outcome_fully_verified(ctx) is False
+    assert verified_goal_satisfied_context(ctx) is False
+    assert _verified_workflow_or_none(ctx) == (None, None)
 
 
 @pytest.mark.asyncio
@@ -1573,7 +1732,10 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
 
 
 def test_completion_contract_not_violated_unavailable_blocks_surfacing() -> None:
-    ctx = SimpleNamespace(completion_verification_result=CompletionVerificationResult("unavailable"))
+    ctx = SimpleNamespace(
+        completion_verification_result=CompletionVerificationResult("unavailable"),
+        last_artifact_health_blocker_reason=None,
+    )
     # An unavailable verdict means the outcome could not be verified: do not surface
     # the workflow as verified on run status alone.
     assert _completion_contract_not_violated(ctx) is False  # type: ignore[arg-type]
