@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.api.files import get_download_dir
+from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.browser_factory import (
     _apply_download_behaviour,
@@ -277,3 +277,176 @@ async def test_block_adoption_seam_fail_open_on_rebind_error() -> None:
 
     assert result is browser_state
     mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run.assert_not_called()
+
+
+def test_resolve_run_download_id_prefers_run_id() -> None:
+    ctx = SkyvernContext(run_id="run_x", workflow_run_id="wr_y", task_id="t_z")
+    assert resolve_run_download_id(ctx, fallback_run_id="fb") == "run_x"
+
+
+def test_resolve_run_download_id_falls_back_through_workflow_then_task() -> None:
+    assert resolve_run_download_id(SkyvernContext(run_id=None, workflow_run_id="wr_y", task_id="t_z")) == "wr_y"
+    assert resolve_run_download_id(SkyvernContext(run_id=None, workflow_run_id=None, task_id="t_z")) == "t_z"
+
+
+def test_resolve_run_download_id_uses_fallback_when_context_empty() -> None:
+    assert resolve_run_download_id(None, fallback_run_id="fb") == "fb"
+    empty = SkyvernContext(run_id=None, workflow_run_id=None, task_id=None)
+    assert resolve_run_download_id(empty, fallback_run_id="fb") == "fb"
+
+
+@pytest.mark.asyncio
+async def test_block_adoption_prefers_context_run_id_over_workflow_run_id() -> None:
+    """SKY-11153 regression: when context.run_id differs from workflow_run_id (e.g. task_v2),
+    the adopted session's download dir must bind to context.run_id — the key FileUploadBlock
+    scans — not the raw workflow_run_id."""
+    from skyvern.forge.sdk.workflow.models.block import Block
+
+    browser, cdp_session = _recording_browser()
+    browser_state = MagicMock()
+    browser_state.browser_context.browser = browser
+    ctx = SkyvernContext(run_id="run_ctx", workflow_run_id="wr_block")
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=ctx),
+    ):
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
+        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
+
+        result = await Block.get_or_create_browser_state(
+            MagicMock(),
+            workflow_run_id="wr_block",
+            organization_id="org_1",
+            browser_session_id="bs_block",
+        )
+
+    assert result is browser_state
+    _, params = cdp_session.send.await_args.args
+    assert params["downloadPath"] == get_download_dir("run_ctx")
+    assert params["downloadPath"].endswith("/run_ctx")
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_fails_when_no_files_found(tmp_path) -> None:
+    """SKY-11153 regression: an empty download dir must fail the block, not silently report
+    success with zero files uploaded."""
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="ak",
+        aws_secret_access_key="sk",
+        path=None,
+        continue_on_empty=False,
+    )
+    empty_dir = tmp_path / "wr_empty"
+    empty_dir.mkdir()
+    sentinel = object()
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=MagicMock()),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            return_value=empty_dir,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+    ):
+        result = await block.execute(
+            workflow_run_id="wr_empty",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_continue_on_empty_succeeds(tmp_path) -> None:
+    """SKY-11153 / RISK-1: continue_on_empty=True preserves prior semantics — empty dir -> success."""
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="ak",
+        aws_secret_access_key="sk",
+        path=None,
+        continue_on_empty=True,
+    )
+    empty_dir = tmp_path / "wr_empty2"
+    empty_dir.mkdir()
+    sentinel = object()
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=MagicMock()),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock),
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            return_value=empty_dir,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock()
+        result = await block.execute(
+            workflow_run_id="wr_empty2",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is True
+    # The success is a true no-op, not an accidental upload (claude-review hardening).
+    mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_not_awaited()
+
+
+def test_resolve_run_download_id_preserves_task_id_tail() -> None:
+    """CORR-1: mirrors handler.py fallback_run_id=task.workflow_run_id or task.task_id — when both
+    context and workflow_run_id are absent, the task_id tail must still be resolved (not None)."""
+    empty = SkyvernContext(run_id=None, workflow_run_id=None, task_id=None)
+    # Equivalent to handler.py's `task.workflow_run_id or task.task_id` collapsing to the task_id tail.
+    assert resolve_run_download_id(empty, fallback_run_id="tsk_x") == "tsk_x"
+
+
+@pytest.mark.asyncio
+async def test_real_browser_manager_adoption_resolves_context_run_id() -> None:
+    """SKY-11153 / COMP-2: the RealBrowserManager adoption seam rebinds the adopted session's
+    download dir to context.run_id-first, matching the block seam and FileUploadBlock."""
+    from skyvern.webeye.real_browser_manager import RealBrowserManager
+
+    manager = RealBrowserManager.__new__(RealBrowserManager)
+    manager.pages = {}
+    workflow_run = MagicMock(
+        workflow_run_id="wr_x", parent_workflow_run_id=None, browser_profile_id=None, organization_id="org_1"
+    )
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.get_or_create_page = AsyncMock()
+    ctx = SkyvernContext(run_id="run_ctx", workflow_run_id="wr_x")
+
+    with (
+        patch.object(RealBrowserManager, "get_for_workflow_run", return_value=None),
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=ctx),
+    ):
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
+        result = await manager.get_or_create_for_workflow_run(workflow_run, browser_session_id="bs")
+
+    assert result is browser_state
+    mock_rebind.assert_awaited_once_with(browser_state.browser_context.browser, run_id="run_ctx")
