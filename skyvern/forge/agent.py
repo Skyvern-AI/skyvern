@@ -79,6 +79,7 @@ from skyvern.forge.sdk.api.files import (
     list_downloading_files_in_directory,
     list_files_in_directory,
     rename_file,
+    resolve_run_download_id,
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
@@ -402,7 +403,7 @@ class ForgeAgent:
 
         context = skyvern_context.current()
         workflow_download_directory = get_path_for_workflow_download_directory(
-            context.run_id if context and context.run_id else task.workflow_run_id
+            resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
         )
         list_files_after = list_files_in_directory(workflow_download_directory)
         if task.browser_session_id:
@@ -773,7 +774,7 @@ class ForgeAgent:
             if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(
-                        context.run_id if context and context.run_id else task.workflow_run_id
+                        resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
                     )
                 )
             if task.browser_session_id and download_baseline_files is None:
@@ -870,7 +871,7 @@ class ForgeAgent:
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
                 workflow_download_directory = get_path_for_workflow_download_directory(
-                    context.run_id if context and context.run_id else task.workflow_run_id
+                    resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
                 )
 
                 downloading_files = list_downloading_files_in_directory(workflow_download_directory)
@@ -4389,7 +4390,7 @@ class ForgeAgent:
                             )
                         context = skyvern_context.current()
                         finalization_run_id = (
-                            context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+                            resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                         )
                         await app.STORAGE.save_downloaded_files(
                             organization_id=task.organization_id,
@@ -4640,7 +4641,7 @@ class ForgeAgent:
                     context = skyvern_context.current()
                     downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=task.organization_id,
-                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
+                        run_id=resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(

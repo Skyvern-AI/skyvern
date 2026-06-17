@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, unquote, urlparse
 
 import aiohttp
@@ -19,6 +20,9 @@ from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFF
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
 from skyvern.forge import app
 from skyvern.utils.url_validators import encode_url
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 
 LOG = structlog.get_logger()
 
@@ -320,6 +324,19 @@ def get_download_dir(run_id: str | None) -> str:
     download_dir = os.path.join(settings.DOWNLOAD_PATH, str(run_id))
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
+
+
+def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: str | None = None) -> str | None:
+    # Canonical key for a run's download dir: the producer (rebind) and consumers (FileUploadBlock,
+    # download listener) must resolve the same key, or downloaded files are silently lost.
+    if context:
+        if context.run_id:
+            return context.run_id
+        if context.workflow_run_id:
+            return context.workflow_run_id
+        if context.task_id:
+            return context.task_id
+    return fallback_run_id
 
 
 def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:

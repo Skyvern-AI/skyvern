@@ -7,6 +7,8 @@ from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import resolve_run_download_id
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -215,7 +217,10 @@ class RealBrowserManager(BrowserManager):
                 adopted_browser = browser_context.browser if browser_context else None
                 if adopted_browser is not None:
                     try:
-                        await rebind_download_dir(adopted_browser, run_id=workflow_run.workflow_run_id)
+                        rebind_run_id = resolve_run_download_id(
+                            skyvern_context.current(), fallback_run_id=workflow_run.workflow_run_id
+                        )
+                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
                     except Exception:
                         LOG.warning(
                             "Failed to rebind download dir on adopted browser session",
