@@ -101,10 +101,38 @@ async def _get_block_schema_pre_hook(
     }
 
 
+_BLOCK_JSON_ALIASES = ("block", "block_definition", "definition", "block_yaml")
+
+
+def _normalize_block_json_alias(params: dict[str, Any]) -> None:
+    """Promote a misnamed block payload (e.g. ``block``) to ``block_json`` in place.
+
+    The model sometimes passes the block under a shorter key than the schema's
+    ``block_json``; without this, FastMCP rejects the whole call at signature
+    validation before the tool runs. Stray alias keys are always dropped so they
+    cannot trip the "unexpected keyword argument" check.
+    """
+    has_block_json = isinstance(params.get("block_json"), str) and bool(params["block_json"].strip())
+    promoted: str | None = None
+    for alias in _BLOCK_JSON_ALIASES:
+        if alias not in params:
+            continue
+        value = params.pop(alias)
+        if has_block_json or promoted is not None:
+            continue
+        if isinstance(value, str):
+            promoted = value
+        elif isinstance(value, (dict, list)):
+            promoted = json.dumps(value)
+    if promoted is not None:
+        params["block_json"] = promoted
+
+
 async def _validate_block_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    _normalize_block_json_alias(params)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     block_json = params.get("block_json")

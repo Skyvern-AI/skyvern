@@ -3,6 +3,7 @@ types at the discovery surface (SKY-9174, Part C)."""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -238,6 +239,72 @@ async def test_code_only_validate_block_pre_hook_leaves_shape_errors_to_validato
     result = await _validate_block_pre_hook({"block_json": block_json}, code_only_ctx)
 
     assert result is None
+
+
+_NAV_BLOCK = '{"block_type": "navigation", "label": "x", "url": "https://e.com", "navigation_goal": "g"}'
+
+
+@pytest.mark.parametrize("alias", ["block", "block_definition", "definition", "block_yaml"])
+@pytest.mark.asyncio
+async def test_validate_block_pre_hook_normalizes_misnamed_arg_to_block_json(alias: str, ctx: MagicMock) -> None:
+    """SKY-11133: the model calls validate_block with the block under a shorter
+    key (e.g. `block`). The pre-hook must promote it to `block_json` so the call
+    no longer dies at FastMCP signature validation."""
+    params = {alias: _NAV_BLOCK}
+
+    result = await _validate_block_pre_hook(params, ctx)
+
+    assert result is None
+    assert params["block_json"] == _NAV_BLOCK
+    assert alias not in params
+
+
+@pytest.mark.asyncio
+async def test_validate_block_pre_hook_serializes_dict_alias_value(ctx: MagicMock) -> None:
+    block = {"block_type": "navigation", "label": "x", "url": "https://e.com", "navigation_goal": "g"}
+    params: dict = {"block": block}
+
+    result = await _validate_block_pre_hook(params, ctx)
+
+    assert result is None
+    assert json.loads(params["block_json"]) == block
+    assert "block" not in params
+
+
+@pytest.mark.asyncio
+async def test_validate_block_pre_hook_strips_stray_alias_without_clobbering_block_json(ctx: MagicMock) -> None:
+    params = {"block_json": _NAV_BLOCK, "block": '{"block_type": "extraction", "label": "y"}'}
+
+    result = await _validate_block_pre_hook(params, ctx)
+
+    assert result is None
+    assert params["block_json"] == _NAV_BLOCK
+    assert "block" not in params
+
+
+@pytest.mark.asyncio
+async def test_validate_block_pre_hook_normalizes_alias_before_code_only_gate(code_only_ctx: MagicMock) -> None:
+    """Normalization must run before the code-only policy gate so a `code` block
+    passed under the wrong key is still rejected (not crashed)."""
+    params = {"block": '{"block_type": "code", "label": "x", "code": "pass"}'}
+
+    result = await _validate_block_pre_hook(params, code_only_ctx)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert "validate real code blocks through update_and_run_blocks" in result["error"]
+    assert params["block_json"]
+    assert "block" not in params
+
+
+@pytest.mark.asyncio
+async def test_validate_block_pre_hook_alias_allows_helper_under_code_only(code_only_ctx: MagicMock) -> None:
+    params = {"block": '{"block_type": "conditional", "label": "x"}'}
+
+    result = await _validate_block_pre_hook(params, code_only_ctx)
+
+    assert result is None
+    assert params["block_json"] == '{"block_type": "conditional", "label": "x"}'
 
 
 def test_pre_hook_and_post_emission_reject_share_constant() -> None:
