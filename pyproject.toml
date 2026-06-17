@@ -34,7 +34,7 @@ local = [
     "python-multipart>=0.0.27,<1",
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
-    "litellm==1.83.14",
+    "litellm>=1.84.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
@@ -103,7 +103,7 @@ server = [
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.44.0",
-    "litellm==1.83.14",
+    "litellm>=1.84.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
@@ -264,7 +264,7 @@ override-dependencies = [
     "openai>=2.24.0",
     # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
     "httpx[socks]>=0.26.0",
-    # litellm==1.83.14 exact-pins aiohttp==3.13.4; relax so the security-patched
+    # litellm exact-pins aiohttp; relax so the security-patched
     # 3.14.x resolves for cloud/source installs (plain pip keeps litellm's pin).
     "aiohttp>=3.14.0",
 ]

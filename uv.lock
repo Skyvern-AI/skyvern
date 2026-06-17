@@ -2757,7 +2757,7 @@ wheels = [
 
 [[package]]
 name = "litellm"
-version = "1.83.14"
+version = "1.89.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2773,9 +2773,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8d/7c/c095649380adc96c8630273c1768c2ad1e74aa2ee1dd8dd05d218a60569f/litellm-1.83.14.tar.gz", hash = "sha256:24aef9b47cdc424c833e32f3727f411741c690832cd1fe4405e0077144fe09c9", size = 14836599, upload-time = "2026-04-26T03:16:10.176Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/1b/de398e6cef46d4cbc4395c895330f30eab05439bf6d0c5c53b0203661eeb/litellm-1.89.1.tar.gz", hash = "sha256:eb9292f90afe46dcce4bfef6bbeaa54494945813763e1c0917f4e9a1c584c1a4", size = 14071586, upload-time = "2026-06-16T03:12:52.997Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/5c/1b5691575420135e90578543b2bf219497caa33cfd0af64cb38f30288450/litellm-1.83.14-py3-none-any.whl", hash = "sha256:92b11ba2a32cf80707ddf388d18526696c7999a21b418c5e3b6eda1243d2cfdb", size = 16457054, upload-time = "2026-04-26T03:16:05.72Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/24/81f03088876a13b628fdbaf746ee746e1dff127d63f339ef72f1a3801c91/litellm-1.89.1-py3-none-any.whl", hash = "sha256:a52a67625d89cb1787ef48c4b3c1ab9c2574ea304f56900bc631844297a13bd4", size = 15484855, upload-time = "2026-06-16T03:12:49.457Z" },
 ]
 
 [[package]]
@@ -6026,8 +6026,8 @@ requires-dist = [
     { name = "lark", marker = "extra == 'server'", specifier = ">=1.2.2,<2" },
     { name = "libcst", marker = "extra == 'local'", specifier = ">=1.8.2,<2" },
     { name = "libcst", marker = "extra == 'server'", specifier = ">=1.8.2,<2" },
-    { name = "litellm", marker = "extra == 'local'", specifier = "==1.83.14" },
-    { name = "litellm", marker = "extra == 'server'", specifier = "==1.83.14" },
+    { name = "litellm", marker = "extra == 'local'", specifier = ">=1.84.0" },
+    { name = "litellm", marker = "extra == 'server'", specifier = ">=1.84.0" },
     { name = "onepassword-sdk", marker = "extra == 'local'", specifier = "==0.4.0" },
     { name = "onepassword-sdk", marker = "extra == 'server'", specifier = "==0.4.0" },
     { name = "openai", marker = "extra == 'local'", specifier = ">=1.68.2" },
