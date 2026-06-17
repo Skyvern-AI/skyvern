@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import aiofiles
+import pdfplumber
 import structlog
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -67,6 +68,9 @@ class PdfFieldInventory:
     field_type: str
     current_value: Any
     allowed_values: list[str]
+    # Printed label nearest the field's widget on the page; AcroForm field names like "f1_03[0]"
+    # are opaque, so this is what lets the LLM map a value to the right field.
+    context_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -231,8 +235,11 @@ class PdfFillBlock(Block):
             return "checkbox"
         return "text"
 
-    def _extract_field_inventory(self, reader: PdfReader) -> dict[str, PdfFieldInventory]:
+    def _extract_field_inventory(self, reader: PdfReader, pdf_path: str | None = None) -> dict[str, PdfFieldInventory]:
         fields = reader.get_fields() or {}
+        if not fields:
+            return {}
+        labels = self._extract_field_labels(pdf_path) if pdf_path else {}
         inventory: dict[str, PdfFieldInventory] = {}
         for name, field in fields.items():
             inventory[name] = PdfFieldInventory(
@@ -240,8 +247,91 @@ class PdfFillBlock(Block):
                 field_type=self._field_type(field),
                 current_value=field.get("/V"),
                 allowed_values=self._field_allowed_values(field),
+                context_label=labels.get(name.split(".")[-1], ""),
             )
         return inventory
+
+    @staticmethod
+    def _extract_field_labels(pdf_path: str) -> dict[str, str]:
+        """Best-effort map of leaf field name (e.g. 'f1_03[0]') -> nearest printed label on the page.
+
+        AcroForm field names carry no meaning, so the LLM mapping mislocates values without this
+        spatial context. Failures here are non-fatal: the fill falls back to name-only mapping.
+        """
+        try:
+            reader = PdfReader(pdf_path)
+            leaf_rects: dict[str, tuple[int, float, float, float, float, bool]] = {}
+            for page_index, page in enumerate(reader.pages):
+                page_height = float(page.mediabox.height)
+                for annotation in page.get("/Annots") or []:
+                    widget = annotation.get_object()
+                    if widget.get("/Subtype") != "/Widget" or not widget.get("/Rect"):
+                        continue
+                    leaf = widget.get("/T")
+                    field_type = widget.get("/FT")
+                    if widget.get("/Parent"):
+                        parent = widget["/Parent"].get_object()
+                        leaf = leaf or parent.get("/T")
+                        field_type = field_type or parent.get("/FT")
+                    if not leaf or str(leaf) in leaf_rects:
+                        continue
+                    x0, y0, x1, y1 = (float(v) for v in widget["/Rect"])
+                    is_button = str(field_type) == "/Btn"
+                    leaf_rects[str(leaf)] = (page_index, x0, page_height - y1, x1, page_height - y0, is_button)
+
+            if not leaf_rects:
+                return {}
+
+            with pdfplumber.open(pdf_path) as pdf:
+                words_by_page = {
+                    pi: [w for w in pg.extract_words(extra_attrs=["upright"]) if w.get("upright", True)]
+                    for pi, pg in enumerate(pdf.pages)
+                }
+
+            labels: dict[str, str] = {}
+            for leaf, (page_index, fx0, ftop, fx1, fbot, is_button) in leaf_rects.items():
+                labels[leaf] = PdfFillBlock._nearest_label(
+                    words_by_page.get(page_index, []), fx0, ftop, fx1, fbot, is_button
+                )
+            return labels
+        except Exception:
+            LOG.warning("PdfFillBlock failed to derive field labels; falling back to name-only mapping", exc_info=True)
+            return {}
+
+    @staticmethod
+    def _nearest_label(
+        words: list[dict[str, Any]], fx0: float, ftop: float, fx1: float, fbot: float, is_button: bool = False
+    ) -> str:
+        field_height = fbot - ftop
+        per_side: dict[str, list[tuple[float, dict[str, Any]]]] = {"above": [], "left": [], "right": []}
+        for w in words:
+            wx0, wtop, wx1, wbot = w["x0"], w["top"], w["x1"], w["bottom"]
+            vertical_overlap = min(wbot, fbot) - max(wtop, ftop) > 0
+            horizontal_overlap = min(wx1, fx1) - max(wx0, fx0) > -120
+            if vertical_overlap and wx1 <= fx0 + 2:
+                per_side["left"].append((fx0 - wx1, w))
+            if vertical_overlap and wx0 >= fx1 - 2:
+                per_side["right"].append((wx0 - fx1, w))
+            if wbot <= ftop + 2 and horizontal_overlap:
+                per_side["above"].append((ftop - wbot, w))
+
+        # Checkbox/radio labels sit to the right of the box (the option text); text-field labels
+        # sit above or to the left of the entry box.
+        side_order = ("right", "above", "left") if is_button else ("above", "left", "right")
+        for side in side_order:
+            candidates = sorted(per_side[side], key=lambda c: c[0])
+            # distances in PDF user-space points (~1/72"), calibrated on IRS AcroForms
+            threshold = 220.0 if side in ("left", "right") else 26.0
+            near = [c for c in candidates if c[0] <= threshold]
+            if not near:
+                continue
+            anchor = near[0][1]
+            anchor_cy = (anchor["top"] + anchor["bottom"]) / 2
+            band = [c[1] for c in near if abs((c[1]["top"] + c[1]["bottom"]) / 2 - anchor_cy) < field_height * 1.5 + 4]
+            text = " ".join(w["text"] for w in sorted(band, key=lambda w: w["x0"])).strip()
+            if text:
+                return text[:70]
+        return ""
 
     async def _map_fields_with_llm(
         self,
@@ -771,7 +861,7 @@ class PdfFillBlock(Block):
             try:
                 validate_pdf_file(source_pdf_path, file_identifier=self.file_url)
                 reader = PdfReader(source_pdf_path)
-                inventory = self._extract_field_inventory(reader)
+                inventory = self._extract_field_inventory(reader, source_pdf_path)
             except PDFParsingError as e:
                 return await self._record_failure(
                     workflow_run_context,
