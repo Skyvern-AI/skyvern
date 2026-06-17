@@ -691,6 +691,19 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     assert "The workflow was not modified" in assistant_contents[0]
     assert "reference cpe_" in assistant_contents[0]
 
+    assistant_messages = [
+        call.kwargs
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    ]
+    assert len(assistant_messages) == 1
+    turn_outcome = assistant_messages[0]["turn_outcome"]
+    assert turn_outcome is not None
+    assert turn_outcome.response_kind == "recover"
+    assert turn_outcome.terminal_reason == workflow_copilot_route.COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    assert turn_outcome.copilot_effective_mode == "build"
+    assert turn_outcome.copilot_turn_id is not None
+
     frames = [call.args[0] for call in stream.send.await_args_list if call.args]
     response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
     assert response_frames
