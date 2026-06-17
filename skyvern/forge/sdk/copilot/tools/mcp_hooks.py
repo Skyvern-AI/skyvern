@@ -31,6 +31,7 @@ from .banned_blocks import (
     _copilot_banned_block_types,
     _copilot_block_authoring_policy,
     _copilot_block_policy,
+    _record_code_native_pending_capability,
     _render_block_policy_detail,
 )
 from .completion import _maybe_run_completion_verification_from_page_observation
@@ -90,6 +91,7 @@ async def _get_block_schema_pre_hook(
     if policy_entry is None:
         return None
     normalized, policy = policy_entry
+    _record_code_native_pending_capability(ctx, policy)
     return {
         "ok": False,
         "error": (
@@ -131,6 +133,7 @@ async def _validate_block_pre_hook(
     if policy_entry is None:
         return None
     normalized, policy = policy_entry
+    _record_code_native_pending_capability(ctx, policy)
     return {
         "ok": False,
         "error": (
