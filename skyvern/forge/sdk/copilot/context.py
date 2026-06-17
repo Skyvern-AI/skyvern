@@ -403,6 +403,9 @@ class CopilotContext(AgentContext):
     last_update_block_count: int | None = None
     last_test_ok: bool | None = None
     last_test_failure_reason: str | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
+    last_artifact_health_failure_classes: list[str] = field(default_factory=list)
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     code_only_code_schema_seen: bool = False
