@@ -7,7 +7,6 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
     derive_code_block_steps,
     derive_code_block_steps_in_yaml,
     fill_code_block_prompts_in_yaml,
-    refine_step_descriptions,
 )
 from skyvern.webeye.actions.action_types import ActionType
 
@@ -278,21 +277,6 @@ async def test_apply_derived_steps_on_copilot_yaml_shape():
     assert steps[1]["action_type"] == "input_text"
 
 
-@pytest.mark.asyncio
-async def test_refine_overrides_descriptions_by_line_start():
-    steps = [
-        {"description": "Open https://x.com/", "action_type": "goto_url", "line_start": 2, "line_end": 2},
-        {"description": 'Click "Go"', "action_type": "click", "line_start": 3, "line_end": 3},
-    ]
-
-    async def handler(prompt: str, prompt_name: str):
-        return '[{"line_start": 2, "description": "Open the homepage"}, {"line_start": 3, "description": "Start the search"}]'
-
-    out = await refine_step_descriptions("code", None, steps, handler=handler)
-    assert [s["description"] for s in out] == ["Open the homepage", "Start the search"]
-    assert [s["action_type"] for s in out] == ["goto_url", "click"]  # labels & lines unchanged
-
-
 def test_multiline_call_span_covers_all_lines():
     code = "async def run(page):\n    await page.get_by_label('Email').fill(\n        str(email)\n    )\n"
     spans = analyze_code_actions(code)
@@ -304,16 +288,3 @@ def test_get_by_role_without_name_falls_back_to_the_element():
     code = "async def run(page):\n    await page.get_by_role('button').click()\n"
     steps = derive_code_block_steps(code)
     assert steps[0]["description"] == "Click the element"
-
-
-@pytest.mark.asyncio
-async def test_refine_falls_back_to_input_on_handler_failure():
-    steps = [{"description": "Open https://x.com/", "action_type": "goto_url", "line_start": 2, "line_end": 2}]
-
-    async def handler(prompt: str, prompt_name: str):
-        raise RuntimeError("llm down")
-
-    out = await refine_step_descriptions("code", None, steps, handler=handler)
-    assert out == steps  # unchanged on failure
-
-    assert await refine_step_descriptions("code", None, steps, handler=None) == steps  # no handler -> unchanged

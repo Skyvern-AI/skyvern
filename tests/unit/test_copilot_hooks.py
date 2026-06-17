@@ -1550,12 +1550,9 @@ class TestClickPostHookReachedDownloadTarget:
     async def test_click_on_download_affordance_populates_reached_download_target(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from skyvern.config import settings
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
         self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
-        monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
 
         ctx = self._ctx()
         result = {"ok": True, "data": {"selector": 'a[href="/x/statement.pdf"]'}}
@@ -1566,12 +1563,9 @@ class TestClickPostHookReachedDownloadTarget:
 
     @pytest.mark.asyncio
     async def test_click_post_hook_is_noop_in_standard_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.config import settings
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
         self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
-        monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
 
         ctx = self._ctx(BlockAuthoringPolicy.STANDARD)
         result = {"ok": True, "data": {"selector": 'a[href="/x/statement.pdf"]'}}
@@ -1581,7 +1575,6 @@ class TestClickPostHookReachedDownloadTarget:
 
     @pytest.mark.asyncio
     async def test_click_on_two_affordances_leaves_target_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.config import settings
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
         two = {
@@ -1591,8 +1584,6 @@ class TestClickPostHookReachedDownloadTarget:
             ]
         }
         self._patch_scouting(monkeypatch, page_evidence=two)
-        monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
 
         ctx = self._ctx()
         result = {"ok": True, "data": {"selector": 'a[href="/x/a.pdf"]'}}

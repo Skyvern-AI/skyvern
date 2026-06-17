@@ -4,7 +4,6 @@ import json
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import scouting
 
@@ -441,7 +440,6 @@ def test_auto_act_candidate_rejects_javascript_href() -> None:
 
 @pytest.mark.asyncio
 async def test_multiple_candidates_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -461,7 +459,6 @@ async def test_multiple_candidates_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_high_tier_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -481,7 +478,6 @@ async def test_high_tier_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_bare_button_submit_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/checkout"
@@ -501,7 +497,6 @@ async def test_bare_button_submit_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_empty_text_link_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -521,7 +516,6 @@ async def test_empty_text_link_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -549,7 +543,6 @@ async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -578,7 +571,6 @@ async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypa
 
 @pytest.mark.asyncio
 async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -625,7 +617,6 @@ async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatc
 
 @pytest.mark.asyncio
 async def test_auto_act_re_arms_on_changed_signature(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -666,7 +657,6 @@ async def test_auto_act_re_arms_on_changed_signature(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_auto_act_idempotent_on_unchanged_signature(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -682,28 +672,7 @@ async def test_auto_act_idempotent_on_unchanged_signature(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_act_flag_off_pure_advisory(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", False)
-    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
-    ctx = _auto_act_ctx(server)
-    url = "https://apexbiz.example.com/bill"
-
-    async def fake(c, *, url):
-        return _single_link_packet()
-
-    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
-    first = {"ok": True, "data": {"url": url}}
-    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
-    second = {"ok": True, "data": {"url": url}}
-    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
-    assert server.calls == []
-    assert "auto_acted" not in second["data"]
-    assert second["data"].get("next_action") == "click"
-
-
-@pytest.mark.asyncio
 async def test_auto_act_click_failure_degrades_to_advisory(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": False, "error": "element not found"})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
@@ -726,7 +695,6 @@ async def test_auto_act_click_failure_degrades_to_advisory(monkeypatch) -> None:
 async def test_auto_act_front_runs_the_third_evaluate(monkeypatch) -> None:
     from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
 
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
     url = "https://apexbiz.example.com/bill"
