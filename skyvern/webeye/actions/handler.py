@@ -158,6 +158,66 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
+async def _save_adopted_session_download(
+    download: Download,
+    page: Page,
+    download_dir: Path,
+    workflow_run_id: str | None = None,
+) -> Path | None:
+    """Land an adopted-session download's bytes into download_dir, returning the file path or None.
+
+    Eager save_as is the only protection against the worker pod tearing the shared browser down before a
+    deferred save_as runs.
+    """
+    download_target = _download_target_path(download_dir, download.suggested_filename)
+    try:
+        await download.save_as(download_target)
+        if download_target.exists() and download_target.stat().st_size > 0:
+            return download_target
+        download_target.unlink(missing_ok=True)
+        LOG.warning(
+            "Adopted-session eager save_as produced an empty file; re-fetching download url",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+        )
+    except Exception:
+        download_target.unlink(missing_ok=True)
+        LOG.warning(
+            "Adopted-session eager save_as failed; re-fetching download url",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+
+    try:
+        response = await page.context.request.get(download.url)
+        if response.status != 200:
+            LOG.error(
+                "Adopted-session download url re-fetch returned non-200 status",
+                status=response.status,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        # APIResponse.body() has no streaming variant, so a large download peaks at 2x its size in RSS.
+        body = await response.body()
+        if not body:
+            LOG.error(
+                "Adopted-session download url re-fetch returned an empty body",
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        download_target.write_bytes(body)
+        return download_target
+    except Exception:
+        LOG.error(
+            "Adopted-session download url re-fetch failed",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+
+
 def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
     off = getattr(page, "off", None)
     if callable(off):
@@ -831,6 +891,36 @@ class ActionHandler:
                                     download_signal_poll_iterations=download_signal_poll_iterations,
                                 )
 
+                            if (
+                                task.browser_session_id
+                                and captured_download is not None
+                                and not download_event_fallback_attempted
+                            ):
+                                download_event_fallback_attempted = True
+                                saved_path = await _save_adopted_session_download(
+                                    captured_download,
+                                    page,
+                                    download_dir,
+                                    workflow_run_id=task.workflow_run_id,
+                                )
+                                if saved_path is not None:
+                                    download_event_fallback_used = True
+                                    download_triggered = True
+                                    LOG.info(
+                                        "Saved adopted-session download to active run directory",
+                                        download_dir=download_dir,
+                                        download_target=str(saved_path),
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                    break
+                                download_event_fallback_failed = True
+                                LOG.warning(
+                                    "Adopted-session download could not be saved or re-fetched",
+                                    download_dir=download_dir,
+                                    workflow_run_id=task.workflow_run_id,
+                                )
+                                break
+
                             list_files_after = await _list_observed_download_files()
 
                             if len(list_files_after) > len(list_files_before):
@@ -847,7 +937,8 @@ class ActionHandler:
                                 break
 
                             if (
-                                captured_download is not None
+                                not task.browser_session_id
+                                and captured_download is not None
                                 and download_event_captured_at is not None
                                 and not download_event_fallback_attempted
                                 and time.monotonic() - download_event_captured_at >= _download_event_grace_seconds

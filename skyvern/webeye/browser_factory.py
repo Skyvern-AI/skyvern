@@ -198,6 +198,14 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
         asyncio.ensure_future(_on_page(page))
 
 
+def _redact_url_query(url: str) -> str:
+    # Download URLs are often S3 presigned, carrying an X-Amz signature in the query — drop it before logging.
+    try:
+        return urlparse(url)._replace(query="").geturl()
+    except Exception:
+        return "<redacted>"
+
+
 def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
@@ -208,6 +216,16 @@ def set_download_file_listener(
         try:
             async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
+                if not file_path.exists():
+                    # On an adopted persistent session the bytes live on the run connection, not
+                    # this worker connection; saving is the run side's job, so skip rather than crash.
+                    LOG.warning(
+                        "Download artifact absent on this connection; skipping worker-side rename",
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        suggested_filename=download.suggested_filename,
+                    )
+                    return
                 if file_path.suffix:
                     return
 
@@ -216,7 +234,7 @@ def set_download_file_listener(
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                     suggested_filename=download.suggested_filename,
-                    url=download.url,
+                    url=_redact_url_query(download.url),
                 )
                 suffix = Path(download.suggested_filename).suffix
                 if suffix:
