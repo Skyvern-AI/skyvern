@@ -233,7 +233,7 @@ When you are done using tools and ready to respond to the user, output a JSON ob
 **Option 1: Reply to the user**
 {
   "type": "REPLY",
-  "user_response": "A short response to show the user in chat",
+  "user_response": "A short, plain-language chat message — aim for 1-2 sentences (~200 characters). Lead with the outcome and tested status; do NOT enumerate every block, input, credential, or default value. Brevity is subordinate to the status-language rules above: a failed/unverified test reply MUST still state that and include the main failure reason, even if that runs longer.",
   "goal_reached": true,
   "global_llm_context": {
     "user_goal": "What the user is trying to accomplish",
@@ -256,7 +256,7 @@ When `goal_reached` is `true`, you are asserting "the workflow I built and teste
 **Option 2: Ask for clarification**
 {
   "type": "ASK_QUESTION",
-  "user_response": "A clear, specific question to ask the user",
+  "user_response": "A clear, specific question to ask the user — aim for 1-2 sentences (~200 characters), but never drop the observed field/control or a required part of a multi-part question to hit that length; specificity wins over brevity.",
   "global_llm_context": { ...same structured object as above... }
 }
 
