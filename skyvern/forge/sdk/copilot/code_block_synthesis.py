@@ -104,6 +104,10 @@ _POSITIONAL_RE = re.compile(
     r":nth-of-type\(|:nth-child\(|:nth-last-of-type\(|:nth-last-child\(|>>\s*nth=|:first-child|:last-child"
 )
 
+# A lone tag/role token (`button`, `a`) matches every such element, so a bare emission is not
+# unique under Playwright strict mode.
+_BARE_TAG_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]*$")
+
 
 @dataclass
 class SynthesisDiagnostics:
@@ -208,6 +212,12 @@ def _is_positional_selector(selector: str) -> bool:
     return bool(_POSITIONAL_RE.search(selector))
 
 
+def _is_bare_ambiguous_selector(selector: str) -> bool:
+    """True when the captured selector is a lone tag/role token or the universal `*` with no qualifier."""
+    stripped = selector.strip()
+    return stripped == "*" or bool(_BARE_TAG_RE.match(stripped))
+
+
 def _slug(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
     if cleaned and cleaned[0].isdigit():
@@ -225,7 +235,8 @@ def _safe_param_base(value: str) -> str:
 def _get_by_role_expr(role: str, name: str) -> str:
     if name:
         return f"page.get_by_role({_py_str(role)}, name={_py_str(name)})"
-    return f"page.get_by_role({_py_str(role)})"
+    # A nameless role matches every element of that role; `.first` pins the scout's document-order pick.
+    return f"page.get_by_role({_py_str(role)}).first"
 
 
 def _locator_expr(
@@ -260,6 +271,20 @@ def _locator_expr(
                     }
                 )
             return ""
+        parsed_strict = _parse_role_name(selector)
+        ambiguous_role = parsed_strict is not None and not parsed_strict[1]
+        if ambiguous_role or _is_bare_ambiguous_selector(selector):
+            notes.append(f"dropped an interaction with an ambiguous bare selector {selector!r}")
+            if diagnostics is not None:
+                diagnostics.dropped_interactions.append(
+                    {
+                        "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                        "tool_name": tool_name,
+                        "selector": selector,
+                        "reason_code": "ambiguous_bare_selector",
+                    }
+                )
+            return ""
         if diagnostics is not None:
             diagnostics.locator_provenance.append(
                 {
@@ -290,6 +315,21 @@ def _locator_expr(
             return _get_by_role_expr(role, name)
         if _is_positional_selector(selector):
             notes.append(f"low-confidence locator: positional selector {selector!r} with no role/name to anchor on")
+            return f"page.locator({_py_str(selector)})"
+        if _is_bare_ambiguous_selector(selector):
+            if role and name:
+                return _get_by_role_expr(role, name)
+            notes.append(f"disambiguated a bare {selector!r} selector to .first from scout document order")
+            if diagnostics is not None:
+                diagnostics.locator_provenance.append(
+                    {
+                        "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                        "selector": selector,
+                        "emitted_literal": selector,
+                        "source": "first_fallback",
+                    }
+                )
+            return f"page.locator({_py_str(selector)}).first"
         return f"page.locator({_py_str(selector)})"
 
     if role and name:
