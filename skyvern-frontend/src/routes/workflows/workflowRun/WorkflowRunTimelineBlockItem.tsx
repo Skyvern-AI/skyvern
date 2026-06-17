@@ -10,7 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   type ActionsApiResponse,
   ActionTypes,
-  ReadableActionTypes,
+  getReadableActionType,
   Status,
 } from "@/api/types";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
@@ -171,7 +171,9 @@ function getCodeActionRowPresentation(
   const isCodeError =
     action.status === Status.Failed &&
     action.action_type === ActionTypes.NullAction;
-  const label = isCodeError ? "Error" : ReadableActionTypes[action.action_type];
+  const label = isCodeError
+    ? "Error"
+    : getReadableActionType(action.action_type);
   const { codeLine, durationMs } = getRecordedActionMeta(action);
   const parts = [
     getActionSummary(action) ?? normalizeInlineText(action.description),
@@ -459,7 +461,7 @@ function TimelineActionRows({
         const { label, summary } = isCodeBlock
           ? getCodeActionRowPresentation(action)
           : {
-              label: ReadableActionTypes[action.action_type],
+              label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
             };
 
