@@ -41,6 +41,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import {
   BULK_CONCURRENCY_LIMIT,
@@ -181,7 +183,12 @@ function WorkflowsFlat() {
     () => parseTagFilter(tagFilterParam),
     [tagFilterParam],
   );
-  const serializedTagFilter = serializeTagFilter(tagFilters);
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  // While tagging is hidden, ignore stale `?tags=` so the backend list isn't tag-filtered.
+  const serializedTagFilter = taggingEnabled
+    ? serializeTagFilter(tagFilters)
+    : "";
 
   const setTagFilters = useCallback(
     (terms: TagFilterTerm[]) => {
@@ -394,7 +401,7 @@ function WorkflowsFlat() {
   // Tag-key registry: supplies chip-hover descriptions and the filter's key list.
   // Keyed with a Map so tag keys like "constructor"/"toString" can't resolve to
   // inherited Object prototype members when looked up.
-  const { data: tagKeys = [] } = useTagKeysQuery();
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
   const tagDescriptions = useMemo(
     () =>
       new Map(
@@ -411,7 +418,12 @@ function WorkflowsFlat() {
     () => workflows.map((workflow) => workflow.workflow_permanent_id),
     [workflows],
   );
-  const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(workflowIds);
+  const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
+    workflowIds,
+    {
+      enabled: taggingEnabled,
+    },
+  );
 
   // Tags observed on the page for editor/filter suggestions: grouped values per
   // key plus standalone labels. Maps avoid prototype-key collisions.
@@ -764,13 +776,15 @@ function WorkflowsFlat() {
               placeholder="Search by title or input..."
               className="w-48 lg:w-72"
             />
-            <WorkflowTagFilter
-              tagKeys={tagKeys}
-              value={tagFilters}
-              onChange={setTagFilters}
-              labelSuggestions={labelSuggestions}
-              valueSuggestionsByKey={valueSuggestionsByKey}
-            />
+            {taggingEnabled ? (
+              <WorkflowTagFilter
+                tagKeys={tagKeys}
+                value={tagFilters}
+                onChange={setTagFilters}
+                labelSuggestions={labelSuggestions}
+                valueSuggestionsByKey={valueSuggestionsByKey}
+              />
+            ) : null}
           </div>
           <div className="flex items-center gap-4">
             <Link
@@ -1014,7 +1028,9 @@ function WorkflowsFlat() {
                                   </TooltipProvider>
                                 )}
                               </div>
-                              {workflowTags && workflowTags.length > 0 ? (
+                              {taggingEnabled &&
+                              workflowTags &&
+                              workflowTags.length > 0 ? (
                                 <TagChipList
                                   tags={workflowTags}
                                   descriptions={tagDescriptions}
@@ -1088,17 +1104,19 @@ function WorkflowsFlat() {
                                       </TooltipContent>
                                     </Tooltip>
                                   </TooltipProvider>
-                                  <WorkflowTagEditor
-                                    workflowPermanentId={
-                                      workflow.workflow_permanent_id
-                                    }
-                                    tags={workflowTags ?? []}
-                                    tagKeys={tagKeys}
-                                    labelSuggestions={labelSuggestions}
-                                    valueSuggestionsByKey={
-                                      valueSuggestionsByKey
-                                    }
-                                  />
+                                  {taggingEnabled ? (
+                                    <WorkflowTagEditor
+                                      workflowPermanentId={
+                                        workflow.workflow_permanent_id
+                                      }
+                                      tags={workflowTags ?? []}
+                                      tagKeys={tagKeys}
+                                      labelSuggestions={labelSuggestions}
+                                      valueSuggestionsByKey={
+                                        valueSuggestionsByKey
+                                      }
+                                    />
+                                  ) : null}
                                 </>
                               )}
                               <TooltipProvider>
@@ -1246,6 +1264,7 @@ function WorkflowsFlat() {
               })
             }
             onMoveToFolder={handleBulkMoveToFolder}
+            taggingEnabled={taggingEnabled}
             tagKeys={tagKeys}
             labelSuggestions={labelSuggestions}
             valueSuggestionsByKey={valueSuggestionsByKey}

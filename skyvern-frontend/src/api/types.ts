@@ -447,6 +447,7 @@ export const ActionTypes = {
   LeftMouse: "left_mouse",
   GotoUrl: "goto_url",
   ClosePage: "close_page",
+  ExecuteJs: "execute_js",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -475,7 +476,26 @@ export const ReadableActionTypes: {
   left_mouse: "Left Mouse",
   goto_url: "Goto URL",
   close_page: "Close Page",
+  execute_js: "Execute JS",
 };
+
+// Recorded code-block actions can carry an action_type the readable map doesn't
+// list yet (the runtime recorder maps more Playwright calls than the UI enumerates).
+// Humanize unknown types instead of rendering a blank badge.
+export function getReadableActionType(actionType: string): string {
+  const known = ReadableActionTypes[actionType as ActionType];
+  if (known) {
+    return known;
+  }
+  if (!actionType) {
+    return "Step";
+  }
+  return actionType
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
 
 export type Option = {
   label: string;

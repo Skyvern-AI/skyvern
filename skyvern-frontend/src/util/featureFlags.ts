@@ -15,6 +15,7 @@ export const ANALYTICS_DASHBOARD_FLAG = "ANALYTICS_DASHBOARD";
  * surfaces gate on a resolved variant (isABVariant), so 0% or rollback hides them.
  */
 export const EDITOR_ONBOARDING_TOUR_FLAG = "EDITOR_ONBOARDING_TOUR";
+export const WORKFLOW_TAGGING_FLAG = "WORKFLOW_TAGGING";
 
 // Opt-in (0% base rollout) preview gating the workflows directory-tree view.
 // Not enrolled reads as disabled, so the default stays the flat folders/list.
