@@ -203,8 +203,10 @@ async def _scrolling_screenshots_helper(
     frame = "main.frame"
     frame_index = 0
 
-    # when mode is lite, we don't draw bounding boxes
-    # since draw_boxes impacts the performance of processing
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # ``draw_boxes`` is False by default for all scrape callers; the ``if draw_boxes:``
+    # branches below are retained briefly for backwards compatibility and are
+    # scheduled for removal. The LITE-mode override is kept as a defensive guard.
     if mode == ScreenshotMode.LITE:
         draw_boxes = False
 

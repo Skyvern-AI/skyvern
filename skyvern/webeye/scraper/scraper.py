@@ -195,7 +195,10 @@ async def scrape_website(
     max_retries: int = settings.MAX_SCRAPING_RETRIES,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
-    draw_boxes: bool = True,
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # The parameter is retained for backwards compatibility and is scheduled for removal.
+    # New call sites must not pass ``draw_boxes=True``.
+    draw_boxes: bool = False,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
@@ -379,7 +382,10 @@ async def scrape_web_unsafe(
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
-    draw_boxes: bool = True,
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # The parameter is retained for backwards compatibility and is scheduled for removal.
+    # New call sites must not pass ``draw_boxes=True``.
+    draw_boxes: bool = False,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,

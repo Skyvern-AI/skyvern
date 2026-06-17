@@ -146,7 +146,10 @@ class ScriptSkyvernPage(SkyvernPage):
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
-            draw_boxes=True,
+            # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+            # ``draw_boxes`` is wired through the scrape pipeline as False; the overlay helpers
+            # are retained briefly for backwards compatibility and scheduled for removal.
+            draw_boxes=False,
             scroll=True,
             support_empty_page=True,
         )
