@@ -13,7 +13,6 @@ from typing import Any
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
@@ -1312,7 +1311,6 @@ class TestDownloadRungSynthesis:
         ast.parse("async def _block(page):\n" + result.code)
 
     def test_appended_terminal_step_compiled_from_typed_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         assert result is not None
         assert "_scout_entry_reused_current_page = False" in result.code
@@ -1331,32 +1329,21 @@ class TestDownloadRungSynthesis:
         assert 'wait_for_load_state("load")' not in download_step
 
     def test_already_registered_emits_no_download_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block(
             [_nav_click()], reached_download_target=_download_target(already_registered=True, selector="")
         )
         assert result is not None
         assert "expect_download" not in result.code
 
-    def test_flag_off_with_target_byte_identical_to_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        trajectory = [_nav_click()]
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", False)
-        base = synthesize_code_block(trajectory)
-        with_target = synthesize_code_block(trajectory, reached_download_target=_download_target())
-        assert base is not None and with_target is not None
-        assert base.code == with_target.code
-        assert "expect_download" not in with_target.code
-
     def test_target_none_byte_identical_to_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
         trajectory = [_nav_click()]
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         base = synthesize_code_block(trajectory)
         none_target = synthesize_code_block(trajectory, reached_download_target=None)
         assert base is not None and none_target is not None
         assert base.code == none_target.code
         assert "expect_download" not in none_target.code
 
-    def test_non_download_trajectories_byte_identical_across_flag_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_non_download_trajectory_emits_no_download_terminal(self) -> None:
         trajectory = [
             _interaction("type_text", selector="#user", source_url="https://example.com/", typed_value="abc"),
             _interaction("select_option", selector="#state", value="CA"),
@@ -1370,16 +1357,11 @@ class TestDownloadRungSynthesis:
             _interaction("press_key", selector="#user", key="Enter"),
             _interaction("click", selector="#submit", source_url="https://example.com/"),
         ]
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", False)
-        off = synthesize_code_block(trajectory)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
-        on = synthesize_code_block(trajectory)
-        assert off is not None and on is not None
-        assert off.code == on.code
-        assert "expect_download" not in on.code
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        assert "expect_download" not in result.code
 
     def test_user_param_named_dl_info_is_renamed_via_reserved_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block(
             [
                 _interaction(
@@ -1400,7 +1382,6 @@ class TestDownloadRungSynthesis:
         assert f"async with page.expect_download() as {_DOWNLOAD_VAR_BASE}:" in result.code
 
     def test_emitted_download_snippet_is_safe_and_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         assert result is not None
         wrapped = "async def _block(page):\n" + result.code
@@ -1409,7 +1390,6 @@ class TestDownloadRungSynthesis:
         ast.parse(wrapped)
 
     def test_download_snippet_awaits_completion_without_save_as(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         assert result is not None
         download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
@@ -1421,7 +1401,6 @@ class TestDownloadRungSynthesis:
         CodeBlock.is_safe_code("async def _block(page):\n" + result.code)
 
     def test_download_offer_text_only_present_for_download_snippet(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         download = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         plain = synthesize_code_block([_interaction("click", selector="#go", source_url="https://example.com/")])
         assert download is not None and plain is not None
@@ -1429,7 +1408,6 @@ class TestDownloadRungSynthesis:
         assert "expect_download" not in render_synthesized_offer_text(plain)
 
     def test_non_live_call_sites_compile_without_kwarg(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block([_nav_click()])
         assert result is not None
         assert "expect_download" not in result.code
