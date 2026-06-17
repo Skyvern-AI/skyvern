@@ -1,5 +1,6 @@
 import {
   CheckCircledIcon,
+  CodeIcon,
   CrossCircledIcon,
   CursorArrowIcon,
   Cross2Icon,
@@ -55,6 +56,7 @@ export const actionTypeIcons: Record<ActionType, ReactNode> = {
     <WorkflowBlockIcon workflowBlockType="goto_url" className="size-3.5" />
   ),
   [ActionTypes.ClosePage]: <Cross2Icon className="size-3.5" />,
+  [ActionTypes.ExecuteJs]: <CodeIcon className="size-3.5" />,
 };
 
 export function getActionTypeIcon(actionType: string): ReactNode {

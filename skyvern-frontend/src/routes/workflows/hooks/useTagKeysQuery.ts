@@ -3,11 +3,12 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import type { TagKey } from "../types/tagTypes";
 
-function useTagKeysQuery() {
+function useTagKeysQuery({ enabled = true }: { enabled?: boolean } = {}) {
   const credentialGetter = useCredentialGetter();
 
   return useQuery({
     queryKey: ["tag-keys"],
+    enabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client

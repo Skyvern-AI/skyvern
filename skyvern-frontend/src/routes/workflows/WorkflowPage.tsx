@@ -81,7 +81,11 @@ import {
   useFeatureFlagVariantKey,
 } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import { ANALYTICS_DASHBOARD_FLAG } from "@/util/featureFlags";
+import {
+  ANALYTICS_DASHBOARD_FLAG,
+  WORKFLOW_TAGGING_FLAG,
+} from "@/util/featureFlags";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 
@@ -129,13 +133,16 @@ function WorkflowPage() {
     workflowPermanentId,
   });
 
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
+    { enabled: taggingEnabled },
   );
   const workflowTags = workflowPermanentId
     ? workflowTagsMap[workflowPermanentId]
     : undefined;
-  const { data: tagKeys = [] } = useTagKeysQuery();
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
   const tagDescriptions = useMemo(
     () =>
       new Map(
@@ -168,7 +175,10 @@ function WorkflowPage() {
               </>
             )}
           </div>
-          {!workflowIsLoading && workflowTags && workflowTags.length > 0 ? (
+          {taggingEnabled &&
+          !workflowIsLoading &&
+          workflowTags &&
+          workflowTags.length > 0 ? (
             <TagChipList
               tags={workflowTags}
               descriptions={tagDescriptions}

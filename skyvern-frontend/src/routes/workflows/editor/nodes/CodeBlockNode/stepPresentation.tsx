@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-import { type ActionType, ReadableActionTypes } from "@/api/types";
+import { getReadableActionType } from "@/api/types";
 import { getActionTypeIcon } from "@/routes/workflows/components/actionTypeIcons";
 
 export function getStepIcon(actionType: string): ReactNode {
@@ -8,7 +8,7 @@ export function getStepIcon(actionType: string): ReactNode {
 }
 
 export function getStepLabel(actionType: string): string {
-  return ReadableActionTypes[actionType as ActionType] ?? "Step";
+  return getReadableActionType(actionType);
 }
 
 const chipTintByActionType: Record<string, string> = {
@@ -23,6 +23,7 @@ const chipTintByActionType: Record<string, string> = {
   extract: "bg-emerald-500/10 text-emerald-300",
   verification_code: "bg-emerald-500/10 text-emerald-300",
   complete: "bg-emerald-500/10 text-emerald-300",
+  execute_js: "bg-violet-500/10 text-violet-300",
   wait: "bg-amber-500/10 text-amber-300",
   solve_captcha: "bg-amber-500/10 text-amber-300",
   terminate: "bg-rose-500/10 text-rose-300",

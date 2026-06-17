@@ -407,6 +407,70 @@ describe("WorkflowRunTimelineBlockItem", () => {
     ).toBeTruthy();
   });
 
+  it("labels a recorded page.evaluate action as Execute JS instead of a blank badge", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_eval",
+      block_type: "code",
+      label: "run_script",
+      actions: [
+        {
+          action_id: "wrb_code_eval_action_0",
+          action_type: "execute_js",
+          status: Status.Completed,
+          reasoning: null,
+          description: "page.evaluate () => document.title",
+          output: { code_line: 3, duration_ms: 800 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Execute JS")).toBeDefined();
+  });
+
+  it("humanizes an unmapped recorded action type rather than rendering a blank badge", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_unmapped",
+      block_type: "code",
+      label: "run_script",
+      actions: [
+        {
+          action_id: "wrb_code_unmapped_action_0",
+          action_type: "go_forward",
+          status: Status.Completed,
+          reasoning: null,
+          description: "page.go_forward",
+          output: { code_line: 2, duration_ms: 100 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Go Forward")).toBeDefined();
+  });
+
   it("labels the synthetic code error row as Error instead of Screenshot", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_code_failed",
