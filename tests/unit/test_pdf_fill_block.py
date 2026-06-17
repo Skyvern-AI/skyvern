@@ -258,6 +258,43 @@ async def test_downloaded_source_pdf_is_cleaned_up(monkeypatch: pytest.MonkeyPat
     assert not downloaded.exists(), "the downloaded source temp should be removed after execute"
 
 
+def test_nearest_label_picks_aligned_side() -> None:
+    # field box at x 100-200, top 100-114
+    field = (100.0, 100.0, 200.0, 114.0)
+    # label above the field
+    above = [
+        {"text": "Social", "x0": 100, "x1": 140, "top": 84, "bottom": 96, "upright": True},
+        {"text": "security", "x0": 142, "x1": 190, "top": 84, "bottom": 96, "upright": True},
+    ]
+    assert PdfFillBlock._nearest_label(above, *field) == "Social security"
+    # checkbox: label to the right
+    right = [{"text": "LLC", "x0": 210, "x1": 240, "top": 100, "bottom": 114, "upright": True}]
+    assert PdfFillBlock._nearest_label(right, *field) == "LLC"
+    # nothing nearby
+    assert PdfFillBlock._nearest_label([], *field) == ""
+
+
+def test_nearest_label_button_prefers_right_option_text() -> None:
+    # A classification checkbox with a section header ABOVE and its option label to the RIGHT:
+    # text fields should take the header, button fields should take the option text.
+    field = (100.0, 100.0, 112.0, 112.0)
+    words = [
+        {"text": "Check", "x0": 60, "x1": 95, "top": 80, "bottom": 92, "upright": True},
+        {"text": "one", "x0": 97, "x1": 120, "top": 80, "bottom": 92, "upright": True},
+        {"text": "Individual", "x0": 120, "x1": 200, "top": 100, "bottom": 112, "upright": True},
+    ]
+    assert PdfFillBlock._nearest_label(words, *field, is_button=False) == "Check one"
+    assert PdfFillBlock._nearest_label(words, *field, is_button=True) == "Individual"
+
+
+def test_extract_field_labels_on_fillable_fixture(tmp_path: Path) -> None:
+    source_pdf = tmp_path / "labelled.pdf"
+    _write_fillable_pdf(source_pdf)
+    labels = PdfFillBlock._extract_field_labels(str(source_pdf))
+    # the fixture has no printed text, so labels are empty strings but extraction must not crash
+    assert isinstance(labels, dict)
+
+
 def test_checkbox_without_known_state_is_skipped_not_silently_unchecked() -> None:
     block = _make_block()
     inventory = {
