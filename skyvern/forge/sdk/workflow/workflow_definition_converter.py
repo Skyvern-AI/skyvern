@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
+from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -394,6 +395,64 @@ def _build_block_kwargs(
     }
 
 
+def _code_block_step_span_issue(step: CodeBlockStep, code_line_count: int) -> str | None:
+    """Return why a step's line span is malformed, or None when it is well-formed: a well-formed span
+    is empty, a lone 1-based line_start, or a 1-based line_start <= line_end with both bounds within
+    the code's line count (a lone line_end has no anchor for the editor to render from)."""
+    line_start = step.line_start
+    line_end = step.line_end
+    if line_end is not None and line_start is None:
+        return "line_end is set without line_start"
+    for bound_name, bound in (("line_start", line_start), ("line_end", line_end)):
+        if bound is None:
+            continue
+        if bound < 1:
+            return f"{bound_name} must be >= 1, got {bound}"
+        if bound > code_line_count:
+            return f"{bound_name} ({bound}) exceeds the code length ({code_line_count} line(s))"
+    if line_start is not None and line_end is not None and line_start > line_end:
+        return f"line_start ({line_start}) must be <= line_end ({line_end})"
+    return None
+
+
+def _reconcile_code_block_step_spans(
+    *,
+    block_label: str,
+    steps: list[CodeBlockStep],
+    code: str,
+) -> list[CodeBlockStep]:
+    """Repair malformed step spans against the code-derived spans instead of rejecting the save.
+
+    Step spans are display-only line references the editor and run timeline render. A non-copilot
+    save path (the copilot re-derives) can persist a stale or model-mangled span, e.g. a code edit
+    that shortens the block below a step's line_end. Snap an invalid span to the synthesized span at
+    the same position, or drop it to null when the code yields no step there; well-formed spans and
+    all other fields are kept untouched."""
+    code_line_count = len(code.splitlines())
+    issues = [_code_block_step_span_issue(step, code_line_count) for step in steps]
+    if not any(issues):
+        return steps
+    derived = derive_code_block_steps(code)
+    reconciled: list[CodeBlockStep] = []
+    for step_index, (step, issue) in enumerate(zip(steps, issues)):
+        if issue is None:
+            reconciled.append(step)
+            continue
+        derived_step = derived[step_index] if step_index < len(derived) else None
+        repaired_start = derived_step["line_start"] if derived_step else None
+        repaired_end = derived_step["line_end"] if derived_step else None
+        LOG.info(
+            "Reconciled malformed code-block step span",
+            block_label=block_label,
+            step_index=step_index,
+            issue=issue,
+            line_start=repaired_start,
+            line_end=repaired_end,
+        )
+        reconciled.append(step.model_copy(update={"line_start": repaired_start, "line_end": repaired_end}))
+    return reconciled
+
+
 def block_yaml_to_block(
     block_yaml: BLOCK_YAML_TYPES,
     parameters: dict[str, PARAMETER_TYPE],
@@ -519,7 +578,7 @@ def block_yaml_to_block(
             code_block_steps = []
             for step_index, step_yaml in enumerate(block_yaml.steps):
                 try:
-                    code_block_steps.append(CodeBlockStep(**step_yaml.model_dump()))
+                    step = CodeBlockStep(**step_yaml.model_dump())
                 except ValidationError as exc:
                     first_error = exc.errors()[0]
                     field = ".".join(str(part) for part in first_error["loc"])
@@ -528,6 +587,12 @@ def block_yaml_to_block(
                         step_index=step_index,
                         detail=f"{field}: {first_error['msg']}",
                     ) from exc
+                code_block_steps.append(step)
+            code_block_steps = _reconcile_code_block_step_spans(
+                block_label=block_yaml.label,
+                steps=code_block_steps,
+                code=block_yaml.code,
+            )
         return CodeBlock(
             **base_kwargs,
             code=block_yaml.code,
