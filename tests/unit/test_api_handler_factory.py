@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from asyncio import CancelledError
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
@@ -824,3 +825,42 @@ def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.Mo
     monkeypatch.setattr(litellm, "completion_cost", _raise)
     resp = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
     assert LLMAPIHandlerFactory._completion_cost(resp) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_non_speculative_cancelled_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run-level cancellation (elapsed-time timeout / user stop) landing inside an LLM call must
+    propagate as CancelledError so the timeout actually halts the run. It must NOT be converted into
+    a retryable LLMProviderError, which the step loop would treat as a failure and retry."""
+    context = MagicMock()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = False
+    context.cached_static_prompt = None
+    context.hashed_href_map = {}
+
+    llm_config = LLMConfig(
+        model_name="gpt-4",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.get_config", lambda _: llm_config
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.is_router_config", lambda _: False
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.skyvern_context.current", lambda: context)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", AsyncMock(side_effect=CancelledError()))
+
+    # No step is passed, so is_speculative_step is False (the non-speculative branch).
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("gpt-4")
+    with pytest.raises(BaseException) as exc_info:
+        await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+    assert isinstance(exc_info.value, CancelledError), (
+        f"expected CancelledError to propagate, got {type(exc_info.value).__name__}"
+    )
