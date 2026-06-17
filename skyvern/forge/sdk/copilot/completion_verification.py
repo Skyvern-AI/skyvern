@@ -346,6 +346,110 @@ def grade_definition_criteria(criteria: list[CompletionCriterion], workflow_yaml
     return verdicts
 
 
+# Quoted literals need >=4 chars: a 2-3 char quoted token (a state code, "id", "ok")
+# collides with incidental prose, too low-specificity to credit on lexical presence.
+_QUOTED_LITERAL_RE = re.compile(r"[\"'‘’“”]([^\"'‘’“”]{4,120})[\"'‘’“”]")
+_CURRENCY_LITERAL_RE = re.compile(r"[$€£¥]\s?\d[\d,]*(?:\.\d+)?")
+_ISO_DATE_LITERAL_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+# A bare digit run qualifies as an identifier only at >=5 digits: a 4-digit run is
+# usually a year and too low-specificity to credit on a coincidental output match.
+_LONG_DIGIT_LITERAL_RE = re.compile(r"\b\d{5,}\b")
+
+
+def _normalize_present_value(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _extract_present_value_literals(outcome: str) -> list[str]:
+    literals: list[str] = []
+    for match in _QUOTED_LITERAL_RE.finditer(outcome):
+        literals.append(match.group(1))
+    for pattern in (_CURRENCY_LITERAL_RE, _ISO_DATE_LITERAL_RE, _LONG_DIGIT_LITERAL_RE):
+        literals.extend(pattern.findall(outcome))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for literal in literals:
+        candidate = _normalize_present_value(literal)
+        if len(candidate) >= 2 and candidate not in seen:
+            seen.add(candidate)
+            normalized.append(candidate)
+    return normalized
+
+
+def _serialized_block_output_haystacks(block_outputs: dict[str, Any]) -> list[tuple[str, str]]:
+    haystacks: list[tuple[str, str]] = []
+    for label, payload in block_outputs.items():
+        if payload is None:
+            continue
+        forms = [payload] if isinstance(payload, str) else [json.dumps(payload, default=str), str(payload)]
+        normalized = " ".join(_normalize_present_value(form) for form in forms if form)
+        if normalized:
+            haystacks.append((str(label), normalized))
+    return haystacks
+
+
+def _present_verbatim(literal: str, haystack: str) -> bool:
+    # Boundary-aware: plain substring would over-credit a short/numeric literal against
+    # a sibling value ('$10' in '$100', 'ca' in 'california') — require token boundaries.
+    start = 0
+    while (idx := haystack.find(literal, start)) != -1:
+        before = haystack[idx - 1] if idx else ""
+        before_prev = haystack[idx - 2] if idx >= 2 else ""
+        end = idx + len(literal)
+        after = haystack[end] if end < len(haystack) else ""
+        after_next = haystack[end + 1] if end + 1 < len(haystack) else ""
+        embedded = (
+            before.isalnum()
+            or after.isalnum()
+            or (after in ".," and after_next.isdigit())
+            or (before in ".," and before_prev.isdigit())
+        )
+        if not embedded:
+            return True
+        start = idx + 1
+    return False
+
+
+def grade_present_value_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    """Deterministically credit a run-plane criterion whose explicitly named/quoted
+    value appears verbatim in the run's own block outputs.
+
+    Abstains (emits nothing) for any criterion lacking a high-specificity literal or
+    whose literal is not present, so the judge keeps deciding and recall is never
+    weakened; only ever upgrades to ``satisfied``.
+    """
+    haystacks = _serialized_block_output_haystacks(snapshot.block_outputs)
+    if not haystacks:
+        return []
+    verdicts: list[CriterionVerdict] = []
+    for criterion in criteria:
+        literals = _extract_present_value_literals(criterion.outcome)
+        if not literals:
+            continue
+        # Every named literal must appear in a SINGLE block output: a partial match
+        # (e.g. a date present while the named total is not) is not the named outcome.
+        match_label = next(
+            (
+                label
+                for label, haystack in haystacks
+                if all(_present_verbatim(literal, haystack) for literal in literals)
+            ),
+            None,
+        )
+        if match_label is not None:
+            verdicts.append(
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="satisfied",
+                    reason_code="present_value_verbatim",
+                    evidence_ref=f"block_outputs:{match_label}",
+                )
+            )
+    return verdicts
+
+
 _DEFINITION_REASON_PREFIX = "definition_"
 
 

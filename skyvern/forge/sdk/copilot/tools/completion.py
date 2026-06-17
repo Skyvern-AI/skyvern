@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
+    grade_present_value_criteria,
     summarize_unsatisfied_outcomes,
 )
 from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
@@ -162,6 +163,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                 )
             else:
                 run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
+                run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
             verification = combine_verification_results(criterion_ids, run_result, definition_verdicts)
 
     if (
@@ -261,6 +263,31 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     )
 
 
+def _apply_present_value_upgrades(
+    run_result: CompletionVerificationResult,
+    run_criteria: list[CompletionCriterion],
+    snapshot: RunEvidenceSnapshot,
+) -> CompletionVerificationResult:
+    """Upgrade a ``no_evidence``/``unknown`` run verdict to a deterministic present-value
+    ``satisfied``. An ``evidence_contradicts`` verdict is left to the judge, a judge
+    ``satisfied`` is never downgraded, and an unavailable result is never fabricated.
+    """
+    if run_result.status != "evaluated":
+        return run_result
+    upgrades = {verdict.criterion_id: verdict for verdict in grade_present_value_criteria(run_criteria, snapshot)}
+    if not upgrades:
+        return run_result
+    verdicts = [
+        upgrades[verdict.criterion_id]
+        if verdict.criterion_id in upgrades and not verdict.satisfied and verdict.reason_code != "evidence_contradicts"
+        else verdict
+        for verdict in run_result.verdicts
+    ]
+    return CompletionVerificationResult(
+        status="evaluated", criterion_ids=list(run_result.criterion_ids), verdicts=verdicts
+    )
+
+
 async def _maybe_run_completion_verification(
     copilot_ctx: Any, result: dict[str, Any], handler_start: float
 ) -> CompletionVerificationResult | None:
@@ -305,6 +332,7 @@ async def _maybe_run_completion_verification(
         )
     else:
         run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
+        run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
     return combine_verification_results(criterion_ids, run_result, definition_verdicts)
 
 
