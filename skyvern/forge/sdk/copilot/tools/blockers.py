@@ -835,6 +835,13 @@ _ANTI_BOT_BLOCKER_TERMS: tuple[str, ...] = (
     "human verification",
     "verify you are human",
 )
+# Multi-word anti-bot phrases only: the bare tokens ``captcha``/``challenge`` are
+# excluded so business text mentioning them does not false-positive when a code-block
+# value is scanned regardless of its key.
+_BROAD_SINGLE_TOKEN_TERMS: frozenset[str] = frozenset({"captcha", "challenge"})
+_ANTI_BOT_BLOCKER_PHRASES: tuple[str, ...] = tuple(
+    term for term in _ANTI_BOT_BLOCKER_TERMS if term not in _BROAD_SINGLE_TOKEN_TERMS
+)
 # Strict subset of ``_STRUCTURED_BLOCKER_KEY_TERMS`` for the flag/status rules that
 # scan arbitrary code-block JSON; broad terms like ``verification`` stay string-only.
 _STRICT_BLOCKER_FLAG_TERMS: frozenset[str] = frozenset(
@@ -864,6 +871,11 @@ def _looks_like_anti_bot_blocker(text: str) -> bool:
     return any(term in lowered for term in _ANTI_BOT_BLOCKER_TERMS)
 
 
+def _looks_like_anti_bot_phrase(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _ANTI_BOT_BLOCKER_PHRASES)
+
+
 def _structured_blocker_message(
     value: object,
     *,
@@ -871,6 +883,7 @@ def _structured_blocker_message(
     include_flag_keys: bool = False,
     key_terms: frozenset[str] = _STRUCTURED_BLOCKER_KEY_TERMS,
     declared_keys: frozenset[str] = frozenset(),
+    scan_all_values_for_anti_bot: bool = False,
 ) -> str | None:
     if depth > 5:
         return None
@@ -884,9 +897,13 @@ def _structured_blocker_message(
             has_blocker_key = normalized_key in _STRUCTURED_BLOCKER_MESSAGE_KEYS or any(
                 term in normalized_key for term in key_terms
             )
-            if has_blocker_key or (
-                normalized_key in {"message", "error", "failure_reason", "reason"}
-                and _looks_like_anti_bot_blocker(item)
+            if (
+                has_blocker_key
+                or (
+                    normalized_key in {"message", "error", "failure_reason", "reason"}
+                    and _looks_like_anti_bot_blocker(item)
+                )
+                or (scan_all_values_for_anti_bot and _looks_like_anti_bot_phrase(item))
             ):
                 return item.strip()[:240]
         if include_flag_keys:
@@ -900,6 +917,7 @@ def _structured_blocker_message(
                 include_flag_keys=include_flag_keys,
                 key_terms=key_terms,
                 declared_keys=declared_keys,
+                scan_all_values_for_anti_bot=scan_all_values_for_anti_bot,
             )
             if nested:
                 return nested
@@ -911,6 +929,7 @@ def _structured_blocker_message(
                 include_flag_keys=include_flag_keys,
                 key_terms=key_terms,
                 declared_keys=declared_keys,
+                scan_all_values_for_anti_bot=scan_all_values_for_anti_bot,
             )
             if nested:
                 return nested
@@ -982,12 +1001,14 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any], copilot_ctx: 
         if _is_code_block_type(block_type):
             # Code-block outputs are arbitrary JSON the model authored: key matching
             # uses the strict term set (broad terms like ``verification`` belong to
-            # the page-text arms) and metadata-declared goal keys are exempt.
+            # the page-text arms) and metadata-declared goal keys are exempt. A value
+            # carrying a real anti-bot phrase is still caught regardless of its key.
             blocker = _structured_blocker_message(
                 block.get("extracted_data"),
                 include_flag_keys=True,
                 key_terms=_STRICT_BLOCKER_FLAG_TERMS,
                 declared_keys=_declared_code_output_keys(copilot_ctx, block.get("label")),
+                scan_all_values_for_anti_bot=True,
             )
         elif block_type in _DATA_PRODUCING_BLOCK_TYPES:
             payload = _block_data_payload(block.get("extracted_data"), block_type)
@@ -1574,6 +1595,7 @@ def _analyze_run_blocks(
                     include_flag_keys=True,
                     key_terms=_STRICT_BLOCKER_FLAG_TERMS,
                     declared_keys=declared_keys,
+                    scan_all_values_for_anti_bot=True,
                 )
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)

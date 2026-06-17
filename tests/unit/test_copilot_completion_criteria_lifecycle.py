@@ -26,9 +26,11 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
+    RunEvidenceSnapshot,
     _coerce_result,
     combine_verification_results,
     grade_definition_criteria,
+    grade_present_value_criteria,
     run_plane_all_no_evidence,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -50,7 +52,11 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _parse_completion_criteria,
     normalized_criterion_outcome_key,
 )
-from skyvern.forge.sdk.copilot.tools.completion import _outcome_failure_warrants_repair, _split_criteria_by_plane
+from skyvern.forge.sdk.copilot.tools.completion import (
+    _apply_present_value_upgrades,
+    _outcome_failure_warrants_repair,
+    _split_criteria_by_plane,
+)
 
 
 def _criterion(cid: str, outcome: str, *, level: str = "run") -> CompletionCriterion:
@@ -435,6 +441,137 @@ def test_split_criteria_by_plane() -> None:
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     assert [c.id for c in run_criteria] == ["c0"]
     assert [c.id for c in definition_criteria] == ["c1"]
+
+
+def _snapshot(block_outputs: dict) -> RunEvidenceSnapshot:
+    return RunEvidenceSnapshot(workflow_run_id="wr_test", block_outputs=block_outputs)
+
+
+def test_present_value_credits_quoted_currency_literal_verbatim() -> None:
+    criteria = [_criterion("c0", "the May 2026 statement total reads $4,210.55")]
+    snapshot = _snapshot({"read_statement": {"month": "May 2026", "total": "$4,210.55"}})
+    (verdict,) = grade_present_value_criteria(criteria, snapshot)
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "present_value_verbatim"
+    assert verdict.evidence_ref == "block_outputs:read_statement"
+
+
+def test_present_value_abstains_when_literal_absent_from_outputs() -> None:
+    criteria = [_criterion("c0", "the May 2026 statement total reads $4,210.55")]
+    snapshot = _snapshot({"read_statement": {"total": "$1,000.00"}})
+    assert grade_present_value_criteria(criteria, snapshot) == []
+
+
+def test_present_value_abstains_on_empty_block_outputs() -> None:
+    criteria = [_criterion("c0", "the May 2026 statement total reads $4,210.55")]
+    assert grade_present_value_criteria(criteria, _snapshot({})) == []
+
+
+def test_present_value_abstains_on_blocked_run_without_target_literal() -> None:
+    criteria = [_criterion("c0", "the statement total reads $4,210.55")]
+    snapshot = _snapshot({"download": {"blocker": "verify you are human to continue"}})
+    assert grade_present_value_criteria(criteria, snapshot) == []
+
+
+def test_present_value_abstains_when_no_high_specificity_literal() -> None:
+    criteria = [_criterion("c0", "the invoice was downloaded successfully")]
+    snapshot = _snapshot({"download": {"file": "invoice downloaded successfully"}})
+    assert grade_present_value_criteria(criteria, snapshot) == []
+
+
+def test_present_value_does_not_credit_on_bare_year_token() -> None:
+    # A 4-digit year is too low-specificity: a coincidental output mention of the
+    # year must not credit the criterion.
+    criteria = [_criterion("c0", "the 2026 billing summary is shown")]
+    snapshot = _snapshot({"footer": {"copyright": "© 2026 Example Corp"}})
+    assert grade_present_value_criteria(criteria, snapshot) == []
+
+
+def test_present_value_credits_multi_digit_account_identifier() -> None:
+    criteria = [_criterion("c0", "Billing is open for account 100245")]
+    snapshot = _snapshot({"open_billing": {"account_number": "100245", "tab": "Billing"}})
+    (verdict,) = grade_present_value_criteria(criteria, snapshot)
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "present_value_verbatim"
+
+
+def test_present_value_requires_every_named_literal_present() -> None:
+    # A criterion naming both a date and a total must not be credited when only the
+    # date is present: a partial match is not the named outcome.
+    criteria = [_criterion("c0", "the 2026-05-05 statement totaling $4,210.55 is downloaded")]
+    partial = _snapshot({"observe": {"statement_date": "2026-05-05"}})
+    assert grade_present_value_criteria(criteria, partial) == []
+
+    full = _snapshot({"download": {"date": "2026-05-05", "total": "$4,210.55"}})
+    (verdict,) = grade_present_value_criteria(criteria, full)
+    assert verdict.state == "satisfied"
+
+    # Both literals must land in the SAME block output, not split across two.
+    split = _snapshot({"observe": {"date": "2026-05-05"}, "summary": {"total": "$4,210.55"}})
+    assert grade_present_value_criteria(criteria, split) == []
+
+
+def test_present_value_rejects_substring_of_longer_token() -> None:
+    # Plain containment would over-credit a short/numeric literal against a sibling
+    # value; a bounded match must reject these.
+    embedded_quote = [_criterion("c0", 'the vendor is "acme"')]
+    assert grade_present_value_criteria(embedded_quote, _snapshot({"x": {"vendor": "acmecorp"}})) == []
+
+    currency = [_criterion("c0", "the total is $10")]
+    assert grade_present_value_criteria(currency, _snapshot({"x": {"total": "$100"}})) == []
+    assert grade_present_value_criteria(currency, _snapshot({"x": {"total": "$10.50"}})) == []
+
+    identifier = [_criterion("c0", "account 100245")]
+    assert grade_present_value_criteria(identifier, _snapshot({"x": {"account": "1002450"}})) == []
+    assert grade_present_value_criteria(identifier, _snapshot({"x": {"account": "9100245"}})) == []
+    assert grade_present_value_criteria(identifier, _snapshot({"x": {"ratio": "0.100245"}})) == []
+
+
+def test_present_value_credits_exact_bounded_literal() -> None:
+    currency = [_criterion("c0", "the total is $10")]
+    (verdict,) = grade_present_value_criteria(currency, _snapshot({"x": {"total": "$10"}}))
+    assert verdict.reason_code == "present_value_verbatim"
+
+    identifier = [_criterion("c0", "account 100245")]
+    (verdict2,) = grade_present_value_criteria(identifier, _snapshot({"x": {"account": "100245"}}))
+    assert verdict2.reason_code == "present_value_verbatim"
+
+
+def test_present_value_quoted_literal_specificity_floor() -> None:
+    # A 2-3 char quoted literal is too low-specificity to credit even when present
+    # verbatim (it collides with incidental prose); >=4 chars credits.
+    two_char = [_criterion("c0", 'the state is "ca"')]
+    assert grade_present_value_criteria(two_char, _snapshot({"x": {"state": "ca"}})) == []
+
+    four_char = [_criterion("c0", 'the vendor is "acme"')]
+    (verdict,) = grade_present_value_criteria(four_char, _snapshot({"x": {"vendor": "acme"}}))
+    assert verdict.reason_code == "present_value_verbatim"
+
+
+def test_present_value_upgrade_is_upgrade_only() -> None:
+    criteria = [_criterion("c0", 'the confirmation number is "ABC12345"')]
+    snapshot = _snapshot({"confirm": {"number": "ABC12345"}})
+
+    run_result = _evaluated(_verdict("c0", "unsatisfied", "no_evidence"))
+    upgraded = _apply_present_value_upgrades(run_result, criteria, snapshot)
+    assert upgraded.verdicts[0].state == "satisfied"
+    assert upgraded.verdicts[0].reason_code == "present_value_verbatim"
+
+    already_satisfied = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
+    kept = _apply_present_value_upgrades(already_satisfied, criteria, snapshot)
+    assert kept.verdicts[0].reason_code == "evidence_confirms"
+
+    contradicts = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
+    absent_snapshot = _snapshot({"confirm": {"number": "ZZZ00000"}})
+    unchanged = _apply_present_value_upgrades(contradicts, criteria, absent_snapshot)
+    assert unchanged.verdicts[0].reason_code == "evidence_contradicts"
+
+    present_contradicts = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
+    kept_contradicts = _apply_present_value_upgrades(present_contradicts, criteria, snapshot)
+    assert kept_contradicts.verdicts[0].reason_code == "evidence_contradicts"
+
+    unavailable = CompletionVerificationResult(status="unavailable")
+    assert _apply_present_value_upgrades(unavailable, criteria, snapshot).status == "unavailable"
 
 
 def test_parse_completion_criteria_coerces_level() -> None:
