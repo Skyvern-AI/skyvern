@@ -407,12 +407,13 @@ def _valid_runtime_anchor_url(value: object) -> str | None:
     return url
 
 
-async def _fallback_page_info(ctx: AgentContext) -> tuple[str, str]:
-    if not ctx.browser_session_id:
+async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None = None) -> tuple[str, str]:
+    session_id = session_id_override or ctx.browser_session_id
+    if not session_id:
         return "", ""
     try:
         browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
+            session_id=session_id,
             organization_id=ctx.organization_id,
         )
         if not browser_state:
