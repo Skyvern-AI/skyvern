@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.utils.strings import escape_code_fences
@@ -503,8 +502,7 @@ def synthesize_code_block(
     credential_param_keys: dict[str, str] = {}
     used_download_vars: set[str] = set()
     compile_download_target = (
-        settings.COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED
-        and reached_download_target is not None
+        reached_download_target is not None
         and not reached_download_target.already_registered
         and bool(reached_download_target.selector)
     )

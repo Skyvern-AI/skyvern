@@ -1197,7 +1197,7 @@ class AgentFunction:
         resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
         return CopilotConfig(
             block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
-            impose_synthesized_code_block=settings.WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS,
+            impose_synthesized_code_block=True,
         )
 
     async def get_copilot_config_for_request(

@@ -6,7 +6,6 @@ from typing import Any
 import structlog
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, RecoveryHint
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -183,10 +182,6 @@ def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) 
     this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
     synthesizer can compile the terminal download step. Active in code-only browser mode."""
     if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if not settings.COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
-        # The gate is cleared by the reached-download scout interaction, which is only registered
-        # when author-steer is on; enforcing it without that flag deadlocks until the retry cap.
         return None
     if copilot_ctx is None or workflow_yaml is None:
         return None

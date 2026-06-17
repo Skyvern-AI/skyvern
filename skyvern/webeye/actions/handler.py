@@ -69,6 +69,7 @@ from skyvern.forge.sdk.api.files import (
     get_download_dir,
     list_files_in_directory,
     make_temp_directory,
+    resolve_run_download_id,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -718,7 +719,7 @@ class ActionHandler:
             return results
 
         context = skyvern_context.current()
-        run_id = context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+        run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id or task.task_id)
         download_dir = Path(get_download_dir(run_id=run_id))
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
 
