@@ -56,6 +56,7 @@ mode: custom
 - Fixed code block runs not generating a recording entry, causing the Recording tab to appear empty. ([#6607](https://github.com/Skyvern-AI/skyvern/pull/6607))
 - Fixed code block action screenshots not appearing on the run Overview page. ([#6605](https://github.com/Skyvern-AI/skyvern/pull/6605))
 - Fixed long usernames or email addresses hiding the sidebar collapse button on desktop.
+- Fixed the File Parser block crashing when a downloaded file isn't a valid PDF (e.g. a site returns a short plain-text error instead of the expected document); the block now surfaces a clear parse error instead of failing the run unexpectedly.
 
 </Update>
 
