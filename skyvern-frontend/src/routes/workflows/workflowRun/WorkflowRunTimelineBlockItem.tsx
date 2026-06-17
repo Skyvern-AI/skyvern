@@ -29,7 +29,7 @@ import {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
-import { CodeBlockStep } from "../types/workflowTypes";
+import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
@@ -447,7 +447,7 @@ function TimelineActionRows({
 }: TimelineActionRowsProps) {
   const actions = block.actions ?? [];
   const actionsTopDown = [...actions].reverse();
-  const isCodeBlock = block.block_type === "code";
+  const isCodeBlock = block.block_type === WorkflowBlockTypes.Code;
 
   if (actions.length === 0) return null;
 
@@ -624,10 +624,16 @@ function WorkflowRunTimelineBlockItem({
   const actionCount = actions.length;
 
   const hasActions = actionCount > 0;
+  // Only code blocks break their execution down into action/step rows inside the
+  // timeline rail. Agent blocks (login, task, navigation, ...) expose their
+  // actions through the detail panel instead, so the rail stays a high-level
+  // block outline for them.
+  const isCodeBlock = block.block_type === WorkflowBlockTypes.Code;
+  const showsActionRows = isCodeBlock && hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
   const codeSteps =
-    block.block_type === "code" && !hasActions
+    isCodeBlock && !hasActions
       ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
       : [];
   const hasCodeSteps = codeSteps.length > 0;
@@ -646,7 +652,8 @@ function WorkflowRunTimelineBlockItem({
   // the runtime didn't model any child blocks under them (e.g. conditionals
   // whose "next" block is a flat sibling), showing a chevron that reveals
   // nothing is worse than no chevron at all.
-  const isContainer = hasRenderableNestedChildren || hasActions || hasCodeSteps;
+  const isContainer =
+    hasRenderableNestedChildren || showsActionRows || hasCodeSteps;
 
   // The loop block itself is only "active" when no specific iteration is
   // selected — otherwise the iteration row owns the highlight.
@@ -683,7 +690,7 @@ function WorkflowRunTimelineBlockItem({
   const [expanded, setExpanded] = useState(
     isRunning ||
       isActiveBlock ||
-      hasActions ||
+      showsActionRows ||
       hasActiveDescendant ||
       isLoopWithSelectedIteration ||
       !hasRenderableNestedChildren,
@@ -700,14 +707,19 @@ function WorkflowRunTimelineBlockItem({
   useEffect(() => {
     if (userToggledRef.current) return;
     if (
-      hasActions ||
+      showsActionRows ||
       hasActiveDescendant ||
       isRunning ||
       isLoopWithSelectedIteration
     ) {
       setExpanded(true);
     }
-  }, [hasActions, hasActiveDescendant, isRunning, isLoopWithSelectedIteration]);
+  }, [
+    showsActionRows,
+    hasActiveDescendant,
+    isRunning,
+    isLoopWithSelectedIteration,
+  ]);
 
   const loopValues = Array.isArray(block.loop_values) ? block.loop_values : [];
 
@@ -814,7 +826,7 @@ function WorkflowRunTimelineBlockItem({
       {isContainer && (
         <Collapsible open={expanded}>
           <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
-            {hasActions && (
+            {showsActionRows && (
               <TimelineActionRows
                 block={block}
                 activeItem={activeItem}

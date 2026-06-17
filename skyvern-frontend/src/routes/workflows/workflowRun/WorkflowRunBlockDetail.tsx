@@ -117,7 +117,13 @@ function renderBodyForBlock(
         />
       );
     case "conditional":
-      return <BlockDetailConditional block={block} />;
+      return (
+        <BlockDetailConditional
+          block={block}
+          activeItem={activeItem}
+          onActionSelect={onActionSelect}
+        />
+      );
     case "for_loop":
     case "while_loop":
       return <BlockDetailLoop block={block} iterationIndex={activeIteration} />;

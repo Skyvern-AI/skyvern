@@ -149,11 +149,11 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.queryByText("0 actions")).toBeNull();
   });
 
-  it("renders action rows under a leaf block and lets the user select an action", () => {
+  it("renders action rows under a code block and lets the user select an action", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({
       workflow_run_block_id: "wrb_action_block",
-      block_type: "task_v2",
+      block_type: "code",
       label: "Open account page",
       actions: [
         {
@@ -204,7 +204,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     });
   });
 
-  it("renders action rows under a container block without requiring expansion", () => {
+  it("renders child blocks but not action rows under a non-code container block", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_container_with_actions",
       block_type: "conditional",
@@ -236,23 +236,26 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
+    // The nested child block is still revealed...
+    expect(screen.getByText("Next step")).toBeDefined();
+    // ...but a non-code block never surfaces its own actions as rows.
     expect(
-      screen.getByText(/Extract the condition result from the page/),
-    ).toBeDefined();
+      screen.queryByText(/Extract the condition result from the page/),
+    ).toBeNull();
   });
 
-  it("renders extract action rows for conditional blocks", () => {
+  it("does not render action rows under a non-code leaf block but keeps the count badge", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({
-      workflow_run_block_id: "wrb_condition_action",
-      block_type: "conditional",
-      label: "check_signin_ok",
+      workflow_run_block_id: "wrb_login_actions",
+      block_type: "login",
+      label: "block_1",
       actions: [
         {
-          action_id: "act_condition_extract",
-          action_type: ActionTypes.extract,
+          action_id: "act_login_click",
+          action_type: ActionTypes.Click,
           status: Status.Completed,
-          reasoning: "Extract whether sign-in succeeded from the page",
+          reasoning: "Click the login link in the top navigation",
           created_by: null,
           confidence_float: 1,
         },
@@ -269,18 +272,13 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
+    // The block still advertises how many actions it ran...
     expect(screen.getByText("1 action")).toBeDefined();
-    expect(screen.getByText("Extract Data")).toBeDefined();
+    // ...but those actions are not surfaced as rows in the timeline rail.
     expect(
-      screen.getByText(/Extract whether sign-in succeeded from the page/),
-    ).toBeDefined();
-
-    fireEvent.click(screen.getByRole("button", { name: /#1/i }));
-
-    expect(onActionClick).toHaveBeenCalledWith({
-      block,
-      action: expect.objectContaining({ action_id: "act_condition_extract" }),
-    });
+      screen.queryByText(/Click the login link in the top navigation/),
+    ).toBeNull();
+    expect(onActionClick).not.toHaveBeenCalled();
   });
 
   it("renders loop iterations from first to last", () => {
@@ -507,7 +505,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText(/ValueError: boom · line 7/)).toBeDefined();
   });
 
-  it("keeps task block action rows unchanged even when output carries line metadata", () => {
+  it("does not render action rows for a non-code block even when output carries line metadata", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_task_null_action",
       block_type: "task_v2",
@@ -535,9 +533,9 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(screen.getByText("Screenshot")).toBeDefined();
+    expect(screen.queryByText("Screenshot")).toBeNull();
     expect(screen.queryByText("Error")).toBeNull();
-    expect(screen.getByText(/Capture failed/)).toBeDefined();
+    expect(screen.queryByText(/Capture failed/)).toBeNull();
     expect(screen.queryByText(/line 5/)).toBeNull();
   });
 
