@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -390,3 +394,78 @@ def test_unrecoverable_browser_session_contract_stops_with_blocker() -> None:
     assert contract.repair_decision.next_action == RepairNextAction.STOP
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.remaining_blocker == reason
+
+
+def test_contract_trace_exposes_stable_root_cause_identity() -> None:
+    def result(reason: str, status: str, label: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "error": reason,
+            "data": {
+                "workflow_run_id": f"wr_{label}",
+                "overall_status": status,
+                "failure_reason": reason,
+                "frontier_start_label": label,
+                "failure_categories": [{"category": "UNRECOVERABLE_TOOL_ERROR"}],
+                "blocks": [{"label": label, "status": status, "failure_reason": reason}],
+            },
+        }
+
+    base = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result=result('Browser session not found while waiting for locator("#submit")', "failed", "login_v1"),
+        ctx=_ctx(),
+    )
+    renamed = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result=result('No browser context while waiting for locator("#submit")', "terminated", "login_v2"),
+        ctx=_ctx(),
+    )
+
+    base_trace = base.to_trace_data()
+    renamed_trace = renamed.to_trace_data()
+    assert base_trace["root_cause_signature"] == renamed_trace["root_cause_signature"]
+    assert base_trace["root_cause_error_class"] == "browser_session_not_found"
+    assert base_trace["root_cause_selector_kind"] == "locator"
+    assert base_trace["root_cause_selector"] == "#submit"
+    assert (
+        base.model_dump()["diagnosis_result"]["root_cause_identity"]["root_cause_signature"]
+        == base_trace["root_cause_signature"]
+    )
+    assert base_trace["run_status"] != renamed_trace["run_status"]
+    assert {base.diagnosis_result.suspected_failure_type, renamed.diagnosis_result.suspected_failure_type} == {
+        DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_failure_records_diagnosis_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.copilot import tools as tools_module
+
+    error = (
+        "Unable to impose synthesized code block: dropped scout interaction 0 from `click` (ambiguous_bare_selector)."
+    )
+    recorded: list[tuple[str, dict[str, object], str]] = []
+
+    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_request_policy_allows_credential_deferred_draft", lambda *args: False)
+    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_update_workflow", AsyncMock(return_value={"ok": False, "error": error}))
+
+    def fake_record_contract(ctx: CopilotContext, *, source_tool: str, result: dict[str, object]) -> None:
+        contract = build_diagnosis_repair_contract(source_tool=source_tool, result=result, ctx=ctx)
+        recorded.append((source_tool, result, contract.to_trace_data()["root_cause_error_class"]))
+
+    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", fake_record_contract)
+
+    result = await tools_module.update_workflow_tool.on_invoke_tool(
+        SimpleNamespace(context=_ctx(), tool_name="update_workflow"),
+        json.dumps({"workflow_yaml": "title: Test\nworkflow_definition:\n  parameters: []\n  blocks: []\n"}),
+    )
+
+    assert json.loads(result)["ok"] is False
+    assert recorded == [
+        ("update_workflow", {"ok": False, "error": error}, "code_block_synthesis_ambiguous_bare_selector")
+    ]

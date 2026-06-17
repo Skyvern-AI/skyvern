@@ -1562,6 +1562,47 @@ def test_snapshot_uses_current_run_blocks_not_stale_outputs() -> None:
     assert snap2.block_outputs.get("b3") == {"extracted_information": {"price": "9.99"}}
 
 
+def test_snapshot_summarizes_registered_download_outputs() -> None:
+    ctx = _run_ctx()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="download_statement")])
+    )
+    run = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_download",
+            "blocks": [
+                {
+                    "label": "download_statement",
+                    "extracted_data": {
+                        "page": "<RecordingLocator>",
+                        "download": "<Download>",
+                        "downloaded_file_name": "apexbiz_100245_2026-05.pdf",
+                        "downloaded_files": [{"filename": "apexbiz_100245_2026-05.pdf"}],
+                        "downloaded_file_urls": [
+                            "https://local.test/downloads/apexbiz_100245_2026-05.pdf?token=secret"
+                        ],
+                        "downloaded_file_artifact_ids": ["artifact_1"],
+                    },
+                }
+            ],
+        },
+    }
+
+    snapshot = _build_run_evidence_snapshot(ctx, run)
+    rendered = snapshot.render_prompt_block()
+
+    assert snapshot.block_outputs["download_statement"] == {
+        "download_registered": True,
+        "downloaded_file_count": 1,
+        "downloaded_file_url_count": 1,
+        "downloaded_file_artifact_count": 1,
+        "downloaded_file_names": ["apexbiz_100245_2026-05.pdf"],
+    }
+    assert "apexbiz_100245_2026-05.pdf" in rendered
+    assert "RecordingLocator" not in rendered and "Download" not in rendered and "secret" not in rendered
+
+
 def test_snapshot_includes_verified_context_labels_without_prior_outputs() -> None:
     ctx = _run_ctx()
     labels = [

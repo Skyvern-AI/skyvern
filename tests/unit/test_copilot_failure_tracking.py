@@ -8,6 +8,7 @@ import pytest
 from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_failure_signature,
     compute_frontier_fingerprint,
+    compute_repair_root_cause_signature,
     update_repeated_failure_state,
 )
 
@@ -30,6 +31,7 @@ def _make_ctx(
     *,
     suspicious: bool = False,
     failure_reason: str | None = "Timeout on element",
+    anti_bot: str | None = None,
     frontier_label: str = "extract",
     executed_labels: list[str] | None = None,
     workflow: Any = None,
@@ -40,6 +42,7 @@ def _make_ctx(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         last_test_suspicious_success=suspicious,
+        last_test_anti_bot=anti_bot,
         last_test_failure_reason=failure_reason,
         last_frontier_start_label=frontier_label,
         last_executed_block_labels=executed_labels or ["open", "extract"],
@@ -63,6 +66,32 @@ def test_signature_differs_on_reason_change() -> None:
     assert a != b
 
 
+def test_signature_uses_root_cause_identity_for_repeat_detection() -> None:
+    categories = [{"category": "UNRECOVERABLE_TOOL_ERROR"}]
+    signatures = {
+        compute_failure_signature(
+            "login_v1", 'Browser session not found while waiting for locator("#submit")', categories, False
+        ),
+        compute_failure_signature(
+            "login_v2", 'No browser context while waiting for locator("#submit")', categories, False
+        ),
+        compute_failure_signature(
+            "login_v3", 'No browser context while waiting for locator("#submit")', categories, True
+        ),
+        compute_failure_signature(
+            "login_v4", 'browser_context.mode=none while waiting for locator("#submit")', categories, True
+        ),
+    }
+    parameter_signature = compute_failure_signature("block_a", None, [{"category": "PARAMETER_BINDING_ERROR"}], False)
+
+    assert len(signatures) == 1
+    assert next(iter(signatures)) is not None
+    assert parameter_signature is not None
+    assert parameter_signature == compute_failure_signature(
+        "renamed_block", None, [{"category": "PARAMETER_BINDING_ERROR"}], False
+    )
+
+
 def test_signature_collapses_parameter_binding_error() -> None:
     # PARAMETER_BINDING_ERROR embeds offending key names in failure_reason;
     # different keys must still hash to the same signature so repeats count.
@@ -73,6 +102,33 @@ def test_signature_collapses_parameter_binding_error() -> None:
         "block_a", "missing parameter 'y' at path baz.qux", [{"category": "PARAMETER_BINDING_ERROR"}], False
     )
     assert a == b
+
+
+def test_category_only_and_code_imposition_root_causes_collapse_noise() -> None:
+    category_detected = compute_repair_root_cause_signature(
+        failure_categories=[{"category": "ANTI_BOT_DETECTION"}],
+        failure_reason="Verify you are human before continuing.",
+    )
+    context_detected = compute_repair_root_cause_signature(
+        failure_categories=[],
+        failure_reason="Access page showed different challenge copy this time.",
+        detected_challenge=True,
+    )
+    first = compute_repair_root_cause_signature(
+        error_texts=[
+            "Unable to impose synthesized code block: dropped scout interaction 0 from `click` (ambiguous_bare_selector)."
+        ],
+    )
+    retried = compute_repair_root_cause_signature(
+        error_texts=[
+            "Unable to impose synthesized code block: dropped scout interaction 4 from `click` (ambiguous_bare_selector)."
+        ],
+    )
+
+    assert category_detected.root_cause_signature == context_detected.root_cause_signature
+    assert category_detected.primary_category == "ANTI_BOT_CHALLENGE"
+    assert first.root_cause_signature == retried.root_cause_signature
+    assert first.error_class == "code_block_synthesis_ambiguous_bare_selector"
 
 
 def test_fingerprint_empty_without_workflow_definition() -> None:
@@ -104,6 +160,33 @@ def test_streak_increments_when_signature_and_fingerprint_repeat() -> None:
     assert ctx.repeated_failure_streak_count == 2
     assert ctx.last_failure_signature == signature
     assert ctx.last_frontier_fingerprint == fingerprint
+
+
+def test_streak_increments_across_challenge_prose_and_frontier_drift() -> None:
+    wf = _make_workflow([_Block("open", url="x"), _Block("extract", schema="s")])
+    fingerprint = compute_frontier_fingerprint(["open", "extract"], wf.workflow_definition)
+    signature = compute_failure_signature(
+        "extract_v1",
+        "Run completed, but extracted data reported a blocker: Verify you are human",
+        None,
+        True,
+        detected_challenge=True,
+    )
+
+    ctx = _make_ctx(
+        suspicious=True,
+        anti_bot="Extracted data reported anti-bot blocker: Verify you are human",
+        failure_reason="Run completed, but extracted data reported a blocker: Cloudflare challenge still present",
+        frontier_label="extract_v2",
+        workflow=wf,
+        last_signature=signature,
+        last_fingerprint=fingerprint,
+        streak=5,
+    )
+    update_repeated_failure_state(ctx, {"ok": True, "data": {}})
+
+    assert ctx.repeated_failure_streak_count == 6
+    assert ctx.last_failure_signature == signature
 
 
 def test_streak_resets_on_meaningful_success() -> None:
@@ -259,6 +342,7 @@ def test_action_fingerprint_streak_independent_of_frontier_streak() -> None:
 
     ctx = SimpleNamespace(
         last_test_suspicious_success=False,
+        last_test_anti_bot=None,
         last_test_failure_reason="Validation failed: name is required",
         last_frontier_start_label="open",
         last_executed_block_labels=["open"],
