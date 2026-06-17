@@ -5668,9 +5668,18 @@ class WorkflowService:
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
 
-        # Last resort: a run's own recording — a non-session task recording, or a session run
-        # whose clip and finalized session recording are both unavailable.
-        if not recording_urls and not recording_archived and run_recording_artifacts and not clip_artifacts:
+        # Last resort: a run's own recording, only when its browser closes on completion. A run that
+        # keeps its browser open (persistent session or pinned browser_address) never finalizes its
+        # per-run webm, so it has no Duration/Cues and won't play; the clip / session-recording paths
+        # above cover those runs instead.
+        closes_on_completion = not workflow_run.browser_session_id and not workflow_run.browser_address
+        if (
+            not recording_urls
+            and not recording_archived
+            and run_recording_artifacts
+            and not clip_artifacts
+            and closes_on_completion
+        ):
             recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(run_recording_artifacts[0])
             if not recording_archived:
                 urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(run_recording_artifacts)
