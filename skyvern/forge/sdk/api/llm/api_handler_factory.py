@@ -1381,9 +1381,12 @@ class LLMAPIHandlerFactory:
                     )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except CancelledError:
+                    # A cancellation here means the run is being stopped (elapsed-time timeout / user
+                    # cancel) or a speculative step was intentionally cancelled. Either way it must
+                    # propagate so the stop actually halts the run; never convert it to a provider error.
                     _duration = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "cancelled")
                     if is_speculative_step:
-                        _llm_span.set_attribute("status", "cancelled")
                         LOG.debug(
                             "LLM request cancelled (speculative step)",
                             llm_key=llm_key,
@@ -1391,17 +1394,15 @@ class LLMAPIHandlerFactory:
                             prompt_name=prompt_name,
                             duration_seconds=_duration,
                         )
-                        raise
                     else:
-                        _llm_span.set_attribute("status", "error")
-                        LOG.error(
-                            "LLM request got cancelled",
+                        LOG.warning(
+                            "LLM request cancelled",
                             llm_key=llm_key,
                             model=main_model_group,
                             prompt_name=prompt_name,
                             duration_seconds=_duration,
                         )
-                        raise LLMProviderError(llm_key) from None
+                    raise
                 except litellm.exceptions.RateLimitError as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "rate_limited")
@@ -1939,11 +1940,12 @@ class LLMAPIHandlerFactory:
                     )
                     raise SkyvernContextWindowExceededError(model=model_name, prompt_name=prompt_name) from e
                 except CancelledError:
-                    # Speculative steps are intentionally cancelled when goal verification completes first,
-                    # so we log at debug level. Non-speculative cancellations are unexpected errors.
+                    # A cancellation here means the run is being stopped (elapsed-time timeout / user
+                    # cancel) or a speculative step was intentionally cancelled. Either way it must
+                    # propagate so the stop actually halts the run; never convert it to a provider error.
                     t_llm_cancelled = time.perf_counter()
+                    _llm_span.set_attribute("status", "cancelled")
                     if is_speculative_step:
-                        _llm_span.set_attribute("status", "cancelled")
                         LOG.debug(
                             "LLM request cancelled (speculative step)",
                             llm_key=llm_key,
@@ -1951,17 +1953,15 @@ class LLMAPIHandlerFactory:
                             prompt_name=prompt_name,
                             duration=t_llm_cancelled - t_llm_request,
                         )
-                        raise
                     else:
-                        _llm_span.set_attribute("status", "error")
-                        LOG.error(
-                            "LLM request got cancelled",
+                        LOG.warning(
+                            "LLM request cancelled",
                             llm_key=llm_key,
                             model=model_name,
                             prompt_name=prompt_name,
                             duration=t_llm_cancelled - t_llm_request,
                         )
-                        raise LLMProviderError(llm_key) from None
+                    raise
                 except litellm.exceptions.RateLimitError as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "rate_limited")
@@ -2513,27 +2513,26 @@ class LLMCaller:
                 _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except CancelledError:
-                # Speculative steps are intentionally cancelled when goal verification returns completed,
-                # so we log at debug level. Non-speculative cancellations are unexpected errors.
+                # A cancellation here means the run is being stopped (elapsed-time timeout / user
+                # cancel) or a speculative step was intentionally cancelled. Either way it must
+                # propagate so the stop actually halts the run; never convert it to a provider error.
                 t_llm_cancelled = time.perf_counter()
+                _llm_span.set_attribute("status", "cancelled")
                 if is_speculative_step:
-                    _llm_span.set_attribute("status", "cancelled")
                     LOG.debug(
                         "LLM request cancelled (speculative step)",
                         llm_key=self.llm_key,
                         model=self.llm_config.model_name,
                         duration=t_llm_cancelled - t_llm_request,
                     )
-                    raise
                 else:
-                    _llm_span.set_attribute("status", "error")
-                    LOG.error(
-                        "LLM request got cancelled",
+                    LOG.warning(
+                        "LLM request cancelled",
                         llm_key=self.llm_key,
                         model=self.llm_config.model_name,
                         duration=t_llm_cancelled - t_llm_request,
                     )
-                    raise LLMProviderError(self.llm_key) from None
+                raise
             except RateLimitError as e:
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)

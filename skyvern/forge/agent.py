@@ -2088,18 +2088,25 @@ class ForgeAgent:
                 completed_step.speculative_original_status = StepStatus.completed
             return completed_step, detailed_agent_step_output.get_clean_detailed_output()
         except CancelledError:
-            LOG.exception(
-                "CancelledError in agent_step, marking step as failed",
+            # A cancellation here is a deliberate stop (elapsed-time timeout / user cancel). Persist
+            # the step as failed (shielded, so the write survives the cancel) for observability, then
+            # re-raise so the cancellation actually halts the run. Returning instead would let the step
+            # loop treat it as a retryable failure and keep executing past the timeout.
+            LOG.info(
+                "CancelledError in agent_step, marking step failed and re-raising",
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
             detailed_agent_step_output.step_exception = "CancelledError"
-            failed_step = await self.update_step(
-                step=step,
-                status=StepStatus.failed,
-                output=detailed_agent_step_output.to_agent_step_output(),
-            )
-            return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    self.update_step(
+                        step=step,
+                        status=StepStatus.failed,
+                        output=detailed_agent_step_output.to_agent_step_output(),
+                    )
+                )
+            raise
         except (
             UnsupportedActionType,
             UnsupportedTaskType,
