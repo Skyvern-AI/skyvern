@@ -1567,3 +1567,112 @@ async def test_fill_multipage_form_allows_unmapped_optional_file_page_to_stop(mo
             assert pages_filled == 1
             fill_mock.assert_called_once()
             click_mock.assert_called_once()
+
+
+# =============================================================================
+# Tests for fill(mode="direct") — JS-gate event dispatch (SKY-11111)
+# =============================================================================
+
+
+class _RecordingLocator:
+    """A fake Playwright locator that records fill/dispatch_event calls in order.
+
+    Optionally models a JS gate by flipping `enabled` to True when it observes a
+    `change` dispatch — the unit-level proxy for a disabled control whose listener
+    keys on `change`.
+    """
+
+    def __init__(self, *, dispatch_error: Exception | None = None, gate_on_change: bool = False) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+        self.first = self
+        self._dispatch_error = dispatch_error
+        self._gate_on_change = gate_on_change
+        self.enabled = False
+
+    async def fill(self, value: str, **kwargs: object) -> None:
+        self.calls.append(("fill", value))
+
+    async def dispatch_event(self, event_name: str, **kwargs: object) -> None:
+        self.calls.append(("dispatch_event", event_name))
+        if self._dispatch_error is not None:
+            raise self._dispatch_error
+        if self._gate_on_change and event_name == "change":
+            self.enabled = True
+
+
+class _RecordingLocatorScope:
+    def __init__(self, locator: _RecordingLocator) -> None:
+        self._locator = locator
+
+    def locator(self, _selector: str, **_kwargs: object) -> _RecordingLocator:
+        return self._locator
+
+
+def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) -> ScriptSkyvernPage:
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=create_mock_page(),
+            ai=mock_ai,
+        )
+    script_page._working_frame = _RecordingLocatorScope(locator)
+    return script_page
+
+
+@pytest.mark.asyncio
+async def test_direct_fill_dispatches_change_and_blur_after_value_set(mock_scraped_page, mock_ai):
+    """mode='direct' must dispatch change/blur after the value-set so a JS gate
+    listening on change/blur unlocks exactly as it does for real keystrokes."""
+    locator = _RecordingLocator()
+    script_page = _direct_fill_page(mock_scraped_page, mock_ai, locator)
+
+    result = await script_page.fill("#username", "user@example.com", mode="direct")
+
+    assert result == "user@example.com"
+    event_names = [name for kind, name in locator.calls if kind == "dispatch_event"]
+    assert "change" in event_names
+    assert "blur" in event_names
+    fill_index = locator.calls.index(("fill", "user@example.com"))
+    change_index = locator.calls.index(("dispatch_event", "change"))
+    blur_index = locator.calls.index(("dispatch_event", "blur"))
+    assert fill_index < change_index < blur_index
+
+
+@pytest.mark.asyncio
+async def test_direct_fill_enables_change_gated_control(mock_scraped_page, mock_ai):
+    """Behavioral AC1: a control gated on a `change` listener becomes enabled after
+    the direct fill (parity with real keystrokes)."""
+    locator = _RecordingLocator(gate_on_change=True)
+    script_page = _direct_fill_page(mock_scraped_page, mock_ai, locator)
+
+    assert locator.enabled is False
+    await script_page.fill("#username", "user@example.com", mode="direct")
+    assert locator.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_direct_fill_returns_value_and_fills_once(mock_scraped_page, mock_ai):
+    """AC3: single-step value-on-submit forms are unaffected — the value is set once
+    and returned; the extra events are inert for forms that read `.value` at submit."""
+    locator = _RecordingLocator()
+    script_page = _direct_fill_page(mock_scraped_page, mock_ai, locator)
+
+    result = await script_page.fill("#password", "hunter2", mode="direct")
+
+    assert result == "hunter2"
+    assert [call for call in locator.calls if call[0] == "fill"] == [("fill", "hunter2")]
+
+
+@pytest.mark.asyncio
+async def test_direct_fill_dispatch_failure_does_not_regress_fill(mock_scraped_page, mock_ai):
+    """A synthetic-event failure on an exotic element must not fail the fill — the
+    value is already set, so dispatch is best-effort."""
+    locator = _RecordingLocator(dispatch_error=RuntimeError("element rejected synthetic event"))
+    script_page = _direct_fill_page(mock_scraped_page, mock_ai, locator)
+
+    result = await script_page.fill("#password", "hunter2", mode="direct")
+
+    assert result == "hunter2"
