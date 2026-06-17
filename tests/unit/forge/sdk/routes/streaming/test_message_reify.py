@@ -241,7 +241,7 @@ class TestLocalExecutionChannel:
         result = await channel.evaluate_js("() => 'hello'")
 
         assert result == "hello"
-        page.evaluate.assert_awaited_once_with("() => 'hello'", None)
+        page.evaluate.assert_awaited_once_with("() => 'hello'")
 
     @pytest.mark.asyncio
     async def test_evaluate_js_forwards_arg(self) -> None:
