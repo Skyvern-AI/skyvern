@@ -33,6 +33,20 @@ class BrowserState(Protocol):
         browser_profile_id: str | None = None,
     ) -> None: ...
 
+    def is_connected(self) -> bool: ...
+
+    async def reconnect(
+        self,
+        proxy_location: ProxyLocationInput = None,
+        workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
+        browser_profile_id: str | None = None,
+    ) -> None: ...
+
     async def get_working_page(self) -> Page | None: ...
 
     async def must_get_working_page(self) -> Page: ...
