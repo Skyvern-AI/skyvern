@@ -3737,8 +3737,12 @@ async def wrapper({default_args}):
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None,
+        browser_session_id: str | None = None,
     ) -> None:
-        """Register the run-scoped RECORDING row that a code block otherwise lacks so the recording is reachable."""
+        """Register the run-scoped RECORDING row a fresh-browser code block otherwise lacks; no-op when the
+        browser stays open on completion (persistent session or pinned browser_address)."""
+        if browser_session_id:
+            return
         # get_video_artifacts returns the same VideoArtifact objects held on browser_state, so the id
         # written below is observed by the early-return guard on later blocks sharing the browser.
         # Idempotency assumes those blocks run sequentially (no concurrent first-time registration).
@@ -3746,6 +3750,11 @@ async def wrapper({default_args}):
         if not browser_artifacts or all(va.video_artifact_id for va in browser_artifacts.video_artifacts):
             return
         try:
+            # A pinned browser_address run also keeps its browser open, so its per-run webm never
+            # finalizes — skip it like a session run and let the clip path serve the recording.
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id)
+            if workflow_run is not None and workflow_run.browser_address:
+                return
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
                 workflow_run_id=workflow_run_id, browser_state=browser_state, finalize=False
             )
@@ -3920,6 +3929,7 @@ async def wrapper({default_args}):
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            browser_session_id=browser_session_id,
         )
 
         try:

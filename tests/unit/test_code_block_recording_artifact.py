@@ -54,10 +54,12 @@ async def test_registers_run_scoped_recording_when_video_artifact_has_no_id() ->
     get_video = AsyncMock(return_value=video_artifacts)
     fake_block = SimpleNamespace(workflow_run_block_id="wrb_1", workflow_run_id="wr_1", organization_id="o_1")
     get_block = AsyncMock(return_value=fake_block)
+    get_run = AsyncMock(return_value=SimpleNamespace(browser_address=None))
     create_artifact = AsyncMock(return_value="a_recording")
 
     with (
         patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.DATABASE.workflow_runs.get_workflow_run", get_run),
         patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
         patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
     ):
@@ -78,6 +80,62 @@ async def test_registers_run_scoped_recording_when_video_artifact_has_no_id() ->
     assert kwargs["workflow_run_block"] is fake_block
     # The id is stored back so the workflow cleanup updates this exact row.
     assert video_artifacts[0].video_artifact_id == "a_recording"
+
+
+@pytest.mark.asyncio
+async def test_skips_registration_for_persistent_session_run() -> None:
+    # A persistent/copilot session keeps the browser open on completion, so the per-run webm never
+    # finalizes (no Duration/Cues — it won't play). The clip path (sync_run_recording_clips) delivers
+    # the playable run-scoped MP4 at session close, so registering the unfinalized webm here would only
+    # produce a broken last-resort recording (SKY-11086). Skip it entirely for session runs.
+    video_artifacts = [VideoArtifact(video_path="/tmp/recording.webm", video_data=b"partial-video")]
+    browser_state = _browser_state(video_artifacts)
+    get_video = AsyncMock(return_value=video_artifacts)
+    create_artifact = AsyncMock()
+
+    with (
+        patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
+    ):
+        await _code_block()._ensure_run_recording_artifact(
+            browser_state=browser_state,
+            workflow_run_id="wr_1",
+            workflow_run_block_id="wrb_1",
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+        )
+
+    get_video.assert_not_awaited()
+    create_artifact.assert_not_awaited()
+    assert video_artifacts[0].video_artifact_id is None
+
+
+@pytest.mark.asyncio
+async def test_skips_registration_for_pinned_browser_address_run() -> None:
+    # A run pinned to a remote browser via browser_address (no browser_session_id) also keeps its
+    # browser open on completion, so its per-run webm never finalizes — skip registration like a
+    # session run, mirroring close_browser_on_completion. The video is never read.
+    video_artifacts = [VideoArtifact(video_path="/tmp/recording.webm", video_data=b"partial-video")]
+    browser_state = _browser_state(video_artifacts)
+    get_run = AsyncMock(return_value=SimpleNamespace(browser_address="ws://browser.example:9222"))
+    get_video = AsyncMock(return_value=video_artifacts)
+    create_artifact = AsyncMock()
+
+    with (
+        patch(f"{_BLOCK_PATH}.DATABASE.workflow_runs.get_workflow_run", get_run),
+        patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
+    ):
+        await _code_block()._ensure_run_recording_artifact(
+            browser_state=browser_state,
+            workflow_run_id="wr_1",
+            workflow_run_block_id="wrb_1",
+            organization_id="o_1",
+        )
+
+    get_video.assert_not_awaited()
+    create_artifact.assert_not_awaited()
+    assert video_artifacts[0].video_artifact_id is None
 
 
 @pytest.mark.asyncio
@@ -130,6 +188,7 @@ async def test_artifact_failure_is_swallowed() -> None:
     video_artifacts = [VideoArtifact(video_path="/tmp/recording.webm", video_data=b"partial-video")]
     browser_state = _browser_state(video_artifacts)
     get_video = AsyncMock(return_value=video_artifacts)
+    get_run = AsyncMock(return_value=SimpleNamespace(browser_address=None))
     get_block = AsyncMock(
         return_value=SimpleNamespace(workflow_run_block_id="wrb_1", workflow_run_id="wr_1", organization_id="o_1")
     )
@@ -137,6 +196,7 @@ async def test_artifact_failure_is_swallowed() -> None:
 
     with (
         patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.DATABASE.workflow_runs.get_workflow_run", get_run),
         patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
         patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
     ):
@@ -159,11 +219,13 @@ async def test_second_call_skips_re_registration() -> None:
     video_artifacts = [VideoArtifact(video_path="/tmp/recording.webm", video_data=b"partial-video")]
     browser_state = _browser_state(video_artifacts)
     get_video = AsyncMock(return_value=video_artifacts)
+    get_run = AsyncMock(return_value=SimpleNamespace(browser_address=None))
     get_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_1"))
     create_artifact = AsyncMock(return_value="a_recording")
 
     with (
         patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.DATABASE.workflow_runs.get_workflow_run", get_run),
         patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
         patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
     ):
@@ -190,11 +252,13 @@ async def test_registers_when_video_data_not_yet_captured() -> None:
     assert video_artifacts[0].video_data == b""
     browser_state = _browser_state(video_artifacts)
     get_video = AsyncMock(return_value=video_artifacts)
+    get_run = AsyncMock(return_value=SimpleNamespace(browser_address=None))
     get_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_1"))
     create_artifact = AsyncMock(return_value="a_recording")
 
     with (
         patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.DATABASE.workflow_runs.get_workflow_run", get_run),
         patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
         patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
     ):
