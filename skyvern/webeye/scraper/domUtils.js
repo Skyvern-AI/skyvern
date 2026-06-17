@@ -2128,6 +2128,9 @@ async function buildElementTree(
   return [elements, resultArray];
 }
 
+// DEPRECATED: visual bounding box overlay is no longer rendered during scraping.
+// This helper is retained briefly for backwards compatibility and is scheduled
+// for removal; new call sites must not be added.
 function drawBoundingBoxes(elements) {
   // draw a red border around the elements
   DomUtils.clearVisibleClientRectCache();
@@ -2141,6 +2144,9 @@ function drawBoundingBoxes(elements) {
   DomUtils.clearVisibleClientRectCache();
 }
 
+// DEPRECATED: visual bounding box overlay is no longer rendered during scraping.
+// This helper is retained briefly for backwards compatibility and is scheduled
+// for removal; new call sites must not be added.
 async function buildElementsAndDrawBoundingBoxes(
   frame = "main.frame",
   frame_index = undefined,
@@ -2381,6 +2387,9 @@ function addHintMarkersToPage(hintMarkers) {
   document.documentElement.appendChild(parent);
 }
 
+// DEPRECATED: visual bounding box overlay is no longer rendered during scraping.
+// This helper is retained briefly for backwards compatibility and is scheduled
+// for removal; new call sites must not be added.
 function removeBoundingBoxes() {
   var hintMarkerContainer = document.querySelector("#boundingBoxContainer");
   // Avoid Element.prototype.remove(): pages that polyfill it Prototype.js-style
@@ -2406,7 +2415,12 @@ async function safeScrollToTop(
   frame = "main.frame",
   frame_index = undefined,
 ) {
-  removeBoundingBoxes();
+  // The overlay path is deprecated. Skyvern only touches the marker container
+  // it has previously inserted; ``draw_boxes=false`` callers must not mutate
+  // the target page (e.g. an unrelated page-owned ``#boundingBoxContainer``).
+  if (draw_boxes) {
+    removeBoundingBoxes();
+  }
   safeWindowScroll(0, 0);
   if (draw_boxes) {
     await buildElementsAndDrawBoundingBoxes(frame, frame_index);
@@ -2435,9 +2449,12 @@ async function scrollToNextPage(
   frame_index = undefined,
   need_overlap = true,
 ) {
-  // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
-  // return true if there is a next page, false otherwise
-  removeBoundingBoxes();
+  // The overlay path is deprecated. Skyvern only touches the marker container
+  // it has previously inserted; ``draw_boxes=false`` callers must not mutate
+  // the target page (e.g. an unrelated page-owned ``#boundingBoxContainer``).
+  if (draw_boxes) {
+    removeBoundingBoxes();
+  }
   window.scrollBy({
     left: 0,
     top: need_overlap ? window.innerHeight - 200 : window.innerHeight,

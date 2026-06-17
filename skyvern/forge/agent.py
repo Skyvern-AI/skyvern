@@ -3243,11 +3243,13 @@ class ForgeAgent:
             await browser_state.reload_page(degradation=True)
 
         max_screenshot_number = settings.MAX_NUM_SCREENSHOTS
-        draw_boxes = True
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # ``draw_boxes`` is wired through the scrape pipeline as False; the overlay helpers
+        # are retained briefly for backwards compatibility and scheduled for removal.
+        draw_boxes = False
         scroll = True
         if engine in CUA_ENGINES:
             max_screenshot_number = 1
-            draw_boxes = False
             scroll = False
 
         return await browser_state.scrape_website(

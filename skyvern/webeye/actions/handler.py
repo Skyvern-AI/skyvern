@@ -121,6 +121,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     is_download_response,
     normalize_download_filename,
 )
+from skyvern.webeye.main_world_eval import evaluate_in_main_world
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -3282,7 +3283,7 @@ async def handle_execute_js_action(
 ) -> list[ActionResult]:
     import json as _json
 
-    result = await page.evaluate(action.js_code)
+    result = await evaluate_in_main_world(page, action.js_code)
     if result is None:
         return [ActionSuccess(data="undefined")]
     if isinstance(result, str):

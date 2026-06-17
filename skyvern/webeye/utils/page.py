@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from enum import StrEnum
 from io import BytesIO
@@ -18,6 +19,7 @@ from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
 LOG = structlog.get_logger()
 
@@ -45,6 +47,29 @@ def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Execution context was destroyed" in error_msg:
         return True
     return "ReferenceError" in error_msg and "is not defined" in error_msg
+
+
+def _is_json_inlinable(arg: Any) -> bool:
+    # ElementHandle / JSHandle aren't JSON-serialisable; those must keep
+    # Playwright's own marshalling instead of being inlined into Runtime.evaluate.
+    try:
+        json.dumps(arg)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None) -> Any:
+    # Page + prefix + JSON-safe arg → main-world hook (preserves the marker).
+    # Iframe Frames and non-JSON args fall back to per-frame evaluate so iframe
+    # contexts and Playwright handle-marshalling keep working.
+    if not isinstance(frame, Page):
+        return await frame.evaluate(expression=expression, arg=arg)
+    if get_main_world_prefix(frame.context) is None:
+        return await frame.evaluate(expression=expression, arg=arg)
+    if arg is not None and not _is_json_inlinable(arg):
+        return await frame.evaluate(expression=expression, arg=arg)
+    return await evaluate_in_main_world(frame, expression, arg)
 
 
 async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) -> None:
@@ -178,8 +203,10 @@ async def _scrolling_screenshots_helper(
     frame = "main.frame"
     frame_index = 0
 
-    # when mode is lite, we don't draw bounding boxes
-    # since draw_boxes impacts the performance of processing
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # ``draw_boxes`` is False by default for all scrape callers; the ``if draw_boxes:``
+    # branches below are retained briefly for backwards compatibility and are
+    # scheduled for removal. The LITE-mode override is kept as a defensive guard.
     if mode == ScreenshotMode.LITE:
         draw_boxes = False
 
@@ -288,8 +315,21 @@ class SkyvernFrame:
     ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
-                return await frame.evaluate(expression=expression, arg=arg)
+                return await _dispatch_evaluate(frame, expression, arg)
         except PlaywrightError as e:
+            error_msg = str(e)
+            if not _is_navigation_context_lost(error_msg):
+                raise
+            return await SkyvernFrame._evaluate_with_navigation_recovery(
+                frame=frame,
+                expression=expression,
+                arg=arg,
+                timeout_ms=timeout_ms,
+                initial_error=error_msg,
+            )
+        except RuntimeError as e:
+            # `evaluate_in_main_world` raises RuntimeError on Runtime.evaluate
+            # exception payloads; only navigation-context-lost text recovers here.
             error_msg = str(e)
             if not _is_navigation_context_lost(error_msg):
                 raise
@@ -351,14 +391,16 @@ class SkyvernFrame:
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(inject_budget):
-                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
+                    # Same dispatch helper so a prefixed Page re-injects
+                    # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
+                    await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
             except asyncio.TimeoutError:
                 LOG.exception(
                     "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
                     expression=expression,
                 )
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
-            except PlaywrightError as inject_err:
+            except (PlaywrightError, RuntimeError) as inject_err:
                 last_error_msg = str(inject_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
                     LOG.warning(
@@ -377,11 +419,11 @@ class SkyvernFrame:
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    return await frame.evaluate(expression=expression, arg=arg)
+                    return await _dispatch_evaluate(frame, expression, arg)
             except asyncio.TimeoutError:
                 LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
-            except PlaywrightError as retry_err:
+            except (PlaywrightError, RuntimeError) as retry_err:
                 last_error_msg = str(retry_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
                     raise
