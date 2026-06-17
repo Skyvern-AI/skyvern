@@ -264,9 +264,9 @@ function SideNav({ collapsed }: Props = {}) {
       icon: <GearIcon className="size-4" />,
       children: [
         {
-          label: "API Keys",
-          to: "/settings?section=api-keys",
-          icon: <KeyIcon className="size-3.5" />,
+          label: "General",
+          to: "/settings",
+          icon: <GearIcon className="size-3.5" />,
         },
       ],
     },
