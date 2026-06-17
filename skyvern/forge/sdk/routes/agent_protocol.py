@@ -1591,6 +1591,16 @@ async def _apply_tag_changes_with_retry(
             )
 
 
+async def require_workflow_tagging(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    if not await app.AGENT_FUNCTION.is_workflow_tagging_enabled(current_org.organization_id):
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Workflow tagging is not enabled for this organization.",
+        )
+
+
 @legacy_base_router.post(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
@@ -1619,6 +1629,7 @@ async def apply_workflow_tags(
     workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
     data: TagApplyRequest = Body(...),
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> TagsResponse:
     analytics.capture("skyvern-oss-workflow-tags-apply")
     organization_id = caller.organization.organization_id
@@ -1677,6 +1688,7 @@ async def delete_workflow_tag(
     workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
     key: str = Path(..., description="Tag key to delete", examples=["env"]),
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> TagsResponse:
     analytics.capture("skyvern-oss-workflow-tags-delete")
     organization_id = caller.organization.organization_id
@@ -1723,6 +1735,7 @@ async def delete_workflow_tag(
 async def get_workflow_tags(
     workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> TagsResponse:
     organization_id = current_org.organization_id
     await _assert_workflow_in_org(workflow_permanent_id, organization_id)
@@ -1776,6 +1789,7 @@ async def get_workflow_tag_history(
     since: datetime | None = Query(None, description="Only return events at or after this timestamp"),
     key: str | None = Query(None, description="Filter to events for a single tag key"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> TagHistoryResponse:
     organization_id = current_org.organization_id
     await _assert_workflow_in_org(workflow_permanent_id, organization_id)
@@ -1806,6 +1820,7 @@ async def get_workflow_tag_history(
 @base_router.get("/tag-keys/", response_model=list[TagKey], include_in_schema=False)
 async def list_tag_keys(
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> list[TagKey]:
     organization_id = current_org.organization_id
     rows = await app.DATABASE.tags.list_tag_keys(organization_id=organization_id)
@@ -1833,6 +1848,7 @@ async def update_tag_key(
     key: str = Path(..., description="Tag key to update"),
     data: TagKeyUpdate = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> TagKey:
     _validate_path_key(key)
     organization_id = current_org.organization_id
@@ -1868,6 +1884,7 @@ async def update_tag_key(
 async def delete_tag_key(
     key: str = Path(..., description="Tag key to delete", examples=["env"]),
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> TagKeyDeleteResponse:
     analytics.capture("skyvern-oss-tag-key-delete")
     _validate_path_key(key)
@@ -1971,6 +1988,7 @@ async def batch_get_workflow_tags(
         examples=["wpid_123,wpid_456"],
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> WorkflowTagsBatchResponse:
     wpids = _parse_batch_wpids(workflow_permanent_ids)
     if len(wpids) > _BATCH_TAGS_MAX_WPIDS:
@@ -2002,6 +2020,7 @@ async def batch_get_workflow_tags(
 async def batch_get_workflow_tags_post(
     data: WorkflowTagsBatchRequest = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> WorkflowTagsBatchResponse:
     wpids = [wpid.strip() for wpid in data.workflow_permanent_ids if wpid and wpid.strip()]
     if len(wpids) > _BATCH_TAGS_MAX_WPIDS:

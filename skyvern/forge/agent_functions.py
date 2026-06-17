@@ -514,6 +514,10 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
+        """OSS always-on; cloud overrides to gate per-org for staged rollout."""
+        return True
+
     async def get_analytics_warmable_organization_ids(self, statement_timeout_seconds: int = 10) -> list[str]:
         """Return org IDs whose analytics summary cache should be kept warm.
 
