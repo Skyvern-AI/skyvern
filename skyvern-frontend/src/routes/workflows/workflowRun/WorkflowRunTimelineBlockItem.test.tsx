@@ -204,7 +204,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     });
   });
 
-  it("renders child blocks but not action rows under a non-code container block", () => {
+  it("renders child blocks and action rows under a non-code container block", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_container_with_actions",
       block_type: "conditional",
@@ -236,15 +236,13 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    // The nested child block is still revealed...
     expect(screen.getByText("Next step")).toBeDefined();
-    // ...but a non-code block never surfaces its own actions as rows.
     expect(
-      screen.queryByText(/Extract the condition result from the page/),
-    ).toBeNull();
+      screen.getByText(/Extract the condition result from the page/),
+    ).toBeDefined();
   });
 
-  it("does not render action rows under a non-code leaf block but keeps the count badge", () => {
+  it("renders action rows under a non-code leaf block and lets the user select an action", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({
       workflow_run_block_id: "wrb_login_actions",
@@ -272,13 +270,17 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    // The block still advertises how many actions it ran...
     expect(screen.getByText("1 action")).toBeDefined();
-    // ...but those actions are not surfaced as rows in the timeline rail.
     expect(
-      screen.queryByText(/Click the login link in the top navigation/),
-    ).toBeNull();
-    expect(onActionClick).not.toHaveBeenCalled();
+      screen.getByText(/Click the login link in the top navigation/),
+    ).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: /#1/i }));
+
+    expect(onActionClick).toHaveBeenCalledWith({
+      block,
+      action: expect.objectContaining({ action_id: "act_login_click" }),
+    });
   });
 
   it("renders loop iterations from first to last", () => {
@@ -505,7 +507,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText(/ValueError: boom · line 7/)).toBeDefined();
   });
 
-  it("does not render action rows for a non-code block even when output carries line metadata", () => {
+  it("renders non-code action rows without code line metadata", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_task_null_action",
       block_type: "task_v2",
@@ -533,9 +535,9 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(screen.queryByText("Screenshot")).toBeNull();
+    expect(screen.getByText("Screenshot")).toBeDefined();
     expect(screen.queryByText("Error")).toBeNull();
-    expect(screen.queryByText(/Capture failed/)).toBeNull();
+    expect(screen.getByText(/Capture failed/)).toBeDefined();
     expect(screen.queryByText(/line 5/)).toBeNull();
   });
 

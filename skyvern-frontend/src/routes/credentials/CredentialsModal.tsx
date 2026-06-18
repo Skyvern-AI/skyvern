@@ -14,16 +14,21 @@ import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
+import {
+  CreditCardCredentialContent,
+  type CreditCardCredentialValues,
+} from "./CreditCardCredentialContent";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  CreateCredentialRequest,
-  CredentialApiResponse,
+  type CreateCredentialRequest,
+  type CreditCardBillingAddress,
+  type CreditCardCredential,
+  type CredentialApiResponse,
   isPasswordCredential,
   isCreditCardCredential,
   isSecretCredential,
-  TestCredentialStatusResponse,
-  TestLoginResponse,
+  type TestCredentialStatusResponse,
+  type TestLoginResponse,
 } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -54,14 +59,27 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   totp_identifier: "",
 };
 
-const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
-  name: "",
-  cardNumber: "",
-  cardExpirationDate: "",
-  cardCode: "",
-  cardBrand: "",
-  cardHolderName: "",
-};
+function createCreditCardCredentialInitialValues(): CreditCardCredentialValues {
+  return {
+    name: "",
+    cardNumber: "",
+    cardExpirationDate: "",
+    cardCode: "",
+    cardBrand: "",
+    cardHolderName: "",
+    billingAddressLine1: "",
+    billingAddressLine2: "",
+    billingCity: "",
+    billingState: "",
+    billingStateCode: "",
+    billingPostalCode: "",
+    billingCountry: "",
+    billingCountryCode: "",
+    billingEmail: "",
+    billingPhone: "",
+    metadata: [{ key: "", value: "" }],
+  };
+}
 
 const SECRET_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -99,6 +117,60 @@ function generateDefaultCredentialName(existingNames: string[]): string {
   }
 
   return `${baseName}_${counter}`;
+}
+
+function trimmedOrNull(value: string) {
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function buildBillingAddress(
+  values: CreditCardCredentialValues,
+): CreditCardBillingAddress | null {
+  const billingAddress: CreditCardBillingAddress = {};
+
+  const line1 = trimmedOrNull(values.billingAddressLine1);
+  const line2 = trimmedOrNull(values.billingAddressLine2);
+  const city = trimmedOrNull(values.billingCity);
+  const state = trimmedOrNull(values.billingState);
+  const stateCode = trimmedOrNull(values.billingStateCode);
+  const postalCode = trimmedOrNull(values.billingPostalCode);
+  const country = trimmedOrNull(values.billingCountry);
+  const countryCode = trimmedOrNull(values.billingCountryCode);
+
+  if (line1) billingAddress.line1 = line1;
+  if (line2) billingAddress.line2 = line2;
+  if (city) billingAddress.city = city;
+  if (state) billingAddress.state = state;
+  if (stateCode) billingAddress.state_code = stateCode;
+  if (postalCode) billingAddress.postal_code = postalCode;
+  if (country) billingAddress.country = country;
+  if (countryCode) billingAddress.country_code = countryCode;
+
+  return Object.keys(billingAddress).length > 0 ? billingAddress : null;
+}
+
+function buildMetadata(values: CreditCardCredentialValues) {
+  const metadata: Record<string, string> = {};
+  let hasIncompleteEntry = false;
+
+  for (const entry of values.metadata) {
+    const key = entry.key.trim();
+    const value = entry.value.trim();
+    if (!key && !value) {
+      continue;
+    }
+    if (!key || !value) {
+      hasIncompleteEntry = true;
+      continue;
+    }
+    metadata[key] = value;
+  }
+
+  return {
+    metadata: Object.keys(metadata).length > 0 ? metadata : null,
+    hasIncompleteEntry,
+  };
 }
 
 type Props = {
@@ -151,7 +223,7 @@ function CredentialsModal({
     PASSWORD_CREDENTIAL_INITIAL_VALUES,
   );
   const [creditCardCredentialValues, setCreditCardCredentialValues] = useState(
-    CREDIT_CARD_CREDENTIAL_INITIAL_VALUES,
+    createCreditCardCredentialInitialValues,
   );
   const [secretCredentialValues, setSecretCredentialValues] = useState(
     SECRET_CREDENTIAL_INITIAL_VALUES,
@@ -290,6 +362,7 @@ function CredentialsModal({
         });
       } else if (isCreditCardCredential(cred)) {
         setCreditCardCredentialValues({
+          ...createCreditCardCredentialInitialValues(),
           name: editingCredential.name,
           cardNumber: "",
           cardExpirationDate: "",
@@ -330,7 +403,7 @@ function CredentialsModal({
   function reset() {
     setVaultType("default");
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
-    setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
+    setCreditCardCredentialValues(createCreditCardCredentialInitialValues());
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
     setEditingGroups({ name: false, values: false });
     setTestAndSave(false);
@@ -909,17 +982,40 @@ function CredentialsModal({
       }
       // remove all spaces from the card number
       const number = creditCardCredentialValues.cardNumber.replace(/\s/g, "");
+      const billingAddress = buildBillingAddress(creditCardCredentialValues);
+      const billingEmail = trimmedOrNull(
+        creditCardCredentialValues.billingEmail,
+      );
+      const billingPhone = trimmedOrNull(
+        creditCardCredentialValues.billingPhone,
+      );
+      const { metadata, hasIncompleteEntry } = buildMetadata(
+        creditCardCredentialValues,
+      );
+      if (hasIncompleteEntry) {
+        toast({
+          title: "Error",
+          description: "Metadata rows need both a key and a value",
+          variant: "destructive",
+        });
+        return;
+      }
+      const credentialPayload: CreditCardCredential = {
+        card_number: number,
+        card_cvv: cardCode,
+        card_exp_month: cardExpirationMonth,
+        card_exp_year: cardExpirationYear,
+        card_brand: cardBrand,
+        card_holder_name: cardHolderName,
+        ...(billingAddress ? { billing_address: billingAddress } : {}),
+        ...(billingEmail ? { billing_email: billingEmail } : {}),
+        ...(billingPhone ? { billing_phone: billingPhone } : {}),
+        ...(metadata ? { metadata } : {}),
+      };
       activeMutation.mutate({
         name,
         credential_type: "credit_card",
-        credential: {
-          card_number: number,
-          card_cvv: cardCode,
-          card_exp_month: cardExpirationMonth,
-          card_exp_year: cardExpirationYear,
-          card_brand: cardBrand,
-          card_holder_name: cardHolderName,
-        },
+        credential: credentialPayload,
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     } else if (type === CredentialModalTypes.SECRET) {

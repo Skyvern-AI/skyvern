@@ -1,27 +1,51 @@
 import { DropdownWithOptions } from "@/components/DropdownWithOptions";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/util/utils";
-import { Pencil1Icon } from "@radix-ui/react-icons";
+import { Pencil1Icon, PlusIcon, TrashIcon } from "@radix-ui/react-icons";
+
+export type CreditCardMetadataEntry = {
+  key: string;
+  value: string;
+};
+
+export type CreditCardCredentialValues = {
+  name: string;
+  cardNumber: string;
+  cardExpirationDate: string;
+  cardCode: string;
+  cardBrand: string;
+  cardHolderName: string;
+  billingAddressLine1: string;
+  billingAddressLine2: string;
+  billingCity: string;
+  billingState: string;
+  billingStateCode: string;
+  billingPostalCode: string;
+  billingCountry: string;
+  billingCountryCode: string;
+  billingEmail: string;
+  billingPhone: string;
+  metadata: CreditCardMetadataEntry[];
+};
+
+type BillingFieldKey =
+  | "billingAddressLine1"
+  | "billingAddressLine2"
+  | "billingCity"
+  | "billingState"
+  | "billingStateCode"
+  | "billingPostalCode"
+  | "billingCountry"
+  | "billingCountryCode"
+  | "billingEmail"
+  | "billingPhone";
 
 type Props = {
-  values: {
-    name: string;
-    cardNumber: string;
-    cardExpirationDate: string;
-    cardCode: string;
-    cardBrand: string;
-    cardHolderName: string;
-  };
-  onChange: (values: {
-    name: string;
-    cardNumber: string;
-    cardExpirationDate: string;
-    cardCode: string;
-    cardBrand: string;
-    cardHolderName: string;
-  }) => void;
+  values: CreditCardCredentialValues;
+  onChange: (values: CreditCardCredentialValues) => void;
   /** Slot rendered right after Name, before the separator */
   beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
@@ -43,6 +67,54 @@ const brandOptions = [
   "Other",
 ];
 
+const billingFields: Array<{
+  label: string;
+  key: BillingFieldKey;
+  autoComplete?: string;
+  className?: string;
+}> = [
+  {
+    label: "Address Line 1",
+    key: "billingAddressLine1",
+    autoComplete: "billing address-line1",
+    className: "md:col-span-3",
+  },
+  {
+    label: "Address Line 2",
+    key: "billingAddressLine2",
+    autoComplete: "billing address-line2",
+    className: "md:col-span-3",
+  },
+  { label: "City", key: "billingCity", autoComplete: "billing address-level2" },
+  {
+    label: "State",
+    key: "billingState",
+    autoComplete: "billing address-level1",
+  },
+  { label: "State Code", key: "billingStateCode" },
+  {
+    label: "Postal Code",
+    key: "billingPostalCode",
+    autoComplete: "billing postal-code",
+  },
+  {
+    label: "Country",
+    key: "billingCountry",
+    autoComplete: "billing country-name",
+  },
+  {
+    label: "Country Code",
+    key: "billingCountryCode",
+    autoComplete: "billing country",
+  },
+  {
+    label: "Billing Email",
+    key: "billingEmail",
+    autoComplete: "billing email",
+  },
+  { label: "Billing Phone", key: "billingPhone", autoComplete: "billing tel" },
+];
+
 function formatCardNumber(cardNumber: string) {
   // put spaces every 4 digits
   return cardNumber.replace(/(\d{4})(?=\d)/g, "$1 ");
@@ -51,6 +123,27 @@ function formatCardNumber(cardNumber: string) {
 function formatCardExpirationDate(cardExpirationDate: string) {
   // put a slash between the month and year
   return cardExpirationDate.replace(/(\d{2})(?=\d)/g, "$1/");
+}
+
+function updateMetadataEntry(
+  entries: CreditCardMetadataEntry[],
+  index: number,
+  field: keyof CreditCardMetadataEntry,
+  value: string,
+) {
+  return entries.map((entry, entryIndex) =>
+    entryIndex === index ? { ...entry, [field]: value } : entry,
+  );
+}
+
+function removeMetadataEntry(
+  entries: CreditCardMetadataEntry[],
+  index: number,
+) {
+  if (entries.length <= 1) {
+    return [{ key: "", value: "" }];
+  }
+  return entries.filter((_, entryIndex) => entryIndex !== index);
 }
 
 function CreditCardCredentialContent({
@@ -64,6 +157,7 @@ function CreditCardCredentialContent({
 }: Props) {
   const nameReadOnly = editMode && !editingGroups?.name;
   const valuesReadOnly = editMode && !editingGroups?.values;
+  const optionalFieldClassName = cn({ "opacity-70": valuesReadOnly });
 
   return (
     <div className="space-y-4">
@@ -219,6 +313,106 @@ function CreditCardCredentialContent({
               maxLength={4}
             />
           )}
+        </div>
+      </div>
+      <Separator />
+      <div className="space-y-3">
+        <div className="text-sm font-medium">Billing Details</div>
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+          {billingFields.map((field) => (
+            <div className={cn("space-y-2", field.className)} key={field.key}>
+              <Label>{field.label}</Label>
+              <Input
+                value={values[field.key]}
+                onChange={(e) =>
+                  onChange({ ...values, [field.key]: e.target.value })
+                }
+                readOnly={valuesReadOnly}
+                className={optionalFieldClassName}
+                autoComplete={field.autoComplete}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-medium">Metadata</div>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={valuesReadOnly}
+            onClick={() =>
+              onChange({
+                ...values,
+                metadata: [...values.metadata, { key: "", value: "" }],
+              })
+            }
+          >
+            <PlusIcon className="mr-1.5 size-4" />
+            Add
+          </Button>
+        </div>
+        <div className="space-y-2">
+          {values.metadata.map((entry, index) => (
+            <div
+              className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] gap-2"
+              key={index}
+            >
+              <Input
+                value={entry.key}
+                onChange={(e) =>
+                  onChange({
+                    ...values,
+                    metadata: updateMetadataEntry(
+                      values.metadata,
+                      index,
+                      "key",
+                      e.target.value,
+                    ),
+                  })
+                }
+                readOnly={valuesReadOnly}
+                className={optionalFieldClassName}
+                placeholder="Key"
+                aria-label={`Metadata key ${index + 1}`}
+              />
+              <Input
+                value={entry.value}
+                onChange={(e) =>
+                  onChange({
+                    ...values,
+                    metadata: updateMetadataEntry(
+                      values.metadata,
+                      index,
+                      "value",
+                      e.target.value,
+                    ),
+                  })
+                }
+                readOnly={valuesReadOnly}
+                className={optionalFieldClassName}
+                placeholder="Value"
+                aria-label={`Metadata value ${index + 1}`}
+              />
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                disabled={valuesReadOnly}
+                onClick={() =>
+                  onChange({
+                    ...values,
+                    metadata: removeMetadataEntry(values.metadata, index),
+                  })
+                }
+                aria-label={`Remove metadata row ${index + 1}`}
+              >
+                <TrashIcon className="size-4" />
+              </Button>
+            </div>
+          ))}
         </div>
       </div>
     </div>
