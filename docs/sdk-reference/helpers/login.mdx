@@ -48,7 +48,7 @@ console.log(result.status);
 | `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the login finishes. |
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
-| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `totp_url` | `str` | No | `None` | Endpoint Skyvern polls to fetch TOTP codes. |
 | `wait_for_completion` (Python) / `waitForCompletion` (TS) | `bool` | No | `False` | Block until the login finishes. |
 | `timeout` | `float` | No | `1800` | Max wait time in seconds. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |

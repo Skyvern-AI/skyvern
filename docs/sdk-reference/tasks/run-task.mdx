@@ -54,7 +54,7 @@ console.log(result.output);
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
 | `error_code_mapping` | `dict[str, str]` | No | `None` | Map custom error codes to failure reasons. |
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
-| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `totp_url` | `str` | No | `None` | Endpoint Skyvern polls to fetch TOTP codes. |
 | `title` | `str` | No | `None` | Display name for this run in the dashboard. |
 | `model` | `dict` | No | `None` | Override the output model definition. |
 | `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
