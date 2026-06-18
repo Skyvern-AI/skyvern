@@ -788,12 +788,18 @@ def synthesize_code_block(
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
         # Awaiting the download value lands the file in the run-scoped downloads dir; the execution-layer
         # dir-diff registers the single file, so the synthesizer never save_as (which would double-register).
+        # Return a JSON-safe filename summary too; artifact IDs/URLs are injected by the execution layer.
         download_var = _unique_key(_DOWNLOAD_VAR_BASE, used_download_vars)
         download_obj = _unique_key(f"{download_var}_file", used_download_vars)
+        download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
         lines.append(f"{_INDENT}async with page.expect_download() as {download_var}:")
         lines.append(f"{_INDENT * 2}await page.locator({_py_str(reached_download_target.selector)}).click()")
         lines.append(f"{_INDENT}{download_obj} = await {download_var}.value")
+        lines.append(f"{_INDENT}{download_filename} = {download_obj}.suggested_filename")
         lines.append(f"{_INDENT}await {download_obj}.path()")
+        lines.append(f"{_INDENT}return {{")
+        lines.append(f'{_INDENT * 2}"downloaded_file_name": {download_filename},')
+        lines.append(f"{_INDENT}}}")
 
     if not lines:
         return None

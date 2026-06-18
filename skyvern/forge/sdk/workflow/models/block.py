@@ -4274,6 +4274,8 @@ async def wrapper({default_args}):
             downloaded_files,
             current_context.loop_internal_state if current_context else None,
         )
+        if downloaded_files and not isinstance(result, dict):
+            result = {"value": result} if result is not None else {}
         if downloaded_files and isinstance(result, dict):
             result["downloaded_files"] = [fi.model_dump() for fi in downloaded_files]
             result["downloaded_file_urls"] = [fi.url for fi in downloaded_files]
