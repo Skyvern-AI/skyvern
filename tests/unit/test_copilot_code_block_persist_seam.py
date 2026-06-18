@@ -671,6 +671,31 @@ class TestCompiledAuthoringImposition:
         assert "async with page.expect_download()" in block["code"]
 
     @pytest.mark.asyncio
+    async def test_reached_download_target_still_imposes_after_prior_update_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._download_ctx()
+        ctx.update_workflow_called = True
+        submitted = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        block = _single_code_block(parse_workflow_yaml(ctx.workflow_yaml))
+        assert "async with page.expect_download()" in block["code"]
+
+    @pytest.mark.asyncio
     async def test_imposition_carries_reached_download_target_to_synthesized_code(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -712,6 +737,79 @@ class TestCompiledAuthoringImposition:
         block = _single_code_block(parsed)
         assert "expect_download" in block["code"]
         assert 'await page.locator("[href=\\"/files/report.pdf\\"]").click()' in block["code"]
+
+    def test_imposition_targets_synthesized_label_in_multi_code_workflow(self) -> None:
+        ctx = self._download_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: summarize_statement
+                code: |
+                  return {"status": "ready"}
+              - block_type: code
+                label: scout_synthesized_browser_steps
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        blocks = {str(block.get("label")): block for block in workflow_blocks(parsed)}
+        assert blocks["summarize_statement"]["code"].strip() == 'return {"status": "ready"}'
+        assert "async with page.expect_download()" in blocks["scout_synthesized_browser_steps"]["code"]
+
+    def test_prior_synthesized_label_prevents_unrelated_multi_code_imposition(self) -> None:
+        ctx = self._download_ctx()
+        prior_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: summarize_statement
+                code: |
+                  return {"status": "ready"}
+              - block_type: code
+                label: scout_synthesized_browser_steps
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+        submitted_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: summarize_statement
+                code: |
+                  return {"status": "edited"}
+              - block_type: code
+                label: scout_synthesized_browser_steps
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+        ctx.workflow_yaml = prior_yaml
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted_yaml, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is None
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        blocks = {str(block.get("label")): block for block in workflow_blocks(parsed)}
+        assert blocks["summarize_statement"]["code"].strip() == 'return {"status": "edited"}'
+        assert blocks["scout_synthesized_browser_steps"]["code"].strip() == (
+            'await page.locator("#statement-row").click()'
+        )
 
     @pytest.mark.asyncio
     async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:

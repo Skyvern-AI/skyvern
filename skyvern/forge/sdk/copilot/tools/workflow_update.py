@@ -18,8 +18,11 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_diagnostics
+from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _SYNTHESIZED_BLOCK_LABEL,
+    SynthesisDiagnostics,
     artifact_dependency_id,
     artifact_observation_ref_id,
     synthesize_code_block,
@@ -46,7 +49,11 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    ReachedDownloadTarget,
+    code_is_download_intent,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -689,13 +696,13 @@ def _artifact_id_for_block_label(label: str) -> str:
     return f"code_artifact:{_artifact_label_fragment(label)}"
 
 
-def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None) -> list[str]:
+def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None) -> list[str | CodeBlockSecurityError]:
     """Run the sandbox's static safety rule on new/changed code blocks before any run.
 
     Label-scoped diff so legacy code blocks the model did not touch cannot wedge
     every subsequent update."""
     prior_blocks = _workflow_yaml_code_blocks_by_label(prior_yaml)
-    errors: list[str] = []
+    errors: list[str | CodeBlockSecurityError] = []
     for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items():
         code = str(block.get("code") or "")
         if not code.strip():
@@ -719,6 +726,7 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
                 "code-block parameter keys, `json`, `re`, `html`, `asyncio.sleep`, and its explicit safe helper "
                 "namespace. `Exception` is the only available exception type."
             )
+        errors.extend(author_time_code_security_errors(label=label, code=code))
         unresolved_diagnostics = sandbox_unresolved_name_diagnostics(code, parameter_keys=parameter_keys)
         errors.extend(
             f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
@@ -787,6 +795,52 @@ def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | No
             continue
         return str(prior_block.get("code") or "") != str(block.get("code") or "")
     return True
+
+
+def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
+    target = ctx.reached_download_target
+    return isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip())
+
+
+def _select_synthesized_imposition_code_block(
+    code_blocks: list[dict[str, Any]],
+    *,
+    prior_yaml: str | None,
+) -> dict[str, Any] | None:
+    if len(code_blocks) == 1:
+        return code_blocks[0]
+
+    synthesized_label_matches = [
+        block for block in code_blocks if str(block.get("label") or "").strip() == _SYNTHESIZED_BLOCK_LABEL
+    ]
+    if len(synthesized_label_matches) == 1:
+        synthesized_block = synthesized_label_matches[0]
+        if not code_is_download_intent(str(synthesized_block.get("code") or "")):
+            return synthesized_block
+        return None
+    if synthesized_label_matches:
+        return None
+
+    changed_blocks = [block for block in code_blocks if _submitted_code_block_changed(block, prior_yaml)]
+    if len(changed_blocks) == 1:
+        return changed_blocks[0]
+
+    changed_without_download_intent = [
+        block for block in changed_blocks if not code_is_download_intent(str(block.get("code") or ""))
+    ]
+    if len(changed_without_download_intent) == 1:
+        return changed_without_download_intent[0]
+    return None
+
+
+def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: SynthesisDiagnostics) -> bool:
+    return (
+        dropped.get("reason_code") == "ambiguous_bare_selector"
+        and dropped.get("tool_name") == "click"
+        and dropped.get("trajectory_index") == 0
+        and str(dropped.get("selector") or "").strip() in {"button", "role=button"}
+        and bool(diagnostics.locator_provenance)
+    )
 
 
 def _wrapped_code_ast(code: str) -> ast.AST | None:
@@ -1319,7 +1373,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
-    if getattr(ctx, "update_workflow_called", False):
+    if ctx.update_workflow_called and not _should_impose_after_update_attempt(ctx):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
@@ -1333,19 +1387,19 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     if not isinstance(parsed, dict):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     code_blocks = _workflow_code_blocks(parsed)
-    if len(code_blocks) != 1:
+    prior_source, prior_yaml = _prior_yaml_source(ctx)
+    code_block = _select_synthesized_imposition_code_block(code_blocks, prior_yaml=prior_yaml)
+    if code_block is None:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
-    code_block = code_blocks[0]
     submitted_code = str(code_block.get("code") or "")
 
-    prior_source, prior_yaml = _prior_yaml_source(ctx)
     if not _submitted_code_block_changed(code_block, prior_yaml):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
     synthesized = synthesize_code_block(
         scout_trajectory,
         strict_selectors=True,
-        reached_download_target=getattr(ctx, "reached_download_target", None),
+        reached_download_target=ctx.reached_download_target,
     )
     if synthesized is None:
         return _SynthesizedCodeImpositionResult(
@@ -1358,6 +1412,8 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     if diagnostics.truncated:
         violations.append("Unable to impose synthesized code block: scout trajectory was truncated.")
     for dropped in diagnostics.dropped_interactions:
+        if _is_ignorable_entry_opener_drop(dropped, diagnostics):
+            continue
         reason = str(dropped.get("reason_code") or "unknown")
         tool_name = str(dropped.get("tool_name") or "unknown")
         index = dropped.get("trajectory_index", "?")
@@ -1734,12 +1790,15 @@ def _code_uses_expect_download(code: str) -> bool:
 def _dict_keys(node: ast.expr) -> set[str]:
     if isinstance(node, ast.Await):
         return _dict_keys(node.value)
-    if not isinstance(node, ast.Dict):
-        return set()
-    return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+    if isinstance(node, ast.Dict):
+        return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict" and not node.args:
+        return {keyword.arg for keyword in node.keywords if keyword.arg is not None}
+    return set()
 
 
 _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+_DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET = frozenset({"downloaded_file_path", "download_url"})
 
 
 def _code_returns_registration_keys(code: str) -> bool:
@@ -1757,6 +1816,26 @@ def _code_returns_registration_keys(code: str) -> bool:
         if isinstance(node, ast.Assign):
             if _dict_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
                 return True
+    return False
+
+
+def _code_returns_download_descriptor_leak_keys(code: str) -> bool:
+    """Detect simple top-level descriptor returns; execution-registered artifacts remain
+    the authoritative download proof."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+    leak_key_locals: set[str] = set()
+    for node in _iter_top_level_scope(tree.body):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if _dict_keys(node.value) & _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET:
+                return True
+            if isinstance(node.value, ast.Name) and node.value.id in leak_key_locals:
+                return True
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if _dict_keys(node.value) & _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET:
+                leak_key_locals.add(node.targets[0].id)
     return False
 
 
@@ -1804,6 +1883,11 @@ def _download_return_shape_error(label: str, artifact: Mapping[str, Any], code: 
             "browser download fires; writing them self-certifies a download that may never have happened. Return a "
             'small keyed descriptor instead (for example `return {"saved_as": dl_info.value.suggested_filename}`) and '
             "let the expect_download idiom register the file."
+        )
+    if _code_returns_download_descriptor_leak_keys(code):
+        return (
+            f"Code block `{label}` returns raw download path/URL descriptor keys. Return only non-sensitive summary "
+            "fields such as the suggested filename; the execution layer injects artifact URLs and IDs."
         )
     return None
 
