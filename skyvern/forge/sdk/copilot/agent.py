@@ -44,13 +44,22 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
-from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    is_optional_dismissal_only_trajectory,
+    render_synthesized_offer_text,
+    synthesize_code_block,
+)
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSnapshot,
     build_turn_state,
     reconcile_completion_criteria,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
+from skyvern.forge.sdk.copilot.config import (
+    SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+    normalize_block_authoring_policy,
+)
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     AgentResult,
@@ -523,11 +532,21 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if ctx.update_workflow_called:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
         return ""
-    if ctx.synthesized_block_offered:
-        LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_offered")
-        return ""
     if not ctx.scout_trajectory:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="empty_trajectory")
+        return ""
+    trajectory_len = len(ctx.scout_trajectory)
+    previous_offer_len = ctx.synthesized_block_offered_trajectory_len
+    if ctx.synthesized_block_offered and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD:
+        LOG.debug(
+            "copilot_synthesized_block_offer_skipped",
+            reason="already_offered",
+            previous_trajectory_len=previous_offer_len,
+            trajectory_len=trajectory_len,
+        )
+        return ""
+    if is_optional_dismissal_only_trajectory(ctx.scout_trajectory):
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="optional_dismissal_only")
         return ""
     synthesized = synthesize_code_block(ctx.scout_trajectory, reached_download_target=ctx.reached_download_target)
     if synthesized is None:
@@ -538,9 +557,11 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         )
         return ""
     ctx.synthesized_block_offered = True
+    ctx.synthesized_block_offered_trajectory_len = trajectory_len
     LOG.info(
         "copilot_synthesized_block_offer_rendered",
-        trajectory_len=len(ctx.scout_trajectory),
+        trajectory_len=trajectory_len,
+        previous_trajectory_len=previous_offer_len,
         code_len=len(synthesized.code),
     )
     goal = ctx.block_goal_main_goal or ctx.user_message or ""

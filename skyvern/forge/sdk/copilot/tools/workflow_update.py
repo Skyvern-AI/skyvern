@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
+import keyword
 import re
 import textwrap
+import tokenize
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -420,7 +423,15 @@ def _normalize_code_artifact_metadata_detailed(
             )
         )
         block_code = str(code_blocks[label].get("code") or "")
-        return_shape_error = _extraction_return_shape_error(label, dumped, block_code)
+        require_declared_output = impose_defaults and (
+            len(code_blocks) == 1 or _block_declares_output_intent(code_blocks[label])
+        )
+        return_shape_error = _extraction_return_shape_error(
+            label,
+            dumped,
+            block_code,
+            require_declared_output=require_declared_output,
+        )
         if return_shape_error is not None:
             item_violations.append(return_shape_error)
         schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
@@ -736,9 +747,150 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
 
 def _code_block_parameter_keys(block: Mapping[str, Any]) -> frozenset[str]:
     raw_keys = block.get("parameter_keys")
-    if not isinstance(raw_keys, list):
-        return frozenset()
-    return frozenset(key for key in raw_keys if isinstance(key, str) and key)
+    keys = {key for key in raw_keys if isinstance(key, str) and key} if isinstance(raw_keys, list) else set()
+    # Synthesized blocks may submit full parameter rows before the persist seam
+    # re-derives them into `parameter_keys`, so validate both sources.
+    raw_parameters = block.get("parameters")
+    if isinstance(raw_parameters, list):
+        keys.update(
+            str(parameter.get("key") or "").strip()
+            for parameter in raw_parameters
+            if isinstance(parameter, Mapping) and str(parameter.get("key") or "").strip()
+        )
+    return frozenset(keys)
+
+
+def _conflict_marker_for_line(line: str) -> str | None:
+    # Match marker text after incidental whitespace, while callers decide
+    # whether indented markers are valid YAML string content for their surface.
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if stripped == "=======":
+        return stripped
+    for prefix in ("<<<<<<<", ">>>>>>>"):
+        if stripped == prefix or stripped.startswith(f"{prefix} "):
+            return stripped
+    return None
+
+
+def _raw_workflow_yaml_conflict_marker_error(workflow_yaml: str) -> str | None:
+    for line_number, line in enumerate(workflow_yaml.splitlines(), start=1):
+        marker = _conflict_marker_for_line(line)
+        if marker is not None and line == line.lstrip():
+            return (
+                f"Workflow YAML contains unresolved conflict marker `{marker}` on line {line_number}. "
+                "Remove every git conflict marker line and submit valid workflow YAML before retrying."
+            )
+    return None
+
+
+def _declared_workflow_parameter_keys(parsed: dict[str, Any]) -> set[str] | None:
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return set()
+    parameters = workflow_definition.get("parameters")
+    if parameters is None:
+        return set()
+    if not isinstance(parameters, list):
+        return None
+    return {
+        str(parameter.get("key") or "").strip()
+        for parameter in parameters
+        if isinstance(parameter, Mapping) and str(parameter.get("key") or "").strip()
+    }
+
+
+_ORDERED_CHILD_BLOCK_LIST_KEYS = ("loop_blocks", "blocks")
+_ORDERED_BRANCH_LIST_KEYS = ("branch_conditions", "branches", "ordered_branches")
+
+
+def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return None
+    declared_parameter_keys = _declared_workflow_parameter_keys(parsed)
+    if declared_parameter_keys is None:
+        return "Unable to validate code-block parameter keys: workflow_definition.parameters must be a list."
+    registered_download_keys = set(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+
+    errors: list[str] = []
+
+    def block_output_key(block: Mapping[str, Any]) -> str | None:
+        label = str(block.get("label") or "").strip()
+        return f"{label}_output" if label else None
+
+    def check_code_block(block: Mapping[str, Any], available_parameter_keys: set[str]) -> None:
+        label = str(block.get("label") or "").strip() or "unlabeled code block"
+        code = str(block.get("code") or "")
+        for line_number, line in enumerate(code.splitlines(), start=1):
+            marker = _conflict_marker_for_line(line)
+            if marker is not None:
+                errors.append(
+                    f"Code block `{label}` contains unresolved conflict marker `{marker}` on code line "
+                    f"{line_number}. Remove every git conflict marker line before retrying."
+                )
+                break
+        parameter_keys = _code_block_parameter_keys(block)
+        registered_keys = sorted(parameter_keys & registered_download_keys)
+        if registered_keys:
+            joined = ", ".join(f"`{key}`" for key in registered_keys)
+            errors.append(
+                f"Code block `{label}` lists registered download output key(s) {joined} in `parameter_keys`, "
+                "but the execution layer injects registered download output keys only after a browser download "
+                "fires. Remove them from `parameter_keys` and return a small descriptor instead."
+            )
+        undeclared_keys = sorted(parameter_keys - available_parameter_keys - registered_download_keys)
+        if undeclared_keys:
+            joined = ", ".join(f"`{key}`" for key in undeclared_keys)
+            errors.append(
+                f"Code block `{label}` lists undeclared `parameter_keys`: {joined}. Declare each workflow input "
+                "under `workflow_definition.parameters`, use a prior block output key such as "
+                "`<block_label>_output`, or remove stale `parameter_keys` entries before retrying."
+            )
+
+    def visit_branch(branch: Mapping[str, Any], available_parameter_keys: set[str]) -> None:
+        for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
+            # Child scopes inherit known keys without leaking their outputs back into sibling branches.
+            visit_blocks(branch.get(key), set(available_parameter_keys))
+        for branch_key in _ORDERED_BRANCH_LIST_KEYS:
+            branches = branch.get(branch_key)
+            if not isinstance(branches, list):
+                continue
+            for nested_branch in branches:
+                if isinstance(nested_branch, Mapping):
+                    # Branch scopes intentionally isolate output keys from their parent branch.
+                    visit_branch(nested_branch, set(available_parameter_keys))
+
+    def visit_blocks(blocks: Any, available_parameter_keys: set[str]) -> set[str]:
+        if not isinstance(blocks, list):
+            return available_parameter_keys
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
+                check_code_block(block, available_parameter_keys)
+            for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
+                visit_blocks(block.get(key), set(available_parameter_keys))
+            for branch_key in _ORDERED_BRANCH_LIST_KEYS:
+                branches = block.get(branch_key)
+                if not isinstance(branches, list):
+                    continue
+                for branch in branches:
+                    if isinstance(branch, Mapping):
+                        visit_branch(branch, set(available_parameter_keys))
+            output_key = block_output_key(block)
+            if output_key:
+                available_parameter_keys.add(output_key)
+        return available_parameter_keys
+
+    workflow_definition = parsed.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
+    try:
+        visit_blocks(blocks, set(declared_parameter_keys))
+    except RecursionError:
+        return "Workflow YAML nesting is too deep to validate."
+    return "\n".join(errors) if errors else None
 
 
 def _code_seam_rejection_user_summary(*, metadata_rejected: bool, code_rejected: bool) -> str:
@@ -781,6 +933,81 @@ def _workflow_code_blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
         for block in workflow_blocks(parsed)
         if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value
     ]
+
+
+_CODE_OUTPUT_INTENT_RE = re.compile(
+    r"\b(?:extract|output|read\s+back|capture\s+(?:the\s+)?(?:data|fields|values)|return\s+structured)\b",
+    re.I,
+)
+
+
+def _raw_code_artifact_metadata_empty(raw_metadata: Any) -> bool:
+    return raw_metadata in (None, [], {})
+
+
+def _workflow_declares_output_parameter(parsed: Mapping[str, Any]) -> bool:
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, Mapping):
+        return False
+    parameters = definition.get("parameters")
+    if not isinstance(parameters, list):
+        return False
+    return any(
+        isinstance(parameter, Mapping) and _enum_or_string_name(parameter.get("parameter_type")) == "output"
+        for parameter in parameters
+    )
+
+
+def _block_declares_output_intent(block: Mapping[str, Any]) -> bool:
+    text = " ".join(str(block.get(field_name) or "") for field_name in ("prompt", "description", "title", "label"))
+    return bool(_CODE_OUTPUT_INTENT_RE.search(text))
+
+
+def _existing_metadata_covers_output(label: str, existing_metadata: Any) -> bool:
+    if not isinstance(existing_metadata, Mapping):
+        return False
+    metadata = existing_metadata.get(label)
+    return isinstance(metadata, Mapping) and _artifact_declares_goal_values(metadata)
+
+
+def _missing_code_artifact_metadata_error(workflow_yaml: str, ctx: AgentContext, raw_metadata: Any) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, Mapping):
+        return None
+    code_blocks = _workflow_code_blocks(dict(parsed))
+    if not code_blocks:
+        return None
+    has_workflow_output = _workflow_declares_output_parameter(parsed)
+    output_intent_blocks = [block for block in code_blocks if _block_declares_output_intent(block)]
+    if has_workflow_output and not output_intent_blocks and len(code_blocks) == 1:
+        output_intent_blocks = list(code_blocks)
+    labels = [
+        str(block.get("label") or "").strip() or "this code block"
+        for block in (output_intent_blocks if has_workflow_output else code_blocks)
+        if has_workflow_output or _block_declares_output_intent(block)
+    ]
+    if not labels:
+        return None
+    existing_metadata = getattr(ctx, "code_artifact_metadata", None)
+    if _raw_code_artifact_metadata_empty(raw_metadata):
+        missing = [label for label in labels if not _existing_metadata_covers_output(label, existing_metadata)]
+    else:
+        missing = [
+            label
+            for label in labels
+            if not _raw_metadata_covers_output_label(raw_metadata, label, candidate_labels=labels)
+        ]
+    if not missing:
+        return None
+    joined = ", ".join(f"`{label}`" for label in missing)
+    return (
+        f"Code-only browser workflow output block(s) {joined} must pass `code_artifact_metadata` with concrete "
+        "`goal_value_paths` before saving or testing. Include an `extraction_schema` when the user requested "
+        "structured fields, and make the code return a keyed dict/list or expose top-level locals matching those "
+        "goal path roots."
+    )
 
 
 def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | None) -> bool:
@@ -841,6 +1068,73 @@ def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: Syn
         and str(dropped.get("selector") or "").strip() in {"button", "role=button"}
         and bool(diagnostics.locator_provenance)
     )
+
+
+def _submitted_suffix_after_synthesized_code(submitted_code: str, synthesized_code: str) -> str:
+    # Preserve a pure suffix appended after the synthesized steps. Returns empty for
+    # prepended extraction scaffolding; that shape is handled by preserve_submitted_extraction.
+    submitted = textwrap.dedent(submitted_code).strip()
+    synthesized = textwrap.dedent(synthesized_code).strip()
+    if not submitted or not synthesized:
+        return ""
+    if submitted == synthesized:
+        return ""
+    if submitted.startswith(synthesized):
+        suffix = submitted[len(synthesized) :]
+        return textwrap.dedent(suffix).lstrip("\n").rstrip()
+    submitted_lines = submitted_code.strip("\n").splitlines()
+    synthesized_lines = synthesized_code.strip("\n").splitlines()
+    if len(submitted_lines) <= len(synthesized_lines):
+        return ""
+    submitted_prefix = "\n".join(submitted_lines[: len(synthesized_lines)])
+    if textwrap.dedent(submitted_prefix).strip() != textwrap.dedent(synthesized_code).strip():
+        return ""
+    return textwrap.dedent("\n".join(submitted_lines[len(synthesized_lines) :])).lstrip("\n").rstrip()
+
+
+def _raw_metadata_item_mapping(raw_item: Any) -> Mapping[str, Any] | None:
+    if isinstance(raw_item, CodeArtifactMetadata):
+        return raw_item.model_dump(mode="json", exclude_none=True)
+    if isinstance(raw_item, Mapping):
+        return raw_item
+    return None
+
+
+def _raw_metadata_covers_output_label(raw_metadata: Any, label: str, *, candidate_labels: list[str]) -> bool:
+    if not label:
+        return False
+    unlabeled_declares_goal_values = False
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        item_label = str(item.get("block_label") or "").strip()
+        if item_label == label and _artifact_declares_goal_values(item):
+            return True
+        if not item_label and _artifact_declares_goal_values(item):
+            unlabeled_declares_goal_values = True
+    return len(candidate_labels) == 1 and unlabeled_declares_goal_values
+
+
+def _raw_metadata_declares_goal_values_for_block(raw_metadata: Any, label: str) -> bool:
+    if not label:
+        return False
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        item_label = str(item.get("block_label") or "").strip()
+        if item_label and item_label != label:
+            continue
+        if _artifact_declares_goal_values(item):
+            return True
+    return False
+
+
+def _is_submitted_code_synthesized_only(submitted_code: str, synthesized_code: str) -> bool:
+    submitted = textwrap.dedent(submitted_code).strip()
+    synthesized = textwrap.dedent(synthesized_code).strip()
+    return bool(submitted and synthesized and submitted == synthesized)
 
 
 def _wrapped_code_ast(code: str) -> ast.AST | None:
@@ -1250,6 +1544,148 @@ def _submitted_string_parameter_default(
     return candidate, None
 
 
+def _string_parameter_default_value(parameter: Mapping[str, Any]) -> str | None:
+    if _is_credential_parameter(parameter):
+        return None
+    parameter_type = str(parameter.get("parameter_type") or "").lower()
+    workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+    if parameter_type and parameter_type != "workflow":
+        return None
+    if workflow_parameter_type and workflow_parameter_type != "string":
+        return None
+    default_value = parameter.get("default_value")
+    return default_value if isinstance(default_value, str) else None
+
+
+def _matching_string_parameter_key_by_default(
+    parameters: list[Any],
+    *,
+    default_value: str,
+    exclude_key: str,
+) -> str | None:
+    if not default_value or _SECRET_LIKE_LITERAL_RE.search(default_value):
+        return None
+    matches: list[str] = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if not key or key == exclude_key:
+            continue
+        if _string_parameter_default_value(parameter) == default_value:
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _matching_string_parameter_key_by_default_length(
+    parameters: list[Any],
+    *,
+    default_length: int | None,
+    exclude_key: str,
+) -> str | None:
+    if default_length is None or default_length <= 0:
+        return None
+    matches: list[str] = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if not key or key == exclude_key:
+            continue
+        default_value = _string_parameter_default_value(parameter)
+        if not default_value or _SECRET_LIKE_LITERAL_RE.search(default_value):
+            continue
+        if len(default_value) == default_length:
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _drop_parameter_key(parameters: list[Any], key: str) -> None:
+    parameters[:] = [
+        parameter
+        for parameter in parameters
+        if not (isinstance(parameter, dict) and str(parameter.get("key") or "").strip() == key)
+    ]
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _replace_python_identifier(source: str, old: str, new: str) -> str:
+    if old == new:
+        return source
+    if not _is_python_identifier(old):
+        return source
+    try:
+        tokens = [
+            token._replace(string=new) if token.type == tokenize.NAME and token.string == old else token
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        ]
+        replaced = tokenize.untokenize(tokens)
+        ast.parse(replaced)
+    except (SyntaxError, tokenize.TokenError):
+        return source
+    return replaced
+
+
+def _is_python_identifier(value: str) -> bool:
+    return value.isidentifier() and not keyword.iskeyword(value)
+
+
+def _combined_string_default_expression(
+    parameters: list[Any],
+    *,
+    synthesized_default: str,
+    typed_length: int | None,
+) -> tuple[list[str], str] | None:
+    if not synthesized_default and typed_length is None:
+        return None
+
+    candidates: list[tuple[str, str]] = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if not _is_python_identifier(key):
+            continue
+        default_value = _string_parameter_default_value(parameter)
+        if not default_value or _SECRET_LIKE_LITERAL_RE.search(default_value):
+            continue
+        candidates.append((key, default_value))
+
+    matches: list[tuple[list[str], str]] = []
+    for first_index, (first_key, first_default) in enumerate(candidates):
+        for last_key, last_default in candidates[first_index + 1 :]:
+            combined_default = f"{first_default} {last_default}".strip()
+            if synthesized_default:
+                if combined_default != synthesized_default:
+                    continue
+            elif len(combined_default) != typed_length:
+                continue
+            matches.append(([first_key, last_key], f'(str({first_key}) + " " + str({last_key}))'))
+    if len(matches) > 1:
+        LOG.debug(
+            "copilot_synthesized_parameter_combined_default_ambiguous",
+            match_count=len(matches),
+            synthesized_default_present=bool(synthesized_default),
+            typed_length=typed_length,
+        )
+        return None
+    return matches[0] if matches else None
+
+
+class _SynthesizedParameterReconciliation(NamedTuple):
+    parameter_keys: list[str]
+    violations: list[str]
+    aliases: dict[str, str]
+    expressions: dict[str, str]
+
+
 def _reconcile_synthesized_parameters(
     *,
     parsed: dict[str, Any],
@@ -1257,16 +1693,20 @@ def _reconcile_synthesized_parameters(
     submitted_code: str,
     synthesized_parameters: list[dict[str, str]],
     scout_trajectory: list[ScoutedInteraction],
-) -> tuple[list[str], list[str]]:
+) -> _SynthesizedParameterReconciliation:
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
-        return [], ["Unable to bind synthesized parameters: workflow_definition is missing."]
+        return _SynthesizedParameterReconciliation(
+            [], ["Unable to bind synthesized parameters: workflow_definition is missing."], {}, {}
+        )
     parameters = workflow_definition.get("parameters")
     if parameters is None:
         parameters = []
         workflow_definition["parameters"] = parameters
     if not isinstance(parameters, list):
-        return [], ["Unable to bind synthesized parameters: workflow_definition.parameters must be a list."]
+        return _SynthesizedParameterReconciliation(
+            [], ["Unable to bind synthesized parameters: workflow_definition.parameters must be a list."], {}, {}
+        )
 
     existing_by_key = {
         str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
@@ -1274,6 +1714,8 @@ def _reconcile_synthesized_parameters(
     existing_credentials = credential_params(parameters)
     parameter_keys: list[str] = []
     violations: list[str] = []
+    aliases: dict[str, str] = {}
+    expressions: dict[str, str] = {}
     non_credential_synthesized = [param for param in synthesized_parameters if not param.get("credential_id")]
     typed_lengths = [
         int(interaction.get("typed_length") or 0)
@@ -1293,6 +1735,8 @@ def _reconcile_synthesized_parameters(
 
         credential_id = str(synthesized_param.get("credential_id") or "").strip()
         existing = existing_by_key.get(key)
+        synthesized_default = str(synthesized_param.get("default_value") or "").strip()
+        typed_length = _coerce_positive_int(synthesized_param.get("typed_length"))
         if credential_id:
             if existing is not None:
                 if existing_credentials.get(key) != credential_id:
@@ -1311,19 +1755,39 @@ def _reconcile_synthesized_parameters(
             continue
 
         if existing is not None:
+            alias_key = _matching_string_parameter_key_by_default(
+                parameters,
+                default_value=synthesized_default,
+                exclude_key=key,
+            )
+            if alias_key is not None:
+                aliases[key] = alias_key
+                parameter_keys[-1] = alias_key
+                _drop_parameter_key(parameters, key)
+                continue
+            alias_key = _matching_string_parameter_key_by_default_length(
+                parameters,
+                default_length=typed_length,
+                exclude_key=key,
+            )
+            if alias_key is not None:
+                aliases[key] = alias_key
+                parameter_keys[-1] = alias_key
+                _drop_parameter_key(parameters, key)
+                continue
             if _is_credential_parameter(existing):
                 violations.append(
                     f"Unable to bind synthesized parameter `{key}`: submitted parameter is credential-typed."
                 )
+            elif synthesized_default:
+                existing_default = _string_parameter_default_value(existing)
+                if existing_default != synthesized_default:
+                    violations.append(
+                        f"Unable to bind synthesized parameter `{key}`: "
+                        "submitted parameter default does not match the scout record."
+                    )
             continue
 
-        if len(non_credential_synthesized) != 1:
-            violations.append(
-                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous."
-            )
-            continue
-
-        synthesized_default = str(synthesized_param.get("default_value") or "").strip()
         if synthesized_default:
             # Narrow defense-in-depth backstop for synthesized rows; values
             # captured from live type_text scouting are fully screened by
@@ -1333,7 +1797,61 @@ def _reconcile_synthesized_parameters(
                     f"Unable to bind synthesized parameter `{key}`: synthesized default looks credential-like."
                 )
                 continue
+            alias_key = _matching_string_parameter_key_by_default(
+                parameters,
+                default_value=synthesized_default,
+                exclude_key=key,
+            )
+            if alias_key is not None:
+                aliases[key] = alias_key
+                parameter_keys[-1] = alias_key
+                continue
+            combined_expression = _combined_string_default_expression(
+                parameters,
+                synthesized_default=synthesized_default,
+                typed_length=typed_length,
+            )
+            if combined_expression is not None:
+                expression_keys, expression = combined_expression
+                parameter_keys.pop()
+                for expression_key in expression_keys:
+                    if expression_key not in parameter_keys:
+                        parameter_keys.append(expression_key)
+                expressions[key] = expression
+                continue
             parameters.append(_string_parameter_row(synthesized_default, key))
+            continue
+
+        if len(non_credential_synthesized) != 1:
+            alias_key = _matching_string_parameter_key_by_default_length(
+                parameters,
+                default_length=typed_length,
+                exclude_key=key,
+            )
+            if alias_key is not None:
+                aliases[key] = alias_key
+                parameter_keys[-1] = alias_key
+                continue
+
+        combined_expression = _combined_string_default_expression(
+            parameters,
+            synthesized_default=synthesized_default,
+            typed_length=typed_length,
+        )
+        if combined_expression is not None:
+            expression_keys, expression = combined_expression
+            parameter_keys.pop()
+            for expression_key in expression_keys:
+                if expression_key not in parameter_keys:
+                    parameter_keys.append(expression_key)
+            expressions[key] = expression
+            continue
+
+        if len(non_credential_synthesized) != 1:
+            # Fall through only after length aliasing and combined-expression binding both miss.
+            violations.append(
+                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous."
+            )
             continue
 
         typed_length = typed_lengths[0] if len(typed_lengths) == 1 else None
@@ -1365,7 +1883,9 @@ def _reconcile_synthesized_parameters(
         )
 
     code_block["parameter_keys"] = parameter_keys
-    return parameter_keys, violations
+    # Submitted synthesized parameter rows are re-derived from scout evidence before persistence.
+    code_block.pop("parameters", None)
+    return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, expressions)
 
 
 def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
@@ -1425,29 +1945,52 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             violations.append("Unable to impose synthesized code block: locator provenance was not byte-equal.")
             break
 
-    parameter_keys, parameter_violations = _reconcile_synthesized_parameters(
+    parameter_reconciliation = _reconcile_synthesized_parameters(
         parsed=parsed,
         code_block=code_block,
         submitted_code=submitted_code,
         synthesized_parameters=synthesized.parameters,
         scout_trajectory=scout_trajectory,
     )
-    violations.extend(parameter_violations)
+    violations.extend(parameter_reconciliation.violations)
     if violations:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml, violations=violations)
 
-    code_block["code"] = textwrap.dedent(synthesized.code).lstrip("\n")
+    extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
+    raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
+    preserve_submitted_extraction = (
+        bool(raw_metadata)
+        and _raw_metadata_declares_goal_values_for_block(raw_metadata, str(code_block.get("label") or ""))
+        and not extraction_suffix
+        and not _is_submitted_code_synthesized_only(submitted_code, synthesized.code)
+    )
+    imposed_code = textwrap.dedent(submitted_code if preserve_submitted_extraction else synthesized.code).lstrip("\n")
+    if extraction_suffix:
+        imposed_code = imposed_code.rstrip() + "\n" + extraction_suffix.rstrip() + "\n"
+    for old_key, new_key in parameter_reconciliation.aliases.items():
+        imposed_code = _replace_python_identifier(imposed_code, old_key, new_key)
+    for old_key, expression in parameter_reconciliation.expressions.items():
+        imposed_code = _replace_python_identifier(imposed_code, old_key, expression)
+    code_block["code"] = imposed_code
     credential_parameter_keys = [
         str(param.get("key") or "") for param in synthesized.parameters if str(param.get("credential_id") or "").strip()
     ]
     substitutions = {
         "block_label": str(code_block.get("label") or ""),
         "source_trajectory_count": len(scout_trajectory),
-        "parameter_keys": parameter_keys,
+        "parameter_keys": parameter_reconciliation.parameter_keys,
         "credential_parameter_keys": credential_parameter_keys,
         "selector_provenance": diagnostics.locator_provenance,
         "prior_source": prior_source,
     }
+    if parameter_reconciliation.aliases:
+        substitutions["parameter_aliases"] = parameter_reconciliation.aliases
+    if parameter_reconciliation.expressions:
+        substitutions["parameter_expressions"] = parameter_reconciliation.expressions
+    if extraction_suffix:
+        substitutions["preserved_extraction_suffix"] = True
+    if preserve_submitted_extraction:
+        substitutions["preserved_submitted_extraction_code"] = True
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
         substitutions=substitutions,
@@ -1606,7 +2149,66 @@ def _artifact_declares_goal_values(artifact: Mapping[str, Any]) -> bool:
     return False
 
 
-def _extraction_return_shape_error(label: str, artifact: Mapping[str, Any], code: str) -> str | None:
+def _artifact_goal_value_roots(artifact: Mapping[str, Any]) -> set[str]:
+    roots: set[str] = set()
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(artifact.get(field_name)):
+            for path in _artifact_goal_value_paths(row.get("goal_value_paths")):
+                root = path.split(".", 1)[0].split("[", 1)[0].strip()
+                if root:
+                    roots.add(root)
+    return roots
+
+
+def _target_names(target: ast.expr) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in target.elts:
+            names.update(_target_names(element))
+        return names
+    return set()
+
+
+def _assigned_top_level_names(statements: list[ast.stmt]) -> set[str]:
+    names: set[str] = set()
+    for node in _iter_top_level_scope(statements):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(_target_names(node.target))
+        elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+            names.update(_target_names(node.target))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            names.update(_target_names(node.target))
+    return names
+
+
+def _missing_declared_output_roots(code: str, goal_roots: set[str]) -> set[str] | None:
+    if not goal_roots:
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        # Code safety reports syntax errors first; avoid layering output-root errors onto invalid code.
+        return None
+    scope_statements = list(_iter_top_level_scope(tree.body))
+    if any(isinstance(node, ast.Return) and node.value is not None for node in scope_statements):
+        return None
+    assigned_names = _assigned_top_level_names(tree.body)
+    missing = goal_roots - assigned_names
+    return missing or None
+
+
+def _extraction_return_shape_error(
+    label: str,
+    artifact: Mapping[str, Any],
+    code: str,
+    *,
+    require_declared_output: bool = False,
+) -> str | None:
     """Reject an extraction-intent code block whose declared goal values do not reach
     the block output as a keyed structure: a flat text blob, or structured data trapped
     in an uninvoked nested function. Extraction-intent is the existing `goal_value_paths`
@@ -1630,6 +2232,16 @@ def _extraction_return_shape_error(label: str, artifact: Mapping[str, Any], code
             "Call that function and return its result (e.g. `return await run(page)`), or build the keyed "
             "structure at the top level so the declared goal values reach the block output."
         )
+    if require_declared_output:
+        missing_roots = _missing_declared_output_roots(code, _artifact_goal_value_roots(artifact))
+        if missing_roots:
+            missing = ", ".join(f"`{root}`" for root in sorted(missing_roots))
+            return (
+                f"Code block `{label}` declares `goal_value_paths` but does not return a keyed structure or leave "
+                f"top-level output local(s) matching the declared path root(s): {missing}. Add an explicit "
+                "structured `return` (a dict, or an array of objects for repeated records), or assign those "
+                "top-level locals so the implicit code-block output contains the declared goal values."
+            )
     return None
 
 
@@ -2169,11 +2781,19 @@ async def _update_workflow(
         return {"ok": False, "error": authority_error}
 
     workflow_yaml = params["workflow_yaml"]
+    raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
+    if raw_conflict_marker_error is not None:
+        return {
+            "ok": False,
+            "error": raw_conflict_marker_error,
+            "user_facing_summary": _compiled_authoring_user_summary(),
+        }
     # Tool wrappers run authority/loop guards before calling here. The composition
     # gate below consumes these refs, so they must be visible before validation.
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
+    # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
     if imposition.violations:
         return {
@@ -2190,6 +2810,24 @@ async def _update_workflow(
             "user_facing_summary": _compiled_authoring_user_summary(),
         }
     params["workflow_yaml"] = workflow_yaml
+    parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
+    if parameter_contract_error is not None:
+        return {
+            "ok": False,
+            "error": parameter_contract_error,
+            "user_facing_summary": _compiled_authoring_user_summary(),
+        }
+    missing_metadata_error = _missing_code_artifact_metadata_error(
+        workflow_yaml,
+        ctx,
+        params.get("code_artifact_metadata"),
+    )
+    if missing_metadata_error is not None:
+        return {
+            "ok": False,
+            "error": missing_metadata_error,
+            "user_facing_summary": _compiled_authoring_user_summary(),
+        }
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     normalization = _normalize_code_artifact_metadata_detailed(
         params.get("code_artifact_metadata"),

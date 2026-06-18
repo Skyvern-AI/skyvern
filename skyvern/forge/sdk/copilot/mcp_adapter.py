@@ -68,6 +68,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "last_auto_acted_signature",
     "reached_download_target",
     "synthesized_block_offered",
+    "synthesized_block_offered_trajectory_len",
 )
 
 

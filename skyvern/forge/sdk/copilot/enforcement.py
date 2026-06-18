@@ -21,7 +21,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
-from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    is_optional_dismissal_only_trajectory,
+    render_synthesized_offer_text,
+    synthesize_code_block,
+)
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -45,6 +49,7 @@ from skyvern.forge.sdk.copilot.config import (
     POST_UPDATE_NUDGE,
     PRE_DISCOVERY_URL_QUESTION_NUDGE,
     SCREENSHOT_DROPPED_NUDGE,
+    SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
     BlockAuthoringPolicy,
     CopilotConfig,
     normalize_block_authoring_policy,
@@ -1632,11 +1637,10 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
 
     Returns a single user message wrapping the synthesized Playwright block, or
     None when the policy/latch/empty-trajectory guards do not hold. Shares the
-    one-shot latch with the pre-authoring prompt-side offer, so whichever fires
-    first wins and the model sees the offer at most once.
+    latch with the pre-authoring prompt-side offer. The initial offer suppresses
+    near-duplicate repeats, but a materially longer scout trajectory can refresh
+    the deterministic code before the model authors the workflow.
     """
-    if getattr(ctx, "synthesized_block_offered", False):
-        return None
     if getattr(ctx, "update_workflow_called", False):
         return None
     if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
@@ -1646,6 +1650,15 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     trajectory = getattr(ctx, "scout_trajectory", None) or []
     if not trajectory:
         return None
+    if is_optional_dismissal_only_trajectory(trajectory):
+        return None
+    trajectory_len = len(trajectory)
+    previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
+    if (
+        getattr(ctx, "synthesized_block_offered", False)
+        and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+    ):
+        return None
     synthesized = synthesize_code_block(
         trajectory, reached_download_target=getattr(ctx, "reached_download_target", None)
     )
@@ -1653,6 +1666,7 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
         return None
 
     ctx.synthesized_block_offered = True
+    ctx.synthesized_block_offered_trajectory_len = trajectory_len
     goal = getattr(ctx, "block_goal_main_goal", "") or getattr(ctx, "user_message", "") or ""
     return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory, goal=goal)}
 
