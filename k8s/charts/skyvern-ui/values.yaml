@@ -1,0 +1,71 @@
+# Default values for skyvern-ui.
+replicaCount: 1
+image:
+  repository: public.ecr.aws/skyvern/skyvern-ui
+  # Pin to a specific version. Do NOT use "latest" in production: a floating tag
+  # means a pod restart can silently pull a newly published image, which is
+  # exactly how a known-good deployment can drift onto a different build.
+  tag: "v1.0.42"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+# -----------------------------------------------------------------------------
+# IMPORTANT: do not set a container `command`/`args` for the UI.
+#
+# The image ships a PREBUILT static bundle. Its entrypoint injects the VITE_*
+# runtime config below into the already-built assets at container start and then
+# serves them. Overriding the command (e.g. `npm run start`) forces a runtime
+# `tsc && vite build`, which the lean production image cannot perform — the
+# container will crashloop with "tsc: not found". Let the image entrypoint run.
+# -----------------------------------------------------------------------------
+
+# Runtime config injected into the prebuilt bundle by the image entrypoint.
+config:
+  apiBaseUrl: "http://skyvern:8000/api/v1"
+  wssBaseUrl: "ws://skyvern:8000/api/v1"
+  artifactApiBaseUrl: "http://skyvern:9090"
+  browserStreamingMode: "vnc"
+  enableCodeBlock: "false"
+  # NOTE: enableLogArtifacts is honored at runtime only on images that ship the
+  # log-artifacts placeholder in the bundle. On older images this flag is fixed
+  # at build time; setting it here is forward-compatible and harmless.
+  enableLogArtifacts: "false"
+  enable2faNotifications: "false"
+# API key the UI uses to call the backend. Provide ONE of:
+#   - apiKey.value: inline (templated into a Secret managed by this chart)
+#   - apiKey.existingSecret (+ existingSecretKey): reference a pre-existing Secret
+# If neither is set, the env is left unset (the UI logs a warning and starts).
+apiKey:
+  value: ""
+  existingSecret: ""
+  existingSecretKey: "VITE_SKYVERN_API_KEY"
+service:
+  type: ClusterIP
+  port: 8080
+  artifactPort: 9090
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: skyvern-ui.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+# Sized for SERVING static assets, not building. A runtime build would need
+# ~4Gi (Vite/rollup) — another reason not to override the command.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

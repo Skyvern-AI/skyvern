@@ -14,9 +14,9 @@
     "artifact-server": "node artifactServer.js",
     "run-artifact-server": "node artifactServer.js",
     "start-local": "npm run dev & npm run artifact-server",
-    "serve": "npm run build && node localServer.js",
+    "serve": "if [ -d dist.template ]; then echo '[skyvern-ui] prebuilt bundle detected; injecting runtime env and serving without rebuild' && exec bash ./entrypoint-skyvernui.sh; else npm run build && node localServer.js; fi",
     "test": "vitest run",
-    "start": "npm run serve & npm run run-artifact-server"
+    "start": "if [ -d dist.template ]; then echo '[skyvern-ui] prebuilt bundle detected; injecting runtime env and serving without rebuild' && exec bash ./entrypoint-skyvernui.sh; else npm run serve & npm run run-artifact-server; fi"
   },
   "dependencies": {
     "@clerk/clerk-react": "^5.61.8",

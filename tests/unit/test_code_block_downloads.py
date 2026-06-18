@@ -136,6 +136,41 @@ async def test_code_block_registers_downloads_into_output(
 
 
 @pytest.mark.asyncio
+async def test_code_block_wraps_non_dict_output_before_attaching_downloads(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    file_info = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="deadbeef",
+        artifact_id="a_dl_1",
+        modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
+    )
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(side_effect=[[], [file_info]]),
+    )
+    _wire_block_runtime(monkeypatch)
+
+    block = CodeBlock(
+        label="code_download",
+        code="return 'ok'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    output = result.output_parameter_value
+    assert output["value"] == "ok"
+    assert output["downloaded_files"] == [file_info.model_dump()]
+    assert output["downloaded_file_urls"] == [file_info.url]
+    assert output["downloaded_file_artifact_ids"] == ["a_dl_1"]
+
+
+@pytest.mark.asyncio
 async def test_code_block_without_downloads_has_no_download_keys(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:

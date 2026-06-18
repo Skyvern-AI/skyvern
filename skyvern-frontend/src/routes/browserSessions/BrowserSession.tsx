@@ -34,6 +34,7 @@ import {
 
 import { getBrowserSessionRefetchIntervalMs } from "./browserSessionQueryUtils";
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
+import { BrowserSessionOccupiedBy } from "./BrowserSessionOccupiedBy";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
@@ -156,6 +157,11 @@ function BrowserSession() {
                       text={browserSession.browser_address}
                     />
                   </div>
+                )}
+                {browserSession.runnable_id && (
+                  <BrowserSessionOccupiedBy
+                    runnableId={browserSession.runnable_id}
+                  />
                 )}
               </div>
             )}

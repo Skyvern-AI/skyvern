@@ -169,10 +169,9 @@ server = [
 
 [dependency-groups]
 cloud = [
-    # Cloud-only browser vendor SDK. Imported at module scope in
-    # cloud/webeye/cloud_browser_factory.py for the `browser-use` CloudBrowserType;
-    # no skyvern/ code path references it, so default OSS installs don't need it.
+    # Remote-browser vendor SDKs used only by cloud-side factories.
     "browser-use-sdk>=3.8,<4",
+    "anchorbrowser>=0.11,<0.12",
     # Keep workflow-copilot on the newer Agents SDK for cloud/source installs.
     # uv's override-dependencies below relax LiteLLM's exact transitive pins,
     # but those overrides do not ship in public wheel metadata.
@@ -271,6 +270,11 @@ override-dependencies = [
     # litellm exact-pins aiohttp; relax so the security-patched
     # 3.14.x resolves for cloud/source installs (plain pip keeps litellm's pin).
     "aiohttp>=3.14.0",
+    # A remote-browser vendor SDK declares playwright>=1.55, but the local/server
+    # groups pin playwright==1.46.0 on python<3.12 for binary-compat. Skyvern
+    # connects to the remote session via its own playwright, so the SDK's
+    # playwright dep is unused at runtime. Relax it to match.
+    "playwright>=1.46.0",
 ]
 constraint-dependencies = [
     "authlib>=1.7.1",
