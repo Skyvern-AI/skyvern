@@ -629,12 +629,8 @@ function WorkflowRunTimelineBlockItem({
   const actionCount = actions.length;
 
   const hasActions = actionCount > 0;
-  // Only code blocks break their execution down into action/step rows inside the
-  // timeline rail. Agent blocks (login, task, navigation, ...) expose their
-  // actions through the detail panel instead, so the rail stays a high-level
-  // block outline for them.
   const isCodeBlock = block.block_type === WorkflowBlockTypes.Code;
-  const showsActionRows = isCodeBlock && hasActions;
+  const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
   const codeSteps =

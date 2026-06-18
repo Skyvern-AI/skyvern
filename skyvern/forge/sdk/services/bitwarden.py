@@ -29,6 +29,7 @@ from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_js
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
+    CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
     SecretCredential,
@@ -45,6 +46,87 @@ class BitwardenItemType(IntEnum):
     SECURE_NOTE = 2
     CREDIT_CARD = 3
     IDENTITY = 4
+
+
+BITWARDEN_CUSTOM_FIELD_TYPE_HIDDEN = 1
+CREDIT_CARD_BILLING_ADDRESS_FIELDS = (
+    "line1",
+    "line2",
+    "city",
+    "state",
+    "state_code",
+    "postal_code",
+    "country",
+    "country_code",
+)
+
+
+def _credit_card_extra_custom_field_values(credential: CreditCardCredential) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if credential.billing_address is not None:
+        for key, value in credential.billing_address.model_dump(exclude_none=True).items():
+            if value:
+                values[f"billing_address_{key}"] = value
+    if credential.billing_email:
+        values["billing_email"] = credential.billing_email
+    if credential.billing_phone:
+        values["billing_phone"] = credential.billing_phone
+    if credential.metadata:
+        for key, value in credential.metadata.items():
+            if key and value:
+                values[f"metadata_{key}"] = value
+    return values
+
+
+def _build_bitwarden_custom_fields(credential: CreditCardCredential) -> list[dict[str, str | int | None]]:
+    return [
+        {
+            "name": name,
+            "value": value,
+            "type": BITWARDEN_CUSTOM_FIELD_TYPE_HIDDEN,
+            "linkedId": None,
+        }
+        for name, value in _credit_card_extra_custom_field_values(credential).items()
+    ]
+
+
+def _extract_credit_card_extra_custom_field_values(item: dict) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field in item.get("fields") or []:
+        name = field.get("name")
+        value = field.get("value")
+        if not isinstance(name, str) or not isinstance(value, str) or not value:
+            continue
+        if name == "billing_email" or name == "billing_phone" or name.startswith("billing_address_"):
+            values[name] = value
+        elif name.startswith("metadata_"):
+            values[name] = value
+    return values
+
+
+def _credit_card_credential_from_bitwarden_item(item: dict) -> CreditCardCredential:
+    card = item["card"]
+    extra_values = _extract_credit_card_extra_custom_field_values(item)
+    address_values = {
+        key: extra_values[f"billing_address_{key}"]
+        for key in CREDIT_CARD_BILLING_ADDRESS_FIELDS
+        if f"billing_address_{key}" in extra_values
+    }
+    metadata = {
+        key.removeprefix("metadata_"): value for key, value in extra_values.items() if key.startswith("metadata_")
+    }
+    return CreditCardCredential(
+        card_holder_name=card["cardholderName"],
+        card_number=card["number"],
+        card_exp_month=card["expMonth"],
+        card_exp_year=card["expYear"],
+        card_cvv=card["code"],
+        card_brand=card["brand"],
+        billing_address=CreditCardBillingAddress(**address_values) if address_values else None,
+        billing_email=extra_values.get("billing_email"),
+        billing_phone=extra_values.get("billing_phone"),
+        metadata=metadata or None,
+    )
 
 
 def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
@@ -73,17 +155,9 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
             credential_type=CredentialType.PASSWORD,
         )
     elif item["type"] == BitwardenItemType.CREDIT_CARD:
-        card = item["card"]
         return CredentialItem(
             item_id=item["id"],
-            credential=CreditCardCredential(
-                card_holder_name=card["cardholderName"],
-                card_number=card["number"],
-                card_exp_month=card["expMonth"],
-                card_exp_year=card["expYear"],
-                card_cvv=card["code"],
-                card_brand=card["brand"],
-            ),
+            credential=_credit_card_credential_from_bitwarden_item(item),
             name=item["name"],
             credential_type=CredentialType.CREDIT_CARD,
         )
@@ -748,6 +822,7 @@ class BitwardenService:
                 BitwardenConstants.CREDIT_CARD_CVV: credit_card_data["code"],
                 BitwardenConstants.CREDIT_CARD_BRAND: credit_card_data["brand"],
             }
+            mapped_credit_card_data.update(_extract_credit_card_extra_custom_field_values(item))
 
             return mapped_credit_card_data
         finally:
@@ -894,6 +969,7 @@ class BitwardenService:
         item_template["type"] = get_bitwarden_item_type_code(BitwardenItemType.CREDIT_CARD)
         item_template["name"] = name
         item_template["card"] = credit_card_template
+        item_template["fields"] = _build_bitwarden_custom_fields(credential)
         item_template["collectionIds"] = [collection_id]
         item_template["organizationId"] = bw_organization_id
 
@@ -1145,20 +1221,12 @@ class BitwardenService:
                 ),
             )
         elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
-            credit_card_item = response["data"]["card"]
             name = response["data"]["name"]
             return CredentialItem(
                 item_id=item_id,
                 credential_type=CredentialType.CREDIT_CARD,
                 name=name,
-                credential=CreditCardCredential(
-                    card_holder_name=credit_card_item["cardholderName"],
-                    card_number=credit_card_item["number"],
-                    card_exp_month=credit_card_item["expMonth"],
-                    card_exp_year=credit_card_item["expYear"],
-                    card_cvv=credit_card_item["code"],
-                    card_brand=credit_card_item["brand"],
-                ),
+                credential=_credit_card_credential_from_bitwarden_item(response["data"]),
             )
         elif response["data"]["type"] == BitwardenItemType.SECURE_NOTE:
             name = response["data"]["name"]

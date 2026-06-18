@@ -107,6 +107,7 @@ function renderBodyForBlock(
     case "login":
     case "validation":
     case "extraction":
+    case "file_download":
       return (
         <BlockDetailTask
           block={block}

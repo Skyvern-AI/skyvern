@@ -4,8 +4,9 @@ SECURITY INVARIANT — NO RAW CREDENTIAL RETRIEVAL
 =================================================
 Credential endpoints must NEVER return sensitive credential data (passwords,
 TOTP secrets, full card numbers, CVVs, expiration dates, card holder names,
-or secret values) in any API response. The only fields that may be returned
-are non-sensitive metadata:
+credit card billing/contact fields, credit card metadata, or secret values)
+in any API response. The only fields that may be returned are non-sensitive
+metadata:
 
   - Password credentials: ``username``, ``totp_type``, ``totp_identifier``
   - Credit card credentials: ``last_four``, ``brand``
@@ -2438,7 +2439,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
 
     SECURITY: This function must ONLY copy non-sensitive metadata into the
     response. Never include passwords, TOTP secrets, full card numbers, CVVs,
-    expiration dates, card holder names, or secret values. See the module
+    expiration dates, card holder names, credit card billing/contact fields,
+    credit card metadata, or secret values. See the module
     docstring for the full security invariant.
     """
     if credential.credential_type == CredentialType.PASSWORD:

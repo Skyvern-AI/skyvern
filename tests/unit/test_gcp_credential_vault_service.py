@@ -14,6 +14,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialType,
     CredentialVaultType,
+    CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
     SecretCredential,
@@ -76,6 +77,14 @@ class TestGcpSecretItemCreation:
                 card_exp_year="2030",
                 card_brand="visa",
                 card_holder_name="John Doe",
+                billing_address=CreditCardBillingAddress(
+                    line1="123 Main St",
+                    city="San Francisco",
+                    state_code="CA",
+                    postal_code="94105",
+                    country_code="US",
+                ),
+                billing_email="billing@example.com",
             ),
         )
 
@@ -83,6 +92,8 @@ class TestGcpSecretItemCreation:
         assert payload["type"] == "credit_card"
         assert payload["card_number"] == "4111111111111111"
         assert payload["card_holder_name"] == "John Doe"
+        assert payload["billing_address"]["line1"] == "123 Main St"
+        assert payload["billing_email"] == "billing@example.com"
 
     async def test_create_secret_item_excludes_none_label(self) -> None:
         svc, client = _service()
@@ -150,6 +161,14 @@ class TestGetCredentialItem:
                     "card_exp_year": "2030",
                     "card_brand": "visa",
                     "card_holder_name": "John Doe",
+                    "billing_address": {
+                        "line1": "123 Main St",
+                        "city": "San Francisco",
+                        "state_code": "CA",
+                        "postal_code": "94105",
+                        "country_code": "US",
+                    },
+                    "billing_phone": "+14155550123",
                 }
             )
         )
@@ -160,6 +179,9 @@ class TestGetCredentialItem:
         assert item.credential_type == CredentialType.CREDIT_CARD
         assert isinstance(item.credential, CreditCardCredential)
         assert item.credential.card_number == "4111111111111111"
+        assert item.credential.billing_address
+        assert item.credential.billing_address.country_code == "US"
+        assert item.credential.billing_phone == "+14155550123"
 
     async def test_get_secret_credential(self) -> None:
         svc, client = _service()

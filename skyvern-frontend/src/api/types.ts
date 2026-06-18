@@ -854,6 +854,21 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+  billing_address?: CreditCardBillingAddress | null;
+  billing_email?: string | null;
+  billing_phone?: string | null;
+  metadata?: Record<string, string> | null;
+};
+
+export type CreditCardBillingAddress = {
+  line1?: string | null;
+  line2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  state_code?: string | null;
+  postal_code?: string | null;
+  country?: string | null;
+  country_code?: string | null;
 };
 
 export type SecretCredential = {
