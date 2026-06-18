@@ -68,6 +68,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
+from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -78,6 +79,13 @@ RANDOM_STRING_POOL = string.ascii_letters + string.digits
 # Maximum number of planning iterations for TaskV2
 # This limits how many times the LLM can plan and execute actions
 DEFAULT_MAX_ITERATIONS = 50
+
+# Cap a navigate block's recovered terminal output: task_history is re-fed to the
+# planner every iteration, so an unbounded reasoning blob would grow context.
+NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS = 2000
+# Structured (dict/list) output can't be sliced without corrupting it; one that exceeds
+# this is dropped entirely rather than written uncapped to task_history.
+NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS = 10 * NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -1049,6 +1057,30 @@ async def run_task_v2_helper(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
         )
+        # Fallback for navigate: recover from the COMPLETE action only when extraction was
+        # expected but came back null (extracted_information present and None). A navigate
+        # block's output is always a TaskOutput dump, so the key is always present here.
+        block_output = block_result.output_parameter_value
+        if (
+            extracted_data is None
+            and task_type == "navigate"
+            and block_result.success
+            and isinstance(block_output, dict)
+            and "extracted_information" in block_output
+            and block_output["extracted_information"] is None
+        ):
+            extracted_data = await _get_navigate_complete_output(
+                block_result,
+                organization_id,
+                task_v2_id=task_v2_id,
+                workflow_run_id=workflow_run_id,
+            )
+            if extracted_data is not None:
+                LOG.info(
+                    "Recovered navigate terminal output from COMPLETE action",
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                )
         if extracted_data is not None:
             task_history_record["extracted_data"] = extracted_data
         task_history.append(task_history_record)
@@ -1923,14 +1955,14 @@ def _get_extracted_data_from_block_result(
 
     Args:
         block_result: The result from block execution
-        task_type: Type of task ("extract" or "loop")
+        task_type: Type of task ("extract", "navigate", or "loop")
         task_v2_id: Optional ID for logging
         workflow_run_id: Optional ID for logging
 
     Returns:
         Extracted data if available, None otherwise
     """
-    if task_type == "extract":
+    if task_type in ("extract", "navigate"):
         if (
             isinstance(block_result.output_parameter_value, dict)
             and "extracted_information" in block_result.output_parameter_value
@@ -1979,6 +2011,70 @@ def _get_extracted_data_from_block_result(
                             inner_loop_output_overall.append(output_value["extracted_information"])
                 loop_output_overall.append(inner_loop_output_overall)
             return loop_output_overall if loop_output_overall else None
+    return None
+
+
+async def _get_navigate_complete_output(
+    block_result: BlockResult,
+    organization_id: str | None,
+    task_v2_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> Any:
+    """Recover a navigate block's terminal answer from its verifying COMPLETE action.
+
+    Falls back through response, output, then reasoning, capping str candidates.
+    """
+    if not isinstance(block_result.output_parameter_value, dict):
+        return None
+    task_id = block_result.output_parameter_value.get("task_id")
+    if not task_id:
+        return None
+    try:
+        actions = await app.DATABASE.tasks.get_task_actions(task_id=task_id, organization_id=organization_id)
+    except Exception:
+        LOG.warning(
+            "Failed to load navigate task actions; skipping terminal-output recovery",
+            task_id=task_id,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    for action in reversed(actions):
+        if action.action_type != ActionType.COMPLETE:
+            continue
+        for candidate in (action.response, action.output, action.reasoning):
+            if not candidate:
+                continue
+            if isinstance(candidate, str):
+                if len(candidate) > NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS:
+                    LOG.warning(
+                        "Truncating navigate terminal output before writing to task_history",
+                        task_id=task_id,
+                        original_length=len(candidate),
+                        cap=NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS,
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return candidate[:NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS]
+                return candidate
+            # Structured output (dict/list from CUA engines) can't be sliced without
+            # corrupting it, so drop an oversized one entirely (forcing a separate extract
+            # task) rather than let it bloat the task_history fed to the planner.
+            structured_len = len(str(candidate))
+            if structured_len > NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS:
+                LOG.warning(
+                    "Dropping oversized structured navigate terminal output; expecting a separate extract task",
+                    task_id=task_id,
+                    approx_length=structured_len,
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                return None
+            return candidate
+        # Only the terminal COMPLETE is authoritative: if it carries no data,
+        # don't fall back to a stale earlier COMPLETE.
+        return None
     return None
 
 
