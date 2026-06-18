@@ -1,4 +1,6 @@
-import { ActionsApiResponse, ActionTypes, Status } from "@/api/types";
+import { ActionsApiResponse, ActionTypes } from "@/api/types";
+import { getActionDisplayKind } from "@/routes/workflows/components/actionStatus";
+import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import { StatusPill } from "@/components/ui/status-pill";
 import {
   Tooltip,
@@ -24,17 +26,12 @@ type Props = {
 };
 
 function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
-  // Wait actions always succeed — they intentionally return ActionFailure
-  // from the backend but completing a wait is expected, not a failure.
-  const success =
-    action.action_type === ActionTypes.wait ||
-    action.status === Status.Completed ||
-    action.status === Status.Skipped;
+  const kind = getActionDisplayKind(action);
 
   return (
     <RunCard
       active={active}
-      status={success ? "success" : "failure"}
+      status={kind}
       onClick={onClick}
       className={cardClassName ? `flex ${cardClassName}` : "flex"}
     >
@@ -61,9 +58,15 @@ function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
                 </Tooltip>
               </TooltipProvider>
             )}
-            {success ? (
+            {kind === "success" ? (
               <StatusPill
                 icon={<CheckCircledIcon className="h-4 w-4 text-success" />}
+              />
+            ) : kind === "terminated" ? (
+              <StatusPill
+                icon={
+                  <TerminatedIcon className={`h-4 w-4 ${terminatedTone}`} />
+                }
               />
             ) : (
               <StatusPill
