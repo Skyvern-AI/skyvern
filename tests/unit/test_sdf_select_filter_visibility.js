@@ -21,7 +21,7 @@ const src = fs.readFileSync(
   path.join(__dirname, "../../skyvern/webeye/scraper/domUtils.js"),
   "utf8",
 );
-const fnStart = src.indexOf("function isElementVisible(element) {");
+const fnStart = src.indexOf("function isElementVisible(");
 if (fnStart === -1) throw new Error("isElementVisible not found");
 const bodyStart = src.indexOf("{", fnStart);
 let depth = 0,
