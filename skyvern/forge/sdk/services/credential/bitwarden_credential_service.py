@@ -6,7 +6,9 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialItem,
+    CredentialType,
     CredentialVaultType,
+    CreditCardCredential,
 )
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -54,11 +56,18 @@ class BitwardenCredentialVaultService(CredentialVaultService):
         if not org_collection:
             raise HTTPException(status_code=404, detail="Credential account not found. It might have been deleted.")
 
+        credential_data = data.credential
+        if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+            credential_data = await self._preserve_omitted_credit_card_fields(
+                credential=credential,
+                updated_credential=credential_data,
+            )
+
         # Create new vault item with the updated data
         new_item_id = await BitwardenService.create_credential_item(
             collection_id=org_collection.collection_id,
             name=data.name,
-            credential=data.credential,
+            credential=credential_data,
         )
 
         # Update DB record to point to the new vault item
