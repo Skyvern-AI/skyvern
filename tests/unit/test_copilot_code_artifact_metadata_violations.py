@@ -31,6 +31,7 @@ def _code_block_yaml(label: str) -> str:
               label: {label}
               code: |
                 await page.goto("https://example.com/")
+                return {{"records": [{{"number": "123"}}]}}
         """
     ).strip()
 
@@ -127,10 +128,12 @@ class TestAccumulateAllViolations:
                   label: block_one
                   code: |
                     await page.goto("https://example.com/")
+                    return {"records": [{"number": "123"}]}
                 - block_type: code
                   label: block_two
                   code: |
                     await page.goto("https://example.com/")
+                    return {"records": [{"number": "123"}]}
             """
         ).strip()
         normalized, error = _normalize_code_artifact_metadata(
@@ -584,7 +587,7 @@ class TestExtractionReturnShape:
     def test_keyed_dict_return_passes(self) -> None:
         code = """
         await page.goto("https://example.com/")
-        return {"records": [{"number": "1-25-80030"}]}
+        return {"records": [{"number": "REC-001"}]}
         """
         normalized, error = _normalize_code_artifact_metadata(
             [_extraction_metadata("my_block", ["records[].number"])],
@@ -635,7 +638,7 @@ class TestExtractionUninvokedNestedReturn:
     def test_uninvoked_nested_structured_function_is_rejected(self) -> None:
         code = """
         async def run(page):
-            result = {"records": [{"number": "1-25-80030"}]}
+            result = {"records": [{"number": "REC-001"}]}
             return result
         """
         normalized, error = _normalize_code_artifact_metadata(
@@ -650,7 +653,7 @@ class TestExtractionUninvokedNestedReturn:
     def test_invoked_and_returned_nested_function_passes(self) -> None:
         code = """
         async def run(page):
-            return {"records": [{"number": "1-25-80030"}]}
+            return {"records": [{"number": "REC-001"}]}
         return await run(page)
         """
         normalized, error = _normalize_code_artifact_metadata(
@@ -663,7 +666,7 @@ class TestExtractionUninvokedNestedReturn:
     def test_invoked_and_bound_nested_function_passes(self) -> None:
         code = """
         async def run(page):
-            return {"records": [{"number": "1-25-80030"}]}
+            return {"records": [{"number": "REC-001"}]}
         data = await run(page)
         """
         normalized, error = _normalize_code_artifact_metadata(
@@ -676,7 +679,7 @@ class TestExtractionUninvokedNestedReturn:
     def test_top_level_structured_local_passes(self) -> None:
         code = """
         await page.goto("https://example.com/")
-        records = [{"number": "1-25-80030"}]
+        records = [{"number": "REC-001"}]
         """
         normalized, error = _normalize_code_artifact_metadata(
             [_extraction_metadata("my_block", ["records[].number"])],
@@ -719,7 +722,7 @@ class TestExtractionUninvokedNestedReturn:
             rows = await page.locator(".row").all()
         except Exception:
             rows = []
-        return {"records": [{"number": "1-25-80030"}]}
+        return {"records": [{"number": "REC-001"}]}
         """
         normalized, error = _normalize_code_artifact_metadata(
             [_extraction_metadata("my_block", ["records[].number"])],
@@ -731,7 +734,7 @@ class TestExtractionUninvokedNestedReturn:
     def test_capture_then_wrap_rebind_passes(self) -> None:
         code = """
         text = await page.locator("#results").inner_text()
-        text = {"records": [{"number": "1-25-80030"}]}
+        text = {"records": [{"number": "REC-001"}]}
         return text
         """
         normalized, error = _normalize_code_artifact_metadata(
@@ -866,7 +869,7 @@ class TestFlatStringClassifier:
         # string_locals so the final structured return is not falsely rejected.
         code = """
         text = await page.inner_text("body")
-        text = {"records": [{"number": "1-25-80030"}]}
+        text = {"records": [{"number": "REC-001"}]}
         return text
         """
         assert _code_block_returns_flat_string(textwrap.dedent(code)) is False

@@ -54,6 +54,19 @@ _SAFE_CODE_YAML = _yaml(
     """
 )
 
+_SAFE_EXTRACTION_CODE_YAML = _yaml(
+    """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.goto("https://example.com/search")
+          records = [{"number": "REC-001"}]
+    """
+)
+
 
 def _code_yaml(
     code: str,
@@ -76,7 +89,7 @@ def _code_yaml(
                 "parameter_type": "workflow",
                 "workflow_parameter_type": "string",
                 "key": "provider_query",
-                "default_value": "Taylor Brooks",
+                "default_value": "Sample Search",
             }
         ]
     if nested:
@@ -98,7 +111,7 @@ _SUBMITTED_LITERAL_YAML = _yaml(
       - block_type: code
         label: search_registry
         code: |
-          await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
+          await page.locator("input[placeholder='Search']").fill("Sample Search")
           await page.locator("button.lookup").click()
     """
 )
@@ -123,7 +136,7 @@ _SUBMITTED_LOCAL_CONSTANT_YAML = _yaml(
       - block_type: code
         label: search_registry
         code: |
-          provider_query = "Taylor Brooks"
+          provider_query = "Sample Search"
           await page.locator("input[placeholder='Search']").fill(str(provider_query))
     """
 )
@@ -136,7 +149,7 @@ _SUBMITTED_COMPUTED_PARAMETER_YAML = _yaml(
       - parameter_type: workflow
         workflow_parameter_type: string
         key: provider_query
-        default_value: Taylor Brooks
+        default_value: Sample Search
       blocks:
       - block_type: code
         label: search_registry
@@ -153,7 +166,7 @@ _SUBMITTED_MIXED_LITERAL_YAML = _yaml(
       - block_type: code
         label: search_registry
         code: |
-          await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
+          await page.locator("input[placeholder='Search']").fill("Sample Search")
           await page.locator("#other").fill(provider_name)
     """
 )
@@ -259,6 +272,11 @@ def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> 
         "      code: |\n"
         f"{indented_code}\n"
     )
+
+
+def _directory_blocks_yaml(blocks: str) -> str:
+    indented_blocks = textwrap.indent(textwrap.dedent(blocks).strip(), "  ")
+    return f"title: Directory lookup\nworkflow_definition:\n  blocks:\n{indented_blocks}\n"
 
 
 def _credential_fill_interaction(
@@ -495,6 +513,273 @@ class TestCodeSafetySeam:
         assert ctx.code_artifact_metadata == {}
 
 
+class TestCodeBlockParameterPersistSeam:
+    @pytest.mark.asyncio
+    async def test_undeclared_parameter_key_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _SAFE_CODE_YAML
+        submitted = _directory_blocks_yaml(
+            """
+            - block_type: code
+              label: search_directory
+              parameter_keys: [address_or_postal_code]
+              code: |
+                await page.locator("#location").fill(str(address_or_postal_code))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "search_directory" in result["error"]
+        assert "`address_or_postal_code`" in result["error"]
+        assert "workflow_definition.parameters" in result["error"]
+        assert ctx.workflow_yaml == _SAFE_CODE_YAML
+
+    @pytest.mark.asyncio
+    async def test_nested_code_block_undeclared_parameter_key_rejects(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _directory_blocks_yaml(
+            """
+            - block_type: loop
+              label: retry_search
+              loop_blocks:
+              - block_type: code
+                label: nested_directory_search
+                parameter_keys: [address_or_postal_code]
+                code: |
+                  await page.locator("#location").fill(str(address_or_postal_code))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "nested_directory_search" in result["error"]
+        assert "`address_or_postal_code`" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    def test_deeply_nested_parameter_contract_returns_validation_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block: dict[str, object] = {
+            "block_type": "code",
+            "label": "search_directory",
+            "parameter_keys": ["search_location"],
+            "code": "print(search_location)",
+        }
+        for index in range(1100):
+            block = {
+                "block_type": "loop",
+                "label": f"loop_{index}",
+                "loop_blocks": [block],
+            }
+        parsed = {
+            "workflow_definition": {
+                "parameters": [{"key": "search_location"}],
+                "blocks": [block],
+            }
+        }
+        monkeypatch.setattr(workflow_update_module, "parse_workflow_yaml", lambda _workflow_yaml: parsed)
+
+        assert (
+            workflow_update_module._code_block_parameter_contract_error("workflow_definition: {}")
+            == "Workflow YAML nesting is too deep to validate."
+        )
+
+    @pytest.mark.asyncio
+    async def test_declared_workflow_string_parameter_key_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _code_yaml(
+            "await page.locator('#query').fill(str(provider_query))",
+            parameter_keys=["provider_query"],
+            workflow_param=True,
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == submitted
+
+    @pytest.mark.asyncio
+    async def test_new_declared_workflow_parameter_key_is_accepted_on_later_edit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _code_yaml(
+            "await page.locator('#query').fill(str(provider_query))",
+            parameter_keys=["provider_query"],
+            workflow_param=True,
+        )
+        submitted = _yaml(
+            """
+            title: Registry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_query, default_value: Sample Search}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location, default_value: Example City}
+              blocks:
+              - block_type: code
+                label: search_registry
+                parameter_keys: [provider_query, search_location]
+                code: |
+                  await page.locator("#query").fill(str(provider_query))
+                  await page.locator("#location").fill(str(search_location))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == submitted
+
+    @pytest.mark.asyncio
+    async def test_prior_block_output_parameter_key_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _directory_blocks_yaml(
+            """
+            - block_type: code
+              label: search_registry
+              code: |
+                return {"records": []}
+            - block_type: code
+              label: summarize_registry
+              parameter_keys: [search_registry_output]
+              code: |
+                print(search_registry_output)
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == submitted
+
+    @pytest.mark.parametrize(
+        ("submitted", "label", "key"),
+        [
+            (
+                _directory_blocks_yaml(
+                    """
+                    - block_type: code
+                      label: summarize_registry
+                      parameter_keys: [search_registry_output]
+                      code: |
+                        print(search_registry_output)
+                    - block_type: code
+                      label: search_registry
+                      code: |
+                        return {"records": []}
+                    """
+                ),
+                "summarize_registry",
+                "search_registry_output",
+            ),
+            (
+                _directory_blocks_yaml(
+                    """
+                    - block_type: loop
+                      label: retry_search
+                      loop_blocks:
+                      - block_type: code
+                        label: nested_directory_search
+                        parameter_keys: [retry_search_output]
+                        code: |
+                          print(retry_search_output)
+                    """
+                ),
+                "nested_directory_search",
+                "retry_search_output",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unavailable_output_parameter_key_rejects(
+        self, monkeypatch: pytest.MonkeyPatch, submitted: str, label: str, key: str
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert label in result["error"]
+        assert f"`{key}`" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.parametrize("marker", ["<<<<<<< HEAD", "======="])
+    @pytest.mark.asyncio
+    async def test_raw_workflow_yaml_conflict_marker_rejects_before_persist(
+        self, monkeypatch: pytest.MonkeyPatch, marker: str
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _SAFE_CODE_YAML
+        submitted = f"{marker}\n{_SAFE_CODE_YAML}"
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert f"conflict marker `{marker}`" in result["error"]
+        assert "line 1" in result["error"]
+        assert ctx.workflow_yaml == _SAFE_CODE_YAML
+
+    @pytest.mark.asyncio
+    async def test_conflict_marker_inside_code_block_has_marker_specific_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  <<<<<<< HEAD
+                  await page.goto("https://example.com/search")
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "Code block `search_registry` contains unresolved conflict marker `<<<<<<< HEAD`" in result["error"]
+        assert "not valid Python" not in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_registered_download_output_keys_are_not_parameter_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                parameter_keys: [downloaded_files]
+                code: |
+                  print(downloaded_files)
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "download_statement" in result["error"]
+        assert "`downloaded_files`" in result["error"]
+        assert "execution layer injects registered download output keys" in result["error"]
+
+
 class TestCompiledAuthoringImposition:
     def _provider_search_ctx(self) -> CopilotContext:
         ctx = _code_only_ctx()
@@ -551,7 +836,7 @@ class TestCompiledAuthoringImposition:
                 "parameter_type": "workflow",
                 "workflow_parameter_type": "string",
                 "key": "provider_name",
-                "default_value": "Taylor Brooks",
+                "default_value": "Sample Search",
             }
         ]
         assert result["data"]["imposed_substitutions"] == {
@@ -582,14 +867,171 @@ class TestCompiledAuthoringImposition:
             {"workflow_yaml": _SUBMITTED_LITERAL_YAML, "code_artifact_metadata": metadata}, ctx
         )
 
+        assert result["ok"] is False
+        assert "does not return a keyed structure" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_output_intent_requires_artifact_metadata_before_persist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        submitted = _yaml(
+            """
+            title: Provider lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: provider_result}
+              blocks:
+              - block_type: code
+                label: search_registry
+                prompt: Search the registry and return structured provider result data.
+                code: |
+                  await page.locator("input[placeholder='Search']").fill("Sample Search")
+                  await page.locator("button.lookup").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "must pass `code_artifact_metadata`" in result["error"]
+        assert "goal_value_paths" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_output_intent_rejects_partial_metadata_without_output_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        submitted = _yaml(
+            """
+            title: Provider lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: provider_result}
+              blocks:
+              - block_type: code
+                label: open_registry
+                prompt: Open the registry.
+                code: |
+                  await page.goto("https://example.com/search")
+              - block_type: code
+                label: extract_registry
+                prompt: Return structured provider result data.
+                code: |
+                  records = [{"number": "REC-001"}]
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [_terminal_metadata("open_registry", "open the registry")],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "extract_registry" in result["error"]
+        assert "must pass `code_artifact_metadata`" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_imposition_preserves_submitted_extraction_suffix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = synthesized.code.rstrip() + '\nrecords = [{"number": "REC-001", "status": "credentialed"}]\n'
+        submitted = yaml.safe_dump(
+            {
+                "title": "Provider lookup",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "parameter_type": "workflow",
+                            "workflow_parameter_type": "string",
+                            "key": "provider_name",
+                            "default_value": "Sample Search",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "search_registry",
+                            "code": submitted_code,
+                        }
+                    ],
+                },
+            },
+            sort_keys=False,
+        )
+        metadata = [_terminal_metadata("search_registry", "search the registry")]
+
+        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
+
         assert result["ok"] is True
-        assert "structured_return_skeleton" not in result["data"]["imposed_substitutions"]
+        assert result["data"]["imposed_substitutions"]["preserved_extraction_suffix"] is True
         parsed = parse_workflow_yaml(ctx.workflow_yaml)
         assert isinstance(parsed, dict)
         block = _single_code_block(parsed)
         assert "<fill" not in block["code"]
         assert "<fill: captured value>" not in block["code"]
         assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert 'records = [{"number": "REC-001", "status": "credentialed"}]' in block["code"]
+
+    @pytest.mark.asyncio
+    async def test_imposition_preserves_custom_extraction_code_with_goal_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        synthesized_code = textwrap.dedent(synthesized.code).lstrip()
+        submitted_code = (
+            "records = []\n"
+            + synthesized_code.rstrip()
+            + '\nrecords.append({"number": "REC-001", "status": "credentialed"})\n'
+        )
+        submitted = yaml.safe_dump(
+            {
+                "title": "Provider lookup",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "parameter_type": "workflow",
+                            "workflow_parameter_type": "string",
+                            "key": "provider_name",
+                            "default_value": "Sample Search",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "search_registry",
+                            "code": submitted_code,
+                        }
+                    ],
+                },
+            },
+            sort_keys=False,
+        )
+        metadata = [_terminal_metadata("search_registry", "search the registry")]
+
+        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
+
+        assert result["ok"] is True
+        assert result["data"]["imposed_substitutions"]["preserved_submitted_extraction_code"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["code"].startswith("records = []")
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert 'records.append({"number": "REC-001", "status": "credentialed"})' in block["code"]
 
     def _download_ctx(self) -> CopilotContext:
         from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -860,6 +1302,351 @@ class TestCompiledAuthoringImposition:
         assert ctx.workflow_yaml == ""
 
     @pytest.mark.asyncio
+    async def test_synthesized_internal_parameter_aliases_to_existing_declared_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 17,
+                "typed_value": "Example City, USA",
+                "role": "textbox",
+                "accessible_name": "Address or postal code",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {key: search_location, default_value: "Example City, USA"}
+              - {key: address_or_postal_code, default_value: "Example City, USA"}
+              blocks:
+              - block_type: code
+                label: search_directory
+                parameter_keys: [address_or_postal_code]
+                parameters:
+                - {key: address_or_postal_code, default_value: "Example City, USA"}
+                code: |
+                  await page.locator("#location").fill(str(address_or_postal_code))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["search_location"]
+        assert "parameters" not in block
+        assert "str(search_location)" in block["code"]
+        assert "address_or_postal_code" not in block["code"]
+        parameters = parsed["workflow_definition"]["parameters"]
+        assert [parameter["key"] for parameter in parameters] == ["search_location"]
+        assert result["data"]["imposed_substitutions"]["parameter_aliases"] == {
+            "address_or_postal_code": "search_location"
+        }
+
+    @pytest.mark.asyncio
+    async def test_multi_input_synthesized_parameter_aliases_before_ambiguity_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 17,
+                "typed_value": "Example City, USA",
+                "role": "textbox",
+                "accessible_name": "Address or postal code",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#firstName",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 5,
+                "typed_value": "Given",
+                "role": "textbox",
+                "accessible_name": "Provider First Name",
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {key: search_location, default_value: "Example City, USA"}
+              - {key: provider_first_name, default_value: "Given"}
+              blocks:
+              - block_type: code
+                label: search_directory
+                parameter_keys: [address_or_postal_code, provider_first_name]
+                code: |
+                  await page.locator("#location").fill(str(address_or_postal_code))
+                  await page.locator("#firstName").fill(str(provider_first_name))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["search_location", "provider_first_name"]
+        assert "str(search_location)" in block["code"]
+        assert "str(provider_first_name)" in block["code"]
+        assert "address_or_postal_code" not in block["code"]
+        assert result["data"]["imposed_substitutions"]["parameter_aliases"] == {
+            "address_or_postal_code": "search_location"
+        }
+
+    @pytest.mark.asyncio
+    async def test_synthesized_parameter_aliases_by_typed_length_to_declared_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 17,
+                "role": "textbox",
+                "accessible_name": "Address or postal code",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#firstName",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "Provider First Name",
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {key: search_location, default_value: "Example City, USA"}
+              - {key: provider_first_name, default_value: "Given"}
+              blocks:
+              - block_type: code
+                label: search_directory
+                parameter_keys: [address_or_postal_code, provider_first_name]
+                code: |
+                  await page.locator("#location").fill(str(address_or_postal_code))
+                  await page.locator("#firstName").fill(str(provider_first_name))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["search_location", "provider_first_name"]
+        assert "str(search_location)" in block["code"]
+        assert "address_or_postal_code" not in block["code"]
+        assert result["data"]["imposed_substitutions"]["parameter_aliases"] == {
+            "address_or_postal_code": "search_location"
+        }
+
+    @pytest.mark.asyncio
+    async def test_synthesized_provider_search_key_rewrites_to_declared_first_last_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 17,
+                "role": "textbox",
+                "accessible_name": "Address or postal code",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#providerSearch",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 12,
+                "role": "textbox",
+                "accessible_name": "Provider name or identifier",
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {key: search_location, default_value: "Example City, USA"}
+              - {key: provider_first_name, default_value: "Given"}
+              - {key: provider_last_name, default_value: "Family"}
+              blocks:
+              - block_type: code
+                label: search_directory
+                parameter_keys:
+                - address_or_postal_code
+                - provider_name_or_identifier
+                code: |
+                  await page.locator("#location").fill(str(address_or_postal_code))
+                  await page.locator("#providerSearch").fill(str(provider_name_or_identifier))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["search_location", "provider_first_name", "provider_last_name"]
+        assert "str(search_location)" in block["code"]
+        assert '(str(provider_first_name) + " " + str(provider_last_name))' in block["code"]
+        assert "address_or_postal_code" not in block["code"]
+        assert "provider_name_or_identifier" not in block["code"]
+        assert result["data"]["imposed_substitutions"]["parameter_aliases"] == {
+            "address_or_postal_code": "search_location"
+        }
+        assert result["data"]["imposed_substitutions"]["parameter_expressions"] == {
+            "provider_name_or_identifier": ('(str(provider_first_name) + " " + str(provider_last_name))')
+        }
+
+    def test_identifier_rewrite_skips_string_literals_and_comments(self) -> None:
+        source = (
+            'await page.locator("#providerSearch").fill(str(provider_query))\n'
+            "# provider_query should stay readable in comments\n"
+            'message = "provider_query should stay readable in strings"\n'
+        )
+
+        rewritten = workflow_update_module._replace_python_identifier(
+            source,
+            "provider_query",
+            '(str(provider_first_name) + " " + str(provider_last_name))',
+        )
+
+        ast.parse(rewritten)
+        assert 'str((str(provider_first_name) + " " + str(provider_last_name)))' in rewritten
+        assert "# provider_query should stay readable in comments" in rewritten
+        assert '"provider_query should stay readable in strings"' in rewritten
+
+    def test_identifier_rewrite_preserves_multiline_block_shape(self) -> None:
+        source = (
+            "if provider_query:\n"
+            '    await page.locator("#providerSearch").fill(str(provider_query))\n'
+            "else:\n"
+            '    await page.locator("#providerSearch").fill("")\n'
+        )
+
+        rewritten = workflow_update_module._replace_python_identifier(source, "provider_query", "provider_name")
+
+        assert rewritten == (
+            "if provider_name:\n"
+            '    await page.locator("#providerSearch").fill(str(provider_name))\n'
+            "else:\n"
+            '    await page.locator("#providerSearch").fill("")\n'
+        )
+
+    def test_ambiguous_combined_default_match_logs_and_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        debug_events: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            workflow_update_module,
+            "LOG",
+            SimpleNamespace(debug=lambda event, **kwargs: debug_events.append((event, kwargs))),
+        )
+
+        result = workflow_update_module._combined_string_default_expression(
+            [
+                {"key": "first_name", "default_value": "Given"},
+                {"key": "last_name", "default_value": "Family"},
+                {"key": "given_name", "default_value": "Given"},
+                {"key": "family_name", "default_value": "Family"},
+            ],
+            synthesized_default="Given Family",
+            typed_length=None,
+        )
+
+        assert result is None
+        assert debug_events == [
+            (
+                "copilot_synthesized_parameter_combined_default_ambiguous",
+                {"match_count": 3, "synthesized_default_present": True, "typed_length": None},
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_synthesized_provider_search_key_rewrites_to_short_first_last_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#providerSearch",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 12,
+                "role": "textbox",
+                "accessible_name": "Provider name or identifier",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {key: first_name, default_value: "Given"}
+              - {key: last_name, default_value: "Family"}
+              blocks:
+              - block_type: code
+                label: search_directory
+                parameter_keys:
+                - provider_name_or_identifier
+                code: |
+                  await page.locator("#providerSearch").fill(str(provider_name_or_identifier))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["first_name", "last_name"]
+        assert '(str(first_name) + " " + str(last_name))' in block["code"]
+        assert "provider_name_or_identifier" not in block["code"]
+        assert result["data"]["imposed_substitutions"]["parameter_expressions"] == {
+            "provider_name_or_identifier": ('(str(first_name) + " " + str(last_name))')
+        }
+
+    @pytest.mark.asyncio
     async def test_single_local_string_constant_is_lifted_for_synthesized_key(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -879,7 +1666,7 @@ class TestCompiledAuthoringImposition:
                 "parameter_type": "workflow",
                 "workflow_parameter_type": "string",
                 "key": "provider_name",
-                "default_value": "Taylor Brooks",
+                "default_value": "Sample Search",
             }
         ]
 
@@ -905,7 +1692,7 @@ class TestCompiledAuthoringImposition:
                 "parameter_type": "workflow",
                 "workflow_parameter_type": "string",
                 "key": synthesized_key,
-                "default_value": "Taylor Brooks",
+                "default_value": "Sample Search",
             }
         ]
         assert result["data"]["imposed_substitutions"]["parameter_keys"] == [synthesized_key]
@@ -1057,6 +1844,7 @@ class TestSeamSalvageIntoContext:
                 label: block_one
                 code: |
                   await page.goto("https://example.com/search")
+                  records = [{"number": "REC-001"}]
               - block_type: code
                 label: block_two
                 code: |
@@ -1140,7 +1928,9 @@ class TestSeamSalvageIntoContext:
     async def test_minimal_metadata_with_trajectory_produces_no_violation_error(self) -> None:
         ctx = _code_only_ctx()
         metadata = [_terminal_metadata("search_registry", "search the registry")]
-        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML, "code_artifact_metadata": metadata}, ctx)
+        result = await _update_workflow(
+            {"workflow_yaml": _SAFE_EXTRACTION_CODE_YAML, "code_artifact_metadata": metadata}, ctx
+        )
         # The seam may reject later (credential checks need the app); the metadata
         # contract itself must not be the rejection.
         error_text = str(result.get("error") or "")
@@ -1157,10 +1947,12 @@ class TestStaleLabelSeamFlow:
         # neither the metadata gate nor the stale-block-metadata validation
         # path can bounce the submission back to the model.
         ctx = _code_only_ctx()
-        ctx.workflow_yaml = _SAFE_CODE_YAML
+        ctx.workflow_yaml = _SAFE_EXTRACTION_CODE_YAML
         metadata = [_terminal_metadata("search_certificant_stale", "search the registry")]
 
-        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML, "code_artifact_metadata": metadata}, ctx)
+        result = await _update_workflow(
+            {"workflow_yaml": _SAFE_EXTRACTION_CODE_YAML, "code_artifact_metadata": metadata}, ctx
+        )
 
         error_text = str(result.get("error") or "")
         assert "Artifact metadata" not in error_text
@@ -1169,7 +1961,7 @@ class TestStaleLabelSeamFlow:
         assert ctx.code_artifact_metadata["search_registry"]["artifact_id"] == "code_artifact:search_registry"
         # The seam never rewrites YAML labels, so its output cannot trip the
         # stale-block-metadata validation that fires on label/title renames.
-        assert _detect_stale_block_metadata(_SAFE_CODE_YAML, ctx.workflow_yaml) == []
+        assert _detect_stale_block_metadata(_SAFE_EXTRACTION_CODE_YAML, ctx.workflow_yaml) == []
 
     @pytest.mark.asyncio
     async def test_malformed_per_entry_refs_normalize_without_scout_interactions(self) -> None:
@@ -1184,7 +1976,9 @@ class TestStaleLabelSeamFlow:
             }
         ]
 
-        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML, "code_artifact_metadata": metadata}, ctx)
+        result = await _update_workflow(
+            {"workflow_yaml": _SAFE_EXTRACTION_CODE_YAML, "code_artifact_metadata": metadata}, ctx
+        )
 
         error_text = str(result.get("error") or "")
         assert "Artifact metadata" not in error_text

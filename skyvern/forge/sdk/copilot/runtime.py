@@ -276,6 +276,7 @@ class AgentContext:
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
     synthesized_block_offered: bool = False
+    synthesized_block_offered_trajectory_len: int = 0
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0

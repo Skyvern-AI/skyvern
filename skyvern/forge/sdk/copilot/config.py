@@ -35,6 +35,7 @@ def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthorin
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 35
 DEFAULT_TOKEN_BUDGET = 90_000
+SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD = 3
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "

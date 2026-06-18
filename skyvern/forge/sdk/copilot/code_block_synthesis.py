@@ -8,9 +8,11 @@ that runs on the raw ``page`` object the copilot code block executes against.
 
 from __future__ import annotations
 
+import io
 import json
 import keyword
 import re
+import tokenize
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,7 +30,16 @@ _ENTRY_REUSED_VAR = "_scout_entry_reused_current_page"
 _ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
 _ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
 _ENTRY_OPENER_VAR = "_scout_entry_opener"
+_OPTIONAL_DISMISSAL_VAR = "_scout_optional_dismissal"
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
+_INTERNAL_SCOUT_VARS = (
+    _ENTRY_TARGET_VAR,
+    _ENTRY_REUSED_VAR,
+    _ENTRY_RESUME_AFTER_AUTH_VAR,
+    _ENTRY_RESUME_TARGET_VAR,
+    _ENTRY_OPENER_VAR,
+    _OPTIONAL_DISMISSAL_VAR,
+)
 
 # Base name for the download var bound by `async with page.expect_download() as <name>:`.
 _DOWNLOAD_VAR_BASE = "dl_info"
@@ -44,6 +55,32 @@ _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
 CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\([A-Za-z_]\w*\.\w+\)")
 _ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
+_OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(
+    r"\b(?:accept|agree|allow|consent|cookies?|decline|reject|refuse|dismiss|got it|no thanks)\b|^(?:ok|okay)$",
+    re.I,
+)
+_OPTIONAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
+    r"(?:acceptcookies|cookies?|consent|decline|reject|refuse|dismiss|close)", re.I
+)
+# Used only after the scout captured an unnamed structural/not-decline cookie click
+# and a later durable target exists; this generic text fallback keeps replay conditional.
+_COOKIE_ACCEPT_FALLBACK_LOCATOR_SELECTOR = "button:has-text('Accept')"
+_NOT_DECLINE_BUTTON_SELECTOR_PATTERN = re.compile(r"^button:not\(\.decline\)(?::nth-of-type\(\d+\))?$", re.I)
+_COOKIE_ACCEPT_TEXT_XPATH_PATTERN = re.compile(
+    r"""^//button\[\s*normalize-space\(\)\s*=\s*(['"])accept\1\s*\]$""", re.I
+)
+_BODY_ROOTED_INDEXED_BUTTON_XPATH_PATTERN = re.compile(
+    r"""^(?:/\*\[name\(\)=["']html["']\]\[1\])?"""
+    r"""(?:/\*\[name\(\)=["']body["']\]\[1\])"""
+    r"""(?:/\*\[name\(\)=["'][a-z0-9_-]+["']\]\[\d+\])*"""
+    r"""/\*\[name\(\)=["']button["']\]\[\d+\]$""",
+    re.I,
+)
+_STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
+    r"^(?:[.#][A-Za-z_][\w-]*\s+)?button(?::nth-(?:of-type|child)\(\d+\))$"
+    r"|^button:not\(\.decline\)(?::nth-of-type\(\d+\))?$",
+    re.I,
+)
 
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
@@ -411,17 +448,97 @@ def _is_generic_entry_opener_click(interaction: Mapping[str, Any]) -> bool:
     return selector == "button" or bool(re.match(r"^button(?:\\.icon|:nth-)", selector))
 
 
-def _should_prefer_durable_entry_target(trajectory: Sequence[Mapping[str, Any]]) -> bool:
-    if not trajectory or not _is_generic_entry_opener_click(trajectory[0]):
+def _is_optional_dismissal_click(interaction: Mapping[str, Any]) -> bool:
+    if str(interaction.get("tool_name") or "") != "click":
         return False
-    first_source_url = str(trajectory[0].get("source_url") or "").strip()
-    for interaction in trajectory[1:]:
+    role = str(interaction.get("role") or "").strip().lower()
+    if role and role not in {"button", "link"}:
+        return False
+    selector = str(interaction.get("selector") or "").strip()
+    name = str(interaction.get("accessible_name") or "").strip()
+    if name and _OPTIONAL_DISMISSAL_NAME_PATTERN.search(name):
+        return True
+    return bool(selector and _OPTIONAL_DISMISSAL_SELECTOR_PATTERN.search(selector))
+
+
+def _is_cookie_accept_xpath_selector(selector: str) -> bool:
+    normalized_selector = selector.strip().lower()
+    if normalized_selector.startswith("xpath="):
+        normalized_selector = normalized_selector[len("xpath=") :].strip()
+    return bool(
+        _COOKIE_ACCEPT_TEXT_XPATH_PATTERN.match(normalized_selector)
+        or _BODY_ROOTED_INDEXED_BUTTON_XPATH_PATTERN.match(normalized_selector)
+    )
+
+
+def _is_structural_dismissal_click(interaction: Mapping[str, Any]) -> bool:
+    if str(interaction.get("tool_name") or "") != "click":
+        return False
+    role = str(interaction.get("role") or "").strip().lower()
+    if role and role not in {"button", "link"}:
+        return False
+    if str(interaction.get("accessible_name") or "").strip():
+        return False
+    selector = str(interaction.get("selector") or "").strip()
+    return bool(
+        selector
+        and (_STRUCTURAL_DISMISSAL_SELECTOR_PATTERN.search(selector) or _is_cookie_accept_xpath_selector(selector))
+    )
+
+
+def _has_later_durable_fallback_target(
+    trajectory: Sequence[Mapping[str, Any]],
+    start_index: int,
+) -> bool:
+    first_source_url = str(trajectory[start_index].get("source_url") or "").strip()
+    for interaction in trajectory[start_index + 1 :]:
         source_url = str(interaction.get("source_url") or "").strip()
         if first_source_url and source_url and source_url != first_source_url:
             continue
         if _is_durable_fallback_entry_target(interaction):
             return True
     return False
+
+
+def _is_optional_or_structural_dismissal_click(interaction: Mapping[str, Any]) -> bool:
+    if _is_optional_dismissal_click(interaction):
+        return True
+    return _is_structural_dismissal_click(interaction)
+
+
+def is_optional_dismissal_only_trajectory(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    return bool(trajectory) and all(
+        _is_optional_or_structural_dismissal_click(interaction) for interaction in trajectory
+    )
+
+
+def _optional_dismissal_locator_expr(interaction: Mapping[str, Any], fallback_locator: str) -> str:
+    selector = str(interaction.get("selector") or "").strip()
+    if _NOT_DECLINE_BUTTON_SELECTOR_PATTERN.match(selector) or _is_cookie_accept_xpath_selector(selector):
+        # Anonymous structural/cookie-shaped selectors are brittle across reloads; name-matched dismissals
+        # keep the captured locator because the accessible name is the durable anchor.
+        return f"page.locator({_py_str(_COOKIE_ACCEPT_FALLBACK_LOCATOR_SELECTOR)})"
+    return fallback_locator
+
+
+def _should_prefer_durable_entry_target(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    if not trajectory or not (
+        _is_generic_entry_opener_click(trajectory[0])
+        or _is_optional_dismissal_click(trajectory[0])
+        or _is_structural_dismissal_click(trajectory[0])
+    ):
+        return False
+    return _has_later_durable_fallback_target(trajectory, 0)
+
+
+def _code_uses_name(source: str, name: str) -> bool:
+    try:
+        return any(
+            token.type == tokenize.NAME and token.string == name
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        )
+    except (IndentationError, tokenize.TokenError):
+        return bool(re.search(rf"\b{re.escape(name)}\b", source))
 
 
 def _entry_target_locator(
@@ -531,12 +648,18 @@ def synthesize_code_block(
             break
     if entry_url:
         entry_trajectory = trajectory[entry_index:]
+        optional_dismissal_prefix = (
+            _is_optional_or_structural_dismissal_click(entry_trajectory[0]) if entry_trajectory else False
+        )
         prefer_durable_entry_target = compile_download_target or _should_prefer_durable_entry_target(entry_trajectory)
         fallback_entry_target, fallback_entry_relative_index = _entry_target_locator(
             entry_trajectory,
             strict_selectors=strict_selectors,
             prefer_durable=prefer_durable_entry_target,
         )
+        if optional_dismissal_prefix and fallback_entry_relative_index == 0:
+            fallback_entry_target = ""
+            fallback_entry_relative_index = -1
         fallback_entry_index = (
             entry_index + fallback_entry_relative_index if fallback_entry_relative_index >= 0 else entry_index
         )
@@ -556,7 +679,9 @@ def synthesize_code_block(
         )
         entry_target = download_entry_target if download_entry_target else fallback_entry_target
         entry_replay_condition_active = bool(download_entry_target and fallback_entry_target)
-        entry_replay_start_index = fallback_entry_index if fallback_entry_index > entry_index else 0
+        entry_replay_start_index = (
+            fallback_entry_index if fallback_entry_index > entry_index and not optional_dismissal_prefix else 0
+        )
         if entry_index > 0:
             notes.append("entry URL taken from a later interaction; earlier steps had no source_url")
         if entry_replay_condition_active and fallback_entry_index > entry_index:
@@ -725,8 +850,20 @@ def synthesize_code_block(
 
         line_start = len(lines) + 1
         if tool_name == "click":
-            lines.append(f"{action_indent}await {locator}.click()")
-            lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+            if _is_optional_or_structural_dismissal_click(interaction):
+                optional_locator = _optional_dismissal_locator_expr(interaction, locator)
+                lines.append(f"{action_indent}{_OPTIONAL_DISMISSAL_VAR} = {optional_locator}")
+                lines.append(f"{action_indent}if await {_OPTIONAL_DISMISSAL_VAR}.count() > 0:")
+                lines.append(f"{action_indent}{_INDENT}try:")
+                lines.append(f"{action_indent}{_INDENT * 2}await {_OPTIONAL_DISMISSAL_VAR}.first.click(timeout=1000)")
+                lines.append(
+                    f"{action_indent}{_INDENT * 2}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})"
+                )
+                lines.append(f"{action_indent}{_INDENT}except Exception:")
+                lines.append(f"{action_indent}{_INDENT * 2}pass")
+            else:
+                lines.append(f"{action_indent}await {locator}.click()")
+                lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
             typed_identity = _typed_value_identity(interaction)
@@ -737,6 +874,14 @@ def synthesize_code_block(
                 typed_value = str(interaction.get("typed_value") or "").strip()
                 if typed_value:
                     parameter["default_value"] = typed_value
+                typed_length = interaction.get("typed_length")
+                if strict_selectors and typed_length is not None:
+                    try:
+                        typed_length_int = int(typed_length)
+                    except (TypeError, ValueError):
+                        typed_length_int = 0
+                    if typed_length_int > 0:
+                        parameter["typed_length"] = str(typed_length_int)
                 parameters.append(parameter)
                 if typed_identity is not None:
                     typed_param_keys[typed_identity] = param_key
@@ -803,6 +948,16 @@ def synthesize_code_block(
 
     if not lines:
         return None
+    emitted_code = "\n".join(lines)
+    for scout_var in _INTERNAL_SCOUT_VARS:
+        if not _code_uses_name(emitted_code, scout_var):
+            continue
+        # Code-block safe vars expose `Exception`, not `NameError`; this cleanup only
+        # swallows missing generated scout locals after guarded branches.
+        lines.append(f"{_INDENT}try:")
+        lines.append(f"{_INDENT * 2}del {scout_var}")
+        lines.append(f"{_INDENT}except Exception:")
+        lines.append(f"{_INDENT * 2}pass")
     if steps:
         steps[-1]["line_end"] = len(lines)
 
