@@ -100,6 +100,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
+from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -867,6 +868,13 @@ class ForgeAgent:
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
+            # Shadow-only loop-stall observability; never raises, never terminates (see shadow.py).
+            await record_fail_fast_shadow(
+                task=task,
+                step=step,
+                organization=organization,
+                scraped_page=detailed_output.scraped_page if detailed_output else None,
+            )
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
