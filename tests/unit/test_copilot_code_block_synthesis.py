@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     build_synthesized_artifact_metadata,
+    is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
 )
@@ -268,6 +269,25 @@ class TestActionSynthesis:
         # Raw typed value is never captured.
         assert "value" not in result.code
 
+    def test_strict_type_text_carries_typed_length_without_value(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/",
+                    typed_length=19,
+                    role="textbox",
+                    accessible_name="Address or postal code",
+                )
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        assert result.parameters == [{"key": "address_or_postal_code", "typed_length": "19"}]
+        assert "Example City" not in result.code
+
     def test_type_text_defaults_are_private_reused_only_for_same_field_identity(self) -> None:
         def typed(selector: str, name: str, url: str = "https://example.com/") -> dict[str, Any]:
             return _interaction(
@@ -315,6 +335,347 @@ class TestActionSynthesis:
         assert lines[3] == "    except Exception:"
         assert lines[4] == '        await page.goto("https://example.com/start", wait_until="domcontentloaded")'
         assert lines[5] == '        await _scout_entry_target.wait_for(state="visible")'
+        assert "        del _scout_entry_target" in lines
+
+    def test_optional_cookie_dismissal_is_conditional_and_uses_durable_entry_target(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#accept-consent",
+                    source_url="https://example.com/find",
+                    role="button",
+                    accessible_name="Accept cookies",
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="City, county, or ZIP code",
+                    typed_value="Example City",
+                ),
+            ]
+        )
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
+        assert '        await page.goto("https://example.com/find", wait_until="domcontentloaded")' in lines
+        assert '        await _scout_entry_target.wait_for(state="visible")' in lines
+        assert '    _scout_optional_dismissal = page.locator("#accept-consent")' in lines
+        assert "    if await _scout_optional_dismissal.count() > 0:" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert result.code.index("_scout_optional_dismissal") < result.code.index(
+            'await page.locator("#locInput").fill'
+        )
+        assert "        del _scout_entry_target" in lines
+        assert "        del _scout_optional_dismissal" in lines
+        assert result.parameters == [{"key": "city_county_or_zip_code", "default_value": "Example City"}]
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_optional_cookie_decline_is_conditional_and_not_entry_target(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="button.decline",
+                    source_url="https://example.com/find",
+                    role="button",
+                    accessible_name="Decline cookies",
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="City, county, or ZIP code",
+                    typed_value="Example City",
+                ),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
+        assert '    _scout_optional_dismissal = page.locator("button.decline")' in lines
+        assert "    if await _scout_optional_dismissal.count() > 0:" in lines
+        assert 'await _scout_entry_target.wait_for(state="visible")' in result.code
+        assert 'await page.locator("button.decline").click()' not in result.code
+
+    def test_close_named_action_is_not_optional_dismissal_by_name_only(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector="#account-action",
+                source_url="https://example.com/settings",
+                role="button",
+                accessible_name="Close account",
+            )
+        ]
+
+        assert is_optional_dismissal_only_trajectory(trajectory) is False
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert 'await page.locator("#account-action").click()' in result.code
+        assert "_scout_optional_dismissal" not in result.code
+
+    def test_internal_scout_cleanup_ignores_names_inside_literals(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#start",
+                    source_url="https://example.com/_scout_optional_dismissal",
+                )
+            ]
+        )
+
+        assert result is not None
+        assert 'await page.goto("https://example.com/_scout_optional_dismissal"' in result.code
+        assert "        del _scout_entry_target" in result.code
+        assert "        del _scout_optional_dismissal" not in result.code
+
+    def test_structural_cookie_button_is_conditional_when_durable_target_follows(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector=".btns button:nth-of-type(2)",
+                    source_url="https://example.com/find",
+                    role="button",
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#npiInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="Provider ID",
+                    typed_value="ID-12345",
+                ),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#npiInput")'
+        assert '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")' in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert 'await page.locator(".btns button:nth-of-type(2)").click()' not in result.code
+        assert result.code.index("_scout_optional_dismissal") < result.code.index(
+            'await page.locator("#npiInput").fill'
+        )
+
+    def test_not_decline_cookie_button_is_conditional_when_durable_target_follows(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="button:not(.decline):nth-of-type(6)",
+                    source_url="https://example.com/find",
+                    role="button",
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="City, county, or ZIP code",
+                    typed_value="Example City",
+                ),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
+        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert 'await page.locator("button:not(.decline):nth-of-type(6)").click()' not in result.code
+
+    def test_cookie_accept_xpath_is_conditional_when_durable_target_follows(self) -> None:
+        cookie_accept_xpath = (
+            'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]'
+            '/*[name()="div"][2]/*[name()="div"][1]/*[name()="button"][2]'
+        )
+
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector=cookie_accept_xpath,
+                    source_url="https://example.com/find",
+                    role="button",
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="City, county, or ZIP code",
+                    typed_value="Example City",
+                ),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
+        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert cookie_accept_xpath not in result.code
+        assert result.code.index("_scout_optional_dismissal") < result.code.index(
+            'await page.locator("#locInput").fill'
+        )
+
+    def test_normalized_accept_xpath_is_conditional_when_durable_target_follows(self) -> None:
+        accept_xpath = "xpath=//button[normalize-space()='Accept']"
+
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector=accept_xpath,
+                    source_url="https://example.com/find",
+                    role="button",
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="City, county, or ZIP code",
+                    typed_value="Example City",
+                ),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
+        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert accept_xpath not in result.code
+
+    def test_bare_normalized_accept_xpath_is_conditional_when_durable_target_follows(self) -> None:
+        accept_xpath = "//button[normalize-space()='Accept']"
+
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector=accept_xpath,
+                    source_url="https://example.com/find",
+                    role=None,
+                ),
+                _interaction(
+                    "type_text",
+                    selector="#locInput",
+                    source_url="https://example.com/find",
+                    role="textbox",
+                    accessible_name="City, county, or ZIP code",
+                    typed_value="Example City",
+                ),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
+        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert accept_xpath not in result.code
+
+    def test_one_step_not_decline_cookie_button_is_not_entry_target(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector="button:not(.decline)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+        ]
+        assert is_optional_dismissal_only_trajectory(trajectory) is True
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
+        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
+        assert 'page.locator("button:not(.decline)")' not in result.code
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_one_step_structural_cookie_button_is_not_entry_target(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector=".btns button:nth-of-type(2)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+        ]
+        assert is_optional_dismissal_only_trajectory(trajectory) is True
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
+        assert '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")' in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
+        assert 'await page.locator(".btns button:nth-of-type(2)").click()' not in result.code
+
+    def test_one_step_bare_accept_xpath_is_not_entry_target(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector="//button[normalize-space()='Accept']",
+                source_url="https://example.com/find",
+                role=None,
+            ),
+        ]
+        assert is_optional_dismissal_only_trajectory(trajectory) is True
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
+        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
+        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
+        assert "//button[normalize-space()='Accept']" not in result.code
+
+    def test_optional_dismissal_with_durable_target_is_offerable(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector="button:not(.decline)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+        ]
+
+        assert is_optional_dismissal_only_trajectory(trajectory) is False
 
     def test_press_enter_uses_keyboard_when_no_selector(self) -> None:
         result = synthesize_code_block([_interaction("press_key", key="Enter")])
