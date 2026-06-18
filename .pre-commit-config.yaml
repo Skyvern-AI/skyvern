@@ -132,3 +132,6 @@ repos:
     rev: v0.17.2
     hooks:
       - id: yamlfmt
+        # Helm chart templates contain Go templating ({{ ... }}) and are not
+        # valid standalone YAML, so yamlfmt cannot parse them.
+        exclude: ^k8s/charts/.*/templates/
