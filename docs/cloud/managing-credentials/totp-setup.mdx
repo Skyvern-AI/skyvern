@@ -171,7 +171,13 @@ This turns email-based 2FA into something nearly as automated as an authenticato
 
 ## Server-fetched codes (totp_url)
 
-Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Pass `totp_url` when running a [task](/cloud/getting-started/run-from-code) or [agent](/cloud/building-agents/build-an-agent), and Skyvern will call your endpoint when it needs a verification code.
+Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Skyvern calls your endpoint only when the automation reaches a page that asks for a verification code.
+
+<Warning>
+For saved agents or workflows, configure the endpoint on the block that performs the login. Open the browser, action, file download, or login block and set **TOTP Verification URL**. Passing `totp_url` only in the top-level workflow run request does not automatically populate a block whose **TOTP Verification URL** is empty.
+</Warning>
+
+If the endpoint changes per run, create a workflow parameter such as `totp_url`, set the block's **TOTP Verification URL** to `{{ totp_url }}`, and pass the URL in `parameters` when starting the run.
 
 Your endpoint must accept a POST request with `task_id`, `workflow_run_id`, and `workflow_permanent_id` in the body, and return:
 
