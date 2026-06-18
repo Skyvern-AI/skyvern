@@ -1319,6 +1319,10 @@ class TestDownloadRungSynthesis:
         download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
         assert f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value" in result.code
         assert f"await {download_obj}.path()" in result.code
+        assert '"downloaded_file_name": downloaded_file_name' in result.code
+        assert '"download_url"' not in result.code
+        assert '"downloaded_file_path"' not in result.code
+        assert '"downloaded_files"' not in result.code
         # The execution-layer dir-diff registers the single landed file, so the synthesizer never save_as.
         assert "save_as" not in result.code
         # The click inside expect_download targets the TYPED download selector, not the navigation click.
@@ -1395,8 +1399,13 @@ class TestDownloadRungSynthesis:
         download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
         assert result.code.count(f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value") == 1
         # Awaiting the path() completes the download into the run-scoped dir; the SKY-10937 dir-diff
-        # registers the single file, so a synthesizer save_as would double-register.
+        # registers the single file when available; the returned summary keeps the filename JSON-safe.
         assert f"await {download_obj}.path()" in result.code
+        assert "return {" in result.code
+        assert '"downloaded_file_name": downloaded_file_name' in result.code
+        assert '"downloaded_file_path"' not in result.code
+        assert '"download_url"' not in result.code
+        assert '"downloaded_files"' not in result.code
         assert "save_as" not in result.code
         CodeBlock.is_safe_code("async def _block(page):\n" + result.code)
 

@@ -1075,6 +1075,25 @@ class TestDownloadReturnShape:
         assert "downloaded_files" in error
         assert "self-certifies" in error
 
+    def test_idiom_but_returns_raw_path_or_url_descriptor_keys_is_rejected(self) -> None:
+        code = """
+        async with page.expect_download() as dl_info:
+            await page.click("a#statement-pdf")
+        payload = dict(
+            download_url="https://example.com/statement.pdf",
+            downloaded_file_path=await dl_info.value.path(),
+            downloaded_file_name="statement.pdf",
+        )
+        return payload
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "raw download path/URL descriptor keys" in error
+
     def test_self_asserted_keys_detected_without_goal_path_declaration(self) -> None:
         code = """
         await page.click("a#statement-pdf")
