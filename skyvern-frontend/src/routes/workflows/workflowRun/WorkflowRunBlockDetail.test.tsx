@@ -158,6 +158,35 @@ describe("WorkflowRunBlockDetail router", () => {
     );
   });
 
+  it("renders actions for a file_download block", () => {
+    const action: ActionsApiResponse = {
+      action_id: "act_download",
+      action_type: ActionTypes.Click,
+      status: Status.Completed,
+      task_id: null,
+      step_id: null,
+      step_order: null,
+      action_order: null,
+      reasoning: "Click the invoice download link",
+      description: null,
+      intention: null,
+      response: null,
+      text: null,
+      created_by: null,
+      confidence_float: 1,
+    };
+    const block = buildBlock({
+      block_type: "file_download",
+      label: "download_invoice",
+      actions: [action],
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    expect(screen.getByText("Actions (1)")).toBeDefined();
+    expect(screen.getByText("Click the invoice download link")).toBeDefined();
+  });
+
   it("renders the conditional detail (branch evaluation) for a conditional block", () => {
     const block = buildBlock({
       block_type: "conditional",
