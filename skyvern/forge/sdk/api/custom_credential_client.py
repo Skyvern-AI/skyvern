@@ -49,7 +49,7 @@ class CustomCredentialAPIClient:
                 "totp_type": credential.totp_type,
             }
         elif isinstance(credential, CreditCardCredential):
-            return {
+            payload: dict[str, Any] = {
                 "type": "credit_card",
                 "card_holder_name": credential.card_holder_name,
                 "card_number": credential.card_number,
@@ -58,6 +58,17 @@ class CustomCredentialAPIClient:
                 "card_cvv": credential.card_cvv,
                 "card_brand": credential.card_brand,
             }
+            if credential.billing_address is not None:
+                billing_address = credential.billing_address.model_dump(exclude_none=True)
+                if billing_address:
+                    payload["billing_address"] = billing_address
+            if credential.billing_email is not None:
+                payload["billing_email"] = credential.billing_email
+            if credential.billing_phone is not None:
+                payload["billing_phone"] = credential.billing_phone
+            if credential.metadata:
+                payload["metadata"] = credential.metadata
+            return payload
         elif isinstance(credential, SecretCredential):
             payload = {
                 "type": "secret",
@@ -123,6 +134,10 @@ class CustomCredentialAPIClient:
                 card_exp_year=credential_data["card_exp_year"],
                 card_cvv=credential_data["card_cvv"],
                 card_brand=credential_data["card_brand"],
+                billing_address=credential_data.get("billing_address"),
+                billing_email=credential_data.get("billing_email"),
+                billing_phone=credential_data.get("billing_phone"),
+                metadata=credential_data.get("metadata"),
             )
             return CredentialItem(
                 item_id=item_id,

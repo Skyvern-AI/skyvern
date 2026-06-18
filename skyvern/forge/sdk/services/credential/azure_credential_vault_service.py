@@ -12,6 +12,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
     CredentialVaultType,
+    CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
     SecretCredential,
@@ -36,6 +37,10 @@ class AzureCredentialVaultService(CredentialVaultService):
         card_exp_year: str
         card_brand: str
         card_holder_name: str
+        billing_address: CreditCardBillingAddress | None = None
+        billing_email: str | None = None
+        billing_phone: str | None = None
+        metadata: dict[str, str] | None = None
 
     class _SecretCredentialDataImage(BaseModel):
         type: Literal["secret"]
@@ -67,6 +72,13 @@ class AzureCredentialVaultService(CredentialVaultService):
         return credential
 
     async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
+        credential_data = data.credential
+        if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+            credential_data = await self._preserve_omitted_credit_card_fields(
+                credential=credential,
+                updated_credential=credential_data,
+            )
+
         # Azure supports in-place secret updates, so we reuse the same item_id.
         # NOTE: If the DB update below fails, the vault will contain the new data
         # while DB metadata (name, type, username) remains stale. The actual credential
@@ -74,7 +86,7 @@ class AzureCredentialVaultService(CredentialVaultService):
         # of the update call will reconcile the DB metadata.
         await self._update_azure_secret_item(
             item_id=credential.item_id,
-            credential=data.credential,
+            credential=credential_data,
         )
 
         try:
@@ -160,6 +172,10 @@ class AzureCredentialVaultService(CredentialVaultService):
                     card_exp_year=data.card_exp_year,
                     card_cvv=data.card_cvv,
                     card_brand=data.card_brand,
+                    billing_address=data.billing_address,
+                    billing_email=data.billing_email,
+                    billing_phone=data.billing_phone,
+                    metadata=data.metadata,
                 ),
                 name=db_credential.name,
                 credential_type=CredentialType.CREDIT_CARD,
@@ -195,6 +211,10 @@ class AzureCredentialVaultService(CredentialVaultService):
                 card_exp_year=credential.card_exp_year,
                 card_brand=credential.card_brand,
                 card_holder_name=credential.card_holder_name,
+                billing_address=credential.billing_address,
+                billing_email=credential.billing_email,
+                billing_phone=credential.billing_phone,
+                metadata=credential.metadata,
             )
         elif isinstance(credential, SecretCredential):
             data = AzureCredentialVaultService._SecretCredentialDataImage(
@@ -235,6 +255,10 @@ class AzureCredentialVaultService(CredentialVaultService):
                 card_exp_year=credential.card_exp_year,
                 card_brand=credential.card_brand,
                 card_holder_name=credential.card_holder_name,
+                billing_address=credential.billing_address,
+                billing_email=credential.billing_email,
+                billing_phone=credential.billing_phone,
+                metadata=credential.metadata,
             )
         elif isinstance(credential, SecretCredential):
             data = AzureCredentialVaultService._SecretCredentialDataImage(

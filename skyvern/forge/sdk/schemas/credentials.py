@@ -55,11 +55,27 @@ class PasswordCredentialResponse(BaseModel):
 class CreditCardCredentialResponse(BaseModel):
     """Response model for credit card credentials — non-sensitive fields only.
 
-    SECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name.
+    SECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,
+    billing fields, or metadata.
     """
 
     last_four: str = Field(..., description="Last four digits of the credit card number", examples=["1234"])
     brand: str = Field(..., description="Brand of the credit card", examples=["visa"])
+
+
+class CreditCardBillingAddress(BaseModel):
+    """Optional billing address fields associated with a credit card credential."""
+
+    line1: str | None = Field(default=None, description="Billing address line 1", examples=["123 Main St"])
+    line2: str | None = Field(default=None, description="Billing address line 2", examples=["Apt 4B"])
+    city: str | None = Field(default=None, description="Billing city", examples=["San Francisco"])
+    state: str | None = Field(default=None, description="Billing state or region", examples=["California"])
+    state_code: str | None = Field(default=None, description="Billing state or region code", examples=["CA"])
+    postal_code: str | None = Field(default=None, description="Billing postal code", examples=["94105"])
+    country: str | None = Field(default=None, description="Billing country", examples=["United States"])
+    country_code: str | None = Field(
+        default=None, description="ISO 3166-1 alpha-2 billing country code", examples=["US"]
+    )
 
 
 class SecretCredentialResponse(BaseModel):
@@ -116,6 +132,24 @@ class CreditCardCredential(BaseModel):
     card_exp_year: str = Field(..., description="The card's expiration year", examples=["2025"])
     card_brand: str = Field(..., description="The card's brand", examples=["visa"])
     card_holder_name: str = Field(..., description="The name of the card holder", examples=["John Doe"])
+    billing_address: CreditCardBillingAddress | None = Field(
+        default=None,
+        description="Optional billing address associated with the card",
+    )
+    billing_email: str | None = Field(default=None, description="Optional billing email address")
+    billing_phone: str | None = Field(default=None, description="Optional billing phone number")
+    metadata: dict[str, str] | None = Field(
+        default=None,
+        description="Optional additional credit card metadata fields",
+    )
+
+    @model_validator(mode="after")
+    def normalize_empty_optional_fields(self) -> Self:
+        if self.billing_address is not None and not self.billing_address.model_dump(exclude_none=True):
+            self.billing_address = None
+        if self.metadata == {}:
+            self.metadata = None
+        return self
 
 
 class NonEmptyCreditCardCredential(CreditCardCredential):

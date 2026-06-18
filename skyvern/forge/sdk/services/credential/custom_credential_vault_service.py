@@ -10,7 +10,9 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialItem,
+    CredentialType,
     CredentialVaultType,
+    CreditCardCredential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
@@ -171,11 +173,17 @@ class CustomCredentialVaultService(CredentialVaultService):
 
         try:
             client = await self._get_client_for_organization(credential.organization_id)
+            credential_data = data.credential
+            if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+                credential_data = await self._preserve_omitted_credit_card_fields(
+                    credential=credential,
+                    updated_credential=credential_data,
+                )
 
             # Create new credential in the external API
             new_item_id = await client.create_credential(
                 name=data.name,
-                credential=data.credential,
+                credential=credential_data,
             )
 
             # Update DB record to point to the new vault item
