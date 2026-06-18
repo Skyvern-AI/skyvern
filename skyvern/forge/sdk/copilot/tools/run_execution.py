@@ -23,6 +23,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_blocker_signal_for_reason_codes,
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.code_block_security import (
+    COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
+    CodeBlockSecurityInput,
+    runtime_code_security_errors,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     code_contains_credential_fill,
     trajectory_has_credential_fill,
@@ -81,6 +86,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -696,6 +702,120 @@ def _labels_replay_login_fill(labels_to_execute: list[str], workflow: Workflow |
     return isinstance(code, str) and code_contains_credential_fill(code)
 
 
+def _runtime_code_security_failure_for_selected_labels(
+    workflow: Workflow,
+    *,
+    block_labels: list[str],
+    labels_to_execute: list[str],
+    frontier_start_label: str | None,
+) -> dict[str, Any] | None:
+    code_blocks = _selected_code_security_inputs(
+        _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+        selected_labels=set(labels_to_execute),
+    )
+    errors = runtime_code_security_errors(code_blocks)
+    if not errors:
+        return None
+
+    failure_reason = "Copilot runtime blocked unsafe synthesized code before browser dispatch."
+    return {
+        "ok": False,
+        "error": failure_reason,
+        "data": {
+            "workflow_run_id": None,
+            "overall_status": "failed",
+            "failure_reason": failure_reason,
+            "requested_block_labels": list(block_labels),
+            "executed_block_labels": [],
+            "planned_block_labels": list(labels_to_execute),
+            "frontier_start_label": frontier_start_label,
+            "blocks": [],
+            "failure_categories": [error.to_failure_category() for error in errors],
+            "failure_category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
+        },
+    }
+
+
+def _workflow_definition_blocks_for_code_security(workflow_definition: Any) -> list[Any]:
+    if isinstance(workflow_definition, Mapping):
+        blocks = workflow_definition.get("blocks")
+    else:
+        blocks = getattr(workflow_definition, "blocks", None)
+    return list(blocks) if isinstance(blocks, list) else []
+
+
+def _selected_code_security_inputs(
+    blocks: list[Any],
+    *,
+    selected_labels: set[str],
+    include_descendants: bool = False,
+) -> list[CodeBlockSecurityInput]:
+    code_blocks: list[CodeBlockSecurityInput] = []
+    for block in blocks:
+        if isinstance(block, Mapping):
+            label = str(block.get("label") or "")
+            selected = include_descendants or label in selected_labels
+            block_type = str(block.get("block_type") or "").lower()
+            code = block.get("code")
+            if block_type == BlockType.CODE.value and selected and isinstance(code, str):
+                code_blocks.append(CodeBlockSecurityInput(label=label, code=code))
+            code_blocks.extend(
+                _selected_code_security_inputs(
+                    _mapping_child_blocks(block),
+                    selected_labels=selected_labels,
+                    include_descendants=selected,
+                )
+            )
+            continue
+        label = str(getattr(block, "label", "") or "")
+        selected = include_descendants or label in selected_labels
+        if isinstance(block, CodeBlock) and selected:
+            code_blocks.append(CodeBlockSecurityInput(label=block.label, code=block.code))
+        if children := _typed_child_blocks(block):
+            code_blocks.extend(
+                _selected_code_security_inputs(
+                    children,
+                    selected_labels=selected_labels,
+                    include_descendants=selected,
+                )
+            )
+    return code_blocks
+
+
+def _mapping_child_blocks(block: Mapping[str, Any]) -> list[Any]:
+    children: list[Any] = []
+    for key in ("loop_blocks", "blocks"):
+        value = block.get(key)
+        if isinstance(value, list):
+            children.extend(value)
+    for key in ("branch_conditions", "branches", "ordered_branches"):
+        branches = block.get(key)
+        if not isinstance(branches, list):
+            continue
+        for branch in branches:
+            if isinstance(branch, Mapping):
+                children.extend(_mapping_child_blocks(branch))
+    return children
+
+
+def _typed_child_blocks(block: Any) -> list[Any]:
+    children: list[Any] = []
+    for key in ("loop_blocks", "blocks"):
+        value = getattr(block, key, None)
+        if isinstance(value, list):
+            children.extend(value)
+    for key in ("branch_conditions", "branches", "ordered_branches"):
+        branches = getattr(block, key, None)
+        if not isinstance(branches, list):
+            continue
+        for branch in branches:
+            if isinstance(branch, Mapping):
+                children.extend(_mapping_child_blocks(branch))
+            else:
+                children.extend(_typed_child_blocks(branch))
+    return children
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -744,6 +864,20 @@ async def _run_blocks_and_collect_debug(
     if not workflow:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
 
+    for label in block_labels:
+        if not workflow.get_output_parameter(label):
+            return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
+
+    runtime_security_failure = _runtime_code_security_failure_for_selected_labels(
+        workflow,
+        block_labels=list(block_labels),
+        labels_to_execute=labels_to_execute,
+        frontier_start_label=frontier_start_label,
+    )
+    if runtime_security_failure is not None:
+        ctx.last_executed_block_labels = []
+        return runtime_security_failure
+
     credential_ids = list(
         dict.fromkeys(
             _extract_credential_ids_from_tool_value(params.get("parameters") or {})
@@ -760,10 +894,6 @@ async def _run_blocks_and_collect_debug(
     credential_error = await _credential_ids_validation_error(credential_ids, ctx)
     if credential_error is not None:
         return {"ok": False, "error": credential_error}
-
-    for label in block_labels:
-        if not workflow.get_output_parameter(label):
-            return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
 
     from skyvern.forge.sdk.schemas.organizations import Organization
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody

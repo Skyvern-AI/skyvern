@@ -1961,7 +1961,7 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
-            max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
@@ -1978,7 +1978,7 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            max_completion_tokens=131072,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,

@@ -19,6 +19,8 @@ import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
+import { getActionDisplayStatus } from "../components/actionStatus";
+import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import {
   isAction,
   isBlockItem,
@@ -99,15 +101,18 @@ function StatusDot({
   isFinalized: boolean;
 }) {
   const isCompleted = status === Status.Completed;
+  const isTerminated = status === Status.Terminated;
   const isFailure =
     status === Status.Failed ||
-    status === Status.Terminated ||
     status === Status.TimedOut ||
     status === Status.Canceled;
   const isRunning = status === Status.Running && !isFinalized;
 
   if (isCompleted) {
     return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
+  }
+  if (isTerminated) {
+    return <TerminatedIcon className={`size-3.5 shrink-0 ${terminatedTone}`} />;
   }
   if (isFailure) {
     return <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />;
@@ -490,7 +495,7 @@ function TimelineActionRows({
                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
               >
                 <StatusDot
-                  status={action.status}
+                  status={getActionDisplayStatus(action)}
                   isFinalized={!!workflowRunIsFinalized}
                 />
                 <span className="shrink-0 text-slate-400" aria-hidden="true">

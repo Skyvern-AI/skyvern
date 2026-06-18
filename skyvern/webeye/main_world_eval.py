@@ -43,10 +43,44 @@ def _resolve_prefix(page: Page) -> str | None:
 # ``(a = (1+2)) => a``) don't match — current callers don't use that shape.
 _ARROW_FN_RE = re.compile(r"^\s*(async\s+)?(\([^()]*\)|\w+)\s*=>")
 _FUNCTION_DECL_RE = re.compile(r"^\s*(async\s+)?function\b")
+# After leading whitespace + line/block comments are stripped, does the body
+# begin with a token that re-declaring on a repeated injection would actually
+# fail? Only the lexical bindings (``let``/``const``/``class``) need
+# ``replMode`` — re-declaring a top-level ``var`` or ``function`` is legal
+# in JS, so forcing replMode on them just risks the Chromium
+# ``returnByValue`` -> ``{}`` envelope rewrite for value-returning bodies
+# like ``function rows() {...}; rows()``.
+_TOP_LEVEL_DECL_TOKEN_RE = re.compile(r"(?:let|const|class)\b")
 
 
 def _is_function_form(expression: str) -> bool:
     return bool(_ARROW_FN_RE.match(expression) or _FUNCTION_DECL_RE.match(expression))
+
+
+def _starts_with_top_level_declaration(body: str) -> bool:
+    """True if ``body`` begins with a top-level declaration token after any
+    leading whitespace, line (``//``) and block (``/* */``) comments."""
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch in " \t\r\n":
+            i += 1
+            continue
+        if body.startswith("//", i):
+            nl = body.find("\n", i + 2)
+            if nl == -1:
+                return False
+            i = nl + 1
+            continue
+        if body.startswith("/*", i):
+            end = body.find("*/", i + 2)
+            if end == -1:
+                return False
+            i = end + 2
+            continue
+        break
+    return bool(_TOP_LEVEL_DECL_TOKEN_RE.match(body, i))
 
 
 def _extract_runtime_result(result: dict[str, Any]) -> Any:
@@ -75,7 +109,8 @@ async def evaluate_in_main_world(page: Page, expression: str, arg: Any = None) -
             return await page.evaluate(expression)
         return await page.evaluate(expression, arg)
 
-    if _is_function_form(expression):
+    is_function_form = _is_function_form(expression)
+    if is_function_form:
         if arg is None:
             wrapped = f"({expression})()"
         else:
@@ -83,16 +118,23 @@ async def evaluate_in_main_world(page: Page, expression: str, arg: Any = None) -
     else:
         wrapped = expression
     body = f"{prefix}\n{wrapped}"
+    # ``replMode`` only for statement-form bodies that begin with a lexical
+    # top-level declaration (``let``/``const``/``class``). Bare expressions
+    # and value-returning forms must skip it — Chromium rewrites their
+    # ``returnByValue`` envelope to ``{}`` under replMode. The check runs
+    # against ``body`` so a prefix that itself carries declarations is
+    # covered too.
+    needs_repl_mode = not is_function_form and _starts_with_top_level_declaration(body)
     cdp_session = await page.context.new_cdp_session(page)
     try:
-        result = await cdp_session.send(
-            "Runtime.evaluate",
-            {
-                "expression": body,
-                "returnByValue": True,
-                "awaitPromise": True,
-            },
-        )
+        params: dict[str, Any] = {
+            "expression": body,
+            "returnByValue": True,
+            "awaitPromise": True,
+        }
+        if needs_repl_mode:
+            params["replMode"] = True
+        result = await cdp_session.send("Runtime.evaluate", params)
     finally:
         with contextlib.suppress(Exception):
             await cdp_session.detach()

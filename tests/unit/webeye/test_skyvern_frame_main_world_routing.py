@@ -149,6 +149,62 @@ class TestSkyvernFrameEvaluateRouting:
             clear_main_world_prefix(ctx)  # type: ignore[arg-type]
 
 
+class TestRepeatedHelperInjectionRegression:
+    @pytest.mark.asyncio
+    async def test_repeated_helper_injection_via_runtime_evaluate_sets_repl_mode(self) -> None:
+        page, ctx = _make_page_mock(prefix="// MARK")
+        page.context.new_cdp_session.return_value.send = AsyncMock(  # type: ignore[attr-defined]
+            return_value={"result": {"value": None}}
+        )
+
+        script_with_top_level_let = "let browserNameForWorkarounds = 'chromium';\nfunction helper() { return 1; }"
+        try:
+            await SkyvernFrame.evaluate(page, script_with_top_level_let)
+            await SkyvernFrame.evaluate(page, script_with_top_level_let)
+        finally:
+            clear_main_world_prefix(ctx)  # type: ignore[arg-type]
+
+        send_mock = page.context.new_cdp_session.return_value.send  # type: ignore[attr-defined]
+        assert send_mock.await_count == 2
+        for call in send_mock.await_args_list:
+            method, params = call.args
+            assert method == "Runtime.evaluate"
+            assert params.get("replMode") is True
+
+    @pytest.mark.asyncio
+    async def test_repeated_injection_succeeds_against_redeclare_simulating_cdp(self) -> None:
+        page, ctx = _make_page_mock(prefix="// MARK")
+
+        success_sentinel = "second-call-also-returned"
+
+        async def fake_send(method: str, params: dict[str, object]) -> dict[str, object]:
+            if not params.get("replMode"):
+                return {
+                    "exceptionDetails": {
+                        "text": "Uncaught",
+                        "exception": {
+                            "description": "SyntaxError: Identifier 'foo' has already been declared",
+                        },
+                    }
+                }
+            return {"result": {"value": success_sentinel}}
+
+        page.context.new_cdp_session.return_value.send = AsyncMock(side_effect=fake_send)  # type: ignore[attr-defined]
+
+        try:
+            first = await SkyvernFrame.evaluate(page, "let foo = 1;")
+            second = await SkyvernFrame.evaluate(page, "let foo = 1;")
+        finally:
+            clear_main_world_prefix(ctx)  # type: ignore[arg-type]
+
+        # Both calls returning the sentinel proves no SyntaxError was raised on
+        # the second injection — the regression decoder would have surfaced the
+        # redeclare as RuntimeError before we got a value back.
+        assert first == success_sentinel
+        assert second == success_sentinel
+        assert page.context.new_cdp_session.return_value.send.await_count == 2  # type: ignore[attr-defined]
+
+
 class TestNavigationRecoveryRouting:
     """Recovery loop must keep using the main-world hook for prefixed Pages,
     otherwise the marker is dropped on the post-navigation re-injection + retry."""

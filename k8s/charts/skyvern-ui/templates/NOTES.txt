@@ -1,0 +1,28 @@
+Skyvern UI ({{ .Values.image.repository }}:{{ .Values.image.tag }}) has been deployed.
+
+IMPORTANT — do NOT override the container command.
+  This chart deliberately runs the image's own entrypoint, which injects the
+  VITE_* runtime config into the prebuilt bundle and serves it. Adding a
+  `command:`/`args:` such as ["npm","run","start"] forces a runtime build that
+  the production image cannot perform and will crashloop ("tsc: not found").
+
+Access the UI:
+{{- if .Values.ingress.enabled }}
+  http(s)://{{ (index .Values.ingress.hosts 0).host }}
+{{- else if eq .Values.service.type "ClusterIP" }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "skyvern-ui.fullname" . }} 8080:{{ .Values.service.port }}
+  then open http://localhost:8080
+{{- else }}
+  Service type {{ .Values.service.type }} — resolve the external address with:
+  kubectl --namespace {{ .Release.Namespace }} get svc {{ include "skyvern-ui.fullname" . }}
+{{- end }}
+
+Backend wiring (set in values.yaml -> config):
+  VITE_API_BASE_URL          = {{ .Values.config.apiBaseUrl }}
+  VITE_WSS_BASE_URL          = {{ .Values.config.wssBaseUrl }}
+  VITE_ARTIFACT_API_BASE_URL = {{ .Values.config.artifactApiBaseUrl }}
+{{- if and (not .Values.apiKey.value) (not .Values.apiKey.existingSecret) }}
+
+WARNING: no API key configured (apiKey.value / apiKey.existingSecret). The UI
+will start but cannot authenticate to the backend until one is provided.
+{{- end }}

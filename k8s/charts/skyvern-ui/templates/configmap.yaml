@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "skyvern-ui.fullname" . }}
+  labels:
+    {{- include "skyvern-ui.labels" . | nindent 4 }}
+data:
+  VITE_API_BASE_URL: {{ .Values.config.apiBaseUrl | quote }}
+  VITE_WSS_BASE_URL: {{ .Values.config.wssBaseUrl | quote }}
+  VITE_ARTIFACT_API_BASE_URL: {{ .Values.config.artifactApiBaseUrl | quote }}
+  VITE_BROWSER_STREAMING_MODE: {{ .Values.config.browserStreamingMode | quote }}
+  VITE_ENABLE_CODE_BLOCK: {{ .Values.config.enableCodeBlock | quote }}
+  VITE_ENABLE_LOG_ARTIFACTS: {{ .Values.config.enableLogArtifacts | quote }}
+  VITE_ENABLE_2FA_NOTIFICATIONS: {{ .Values.config.enable2faNotifications | quote }}

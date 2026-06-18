@@ -4,10 +4,10 @@ import {
   ActionApiResponse,
   ActionsApiResponse,
   ActionTypes,
-  Status,
   StepApiResponse,
   TaskApiResponse,
 } from "@/api/types";
+import { isActionSuccess } from "@/routes/workflows/components/actionStatus";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { statusIsNotFinalized } from "../../types";
@@ -106,11 +106,12 @@ function useActions({ id }: Props): {
                 confidence: action.confidence_float,
                 input: getActionInput(action),
                 type: action.action_type,
-                // Wait actions always succeed — they intentionally return ActionFailure
-                // from the backend but completing a wait is expected, not a failure.
+                // wait reports ActionFailure but completing it is expected; terminate
+                // reports ActionSuccess but means the agent gave up — a failure.
                 success:
-                  action.action_type === ActionTypes.wait ||
-                  (actionResult?.[0]?.success ?? false),
+                  action.action_type !== ActionTypes.terminate &&
+                  (action.action_type === ActionTypes.wait ||
+                    (actionResult?.[0]?.success ?? false)),
                 stepId: step.step_id,
                 index,
                 created_by: action.created_by,
@@ -125,11 +126,7 @@ function useActions({ id }: Props): {
             confidence: action.confidence_float ?? undefined,
             input: action.response ?? "",
             type: action.action_type,
-            // Wait actions always succeed — see comment in legacy path above.
-            success:
-              action.action_type === ActionTypes.wait ||
-              action.status === Status.Completed ||
-              action.status === Status.Skipped,
+            success: isActionSuccess(action),
             stepId: action.step_id ?? "",
             index: index,
             created_by: action.created_by,
