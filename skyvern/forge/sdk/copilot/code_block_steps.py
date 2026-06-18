@@ -12,23 +12,27 @@ LOG = structlog.get_logger()
 
 # Playwright/SkyvernPage method name -> step action_type (values are ActionType members;
 # kept as string literals so this module does not import skyvern.webeye, matching code_block_synthesis.py).
-# Mirror the restricted runtime recorder's action maps so the static editor preview only
-# surfaces calls that code blocks can execute through the capability proxy.
+# Mirror the runtime recorder's maps (code_block_recorder._PAGE_ACTION_MAP / _LOCATOR_ACTION_MAP) so the
+# static editor preview surfaces the same calls the timeline records — otherwise a recorded call (e.g.
+# page.evaluate) renders in the timeline but is silently dropped from the editor step list.
 _METHOD_ACTION_TYPES: dict[str, str] = {
     "goto": "goto_url",
     "click": "click",
     "dblclick": "click",
     "check": "click",
     "uncheck": "click",
+    "tap": "click",
     "fill": "input_text",
     "type": "input_text",
     "press": "keypress",
+    "press_sequentially": "input_text",
     "select_option": "select_option",
     "set_input_files": "upload_file",
     "hover": "hover",
     "go_back": "go_back",
     "go_forward": "go_forward",
     "reload": "reload_page",
+    "evaluate": "execute_js",
     "wait_for_timeout": "wait",
 }
 # Awaited calls that are sync/no-op helpers — never surfaced as their own step.
@@ -142,6 +146,8 @@ def _describe(span: CodeActionSpan) -> str:
         return "Go forward"
     if span.action_type == "reload_page":
         return "Reload the page"
+    if span.action_type == "execute_js":
+        return "Run a script"
     return "Run a step"
 
 

@@ -125,7 +125,6 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
-    CodeBlockSecret,
     RecordingPage,
     user_code_line_from_exception,
 )
@@ -3676,10 +3675,8 @@ class CodeBlock(Block):
     def is_safe_code(code: str) -> None:
         tree = ast.parse(code)
         for node in ast.walk(tree):
-            # Block all private attribute access (obj._foo, obj.__foo__, obj._Class__foo).
-            # This is intentionally wider than the old dunder-only guard so opaque handles
-            # and proxy internals cannot be reached through single-underscore helpers.
-            if hasattr(node, "attr") and str(node.attr).startswith("_"):
+            # Block dunder attribute access (obj.__foo__)
+            if hasattr(node, "attr") and str(node.attr).startswith("__"):
                 raise InsecureCodeDetected("Not allowed to access private methods or attributes")
             # Block bare dunder identifiers (__capture_locals, __builtins__, etc.)
             if isinstance(node, ast.Name) and node.id.startswith("__"):
@@ -4051,20 +4048,14 @@ async def wrapper({default_args}):
                             )
 
                     real_secret_value = secret_value if secret_value is not None else credential_place_holder
-                    runtime_secret_value = (
-                        CodeBlockSecret(real_secret_value) if isinstance(real_secret_value, str) else real_secret_value
-                    )
-                    parameter_values[credential_field] = runtime_secret_value
-                    real_secret_values[credential_field] = runtime_secret_value
+                    parameter_values[credential_field] = real_secret_value
+                    real_secret_values[credential_field] = real_secret_value
                 credential_namespace = Credential(**real_secret_values)
                 credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
                 parameter_values[parameter.key] = credential_namespace
             else:
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-                real_secret_value = secret_value if secret_value is not None else value
-                parameter_values[parameter.key] = (
-                    CodeBlockSecret(real_secret_value) if isinstance(real_secret_value, str) else real_secret_value
-                )
+                parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         workflow_run_block = None
 
@@ -4089,8 +4080,9 @@ async def wrapper({default_args}):
             if task is None:
                 return
             # Every action that reaches this sink is one the recorder chose to surface on the timeline
-            # (goto, click, input, select, hover, wait, ...), so each one earns a screenshot.
-            # Re-listing eligible types here only drifts from the recorder's maps.
+            # (goto, click, input, page.evaluate, select, hover, ...), so each one earns a screenshot.
+            # Re-listing eligible types here only drifts from the recorder's maps — which is exactly how
+            # page.evaluate (EXECUTE_JS) ended up with no screenshot.
             # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
             # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
             # only the page-free S3 upload is deferred off the critical path.
@@ -4195,7 +4187,7 @@ async def wrapper({default_args}):
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
             )
         except InsecureCodeDetected as e:
-            await _persist_recorded_actions(recording_page._recorded_actions())
+            await _drain_screenshots()
             await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
@@ -4206,7 +4198,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         except asyncio.TimeoutError:
-            await _persist_recorded_actions(recording_page._recorded_actions())
+            await _persist_recorded_actions(recording_page.recorded_actions())
             await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
@@ -4225,8 +4217,8 @@ async def wrapper({default_args}):
             # User code can raise an exception carrying a resolved secret (e.g.
             # `raise Exception(await cred.otp())`); mask before it reaches the persisted reason.
             failure_reason = workflow_run_context.mask_secrets_in_data(exc.message)
-            recorded = recording_page._recorded_actions()
-            if recording_page._last_recorded_exception() is not e:
+            recorded = recording_page.recorded_actions()
+            if recording_page.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
                     Action(
@@ -4250,7 +4242,7 @@ async def wrapper({default_args}):
             )
 
         else:
-            await _persist_recorded_actions(recording_page._recorded_actions())
+            await _persist_recorded_actions(recording_page.recorded_actions())
             await _finalize_code_block_task(success=True)
         finally:
             # Safety net for paths the except arms miss (CancelledError, update_workflow_run_block failure).

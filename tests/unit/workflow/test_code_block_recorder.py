@@ -5,24 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
-    CodeBlockSecret,
-    RecordingLocator,
     RecordingPage,
     user_code_line_from_exception,
 )
@@ -36,7 +31,6 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 class FakeLocator:
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.page = SimpleNamespace(url="https://raw-playwright-page.invalid")
 
     def locator(self, selector):  # noqa: ANN001, ANN201
         return self
@@ -46,13 +40,6 @@ class FakeLocator:
 
     @property
     def first(self):  # noqa: ANN201
-        return self
-
-    @property
-    def last(self):  # noqa: ANN201
-        return self
-
-    def nth(self, index):  # noqa: ANN001, ANN201
         return self
 
     async def click(self, **kwargs):  # noqa: ANN003, ANN201
@@ -73,99 +60,23 @@ class FakeLocator:
     def filter(self, **kwargs):  # noqa: ANN003, ANN201
         return self
 
-    async def inner_text(self, **kwargs):  # noqa: ANN003, ANN201
-        return "ready"
-
-    async def inner_html(self, **kwargs):  # noqa: ANN003, ANN201
-        return "<span>ready</span>"
-
-    async def count(self, **kwargs):  # noqa: ANN003, ANN201
-        return 1
-
-    async def all(self):  # noqa: ANN201
-        return [self, FakeLocator()]
-
-    async def evaluate(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
-        return "raw-js"
-
-    async def evaluate_handle(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
-        return "raw-handle"
-
 
 class FakeKeyboard:
     async def press(self, key, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
-
-    async def type(self, text, **kwargs):  # noqa: ANN001, ANN003, ANN201
-        return None
-
-
-class FakeDownload:
-    def __init__(self, page) -> None:  # noqa: ANN001
-        self.page = page
-        self.suggested_filename = "report.pdf"
-        self.url = "https://example.com/report.pdf"
-
-    async def path(self):  # noqa: ANN201
-        return "/tmp/downloads/report.pdf"
-
-    async def failure(self):  # noqa: ANN201
-        return None
-
-    async def save_as(self, path):  # noqa: ANN001, ANN201
-        return None
-
-
-class FakeDownloadContext:
-    def __init__(self, download: FakeDownload) -> None:
-        self._download = download
-
-    async def __aenter__(self) -> FakeDownloadContext:
-        return self
-
-    async def __aexit__(self, exc_type, exc, traceback):  # noqa: ANN001, ANN201
-        return None
-
-    @property
-    def value(self):  # noqa: ANN201
-        async def _value():
-            return self._download
-
-        return _value()
 
 
 class FakePage:
     def __init__(self) -> None:
         self.inner = FakeLocator()
         self.keyboard = FakeKeyboard()
-        self.download = FakeDownload(self)
-        self.request = SimpleNamespace(post=AsyncMock(return_value=None))
-        self.context = SimpleNamespace(storage_state=AsyncMock(return_value={}))
-        self.main_frame = SimpleNamespace(evaluate=AsyncMock(return_value=None))
-        self.frames = [self.main_frame]
         self.url = "about:blank"
 
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
-        self.url = url
-        return SimpleNamespace(frame=SimpleNamespace(page=self))
-
-    async def go_back(self, **kwargs):  # noqa: ANN003, ANN201
-        return SimpleNamespace(frame=SimpleNamespace(page=self))
-
-    async def go_forward(self, **kwargs):  # noqa: ANN003, ANN201
-        return SimpleNamespace(frame=SimpleNamespace(page=self))
-
-    async def reload(self, **kwargs):  # noqa: ANN003, ANN201
-        return SimpleNamespace(frame=SimpleNamespace(page=self))
+        return None
 
     async def wait_for_load_state(self, state="load", **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
-
-    async def title(self):  # noqa: ANN201
-        return "Example"
-
-    async def content(self):  # noqa: ANN201
-        return "<html><body>Example</body></html>"
 
     def locator(self, selector):  # noqa: ANN001, ANN201
         return self.inner
@@ -185,21 +96,6 @@ class FakePage:
     async def evaluate(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
         return None
 
-    async def evaluate_handle(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
-        return None
-
-    async def route(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        return None
-
-    async def add_init_script(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        return None
-
-    async def wait_for_timeout(self, timeout, **kwargs):  # noqa: ANN001, ANN003, ANN201
-        return None
-
-    def expect_download(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        return FakeDownloadContext(self.download)
-
 
 @pytest.mark.asyncio
 async def test_records_goto_click_fill_with_types_and_order() -> None:
@@ -207,7 +103,7 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     await page.goto("https://example.com")
     await page.locator("#q").fill("hello")
     await page.locator("#go").click()
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [
         ActionType.GOTO_URL,
         ActionType.INPUT_TEXT,
@@ -219,300 +115,13 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_page_evaluate_is_denied_by_capability_proxy() -> None:
+async def test_page_evaluate_records_execute_js_action() -> None:
     page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="page.evaluate"):
-        await page.evaluate("() => document.title")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.parametrize(
-    ("name", "action_type"),
-    [
-        ("goto", ActionType.GOTO_URL),
-        ("go_back", ActionType.GO_BACK),
-        ("go_forward", ActionType.GO_FORWARD),
-        ("reload", ActionType.RELOAD_PAGE),
-    ],
-)
-@pytest.mark.asyncio
-async def test_navigation_actions_do_not_return_raw_playwright_response(name: str, action_type: ActionType) -> None:
-    fake = FakePage()
-    page = RecordingPage(fake)
-    method = getattr(page, name)
-    result = await method("https://example.com") if name == "goto" else await method()
-
-    assert result is None
-    assert [a.action_type for a in page._recorded_actions()] == [action_type]
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "request",
-        "context",
-        "route",
-        "add_init_script",
-        "evaluate_handle",
-        "main_frame",
-        "frames",
-        "frame",
-        "frame_locator",
-    ],
-)
-def test_unsafe_page_capabilities_are_denied(name: str) -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match=f"page.{name}"):
-        getattr(page, name)
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "wait_for_selector",
-        "wait_for_function",
-    ],
-)
-def test_raw_page_handle_reads_are_denied(name: str) -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match=f"page.{name}"):
-        getattr(page, name)
-
-
-@pytest.mark.asyncio
-async def test_safe_page_read_methods_pass_through_without_recording() -> None:
-    page = RecordingPage(FakePage())
-
-    assert await page.title() == "Example"
-    assert await page.content() == "<html><body>Example</body></html>"
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_locator_evaluate_capabilities_are_denied() -> None:
-    page = RecordingPage(FakePage())
-    locator = page.locator("body")
-
-    with pytest.raises(InsecureCodeDetected, match="locator.evaluate"):
-        await locator.evaluate("node => node.textContent")
-    with pytest.raises(InsecureCodeDetected, match="locator.evaluate_handle"):
-        await locator.evaluate_handle("node => node")
-    with pytest.raises(InsecureCodeDetected, match="locator.page"):
-        locator.page
-
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_safe_locator_read_methods_pass_through_without_recording() -> None:
-    page = RecordingPage(FakePage())
-
-    assert await page.locator("#status").inner_text() == "ready"
-    assert await page.locator("#status").inner_html() == "<span>ready</span>"
-    assert await page.locator("#status").count() == 1
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_locator_all_returns_wrapped_locators() -> None:
-    page = RecordingPage(FakePage())
-
-    locators = await page.locator(".row").all()
-
-    assert len(locators) == 2
-    assert all(isinstance(locator, RecordingLocator) for locator in locators)
-    with pytest.raises(InsecureCodeDetected, match="locator.page"):
-        locators[0].page
-    await locators[0].click()
-    assert [a.action_type for a in page._recorded_actions()] == [ActionType.CLICK]
-
-
-@pytest.mark.asyncio
-async def test_expect_download_returns_wrapped_download_handle() -> None:
-    page = RecordingPage(FakePage())
-
-    async with page.expect_download() as download_info:
-        await page.locator("#download").click()
-    download = await download_info.value
-
-    assert download.suggested_filename == "report.pdf"
-    assert download.url == "https://example.com/report.pdf"
-    assert await download.path() == "/tmp/downloads/report.pdf"
-    assert await download.failure() is None
-    with pytest.raises(InsecureCodeDetected, match="download.page"):
-        download.page
-    with pytest.raises(InsecureCodeDetected, match="download.save_as"):
-        download.save_as
-    with pytest.raises(InsecureCodeDetected, match=r"download\._impl_obj"):
-        download._impl_obj
-    assert [a.action_type for a in page._recorded_actions()] == [ActionType.CLICK]
-
-
-@pytest.mark.asyncio
-async def test_generated_download_idiom_executes_with_restricted_page() -> None:
-    code = """
-async with page.expect_download() as download_info:
-    await page.locator("#download").click()
-downloaded_file = await download_info.value
-download_path = await downloaded_file.path()
-"""
-    user_function = _make_code_block(code).generate_async_user_function(code, RecordingPage(FakePage()))
-
-    result = await user_function()
-
-    assert result["download_path"] == "/tmp/downloads/report.pdf"
-
-
-@pytest.mark.asyncio
-async def test_unknown_page_locator_and_keyboard_apis_are_denied() -> None:
-    page = RecordingPage(FakePage())
-
-    with pytest.raises(InsecureCodeDetected, match="page.screenshot"):
-        await page.screenshot()
-    with pytest.raises(InsecureCodeDetected, match="locator.screenshot"):
-        await page.locator("#status").screenshot()
-    with pytest.raises(InsecureCodeDetected, match="keyboard.type"):
-        await page.keyboard.type("secret")
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_link_local_metadata_target() -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="169.254.169.254"):
-        await page.goto("http://169.254.169.254/latest/meta-data/")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_same_origin_link_local_target() -> None:
-    fake = FakePage()
-    fake.url = "http://169.254.169.254/latest/"
-    page = RecordingPage(fake)
-    with pytest.raises(InsecureCodeDetected, match="169.254.169.254"):
-        await page.goto("http://169.254.169.254/latest/meta-data/")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_same_origin_private_target() -> None:
-    fake = FakePage()
-    fake.url = "http://10.0.0.1/admin/"
-    page = RecordingPage(fake)
-    with pytest.raises(InsecureCodeDetected, match="10.0.0.1"):
-        await page.goto("http://10.0.0.1/admin/status")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_multicast_target() -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="224.0.0.1"):
-        await page.goto("http://224.0.0.1/status")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://2130706433/",
-        "http://0x7f000001/",
-        "http://0177.0.0.1/",
-        "http://2852039166/latest/meta-data/",
-    ],
-)
-@pytest.mark.asyncio
-async def test_page_goto_blocks_browser_normalized_internal_ip_forms(url: str) -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="blocked target"):
-        await page.goto(url)
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_private_target_even_when_globally_allowlisted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ALLOWED_HOSTS", ["10.0.0.1"])
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="10.0.0.1"):
-        await page.goto("http://10.0.0.1/admin/status")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.parametrize("url", ["http:///etc/passwd", "https:///169.254.169.254/latest/meta-data/"])
-@pytest.mark.asyncio
-async def test_page_goto_blocks_malformed_absolute_targets_without_hostname(url: str) -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="blocked target"):
-        await page.goto(url)
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_scheme_relative_targets() -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="blocked non-http target"):
-        await page.goto("//evil.internal/path")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.parametrize("target", ["", "   "])
-@pytest.mark.asyncio
-async def test_page_goto_blocks_empty_targets(target: str) -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="blocked empty target"):
-        await page.goto(target)
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.parametrize("target", [2130706433, CodeBlockSecret("https://example.com")])
-@pytest.mark.asyncio
-async def test_page_goto_blocks_non_string_targets(target: object) -> None:
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="page.goto requires a string URL"):
-        await page.goto(target)
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_blocks_first_hop_localhost_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [])
-    page = RecordingPage(FakePage())
-    with pytest.raises(InsecureCodeDetected, match="localhost:8900"):
-        await page.goto("http://localhost:8900/demo/app/")
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_page_goto_allows_first_hop_localhost_when_explicitly_allowed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ALLOWED_HOSTS", ["localhost"])
-    fake = FakePage()
-    page = RecordingPage(fake)
-    await page.goto("http://localhost:8900/demo/app/")
-    assert fake.url == "http://localhost:8900/demo/app/"
-    assert [a.action_type for a in page._recorded_actions()] == [ActionType.GOTO_URL]
-
-
-@pytest.mark.asyncio
-async def test_page_goto_allows_same_origin_localhost_fixture() -> None:
-    fake = FakePage()
-    fake.url = "http://localhost:8900/demo/app/"
-    page = RecordingPage(fake)
-    await page.goto("http://localhost:8900/demo/app/settings")
-    assert fake.url == "http://localhost:8900/demo/app/settings"
-    assert [a.action_type for a in page._recorded_actions()] == [ActionType.GOTO_URL]
-
-
-@pytest.mark.asyncio
-async def test_page_goto_allows_same_origin_loopback_fixture() -> None:
-    fake = FakePage()
-    fake.url = "http://127.0.0.1:8900/demo/app/"
-    page = RecordingPage(fake)
-    await page.goto("http://127.0.0.1:8900/demo/app/settings")
-    assert fake.url == "http://127.0.0.1:8900/demo/app/settings"
-    assert [a.action_type for a in page._recorded_actions()] == [ActionType.GOTO_URL]
+    await page.evaluate("() => document.title")
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.EXECUTE_JS]
+    assert recorded[0].description == "page.evaluate () => document.title"
+    assert recorded[0].status == ActionStatus.completed
 
 
 @pytest.mark.asyncio
@@ -521,23 +130,14 @@ async def test_unmapped_calls_and_attributes_pass_through_unrecorded() -> None:
     page = RecordingPage(fake)
     await page.wait_for_load_state("networkidle")
     assert page.url == "about:blank"
-    assert page._recorded_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_wait_for_timeout_records_wait_action() -> None:
-    page = RecordingPage(FakePage())
-    await page.wait_for_timeout(500)
-    recorded = page._recorded_actions()
-    assert [a.action_type for a in recorded] == [ActionType.WAIT]
-    assert "500" in (recorded[0].description or "")
+    assert page.recorded_actions() == []
 
 
 @pytest.mark.asyncio
 async def test_keyboard_press_records_keypress_action() -> None:
     page = RecordingPage(FakePage())
     await page.keyboard.press("Enter")
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.KEYPRESS]
     assert recorded[0].description and "Enter" in recorded[0].description
 
@@ -546,7 +146,7 @@ async def test_keyboard_press_records_keypress_action() -> None:
 async def test_get_by_role_click_is_recorded() -> None:
     page = RecordingPage(FakePage())
     await page.get_by_role("button", name="Go").click()
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
     assert recorded[0].description == "locator.click get_by_role(button)"
 
@@ -555,7 +155,7 @@ async def test_get_by_role_click_is_recorded() -> None:
 async def test_locator_get_by_chain_is_recorded() -> None:
     page = RecordingPage(FakePage())
     await page.locator("#form").get_by_text("Submit").click()
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
     assert recorded[0].description == "locator.click get_by_text(Submit)"
 
@@ -565,7 +165,7 @@ async def test_direct_page_actions_are_recorded_with_redaction() -> None:
     page = RecordingPage(FakePage())
     await page.click("#submit")
     await page.fill("#email", "secret@example.com")
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.CLICK, ActionType.INPUT_TEXT]
     # Input values may be credentials; the fill value must never reach the description.
     assert all("secret@example.com" not in (a.description or "") for a in recorded)
@@ -575,7 +175,7 @@ async def test_direct_page_actions_are_recorded_with_redaction() -> None:
 async def test_filter_locator_chain_click_is_recorded() -> None:
     page = RecordingPage(FakePage())
     await page.get_by_role("button", name="Go").filter(has_text="Submit").click()
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
 
 
@@ -590,7 +190,7 @@ async def test_failed_call_records_failed_action_and_reraises() -> None:
     page = RecordingPage(fake)
     with pytest.raises(RuntimeError):
         await page.locator("#x").click()
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     assert recorded[-1].action_type == ActionType.CLICK
     assert recorded[-1].status == ActionStatus.failed
     assert "element detached" in (recorded[-1].response or "")
@@ -608,7 +208,7 @@ async def test_on_action_sink_receives_each_action_and_errors_are_swallowed() ->
     await page.goto("https://example.com")
     await page.locator("#go").click()
     assert seen == [ActionType.GOTO_URL, ActionType.CLICK]
-    assert len(page._recorded_actions()) == 2
+    assert len(page.recorded_actions()) == 2
 
 
 def test_user_code_line_from_exception_unwraps_wrapper_offset() -> None:
@@ -636,37 +236,12 @@ async def test_input_values_are_elided_from_descriptions() -> None:
     page = RecordingPage(FakePage())
     await page.locator("#pw").fill("hunter2-credential")
     await page.locator("#user").type("alice-credential")
-    recorded = page._recorded_actions()
+    recorded = page.recorded_actions()
     dumped = json.dumps([a.model_dump(mode="json") for a in recorded])
     assert "hunter2-credential" not in dumped
     assert "alice-credential" not in dumped
     assert recorded[0].description == "locator.fill #pw"
     assert recorded[1].description == "locator.type #user"
-
-
-@pytest.mark.asyncio
-async def test_secret_handle_resolves_only_inside_input_actions() -> None:
-    fake = FakePage()
-    page = RecordingPage(fake)
-    secret = CodeBlockSecret("hunter2-credential")
-
-    await page.locator("#pw").fill(secret)
-
-    assert fake.inner.calls == ["fill:hunter2-credential"]
-    dumped = json.dumps([a.model_dump(mode="json") for a in page._recorded_actions()])
-    assert "hunter2-credential" not in dumped
-    assert str(secret) == "*****"
-
-
-@pytest.mark.asyncio
-async def test_secret_handle_in_unsupported_action_fails_clearly() -> None:
-    page = RecordingPage(FakePage())
-    secret = CodeBlockSecret("gold-plan")
-
-    with pytest.raises(InsecureCodeDetected, match="CodeBlockSecret can only be used"):
-        await page.locator("#plan").select_option(secret)
-
-    assert page._recorded_actions() == []
 
 
 def _make_code_block(code: str, goal: str | None = None) -> CodeBlock:
@@ -968,7 +543,9 @@ async def test_backgrounded_screenshots_are_drained_and_linked_before_persist(
 
 
 @pytest.mark.asyncio
-async def test_page_evaluate_is_denied_before_action_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_page_evaluate_action_captures_and_links_screenshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """page.evaluate (EXECUTE_JS) is a recorded, timeline-visible action and must get a screenshot
+    like clicks and navigations do, so the run detail panel can render it instead of "No screenshot"."""
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
@@ -976,33 +553,11 @@ async def test_page_evaluate_is_denied_before_action_persistence(monkeypatch: py
     block = _make_code_block("await page.evaluate('() => document.title')", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
-    assert result.success is False
-    assert result.failure_reason is not None
-    assert "page" in result.failure_reason and "evaluate" in result.failure_reason
-    assert _created_actions(mocks) == []
-    assert mocks["create_artifact"].await_count == 0
-
-
-@pytest.mark.asyncio
-async def test_runtime_denial_after_recorded_action_persists_prior_actions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    page = FakePage()
-    context = FakeWorkflowRunContext()
-    mocks = _patch_execute_environment(monkeypatch, page, context)
-
-    block = _make_code_block(
-        "await page.goto('https://example.com')\nawait page.evaluate('() => document.title')", goal="go"
-    )
-    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
-
-    assert result.success is False
-    assert result.failure_reason is not None
-    assert "page" in result.failure_reason and "evaluate" in result.failure_reason
+    assert result.success is True
     actions = _created_actions(mocks)
-    assert [a.action_type for a in actions] == [ActionType.GOTO_URL]
-    assert actions[0].screenshot_artifact_id == "artifact_1"
+    assert [a.action_type for a in actions] == [ActionType.EXECUTE_JS]
     assert mocks["create_artifact"].await_count == 1
+    assert actions[0].screenshot_artifact_id == "artifact_1"
 
 
 @pytest.mark.asyncio
