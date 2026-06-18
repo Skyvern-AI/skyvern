@@ -128,6 +128,9 @@ class Settings(BaseSettings):
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
+    # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
+    # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
+    FAIL_FAST_SHADOW: bool = False
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
