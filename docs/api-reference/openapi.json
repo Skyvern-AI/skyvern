@@ -8848,6 +8848,33 @@
             "type": "array",
             "title": "Parameters",
             "default": []
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language goal that describes what the code block should accomplish. When set, the block runs against a recording proxy so its page interactions are persisted as actions and screenshots in the run timeline, and the agent can take over on failure."
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeBlockStep"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps",
+            "description": "Optional plain-language summary of the code block's behavior used for rendering in the workflow editor and run timeline. Derived from the code when omitted."
           }
         },
         "type": "object",
@@ -8857,6 +8884,125 @@
           "code"
         ],
         "title": "CodeBlock"
+      },
+      "CodeBlockStep": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "Short label for this step (for example, the action being performed)."
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Longer description of what the step does."
+          },
+          "action_type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ActionType"
+              }
+            ],
+            "default": "null_action",
+            "description": "Action category for the step. Defaults to `null_action` for steps that are not associated with a specific browser action."
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start",
+            "description": "Optional inclusive starting line number in the block's `code` that this step maps to."
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End",
+            "description": "Optional inclusive ending line number in the block's `code` that this step maps to."
+          }
+        },
+        "type": "object",
+        "title": "CodeBlockStep"
+      },
+      "CodeBlockStepYAML": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "action_type": {
+            "type": "string",
+            "title": "Action Type",
+            "default": "null_action",
+            "description": "Action category for the step. Stored as a string in YAML and coerced to an `ActionType` by the converter."
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start"
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End"
+          }
+        },
+        "type": "object",
+        "title": "CodeBlockStepYAML"
       },
       "CodeBlockYAML": {
         "properties": {
@@ -8927,6 +9073,33 @@
               }
             ],
             "title": "Parameter Keys"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language goal for the code block. When set, the block runs against a recording proxy so its page interactions are persisted as actions and screenshots in the run timeline, and the agent can take over on failure."
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeBlockStepYAML"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps",
+            "description": "Optional plain-language summary of the code block's behavior used for rendering in the workflow editor and run timeline. Derived from the code when omitted."
           }
         },
         "type": "object",

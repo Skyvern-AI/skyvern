@@ -308,6 +308,8 @@ Execute custom Python code. Input parameters are available as global variables. 
 |-------|------|-------------|
 | **Code** | code editor | Python code to execute |
 | **Input Parameters** | select | Parameters available as globals in the code |
+| **Goal** | text | Optional natural-language description of what the code block accomplishes. When set, browser interactions in the code are recorded as actions and screenshots in the run timeline, and the agent can take over if the code fails. |
+| **Steps** | list | Optional plain-language summary used to render the block in the editor and run timeline. Auto-derived from the code when omitted. |
 
 <Frame>
 <img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
