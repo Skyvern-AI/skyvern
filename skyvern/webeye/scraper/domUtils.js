@@ -451,7 +451,12 @@ function isHoverOnlyElement(element) {
 
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
-function isElementVisible(element) {
+function isElementVisible(element, seen) {
+  // Break the option/checkbox→parent ↔ display:contents→child recursion cycle
+  // that would otherwise overflow the call stack.
+  if (seen && seen.has(element)) {
+    return false;
+  }
   const tagLower = element.tagName.toLowerCase();
 
   // Web Component libraries often hide native form inputs inside shadow DOM
@@ -489,8 +494,14 @@ function isElementVisible(element) {
     tagLower === "option" ||
     (tagLower === "input" &&
       (element.type === "radio" || element.type === "checkbox"))
-  )
-    return element.parentElement && isElementVisible(element.parentElement);
+  ) {
+    if (!element.parentElement) {
+      return false;
+    }
+    const pathSeen = seen ? new Set(seen) : new Set();
+    pathSeen.add(element);
+    return isElementVisible(element.parentElement, pathSeen);
+  }
 
   const className = element.className ? element.className.toString() : "";
   if (
@@ -505,10 +516,13 @@ function isElementVisible(element) {
   if (!style) return true;
   if (style.display === "contents") {
     // display:contents is not rendered itself, but its child nodes are.
+    const pathSeen = seen ? new Set(seen) : new Set();
+    pathSeen.add(element);
+    // pathSeen is shared across siblings; safe because each recursion copies it.
     for (let child = element.firstChild; child; child = child.nextSibling) {
       if (
         child.nodeType === 1 /* Node.ELEMENT_NODE */ &&
-        isElementVisible(child)
+        isElementVisible(child, pathSeen)
       )
         return true;
       if (child.nodeType === 3 /* Node.TEXT_NODE */ && isVisibleTextNode(child))
@@ -827,7 +841,13 @@ function isDOMNodeRepresentDiv(element) {
 
 function isHoverPointerElement(element, hoverStylesMap) {
   const tagName = element.tagName.toLowerCase();
-  const elementClassName = element.className.toString();
+  // SVG className is an SVGAnimatedString; read .baseVal so class matching works
+  // for SVG targets (its toString() is "[object SVGAnimatedString]", not the classes).
+  const rawClassName = element.className;
+  const elementClassName =
+    typeof rawClassName === "string"
+      ? rawClassName
+      : (rawClassName?.baseVal ?? "");
   const elementCursor = getElementComputedStyle(element)?.cursor;
   if (elementCursor === "pointer") {
     return true;
@@ -1186,7 +1206,7 @@ const isDropdownButton = (element) => {
 
 const isSelect2Dropdown = (element) => {
   const tagName = element.tagName.toLowerCase();
-  const className = element.className.toString();
+  const className = element.className?.toString() ?? "";
   const role = element.getAttribute("role")
     ? element.getAttribute("role").toLowerCase()
     : "";
@@ -1205,14 +1225,14 @@ const isSelect2Dropdown = (element) => {
 const isSelect2MultiChoice = (element) => {
   return (
     element.tagName.toLowerCase() === "input" &&
-    element.className.toString().includes("select2-input")
+    (element.className?.toString() ?? "").includes("select2-input")
   );
 };
 
 const isReactSelectDropdown = (element) => {
   return (
     element.tagName.toLowerCase() === "input" &&
-    element.className.toString().includes("select__input") &&
+    (element.className?.toString() ?? "").includes("select__input") &&
     element.getAttribute("role") === "combobox"
   );
 };
@@ -1413,7 +1433,7 @@ const checkRequiredFromStyle = (element) => {
 };
 
 function checkDisabledFromStyle(element) {
-  const className = element.className.toString().toLowerCase();
+  const className = (element.className?.toString() ?? "").toLowerCase();
   if (className.includes("react-datepicker__day--disabled")) {
     return true;
   }

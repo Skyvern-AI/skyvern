@@ -83,6 +83,7 @@ _ONEPASSWORD_5XX_PATTERN = re.compile(
     r"|"
     r"(?:\b(5\d{2})\s+(?:service\s+unavailable|bad\s+gateway|gateway\s+timeout|internal\s+server\s+error)\b)"
 )
+_SECRET_FIELD_KEY_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 
 
 class WorkflowRunContext:
@@ -639,17 +640,20 @@ class WorkflowRunContext:
         self.values[parameter.key] = {
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
-        credential_dict: dict[str, str | None] = credential.model_dump()
+        credential_dict: dict[str, Any] = credential.model_dump(exclude_none=True)
+        used_secret_field_keys = set(self.values[parameter.key])
         for key, value in credential_dict.items():
             # totp_type is metadata; totp is registered as a TOTP seed below, not as a plain field.
             if key in ("totp_type", "totp"):
                 continue
             if not value:
                 continue
-            random_secret_id = self.generate_random_secret_id()
-            secret_id = f"{random_secret_id}_{key}"
-            self.secrets[secret_id] = value
-            self.values[parameter.key][key] = secret_id
+            for field_key, field_value in self._flatten_credential_secret_field(key, value):
+                field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                random_secret_id = self.generate_random_secret_id()
+                secret_id = f"{random_secret_id}_{field_key}"
+                self.secrets[secret_id] = field_value
+                self.values[parameter.key][field_key] = secret_id
 
         if isinstance(credential, PasswordCredential) and credential.totp:
             random_secret_id = self.generate_random_secret_id()
@@ -1236,6 +1240,25 @@ class WorkflowRunContext:
                 self.secrets[secret_id] = credit_card_data[data_key]
                 parameter_value[secret_suffix] = secret_id
 
+            extra_field_keys = [
+                key
+                for key in credit_card_data
+                if key == "billing_email"
+                or key == "billing_phone"
+                or key.startswith("billing_address_")
+                or key.startswith("metadata_")
+            ]
+            used_secret_field_keys = set(parameter_value)
+            for data_key in extra_field_keys:
+                field_key = self._normalize_secret_field_key(data_key)
+                if not field_key:
+                    continue
+                field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                random_secret_id = self.generate_random_secret_id()
+                secret_id = f"{random_secret_id}_{field_key}"
+                self.secrets[secret_id] = credit_card_data[data_key]
+                parameter_value[field_key] = secret_id
+
             self.values[parameter.key] = parameter_value
             self.parameters[parameter.key] = parameter
 
@@ -1507,6 +1530,39 @@ class WorkflowRunContext:
         secret_id = f"{random_secret_id}_{key}"
         self.secrets[secret_id] = value
         self.values[parameter.key][key] = secret_id
+
+    @staticmethod
+    def _normalize_secret_field_key(key: str) -> str:
+        return _SECRET_FIELD_KEY_PATTERN.sub("_", key).strip("_").lower()
+
+    @staticmethod
+    def _dedupe_secret_field_key(field_key: str, used_field_keys: set[str]) -> str:
+        if field_key not in used_field_keys:
+            used_field_keys.add(field_key)
+            return field_key
+
+        index = 2
+        while f"{field_key}_{index}" in used_field_keys:
+            index += 1
+        deduped_field_key = f"{field_key}_{index}"
+        used_field_keys.add(deduped_field_key)
+        return deduped_field_key
+
+    @classmethod
+    def _flatten_credential_secret_field(cls, key: str, value: Any) -> list[tuple[str, str]]:
+        if isinstance(value, str):
+            field_key = cls._normalize_secret_field_key(key)
+            return [(field_key, value)] if field_key else []
+        if isinstance(value, dict):
+            fields: list[tuple[str, str]] = []
+            for nested_key, nested_value in value.items():
+                if not nested_value:
+                    continue
+                field_key = cls._normalize_secret_field_key(f"{key}_{nested_key}")
+                if field_key:
+                    fields.append((field_key, str(nested_value)))
+            return fields
+        return []
 
 
 class WorkflowContextManager:
