@@ -8,7 +8,6 @@ import {
   CrossCircledIcon,
   MinusCircledIcon,
   PauseIcon,
-  StopIcon,
   StopwatchIcon,
   UpdateIcon,
 } from "@radix-ui/react-icons";
@@ -16,6 +15,7 @@ import {
 import { Status } from "@/api/types";
 import { cn } from "@/util/utils";
 
+import { TerminatedIcon } from "./terminatedVisual";
 import { Badge } from "./ui/badge";
 
 type StatusVariant =
@@ -98,7 +98,7 @@ function iconForStatus(status: Status | "pending") {
     case Status.TimedOut:
       return <StopwatchIcon className={cls} />;
     case Status.Terminated:
-      return <StopIcon className={cls} />;
+      return <TerminatedIcon className={cls} />;
     case Status.Skipped:
       return <MinusCircledIcon className={cls} />;
     case Status.Paused:

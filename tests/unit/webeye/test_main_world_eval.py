@@ -273,6 +273,219 @@ class TestRuntimeResultDecoding:
             await evaluate_in_main_world(page, "() => 1")
 
 
+class TestRedeclarationSafety:
+    @pytest.mark.asyncio
+    async def test_runtime_evaluate_request_carries_repl_mode(self) -> None:
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": None}})
+
+        await evaluate_in_main_world(page, "let x = 1;")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params.get("replMode") is True
+
+    @pytest.mark.asyncio
+    async def test_function_form_does_not_carry_repl_mode(self) -> None:
+        # Protocol invariant: function-form IIFEs must not carry replMode.
+        # Chromium rewrites returnByValue async-IIFE array results to {} under
+        # replMode, which surfaces in Python as "not enough values to unpack".
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": 1}})
+
+        await evaluate_in_main_world(page, "() => 1")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_sent_on_every_call_not_just_first(self) -> None:
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": None}})
+
+        await evaluate_in_main_world(page, "let foo = 1;")
+        await evaluate_in_main_world(page, "let foo = 1;")
+
+        send_mock = page.context.new_cdp_session.return_value.send
+        assert send_mock.await_count == 2
+        for call in send_mock.await_args_list:
+            params = call.args[1]
+            assert params.get("replMode") is True
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_set_for_top_level_class_declaration_after_comment(self) -> None:
+        # Lexical declarations (``let``/``const``/``class``) still trigger
+        # replMode after the comment-strip; the helper-script injection
+        # relies on this to safely redeclare on a repeated call.
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": None}})
+
+        await evaluate_in_main_world(page, "// header comment\nclass Foo { constructor() { this.x = 1; } }")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params.get("replMode") is True
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_set_for_top_level_const_declaration(self) -> None:
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": None}})
+
+        await evaluate_in_main_world(page, "const x = 1;")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params.get("replMode") is True
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_not_set_for_top_level_function_declaration(self) -> None:
+        # Top-level ``function`` re-declaration is legal in JS, so it does NOT
+        # need replMode. A value-returning script like
+        # ``function rows(){ return [1,2]; }; rows()`` must round-trip cleanly
+        # without the Chromium ``returnByValue`` -> ``{}`` envelope rewrite.
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": [1, 2]}})
+
+        await evaluate_in_main_world(page, "function rows(){ return [1, 2]; }; rows()")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_not_set_for_bare_object_literal_expression(self) -> None:
+        # Bare expressions (object/array literals) must not take replMode —
+        # Chromium rewrites their returnByValue envelopes under replMode.
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": {"foo": 1}}})
+
+        await evaluate_in_main_world(page, "({foo: 1})")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_not_set_for_bare_array_literal_expression(self) -> None:
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": [1, 2, 3]}})
+
+        await evaluate_in_main_world(page, "[1, 2, 3]")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_not_set_for_top_level_await_resolving_to_array(self) -> None:
+        # Reachable via ExecuteJsAction / streaming evaluate_js; top-level
+        # ``await`` that resolves to an array must NOT carry replMode, or
+        # Chromium will mangle the returnByValue envelope to ``{}``.
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": [1, 2]}})
+
+        await evaluate_in_main_world(page, "await Promise.resolve([1, 2])")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+
+    @pytest.mark.asyncio
+    async def test_repl_mode_not_set_for_top_level_var_declaration(self) -> None:
+        # ``var`` redeclaration is legal in JS, so it doesn't need replMode.
+        # A value-returning script like ``var rows = [1, 2]; rows`` must
+        # round-trip cleanly without the returnByValue->{} rewrite.
+        page, _ = _mock_page(prefix="// P")
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": [1, 2]}})
+
+        await evaluate_in_main_world(page, "var rows = [1, 2]; rows")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+        assert params["expression"] == "// P\nvar rows = [1, 2]; rows"
+
+
+class TestReplModeAgainstMarkerPrefix:
+    """A configured marker prefix is just an opaque comment; pin that the
+    declaration check correctly sees through it so:
+      * helper-script injection (leads with a lexical declaration) keeps
+        carrying replMode;
+      * bare value-returning expressions under the same prefix do NOT.
+    Also covers the forward-defensive case where a prefix itself carries
+    top-level declarations (single-call ``Runtime.evaluate`` can't avoid
+    declaration collisions on repeated injection without replMode there,
+    so we accept the replMode envelope risk for value-returning expressions
+    in that hypothetical config — see the comment in main_world_eval.py)."""
+
+    MARKER = "// @marker"
+    HELPER_SCRIPT_SHAPE = (
+        "// leading comment\n"
+        "let workaroundName = 'chromium';\n"
+        "class Counter { constructor() { this.value = 0; } }\n"
+        "function buildTree() { return []; }\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_helper_script_injection_under_marker_prefix_sets_repl_mode(self) -> None:
+        page, _ = _mock_page(prefix=self.MARKER)
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": None}})
+
+        await evaluate_in_main_world(page, self.HELPER_SCRIPT_SHAPE)
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params.get("replMode") is True
+        assert params["expression"].startswith(self.MARKER + "\n")
+
+    @pytest.mark.asyncio
+    async def test_helper_script_injection_can_be_repeated_under_marker_prefix(self) -> None:
+        # Two consecutive injections of the helper-script shape must both
+        # carry replMode so Chromium accepts the redeclared bindings.
+        page, _ = _mock_page(prefix=self.MARKER)
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": None}})
+
+        await evaluate_in_main_world(page, self.HELPER_SCRIPT_SHAPE)
+        await evaluate_in_main_world(page, self.HELPER_SCRIPT_SHAPE)
+
+        send_mock = page.context.new_cdp_session.return_value.send
+        assert send_mock.await_count == 2
+        for call in send_mock.await_args_list:
+            assert call.args[1].get("replMode") is True
+
+    @pytest.mark.asyncio
+    async def test_bare_object_literal_under_marker_prefix_does_not_carry_repl_mode(self) -> None:
+        page, _ = _mock_page(prefix=self.MARKER)
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": {"foo": 1}}})
+
+        await evaluate_in_main_world(page, "({foo: 1})")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+        assert params["expression"] == f"{self.MARKER}\n({{foo: 1}})"
+
+    @pytest.mark.asyncio
+    async def test_top_level_await_array_under_marker_prefix_does_not_carry_repl_mode(self) -> None:
+        page, _ = _mock_page(prefix=self.MARKER)
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": [1, 2]}})
+
+        await evaluate_in_main_world(page, "await Promise.resolve([1, 2])")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert "replMode" not in params
+
+    @pytest.mark.asyncio
+    async def test_declaration_in_prefix_forces_repl_mode_even_when_expression_is_bare_expression(
+        self,
+    ) -> None:
+        # Forward-defensive: if a future caller registers a prefix that itself
+        # carries top-level declarations, repeated invocation would otherwise
+        # surface ``Identifier ... has already been declared``. We choose
+        # replMode here so the prefix can re-inject safely; the cost is that
+        # value-returning expressions on this hypothetical config may see the
+        # Chromium ``{}`` envelope rewrite, which the caller accepts when they
+        # opt into a declaration-bearing prefix.
+        declaration_prefix = "let __probe__ = 1;"
+        page, _ = _mock_page(prefix=declaration_prefix)
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": {"foo": 1}}})
+
+        await evaluate_in_main_world(page, "({foo: 1})")
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params.get("replMode") is True
+
+
 class TestPrefixRegistry:
     def test_configure_and_get_round_trip(self) -> None:
         context = _MockBrowserContext()
