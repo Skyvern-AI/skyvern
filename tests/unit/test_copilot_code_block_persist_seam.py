@@ -1211,6 +1211,14 @@ class TestCredentialScoutPersistGate:
         await page.locator("#totpmfa").fill(login_credential.totp)
         """
     )
+    _UNSAFE_SUBMIT_CODE_YAML = _credential_code_yaml(
+        code="""
+        import asyncio
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("input[type='submit']").click()
+        """
+    )
 
     @pytest.mark.asyncio
     async def test_rejects_credential_submit_code_without_matching_fill_scouts(self) -> None:
@@ -1223,8 +1231,25 @@ class TestCredentialScoutPersistGate:
         assert "fill_credential_field" in result["error"]
         assert "click the submit control or press Enter" in result["error"]
         assert result["user_facing_summary"] == (
-            "I need to scout the saved-credential login flow in the debug browser before I can persist or run this code."
+            "I need to verify the saved-credential login in the browser before I can save or run this code."
         )
+
+    @pytest.mark.asyncio
+    async def test_credential_scout_blocker_takes_precedence_over_code_safety(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": self._UNSAFE_SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "fill_credential_field" in result["error"]
+        assert "Insecure code detected" not in result["error"]
+        assert result["user_facing_summary"] == (
+            "I need to verify the saved-credential login in the browser before I can save or run this code."
+        )
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        code_safety_diagnostics = result["data"]["diagnostic_code_safety_errors"]
+        assert any("Not allowed to import modules" in error for error in code_safety_diagnostics)
 
     @pytest.mark.asyncio
     async def test_allows_submit_code_gate_once_matching_fills_and_submit_are_scouted(self) -> None:

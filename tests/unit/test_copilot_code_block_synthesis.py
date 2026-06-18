@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
+from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 
 
@@ -1219,6 +1220,32 @@ class TestCredentialFillSynthesis:
         assert result is not None
         wrapped = "async def _block(page, authtest_simple):\n" + result.code
         ast.parse(wrapped)
+
+    def test_synthesized_credential_code_passes_persist_safety_seam(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(),
+                self._credential_fill(selector="#passwordInput", credential_field="password"),
+            ]
+        )
+        assert result is not None
+        workflow_yaml = (
+            "title: Login with saved credential\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "    - parameter_type: workflow\n"
+            "      workflow_parameter_type: credential_id\n"
+            "      key: authtest_simple\n"
+            "      default_value: cred_123\n"
+            "  blocks:\n"
+            "    - block_type: code\n"
+            "      label: login_with_saved_credential\n"
+            "      parameter_keys:\n"
+            "        - authtest_simple\n"
+            "      code: |\n" + "\n".join(f"        {line}" for line in result.code.splitlines()) + "\n"
+        )
+
+        assert _code_block_safety_errors(workflow_yaml, None) == []
 
 
 def test_code_block_preflight_restores_recursion_limit() -> None:

@@ -2220,6 +2220,19 @@ async def _update_workflow(
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
         params["code_artifact_metadata"] = merged_metadata
+    credential_scout_errors = _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
+        return {
+            "ok": False,
+            "error": "\n".join(credential_scout_errors),
+            "user_facing_summary": (
+                "I need to verify the saved-credential login in the browser before I can save or run this code."
+            ),
+            "data": {
+                "failure_type": "missing_credential_or_init",
+                "diagnostic_code_safety_errors": code_safety_errors,
+            },
+        }
     seam_errors = [error for error in (code_artifact_metadata_error, *code_safety_errors) if error]
     if seam_errors:
         return {
@@ -2230,14 +2243,14 @@ async def _update_workflow(
                 code_rejected=bool(code_safety_errors),
             ),
         }
-    credential_scout_errors = _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
     if credential_scout_errors:
         return {
             "ok": False,
             "error": "\n".join(credential_scout_errors),
             "user_facing_summary": (
-                "I need to scout the saved-credential login flow in the debug browser before I can persist or run this code."
+                "I need to verify the saved-credential login in the browser before I can save or run this code."
             ),
+            "data": {"failure_type": "missing_credential_or_init"},
         }
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
