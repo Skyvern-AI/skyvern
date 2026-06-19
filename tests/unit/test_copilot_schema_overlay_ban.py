@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     CopilotBlockPolicyStatus,
+    _code_only_browser_authoring_prompt,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
 
@@ -190,6 +191,23 @@ async def test_code_schema_guidance_is_policy_rendered_and_allows_helper_validat
     assert "Browser/page workflow block types are unavailable" in out["data"]["code_only_note"]
     assert "validate_block only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
     assert "Do not persist navigation/action/login" not in " ".join(out["data"]["code_only_guidance"])
+
+
+def test_code_only_authoring_prompt_does_not_recommend_blocked_page_evaluate() -> None:
+    prompt = _code_only_browser_authoring_prompt()
+
+    assert "`evaluate`" not in prompt
+    assert "locator" in prompt
+    assert "MCP/scout evidence" in prompt
+
+
+def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> None:
+    prompt = _code_only_browser_authoring_prompt()
+
+    assert "Credentialed login code must be idempotent" in prompt
+    assert "already-authenticated page anchor" in prompt
+    assert "only fill username/password" in prompt
+    assert "login fields are visible" in prompt
 
 
 @pytest.mark.parametrize("block_type", ["task", "task_v2"])

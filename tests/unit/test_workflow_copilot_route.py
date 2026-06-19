@@ -904,6 +904,105 @@ async def test_proposed_workflow_cleared_on_restore(
     assert len(response_frames) == 1, f"expected exactly one RESPONSE frame, got {response_frames!r}"
     expected_payload_workflow = proposal.model_dump.return_value if has_valid_proposal else None
     assert response_frames[0].updated_workflow == expected_payload_workflow
+    if not auto_accept:
+        assert response_frames[0].workflow_applied is False
+
+
+@pytest.mark.asyncio
+async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    proposal = MagicMock()
+    proposal.model_dump.return_value = {"workflow_id": "wf-applied"}
+    proposal.title = "Applied"
+    proposal.description = "Applied description"
+    proposal.workflow_definition = SimpleNamespace(blocks=[])
+    proposal.proxy_location = None
+    proposal.webhook_callback_url = None
+    proposal.totp_verification_url = None
+    proposal.totp_identifier = None
+    proposal.persist_browser_session = False
+    proposal.browser_profile_id = None
+    proposal.model = None
+    proposal.max_screenshot_scrolls = None
+    proposal.extra_http_headers = None
+    proposal.cdp_connect_headers = None
+    proposal.run_with = "agent"
+    proposal.ai_fallback = None
+    proposal.cache_key = None
+    proposal.adaptive_caching = False
+    proposal.code_version = 2
+    proposal.run_sequentially = False
+    proposal.sequential_key = None
+    agent_result = SimpleNamespace(
+        user_response="done",
+        updated_workflow=proposal,
+        global_llm_context=None,
+        workflow_yaml="title: Applied",
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        proposal_disposition="auto_applicable",
+        apply_without_review=True,
+        has_staged_proposal=True,
+        staged_workflow=proposal,
+        turn_outcome=None,
+    )
+
+    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_service = SimpleNamespace(update_workflow_definition=AsyncMock())
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "resolve_copilot_created_by_stamp",
+        AsyncMock(return_value="copilot"),
+    )
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_not_awaited()
+    workflow_service.update_workflow_definition.assert_awaited_once()
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None] == []
+    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].workflow_applied is True
+    assert response_frames[0].updated_workflow == {"workflow_id": "wf-applied"}
 
 
 @pytest.mark.asyncio

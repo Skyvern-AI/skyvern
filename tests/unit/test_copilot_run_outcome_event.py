@@ -231,6 +231,34 @@ async def test_satisfied_adjudication_emits_demonstrated(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_satisfied_adjudication_emits_demonstrated_with_unverified_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _clean_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(block_type="code", label="search_registry_person"),
+                SimpleNamespace(block_type="code", label="review_results"),
+            ]
+        )
+    )
+
+    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
+        return _evaluated(satisfied=True)
+
+    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
+    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
+    assert frames[-1].reason_code is None
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_run_outcome == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+
+
+@pytest.mark.asyncio
 async def test_verification_skipped_emits_not_evaluated(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
