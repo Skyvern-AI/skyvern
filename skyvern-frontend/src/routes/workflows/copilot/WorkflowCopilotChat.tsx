@@ -98,6 +98,23 @@ function normalizeComposerDefaultVariant(
   return "build";
 }
 
+function defaultVariantUsesCode(variant: ComposerDefaultVariant): boolean {
+  return variant === "build_code" || variant === "ask_code";
+}
+
+function defaultCodeBlockRequestOverride(
+  variant: string | undefined,
+): boolean | null {
+  if (variant === "build_code") {
+    return true;
+  }
+  if (variant === "build" || variant === "build_no_code") {
+    return false;
+  }
+  // Ask-only variants, including ask_code, do not send a build request override.
+  return null;
+}
+
 function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(seconds / 60);
@@ -405,11 +422,12 @@ export function WorkflowCopilotChat({
       ? "ask"
       : "build",
   );
-  const [codeWorkflow, setCodeWorkflow] = useState(
-    () =>
-      effectiveDefaultVariant === "build_code" ||
-      effectiveDefaultVariant === "ask_code",
+  const [codeWorkflow, setCodeWorkflow] = useState(() =>
+    defaultVariantUsesCode(effectiveDefaultVariant),
   );
+  const [codeBlockRequestOverride, setCodeBlockRequestOverride] = useState<
+    boolean | null
+  >(() => defaultCodeBlockRequestOverride(defaultModeVariant));
   // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
   const composerSeededRef = useRef(false);
   const flagsResolved =
@@ -427,11 +445,11 @@ export function WorkflowCopilotChat({
         ? "ask"
         : "build",
     );
-    setCodeWorkflow(
-      effectiveDefaultVariant === "build_code" ||
-        effectiveDefaultVariant === "ask_code",
+    setCodeWorkflow(defaultVariantUsesCode(effectiveDefaultVariant));
+    setCodeBlockRequestOverride(
+      defaultCodeBlockRequestOverride(defaultModeVariant),
     );
-  }, [flagsResolved, effectiveDefaultVariant]);
+  }, [flagsResolved, effectiveDefaultVariant, defaultModeVariant]);
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
   const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
@@ -1385,7 +1403,8 @@ export function WorkflowCopilotChat({
             audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
             mode: copilotV2Enabled ? composerMode : null,
-            code_block: isBuild && codeBlockModeEnabled ? codeWorkflow : null,
+            code_block:
+              isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
             cancel_token: cancelToken,
             target_block_label: targetBlockLabel,
           } as WorkflowCopilotChatRequest,
@@ -1496,7 +1515,7 @@ export function WorkflowCopilotChat({
       applyWorkflowUpdate,
       autoAccept,
       codeBlockModeEnabled,
-      codeWorkflow,
+      codeBlockRequestOverride,
       composerMode,
       copilotV2Enabled,
       credentialGetter,
@@ -1542,6 +1561,7 @@ export function WorkflowCopilotChat({
     blockBuildTargetLabelRef.current = pendingBlockBuild.blockLabel;
     setComposerMode("build");
     setCodeWorkflow(true);
+    setCodeBlockRequestOverride(true);
     setBlockBuildArmNonce((nonce) => nonce + 1);
     clearPendingBlockBuild();
   }, [pendingBlockBuild, clearPendingBlockBuild]);
@@ -2229,6 +2249,7 @@ export function WorkflowCopilotChat({
                     onSelect={() => {
                       setComposerMode("ask");
                       setCodeWorkflow(false);
+                      setCodeBlockRequestOverride(null);
                     }}
                     className="flex items-start gap-2.5"
                   >
@@ -2248,6 +2269,7 @@ export function WorkflowCopilotChat({
                     onSelect={() => {
                       setComposerMode("build");
                       setCodeWorkflow(false);
+                      setCodeBlockRequestOverride(false);
                     }}
                     className="flex items-start gap-2.5"
                   >
@@ -2269,6 +2291,7 @@ export function WorkflowCopilotChat({
                       onSelect={() => {
                         setComposerMode("build");
                         setCodeWorkflow(true);
+                        setCodeBlockRequestOverride(true);
                       }}
                       className="flex items-start gap-2.5"
                     >

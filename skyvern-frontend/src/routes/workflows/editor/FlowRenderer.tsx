@@ -119,6 +119,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
+import { useResolveDefaultGoogleSheetsCredential } from "./hooks/useResolveDefaultGoogleSheetsCredential";
 import { SortableBlockScope } from "./sortable/SortableBlockScope";
 import {
   TOP_LEVEL_SCOPE,
@@ -1459,6 +1460,7 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
   useAutoGenerateWorkflowTitle(nodes, edges, readOnly);
+  useResolveDefaultGoogleSheetsCredential(nodes, readOnly);
 
   useEffect(() => {
     doLayout(nodes, edges);

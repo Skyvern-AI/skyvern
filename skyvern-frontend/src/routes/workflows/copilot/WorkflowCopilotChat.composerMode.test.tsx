@@ -191,13 +191,13 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat — composer default mode variant", () => {
-  it("defaults to Build with code OFF when the variant is unset (new baseline)", async () => {
+  it("leaves code_block unset for backend fallback when the default variant is unset", async () => {
     await renderChat({ copilotV2: true, codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
+    expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
   it("sends code_block=true for the build_code override variant", async () => {
