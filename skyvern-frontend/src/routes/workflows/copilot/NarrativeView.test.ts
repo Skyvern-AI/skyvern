@@ -774,6 +774,44 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.accent).toBe("ok");
   });
 
+  it("renders a clean built-unverified run as ran, not stopped", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        draft: draft3,
+        blocks: [
+          summaryBlock("block_one"),
+          summaryBlock("block_two"),
+          summaryBlock("block_three"),
+        ],
+        proposalDisposition: "auto_applicable",
+        responseKind: "build",
+        verifiedSuccess: false,
+      }),
+    );
+    expect(summary.headline).toBe("Built and ran the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
+  it("renders a clean built-unverified edit as ran, not re-tested", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        draft: draft3,
+        blocks: [
+          summaryBlock("block_one"),
+          summaryBlock("block_two"),
+          summaryBlock("block_three"),
+        ],
+        priorBlockCount: 2,
+        responseKind: "build",
+        verifiedSuccess: false,
+      }),
+    );
+    expect(summary.headline).toBe("Applied edits and ran the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
   it.each([
     [buildTurn({ responseKind: "build", verifiedSuccess: false }), "Stopped"],
     [
@@ -813,7 +851,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       "Workflow ready for review",
     ],
   ])(
-    "never renders green when the verdict refused the success claim (%#)",
+    "keeps stopped or review-required states when there is no clean completed run (%#)",
     (turn, headline) => {
       const summary = computeTurnSummary(turn);
       expect(summary.headline).toBe(headline);
