@@ -119,7 +119,7 @@ from skyvern.schemas.workflows import (
     WorkflowParameterYAML,
     WorkflowStatus,
 )
-from skyvern.services.otp_service import OTPValue, parse_otp_login
+from skyvern.services.otp_service import OTPValue, parse_otp_login, redact_otp_identifier_for_log
 from skyvern.services.run_service import cancel_workflow_run
 from skyvern.utils.url_validators import validate_url
 
@@ -188,10 +188,11 @@ async def send_totp_code(
     data: TOTPCodeCreate,
     curr_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TOTPCode:
+    redacted_totp_identifier = redact_otp_identifier_for_log(data.totp_identifier)
     LOG.info(
         "Saving OTP code",
         organization_id=curr_org.organization_id,
-        totp_identifier=data.totp_identifier,
+        totp_identifier=redacted_totp_identifier,
         task_id=data.task_id,
         workflow_id=data.workflow_id,
         workflow_run_id=data.workflow_run_id,
@@ -211,18 +212,35 @@ async def send_totp_code(
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content, type=data.type or OTPType.TOTP)
+    parse_exception_type_name: str | None = None
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
-        otp_value = await parse_otp_login(content, curr_org.organization_id, enforced_otp_type=data.type)
+        try:
+            otp_value = await parse_otp_login(content, curr_org.organization_id, enforced_otp_type=data.type)
+        except Exception as e:
+            otp_value = None
+            parse_exception_type_name = type(e).__name__
+
+    if parse_exception_type_name:
+        LOG.error(
+            "Failed to parse otp login",
+            totp_identifier=redacted_totp_identifier,
+            task_id=data.task_id,
+            workflow_id=data.workflow_id,
+            workflow_run_id=data.workflow_run_id,
+            content_length=len(data.content),
+            exception_type=parse_exception_type_name,
+        )
+        raise HTTPException(status_code=400, detail="Failed to parse otp login")
 
     if not otp_value:
         LOG.error(
             "Failed to parse otp login",
-            totp_identifier=data.totp_identifier,
+            totp_identifier=redacted_totp_identifier,
             task_id=data.task_id,
             workflow_id=data.workflow_id,
             workflow_run_id=data.workflow_run_id,
-            content=data.content,
+            content_length=len(data.content),
         )
         raise HTTPException(status_code=400, detail="Failed to parse otp login")
 
