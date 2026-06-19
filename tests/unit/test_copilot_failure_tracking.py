@@ -6,11 +6,13 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.failure_tracking import (
+    ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES,
     compute_failure_signature,
     compute_frontier_fingerprint,
     compute_repair_root_cause_signature,
     update_repeated_failure_state,
 )
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_FAILURE_CATEGORIES
 
 
 class _Block:
@@ -129,6 +131,10 @@ def test_category_only_and_code_imposition_root_causes_collapse_noise() -> None:
     assert category_detected.primary_category == "ANTI_BOT_CHALLENGE"
     assert first.root_cause_signature == retried.root_cause_signature
     assert first.error_class == "code_block_synthesis_ambiguous_bare_selector"
+
+
+def test_terminal_challenge_categories_follow_anti_bot_root_cause_aliases() -> None:
+    assert TERMINAL_CHALLENGE_FAILURE_CATEGORIES == ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES
 
 
 def test_fingerprint_empty_without_workflow_definition() -> None:
