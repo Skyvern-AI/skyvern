@@ -309,6 +309,9 @@ class AgentResult:
     cancelled: bool = False
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
+    # Successful code-only build turns can be applied without requiring the
+    # chat's sticky "Always accept" setting.
+    apply_without_review: bool = False
     output_policy_diagnostics: dict[str, Any] | None = None
     turn_outcome: TurnOutcome | None = None
     turn_id: str | None = None

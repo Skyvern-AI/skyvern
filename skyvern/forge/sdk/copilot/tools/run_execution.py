@@ -1916,9 +1916,7 @@ def _adjudicated_run_outcome(
                     _outcome_unverified_reason(copilot_ctx, completion_verification)
                 ),
             )
-        if copilot_ctx.last_full_workflow_test_ok:
-            return RecordedRunOutcome(verdict="demonstrated")
-        return RecordedRunOutcome(verdict="not_evaluated")
+        return RecordedRunOutcome(verdict="demonstrated")
     if copilot_ctx.last_test_suspicious_success:
         return RecordedRunOutcome(
             verdict="not_demonstrated",

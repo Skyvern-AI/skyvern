@@ -444,7 +444,7 @@ def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None
     """Only auto-applicable proposals may honor ``auto_accept=True``."""
     if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
         return False
-    return auto_accept is True
+    return auto_accept is True or getattr(agent_result, "apply_without_review", False) is True
 
 
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
@@ -656,7 +656,15 @@ async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             proposed_workflow=_build_proposed_workflow_data(updated_workflow, agent_result),
         )
-    elif chat.proposed_workflow is not None and (restored or agent_result.clear_proposed_workflow):
+    elif chat.proposed_workflow is not None and (
+        restored
+        or agent_result.clear_proposed_workflow
+        or (
+            getattr(agent_result, "apply_without_review", False) is True
+            and auto_accept_effective
+            and not _output_policy_blocked_final_response(agent_result)
+        )
+    ):
         # Null any persisted proposed_workflow the assistant just invalidated
         # so a reload does not resurrect a stale Accept/Reject card. Runs
         # under both auto_accept values — a stale proposal can survive an
@@ -843,6 +851,7 @@ async def _finalise_normal_turn(
     await _persist_proposed_workflow_state(chat, agent_result, restored)
     await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
+    workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         agent_result.narrative_payload,
         cancelled=False,
@@ -877,6 +886,7 @@ async def _finalise_normal_turn(
             total_tokens=agent_result.total_tokens,
             response_type=agent_result.response_type,
             proposal_disposition=proposal_disposition,
+            workflow_applied=workflow_applied,
             output_policy_diagnostics=agent_result.output_policy_diagnostics,
             turn_id=agent_result.turn_id,
             narrative_summary=agent_result.narrative_summary,
