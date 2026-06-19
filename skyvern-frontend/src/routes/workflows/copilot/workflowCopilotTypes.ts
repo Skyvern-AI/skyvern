@@ -111,6 +111,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   response_time: string;
   response_type?: CopilotResponseType;
   proposal_disposition: ProposalDisposition;
+  workflow_applied?: boolean;
   // Cancel forces explicit review.
   cancelled?: boolean;
   // Optional so the FE tolerates an older backend that does not emit the
