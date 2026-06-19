@@ -30,6 +30,17 @@ from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
 
+# How often the reaper scans for expired persistent browser sessions to close. Upstream has no idle
+# reaper, so abandoned debug/standalone sessions expire in the DB but their in-process Chromium +
+# Playwright record_video ffmpeg encoders are never torn down (one browser + recorder leaked per
+# abandoned session). The reaper closes sessions whose timeout has elapsed.
+REAP_INTERVAL_SECONDS = 60
+# Only reap a session this long AFTER its timeout has elapsed — a safety buffer so the reaper can
+# never race a renewal that is mid-flight. Active sessions are renewed well before expiry (workflow
+# loop every 5 min, frontend polls), so in practice they never reach expiry at all; this is belt-and-
+# suspenders for any clock skew / in-flight-renewal corner case.
+REAP_GRACE_SECONDS = 120
+
 
 @dataclass
 class BrowserSession:
@@ -184,6 +195,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     instance: DefaultPersistentSessionsManager | None = None
     _browser_sessions: dict[str, BrowserSession] = dict()
     _background_tasks: set[asyncio.Task[None]] = set()
+    _reaper_task: asyncio.Task[None] | None = None
     database: AgentDB
 
     def __new__(cls, database: AgentDB) -> DefaultPersistentSessionsManager:
@@ -586,6 +598,66 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             await self.database.browser_sessions.archive_browser_session_address(
                 db_session.persistent_browser_session_id, db_session.organization_id
             )
+
+    def start_reaper(self) -> None:
+        """Start the background loop that closes expired persistent browser sessions.
+
+        Idempotent, and gated to cdp streaming mode (browsers run in-process). Without it, an
+        idle/abandoned session (e.g. a debug session whose editor tab was closed, so it stops being
+        renewed) expires in the DB but its in-process Chromium + Playwright record_video ffmpeg
+        encoder are never closed, leaking ~1 browser + recorder per abandoned session.
+        """
+        if settings.BROWSER_STREAMING_MODE != "cdp":
+            return
+        if self._reaper_task is not None and not self._reaper_task.done():
+            return
+        task = asyncio.create_task(self._reap_expired_sessions_loop())
+        self._reaper_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        LOG.info("Persistent browser session reaper started", interval_seconds=REAP_INTERVAL_SECONDS)
+
+    async def _reap_expired_sessions_loop(self) -> None:
+        while True:
+            await asyncio.sleep(REAP_INTERVAL_SECONDS)
+            try:
+                await self._reap_expired_sessions_once()
+            except Exception:
+                LOG.exception("Browser session reaper pass failed")
+
+    async def _reap_expired_sessions_once(self) -> None:
+        sessions = await self.database.browser_sessions.get_all_active_persistent_browser_sessions()
+        now = datetime.now(timezone.utc)
+        for db_session in sessions:
+            # Only reap sessions that have actually started AND are past their timeout. Sessions in
+            # active use are continuously renewed (the workflow renewal loop / frontend polls extend
+            # the timeout), so they never reach expiry here; not-yet-started sessions are still
+            # launching and are left to the existing launch/renewal grace logic.
+            if db_session.started_at is None or db_session.timeout_minutes is None:
+                continue
+            started_at_utc = (
+                db_session.started_at.replace(tzinfo=timezone.utc)
+                if db_session.started_at.tzinfo is None
+                else db_session.started_at
+            )
+            expires_at = started_at_utc + timedelta(minutes=float(db_session.timeout_minutes))
+            if expires_at + timedelta(seconds=REAP_GRACE_SECONDS) > now:
+                continue
+            LOG.info(
+                "Reaping expired persistent browser session",
+                session_id=db_session.persistent_browser_session_id,
+                organization_id=db_session.organization_id,
+            )
+            try:
+                await self.close_session(
+                    db_session.organization_id, db_session.persistent_browser_session_id
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to reap expired browser session",
+                    session_id=db_session.persistent_browser_session_id,
+                    organization_id=db_session.organization_id,
+                )
 
     @classmethod
     async def close(cls) -> None:
