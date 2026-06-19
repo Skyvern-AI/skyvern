@@ -348,6 +348,43 @@ class TestSanctionedSecretReferenceIdiom:
 
         assert verdict.allowed
 
+    def test_allows_awaited_credential_otp_assignment_in_workflow_yaml(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            workflow_yaml=(
+                'code: |\n  passcode = await login_credentials.otp()\n  await page.locator("#code").fill(passcode)\n'
+            ),
+        )
+
+        assert verdict.allowed
+
+    def test_allows_keyword_secret_reference_to_awaited_credential_otp_in_tool_arguments(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  token = await login_credential.otp()"},
+        )
+
+        assert verdict.allowed
+
+    def test_allows_secret_keyword_match_when_full_line_is_sanctioned_otp_reference(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  passcode = await login_credential.otp()"},
+        )
+
+        assert verdict.allowed
+
+    def test_rejects_literal_secret_even_when_same_line_has_credential_reference(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={
+                "workflow_yaml": "code: |\n  password = 'hunter2'; password_ref = login_credential.password"
+            },
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
     def test_allows_str_wrapped_parameter_reference(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
@@ -369,6 +406,15 @@ class TestSanctionedSecretReferenceIdiom:
 
             assert not verdict.allowed, rhs
             assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_awaited_non_credential_secret_source(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  passcode = await page.locator('#code').inner_text()"},
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
     def test_allows_keyword_argument_reference_with_closing_paren(self) -> None:
         verdict = evaluate_output_policy(

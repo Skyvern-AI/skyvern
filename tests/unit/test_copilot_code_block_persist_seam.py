@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_te
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import (
     _code_block_safety_errors,
     _detect_stale_block_metadata,
@@ -226,6 +227,28 @@ def _code_only_ctx() -> CopilotContext:
 def _standard_ctx() -> CopilotContext:
     ctx = _code_only_ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+    return ctx
+
+
+def _draft_only_credential_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.scout_trajectory = []
+    ctx.allow_untested_workflow_draft = True
+    ctx.request_policy = RequestPolicy(
+        testing_intent="skip_test",
+        credential_input_kind="credential_name",
+        credential_refs=["Saved portal credential"],
+        allow_update_workflow=True,
+        allow_run_blocks=False,
+        allow_missing_credentials_in_draft=True,
+        resolved_credentials=[
+            SimpleNamespace(
+                credential_id="cred_missing",
+                name="Saved portal credential",
+                tested_url="https://example.com/login",
+            )
+        ],
+    )
     return ctx
 
 
@@ -2013,6 +2036,43 @@ class TestCredentialScoutPersistGate:
         await page.locator("input[type='submit']").click()
         """
     )
+    _RUNTIME_OTP_CODE_YAML = _credential_code_yaml(
+        code="""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#totpmfa").fill(await login_credential.otp())
+        await page.locator("input[type='submit']").click()
+        await page.wait_for_load_state("load")
+        """
+    )
+    _DRAFT_DOWNLOAD_CODE_YAML = _credential_code_yaml(
+        code="""
+        await page.goto("https://example.com/login")
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#totpmfa").fill(await login_credential.otp())
+        await page.locator("input[type='submit']").click()
+        await page.wait_for_load_state("load")
+        async with page.expect_download() as download_info:
+            await page.locator("a[href='/invoices/monthly.pdf']").click()
+        download = await download_info.value
+        print(download.suggested_filename)
+        """
+    )
+    _DOWNLOAD_CODE_YAML = _yaml(
+        """
+        title: Download invoice
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: download_monthly_invoice_pdf
+            code: |
+              async with page.expect_download() as download_info:
+                  await page.locator("a[href='/invoices/monthly.pdf']").click()
+              download = await download_info.value
+              print(download.suggested_filename)
+        """
+    )
 
     @pytest.mark.asyncio
     async def test_rejects_credential_submit_code_without_matching_fill_scouts(self) -> None:
@@ -2094,6 +2154,48 @@ class TestCredentialScoutPersistGate:
         assert "was not found in this organization" in error_text
         assert "click the submit control or press Enter" not in error_text
         assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_runtime_otp_method_does_not_require_impossible_live_otp_fill(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _submit_interaction(),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._RUNTIME_OTP_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "was not found in this organization" in error_text
+        assert "successful `fill_credential_field` scouting for `totp`" not in error_text
+        assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_draft_only_credential_code_download_persists_without_scouts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _draft_only_credential_ctx()
+
+        result = await _update_workflow({"workflow_yaml": self._DRAFT_DOWNLOAD_CODE_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert "login_with_saved_credential" in ctx.workflow_yaml
+        assert "expect_download" in ctx.workflow_yaml
+        assert "login_credential.username" in ctx.workflow_yaml
+
+    @pytest.mark.asyncio
+    async def test_download_scout_gate_still_blocks_normal_code_only_authoring(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": self._DOWNLOAD_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "Scout it first" in result["error"]
+        assert "download affordance" in result["error"]
 
     @pytest.mark.asyncio
     async def test_standard_mode_behavior_is_unchanged(self) -> None:
