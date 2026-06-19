@@ -12,10 +12,12 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_yaml_in_chat,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
-    RAW_SECRET_PATTERNS,
-    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     RequestPolicy,
     contains_email_password_pair,
+)
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,

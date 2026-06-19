@@ -18,7 +18,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     refresh_held_loop_blocker_evidence,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import (
+    TOTAL_TIMEOUT_SECONDS,
+    terminal_challenge_blocker_signal_from_current_page_evidence,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
@@ -26,6 +29,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 )
 from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -51,6 +55,12 @@ from ._shared import (
 )
 
 LOG = structlog.get_logger()
+
+_CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
+    BLOCK_RUNNING_TOOLS
+    | PAGE_INSPECTION_TOOLS
+    | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
+)
 
 
 async def _safe_read_workflow_run(
@@ -751,6 +761,22 @@ def _post_budget_terminal_challenge_signal(
     return _terminal_challenge_signal(reason=reason, arguments=arguments, tool_name=tool_name)
 
 
+def _current_page_terminal_challenge_signal(
+    ctx: AgentContext, arguments: dict[str, Any] | None, tool_name: str
+) -> CopilotToolBlockerSignal | None:
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
+        ctx,
+        blocked_tool=tool_name,
+        evidence_source="page_evidence",
+    )
+    if signal is None:
+        return None
+    requested_labels = _requested_block_label_set(arguments)
+    if requested_labels:
+        signal = signal.model_copy(update={"extra": {**dict(signal.extra), "block_labels": sorted(requested_labels)}})
+    return signal
+
+
 _RECONCILIATION_REQUIRES_INPUT_USER_FACING = (
     "The previous run was canceled. Tell me whether to retry, keep the draft as-is, or adjust the workflow first."
 )
@@ -831,9 +857,17 @@ _ANTI_BOT_BLOCKER_TERMS: tuple[str, ...] = (
     "access denied",
     "anti-bot",
     "bot block",
+    "browser access barrier",
+    "browser or environment port block",
+    "browser port forbidden",
+    "browser refused to render",
+    "browser_port_forbidden",
+    "browser_or_environment_port_block",
     "captcha",
     "challenge",
     "human verification",
+    "port-forbidden",
+    "requested port",
     "verify you are human",
 )
 # Multi-word anti-bot phrases only: the bare tokens ``captcha``/``challenge`` are
@@ -907,10 +941,6 @@ def _structured_blocker_message(
                 or (scan_all_values_for_anti_bot and _looks_like_anti_bot_phrase(item))
             ):
                 return item.strip()[:240]
-        if include_flag_keys:
-            flagged = _blocker_flag_or_status_message(value)
-            if flagged:
-                return flagged
         for item in value.values():
             nested = _structured_blocker_message(
                 item,
@@ -922,6 +952,10 @@ def _structured_blocker_message(
             )
             if nested:
                 return nested
+        if include_flag_keys:
+            flagged = _blocker_flag_or_status_message(value)
+            if flagged:
+                return flagged
     elif isinstance(value, list):
         for item in value:
             nested = _structured_blocker_message(
@@ -1413,6 +1447,11 @@ def _challenge_gated_anti_bot_rerun_signal(
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     refresh_held_loop_blocker_evidence(ctx)
+    if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS:
+        current_page_challenge_signal = _current_page_terminal_challenge_signal(ctx, arguments, tool_name)
+        if current_page_challenge_signal is not None:
+            return _emit_tool_blocker_signal(ctx, current_page_challenge_signal)
+
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:
         return _emit_tool_blocker_signal(
@@ -1576,7 +1615,7 @@ def _analyze_run_blocks(
     precomputed_categories = data.get("failure_categories")
     if isinstance(precomputed_categories, list) and precomputed_categories:
         for cat in precomputed_categories:
-            if isinstance(cat, dict) and cat.get("category") == "ANTI_BOT_DETECTION":
+            if isinstance(cat, dict) and trusted_terminal_challenge_category_name(cat) is not None:
                 anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
                 break
         return anti_bot_match, False, precomputed_categories

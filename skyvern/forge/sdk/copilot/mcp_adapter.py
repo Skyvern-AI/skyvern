@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+from skyvern.forge.sdk.copilot.enforcement import terminal_challenge_blocker_signal_from_current_page_evidence
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -106,12 +107,37 @@ class SchemaOverlay:
 
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
+_CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS = frozenset(
+    {
+        "click",
+        "evaluate",
+        "get_browser_screenshot",
+        "navigate_browser",
+        "press_key",
+        "scroll",
+        "select_option",
+        "type_text",
+    }
+)
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
     payload = stash_blocker_signal(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
+    return payload
+
+
+def _stash_and_emit_current_page_terminal_challenge_blocker(ctx: Any, tool_name: str) -> str | None:
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
+        ctx,
+        blocked_tool=tool_name,
+        evidence_source="mcp_page_evidence",
+    )
+    if signal is None:
+        return None
+    payload = stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_current_page_terminal_challenge")
     return payload
 
 
@@ -270,6 +296,18 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         refresh_held_loop_blocker_evidence(copilot_ctx)
+        if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS:
+            terminal_challenge_payload = _stash_and_emit_current_page_terminal_challenge_blocker(
+                copilot_ctx,
+                tool_name,
+            )
+            if terminal_challenge_payload is not None:
+                LOG.warning(
+                    "Current page terminal challenge detected, skipping MCP browser tool",
+                    tool_name=tool_name,
+                )
+                return _copilot_to_call_tool_result({"ok": False, "error": terminal_challenge_payload})
+
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(
