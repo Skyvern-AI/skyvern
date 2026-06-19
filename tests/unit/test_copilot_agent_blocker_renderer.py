@@ -200,6 +200,27 @@ def test_shim_overrides_proposal_even_when_pre_override_result_carries_workflow(
     assert overridden.workflow_yaml is None
 
 
+def test_blocker_signal_wins_over_demonstrated_recorded_outcome() -> None:
+    ctx = _ctx()
+    ctx.blocker_signal = _signal(user_facing="I need one more detail before I can continue.")
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_hidden")
+    fake_workflow = SimpleNamespace(name="verified")
+    result = AgentResult(
+        user_response="I created and tested the workflow successfully.",
+        updated_workflow=fake_workflow,
+        global_llm_context=None,
+        workflow_yaml="title: verified\n",
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden.user_response == "I need one more detail before I can continue."
+    assert "created and tested" not in overridden.user_response.lower()
+    assert "wr_hidden" not in overridden.user_response
+    assert overridden.updated_workflow is None
+    assert overridden.proposal_disposition == "no_proposal"
+
+
 def test_shim_recomputes_turn_outcome_from_rendered_reply() -> None:
     ctx = _ctx()
     ctx.blocker_signal = _signal()

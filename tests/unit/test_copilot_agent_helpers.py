@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -1900,6 +1901,131 @@ workflow_definition:
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: drafted"
         assert agent_result.proposal_disposition == "review_untested"
+
+    def test_demonstrated_recorded_outcome_overrides_goal_reached_false_underclaim(self) -> None:
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        wf = SimpleNamespace(name="verified")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: verified",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_update_block_count=4,
+            last_run_outcome=RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_secret"),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "I drafted this but did not test it end-to-end.",
+                "goal_reached": False,
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: verified"
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert "created and tested" in agent_result.user_response.lower()
+        assert "demonstrated the requested outcome" in agent_result.user_response.lower()
+        assert "did not test" not in agent_result.user_response.lower()
+        assert "wr_secret" not in agent_result.user_response
+
+    def test_demonstrated_recorded_outcome_overrides_misleading_free_text(self) -> None:
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        wf = SimpleNamespace(name="verified")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: verified",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(verdict="demonstrated"),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "The test could not verify the requested result.",
+                "goal_reached": True,
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert "demonstrated the requested outcome" in agent_result.user_response.lower()
+        assert "could not verify" not in agent_result.user_response.lower()
+
+    def test_not_demonstrated_recorded_outcome_stays_conservative_and_sanitized(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                display_reason="Statement month was still April.",
+                workflow_run_id="wr_hidden",
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "review_untested"
+        assert "did not demonstrate the requested outcome" in agent_result.user_response.lower()
+        assert "statement month was still april" in agent_result.user_response.lower()
+        assert "all set" not in agent_result.user_response.lower()
+        assert "wr_hidden" not in agent_result.user_response
+
+    def test_not_evaluated_recorded_outcome_reports_run_unverified_not_untested(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(verdict="not_evaluated", display_reason="Output judge unavailable."),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "review_untested"
+        assert "could not verify the requested outcome" in agent_result.user_response.lower()
+        assert "output judge unavailable" in agent_result.user_response.lower()
+        assert "untested" not in agent_result.user_response.lower()
 
     def test_goal_reached_default_true_keeps_verified_path(self) -> None:
         # Backwards-compat: stale prompts that omit goal_reached must continue
