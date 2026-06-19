@@ -127,6 +127,7 @@
     },
     "@types/node": "$@types/node",
     "protobufjs": ">=7.5.8",
-    "qs": ">=6.15.2"
+    "qs": ">=6.15.2",
+    "undici": "^7.28.0"
   }
 }
