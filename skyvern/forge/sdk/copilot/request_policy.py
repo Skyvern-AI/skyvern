@@ -8,7 +8,6 @@ from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
-from email_validator import EmailNotValidError, validate_email
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -16,6 +15,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    contains_email_password_pair,
+    redact_raw_secrets_for_prompt,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids, workflow_credential_origins
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -120,23 +124,6 @@ _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
     "I couldn't find the required credentials for the existing workflow. "
     f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
 )
-SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
-    r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I
-)
-_RAW_SECRET_PATTERNS = (
-    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
-    re.compile(
-        r"\b(?:otp|totp|mfa|2fa|verification|auth(?:entication)? code)(?:\s+code)?\s*(?:is|[:=])?\s*\d{6,8}\b",
-        re.I,
-    ),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-)
-# Reused by output-policy guardrails as syntactic leak backstops.
-RAW_SECRET_PATTERNS = _RAW_SECRET_PATTERNS
-_COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS = (",", ";", "|")
-_COLON_DELIMITED_SECRET_EDGE_CHARS = "\"'`()[]{}<>"
 _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "into the conditional",
     "inside the conditional",
@@ -420,57 +407,7 @@ def _canonicalize_credential_ref(ref: str) -> str:
 
 
 def _raw_secret_detected(text: str) -> bool:
-    return any(pattern.search(text or "") for pattern in _RAW_SECRET_PATTERNS) or contains_email_password_pair(text)
-
-
-def _candidate_secret_segments(text: str) -> list[str]:
-    segments: list[str] = []
-    for raw_token in (text or "").split():
-        token_segments = [raw_token]
-        for separator in _COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS:
-            token_segments = [part for segment in token_segments for part in segment.split(separator)]
-        segments.extend(segment.strip(_COLON_DELIMITED_SECRET_EDGE_CHARS) for segment in token_segments)
-    return [segment for segment in segments if segment]
-
-
-def _is_valid_account_row_email(value: str) -> bool:
-    if any(char.isspace() for char in value) or "/" in value or ":" in value:
-        return False
-    try:
-        validate_email(value, check_deliverability=False, test_environment=True)
-    except EmailNotValidError:
-        return False
-    return True
-
-
-def _looks_like_colon_delimited_secret_value(value: str) -> bool:
-    if len(value) < 4:
-        return False
-    if any(char.isspace() for char in value):
-        return False
-    if any(char in value for char in ("/", "?", "#")):
-        return False
-    if value.isdigit() and len(value) <= 5:
-        return False
-    return True
-
-
-def _email_password_pair_segments(text: str) -> list[str]:
-    pairs: list[str] = []
-    for segment in _candidate_secret_segments(text):
-        email, separator, secret_value = segment.partition(":")
-        if not separator:
-            continue
-        if _is_valid_account_row_email(email) and _looks_like_colon_delimited_secret_value(secret_value):
-            pairs.append(segment)
-    return pairs
-
-
-def contains_email_password_pair(text: str) -> bool:
-    # Privacy backstop for pasted account dumps. The request-policy classifier
-    # owns ambiguous credential semantics; this parser keeps high-confidence raw
-    # values out of model prompts and output surfaces without a broad regex rule.
-    return bool(_email_password_pair_segments(text))
+    return any(pattern.search(text or "") for pattern in RAW_SECRET_PATTERNS) or contains_email_password_pair(text)
 
 
 _MIN_RAW_SECRET_EVIDENCE_CHARS = 4
@@ -494,15 +431,6 @@ def _coerce_raw_secret_handling(value: Any) -> RawSecretHandling:
     if value in _RAW_SECRET_HANDLINGS:
         return cast(RawSecretHandling, value)
     return "none"
-
-
-def redact_raw_secrets_for_prompt(text: str) -> str:
-    redacted = text or ""
-    for pattern in _RAW_SECRET_PATTERNS:
-        redacted = pattern.sub("[REDACTED_SECRET]", redacted)
-    for segment in _email_password_pair_segments(redacted):
-        redacted = redacted.replace(segment, "[REDACTED_SECRET]")
-    return redacted
 
 
 def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
