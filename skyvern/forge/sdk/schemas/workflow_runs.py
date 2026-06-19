@@ -70,6 +70,9 @@ class WorkflowRunBlock(BaseModel):
     # clean cached execution, always-agent blocks, and pre-column rows.
     script_run: ScriptRunResponse | None = None
 
+    # Count of files this block downloaded; scalar mirror of output["downloaded_files"].
+    downloaded_file_count: int | None = None
+
 
 class WorkflowRunTimelineType(StrEnum):
     thought = "thought"

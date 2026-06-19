@@ -786,6 +786,14 @@ def convert_to_workflow_run_parameter(
     )
 
 
+def downloaded_file_count_from_output(output: dict | list | str | None) -> int | None:
+    if isinstance(output, dict):
+        downloaded_files = output.get("downloaded_files")
+        if isinstance(downloaded_files, list):
+            return len(downloaded_files)
+    return None
+
+
 def convert_to_workflow_run_block(
     workflow_run_block_model: WorkflowRunBlockModel,
     task: Task | None = None,
@@ -825,6 +833,7 @@ def convert_to_workflow_run_block(
         script_run=ScriptRunResponse.model_validate(workflow_run_block_model.script_run)
         if workflow_run_block_model.script_run
         else None,
+        downloaded_file_count=workflow_run_block_model.downloaded_file_count,
     )
     if task:
         if task.finished_at and task.started_at:

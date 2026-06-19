@@ -932,6 +932,38 @@ HTTP requests and deterministic response checks over browser-based inference.
 | Component doesn't render | Capture screenshot and specific UI error |
 | API returns unexpected 5xx | Save request/response evidence and report the regression |
 
+## Session Recording
+
+Before closing, fetch the session recording so you can include it in the QA report.
+
+### Via MCP tools
+
+```text
+skyvern_browser_session_get(session_id="pbs_xxx")
+→ Returns app_url (watch in browser) and recordings (download URLs)
+```
+
+Or simply close — `skyvern_browser_session_close()` now returns recording data too:
+
+```text
+skyvern_browser_session_close()
+→ { session_id, closed, app_url, recordings: [{url, filename}], downloaded_files: [{url, filename}] }
+```
+
+### Via CLI
+
+```bash
+skyvern browser session get --session pbs_xxx --json
+# → { "app_url": "https://...", "recordings": [...] }
+
+skyvern browser session close --session pbs_xxx --json
+# → { "session_id": "pbs_xxx", "closed": true, "app_url": "https://...", "recordings": [...] }
+```
+
+Include in the QA report:
+- **Watch recording**: the `app_url` value
+- **Download recording**: the first entry in `recordings[].url`
+
 ## Session Cleanup
 
 Always close browser sessions when done:
