@@ -1,6 +1,9 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def test_credential_repository_instantiation():
@@ -42,6 +45,39 @@ def test_otp_repository_instantiation():
     assert repo.Session is mock_session
     assert hasattr(repo, "get_otp_codes")
     assert hasattr(repo, "create_otp_code")
+
+
+@pytest.mark.asyncio
+async def test_otp_repository_can_include_unscoped_workflow_run_rows_in_sql():
+    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+
+    class CapturingSession:
+        query = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def scalars(self, query):
+            self.query = query
+            return SimpleNamespace(all=lambda: [])
+
+    session = CapturingSession()
+    repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
+
+    await repo.get_otp_codes(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        workflow_run_id="wr_test",
+        include_unscoped_workflow_run=True,
+    )
+
+    sql = str(session.query)
+    assert "totp_codes.workflow_run_id = :workflow_run_id_1" in sql
+    assert "totp_codes.workflow_run_id IS NULL" in sql
+    assert " OR " in sql
 
 
 def test_debug_repository_instantiation():

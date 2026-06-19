@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     build_synthesized_artifact_metadata,
+    code_contains_credential_fill,
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
@@ -1465,12 +1466,15 @@ class TestCredentialFillSynthesis:
         assert 'await page.locator("#passwordInput").fill(authtest_simple.password)' in result.code
         assert result.parameters == [{"key": "authtest_simple", "credential_id": "cred_123"}]
 
-    def test_totp_field_reads_totp_attribute(self) -> None:
+    def test_totp_field_reads_runtime_otp_method(self) -> None:
         result = synthesize_code_block(
             [self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6)]
         )
         assert result is not None
-        assert 'await page.locator("#totpCode").fill(authtest_simple.totp)' in result.code
+        assert 'await page.locator("#totpCode").fill(await authtest_simple.otp())' in result.code
+
+    def test_runtime_otp_fill_is_detected_as_credential_fill_code(self) -> None:
+        assert code_contains_credential_fill('await page.locator("#otp").fill(await login_credential.otp())')
 
     def test_missing_credential_reference_is_dropped_with_note(self) -> None:
         result = synthesize_code_block(
@@ -1528,7 +1532,7 @@ class TestCredentialFillSynthesis:
         assert "`authtest_simple` -> `cred_123`" in text
         assert "workflow_parameter_type: credential_id" in text
         assert "default_value" in text
-        assert ".username` / `.password` / `.totp`" in text
+        assert ".username` / `.password` attributes and `.otp()`" in text
         assert "authtest_simple" not in [p.get("key") for p in synthesized.parameters if "credential_id" not in p]
 
     def test_credential_parameters_excluded_from_plain_bind_line(self) -> None:
