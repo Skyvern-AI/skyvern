@@ -117,6 +117,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_request_policy,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
@@ -1402,6 +1403,62 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "It has not been tested or verified end-to-end."
 )
 
+
+@dataclass(frozen=True)
+class _TypedRunOutcomeReply:
+    user_response: str
+    demonstrated: bool
+
+
+def _safe_run_outcome_display_reason(recorded: RecordedRunOutcome) -> str | None:
+    reason = run_outcome_display_reason(recorded.display_reason)
+    if reason is None or contains_internal_machinery_leak(reason):
+        return None
+    try:
+        assert_clean_user_facing_text(reason)
+    except ValueError:
+        return None
+    return reason.rstrip(".")
+
+
+def _render_typed_run_outcome_reply(
+    ctx: CopilotContext,
+    *,
+    response_type: ResponseType,
+    has_verified_workflow: bool,
+    blocker_active: bool,
+) -> _TypedRunOutcomeReply | None:
+    if blocker_active or response_type != "REPLY":
+        return None
+    recorded = ctx.last_run_outcome
+    if not isinstance(recorded, RecordedRunOutcome):
+        return None
+    if recorded.verdict == "demonstrated":
+        if not has_verified_workflow or not verified_goal_claim_authorized(ctx):
+            return None
+        return _TypedRunOutcomeReply(
+            user_response=(
+                "I created and tested the workflow successfully. The latest run demonstrated the requested outcome."
+            ),
+            demonstrated=True,
+        )
+
+    reason = _safe_run_outcome_display_reason(recorded)
+    if recorded.verdict == "not_demonstrated":
+        user_response = (
+            "I built and ran the workflow, but the latest run did not demonstrate the requested outcome. "
+            "Review the draft before using it."
+        )
+    else:
+        user_response = (
+            "I built and ran the workflow, but the latest run could not verify the requested outcome. "
+            "Review the draft before using it."
+        )
+    if reason is not None:
+        user_response = f"{user_response} Reason: {reason}."
+    return _TypedRunOutcomeReply(user_response=user_response, demonstrated=False)
+
+
 # Pre-validated safe string the finalization shim falls back to when the
 # rendered blocker reply somehow trips OutputPolicy. Asserted clean at module
 # load time so a future OutputPolicy regression doesn't silently land here.
@@ -2224,6 +2281,15 @@ async def _translate_to_agent_result(
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # Default-true preserves backwards-compat with stale prompts and missing fields.
     agent_admits_incomplete = _is_explicit_false(action_data.get("goal_reached"))
+    typed_outcome_reply = _render_typed_run_outcome_reply(
+        ctx,
+        response_type=resp_type,
+        has_verified_workflow=verified_workflow is not None,
+        blocker_active=blocker_active,
+    )
+    if typed_outcome_reply is not None:
+        user_response = typed_outcome_reply.user_response
+        agent_admits_incomplete = not typed_outcome_reply.demonstrated
 
     last_workflow = None
     last_workflow_yaml = None
