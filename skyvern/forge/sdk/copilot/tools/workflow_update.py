@@ -98,7 +98,12 @@ from .frontier import (
     _stale_block_metadata_message,
     _workflow_requires_canonical_persist,
 )
-from .guardrails import _authority_tool_error, _download_binding_required_error, _download_scout_required_error
+from .guardrails import (
+    _authority_tool_error,
+    _download_binding_required_error,
+    _download_scout_required_error,
+    _request_policy_allows_untested_code_block_draft,
+)
 
 LOG = structlog.get_logger()
 
@@ -266,9 +271,41 @@ _CODE_ARTIFACT_REQUIRED_LIST_FIELDS = (
     "completion_criteria",
     "terminal_verifier_expectations",
 )
-_CREDENTIAL_FIELD_ACCESS_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(username|password|totp)\b")
+_CREDENTIAL_FIELD_ACCESS_RE = re.compile(
+    r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
+)
 _CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
 _SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
+
+
+class CredentialFieldAccess(NamedTuple):
+    parameter_key: str
+    field: str
+    requires_live_scout: bool
+
+
+def _credential_field_accesses(code: str) -> list[CredentialFieldAccess]:
+    accesses: list[CredentialFieldAccess] = []
+    for match in _CREDENTIAL_FIELD_ACCESS_RE.finditer(code):
+        field = match.group("field")
+        if field:
+            accesses.append(
+                CredentialFieldAccess(
+                    parameter_key=match.group("parameter"),
+                    field=field,
+                    requires_live_scout=True,
+                )
+            )
+            continue
+        if match.group("otp_method"):
+            accesses.append(
+                CredentialFieldAccess(
+                    parameter_key=match.group("parameter"),
+                    field="totp",
+                    requires_live_scout=False,
+                )
+            )
+    return accesses
 
 
 def _code_artifact_metadata_as_tool_argument(
@@ -2703,10 +2740,12 @@ def _credentialed_code_block_scout_gate_errors(
         if not code.strip():
             continue
         required_fields_by_credential: dict[str, set[str]] = {}
-        for parameter_key, field in _CREDENTIAL_FIELD_ACCESS_RE.findall(code):
-            credential_id = credential_params_by_key.get(parameter_key)
+        for access in _credential_field_accesses(code):
+            if not access.requires_live_scout:
+                continue
+            credential_id = credential_params_by_key.get(access.parameter_key)
             if credential_id:
-                required_fields_by_credential.setdefault(credential_id, set()).add(field)
+                required_fields_by_credential.setdefault(credential_id, set()).add(access.field)
         if not required_fields_by_credential:
             continue
 
@@ -2858,7 +2897,11 @@ async def _update_workflow(
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
         params["code_artifact_metadata"] = merged_metadata
-    credential_scout_errors = _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    credential_scout_errors = (
+        []
+        if _request_policy_allows_untested_code_block_draft(ctx)
+        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    )
     if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
         return {
             "ok": False,

@@ -50,9 +50,10 @@ _DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
 CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
 _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
 
-# Shape of a synthesized credential fill, ``.fill(<param>.<field>)`` — distinguishes a login
-# fill from a plain ``.fill(str(<key>))`` text input.
-CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\([A-Za-z_]\w*\.\w+\)")
+# Shape of a synthesized credential fill, ``.fill(<param>.<field>)`` or the runtime OTP
+# accessor ``.fill(await <param>.otp())`` — distinguishes a login fill from a plain
+# ``.fill(str(<key>))`` text input.
+CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|await\s+[A-Za-z_]\w*\.otp\(\))\s*\)")
 _ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
 _OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(
@@ -905,7 +906,10 @@ def synthesize_code_block(
                 credential_param_key = _credential_param_key(interaction, used_param_keys)
                 credential_param_keys[credential_id] = credential_param_key
                 parameters.append({"key": credential_param_key, "credential_id": credential_id})
-            lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
+            if credential_field == "totp":
+                lines.append(f"{action_indent}await {locator}.fill(await {credential_param_key}.otp())")
+            else:
+                lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
         elif tool_name == "select_option":
             value = str(interaction.get("value") or "").strip()
             if not value:
@@ -1113,8 +1117,9 @@ def render_synthesized_offer_text(
             + bindings
             + ". Bind each as a workflow parameter with `workflow_parameter_type: credential_id` and the "
             "credential ID in `default_value`; at runtime the key resolves to a credential object whose "
-            "`.username` / `.password` / `.totp` attributes the snippet reads (`.totp` is a fresh one-time "
-            "code generated when the block starts). Never replace these attribute reads with literal values."
+            "`.username` / `.password` attributes and `.otp()` method the snippet reads (`.otp()` resolves a "
+            "fresh authenticator, email, or SMS one-time code during the run). Never replace these reads with "
+            "literal values."
         )
     if "page.expect_download()" in synthesized.code:
         parts.append(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, asc, select
+from sqlalchemy import and_, asc, or_, select
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -22,6 +22,7 @@ class OTPRepository(BaseRepository):
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
         otp_type: OTPType | None = None,
         workflow_run_id: str | None = None,
+        include_unscoped_workflow_run: bool = False,
         created_after: datetime | None = None,
         limit: int | None = None,
     ) -> list[TOTPCode]:
@@ -29,7 +30,7 @@ class OTPRepository(BaseRepository):
         1. filter by:
         - organization_id
         - totp_identifier
-        - workflow_run_id (optional)
+        - workflow_run_id (optional); include unscoped rows too when requested
         - created_after (optional): only codes created at/after this instant
         2. make sure created_at is within the valid lifespan
         3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
@@ -51,7 +52,11 @@ class OTPRepository(BaseRepository):
             )
             if otp_type:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
-            if workflow_run_id is not None:
+            if workflow_run_id is not None and include_unscoped_workflow_run:
+                query = query.filter(
+                    or_(TOTPCodeModel.workflow_run_id == workflow_run_id, TOTPCodeModel.workflow_run_id.is_(None))
+                )
+            elif workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
             if created_after is not None:
                 query = query.filter(TOTPCodeModel.created_at >= created_after)

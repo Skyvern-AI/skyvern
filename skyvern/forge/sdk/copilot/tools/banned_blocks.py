@@ -225,7 +225,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
-        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username, <key>.password, and <key>.totp (a fresh one-time code generated when the block starts). Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
     ]
 
 
@@ -254,7 +254,7 @@ Runtime facts:
 - For browser reads, prefer visible anchors, locator text, block outputs, and
   MCP/scout evidence gathered before authoring.
 - A `credential_id` workflow parameter resolves to a credential object with
-  `<key>.username`, `<key>.password`, and fresh `<key>.totp`; scout fields with
+  `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
   `fill_credential_field`, never embed literal secrets.
 - Credentialed login code must be idempotent. After `goto`, wait for either the
   login form or an already-authenticated page anchor; only fill username/password

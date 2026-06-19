@@ -754,6 +754,37 @@ def _turn_intent_disables_tools(turn_intent: TurnIntent | None) -> bool:
     return not authority.may_update_workflow and not authority.may_run_blocks
 
 
+_DRAFT_ONLY_MCP_TOOL_ALLOWLIST = frozenset({"get_block_schema", "validate_block"})
+_DRAFT_ONLY_NATIVE_TOOL_DENYLIST = frozenset(
+    {"discover_workflow_entrypoint", "inspect_page_for_composition", "fill_credential_field"}
+)
+
+
+def _request_policy_disables_browser_scout_tools(request_policy: RequestPolicy | None) -> bool:
+    return (
+        isinstance(request_policy, RequestPolicy)
+        and request_policy.allow_update_workflow
+        and not request_policy.allow_run_blocks
+        and (request_policy.testing_intent == "skip_test" or request_policy.allow_missing_credentials_in_draft)
+    )
+
+
+def _mcp_tool_surface_for_turn(
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+    turn_intent: TurnIntent | None,
+    request_policy: RequestPolicy | None = None,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    if _turn_intent_disables_tools(turn_intent):
+        return {}, {}
+    if _request_policy_disables_browser_scout_tools(request_policy):
+        return (
+            {name: target for name, target in alias_map.items() if name in _DRAFT_ONLY_MCP_TOOL_ALLOWLIST},
+            {name: overlay for name, overlay in overlays.items() if name in _DRAFT_ONLY_MCP_TOOL_ALLOWLIST},
+        )
+    return alias_map, overlays
+
+
 def _native_tools_for_turn(
     native_tools: list[Any],
     turn_intent: TurnIntent | None,
@@ -763,6 +794,8 @@ def _native_tools_for_turn(
     # use them. The tool implementations enforce TurnIntent/RequestPolicy
     # authority and return structured blockers; removing a tool lets the model
     # hit an SDK-level ModelBehaviorError if static prompt text still names it.
+    if _request_policy_disables_browser_scout_tools(request_policy):
+        return [tool for tool in native_tools if getattr(tool, "name", None) not in _DRAFT_ONLY_NATIVE_TOOL_DENYLIST]
     return list(native_tools)
 
 
@@ -3366,9 +3399,7 @@ async def _run_copilot_turn_impl(
 
     alias_map = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays(copilot_config.block_authoring_policy)
-    if _turn_intent_disables_tools(ctx.turn_intent):
-        alias_map = {}
-        overlays = {}
+    alias_map, overlays = _mcp_tool_surface_for_turn(alias_map, overlays, ctx.turn_intent, ctx.request_policy)
 
     native_tools = _native_tools_for_turn(list(NATIVE_TOOLS), ctx.turn_intent, ctx.request_policy)
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in native_tools]
