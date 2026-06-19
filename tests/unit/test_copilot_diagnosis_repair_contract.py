@@ -6,12 +6,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     RepairNextAction,
     build_diagnosis_repair_contract,
+)
+from skyvern.forge.sdk.copilot.run_outcome import (
+    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
@@ -309,10 +314,140 @@ def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> No
         workflow_updated=True,
     )
 
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
     assert contract.repair_decision.next_action == RepairNextAction.STOP
     assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
     assert "Verify you are human" in contract.verification_result.remaining_blocker
+    assert contract.to_trace_data()["failure_type"] == "terminal_challenge_blocker"
+
+
+def test_challenge_category_preempts_clean_run_ok_contract() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Typed run analysis reported an anti-bot challenge."
+    ctx.last_test_failure_reason = "Run output reported a blocker: Verify you are human."
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_blocked",
+                "overall_status": "completed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "completed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+
+
+def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contract() -> None:
+    ctx = _ctx()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_clean",
+                "overall_status": "completed",
+                "failure_categories": [
+                    {
+                        "category": "ANTI_BOT_DETECTION",
+                        "confidence_float": 0.2,
+                        "reasoning": "Low-confidence upstream category.",
+                    }
+                ],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "completed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+
+
+def test_pre_run_challenge_observation_does_not_force_stop_on_repairable_failure() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = (
+        "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
+    )
+    ctx.last_test_failure_reason = "The search button selector changed before submit."
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_repair",
+                "overall_status": "failed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "blocks": [{"label": "submit_search", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+
+
+def test_post_run_gated_challenge_observation_forces_stop_on_repairable_failure() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = (
+        "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
+    )
+    ctx.last_test_failure_reason = "The Search button remains disabled after verification."
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_terminal",
+                "overall_status": "failed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "blocks": [{"label": "submit_search", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
 
 
 def test_user_goal_urls_are_reduced_to_origins() -> None:
@@ -469,3 +604,35 @@ async def test_update_workflow_failure_records_diagnosis_contract(monkeypatch: p
     assert recorded == [
         ("update_workflow", {"ok": False, "error": error}, "code_block_synthesis_ambiguous_bare_selector")
     ]
+
+
+def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() -> None:
+    from skyvern.forge.sdk.copilot.tools.run_execution import _diagnosis_repair_tool_error
+
+    ctx = _ctx()
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="terminal challenge",
+        user_facing_reason="The page is gated by a site verification challenge.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+        extra={
+            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+            "evidence_source": "page_evidence",
+            "evidence_reason": "human verification requires human verification",
+        },
+    )
+
+    payload = json.loads(_diagnosis_repair_tool_error(ctx, "update_and_run_blocks", "terminal challenge"))
+
+    assert payload["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
+    assert ctx.latest_diagnosis_repair_contract is not None
+    assert (
+        ctx.latest_diagnosis_repair_contract.diagnosis_result.suspected_failure_type
+        == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    )
+    assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == RepairNextAction.STOP

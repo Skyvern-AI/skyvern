@@ -6,7 +6,7 @@ import json
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -68,10 +68,14 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.run_outcome import (
+    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+    TERMINAL_CHALLENGE_USER_FACING_REASON,
     RecordedRunOutcome,
     RunOutcomeReasonCode,
     RunOutcomeVerdict,
     run_outcome_display_reason,
+    trusted_terminal_challenge_category_name,
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -1559,6 +1563,101 @@ def _composition_anti_bot_reason(copilot_ctx: object) -> str | None:
     return f"Observed anti-bot challenge evidence before the run: {details}"
 
 
+@dataclass(frozen=True)
+class TerminalChallengeEvidence:
+    source: str
+    reason: str
+    workflow_run_id: str | None = None
+    block_labels: tuple[str, ...] = ()
+
+
+def _trusted_terminal_challenge_category_names(failure_categories: list[dict] | None) -> tuple[str, ...]:
+    if not isinstance(failure_categories, list):
+        return ()
+    names: list[str] = []
+    for category in failure_categories:
+        if not isinstance(category, dict):
+            continue
+        name = trusted_terminal_challenge_category_name(category)
+        if isinstance(name, str) and name:
+            names.append(name)
+    return tuple(dict.fromkeys(names))
+
+
+def _ensure_terminal_challenge_category(data: dict[str, Any]) -> None:
+    categories = data.get("failure_categories")
+    if not isinstance(categories, list):
+        categories = []
+    if not any(
+        isinstance(category, dict) and trusted_terminal_challenge_category_name(category) for category in categories
+    ):
+        categories = [
+            *categories,
+            {
+                "category": "ANTI_BOT_DETECTION",
+                "confidence_float": 0.9,
+                "reasoning": "Structured challenge evidence reported a terminal blocker.",
+            },
+        ]
+    data["failure_categories"] = categories
+
+
+def _block_labels_from_result_data(data: Mapping[str, object]) -> tuple[str, ...]:
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return ()
+    labels: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        label = block.get("label")
+        if isinstance(label, str) and label.strip():
+            labels.append(label.strip())
+    return tuple(dict.fromkeys(labels))
+
+
+def _terminal_challenge_evidence(
+    result: dict[str, Any],
+    *,
+    failure_categories: list[dict] | None,
+    structured_blocker: str | None,
+    anti_bot_match: str | None = None,
+) -> TerminalChallengeEvidence | None:
+    data = result.get("data")
+    result_data = data if isinstance(data, dict) else {}
+    workflow_run_id = result_data.get("workflow_run_id")
+    run_id = workflow_run_id if isinstance(workflow_run_id, str) and workflow_run_id.strip() else None
+    block_labels = _block_labels_from_result_data(result_data)
+    challenge_categories = _trusted_terminal_challenge_category_names(failure_categories)
+    if isinstance(structured_blocker, str) and (
+        _looks_like_anti_bot_blocker(structured_blocker) or isinstance(anti_bot_match, str)
+    ):
+        # Prefer the typed blocker payload over category fallback when both are
+        # present because it carries the concrete page/run blocker text.
+        reason = f"Run output reported a blocker: {structured_blocker}"
+        if (
+            isinstance(anti_bot_match, str)
+            and anti_bot_match.strip()
+            and not _looks_like_anti_bot_blocker(structured_blocker)
+        ):
+            reason = f"{anti_bot_match}; {reason}"
+        return TerminalChallengeEvidence(
+            source="structured_blocker",
+            reason=reason,
+            workflow_run_id=run_id,
+            block_labels=block_labels,
+        )
+    if challenge_categories:
+        reason = next(iter_failure_reasons(result), None) or f"Run reported {challenge_categories[0]}"
+        return TerminalChallengeEvidence(
+            source="failure_category",
+            reason=reason,
+            workflow_run_id=run_id,
+            block_labels=block_labels,
+        )
+    return None
+
+
 # Generic failure-reason template emitted by the shared agent when the
 # browser-side scraper catches ScrapingFailed / NoElementFound. Matching on
 # the template (not the shared classifier) lets the copilot notice a repeated
@@ -1752,6 +1851,13 @@ def _record_run_blocks_result(
         if isinstance(data, dict):
             data["failure_categories"] = failure_categories
 
+    terminal_challenge = _terminal_challenge_evidence(
+        result,
+        failure_categories=failure_categories,
+        structured_blocker=structured_blocker,
+        anti_bot_match=anti_bot_match,
+    )
+
     artifact_reason, artifact_labels, artifact_classes = _artifact_health_blocker_from_result(result)
     if artifact_reason is not None:
         copilot_ctx.last_artifact_health_blocker_reason = artifact_reason
@@ -1772,9 +1878,44 @@ def _record_run_blocks_result(
             stash_blocker_signal(copilot_ctx, signal)
             stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
 
+    if terminal_challenge is not None:
+        # A structured challenge is the more actionable terminal blocker when
+        # artifact-health evidence and challenge evidence appear in the same run.
+        _mark_page_inspected(copilot_ctx)
+        result["ok"] = False
+        result.setdefault("error", terminal_challenge.reason)
+        data = result.get("data")
+        if isinstance(data, dict):
+            data.setdefault("failure_reason", terminal_challenge.reason)
+            _ensure_terminal_challenge_category(data)
+            copilot_ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
+        copilot_ctx.last_test_ok = False
+        copilot_ctx.last_test_suspicious_success = False
+        copilot_ctx.last_test_failure_reason = terminal_challenge.reason
+        copilot_ctx.last_test_anti_bot = terminal_challenge.reason
+        copilot_ctx.last_full_workflow_test_ok = False
+        copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
+        signal = _terminal_challenge_blocker_signal(terminal_challenge, tool_name="update_and_run_blocks")
+        stash_blocker_signal(copilot_ctx, signal)
+        stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
+        update_repeated_failure_state(copilot_ctx, result)
+        _update_verification_evidence_from_run_result(copilot_ctx, result)
+        return _stash_recorded_run_outcome(
+            copilot_ctx,
+            RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code=TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+                display_reason=run_outcome_display_reason(terminal_challenge.reason),
+                workflow_run_id=terminal_challenge.workflow_run_id,
+            ),
+        )
+
     if run_ok:
         _mark_page_inspected(copilot_ctx)
         if structured_blocker:
+            # Terminal anti-bot blockers are handled before run_ok; this branch
+            # remains for non-challenge structured blockers that still make a
+            # completed run suspicious.
             failure_reason = f"Run completed, but extracted data reported a blocker: {structured_blocker}"
             result["ok"] = False
             result.setdefault("error", failure_reason)
@@ -1782,26 +1923,9 @@ def _record_run_blocks_result(
             copilot_ctx.last_test_suspicious_success = True
             copilot_ctx.last_test_failure_reason = failure_reason
             copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
-            if not copilot_ctx.last_test_anti_bot and _looks_like_anti_bot_blocker(structured_blocker):
-                copilot_ctx.last_test_anti_bot = f"Extracted data reported anti-bot blocker: {structured_blocker[:160]}"
             data = result.get("data")
             if isinstance(data, dict):
                 data.setdefault("failure_reason", failure_reason)
-                if copilot_ctx.last_test_anti_bot and not failure_categories:
-                    anti_bot_category = {
-                        "category": "ANTI_BOT_DETECTION",
-                        "confidence_float": 0.7,
-                        "reasoning": "Structured extracted data reported an anti-bot blocker.",
-                    }
-                    data["failure_categories"] = [anti_bot_category]
-            if _looks_like_anti_bot_blocker(structured_blocker):
-                signal = _run_output_terminal_blocker_signal(
-                    structured_blocker=structured_blocker,
-                    failure_reason=failure_reason,
-                    tool_name="update_and_run_blocks",
-                )
-                stash_blocker_signal(copilot_ctx, signal)
-                stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_output_content_gate")
             update_repeated_failure_state(copilot_ctx, result)
             _update_verification_evidence_from_run_result(copilot_ctx, result)
             return _stash_recorded_run_outcome(
@@ -2081,38 +2205,60 @@ def _record_diagnosis_repair_contract(
     return contract
 
 
-def _run_output_terminal_blocker_signal(
+def _terminal_challenge_blocker_signal(
+    evidence: TerminalChallengeEvidence,
     *,
-    structured_blocker: str,
-    failure_reason: str,
     tool_name: str,
 ) -> CopilotToolBlockerSignal:
-    agent_steering = (
-        "The workflow run completed with structured anti-bot or challenge blocker evidence: "
-        f"{structured_blocker[:240]}. Do NOT call "
-        f"{tool_name} again in this turn. Reply from the recorded blocker and preserved draft; "
-        "do not claim the workflow is verified end-to-end."
+    safe_evidence_reason = (
+        run_outcome_display_reason(evidence.reason) or "Structured challenge evidence reported a terminal blocker."
     )
-    user_facing = (
-        "The page is gated by a site verification challenge, so I stopped instead of retrying the same path. "
-        "The draft workflow is preserved, but it is not verified end-to-end."
+    agent_steering = (
+        "The latest run produced structured anti-bot or challenge evidence: "
+        f"{safe_evidence_reason}. Do NOT call "
+        f"{tool_name} again in this turn, do NOT try another proxy/location in this turn, and "
+        "do NOT claim the workflow is verified end-to-end. Reply from the recorded blocker and preserved draft."
     )
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
+        user_facing_reason=TERMINAL_CHALLENGE_USER_FACING_REASON,
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=True,
         renders_final_reply=True,
-        internal_reason_code="tool_error_run_output_terminal_blocker",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
         blocked_tool=tool_name,
-        extra={"failure_reason": failure_reason[:240]},
+        extra={
+            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+            "evidence_source": evidence.source,
+            "evidence_reason": safe_evidence_reason,
+            "workflow_run_id": evidence.workflow_run_id,
+            "block_labels": list(evidence.block_labels),
+        },
     )
 
 
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
     result = {"ok": False, "error": error}
+    blocker_signal = getattr(copilot_ctx, "blocker_signal", None)
+    if (
+        isinstance(blocker_signal, CopilotToolBlockerSignal)
+        and blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    ):
+        reason = blocker_signal.extra.get("evidence_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            reason = blocker_signal.user_facing_reason
+        result["data"] = {
+            "failure_reason": reason,
+            "failure_categories": [
+                {
+                    "category": "ANTI_BOT_DETECTION",
+                    "confidence_float": 0.9,
+                    "reasoning": "Structured page challenge evidence reported a terminal blocker.",
+                }
+            ],
+        }
     record_consecutive_tool_result_boundary_for_ctx(copilot_ctx, source_tool, result)
     _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
     return json.dumps(result)

@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     render_synthesized_offer_text,
     synthesize_code_block,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -66,6 +67,13 @@ from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     looks_like_workflow_delivery_claim,
     parse_final_response,
+)
+from skyvern.forge.sdk.copilot.run_outcome import (
+    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+    TERMINAL_CHALLENGE_USER_FACING_REASON,
+    RecordedRunOutcome,
+    run_outcome_display_reason,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -300,6 +308,162 @@ def repair_ceiling_stop_signal(
         internal_reason_code="repair_ceiling_reached",
         blocked_tool="update_and_run_blocks",
     )
+
+
+def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
+    outcome = getattr(ctx, "last_run_outcome", None)
+    if not isinstance(outcome, RecordedRunOutcome):
+        return None
+    if outcome.reason_code != TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE:
+        return None
+    return outcome
+
+
+def _structured_page_challenge_reason(ctx: Any, evidence: dict[str, Any] | None = None) -> str | None:
+    if evidence is None:
+        evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return None
+    challenge_state = evidence.get("challenge_state")
+    if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
+        # This raw page kind is folded into an internal reason here; halt
+        # metadata sanitizes it through run_outcome_display_reason below.
+        kind = str(challenge_state.get("kind") or "site challenge").replace("_", " ")
+        if challenge_state.get("requires_human_verification") is True:
+            if "verification" in kind.lower() or "captcha" in kind.lower():
+                return f"{kind} requires manual completion"
+            return f"{kind} requires human verification"
+        if challenge_state.get("gates_submit_controls") is True:
+            return f"{kind} gates the submit/search controls"
+    controls = evidence.get("challenge_controls")
+    if isinstance(controls, list) and interactive_challenge_controls(controls):
+        return "interactive challenge controls are visible on the page"
+    return None
+
+
+def _terminal_challenge_halt_signal(
+    ctx: Any,
+    *,
+    evidence_source: str,
+    evidence_reason: str,
+    blocked_tool: str = "update_and_run_blocks",
+) -> CopilotToolBlockerSignal:
+    workflow_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    safe_evidence_reason = (
+        run_outcome_display_reason(evidence_reason) or "Structured challenge evidence reported a terminal blocker."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            "Structured challenge evidence confirms this path is blocked: "
+            f"{safe_evidence_reason}. Do NOT retry block-running tools, do NOT try a proxy/location switch "
+            "in this turn, and do NOT claim the workflow is verified end-to-end. Reply with the blocker."
+        ),
+        user_facing_reason=TERMINAL_CHALLENGE_USER_FACING_REASON,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool=blocked_tool,
+        extra={
+            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+            "evidence_source": evidence_source,
+            "evidence_reason": safe_evidence_reason,
+            "workflow_run_id": workflow_run_id if isinstance(workflow_run_id, str) else None,
+        },
+    )
+
+
+def terminal_challenge_blocker_signal_from_page_evidence(
+    ctx: Any,
+    *,
+    blocked_tool: str,
+    evidence_source: str = "page_evidence",
+    evidence: dict[str, Any] | None = None,
+) -> CopilotToolBlockerSignal | None:
+    page_reason = _structured_page_challenge_reason(ctx, evidence)
+    if page_reason is None:
+        return None
+    return _terminal_challenge_halt_signal(
+        ctx,
+        evidence_source=evidence_source,
+        evidence_reason=page_reason,
+        blocked_tool=blocked_tool,
+    )
+
+
+def _current_page_challenge_requires_stop(evidence: dict[str, Any]) -> bool:
+    challenge_state = evidence.get("challenge_state")
+    if isinstance(challenge_state, dict) and (
+        challenge_state.get("requires_human_verification") is True
+        or challenge_state.get("gates_submit_controls") is True
+    ):
+        return True
+    controls = evidence.get("challenge_controls")
+    return isinstance(controls, list) and bool(interactive_challenge_controls(controls))
+
+
+def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for entry in reversed(getattr(ctx, "flow_evidence", None) or []):
+        if not isinstance(entry, dict):
+            continue
+        packet = entry.get("evidence")
+        if isinstance(packet, dict):
+            candidates.append(packet)
+    single = getattr(ctx, "composition_page_evidence", None)
+    if isinstance(single, dict):
+        candidates.append(single)
+    return candidates
+
+
+def terminal_challenge_blocker_signal_from_current_page_evidence(
+    ctx: Any,
+    *,
+    blocked_tool: str,
+    evidence_source: str = "page_evidence",
+) -> CopilotToolBlockerSignal | None:
+    if getattr(ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        return None
+    for evidence in _current_page_evidence_candidates(ctx):
+        if evidence.get("observed_after_workflow_run") is not True:
+            continue
+        if not _current_page_challenge_requires_stop(evidence):
+            continue
+        signal = terminal_challenge_blocker_signal_from_page_evidence(
+            ctx,
+            blocked_tool=blocked_tool,
+            evidence_source=evidence_source,
+            evidence=evidence,
+        )
+        if signal is not None:
+            return signal
+    return None
+
+
+def _maybe_stash_terminal_challenge_halt(ctx: Any) -> None:
+    if getattr(ctx, "turn_halt", None) is not None:
+        return
+    outcome = _typed_terminal_challenge_outcome(ctx)
+    if outcome is not None:
+        reason = outcome.display_reason or "Structured evidence reported a terminal site challenge."
+        signal = _terminal_challenge_halt_signal(ctx, evidence_source="run_outcome", evidence_reason=reason)
+        stash_blocker_signal(ctx, signal)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
+        return
+    # `last_test_ok is False` is the failed-run sentinel for this backstop.
+    # Free-standing visible challenge hints remain diagnostic until a run/test
+    # also records anti-bot evidence.
+    if getattr(ctx, "last_test_ok", None) is not False:
+        return
+    if not getattr(ctx, "last_test_anti_bot", None):
+        return
+    page_signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
+    if page_signal is None:
+        return
+    stash_blocker_signal(ctx, page_signal)
+    stash_turn_halt_from_blocker_signal(ctx, page_signal, source="enforcement")
 
 
 class CopilotTotalTimeoutError(Exception):
@@ -927,6 +1091,8 @@ def _post_run_observed_reply_can_finalize(ctx: AgentContext, result: RunResultSt
 
 def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     """Return True when the last test 'completed' but data blocks had no output."""
+    if _typed_terminal_challenge_outcome(ctx) is not None:
+        return False
     # A non-retriable nav failure cannot be "suspiciously successful" — defer
     # to the dedicated stop path rather than competing for the nudge slot.
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
@@ -1073,6 +1239,9 @@ def _check_enforcement(
 
     if _post_run_observed_reply_can_finalize(ctx, result):
         return None
+
+    _maybe_stash_terminal_challenge_halt(ctx)
+    raise_if_turn_halt(ctx)
 
     # If the last run had confirmed challenge evidence, do not misdiagnose a
     # challenge-solving loop as a long-chain budgeting problem.

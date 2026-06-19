@@ -11,6 +11,7 @@ import structlog
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 
 LOG = structlog.get_logger()
 
@@ -37,6 +38,8 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     {
         ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        # Back-compat sentinel for pre-TERMINAL_CHALLENGE_BLOCKER traces.
         "tool_error_run_output_terminal_blocker",
         "tool_error_post_budget_challenge_blocker",
         "tool_error_challenge_gated_submit_disabled",
@@ -84,7 +87,7 @@ def turn_halt_from_blocker_signal(signal: object, *, source: str) -> TurnHalt | 
         kind=kind,
         blocker_signal=signal,
         draft_state={"preserves_workflow_draft": signal.preserves_workflow_draft},
-        extra={"source": source},
+        extra={**signal.extra, "source": source},
     )
 
 

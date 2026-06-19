@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -14,9 +15,9 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     loop_blocker_evidence_from_ctx,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
+from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _build_loop_blocker_signal, _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
@@ -42,6 +43,22 @@ def _ctx(
     if consecutive_tool_tracker is not None:
         ctx.consecutive_tool_tracker = consecutive_tool_tracker
     return ctx
+
+
+def _current_page_challenge_evidence(*, observed_after_workflow_run: bool = True) -> dict[str, object]:
+    evidence: dict[str, object] = {
+        "current_url": "https://example.test/search",
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+    if observed_after_workflow_run:
+        evidence["observed_after_workflow_run"] = True
+    return evidence
 
 
 @pytest.mark.parametrize(
@@ -410,6 +427,69 @@ def test_native_and_mcp_paths_carry_equivalent_evidence_bearing_signals() -> Non
     assert mcp_signal.agent_steering_text == native_signal.agent_steering_text
     assert mcp_signal.recovery_hint == native_signal.recovery_hint
     assert mcp_signal.blocked_tool == native_signal.blocked_tool
+
+
+def test_native_tool_loop_error_terminal_challenge_preempts_same_tool_loop() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = _current_page_challenge_evidence()
+
+    payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
+
+    assert payload is not None
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.blocked_tool == "evaluate"
+    assert signal.extra["evidence_source"] == "page_evidence"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def test_native_tool_loop_error_does_not_preempt_on_pre_attempt_challenge() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = _current_page_challenge_evidence(observed_after_workflow_run=False)
+
+    payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
+
+    assert payload is not None
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert signal.blocked_tool == "evaluate"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
+
+
+@pytest.mark.asyncio
+async def test_mcp_browser_tool_terminal_challenge_preempts_same_tool_loop() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = _current_page_challenge_evidence()
+
+    class _UnexpectedClient:
+        async def call_tool(self, name: str, args: dict, raise_on_error: bool = False) -> object:
+            raise AssertionError("terminal challenge blocker should skip MCP execution")
+
+    server = SkyvernOverlayMCPServer(
+        transport=None,
+        overlays={"evaluate": SchemaOverlay(requires_browser=True)},
+        alias_map={},
+        allowlist=frozenset({"evaluate"}),
+        context_provider=lambda: ctx,
+    )
+    server._client = _UnexpectedClient()  # type: ignore[assignment]
+
+    result = await server.call_tool("evaluate", {"expression": "document.body.innerText"})
+
+    parsed = json.loads(result.content[0].text)
+    assert result.isError is True
+    assert parsed["ok"] is False
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.blocked_tool == "evaluate"
+    assert signal.extra["evidence_source"] == "mcp_page_evidence"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
 
 
 def test_tool_loop_error_entry_refreshes_stale_held_loop_signal() -> None:
