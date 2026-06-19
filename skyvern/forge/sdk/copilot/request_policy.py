@@ -137,6 +137,9 @@ _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
 )
+_CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
+_LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
+_CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
 
 
 _MAX_COMPLETION_CRITERIA = 8
@@ -587,6 +590,33 @@ def _classifier_fallback_policy(
         classifier_retry_count=retry_count,
         completion_contract_status="unknown",
     )
+
+
+def _explicit_code_block_credential_draft_requested(user_message: str) -> bool:
+    normalized = " ".join((user_message or "").lower().split())
+    if not normalized:
+        return False
+    has_code_marker = any(marker in normalized for marker in _CODE_BLOCK_AUTHORING_MARKERS)
+    if not has_code_marker:
+        return False
+    blocks_login = any(marker in normalized for marker in _LOGIN_BLOCK_BAN_MARKERS)
+    mentions_credential_code = any(marker in normalized for marker in _CREDENTIAL_CODE_MARKERS)
+    return blocks_login or mentions_credential_code
+
+
+def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, user_message: str) -> None:
+    if policy.raw_secret_detected:
+        return
+    if not _explicit_code_block_credential_draft_requested(user_message):
+        return
+    policy.testing_intent = "skip_test"
+    policy.allow_update_workflow = True
+    policy.allow_run_blocks = False
+    policy.allow_missing_credentials_in_draft = True
+    policy.requires_user_clarification = False
+    policy.user_response_policy = "proceed"
+    policy.clarification_reason = "none"
+    policy.clarification_question = None
 
 
 async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any | None, str, int]:
@@ -1216,6 +1246,9 @@ async def build_request_policy(
             organization_id=organization_id,
             exc_info=True,
         )
+    # This narrows classifier output only after the classifier has identified
+    # credential intent; running it earlier would be overwritten by the model verdict.
+    _apply_explicit_code_block_credential_draft_policy(policy, user_message)
     try:
         await _seed_discovered_credentials(
             policy,

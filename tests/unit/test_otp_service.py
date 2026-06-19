@@ -177,10 +177,13 @@ class TestGetOtpValueFromUrl:
             )
 
         reason = exc_info.value.reason or ""
-        assert "https://example.com/totp" in reason
-        assert "HTTP status=200" in reason
-        assert "content_type=text/plain; charset=utf-8" in reason
-        assert "body_preview='147258'" in reason
+        assert "https://example.com/totp" not in reason
+        assert "totp_webhook_non_json_response" in reason
+        assert "http_status=200" in reason
+        assert "content_type=text/plain" in reason
+        assert "charset" not in reason
+        assert "body_preview='[REDACTED_OTP_BODY](length=6,json_like=false)'" in reason
+        assert "147258" not in reason
         assert '{"verification_code":"123456"}' in reason
         assert "api-key" not in reason
 
@@ -204,7 +207,7 @@ class TestGetOtpValueFromUrl:
             )
 
         reason = exc_info.value.reason or ""
-        assert f"body_preview='{long_body[:200]}... (truncated)'" in reason
+        assert "body_preview='[REDACTED_OTP_BODY](length=250,json_like=false)'" in reason
         assert long_body not in reason
 
     @pytest.mark.asyncio
@@ -247,8 +250,9 @@ class TestGetOtpValueFromUrl:
             )
 
         reason = exc_info.value.reason or ""
-        assert "body_preview='line1\\nline2'" in reason
-        assert "body_preview='line1\\\\nline2'" not in reason
+        assert "body_preview='[REDACTED_OTP_BODY](length=11,json_like=false)'" in reason
+        assert "line1" not in reason
+        assert "line2" not in reason
 
     @pytest.mark.asyncio
     async def test_json_missing_verification_code_returns_none_and_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -271,7 +275,13 @@ class TestGetOtpValueFromUrl:
             )
 
         assert result is None
-        assert any("No verification_code found in TOTP webhook response" in log.get("event", "") for log in logs)
+        missing_code_log = next(
+            (log for log in logs if "No verification_code found in TOTP webhook response" in log.get("event", "")),
+            None,
+        )
+        assert missing_code_log is not None
+        assert "endpoint_url" not in missing_code_log
+        assert "https://example.com/totp" not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_json_non_object_response_returns_none_and_logs_distinct_event(
@@ -296,7 +306,13 @@ class TestGetOtpValueFromUrl:
             )
 
         assert result is None
-        assert any("TOTP webhook response body is not a JSON object" in log.get("event", "") for log in logs)
+        non_object_log = next(
+            (log for log in logs if "TOTP webhook response body is not a JSON object" in log.get("event", "")),
+            None,
+        )
+        assert non_object_log is not None
+        assert "endpoint_url" not in non_object_log
+        assert "https://example.com/totp" not in repr(logs)
         assert not any("No verification_code found in TOTP webhook response" in log.get("event", "") for log in logs)
 
     @pytest.mark.asyncio
@@ -320,7 +336,12 @@ class TestGetOtpValueFromUrl:
             )
 
         assert result is None
-        assert any("TOTP webhook returned non-200 response" in log.get("event", "") for log in logs)
+        non_200_log = next(
+            (log for log in logs if "TOTP webhook returned non-200 response" in log.get("event", "")), None
+        )
+        assert non_200_log is not None
+        assert "endpoint_url" not in non_200_log
+        assert "https://example.com/totp" not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_relayed_email_in_malformed_json_extracts_code_instead_of_raising(
@@ -534,7 +555,7 @@ class TestPollOtpValueRetry:
 
     @pytest.mark.asyncio
     async def test_raises_failed_with_reason_when_timeout_during_failure_streak(self) -> None:
-        """When the wall-clock timeout fires while the webhook is still failing, surface the underlying reason."""
+        """When timeout fires while webhook still fails, surface only sanitized failure context."""
         base = datetime(2026, 1, 1, 12, 0, 0)
         utcnow_returns = [
             base,  # start_datetime
@@ -553,15 +574,44 @@ class TestPollOtpValueRetry:
             mock_datetime.utcnow.side_effect = utcnow_returns
             mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
             mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
-            mock_fetch.side_effect = FailedToGetTOTPVerificationCode(reason="connection refused")
+            raw_identifier = "otp@example.com"
+            raw_url = "https://example.com/mfa?token=secret"
+            raw_code = "135790"
+            mock_fetch.side_effect = FailedToGetTOTPVerificationCode(
+                reason=f"connection refused for {raw_identifier} at {raw_url} after code {raw_code}"
+            )
 
-            with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
-                await poll_otp_value(
-                    organization_id="o_test",
-                    task_id="tsk_test",
-                    totp_verification_url="https://example.com/mfa",
-                )
-            assert exc_info.value.reason == "connection refused"
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+                    await poll_otp_value(
+                        organization_id="o_test",
+                        task_id="tsk_test",
+                        totp_identifier=raw_identifier,
+                        totp_verification_url=raw_url,
+                    )
+
+            assert exc_info.value.reason == "totp_webhook_request_failed"
+            assert raw_identifier not in str(exc_info.value)
+            assert raw_url not in str(exc_info.value)
+            assert raw_code not in str(exc_info.value)
+
+            retry_log = next(
+                (r for r in logs if r.get("event") == "OTP fetch failed, will retry until wall-clock timeout"), None
+            )
+            assert retry_log is not None
+            assert "totp_identifier" not in retry_log
+            assert "totp_verification_url" not in retry_log
+
+            timeout_log = next(
+                (r for r in logs if r.get("event") == "Polling otp value timed out while webhook was still failing"),
+                None,
+            )
+            assert timeout_log is not None
+            assert timeout_log["last_error_reason"] == exc_info.value.reason
+            for record in logs:
+                assert raw_identifier not in repr(record)
+                assert raw_url not in repr(record)
+                assert raw_code not in repr(record)
 
     @pytest.mark.asyncio
     async def test_raises_no_otp_at_timeout_when_polls_were_clean(self) -> None:
@@ -597,13 +647,15 @@ class TestPollOtpValueRetry:
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
     @patch("skyvern.services.otp_service.settings")
-    async def test_success_log_omits_raw_otp_code_but_keeps_ids_and_type(
+    async def test_success_log_omits_raw_otp_code_and_otp_locator_fields(
         self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
     ) -> None:
-        """SKY-11011: the success log must not emit the raw OTP code, only ids + OTP type."""
+        """The success and polling logs must not emit OTP codes, identifiers, or verification URLs."""
         import structlog.testing
 
         raw = "135790"
+        raw_identifier = "otp@example.com"
+        raw_url = "https://example.com/mfa"
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_fetch.return_value = OTPValue(value=raw, type=OTPType.TOTP)
@@ -614,8 +666,8 @@ class TestPollOtpValueRetry:
                 task_id="tsk_test",
                 workflow_run_id="wr_test",
                 workflow_permanent_id="wpid_test",
-                totp_identifier="otp@example.com",
-                totp_verification_url="https://example.com/mfa",
+                totp_identifier=raw_identifier,
+                totp_verification_url=raw_url,
             )
 
         assert result is not None
@@ -623,9 +675,13 @@ class TestPollOtpValueRetry:
 
         for record in logs:
             assert raw not in repr(record)
+            assert raw_identifier not in repr(record)
+            assert raw_url not in repr(record)
             assert raw not in str(record.values())
             for value in record.values():
                 assert raw not in str(value)
+                assert raw_identifier not in str(value)
+                assert raw_url not in str(value)
             assert "otp_value" not in record
             assert record.get("value") != raw
 
@@ -634,7 +690,8 @@ class TestPollOtpValueRetry:
         assert success["task_id"] == "tsk_test"
         assert success["workflow_run_id"] == "wr_test"
         assert success["workflow_permanent_id"] == "wpid_test"
-        assert success["totp_identifier"] == "otp@example.com"
+        assert "totp_identifier" not in success
+        assert "totp_verification_url" not in success
         assert success["otp_type"] == "totp"
         assert success["otp_length"] == 6
         assert isinstance(success["otp_length"], int)
@@ -642,7 +699,8 @@ class TestPollOtpValueRetry:
 
         polling = next((r for r in logs if r.get("event") == "Polling otp value"), None)
         assert polling is not None
-        assert polling["totp_identifier"] == "otp@example.com"
+        assert "totp_identifier" not in polling
+        assert "totp_verification_url" not in polling
         assert raw not in str(polling.values())
 
 
@@ -1082,3 +1140,108 @@ async def test_get_otp_value_from_db_forwards_created_after(monkeypatch: pytest.
     assert result is None
     get_otp_codes.assert_awaited_once()
     assert get_otp_codes.await_args.kwargs["created_after"] == started_at
+    assert get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided() -> None:
+    """Run-scoped polling prefers exact rows but keeps unscoped email/SMS pushes eligible."""
+    unscoped = SimpleNamespace(
+        code="111111",
+        otp_type=OTPType.TOTP,
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    other_run = SimpleNamespace(
+        code="333333",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_other",
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    scoped = SimpleNamespace(
+        code="222222",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_test",
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+
+    async def get_otp_codes(**kwargs: object) -> list[SimpleNamespace]:
+        assert kwargs["workflow_run_id"] == "wr_test"
+        assert kwargs["include_unscoped_workflow_run"] is True
+        return [other_run, scoped, unscoped]
+
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(side_effect=get_otp_codes)
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.com",
+            workflow_run_id="wr_test",
+            created_after=datetime(2026, 6, 8, 20, 3, 0),
+        )
+
+    assert result == OTPValue(value="222222", type=OTPType.TOTP)
+    mock_app.DATABASE.otp.get_otp_codes.assert_awaited_once()
+    assert mock_app.DATABASE.otp.get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert mock_app.DATABASE.otp.get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() -> None:
+    unscoped = SimpleNamespace(
+        code="111111",
+        otp_type=OTPType.TOTP,
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    other_run = SimpleNamespace(
+        code="333333",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_other",
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    get_otp_codes = AsyncMock(return_value=[other_run, unscoped])
+
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = get_otp_codes
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.com",
+            workflow_run_id="wr_test",
+            created_after=datetime(2026, 6, 8, 20, 3, 0),
+        )
+
+    assert result == OTPValue(value="111111", type=OTPType.TOTP)
+    assert get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_run() -> None:
+    unscoped = SimpleNamespace(
+        code="111111",
+        otp_type=OTPType.TOTP,
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    get_otp_codes = AsyncMock(return_value=[unscoped])
+
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = get_otp_codes
+        result = await _get_otp_value_from_db("o_test", "otp@example.com")
+
+    assert result == OTPValue(value="111111", type=OTPType.TOTP)
+    assert get_otp_codes.await_args.kwargs["workflow_run_id"] is None
+    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is False

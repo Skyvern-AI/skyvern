@@ -32,9 +32,14 @@ _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
 _EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE = '{"verification_code":"123456"}'
 # Recovers the verification_code value when the surrounding JSON is malformed
 # (e.g. unescaped quotes inside a relayed email). Assumes verification_code is
-# the final field, which is the common shape.
+# the final field, which is the common shape; the closing brace anchor is a
+# best-effort recovery boundary, not a strict JSON parser.
 _VERIFICATION_CODE_FIELD_PATTERN = re.compile(r'"verification_code"\s*:\s*"(?P<value>.*)"\s*}\s*\Z', re.DOTALL)
-_TOTP_WEBHOOK_BODY_PREVIEW_LIMIT = 200
+_REDACTED_OTP_BODY_PLACEHOLDER = "[REDACTED_OTP_BODY]"
+_REDACTED_OTP_IDENTIFIER_PLACEHOLDER = "[REDACTED_OTP_IDENTIFIER]"
+_TOTP_WEBHOOK_NON_JSON_RESPONSE_REASON = "totp_webhook_non_json_response"
+_TOTP_WEBHOOK_REQUEST_FAILED_REASON = "totp_webhook_request_failed"
+_SAFE_TOTP_ERROR_REASON_PREFIXES = (_TOTP_WEBHOOK_NON_JSON_RESPONSE_REASON, _TOTP_WEBHOOK_REQUEST_FAILED_REASON)
 _TOTP_WEBHOOK_REQUEST_MAX_ATTEMPTS = 3
 _TOTP_WEBHOOK_REQUEST_RETRY_TIMEOUT_SECONDS = 5
 
@@ -154,27 +159,40 @@ def _get_header_value(headers: dict[str, str], header_name: str) -> str | None:
 
 
 def _format_content_type_for_error(content_type: str | None) -> str:
-    return content_type if content_type is not None else "<absent>"
+    if content_type is None:
+        return "<absent>"
+    media_type = content_type.split(";", maxsplit=1)[0].strip().lower()
+    if not media_type or "/" not in media_type or len(media_type) > 100:
+        return "<present>"
+    return media_type
 
 
 def _response_body_preview(response_body: Any) -> str:
     body = response_body if isinstance(response_body, str) else str(response_body)
-    if len(body) <= _TOTP_WEBHOOK_BODY_PREVIEW_LIMIT:
-        return body
-    return f"{body[:_TOTP_WEBHOOK_BODY_PREVIEW_LIMIT]}... (truncated)"
+    body_start = body.lstrip()[:1]
+    json_like = body_start in {"{", "["}
+    return f"{_REDACTED_OTP_BODY_PLACEHOLDER}(length={len(body)},json_like={str(json_like).lower()})"
+
+
+def _schema_only_otp_error_reason(reason: str | None) -> str:
+    if reason and reason.startswith(_SAFE_TOTP_ERROR_REASON_PREFIXES):
+        return reason
+    return _TOTP_WEBHOOK_REQUEST_FAILED_REASON
+
+
+def redact_otp_identifier_for_log(totp_identifier: str | None) -> str | None:
+    return _REDACTED_OTP_IDENTIFIER_PLACEHOLDER if totp_identifier else None
 
 
 def _totp_webhook_contract_error_reason(
     *,
-    url: str,
     status_code: int,
     content_type: str | None,
     response_body: Any,
 ) -> str:
     return (
-        "TOTP webhook returned HTTP 200 but the response was not JSON. "
-        f"endpoint_url={url} "
-        f"HTTP status={status_code} "
+        f"{_TOTP_WEBHOOK_NON_JSON_RESPONSE_REASON} "
+        f"http_status={status_code} "
         f"content_type={_format_content_type_for_error(content_type)} "
         f"body_preview={_response_body_preview(response_body)!r} "
         f"expected_response_shape={_EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE}"
@@ -235,17 +253,18 @@ async def _post_totp_verification_url(
                 return response.status_code, response.headers, response.body, False
             parsed, is_json = _coerce_totp_response_body(response.body)
             return response.status_code, response.headers, parsed, is_json
-        except Exception:
+        except Exception as e:
+            # Avoid exc_info here because network exceptions can include the
+            # webhook URL or response details; keep retry logs diagnostic but sanitized.
             LOG.debug(
                 "TOTP webhook request attempt failed",
-                endpoint_url=url,
                 attempt=attempt + 1,
                 max_attempts=max_attempts,
-                exc_info=True,
+                exception_type=type(e).__name__,
             )
             if attempt < max_attempts - 1 and retry_timeout > 0:
                 await asyncio.sleep(retry_timeout)
-    raise _TOTPWebhookRequestError(f"Failed post request url={url}")
+    raise _TOTPWebhookRequestError("Failed post request to TOTP verification URL")
 
 
 def try_generate_totp_for_credential(
@@ -413,8 +432,6 @@ async def poll_otp_value(
         task_id=task_id,
         workflow_run_id=workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
-        totp_verification_url=totp_verification_url,
-        totp_identifier=totp_identifier,
     )
     consecutive_failures = 0
     last_error_reason: str | None = None
@@ -431,8 +448,6 @@ async def poll_otp_value(
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow_id or workflow_permanent_id,
-                    totp_verification_url=totp_verification_url,
-                    totp_identifier=totp_identifier,
                     reason=last_error_reason,
                 )
             LOG.warning("Polling otp value timed out")
@@ -440,8 +455,6 @@ async def poll_otp_value(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id or workflow_permanent_id,
-                totp_verification_url=totp_verification_url,
-                totp_identifier=totp_identifier,
             )
         otp_value: OTPValue | None = None
         try:
@@ -465,15 +478,13 @@ async def poll_otp_value(
                 )
         except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
-            last_error_reason = e.reason
+            last_error_reason = _schema_only_otp_error_reason(e.reason)
             LOG.warning(
                 "OTP fetch failed, will retry until wall-clock timeout",
                 consecutive_failures=consecutive_failures,
-                last_error_reason=e.reason,
+                last_error_reason=last_error_reason,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
-                totp_verification_url=totp_verification_url,
-                totp_identifier=totp_identifier,
             )
             continue
         consecutive_failures = 0
@@ -484,7 +495,6 @@ async def poll_otp_value(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
-                totp_identifier=totp_identifier,
                 otp_type=otp_value.get_otp_type().value,
                 otp_length=len(otp_value.value),
             )
@@ -518,19 +528,20 @@ async def _get_otp_value_from_url(
             organization_id=organization_id,
         )
     except Exception as e:
-        LOG.error("Failed to get otp value from url", totp_verification_url=url, exc_info=True)
+        LOG.error(
+            "Failed to get otp value from url",
+            exception_type=type(e).__name__,
+        )
         raise FailedToGetTOTPVerificationCode(
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_id=workflow_permanent_id,
-            totp_verification_url=url,
-            reason=str(e),
+            reason=f"{_TOTP_WEBHOOK_REQUEST_FAILED_REASON} exception_type={type(e).__name__}",
         )
     content_type = _get_header_value(response_headers, "Content-Type")
     if status_code != 200:
         LOG.warning(
             "TOTP webhook returned non-200 response",
-            endpoint_url=url,
             http_status=status_code,
             content_type=content_type,
             body_preview=_response_body_preview(response_body),
@@ -539,14 +550,12 @@ async def _get_otp_value_from_url(
 
     if not is_json_response:
         reason = _totp_webhook_contract_error_reason(
-            url=url,
             status_code=status_code,
             content_type=content_type,
             response_body=response_body,
         )
         LOG.error(
             "TOTP webhook returned non-JSON response",
-            endpoint_url=url,
             http_status=status_code,
             content_type=content_type,
             body_preview=_response_body_preview(response_body),
@@ -556,14 +565,12 @@ async def _get_otp_value_from_url(
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_id=workflow_permanent_id,
-            totp_verification_url=url,
             reason=reason,
         )
 
     if not isinstance(response_body, dict):
         LOG.warning(
             "TOTP webhook response body is not a JSON object",
-            endpoint_url=url,
             http_status=status_code,
             content_type=content_type,
             response_json_type=type(response_body).__name__,
@@ -575,7 +582,6 @@ async def _get_otp_value_from_url(
     if not content:
         LOG.warning(
             "No verification_code found in TOTP webhook response",
-            endpoint_url=url,
             http_status=status_code,
             content_type=content_type,
             response_keys=list(response_body.keys()),
@@ -587,8 +593,13 @@ async def _get_otp_value_from_url(
     if isinstance(content, str) and len(content) > 10:
         try:
             otp_value = await parse_otp_login(content, organization_id)
-        except Exception:
-            LOG.warning("faile to parse content by LLM call", exc_info=True)
+        except Exception as e:
+            otp_value = None
+            LOG.warning(
+                "Failed to parse OTP content by LLM call",
+                exception_type=type(e).__name__,
+                content_length=len(content),
+            )
 
     if not otp_value:
         LOG.warning(
@@ -608,8 +619,14 @@ async def _get_otp_value_from_db(
     workflow_run_id: str | None = None,
     created_after: datetime | None = None,
 ) -> OTPValue | None:
+    # Email/SMS deliveries can arrive through /v1/credentials/totp without run
+    # scope, so include both exact run matches and unscoped rows in SQL.
     totp_codes = await app.DATABASE.otp.get_otp_codes(
-        organization_id=organization_id, totp_identifier=totp_identifier, created_after=created_after
+        organization_id=organization_id,
+        totp_identifier=totp_identifier,
+        workflow_run_id=workflow_run_id,
+        include_unscoped_workflow_run=workflow_run_id is not None,
+        created_after=created_after,
     )
     for totp_code in totp_codes:
         if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:

@@ -177,6 +177,19 @@ def _has_reached_download_target(ctx: Any) -> bool:
     return target.already_registered or bool(target.selector.strip())
 
 
+def _request_policy_allows_untested_code_block_draft(ctx: Any) -> bool:
+    policy = getattr(ctx, "request_policy", None)
+    return (
+        getattr(ctx, "allow_untested_workflow_draft", False) is True
+        and isinstance(policy, RequestPolicy)
+        and policy.allow_update_workflow
+        and not policy.allow_run_blocks
+        and policy.testing_intent == "skip_test"
+        and policy.credential_input_kind == "credential_name"
+        and policy.allow_missing_credentials_in_draft
+    )
+
+
 def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) -> str | None:
     """Reject authoring a download-intent code block until the affordance has been scout-acted
     this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
@@ -187,6 +200,14 @@ def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) 
         return None
     download_labels = _download_intent_block_labels(workflow_yaml)
     if not download_labels:
+        return None
+    if _request_policy_allows_untested_code_block_draft(copilot_ctx):
+        LOG.info(
+            "copilot download scout-act gate skipped for untested credential draft",
+            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
+            download_intent_block_labels=download_labels,
+            surface="tool_pre_side_effect",
+        )
         return None
     if _has_reached_download_target(copilot_ctx):
         return None

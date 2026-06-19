@@ -5,16 +5,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _native_tools_for_turn
+from skyvern.forge.sdk.copilot.agent import _mcp_tool_surface_for_turn, _native_tools_for_turn
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import (
     NATIVE_TOOLS,
     _authority_tool_error,
+    _build_skyvern_mcp_overlays,
     _get_run_results,
     _turn_intent_tool_error,
     _update_workflow,
+    get_skyvern_mcp_alias_map,
 )
 from skyvern.forge.sdk.copilot.turn_intent import (
     UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
@@ -114,6 +116,38 @@ def test_turn_intent_gate_allows_draft_update_without_run_authority() -> None:
     )
 
     assert _turn_intent_tool_error(_ctx(intent), "update_workflow") is None
+
+
+def test_draft_only_credential_code_policy_prunes_browser_tool_surface() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.DRAFT_ONLY,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+    )
+    policy = RequestPolicy(
+        testing_intent="skip_test",
+        allow_update_workflow=True,
+        allow_run_blocks=False,
+        allow_missing_credentials_in_draft=True,
+    )
+
+    alias_map, overlays = _mcp_tool_surface_for_turn(
+        get_skyvern_mcp_alias_map(),
+        _build_skyvern_mcp_overlays(),
+        intent,
+        policy,
+    )
+    native_names = {getattr(tool, "name", None) for tool in _native_tools_for_turn(list(NATIVE_TOOLS), intent, policy)}
+
+    assert set(alias_map) == {"get_block_schema", "validate_block"}
+    assert set(overlays) == {"get_block_schema", "validate_block"}
+    for browser_tool in {"navigate_browser", "evaluate", "click", "type_text"}:
+        assert browser_tool not in alias_map
+        assert browser_tool not in overlays
+    assert "update_workflow" in native_names
+    assert "list_credentials" in native_names
+    assert "fill_credential_field" not in native_names
+    assert "discover_workflow_entrypoint" not in native_names
+    assert "inspect_page_for_composition" not in native_names
 
 
 def test_turn_intent_gate_allows_build_page_inspection_with_update_authority() -> None:
