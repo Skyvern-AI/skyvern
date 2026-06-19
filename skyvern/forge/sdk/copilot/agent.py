@@ -853,11 +853,16 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     block_count = ctx.last_update_block_count if isinstance(ctx.last_update_block_count, int) else None
     positive_block_count = block_count if block_count is not None and block_count > 0 else None
 
-    if outcome_fully_verified(ctx) and has_keepable_draft and positive_block_count is not None:
-        block_word = "block" if positive_block_count == 1 else "blocks"
+    if outcome_fully_verified(ctx) and has_keepable_draft:
+        if positive_block_count is not None:
+            block_word = "block" if positive_block_count == 1 else "blocks"
+            return (
+                f"I created a workflow with {positive_block_count} {block_word} and verified the requested "
+                "outcome from workflow run evidence and the current browser page. The workflow is ready to review."
+            )
         return (
-            f"I created a workflow with {positive_block_count} {block_word} and verified the requested "
-            "outcome from the current browser page after the run. The workflow is ready to review."
+            "I built the workflow and verified the requested outcome from workflow run evidence and the current "
+            "browser page. The workflow is ready to review."
         )
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
@@ -2320,7 +2325,9 @@ async def _translate_to_agent_result(
             user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # Default-true preserves backwards-compat with stale prompts and missing fields.
-    agent_admits_incomplete = _is_explicit_false(action_data.get("goal_reached"))
+    agent_admits_incomplete = _is_explicit_false(
+        action_data.get("goal_reached")
+    ) and not verified_goal_claim_authorized(ctx)
     typed_outcome_reply = _render_typed_run_outcome_reply(
         ctx,
         response_type=resp_type,

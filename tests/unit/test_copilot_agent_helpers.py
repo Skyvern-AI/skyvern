@@ -1902,7 +1902,7 @@ workflow_definition:
         assert agent_result.workflow_yaml == "title: drafted"
         assert agent_result.proposal_disposition == "review_untested"
 
-    def test_demonstrated_recorded_outcome_overrides_goal_reached_false_underclaim(self) -> None:
+    def test_goal_reached_false_cannot_underclaim_verified_outcome(self) -> None:
         from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 
         wf = SimpleNamespace(name="verified")
@@ -1910,7 +1910,7 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: verified",
             last_test_ok=True,
-            last_full_workflow_test_ok=True,
+            last_full_workflow_test_ok=False,
             last_update_block_count=4,
             last_run_outcome=RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_secret"),
             completion_verification_result=CompletionVerificationResult(
@@ -1922,7 +1922,7 @@ workflow_definition:
         result = _fake_run_result(
             {
                 "type": "REPLY",
-                "user_response": "I drafted this but did not test it end-to-end.",
+                "user_response": "I drafted the workflow, but it has not been tested end-to-end.",
                 "goal_reached": False,
             }
         )
@@ -1936,10 +1936,14 @@ workflow_definition:
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: verified"
         assert agent_result.proposal_disposition == "auto_applicable"
+        assert "draft" not in agent_result.user_response.lower()
+        assert "not been tested" not in agent_result.user_response.lower()
+        assert "tested end-to-end" not in agent_result.user_response.lower()
         assert "created and tested" in agent_result.user_response.lower()
         assert "demonstrated the requested outcome" in agent_result.user_response.lower()
-        assert "did not test" not in agent_result.user_response.lower()
         assert "wr_secret" not in agent_result.user_response
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["verifiedSuccess"] is True
 
     def test_demonstrated_recorded_outcome_overrides_misleading_free_text(self) -> None:
         from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
