@@ -53,6 +53,11 @@ keywords:
 - **Uncapped Workflow Runtime** — Workflows can now be configured to run without a maximum time limit, enabling long-running automations that previously timed out. ([#6567](https://github.com/Skyvern-AI/skyvern/pull/6567))
 - **Code-First Code Block Editor** — Code blocks now feature a dedicated code editor with syntax highlighting, Jinja parameter hints, and a run timeline showing each action taken, giving developers full visibility and control over code-driven automations. ([#6604](https://github.com/Skyvern-AI/skyvern/pull/6604))
 - **Period-Aware Analytics Drill-Down** — The agent analytics drill-down panel now respects the selected time period (7/30/90/365 days or custom range) and shows per-agent average duration, credits per run, and period-over-period trends.
+- **Agent Directory Tree** — The agents and folders list has been redesigned as a navigable directory tree, making it easier to browse and organize agents across nested folder hierarchies. ([#6631](https://github.com/Skyvern-AI/skyvern/pull/6631))
+- **GCP Self-Host: Storage and Vault** — Self-hosted deployments on Google Cloud Platform now support GCS artifact storage and GCP Secret Manager vault, enabling full GCP-native deployments. ([#6632](https://github.com/Skyvern-AI/skyvern/pull/6632))
+- **1Password Credential Picker** — Credential inputs now include an item picker for 1Password vaults, letting you browse and select vault items directly during credential setup. ([#6651](https://github.com/Skyvern-AI/skyvern/pull/6651))
+- **Typed Extraction Schema for Copilot Code Blocks** — Copilot-generated code blocks now support a typed data extraction schema (matching `data_schema` parity), enabling structured data output from code-block automations. ([#6674](https://github.com/Skyvern-AI/skyvern/pull/6674))
+- **SDK-Backed Remote Browser Provider** — Agents can now connect to external browser providers via SDK, enabling tighter integration with third-party remote browser services. ([#6687](https://github.com/Skyvern-AI/skyvern/pull/6687))
 
 ## Improvements
 
@@ -62,6 +67,11 @@ keywords:
 - **Copilot Stops Stuck Repair Loops** — The Workflow Copilot now detects when consecutive repairs make no verified progress, halts after three attempts, and presents an honest escalation with the draft preserved for review. ([#6608](https://github.com/Skyvern-AI/skyvern/pull/6608))
 - **Voice Input Microphone Permission** — The browser microphone permission prompt now appears correctly when using voice dictation in the Prompt Box and Workflow Copilot. ([#6601](https://github.com/Skyvern-AI/skyvern/pull/6601))
 - **`page.evaluate` Recorded in Code Block Timeline** — JavaScript `page.evaluate(...)` calls made inside code blocks are now recorded as actions in the run timeline, filling a gap in execution visibility. ([#6600](https://github.com/Skyvern-AI/skyvern/pull/6600))
+- **Active Run Shown on Browser Session Page** — Browser session detail pages now display which workflow run currently occupies the session, making it easier to understand session usage. ([#6691](https://github.com/Skyvern-AI/skyvern/pull/6691))
+- **Distinct Visual for Terminate Actions** — Terminate actions now appear with a distinct amber triangle icon in the run timeline, making it easy to spot where a run was stopped. ([#6693](https://github.com/Skyvern-AI/skyvern/pull/6693))
+- **PDF Field Mapping by Positional Labels** — PDF form filling now uses positional field labels to improve accuracy when mapping data to form fields with ambiguous names. ([#6663](https://github.com/Skyvern-AI/skyvern/pull/6663))
+- **MiMo-V2.5 Model Support via OpenRouter** — Added Xiaomi MiMo-V2.5 as a selectable LLM via OpenRouter for agent runs. ([#6636](https://github.com/Skyvern-AI/skyvern/pull/6636))
+- **Settings "API Keys" Renamed to "General"** — The "API Keys" section in Settings has been renamed to "General" to better reflect its full scope of configuration options. ([#6642](https://github.com/Skyvern-AI/skyvern/pull/6642))
 
 ## Bug fixes
 
@@ -71,6 +81,18 @@ keywords:
 - Fixed code block runs not generating a recording entry, causing the Recording tab to appear empty. ([#6607](https://github.com/Skyvern-AI/skyvern/pull/6607))
 - Fixed code block action screenshots not appearing on the run Overview page. ([#6605](https://github.com/Skyvern-AI/skyvern/pull/6605))
 - Fixed long usernames or email addresses hiding the sidebar collapse button on desktop.
+- Fixed the FileParserBlock crashing instead of surfacing a clear error when it encountered an unparseable file. ([#6657](https://github.com/Skyvern-AI/skyvern/pull/6657))
+- Fixed the Inputs field missing from the Code view of code-first code blocks. ([#6633](https://github.com/Skyvern-AI/skyvern/pull/6633))
+- Fixed Copilot-synthesized download blocks not downloading the file during code replay. ([#6637](https://github.com/Skyvern-AI/skyvern/pull/6637), [#6638](https://github.com/Skyvern-AI/skyvern/pull/6638))
+- Fixed multi-step login flows not advancing when credentials were filled into JavaScript-gated fields. ([#6650](https://github.com/Skyvern-AI/skyvern/pull/6650))
+- Fixed an infinite update loop on the workflow build page when certain block configurations were active. ([#6660](https://github.com/Skyvern-AI/skyvern/pull/6660))
+- Fixed adopted-session file downloads not being available as run artifacts after the session ended. ([#6679](https://github.com/Skyvern-AI/skyvern/pull/6679))
+- Fixed the run timeline showing action and step rows for non-code blocks when they should only appear for code blocks. ([#6675](https://github.com/Skyvern-AI/skyvern/pull/6675))
+- Fixed workflow run actions not appearing in the timeline for all block types.
+- Fixed workflow runs not stopping when a configured time limit was exceeded. ([#6677](https://github.com/Skyvern-AI/skyvern/pull/6677))
+- Fixed the analytics plan-tier badge showing the incorrect tier for some organizations.
+- Fixed credits not being recorded when data was captured inside a Navigate block in task runs. ([#6698](https://github.com/Skyvern-AI/skyvern/pull/6698))
+- Fixed Copilot directory mode synthesizing incorrect code bindings. ([#6702](https://github.com/Skyvern-AI/skyvern/pull/6702))
 
 </Update>
 
