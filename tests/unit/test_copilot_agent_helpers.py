@@ -2047,6 +2047,32 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.apply_without_review is False
+
+    def test_code_only_verified_build_applies_without_review(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_update_block_count=3,
+            has_staged_proposal=True,
+            staged_workflow=wf,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.apply_without_review is True
 
     def test_goal_reached_true_explicit_keeps_verified_path(self) -> None:
         wf = SimpleNamespace(name="drafted")
@@ -2221,7 +2247,7 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
-    def test_unbacked_workflow_claim_not_rewritten_when_proposal_exists(self) -> None:
+    def test_clean_unverified_run_uses_deterministic_terminal_copy_when_proposal_exists(self) -> None:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
             last_workflow=wf,
@@ -2236,7 +2262,10 @@ workflow_definition:
             )
         )
 
-        assert agent_result.user_response == "Here's the workflow."
+        assert agent_result.user_response == (
+            "I built the workflow and the test run completed, but the goal outcome was not independently verified. "
+            "The workflow is available on the canvas for review."
+        )
         assert agent_result.updated_workflow is wf
 
     def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
@@ -2368,6 +2397,28 @@ workflow_definition:
         assert agent_result.workflow_yaml == "final: yaml"
         assert agent_result.response_type == "REPLY"
         assert agent_result.clear_proposed_workflow is False
+
+    def test_reply_with_unverified_clean_run_uses_deterministic_terminal_copy(self) -> None:
+        workflow = SimpleNamespace(name="final")
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="final: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "The workflow is ready."})
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is workflow
+        assert "the workflow is ready" not in agent_result.user_response.lower()
+        assert "not independently verified" in agent_result.user_response.lower()
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["verifiedSuccess"] is False
 
 
 class TestCredentialRefusalReachesAgent:
