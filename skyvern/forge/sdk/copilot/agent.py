@@ -957,6 +957,32 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     return None, None
 
 
+_BUILT_UNVERIFIED_COMPLETED_REPLY = (
+    "I built the workflow and the test run completed, but the goal outcome was not independently verified. "
+    "The workflow is available on the canvas for review."
+)
+
+
+def _should_use_built_unverified_completed_reply(
+    ctx: CopilotContext,
+    *,
+    response_type: str,
+    updated_workflow: Any,
+    validated: bool,
+    blocker_active: bool,
+) -> bool:
+    return (
+        response_type == "REPLY"
+        and updated_workflow is not None
+        and validated
+        and not blocker_active
+        and ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and not ctx.last_test_suspicious_success
+        and not verified_goal_claim_authorized(ctx)
+    )
+
+
 def _make_agent_result(
     ctx: CopilotContext | None,
     *,
@@ -1000,9 +1026,23 @@ def _make_agent_result(
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None and result.turn_outcome is not None:
         result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
+    if ctx is not None and not result.apply_without_review:
+        result.apply_without_review = _should_apply_code_only_success_without_review(ctx, result.proposal_disposition)
     if ctx is not None and result.completion_criteria_turn_state is None:
         result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     return result
+
+
+def _should_apply_code_only_success_without_review(ctx: CopilotContext, disposition: object) -> bool:
+    return (
+        disposition == "auto_applicable"
+        and ctx.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and not ctx.last_test_suspicious_success
+        and ctx.has_staged_proposal
+        and ctx.staged_workflow is not None
+    )
 
 
 def _build_outcome_adjudication_payload(ctx: CopilotContext) -> NarrativeOutcomeAdjudication | None:
@@ -2323,6 +2363,14 @@ async def _translate_to_agent_result(
     structured.merge_turn_summary(ctx.tool_activity)
     enriched_context = structured.to_json_str()
     workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    if _should_use_built_unverified_completed_reply(
+        ctx,
+        response_type=resp_type,
+        updated_workflow=last_workflow,
+        validated=not unvalidated,
+        blocker_active=blocker_active,
+    ):
+        user_response = _BUILT_UNVERIFIED_COMPLETED_REPLY
     output_kind = derive_output_kind(
         response_type=resp_type,
         request_policy=ctx.request_policy,
