@@ -10,7 +10,10 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { useGoogleOAuthCredentials } from "@/hooks/useGoogleOAuthCredentials";
+import {
+  getDefaultGoogleOAuthCredentialId,
+  useGoogleOAuthCredentials,
+} from "@/hooks/useGoogleOAuthCredentials";
 import { PlusIcon } from "@radix-ui/react-icons";
 
 type Props = {
@@ -40,8 +43,7 @@ function GoogleOAuthCredentialSelector({
 
   const hasCredentials = credentials.length > 0;
   const isKnownCredential = credentials.some((c) => c.id === value);
-  const firstValidId =
-    credentials.find((c) => c.valid)?.id ?? credentials[0]?.id;
+  const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
   const needsAutoFill = !value;
 
   useEffect(() => {
