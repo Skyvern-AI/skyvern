@@ -854,20 +854,23 @@ async def fill_credential_field_tool(
     The secret value is resolved server-side from the stored credential and never
     enters the conversation; the result reports only `typed_length`. Use this
     instead of `type_text` whenever a login form field should receive a saved
-    credential's username, password, or one-time TOTP code — `type_text` cannot
-    type secrets and you never have the values.
+    credential's username, password, or authenticator-app one-time code. Email/SMS
+    OTP credentials are not filled during scouting because scouting has no
+    workflow run/task context for safe polling.
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id` must be a credential from the request policy's
-    `resolved_credentials`. `field` is one of `username`, `password`, `totp`
-    (`totp` generates a fresh code at call time).
+    `resolved_credentials`. `field` is one of `username`, `password`, `totp`.
 
     This tool only fills; it never clicks or submits. Each successful fill is
     recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind
-    the credential as a `credential_id` workflow parameter and reference it as
-    `<parameter_key>.username` / `.password` / `.totp` — keep that attribute
-    form when persisting code blocks.
+    the credential as a `credential_id` workflow parameter and reference
+    username/password as `<parameter_key>.username` / `.password`.
+
+    In synthesized code blocks, one-time codes must use
+    `await <parameter_key>.otp()` so authenticator, email, and SMS OTP sources
+    all resolve at runtime.
     """
     result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))

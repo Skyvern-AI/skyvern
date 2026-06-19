@@ -651,18 +651,21 @@ class WorkflowService:
         published_groups: list[CachedScriptBlocks] = []
         target_labels = set(block_labels_to_disable)
 
+        scripts_by_id = await app.DATABASE.scripts.get_latest_scripts_by_ids(
+            organization_id=organization_id,
+            script_ids=[candidate.script_id for candidate in candidates],
+        )
+        blocks_by_revision = await app.DATABASE.scripts.get_script_blocks_by_script_revision_ids(
+            organization_id=organization_id,
+            script_revision_ids=[script.script_revision_id for script in scripts_by_id.values()],
+        )
+
         for candidate in candidates:
-            script = await app.DATABASE.scripts.get_script(
-                script_id=candidate.script_id,
-                organization_id=organization_id,
-            )
+            script = scripts_by_id.get(candidate.script_id)
             if not script:
                 continue
 
-            script_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
-                script_revision_id=script.script_revision_id,
-                organization_id=organization_id,
-            )
+            script_blocks = blocks_by_revision.get(script.script_revision_id, [])
             blocks_to_clear = [
                 block for block in script_blocks if block.script_block_label in target_labels and block.run_signature
             ]
