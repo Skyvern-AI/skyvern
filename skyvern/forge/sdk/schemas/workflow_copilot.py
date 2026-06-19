@@ -199,6 +199,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
     )
+    workflow_applied: bool = Field(
+        False,
+        description="True when the backend already committed this terminal workflow proposal.",
+    )
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",

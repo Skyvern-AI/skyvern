@@ -20,6 +20,16 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     expect(shouldAutoApplyWorkflowResponse(response(), true, false)).toBe(true);
   });
 
+  it("auto-applies proposals already committed by the backend", () => {
+    expect(
+      shouldAutoApplyWorkflowResponse(
+        response({ workflow_applied: true }),
+        false,
+        false,
+      ),
+    ).toBe(true);
+  });
+
   it.each(["review_untested", "review_tested"] as const)(
     "forces explicit review for %s proposals",
     (proposal_disposition) => {

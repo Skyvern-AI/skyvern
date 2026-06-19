@@ -853,6 +853,7 @@ function adjudicatedSummaryParts(
     needsTestedProposalReview: boolean;
     hasEdited: boolean;
     hasDrafts: boolean;
+    hasCleanCompletedBuild: boolean;
   },
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
@@ -876,6 +877,15 @@ function adjudicatedSummaryParts(
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (!turn.verifiedSuccess) {
+    if (flags.hasCleanCompletedBuild) {
+      return {
+        headline: flags.hasEdited
+          ? "Applied edits and ran the workflow"
+          : "Built and ran the workflow",
+        accent: "ok",
+        glyph: "✓",
+      };
+    }
     return { headline: "Stopped", accent: "qa", glyph: "!" };
   }
   if (flags.hasEdited) {
@@ -912,6 +922,10 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const needsTestedProposalReview =
     hasDrafts && turn.proposalDisposition === "review_tested";
   const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
+  const hasCleanCompletedBuild =
+    hasDrafts &&
+    rollupBlocks.length > 0 &&
+    rollupBlocks.every((block) => isBlockOk(block));
   const hasReviewableDraft =
     hasDrafts &&
     (turn.proposalDisposition === "review_untested" ||
@@ -928,6 +942,7 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
           needsTestedProposalReview,
           hasEdited,
           hasDrafts,
+          hasCleanCompletedBuild,
         });
 
   const headline = adjudicated

@@ -250,10 +250,16 @@ Runtime facts:
 - `code` is async Python with a Playwright `page` object and workflow parameters by key.
 - Valid Python identifier parameter keys are local variables; normalize before page inputs.
 - Use deterministic, bounded Playwright calls: `goto`, `click`, `fill`, `press`,
-  `wait_for_load_state`, and `evaluate`.
+  `wait_for_load_state`, `locator`, `get_by_role`, and locator text/count APIs.
+- For browser reads, prefer visible anchors, locator text, block outputs, and
+  MCP/scout evidence gathered before authoring.
 - A `credential_id` workflow parameter resolves to a credential object with
   `<key>.username`, `<key>.password`, and fresh `<key>.totp`; scout fields with
   `fill_credential_field`, never embed literal secrets.
+- Credentialed login code must be idempotent. After `goto`, wait for either the
+  login form or an already-authenticated page anchor; only fill username/password
+  when the login fields are visible, and after submit wait for a logged-in page
+  anchor instead of relying only on `networkidle`.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
 - For an extraction-intent `code` block, propose a typed `extraction_schema` (named
