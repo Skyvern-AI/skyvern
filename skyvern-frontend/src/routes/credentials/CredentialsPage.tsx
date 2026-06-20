@@ -9,6 +9,7 @@ import {
 } from "./useCredentialModalState";
 import { CredentialsModal } from "./CredentialsModal";
 import { CredentialsList } from "./CredentialsList";
+import { BitwardenCredentialsList } from "./BitwardenCredentialsList";
 import { OnePasswordCredentialsList } from "./OnePasswordCredentialsList";
 import { useBackgroundCredentialTest } from "./useBackgroundCredentialTest";
 import {
@@ -319,6 +320,10 @@ function CredentialsPage() {
             onStartBackgroundTest={startBackgroundTest}
           />
           <OnePasswordCredentialsList
+            search={debouncedSearch}
+            folderId={selectedFolderId}
+          />
+          <BitwardenCredentialsList
             search={debouncedSearch}
             folderId={selectedFolderId}
           />
