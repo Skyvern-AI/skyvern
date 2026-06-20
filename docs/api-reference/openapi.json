@@ -24791,6 +24791,17 @@
                 "type": "null"
               }
             ]
+          },
+          "downloaded_file_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloaded File Count"
           }
         },
         "type": "object",
