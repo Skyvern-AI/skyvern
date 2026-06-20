@@ -341,6 +341,27 @@ class TestSchemaOverlay:
 
 
 class TestMCPFailedStepLoopDetection:
+    def test_post_hook_context_snapshot_restores_loaded_result_composition_steer(self) -> None:
+        from skyvern.forge.sdk.copilot.mcp_adapter import _restore_post_hook_context, _snapshot_post_hook_context
+        from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
+
+        initial_steer = LoadedResultCompositionEvidence(
+            result_container_count=1,
+            table_result_container_count=1,
+        )
+        ctx = SimpleNamespace(
+            latest_evaluate_result_composition_steer=initial_steer,
+        )
+
+        snapshot = _snapshot_post_hook_context(ctx)
+        ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+            result_container_count=2,
+            table_result_container_count=0,
+        )
+        _restore_post_hook_context(ctx, snapshot)
+
+        assert ctx.latest_evaluate_result_composition_steer == initial_steer
+
     @pytest.mark.asyncio
     async def test_post_hook_exception_preserves_successful_tool_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.copilot import mcp_adapter

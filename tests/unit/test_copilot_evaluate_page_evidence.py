@@ -7,6 +7,7 @@ import pytest
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
     _inspect_page_for_composition_impl,
@@ -31,6 +32,33 @@ def _ctx() -> CopilotContext:
             authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
         ),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"ok": False, "error": "evaluate failed"},
+        {"ok": True},
+        {"ok": True, "data": {}},
+        {"ok": True, "data": []},
+    ],
+)
+async def test_evaluate_post_hook_resets_steer_on_unusable_result(result: dict[str, object]) -> None:
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = "stale-signature"
+    ctx.last_evaluate_actionable_url = "https://example.test/old"
+    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+        result_container_count=1,
+        table_result_container_count=1,
+    )
+
+    updated = await _evaluate_post_hook(result, raw={}, ctx=ctx)
+
+    assert updated is result
+    assert ctx.last_evaluate_actionable_signature is None
+    assert ctx.last_evaluate_actionable_url is None
+    assert ctx.latest_evaluate_result_composition_steer is None
 
 
 @pytest.mark.asyncio

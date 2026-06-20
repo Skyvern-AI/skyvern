@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
+from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _build_loop_blocker_signal, _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
@@ -135,6 +136,60 @@ def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
     assert ctx.blocker_signal.cleared_by_tools == frozenset()
     assert ctx.turn_halt is not None
     assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
+
+
+def test_consecutive_evaluate_loop_with_loaded_results_uses_goal_aware_copy() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+        result_container_count=1,
+        table_result_container_count=1,
+    )
+    payload = _tool_loop_error(ctx, "evaluate", None)
+
+    assert payload is not None
+    assert payload.startswith("LOOP DETECTED: 'evaluate' has been called 3 times consecutively.")
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert "loaded results" in ctx.blocker_signal.user_facing_reason
+    assert "extracting the requested information" in ctx.blocker_signal.user_facing_reason
+    assert "retrying the same step" not in ctx.blocker_signal.user_facing_reason
+    assert dict(ctx.blocker_signal.extra) == {"loop_evidence_tiers": ["loaded_results"]}
+    assert_clean_user_facing_text(ctx.blocker_signal.user_facing_reason, blocked_tool="evaluate")
+
+
+def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["list_credentials", "list_credentials"])
+    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+        result_container_count=1,
+        table_result_container_count=1,
+    )
+    payload = _tool_loop_error(ctx, "list_credentials", None)
+
+    assert payload is not None
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert "loaded results" not in ctx.blocker_signal.user_facing_reason
+    assert ctx.blocker_signal.user_facing_reason == (
+        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
+    )
+    assert dict(ctx.blocker_signal.extra) == {}
+
+
+def test_consecutive_evaluate_loop_ignores_stale_composition_page_results_without_latest_steer() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = {
+        "result_containers": [{"tag": "table", "selector": "#old-results", "row_count": 3}],
+    }
+    payload = _tool_loop_error(ctx, "evaluate", None)
+
+    assert payload is not None
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert ctx.blocker_signal.user_facing_reason == (
+        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
+    )
+    assert dict(ctx.blocker_signal.extra) == {}
+    assert_clean_user_facing_text(ctx.blocker_signal.user_facing_reason, blocked_tool="evaluate")
 
 
 def test_native_and_mcp_paths_produce_equivalent_loop_signal() -> None:
