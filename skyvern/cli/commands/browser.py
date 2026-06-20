@@ -2344,6 +2344,7 @@ def qa(
         )
         session_id = session_result.session_id
 
+        task_result: dict[str, Any] = {}
         try:
             # 2. Run task via MCP tool (reuses existing implementation)
             task_result = await tool_run_task(
@@ -2353,45 +2354,45 @@ def qa(
                 max_steps=max_steps,
                 timeout_seconds=task_timeout,
             )
-
-            # 3. Fetch session details for recording
-            recording_data: dict[str, Any] = {}
-            if session_id:
-                try:
-                    session_details = await skyvern_client.get_browser_session(session_id)
-                    recording_data = {
-                        "app_url": session_details.app_url,
-                        "recordings": [
-                            {"url": r.url, "filename": r.filename} for r in (session_details.recordings or [])
-                        ],
-                    }
-                except Exception:
-                    pass
-
-            # 4. Build QA report
-            task_data = task_result.get("data", {}) if task_result.get("ok") else {}
-            qa_result: dict[str, Any] = {
-                "session_id": session_id,
-                "status": task_data.get("status", "failed") if task_data else "failed",
-                "prompt": prompt,
-                "output": task_data.get("output") if task_data else None,
-                "failure_reason": task_data.get("failure_reason") if task_data else None,
-                **recording_data,
-            }
-
-            if not task_result.get("ok"):
-                err = task_result.get("error", {})
-                qa_result["error"] = err.get("message", "Task failed")
-
-            return qa_result
-
         finally:
-            # 5. Always close session
+            # 3. Always close the session. The server syncs the Playwright video
+            #    artifacts during close_session (after browser_state.close()), so the
+            #    recording is only available once this completes.
             if session_id:
                 try:
                     await do_session_close(skyvern_client, session_id)
                 except Exception:
                     pass
+
+        # 4. Fetch session details for the recording AFTER closing the session, so the
+        #    finalized video artifact is returned instead of an empty recordings list.
+        recording_data: dict[str, Any] = {}
+        if session_id:
+            try:
+                session_details = await skyvern_client.get_browser_session(session_id)
+                recording_data = {
+                    "app_url": session_details.app_url,
+                    "recordings": [{"url": r.url, "filename": r.filename} for r in (session_details.recordings or [])],
+                }
+            except Exception:
+                pass
+
+        # 5. Build QA report
+        task_data = task_result.get("data", {}) if task_result.get("ok") else {}
+        qa_result: dict[str, Any] = {
+            "session_id": session_id,
+            "status": task_data.get("status", "failed") if task_data else "failed",
+            "prompt": prompt,
+            "output": task_data.get("output") if task_data else None,
+            "failure_reason": task_data.get("failure_reason") if task_data else None,
+            **recording_data,
+        }
+
+        if not task_result.get("ok"):
+            err = task_result.get("error", {})
+            qa_result["error"] = err.get("message", "Task failed")
+
+        return qa_result
 
     try:
         data = asyncio.run(_run())
