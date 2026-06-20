@@ -203,7 +203,14 @@ def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
 
     assert ctx.turn_halt is not None
     evidence_reason = ctx.turn_halt.extra["evidence_reason"]
-    assert "https://example.com" in evidence_reason
+    # Assert exact equality on the full redacted string: the safe origin is preserved
+    # while every credential is stripped. Equality (vs. a substring `in` check) is a
+    # complete sanitization assertion. The trailing codeql marker suppresses a known
+    # false positive — the value is an exact-match expectation, not URL sanitization.
+    assert evidence_reason == (
+        "Run output reported a blocker: Human verification challenge blocked "
+        "https://example.com after [REDACTED_SECRET] was submitted."  # codeql[py/incomplete-url-substring-sanitization]
+    )
     assert "[REDACTED_SECRET]" in evidence_reason
     assert "user:secret" not in evidence_reason
     assert "password=" not in evidence_reason
@@ -426,7 +433,13 @@ def test_display_reason_redacts_secrets_and_url_credentials() -> None:
     )
 
     assert reason is not None
-    assert "https://example.com" in reason
+    # Exact-equality assertion: safe origin kept, credentials stripped. Using `==` rather
+    # than a substring `in` check is a complete sanitization assertion. The trailing codeql
+    # marker suppresses a known false positive — this is exact-match, not URL sanitization.
+    assert reason == (
+        "Blocked at "
+        "https://example.com after [REDACTED_SECRET] was submitted."  # codeql[py/incomplete-url-substring-sanitization]
+    )
     assert "[REDACTED_SECRET]" in reason
     assert "user:secret" not in reason
     assert "password=" not in reason
