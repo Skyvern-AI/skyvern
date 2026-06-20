@@ -43,7 +43,9 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
+    MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
+    PDF_OCR_PAGE_CONCURRENCY,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.exceptions import (
@@ -5627,37 +5629,107 @@ class FileParserBlock(Block):
         if extracted_text.strip():
             return extracted_text
 
-        # Scanned / image-based PDF — render pages as images and use vision LLM
+        # Scanned / image-based PDF — render pages as images and OCR each page in
+        # its own vision-LLM call. A single call covering every page collapses a
+        # multi-page document down to the first page or two.
         LOG.info(
             "PDF text extraction returned empty content, falling back to vision LLM OCR",
             file_url=self.file_url,
         )
         try:
-            page_images = render_pdf_pages_as_images(file_path, file_identifier=self.file_url)
+            page_images = await asyncio.to_thread(
+                render_pdf_pages_as_images,
+                file_path,
+                file_identifier=self.file_url,
+                max_pages=MAX_PDF_OCR_PAGES,
+            )
             if not page_images:
                 return extracted_text
-
-            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                self.override_llm_key, default=app.LLM_API_HANDLER
-            )
-            # OCR transcription intentionally skips system_prompt
-            # It still applies to the downstream extract-information-from-file-text call.
-            llm_response = await llm_api_handler(
-                prompt=llm_prompt,
-                prompt_name="extract-text-from-image",
-                screenshots=page_images,
-                force_dict=True,
+            return await self._ocr_pdf_pages(
+                page_images,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-            return llm_response.get("extracted_text", "")
         except Exception:
             LOG.exception(
                 "Failed to extract text from PDF via vision LLM fallback",
                 file_url=self.file_url,
             )
             raise
+
+    async def _ocr_pdf_pages(
+        self,
+        page_images: list[bytes],
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
+        """OCR each rendered PDF page in its own vision-LLM call and concatenate.
+
+        Per-page transcription avoids the single-call collapse where a multi-page
+        document is summarized down to its first page(s). Pages are transcribed with
+        bounded concurrency, reassembled in page order with page markers, and
+        truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
+        """
+        llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            self.override_llm_key, default=app.LLM_API_HANDLER
+        )
+        semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
+
+        async def _ocr_page(page_image: bytes) -> str:
+            async with semaphore:
+                # OCR transcription intentionally skips system_prompt; it still applies
+                # to the downstream extract-information-from-file-text call.
+                llm_response = await llm_api_handler(
+                    prompt=llm_prompt,
+                    prompt_name="extract-text-from-image",
+                    screenshots=[page_image],
+                    force_dict=True,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                return llm_response.get("extracted_text", "") or ""
+
+        page_results = await asyncio.gather(
+            *(_ocr_page(page_image) for page_image in page_images),
+            return_exceptions=True,
+        )
+
+        # A total OCR outage must fail the block, not record an empty success — match the
+        # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
+        errors = [r for r in page_results if isinstance(r, BaseException)]
+        if errors and len(errors) == len(page_results):
+            raise errors[0]
+
+        page_chunks: list[str] = []
+        current_tokens = 0
+        for page_number, result in enumerate(page_results, start=1):
+            if isinstance(result, BaseException):
+                LOG.warning(
+                    "Failed to OCR a PDF page via vision LLM, skipping it",
+                    file_url=self.file_url,
+                    page_number=page_number,
+                    error=str(result),
+                )
+                continue
+            page_text = result.strip()
+            if not page_text:
+                continue
+            chunk = f"--- Page {page_number} ---\n{page_text}"
+            chunk_tokens = count_tokens(chunk)
+            if current_tokens + chunk_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
+                LOG.warning(
+                    "PDF OCR text exceeds token limit, truncating at page boundary",
+                    file_url=self.file_url,
+                    pages_included=page_number - 1,
+                    total_pages=len(page_results),
+                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                )
+                break
+            current_tokens += chunk_tokens
+            page_chunks.append(chunk)
+
+        return "\n\n".join(page_chunks)
 
     async def _parse_image_file(
         self,
