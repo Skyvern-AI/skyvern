@@ -255,6 +255,26 @@ class OnePasswordItemsResponse(BaseModel):
     items: list[OnePasswordItemOverview] = Field(..., description="The available 1Password item metadata")
 
 
+class BitwardenItemOverview(BaseModel):
+    """Response model for Bitwarden item metadata."""
+
+    item_id: str = Field(..., description="The Bitwarden item ID")
+    title: str = Field(..., description="The Bitwarden item title")
+    collection_id: str | None = Field(
+        default=None,
+        description="The ID of a collection containing the item, if available",
+    )
+    credential_type: CredentialType = Field(..., description="The item's credential type")
+    url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+
+
+class BitwardenItemsResponse(BaseModel):
+    """Response model for listing Bitwarden item metadata."""
+
+    configured: bool = Field(..., description="Whether Bitwarden credentials are configured")
+    items: list[BitwardenItemOverview] = Field(..., description="The available Bitwarden item metadata")
+
+
 class Credential(BaseModel):
     """Database model for credentials."""
 

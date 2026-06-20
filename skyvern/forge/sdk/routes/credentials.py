@@ -62,6 +62,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
+    BitwardenItemsResponse,
     CancelTestResponse,
     CreateCredentialRequest,
     Credential,
@@ -1934,6 +1935,50 @@ async def list_onepassword_items(
             exc_info=True,
         )
         raise HTTPException(status_code=502, detail="Failed to list 1Password items") from e
+
+
+@base_router.get(
+    "/credentials/bitwarden/items",
+    response_model=BitwardenItemsResponse,
+    summary="List Bitwarden item metadata",
+    description="Lists Bitwarden item metadata for the current organization.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/bitwarden/items/",
+    response_model=BitwardenItemsResponse,
+    include_in_schema=False,
+)
+async def list_bitwarden_items(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BitwardenItemsResponse:
+    org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        current_org.organization_id,
+        OrganizationAuthTokenType.bitwarden_credential.value,
+    )
+    # Org-scoped only: never fall back to global Bitwarden credentials here. In a shared deployment that
+    # would let an org without its own Bitwarden credential browse metadata from the instance/global vault.
+    if not org_auth_token:
+        return BitwardenItemsResponse(configured=False, items=[])
+
+    try:
+        items = await BitwardenService.list_item_overviews(
+            client_id=None,
+            client_secret=None,
+            master_password=org_auth_token.credential.master_password,
+            bw_organization_id=current_org.bw_organization_id,
+            bw_collection_ids=current_org.bw_collection_ids,
+            email=str(org_auth_token.credential.email),
+        )
+        return BitwardenItemsResponse(configured=True, items=items)
+    except Exception as e:
+        LOG.error(
+            "Failed to list Bitwarden items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=502, detail="Failed to list Bitwarden items") from e
 
 
 @base_router.post(
