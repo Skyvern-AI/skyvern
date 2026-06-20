@@ -20,7 +20,10 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
-from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_diagnostics
+from skyvern.forge.sdk.copilot.code_block_preflight import (
+    author_time_code_block_diagnostics,
+    sandbox_unresolved_name_diagnostics,
+)
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -775,6 +778,11 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
                 "namespace. `Exception` is the only available exception type."
             )
         errors.extend(author_time_code_security_errors(label=label, code=code))
+        author_time_diagnostics = author_time_code_block_diagnostics(code)
+        errors.extend(
+            f"Code block `{label}` failed the generated-code preflight check: {item.message}"
+            for item in author_time_diagnostics
+        )
         unresolved_diagnostics = sandbox_unresolved_name_diagnostics(code, parameter_keys=parameter_keys)
         errors.extend(
             f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
@@ -1262,6 +1270,92 @@ def _submitted_fill_type_arguments(code: str) -> list[str | None]:
     return arguments
 
 
+def _direct_parameter_reference_argument_name(first_arg: ast.AST) -> str | None:
+    if isinstance(first_arg, ast.Name):
+        return first_arg.id
+    if (
+        isinstance(first_arg, ast.Call)
+        and isinstance(first_arg.func, ast.Name)
+        and first_arg.func.id == "str"
+        and len(first_arg.args) == 1
+        and isinstance(first_arg.args[0], ast.Name)
+        and not first_arg.keywords
+    ):
+        return first_arg.args[0].id
+    return None
+
+
+def _submitted_scope_nodes(tree: ast.AST) -> list[ast.AST]:
+    if (
+        isinstance(tree, ast.Module)
+        and len(tree.body) == 1
+        and isinstance(tree.body[0], (ast.AsyncFunctionDef, ast.FunctionDef))
+    ):
+        roots: list[ast.AST] = list(tree.body[0].body)
+    else:
+        roots = [tree]
+
+    nodes: list[ast.AST] = []
+    stack = list(reversed(roots))
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef, ast.Lambda)):
+            # Model only the submitted block's outer runtime scope here; helper-local
+            # assignments should not shadow workflow parameters in the outer direct-fill path.
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    return nodes
+
+
+def _name_is_assigned(tree: ast.AST, parameter_key: str) -> bool:
+    for node in _submitted_scope_nodes(tree):
+        targets: list[ast.AST | None] = []
+        if isinstance(node, ast.Assign):
+            targets.extend(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets.append(node.target)
+        elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+            targets.append(node.target)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets.append(node.target)
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == parameter_key:
+                return True
+    return False
+
+
+class _DirectFillTypeUsage(NamedTuple):
+    matched: bool
+    mismatched: bool
+
+
+def _submitted_direct_fill_type_usage(code: str, parameter_key: str) -> _DirectFillTypeUsage:
+    tree = _wrapped_code_ast(code)
+    if tree is None or _name_is_assigned(tree, parameter_key):
+        return _DirectFillTypeUsage(False, False)
+    matched = False
+    mismatched = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in _SUBMITTED_LITERAL_METHODS:
+            continue
+        if not _is_page_locator_expression(func.value) or not node.args:
+            continue
+        if _direct_parameter_reference_argument_name(node.args[0]) != parameter_key:
+            mismatched = True
+        else:
+            matched = True
+    return _DirectFillTypeUsage(matched, mismatched)
+
+
+def _submitted_uses_parameter_in_direct_fill_type(code: str, parameter_key: str) -> bool:
+    usage = _submitted_direct_fill_type_usage(code, parameter_key)
+    return usage.matched and not usage.mismatched
+
+
 def _safe_singleton_literal_for_parameter(
     code: str, parameter_key: str, typed_length: int | None
 ) -> tuple[str | None, str | None]:
@@ -1369,6 +1463,15 @@ def _string_parameter_row(default_value: str, key: str) -> dict[str, Any]:
         "workflow_parameter_type": "string",
         "key": key,
         "default_value": default_value,
+    }
+
+
+def _required_string_parameter_row(key: str) -> dict[str, Any]:
+    # No default_value: direct scout fills become required workflow inputs at runtime.
+    return {
+        "parameter_type": "workflow",
+        "workflow_parameter_type": "string",
+        "key": key,
     }
 
 
@@ -1904,6 +2007,18 @@ def _reconcile_synthesized_parameters(
             submitted_parameter["parameter_type"] = "workflow"
             submitted_parameter["workflow_parameter_type"] = "string"
             submitted_parameter["key"] = key
+            continue
+
+        direct_fill_usage = _submitted_direct_fill_type_usage(submitted_code, key)
+        if direct_fill_usage.matched and not direct_fill_usage.mismatched:
+            parameters.append(_required_string_parameter_row(key))
+            continue
+        if direct_fill_usage.matched and direct_fill_usage.mismatched:
+            violations.append(
+                f"Unable to bind synthesized parameter `{key}`: submitted code mixes direct fills using `{key}` "
+                "with other browser-locator fill/type values. Use the synthesized parameter for every scout-input "
+                "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values."
+            )
             continue
 
         literal, error = _safe_singleton_literal_for_parameter(submitted_code, key, typed_length)
