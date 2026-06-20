@@ -129,6 +129,57 @@ _SUBMITTED_COMPUTED_LITERAL_YAML = _yaml(
     """
 )
 
+_SUBMITTED_REPEATED_COMPUTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill(provider_name)
+          await page.locator("#alternate-search").fill(str(provider_name))
+    """
+)
+
+_SUBMITTED_MIXED_FILL_COMPUTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          form_helper.fill("decorative helper call")
+          await page.locator("input[placeholder='Search']").fill(provider_name)
+    """
+)
+
+_SUBMITTED_MIXED_LOCATOR_FILL_COMPUTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("#org").fill("Sample Org")
+          await page.locator("input[placeholder='Search']").fill(provider_name)
+    """
+)
+
+_SUBMITTED_UNKNOWN_COMPUTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill(unscouted_provider_name)
+    """
+)
+
 _SUBMITTED_LOCAL_CONSTANT_YAML = _yaml(
     """
     title: Provider lookup
@@ -1314,11 +1365,88 @@ class TestCompiledAuthoringImposition:
         assert ctx.workflow_yaml == _SUBMITTED_TYPED_LITERAL_REWRITE_YAML
 
     @pytest.mark.asyncio
-    async def test_unbound_synthesized_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_single_direct_synthesized_parameter_reference_creates_required_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["provider_name"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_name",
+            }
+        ]
+        expected_selector = ctx.scout_trajectory[0]["selector"]
+        assert f'await page.locator("{expected_selector}").fill(str(provider_name))' in block["code"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_direct_synthesized_parameter_reference_creates_required_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_REPEATED_COMPUTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["provider_name"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_name",
+            }
+        ]
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_non_locator_fill_does_not_hide_direct_synthesized_parameter_reference(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_FILL_COMPUTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["provider_name"]
+        expected_selector = ctx.scout_trajectory[0]["selector"]
+        assert f'await page.locator("{expected_selector}").fill(str(provider_name))' in block["code"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_locator_fill_rejects_direct_synthesized_parameter_reference(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LOCATOR_FILL_COMPUTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "submitted code mixes direct fills using `provider_name`" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_unknown_computed_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_UNKNOWN_COMPUTED_LITERAL_YAML}, ctx)
 
         assert result["ok"] is False
         assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
@@ -1730,7 +1858,7 @@ class TestCompiledAuthoringImposition:
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LITERAL_YAML}, ctx)
 
         assert result["ok"] is False
-        assert "exactly one direct browser-locator string literal fill/type call" in result["error"]
+        assert "submitted code mixes direct fills using `provider_name`" in result["error"]
         assert ctx.workflow_yaml == ""
 
     @pytest.mark.asyncio
@@ -1831,6 +1959,31 @@ def test_literal_binding_sees_through_first_last_disambiguator() -> None:
     assert used_keys == ["search"]
     assert 'await page.locator("input").first.fill(str(search))' in rewritten
     assert 'await page.get_by_role("textbox").last.type(str(search))' in rewritten
+
+
+def test_direct_parameter_binding_ignores_nested_function_assignment() -> None:
+    code = textwrap.dedent(
+        """
+        def normalize_search() -> str:
+            search = "local fallback"
+            return search
+
+        await page.locator("#search").fill(search)
+        """
+    ).strip()
+
+    assert workflow_update_module._submitted_uses_parameter_in_direct_fill_type(code, "search") is True
+
+
+def test_direct_parameter_binding_rejects_top_level_assignment() -> None:
+    code = textwrap.dedent(
+        """
+        search = "local fallback"
+        await page.locator("#search").fill(search)
+        """
+    ).strip()
+
+    assert workflow_update_module._submitted_uses_parameter_in_direct_fill_type(code, "search") is False
 
 
 def test_python_ast_offsets_are_utf8_byte_offsets_for_unicode_source() -> None:

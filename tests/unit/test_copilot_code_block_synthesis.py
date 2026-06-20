@@ -897,24 +897,24 @@ class TestTrajectoryFidelity:
             [
                 _interaction(
                     "type_text",
-                    selector="#provInput",
+                    selector="#searchInput",
                     source_url="https://example.com/find-care",
                     typed_length=13,
                     role="textbox",
-                    accessible_name="Provider Name",
+                    accessible_name="Entity Name",
                 )
             ],
             strict_selectors=True,
         )
 
         assert result is not None
-        assert 'await page.locator("#provInput").fill(str(provider_name))' in result.code
+        assert 'await page.locator("#searchInput").fill(str(entity_name))' in result.code
         assert result.diagnostics.dropped_interactions == []
         assert result.diagnostics.locator_provenance == [
             {
                 "trajectory_index": 0,
-                "selector": "#provInput",
-                "emitted_literal": "#provInput",
+                "selector": "#searchInput",
+                "emitted_literal": "#searchInput",
                 "source": "selector",
             }
         ]
@@ -939,7 +939,7 @@ class TestTrajectoryFidelity:
                 _interaction(
                     "click",
                     selector="#go",
-                    source_url="https://user:password@example.com/search?token=secret-token&q=provider#access_token=fragment-token&section=results",
+                    source_url="https://user:password@example.com/search?token=secret-token&q=record#access_token=fragment-token&section=results",
                 )
             ]
         )
@@ -948,7 +948,7 @@ class TestTrajectoryFidelity:
                 _interaction(
                     "click",
                     selector="#go",
-                    source_url="https://user:password@example.com/search?token=secret-token&q=provider#access_token=fragment-token&section=results",
+                    source_url="https://user:password@example.com/search?token=secret-token&q=record#access_token=fragment-token&section=results",
                 )
             ]
         )
@@ -957,11 +957,11 @@ class TestTrajectoryFidelity:
         assert "user:password" not in result.code
         assert "secret-token" not in result.code
         assert "fragment-token" not in result.code
-        assert "q=provider" in result.code
+        assert "q=record" in result.code
         assert "section=results" in result.code
         page_dependency = metadata["page_dependencies"][0]
         assert page_dependency["url_hint"] == (
-            "https://example.com/search?token=__redacted__&q=provider#access_token=__redacted__&section=results"
+            "https://example.com/search?token=__redacted__&q=record#access_token=__redacted__&section=results"
         )
 
     def test_synthesis_scrubs_bare_sensitive_url_fragments(self) -> None:
@@ -970,7 +970,7 @@ class TestTrajectoryFidelity:
                 _interaction(
                     "click",
                     selector="#go",
-                    source_url="https://example.com/search?q=provider#secret-token-fragment",
+                    source_url="https://example.com/search?q=record#secret-token-fragment",
                 )
             ]
         )
@@ -979,7 +979,7 @@ class TestTrajectoryFidelity:
                 _interaction(
                     "click",
                     selector="#go",
-                    source_url="https://example.com/search?q=provider#secret-token-fragment",
+                    source_url="https://example.com/search?q=record#secret-token-fragment",
                 )
             ]
         )
@@ -987,10 +987,10 @@ class TestTrajectoryFidelity:
         assert result is not None
         assert "secret-token-fragment" not in result.code
         assert (
-            'await page.goto("https://example.com/search?q=provider#__redacted__", wait_until="domcontentloaded")'
+            'await page.goto("https://example.com/search?q=record#__redacted__", wait_until="domcontentloaded")'
             in result.code
         )
-        assert metadata["page_dependencies"][0]["url_hint"] == "https://example.com/search?q=provider#__redacted__"
+        assert metadata["page_dependencies"][0]["url_hint"] == "https://example.com/search?q=record#__redacted__"
 
 
 class TestDeterminismAndEmpty:
@@ -1251,6 +1251,179 @@ class TestPreflightSurfacesSyntaxError:
         # A malformed block must be caught at authoring time, not swallowed into a silent run-time failure.
         diagnostics = preflight_code_block('await page.goto("unterminated)\n', parameter_keys=())
         assert any(d.code == "SYNTAX_ERROR" for d in diagnostics)
+
+    def test_broad_body_text_wait_for_function_surfaces_selection_diagnostic(self) -> None:
+        code = (
+            "await page.wait_for_function("
+            "\"() => document.body.innerText.includes('Details') || "
+            "document.body.innerText.includes('Nothing was found')\", timeout=5000)\n"
+        )
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT") == 1
+        assert any("localized result/detail" in d.message for d in diagnostics)
+
+    def test_broad_body_text_wait_for_function_keyword_expression_surfaces_selection_diagnostic(self) -> None:
+        code = (
+            "await page.wait_for_function("
+            "expression=\"() => document.body.innerText.includes('Details')\", timeout=5000)\n"
+        )
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT") == 1
+
+    def test_localized_detail_locator_wait_does_not_surface_body_text_diagnostic(self) -> None:
+        code = (
+            'await page.locator("main").get_by_text("Details").wait_for(timeout=5000)\n'
+            'return {"entity_name": await page.locator("h1").inner_text(timeout=5000)}\n'
+        )
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT" for d in diagnostics)
+
+    def test_non_page_wait_for_function_does_not_surface_body_text_diagnostic(self) -> None:
+        code = """
+        diagnostics = []
+        await custom_waiter.wait_for_function("() => document.body.innerText.includes('Ready')")
+        return {"diagnostics": diagnostics}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=("custom_waiter",))
+
+        assert not any(d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT" for d in diagnostics)
+
+    def test_persist_safety_rejects_broad_body_text_wait_for_function(self) -> None:
+        workflow_yaml = (
+            "title: Record lookup\n"
+            "workflow_definition:\n"
+            "  blocks:\n"
+            "    - block_type: code\n"
+            "      label: check_record_status_status\n"
+            "      code: |\n"
+            "        await page.wait_for_function(\"() => document.body.innerText.includes('Details')\", "
+            "timeout=5000)\n"
+        )
+
+        errors = _code_block_safety_errors(workflow_yaml, None)
+
+        assert any("failed the generated-code preflight check" in str(error) for error in errors)
+        assert any("localized result/detail" in str(error) for error in errors)
+
+    def test_broad_container_record_scan_surfaces_row_extraction_diagnostic(self) -> None:
+        code = """
+        raw_cards = []
+        for selector in ["[class*='result']", "article", "section", ".card", "li"]:
+            locs = page.locator(selector)
+            for i in range(await locs.count()):
+                txt = await locs.nth(i).inner_text()
+                if "status" in txt.lower():
+                    raw_cards.append(txt)
+        items = []
+        for txt in raw_cards:
+            items.append({
+                "item_name": txt.split("\\n")[0],
+                "address": txt[:200],
+                "status": "Inactive" if "inactive" in txt.lower() else "Active",
+            })
+        return {"items": items, "overall_status": "Active"}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
+
+    def test_embedded_tr_substring_does_not_suppress_broad_scan_diagnostic(self) -> None:
+        code = """
+        cards = page.locator("section")
+        items = []
+        for i in range(await cards.count()):
+            text = await cards.nth(i).inner_text()
+            items.append({
+                "record_name": text.split("\\n")[0],
+                "street_label": "Street",
+                "status": "Active",
+            })
+        return {"items": items}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
+
+    def test_non_selector_section_literal_does_not_surface_broad_scan_diagnostic(self) -> None:
+        code = """
+        layout_type = "section"
+        items = [{"name": "Example"}]
+        return {"items": items, "layout_type": layout_type}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
+
+    def test_lone_list_item_selector_does_not_surface_broad_scan_diagnostic(self) -> None:
+        code = """
+        await page.locator("li").filter(has_text="Status").click()
+        return {"items": [], "overall_status": "Active"}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
+
+    def test_status_text_without_record_return_shape_does_not_surface_broad_scan_diagnostic(self) -> None:
+        code = """
+        sections = page.locator("section")
+        for i in range(await sections.count()):
+            text = await sections.nth(i).inner_text()
+            if "status" in text.lower():
+                print("status panel found")
+        return {"ok": True}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
+
+    def test_status_only_error_shape_does_not_surface_broad_scan_diagnostic(self) -> None:
+        code = """
+        section = page.locator("section").first
+        if await section.count() == 0:
+            return {"status": "missing"}
+        await section.click()
+        return {"status": "clicked"}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
+
+    def test_table_row_record_extraction_does_not_surface_broad_scan_diagnostic(self) -> None:
+        code = """
+        rows = page.locator("table tbody tr")
+        items = []
+        for i in range(await rows.count()):
+            row = rows.nth(i)
+            cells = row.locator("td")
+            if await cells.count() < 3:
+                continue
+            item_name = " ".join((await cells.nth(0).inner_text()).split())
+            address = " ".join((await cells.nth(1).inner_text()).split())
+            status = " ".join((await cells.nth(2).inner_text()).split())
+            items.append({
+                "item_name": item_name,
+                "address": address,
+                "status": status,
+            })
+        return {"items": items, "overall_status": "Active"}
+        """
+
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
 
 
 class TestRenderSynthesizedOfferText:
