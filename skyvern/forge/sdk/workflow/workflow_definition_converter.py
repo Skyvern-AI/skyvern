@@ -202,7 +202,11 @@ def convert_workflow_definition(
                     workflow_parameter_key=parameter.key,
                     required_value="bitwarden_collection_id or bitwarden_item_id",
                 )
-            if parameter.bitwarden_collection_id and not parameter.url_parameter_key:
+            if (
+                parameter.bitwarden_collection_id
+                and not parameter.bitwarden_item_id
+                and not parameter.url_parameter_key
+            ):
                 raise WorkflowParameterMissingRequiredValue(
                     workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
                     workflow_parameter_key=parameter.key,

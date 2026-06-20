@@ -4735,8 +4735,9 @@ class FileUploadBlock(Block):
     continue_on_empty: bool = Field(
         default=False,
         description=(
-            "When the run download directory has no files, fail the block (False, default) instead "
-            "of reporting success. Set True to allow an empty upload (success with no files uploaded)."
+            "When the run download directory has no files, allow the empty upload only after confirming no registered, "
+            "browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an "
+            "empty upload."
         ),
     )
 
@@ -4863,6 +4864,194 @@ class FileUploadBlock(Block):
             azure_blob_name=blob_name,
         )
 
+    @staticmethod
+    def _candidate_download_signal_run_ids(
+        *,
+        context: SkyvernContext | None,
+        workflow_run_id: str,
+        run_download_id: str | None,
+    ) -> list[str]:
+        candidate_run_ids: list[str] = []
+        for candidate in (
+            run_download_id,
+            workflow_run_id,
+            context.run_id if context else None,
+            context.workflow_run_id if context else None,
+        ):
+            if candidate and candidate not in candidate_run_ids:
+                candidate_run_ids.append(candidate)
+        if not candidate_run_ids and context and context.task_id:
+            candidate_run_ids.append(context.task_id)
+        return candidate_run_ids
+
+    def _get_files_to_upload_from_download_dir(
+        self,
+        *,
+        download_files_path: str,
+        max_file_count: int,
+    ) -> list[str]:
+        files_to_upload = []
+        if os.path.isdir(download_files_path):
+            files = os.listdir(download_files_path)
+            if len(files) > max_file_count:
+                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
+            for file in files:
+                if os.path.isdir(os.path.join(download_files_path, file)):
+                    LOG.warning("FileUploadBlock Skipping directory", file=file)
+                    continue
+                files_to_upload.append(os.path.join(download_files_path, file))
+        return files_to_upload
+
+    def _get_files_in_alternate_candidate_download_dirs(
+        self,
+        *,
+        context: SkyvernContext | None,
+        workflow_run_id: str,
+        run_download_id: str | None,
+        download_files_path: str,
+        max_file_count: int,
+    ) -> tuple[list[str] | None, str]:
+        """Return alternate local files plus a failure-reason count label.
+
+        None means the local evidence could not be trusted, so execute() fails closed rather than no-oping.
+        """
+        for candidate_run_id in self._candidate_download_signal_run_ids(
+            context=context,
+            workflow_run_id=workflow_run_id,
+            run_download_id=run_download_id,
+        ):
+            candidate_download_files_path = str(get_path_for_workflow_download_directory(candidate_run_id).absolute())
+            if candidate_download_files_path == download_files_path:
+                continue
+            try:
+                alternate_files = self._get_files_to_upload_from_download_dir(
+                    download_files_path=candidate_download_files_path,
+                    max_file_count=max_file_count,
+                )
+            except ValueError:
+                LOG.warning(
+                    "FileUploadBlock found too many files in an alternate candidate download directory",
+                    workflow_run_id=workflow_run_id,
+                    candidate_run_id=candidate_run_id,
+                    download_files_path=download_files_path,
+                    candidate_download_files_path=candidate_download_files_path,
+                    exc_info=True,
+                )
+                return None, "too_many"
+            if alternate_files:
+                LOG.warning(
+                    "FileUploadBlock found files in an alternate candidate download directory",
+                    workflow_run_id=workflow_run_id,
+                    candidate_run_id=candidate_run_id,
+                    download_files_path=download_files_path,
+                    candidate_download_files_path=candidate_download_files_path,
+                    file_count=len(alternate_files),
+                )
+                return alternate_files, str(len(alternate_files))
+        return [], "0"
+
+    async def _get_browser_session_downloaded_files_for_empty_scan(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        browser_session_id: str | None,
+    ) -> list[str] | None:
+        if not browser_session_id:
+            # No persistent-session namespace exists to inspect, so this signal cannot contain downloads.
+            return []
+        if not organization_id:
+            LOG.warning(
+                "FileUploadBlock cannot check browser-session downloads without organization_id",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+            )
+            return None
+
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout checking browser-session downloads for empty FileUploadBlock scan",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+            )
+            return None
+        except Exception:
+            LOG.warning(
+                "Failed to check browser-session downloads for empty FileUploadBlock scan",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _get_registered_downloaded_files_for_empty_scan(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        run_download_id: str | None,
+        context: SkyvernContext | None,
+    ) -> list[FileInfo] | None:
+        """Return registered downloads, or None when the signal is unknown.
+
+        A timeout on any candidate stays unknown even if later candidates might be empty; an empty later lookup cannot
+        prove that the timed-out candidate had no downloads, so the caller fails closed.
+        """
+        if not organization_id:
+            LOG.warning(
+                "FileUploadBlock cannot check registered downloads without organization_id",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+        registered_downloaded_files: list[FileInfo] = []
+        for candidate_run_id in self._candidate_download_signal_run_ids(
+            context=context,
+            workflow_run_id=workflow_run_id,
+            run_download_id=run_download_id,
+        ):
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    registered_downloaded_files.extend(
+                        await app.STORAGE.get_downloaded_files(
+                            organization_id=organization_id,
+                            run_id=candidate_run_id,
+                        )
+                    )
+                    if registered_downloaded_files:
+                        return registered_downloaded_files
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout checking registered downloads for empty FileUploadBlock scan",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    candidate_run_id=candidate_run_id,
+                )
+                return None
+            except Exception:
+                LOG.warning(
+                    "Failed to check registered downloads for empty FileUploadBlock scan",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    candidate_run_id=candidate_run_id,
+                    exc_info=True,
+                )
+                return None
+
+        return registered_downloaded_files
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4923,38 +5112,88 @@ class FileUploadBlock(Block):
             )
 
         context = skyvern_context.current()
-        download_files_path = str(
-            get_path_for_workflow_download_directory(
-                resolve_run_download_id(context, fallback_run_id=workflow_run_id)
-            ).absolute()
-        )
+        run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+        download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
 
-        uploaded_uris = []
+        uploaded_uris: list[str] = []
         try:
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             files_to_upload = []
-            if os.path.isdir(download_files_path):
-                files = os.listdir(download_files_path)
-                max_file_count = (
-                    MAX_UPLOAD_FILE_COUNT
-                    if self.storage_type == FileStorageType.S3
-                    else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
-                )
-                if len(files) > max_file_count:
-                    raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
-                for file in files:
-                    if os.path.isdir(os.path.join(download_files_path, file)):
-                        LOG.warning("FileUploadBlock Skipping directory", file=file)
-                        continue
-                    files_to_upload.append(os.path.join(download_files_path, file))
+            max_file_count = (
+                MAX_UPLOAD_FILE_COUNT
+                if self.storage_type == FileStorageType.S3
+                else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            )
+            files_to_upload = self._get_files_to_upload_from_download_dir(
+                download_files_path=download_files_path,
+                max_file_count=max_file_count,
+            )
 
             if not files_to_upload and not self.continue_on_empty:
-                # Never green on a zero-file upload by default: a download-dir/scan-dir desync
-                # would otherwise be silent data loss (SKY-11153). Opt out with continue_on_empty.
+                (
+                    (alternate_files, alternate_file_count),
+                    browser_session_downloaded_files,
+                    registered_downloaded_files,
+                ) = await asyncio.gather(
+                    asyncio.to_thread(
+                        self._get_files_in_alternate_candidate_download_dirs,
+                        context=context,
+                        workflow_run_id=workflow_run_id,
+                        run_download_id=run_download_id,
+                        download_files_path=download_files_path,
+                        max_file_count=max_file_count,
+                    ),
+                    self._get_browser_session_downloaded_files_for_empty_scan(
+                        organization_id=organization_id or workflow_run_context.organization_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        browser_session_id=browser_session_id or (context.browser_session_id if context else None),
+                    ),
+                    self._get_registered_downloaded_files_for_empty_scan(
+                        organization_id=organization_id or workflow_run_context.organization_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        run_download_id=run_download_id,
+                        context=context,
+                    ),
+                )
+                if (
+                    registered_downloaded_files == []
+                    and alternate_files == []
+                    and browser_session_downloaded_files == []
+                ):
+                    LOG.info(
+                        "FileUploadBlock empty scan has no registered downloads; treating as no-op",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        download_files_path=download_files_path,
+                        storage_type=self.storage_type,
+                    )
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
+                    return await self.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value=uploaded_uris,
+                        status=BlockStatus.completed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
+                registered_download_count = (
+                    str(len(registered_downloaded_files)) if registered_downloaded_files is not None else "unknown"
+                )
+                browser_session_download_count = (
+                    str(len(browser_session_downloaded_files))
+                    if browser_session_downloaded_files is not None
+                    else "unknown"
+                )
                 return await self.build_block_result(
                     success=False,
                     failure_reason=(
                         f"No files found to upload in the run download directory ({download_files_path}); "
+                        f"registered_download_count={registered_download_count}; "
+                        f"alternate_file_count={alternate_file_count}; "
+                        f"browser_session_download_count={browser_session_download_count}; "
                         f"nothing was sent to {self.storage_type}."
                     ),
                     output_parameter_value=None,
