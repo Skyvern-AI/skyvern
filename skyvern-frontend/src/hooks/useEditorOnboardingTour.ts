@@ -259,16 +259,17 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
     if (requestedAt === null) return;
     clearRequest();
     // No provider (non-cloud app) means dismissals/completions cannot persist, so
-    // never start an untracked tour - mirrors the auto-start guard.
+    // never start an untracked tour - mirrors the auto-start guard. The experiment
+    // arm only gates auto-start; the menu item and Shift+? are always-available
+    // affordances, so the manual trigger must run regardless of flag enrollment.
     if (onboarding === null) return;
-    if (!isABVariant(flagVariant)) return;
     if (tourActiveRef.current) {
       driverRef.current?.destroy();
       tourActiveRef.current = false;
       setTourActive(false);
     }
     startDriver();
-  }, [requestedAt, clearRequest, startDriver, flagVariant, onboarding]);
+  }, [requestedAt, clearRequest, startDriver, onboarding]);
 
   // Step 2 ("Add blocks") is gated: opening the block library while it is the
   // active step satisfies the gate once and advances. Once satisfied the Next
