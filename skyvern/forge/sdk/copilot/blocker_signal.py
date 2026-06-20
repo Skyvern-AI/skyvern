@@ -12,6 +12,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 
 BlockerKind = Literal[
@@ -171,7 +172,7 @@ class TerminalEvidence:
 
 @dataclass(frozen=True)
 class LoopBlockerEvidence(TerminalEvidence):
-    pass
+    latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
 
 
 class _LoopEvidenceCtx(Protocol):
@@ -183,6 +184,7 @@ class _LoopEvidenceCtx(Protocol):
     staged_workflow: Any | None
     staged_workflow_yaml: str | None
     has_staged_proposal: bool
+    latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None
 
 
 class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
@@ -239,6 +241,8 @@ def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> 
 
 def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence:
     evidence = terminal_evidence_from_ctx(ctx)
+    # Older context snapshots may not carry fields added after the snapshot was created.
+    result_steer = getattr(ctx, "latest_evaluate_result_composition_steer", None)
     return LoopBlockerEvidence(
         outcome_gate_reason=evidence.outcome_gate_reason,
         outcome_gate_workflow_run_id=evidence.outcome_gate_workflow_run_id,
@@ -246,6 +250,7 @@ def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence
         latest_workflow_run_id=evidence.latest_workflow_run_id,
         anti_bot_blocked=evidence.anti_bot_blocked,
         has_draft=evidence.has_draft,
+        latest_evaluate_result_composition_steer=result_steer,
     )
 
 
@@ -365,6 +370,9 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     ),
 }
 _LOOP_ANTI_BOT_BLOCKER_COPY = "The site's verification challenge was still keeping the submit/search control disabled."
+_LOOP_RESULT_COMPOSITION_BLOCKER_COPY = (
+    "I found loaded results on the page, but I got stuck before extracting the requested information."
+)
 _LOOP_VERDICT_MAX_CHARS = 240
 _LOOP_VERDICT_FAILED_PREFIX = "failed:"
 # Fixed agent-advice tails appended by the recorded-reason producers; repair
@@ -490,6 +498,20 @@ def compose_loop_blocker_user_facing_reason(
     if internal_reason_code == "loop_detected_credential_or_parameter_misconfig":
         return _LOOP_CREDENTIAL_TEMPLATE, draft_tier
     framing, ask = _LOOP_BRANCH_COPY.get(internal_reason_code or "", _LOOP_BRANCH_COPY["loop_detected_generic"])
+    result_steer = evidence.latest_evaluate_result_composition_steer if evidence is not None else None
+    if (
+        internal_reason_code == "loop_detected_consecutive_same_tool"
+        and blocked_tool == "evaluate"
+        and result_steer is not None
+    ):
+        # Loaded-result loops use their own framing while preserving the branch-specific ask.
+        user_facing, tiers = compose_terminal_evidence_user_facing_reason(
+            _LOOP_RESULT_COMPOSITION_BLOCKER_COPY,
+            ask,
+            evidence,
+            blocked_tool=blocked_tool,
+        )
+        return user_facing, ("loaded_results", *tiers)
     return compose_terminal_evidence_user_facing_reason(framing, ask, evidence, blocked_tool=blocked_tool)
 
 

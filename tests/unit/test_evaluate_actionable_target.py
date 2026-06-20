@@ -33,6 +33,36 @@ def _full_packet() -> dict:
     }
 
 
+def _result_table_packet() -> dict:
+    return {
+        "forms": [],
+        "navigation_targets": [{"selector": "#details", "text": "Details", "href": "/details"}],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#results",
+                "text": "Results",
+                "row_count": 2,
+                "sample_rows": ["Result A May 2026 $42.00", "Result B May 2026 $51.00"],
+            }
+        ],
+    }
+
+
+def _row_result_packet() -> dict:
+    return {
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {
+                "selector": "#results",
+                "row_count": 1,
+                "sample_rows": ["May 2026 statement available"],
+            }
+        ],
+    }
+
+
 def _ctx() -> AgentContext:
     return AgentContext.__new__(AgentContext)
 
@@ -74,6 +104,60 @@ async def test_first_evaluate_names_targets_without_next_action(monkeypatch) -> 
     await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/bill")
     assert "actionable_targets" in result["data"]
     assert "next_action" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_first_loaded_result_table_steers_to_composition_not_click_even_with_actionable_targets(
+    monkeypatch,
+) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "extract" in result["data"]["next_action_reason"]
+    assert "click" not in result["data"]["next_action_reason"].lower()
+    assert "actionable_targets" not in result["data"]
+    assert result["data"]["composition_targets"] == {
+        "result_container_count": 1,
+        "table_result_container_count": 1,
+    }
+    assert ctx.latest_evaluate_result_composition_steer.result_container_count == 1
+    assert ctx.last_evaluate_actionable_signature is None
+    assert ctx.last_evaluate_actionable_url is None
+
+
+@pytest.mark.asyncio
+async def test_first_loaded_result_rows_without_table_marker_steers_to_composition(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _row_result_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    result = {"ok": True, "data": {"url": "https://example.com/results"}}
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert result["data"]["composition_targets"] == {
+        "result_container_count": 1,
+        "table_result_container_count": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -160,6 +244,28 @@ async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
     assert second["data"].get("actionable_targets")
     assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
     assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+
+
+@pytest.mark.asyncio
+async def test_first_loaded_result_table_sheds_large_payload_but_keeps_composition_steer(monkeypatch) -> None:
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/results"
+
+    async def fake(c, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "x" * 10000
+    result = {"ok": True, "data": {"url": url, "result": {"html": big, "text": big}}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
+    serialized = json.dumps(result, default=str)
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert result["data"].get("composition_targets")
+    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert "compose_extraction" in serialized
 
 
 @pytest.mark.asyncio
@@ -256,8 +362,9 @@ async def test_probe_none_leaves_data_untouched_and_resets(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_probe_empty_collections_no_steer(monkeypatch) -> None:
     ctx = _ctx()
-    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_signature = "seed"
     ctx.last_evaluate_actionable_url = None
+    ctx.latest_evaluate_result_composition_steer = object()
 
     async def fake(c, *, url):
         return {"forms": [], "navigation_targets": [], "result_containers": []}
@@ -266,6 +373,7 @@ async def test_probe_empty_collections_no_steer(monkeypatch) -> None:
     result = {"ok": True, "data": {"url": "https://app.example.com/x"}}
     await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://app.example.com/x")
     assert "actionable_targets" not in result["data"]
+    assert ctx.latest_evaluate_result_composition_steer is None
 
 
 @pytest.mark.asyncio

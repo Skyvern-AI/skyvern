@@ -28,6 +28,10 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
+from skyvern.forge.sdk.copilot.result_evidence import (
+    loaded_result_composition_evidence_from_page,
+    loaded_result_composition_target_summary,
+)
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
@@ -221,7 +225,7 @@ def _record_scouted_interaction(
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
     if tool_name != "press_key" and not selector:
         return
-    _reset_evaluate_actionable_tracker(ctx)
+    _reset_evaluate_tracker(ctx)
     artifact: ScoutedInteraction = {"tool_name": tool_name}
     if selector:
         artifact["selector"] = selector
@@ -472,11 +476,16 @@ _EVALUATE_ACTIONABLE_MAX_TARGETS = 4
 _EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
     "This page already exposes actionable targets; click the intended one rather than re-evaluating."
 )
+_EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
+    "Loaded results are already visible on the current page; inspect this page for composition or author an "
+    "extraction/validation block from the loaded results instead of re-reading it."
+)
 
 
-def _reset_evaluate_actionable_tracker(ctx: AgentContext) -> None:
+def _reset_evaluate_tracker(ctx: AgentContext) -> None:
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
+    ctx.latest_evaluate_result_composition_steer = None
 
 
 def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
@@ -608,7 +617,15 @@ _EVALUATE_STEER_SHED_MARKER = "[omitted on repeat — act on the named target in
 
 # Keys the steer must never shed: navigation/identity context plus the steer's own output.
 _EVALUATE_STEER_ESSENTIAL_KEYS = frozenset(
-    {"url", "title", "observation_step", "actionable_targets", "next_action", "next_action_reason"}
+    {
+        "url",
+        "title",
+        "observation_step",
+        "actionable_targets",
+        "composition_targets",
+        "next_action",
+        "next_action_reason",
+    }
 )
 
 # Nested bulky subfields inside an evaluate `result` dict (the raw page payload).
@@ -634,21 +651,23 @@ def _largest_non_essential_data_key(data: dict[str, Any]) -> str | None:
     return candidates[0][0]
 
 
-def _fit_evaluate_steer_under_cap(result: dict[str, Any], data: dict[str, Any], *, is_repeat: bool) -> None:
+def _fit_evaluate_steer_under_cap(
+    result: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    keep_raw_page_payload: bool,
+) -> None:
     """Keep the serialized result under the recent-output cap without ever head-slicing it.
 
-    A first evaluate is reconnaissance: if naming targets alone pushes it over cap, drop only the
-    advisory `actionable_targets` and leave the raw page (`data["result"]`) for the model to read.
-    A repeat is an imperative steer: the model already saw the page on evaluate #1, so shed the bulky
-    non-essential payload (the nested raw fields of `result`, then `result`/any large key wholesale,
-    replaced by a short marker) while always keeping `next_action`, its reason, and >=1 target."""
+    Reconnaissance output needs the raw page payload available to the model; imperative steers have
+    enough structured evidence to shed bulky non-essential payload while always preserving the action."""
 
     def over_cap() -> bool:
         return len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
 
     if not over_cap():
         return
-    if not is_repeat:
+    if keep_raw_page_payload:
         data.pop("actionable_targets", None)
         return
     nested = data.get("result")
@@ -760,11 +779,30 @@ async def _maybe_steer_evaluate_to_action(
             else page_evidence
         )
         if parsed is None or not has_bounded_page_schema(parsed):
-            _reset_evaluate_actionable_tracker(ctx)
+            _reset_evaluate_tracker(ctx)
             return False
+        loaded_results = loaded_result_composition_evidence_from_page(parsed)
+        if loaded_results is not None:
+            _reset_evaluate_tracker(ctx)
+            ctx.latest_evaluate_result_composition_steer = loaded_results
+            data.pop("actionable_targets", None)
+            data["composition_targets"] = loaded_result_composition_target_summary(loaded_results)
+            data["next_action"] = "compose_extraction"
+            data["next_action_reason"] = _EVALUATE_RESULT_COMPOSITION_INSTRUCTION
+            # The steer is structured enough to keep under cap without preserving raw page payload.
+            _fit_evaluate_steer_under_cap(result, data, keep_raw_page_payload=False)
+            LOG.info(
+                "copilot_evaluate_result_composition_steer",
+                url=url,
+                result_container_count=loaded_results.result_container_count,
+                table_result_container_count=loaded_results.table_result_container_count,
+            )
+            # The result is patched in-place; returning False keeps the normal tool-loop guard active.
+            return False
+        ctx.latest_evaluate_result_composition_steer = None
         identities = _actionable_target_identities(parsed)
         if not identities:
-            _reset_evaluate_actionable_tracker(ctx)
+            _reset_evaluate_tracker(ctx)
             return False
         signature = _actionable_target_signature(identities)
         # Strict full-URL match (fragment included): on an SPA a hash-route change
@@ -788,7 +826,7 @@ async def _maybe_steer_evaluate_to_action(
             if is_repeat:
                 data["next_action"] = "click"
                 data["next_action_reason"] = _EVALUATE_ACTIONABLE_ACT_INSTRUCTION
-            _fit_evaluate_steer_under_cap(result, data, is_repeat=is_repeat)
+            _fit_evaluate_steer_under_cap(result, data, keep_raw_page_payload=not is_repeat)
         LOG.info(
             "copilot_evaluate_actionable_target_steer",
             url=url,
@@ -798,9 +836,10 @@ async def _maybe_steer_evaluate_to_action(
         )
     except Exception:
         data.pop("actionable_targets", None)
+        data.pop("composition_targets", None)
         data.pop("next_action", None)
         data.pop("next_action_reason", None)
-        _reset_evaluate_actionable_tracker(ctx)
+        _reset_evaluate_tracker(ctx)
         LOG.warning("copilot_evaluate_actionable_target_steer_failed", exc_info=True)
     return False
 
