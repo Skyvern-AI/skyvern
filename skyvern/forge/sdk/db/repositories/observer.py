@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.protocols import TaskReader
 from skyvern.forge.sdk.db.utils import (
     convert_to_task_v2,
     convert_to_workflow_run_block,
+    downloaded_file_count_from_output,
     serialize_proxy_location,
     truncate_oversized_jsonb_value,
 )
@@ -502,6 +503,9 @@ class ObserverRepository(BaseRepository):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
     ) -> WorkflowRunBlock:
+        # Read before truncation: truncate_oversized_jsonb_value strips downloaded_files
+        # from oversized payloads, which would zero out an otherwise-real count.
+        derived_downloaded_file_count = downloaded_file_count_from_output(output)
         if output is not None:
             output = truncate_oversized_jsonb_value(
                 output,
@@ -589,6 +593,10 @@ class ObserverRepository(BaseRepository):
                     workflow_run_block.executed_branch_result = executed_branch_result
                 if executed_branch_next_block is not None:
                     workflow_run_block.executed_branch_next_block = executed_branch_next_block
+                # Count derives from the output; rewrite it whenever output is written
+                # (a non-download output clears a stale count). Falsy output leaves it.
+                if output:
+                    workflow_run_block.downloaded_file_count = derived_downloaded_file_count
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

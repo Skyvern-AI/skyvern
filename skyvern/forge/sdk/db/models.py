@@ -1037,6 +1037,10 @@ class WorkflowRunBlockModel(Base):
     # column on `WorkflowRunModel` but at block granularity.
     script_run = Column(JSON, nullable=True)
 
+    # Scalar mirror of output["downloaded_files"] length: the JSON output column is
+    # not CDC-mirrored, so download success would not otherwise be queryable.
+    downloaded_file_count = Column(Integer, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 

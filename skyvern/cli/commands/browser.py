@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -251,7 +252,20 @@ def session_close(
         skyvern = get_skyvern()
         result = await do_session_close(skyvern, connection.session_id)
         clear_state()
-        return {"session_id": result.session_id, "closed": result.closed}
+
+        # Best-effort fetch of recording data after close
+        recording_data: dict = {}
+        try:
+            resolved = await skyvern.get_browser_session(connection.session_id)
+            recording_data = {
+                "app_url": resolved.app_url,
+                "recordings": [{"url": r.url, "filename": r.filename} for r in (resolved.recordings or [])],
+                "downloaded_files": [{"url": f.url, "filename": f.filename} for f in (resolved.downloaded_files or [])],
+            }
+        except Exception:
+            pass
+
+        return {"session_id": result.session_id, "closed": result.closed, **recording_data}
 
     try:
         data = asyncio.run(_run())
@@ -343,6 +357,8 @@ def session_get(
         resolved = await skyvern.get_browser_session(session)
         state = load_state()
         is_current = bool(state and state.mode == "cloud" and state.session_id == session)
+        recordings = [{"url": r.url, "filename": r.filename} for r in (resolved.recordings or [])]
+        downloaded_files = [{"url": f.url, "filename": f.filename} for f in (resolved.downloaded_files or [])]
         return {
             "session_id": resolved.browser_session_id,
             "status": resolved.status,
@@ -351,6 +367,9 @@ def session_get(
             "timeout": resolved.timeout,
             "runnable_id": resolved.runnable_id,
             "is_current": is_current,
+            "app_url": resolved.app_url,
+            "recordings": recordings,
+            "downloaded_files": downloaded_files,
         }
 
     try:
@@ -2286,3 +2305,122 @@ def clipboard_write_cmd(
     except Exception as e:
         capture_cli_tool_call("skyvern_clipboard_write", ok=False, error=e)
         output_error(str(e), json_mode=json_output)
+
+
+# ---------------------------------------------------------------------------
+# QA command — single-prompt QA with recording
+# ---------------------------------------------------------------------------
+
+
+@browser_app.command("qa")
+def qa(
+    prompt: str = typer.Argument(..., help="Natural language QA task to perform."),
+    url: str | None = typer.Option(None, help="URL to navigate to before running."),
+    timeout: int = typer.Option(15, help="Session timeout in minutes."),
+    max_steps: int | None = typer.Option(None, "--max-steps", min=1, help="Maximum number of agent steps."),
+    task_timeout: int = typer.Option(180, "--task-timeout", min=10, max=1800, help="Task timeout in seconds."),
+    proxy: str | None = typer.Option(None, help="Proxy location (e.g. RESIDENTIAL)."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Run a single-prompt QA task with automatic session management and recording.
+
+    Creates a cloud browser session, runs the task, fetches the recording, and
+    closes the session. Returns the result along with recording URLs.
+
+    \b
+    Examples:
+      skyvern browser qa "Go to https://example.com and verify the homepage loads"
+      skyvern browser qa "Log in and check the dashboard" --url https://app.example.com
+    """
+
+    async def _run() -> dict[str, Any]:
+        skyvern_client = get_skyvern()
+
+        # 1. Create cloud session
+        _browser, session_result = await do_session_create(
+            skyvern_client,
+            timeout=timeout,
+            proxy_location=proxy,
+        )
+        session_id = session_result.session_id
+
+        try:
+            # 2. Run task via MCP tool (reuses existing implementation)
+            task_result = await tool_run_task(
+                prompt=prompt,
+                session_id=session_id,
+                url=url,
+                max_steps=max_steps,
+                timeout_seconds=task_timeout,
+            )
+
+            # 3. Fetch session details for recording
+            recording_data: dict[str, Any] = {}
+            if session_id:
+                try:
+                    session_details = await skyvern_client.get_browser_session(session_id)
+                    recording_data = {
+                        "app_url": session_details.app_url,
+                        "recordings": [
+                            {"url": r.url, "filename": r.filename} for r in (session_details.recordings or [])
+                        ],
+                    }
+                except Exception:
+                    pass
+
+            # 4. Build QA report
+            task_data = task_result.get("data", {}) if task_result.get("ok") else {}
+            qa_result: dict[str, Any] = {
+                "session_id": session_id,
+                "status": task_data.get("status", "failed") if task_data else "failed",
+                "prompt": prompt,
+                "output": task_data.get("output") if task_data else None,
+                "failure_reason": task_data.get("failure_reason") if task_data else None,
+                **recording_data,
+            }
+
+            if not task_result.get("ok"):
+                err = task_result.get("error", {})
+                qa_result["error"] = err.get("message", "Task failed")
+
+            return qa_result
+
+        finally:
+            # 5. Always close session
+            if session_id:
+                try:
+                    await do_session_close(skyvern_client, session_id)
+                except Exception:
+                    pass
+
+    try:
+        data = asyncio.run(_run())
+
+        if json_output:
+            json.dump(data, sys.stdout, indent=2, default=str)
+            sys.stdout.write("\n")
+            return
+
+        # Human-readable output
+        status = data.get("status", "unknown")
+        status_color = "green" if status == "completed" else "red"
+        console.print(f"\n[bold]QA Session:[/bold] {data.get('session_id', 'N/A')}")
+        console.print(f"[bold]Status:[/bold] [{status_color}]{status.upper()}[/{status_color}]")
+
+        if data.get("app_url"):
+            console.print(f"\n[bold]Watch recording:[/bold] [cyan]{data['app_url']}[/cyan]")
+        if data.get("recordings"):
+            for rec in data["recordings"]:
+                console.print(f"[bold]Download recording:[/bold] [cyan]{rec['url']}[/cyan]")
+
+        if data.get("output"):
+            console.print(f"\n[bold]Result:[/bold] {data['output']}")
+        if data.get("failure_reason"):
+            console.print(f"\n[bold red]Failure:[/bold red] {data['failure_reason']}")
+        if data.get("error"):
+            console.print(f"\n[bold red]Error:[/bold red] {data['error']}")
+
+        console.print()
+
+    except Exception as e:
+        output_error(str(e), hint="Check your API key, prompt, and network connection.", json_mode=json_output)
