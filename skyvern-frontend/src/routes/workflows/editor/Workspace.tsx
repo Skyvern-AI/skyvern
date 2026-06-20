@@ -354,7 +354,9 @@ function Workspace({
         ? frozenSidebarOpenRef.current
         : blockSidebarOpen
       : false;
-  const blockSidebarWidth = useBlockSidebarWidthStore((s) => s.width);
+  const renderedBlockSidebarWidth = useBlockSidebarWidthStore(
+    (s) => s.renderedWidth,
+  );
   const handleOnSave = useSaveWorkflow();
   const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -1418,7 +1420,7 @@ function Workspace({
       className="relative h-full w-full"
       style={
         {
-          [BLOCK_SIDEBAR_WIDTH_VAR]: `${blockSidebarWidth}px`,
+          [BLOCK_SIDEBAR_WIDTH_VAR]: `${renderedBlockSidebarWidth}px`,
         } as React.CSSProperties
       }
     >
