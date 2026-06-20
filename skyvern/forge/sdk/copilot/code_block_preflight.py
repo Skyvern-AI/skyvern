@@ -25,6 +25,18 @@ class CodeBlockPreflightDiagnostic:
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")
 _MYPY_ERROR_RE = re.compile(r"^(?P<path>.*?):(?P<line>\d+): (?P<severity>error): (?P<message>.*)$")
 _LOCATOR_NOT_CALLABLE_RE = re.compile(r'"Locator" not callable\s+\[operator\]')
+_BROAD_BODY_TEXT_WAIT_NEEDLES = (
+    "document.body.innertext",
+    "document.body.textcontent",
+    "document.documentelement.innertext",
+    "document.documentelement.textcontent",
+)
+_BROAD_TABLE_RECORD_KEYS = frozenset(("items", "locations", "records", "rows"))
+_BROAD_TABLE_SCAN_SELECTORS = frozenset({"article", "section", ".card", "li"})
+_BROAD_TABLE_SELECTOR_METHODS = frozenset(("locator", "query_selector", "query_selector_all"))
+_LONE_LIST_ITEM_SELECTOR_EXEMPTION = frozenset({"li"})
+_TABLE_ROW_TAG_SELECTOR_RE = re.compile(r"(?<![a-z0-9_-])tr(?![a-z0-9_-])")
+_TABLE_ROW_ROLE_SELECTOR_RE = re.compile(r"\[role\s*=\s*(['\"]?)row\1\]")
 
 
 @cache
@@ -127,21 +139,21 @@ def sandbox_unresolved_name_diagnostics(
     ]
 
 
-def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
-    try:
-        tree = ast.parse(_build_typed_module(code, parameter_keys=()))
-    except SyntaxError as exc:
-        # The wrapper scaffolding is static and valid, so any SyntaxError is in the supplied code —
-        # e.g. an attacker-page string with a raw line-boundary codepoint that splits a literal. Surface
-        # it at authoring time instead of letting the block fail silently at run time.
-        return [
-            CodeBlockPreflightDiagnostic(
-                code="SYNTAX_ERROR",
-                message=f"Code block does not parse as Python: {exc.msg}. Fix the snippet before persisting it.",
-            )
-        ]
+def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+    tree, _ = _parse_static_ast(code)
+    if tree is None:
+        return []
+    return _author_time_ast_diagnostics(tree)
 
-    diagnostics: list[CodeBlockPreflightDiagnostic] = []
+
+def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+    tree, syntax_error = _parse_static_ast(code)
+    if syntax_error is not None:
+        return [syntax_error]
+    if tree is None:
+        return []
+
+    diagnostics = _author_time_ast_diagnostics(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -156,6 +168,35 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
         regex_diagnostic = _regex_literal_diagnostic(node)
         if regex_diagnostic is not None:
             diagnostics.append(regex_diagnostic)
+
+    return diagnostics
+
+
+def _parse_static_ast(code: str) -> tuple[ast.AST | None, CodeBlockPreflightDiagnostic | None]:
+    try:
+        tree = ast.parse(_build_typed_module(code, parameter_keys=()))
+    except SyntaxError as exc:
+        # The wrapper scaffolding is static and valid, so any SyntaxError is in the supplied code —
+        # e.g. an attacker-page string with a raw line-boundary codepoint that splits a literal. Surface
+        # it at authoring time instead of letting the block fail silently at run time.
+        return None, CodeBlockPreflightDiagnostic(
+            code="SYNTAX_ERROR",
+            message=f"Code block does not parse as Python: {exc.msg}. Fix the snippet before persisting it.",
+        )
+    return tree, None
+
+
+def _author_time_ast_diagnostics(tree: ast.AST) -> list[CodeBlockPreflightDiagnostic]:
+    diagnostics: list[CodeBlockPreflightDiagnostic] = []
+    broad_table_scan = _broad_table_record_scan_diagnostic(tree)
+    if broad_table_scan is not None:
+        diagnostics.append(broad_table_scan)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        body_text_wait_diagnostic = _broad_body_text_wait_for_function_diagnostic(node)
+        if body_text_wait_diagnostic is not None:
+            diagnostics.append(body_text_wait_diagnostic)
     return diagnostics
 
 
@@ -535,6 +576,133 @@ def _page_evaluate_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | 
             "pack multiple values into a dict or list before calling evaluate."
         ),
     )
+
+
+def _broad_body_text_wait_for_function_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
+    func = node.func
+    if (
+        not isinstance(func, ast.Attribute)
+        or func.attr != "wait_for_function"
+        or not isinstance(func.value, ast.Name)
+        or func.value.id != "page"
+    ):
+        return None
+
+    script: ast.expr | None
+    if node.args:
+        script = node.args[0]
+    else:
+        expression_keyword = next((keyword for keyword in node.keywords if keyword.arg == "expression"), None)
+        script = expression_keyword.value if expression_keyword is not None else None
+    if not isinstance(script, ast.Constant) or not isinstance(script.value, str):
+        return None
+
+    normalized_script = re.sub(r"\s+", "", script.value).lower()
+    if not any(needle in normalized_script for needle in _BROAD_BODY_TEXT_WAIT_NEEDLES):
+        return None
+
+    return CodeBlockPreflightDiagnostic(
+        code="BROAD_DOCUMENT_BODY_TEXT_WAIT",
+        message=(
+            "Code block waits for broad `document.body` text with `page.wait_for_function`. "
+            "Loaded result/detail pages can be visible while body-level polling still times out. "
+            "Wait on a localized result/detail locator or visible field text, then extract and return "
+            "a keyed record from that region."
+        ),
+    )
+
+
+def _broad_table_record_scan_diagnostic(tree: ast.AST) -> CodeBlockPreflightDiagnostic | None:
+    selector_aliases = _selector_alias_values(tree)
+    record_keys: set[str] = set()
+    broad_selectors: set[str] = set()
+    row_selector_found = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    record_keys.add(key.value.casefold())
+        selector_arg = _locator_selector_arg(node)
+        if selector_arg is not None:
+            for selector in _selector_values(selector_arg, selector_aliases):
+                selector = selector.strip().casefold()
+                if selector in _BROAD_TABLE_SCAN_SELECTORS:
+                    broad_selectors.add(selector)
+                if _TABLE_ROW_TAG_SELECTOR_RE.search(selector) or _TABLE_ROW_ROLE_SELECTOR_RE.search(selector):
+                    row_selector_found = True
+
+    if not any(key in record_keys for key in _BROAD_TABLE_RECORD_KEYS):
+        return None
+    if not broad_selectors or row_selector_found:
+        return None
+    if broad_selectors == _LONE_LIST_ITEM_SELECTOR_EXEMPTION:
+        return None
+
+    return CodeBlockPreflightDiagnostic(
+        code="BROAD_TABLE_RECORD_SCAN",
+        message=(
+            "Code block appears to extract row-like records by scanning broad containers such as `section`, "
+            "`.card`, `article`, or `li`. For table-like or list-like records, iterate the actual row/item "
+            'elements (`tr`, `[role="row"]`, or equivalent repeated item containers) and read fields from '
+            "the same row so fields from separate records cannot be mixed. Derive summary status fields only "
+            "from parsed row objects."
+        ),
+    )
+
+
+def _literal_selector_values(expr: ast.AST) -> set[str]:
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return {expr.value}
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        values: set[str] = set()
+        for element in expr.elts:
+            if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                values.add(element.value)
+        return values
+    return set()
+
+
+def _selector_alias_values(tree: ast.AST) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets = [node.target]
+            value = node.iter
+        if value is None:
+            continue
+        selector_values = _literal_selector_values(value)
+        if not selector_values:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                aliases[target.id] = selector_values
+    return aliases
+
+
+def _selector_values(selector_arg: ast.AST, selector_aliases: dict[str, set[str]]) -> set[str]:
+    values = _literal_selector_values(selector_arg)
+    if values:
+        return values
+    if isinstance(selector_arg, ast.Name):
+        return selector_aliases.get(selector_arg.id, set())
+    return set()
+
+
+def _locator_selector_arg(node: ast.AST) -> ast.AST | None:
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr not in _BROAD_TABLE_SELECTOR_METHODS:
+        return None
+    return node.args[0]
 
 
 _RE_LITERAL_FUNCTIONS = frozenset(
