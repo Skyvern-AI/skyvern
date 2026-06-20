@@ -49,6 +49,7 @@ from .scouting import (
     _maybe_attach_reached_download_target,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
+    _reset_evaluate_tracker,
     _resolve_scout_role_name,
     _steer_evaluate_result,
 )
@@ -558,40 +559,43 @@ async def _evaluate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    if result.get("ok") and result.get("data"):
-        _mark_page_inspected(ctx)
-        result["data"].pop("sdk_equivalent", None)
-        if "url" not in result["data"]:
-            url, _ = await _resolve_url_title(raw, ctx)
-            if url:
-                result["data"]["url"] = url
-        url = str(result["data"].get("url") or "")
-        title = str(result["data"].get("title") or "")
-        if not title:
-            _, title = await _resolve_url_title(raw, ctx)
-        observation_step = _record_composition_page_observation(
-            ctx,
-            source_tool="evaluate",
-            url=url,
-            title=title,
-            observed_data=result["data"],
-            append_to_flow=True,
-            reached_via="auto",
-        )
-        if observation_step is not None:
-            result["observation_step"] = observation_step
-            result["data"]["observation_step"] = observation_step
-        if _copilot_block_authoring_policy(
-            ctx
-        ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(result["data"]):
-            ctx.code_only_target_page_evidence_seen = True
-        await _maybe_run_completion_verification_from_page_observation(
-            ctx,
-            url=url,
-            title=title,
-            observed_data=result["data"],
-        )
-        await _steer_evaluate_result(ctx, result, url=url)
+    data = result.get("data")
+    if not result.get("ok") or not isinstance(data, dict) or not data:
+        _reset_evaluate_tracker(ctx)
+        return result
+    _mark_page_inspected(ctx)
+    data.pop("sdk_equivalent", None)
+    if "url" not in data:
+        url, _ = await _resolve_url_title(raw, ctx)
+        if url:
+            data["url"] = url
+    url = str(data.get("url") or "")
+    title = str(data.get("title") or "")
+    if not title:
+        _, title = await _resolve_url_title(raw, ctx)
+    observation_step = _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url=url,
+        title=title,
+        observed_data=data,
+        append_to_flow=True,
+        reached_via="auto",
+    )
+    if observation_step is not None:
+        result["observation_step"] = observation_step
+        data["observation_step"] = observation_step
+    if _copilot_block_authoring_policy(
+        ctx
+    ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
+        ctx.code_only_target_page_evidence_seen = True
+    await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url=url,
+        title=title,
+        observed_data=data,
+    )
+    await _steer_evaluate_result(ctx, result, url=url)
     return result
 
 
