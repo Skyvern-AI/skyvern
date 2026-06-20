@@ -1,7 +1,7 @@
 import { Cross2Icon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   BLOCK_SIDEBAR_WIDTH_MAX,
@@ -22,6 +22,10 @@ import { isStartNode } from "../nodes/StartNode/types";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowBlockType } from "../../types/workflowTypes";
+import {
+  getBlockSidebarGutterPx,
+  getContainedBlockSidebarWidth,
+} from "../blockSidebar";
 import { BlockConfigForm } from "./BlockConfigForm";
 import { useHasInteractedThisSession } from "./useHasInteractedThisSession";
 import { WorkflowNodeLibraryPanel } from "./WorkflowNodeLibraryPanel";
@@ -76,6 +80,19 @@ function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {
 }
 
 const FOOTER_TICK_INTERVAL_MS = 10_000;
+
+function measureElementWidth(element: HTMLElement): number | null {
+  const boundingWidth = element.getBoundingClientRect().width;
+  if (boundingWidth > 0) {
+    return boundingWidth;
+  }
+
+  if (element.offsetWidth > 0) {
+    return element.offsetWidth;
+  }
+
+  return null;
+}
 
 function formatUpdatedAgo(updatedAt: number, now: number): string {
   const elapsedSec = Math.max(0, Math.floor((now - updatedAt) / 1000));
@@ -271,7 +288,7 @@ function BlockLibrarySidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex-1 overflow-hidden px-5 py-4">
+      <div className="flex min-h-0 flex-1 overflow-hidden px-5 py-4">
         <WorkflowNodeLibraryPanel onNodeClick={onAddNode} />
       </div>
     </>
@@ -283,8 +300,14 @@ type BlockConfigSidebarProps = {
 };
 
 function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
+  const resizableRef = useRef<Resizable | null>(null);
+  const [editorShellMetrics, setEditorShellMetrics] = useState(() => ({
+    gutterPx: getBlockSidebarGutterPx(null),
+    width: null as number | null,
+  }));
   const width = useBlockSidebarWidthStore((s) => s.width);
   const setWidth = useBlockSidebarWidthStore((s) => s.setWidth);
+  const setRenderedWidth = useBlockSidebarWidthStore((s) => s.setRenderedWidth);
   const mode = useWorkflowEditorMode();
   const selectedBlockId = useWorkflowPanelStore(
     (state) => state.selectedBlockId,
@@ -299,6 +322,20 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
     (state) => state.closeWorkflowPanel,
   );
   const flushPendingCommit = usePendingCommitsStore((state) => state.flush);
+  const containedWidth = getContainedBlockSidebarWidth(
+    width,
+    editorShellMetrics.width,
+    editorShellMetrics.gutterPx,
+  );
+  const containedMaxWidth = getContainedBlockSidebarWidth(
+    BLOCK_SIDEBAR_WIDTH_MAX,
+    editorShellMetrics.width,
+    editorShellMetrics.gutterPx,
+  );
+  const containedMinWidth = Math.min(
+    BLOCK_SIDEBAR_WIDTH_MIN,
+    containedMaxWidth,
+  );
 
   // Auto-commit on block switch. When `selectedBlockId` flips
   // from A → B, flush any pending commit registered by the dispatcher
@@ -317,6 +354,62 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
 
   const showLibrary =
     workflowPanelState.active && workflowPanelState.content === "nodeLibrary";
+  const sidebarVisible =
+    showLibrary || (mode !== "build" && selectedBlockId !== null);
+
+  useLayoutEffect(() => {
+    if (!sidebarVisible) {
+      setEditorShellMetrics({
+        gutterPx: getBlockSidebarGutterPx(null),
+        width: null,
+      });
+      return;
+    }
+
+    const parentElement = resizableRef.current?.resizable?.parentElement;
+    if (parentElement === undefined || parentElement === null) {
+      setEditorShellMetrics({
+        gutterPx: getBlockSidebarGutterPx(null),
+        width: null,
+      });
+      return;
+    }
+
+    const updateEditorShellMetrics = () => {
+      setEditorShellMetrics({
+        gutterPx: getBlockSidebarGutterPx(parentElement),
+        width: measureElementWidth(parentElement),
+      });
+    };
+
+    updateEditorShellMetrics();
+
+    if (typeof ResizeObserver === "undefined") {
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      window.addEventListener("resize", updateEditorShellMetrics);
+      return () => {
+        window.removeEventListener("resize", updateEditorShellMetrics);
+      };
+    }
+
+    const resizeObserver = new ResizeObserver(updateEditorShellMetrics);
+    resizeObserver.observe(parentElement);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [sidebarVisible]);
+
+  useLayoutEffect(() => {
+    if (!sidebarVisible) {
+      return;
+    }
+
+    setRenderedWidth(containedWidth);
+  }, [containedWidth, setRenderedWidth, sidebarVisible]);
 
   // In build mode the block-config form is unavailable, but the node library
   // must still render so users can insert blocks from the canvas.
@@ -330,12 +423,13 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
 
   return (
     <Resizable
-      size={{ width, height: "auto" }}
-      minWidth={BLOCK_SIDEBAR_WIDTH_MIN}
-      maxWidth={BLOCK_SIDEBAR_WIDTH_MAX}
+      ref={resizableRef}
+      size={{ width: containedWidth, height: "auto" }}
+      minWidth={containedMinWidth}
+      maxWidth={containedMaxWidth}
       enable={{ left: true }}
-      onResizeStop={(_e, _dir, _ref, delta) => {
-        setWidth(width + delta.width);
+      onResizeStop={(_e, _dir, ref) => {
+        setWidth(ref.offsetWidth);
       }}
       handleClasses={{ left: "block-sidebar-resize-handle" }}
       handleStyles={{

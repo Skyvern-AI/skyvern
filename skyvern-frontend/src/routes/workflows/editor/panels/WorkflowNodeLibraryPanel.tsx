@@ -373,7 +373,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
   });
 
   return (
-    <div className="flex h-full flex-col gap-4">
+    <div className="flex h-full min-h-0 min-w-0 flex-col gap-4">
       <div className="relative">
         <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
           <MagnifyingGlassIcon className="size-5" />
@@ -390,15 +390,18 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
           tabIndex={0}
         />
       </div>
-      <ScrollArea className="h-full flex-1">
-        <ScrollAreaViewport className="h-full">
+      <ScrollArea className="min-h-0 min-w-0 flex-1">
+        {/* Radix wraps viewport children in a display:table div by default;
+        override it so narrow sidebar rows can shrink instead of widening the
+        clipped editor shell. */}
+        <ScrollAreaViewport className="h-full w-full [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="space-y-2">
             {filteredItems.length > 0 ? (
               filteredItems.map((item) => (
                 <div
                   key={item.nodeType}
                   data-testid={`block-library-item-${item.nodeType}`}
-                  className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
+                  className="flex min-w-0 cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
                   onClick={() => {
                     onNodeClick({
                       nodeType: item.nodeType,
@@ -413,15 +416,15 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                     closeWorkflowPanel();
                   }}
                 >
-                  <div className="flex gap-2">
+                  <div className="flex min-w-0 gap-2">
                     <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
                       {item.icon}
                     </div>
-                    <div className="flex flex-col gap-1">
-                      <span className="max-w-64 truncate text-base">
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <span className="min-w-0 truncate text-base">
                         {item.title}
                       </span>
-                      <span className="text-xs text-slate-600 dark:text-slate-400">
+                      <span className="min-w-0 truncate text-xs text-slate-600 dark:text-slate-400">
                         {item.description}
                       </span>
                     </div>
