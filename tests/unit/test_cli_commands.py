@@ -186,6 +186,9 @@ class TestBrowserCommands:
             completed_at=None,
             timeout=60,
             runnable_id=None,
+            app_url="https://app.skyvern.com/browser-session/pbs_123",
+            recordings=[],
+            downloaded_files=[],
         )
         skyvern = SimpleNamespace(get_browser_session=AsyncMock(return_value=session_obj))
         monkeypatch.setattr(browser_cmd, "get_skyvern", lambda: skyvern)
