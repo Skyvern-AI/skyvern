@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _MAX_STEPS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    _get_by_role_expr,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     is_optional_dismissal_only_trajectory,
@@ -248,6 +249,81 @@ class TestLocatorSynthesis:
         assert result is not None
         assert 'await page.locator("*[data-id]").click()' in result.code
         assert ".first" not in result.code
+
+    def test_strict_bare_selector_with_role_name_reanchors_to_get_by_role(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#statement-row", source_url="https://example.com/billing"),
+            _interaction(
+                "click",
+                selector="a",
+                source_url="https://example.com/billing",
+                role="link",
+                accessible_name="View Statements",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="View Statements").click()' in result.code
+        assert ".first" not in result.code
+        assert result.diagnostics.dropped_interactions == []
+        provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
+        assert provenance == [
+            {
+                "trajectory_index": 1,
+                "selector": "a",
+                "emitted_literal": _get_by_role_expr("link", "View Statements"),
+                "source": "aria_role_name",
+                "role": "link",
+                "name": "View Statements",
+            }
+        ]
+
+    def test_strict_bare_role_selector_with_name_reanchors_to_get_by_role(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="role=link",
+                source_url="https://example.com/home",
+                role="link",
+                accessible_name="Continue",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="Continue").click()' in result.code
+        assert result.diagnostics.dropped_interactions == []
+
+    def test_strict_bare_selector_without_role_name_is_still_dropped(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open-login", source_url="https://example.com/home"),
+            _interaction("click", selector="a", source_url="https://example.com/account"),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "get_by_role" not in result.code
+        dropped = [
+            d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
+        ]
+        assert dropped
+
+    def test_strict_reanchor_escapes_quotes_and_newlines_in_name(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="a",
+                source_url="https://example.com/home",
+                role="link",
+                accessible_name='Say "hi"\nplease',
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert result.diagnostics.dropped_interactions == []
+        emitted = _get_by_role_expr("link", 'Say "hi"\nplease')
+        assert "\n" not in emitted
+        assert f"await {emitted}.click()" in result.code
 
 
 class TestActionSynthesis:
