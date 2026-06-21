@@ -498,6 +498,11 @@ def setup_logger() -> None:
     # Anthropic Bedrock SDK emits high-volume WARN noise; keep only its errors.
     logging.getLogger("anthropic").setLevel(logging.ERROR)
 
+    # Mute LiteLLM's high-volume library logs; our own LLM handler already logs calls/errors.
+    logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
+    logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
+    logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
+
     # Drop asyncio's orphaned-future noise from torn-down Playwright driver pipes (logged at
     # ERROR but non-actionable). setup_logger may run more than once (uvicorn reload), so keep
     # exactly one instance instead of stacking duplicates.
