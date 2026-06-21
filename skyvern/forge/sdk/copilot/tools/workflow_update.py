@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _SYNTHESIZED_BLOCK_LABEL,
     SynthesisDiagnostics,
+    _get_by_role_expr,
     artifact_dependency_id,
     artifact_observation_ref_id,
     synthesize_code_block,
@@ -1115,6 +1116,17 @@ def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: Syn
     )
 
 
+def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> bool:
+    source = provenance.get("source")
+    if source == "selector":
+        return provenance.get("selector") == provenance.get("emitted_literal")
+    if source == "aria_role_name":
+        role = str(provenance.get("role") or "")
+        name = str(provenance.get("name") or "")
+        return bool(role) and bool(name) and _get_by_role_expr(role, name) == provenance.get("emitted_literal")
+    return False
+
+
 def _submitted_suffix_after_synthesized_code(submitted_code: str, synthesized_code: str) -> str:
     # Preserve a pure suffix appended after the synthesized steps. Returns empty for
     # prepended extraction scaffolding; that shape is handled by preserve_submitted_extraction.
@@ -2093,7 +2105,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             f"Unable to impose synthesized code block: dropped scout interaction {index} from `{tool_name}` ({reason})."
         )
     for provenance in diagnostics.locator_provenance:
-        if provenance.get("source") != "selector" or provenance.get("selector") != provenance.get("emitted_literal"):
+        if not _locator_provenance_is_self_validating(provenance):
             violations.append("Unable to impose synthesized code block: locator provenance was not byte-equal.")
             break
 
