@@ -263,6 +263,19 @@ export type OnePasswordItemsApiResponse = {
   items: Array<OnePasswordItemApiResponse>;
 };
 
+export type BitwardenItemApiResponse = {
+  item_id: string;
+  title: string;
+  collection_id?: string | null;
+  credential_type: "password" | "credit_card" | "secret";
+  url?: string | null;
+};
+
+export type BitwardenItemsApiResponse = {
+  configured: boolean;
+  items: Array<BitwardenItemApiResponse>;
+};
+
 export type CreateOnePasswordTokenRequest = {
   token: string;
 };

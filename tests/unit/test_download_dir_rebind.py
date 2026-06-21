@@ -328,11 +328,63 @@ async def test_block_adoption_prefers_context_run_id_over_workflow_run_id() -> N
 
 
 @pytest.mark.asyncio
-async def test_file_upload_block_fails_when_no_files_found(tmp_path) -> None:
-    """SKY-11153 regression: an empty download dir must fail the block, not silently report
-    success with zero files uploaded."""
+async def test_file_upload_block_empty_scan_without_registered_downloads_succeeds(tmp_path) -> None:
+    """SKY-11225: zero downloads during the run is a successful no-op."""
     from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
-    from skyvern.schemas.workflows import FileStorageType
+    from skyvern.schemas.workflows import BlockStatus, FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.AZURE,
+        azure_storage_account_name="account",
+        azure_storage_account_key="key",
+        azure_blob_container_name="container",
+        path=None,
+        continue_on_empty=False,
+    )
+    empty_dir = tmp_path / "wr_empty"
+    empty_dir.mkdir()
+    sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            return_value=empty_dir,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock()
+        result = await block.execute(
+            workflow_run_id="wr_empty",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is True
+    assert mock_result.await_args.kwargs["status"] == BlockStatus.completed
+    assert mock_result.await_args.kwargs["failure_reason"] is None
+    assert mock_result.await_args.kwargs["output_parameter_value"] == []
+    mock_record.assert_awaited_once()
+    mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_empty_scan_with_registered_downloads_fails(tmp_path) -> None:
+    """SKY-11153/SKY-11225: downloaded files with an empty scan dir still fail loudly."""
+    from skyvern.forge.sdk.schemas.files import FileInfo
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import BlockStatus, FileStorageType
 
     block = FileUploadBlock.model_construct(
         label="upload",
@@ -346,10 +398,13 @@ async def test_file_upload_block_fails_when_no_files_found(tmp_path) -> None:
     empty_dir = tmp_path / "wr_empty"
     empty_dir.mkdir()
     sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
 
     with (
-        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=MagicMock()),
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
         patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
         patch.object(
             FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
         ) as mock_result,
@@ -358,7 +413,11 @@ async def test_file_upload_block_fails_when_no_files_found(tmp_path) -> None:
             return_value=empty_dir,
         ),
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
     ):
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(
+            return_value=[FileInfo(url="https://example.com/invoice.pdf", filename="invoice.pdf")]
+        )
         result = await block.execute(
             workflow_run_id="wr_empty",
             workflow_run_block_id="wrb_x",
@@ -367,6 +426,233 @@ async def test_file_upload_block_fails_when_no_files_found(tmp_path) -> None:
 
     assert result is sentinel
     assert mock_result.await_args.kwargs["success"] is False
+    assert mock_result.await_args.kwargs["status"] == BlockStatus.failed
+    assert "registered_download_count=1" in mock_result.await_args.kwargs["failure_reason"]
+    mock_record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_empty_scan_with_alternate_download_dir_files_fails(tmp_path) -> None:
+    """SKY-11225: local files in a sibling candidate dir still indicate a download-dir desync."""
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import BlockStatus, FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="ak",
+        aws_secret_access_key="sk",
+        path=None,
+        continue_on_empty=False,
+    )
+    scan_dir = tmp_path / "run_ctx"
+    alternate_dir = tmp_path / "wr_empty"
+    scan_dir.mkdir()
+    alternate_dir.mkdir()
+    (alternate_dir / "invoice.pdf").write_text("pdf")
+    sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
+    context = SkyvernContext(run_id="run_ctx", workflow_run_id="wr_empty")
+
+    def get_download_dir_for_run_id(run_id: str | None):
+        return {"run_ctx": scan_dir, "wr_empty": alternate_dir}[run_id]
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            side_effect=get_download_dir_for_run_id,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock()
+        result = await block.execute(
+            workflow_run_id="wr_empty",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is False
+    assert mock_result.await_args.kwargs["status"] == BlockStatus.failed
+    assert "alternate_file_count=1" in mock_result.await_args.kwargs["failure_reason"]
+    mock_record.assert_not_awaited()
+    mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_empty_scan_with_too_many_alternate_files_reports_too_many(tmp_path) -> None:
+    """SKY-11225: oversized alternate dirs fail closed with a specific diagnostic."""
+    from skyvern.constants import MAX_UPLOAD_FILE_COUNT
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import BlockStatus, FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="ak",
+        aws_secret_access_key="sk",
+        path=None,
+        continue_on_empty=False,
+    )
+    scan_dir = tmp_path / "run_ctx"
+    alternate_dir = tmp_path / "wr_empty"
+    scan_dir.mkdir()
+    alternate_dir.mkdir()
+    for index in range(MAX_UPLOAD_FILE_COUNT + 1):
+        (alternate_dir / f"invoice_{index}.pdf").write_text("pdf")
+    sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
+    context = SkyvernContext(run_id="run_ctx", workflow_run_id="wr_empty")
+
+    def get_download_dir_for_run_id(run_id: str | None):
+        return {"run_ctx": scan_dir, "wr_empty": alternate_dir}[run_id]
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            side_effect=get_download_dir_for_run_id,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock()
+        result = await block.execute(
+            workflow_run_id="wr_empty",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is False
+    assert mock_result.await_args.kwargs["status"] == BlockStatus.failed
+    assert "alternate_file_count=too_many" in mock_result.await_args.kwargs["failure_reason"]
+    mock_record.assert_not_awaited()
+    mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_empty_scan_with_browser_session_downloads_fails(tmp_path) -> None:
+    """SKY-11225: unclaimed browser-session downloads are not a benign empty run."""
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import BlockStatus, FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="ak",
+        aws_secret_access_key="sk",
+        path=None,
+        continue_on_empty=False,
+    )
+    empty_dir = tmp_path / "wr_empty"
+    empty_dir.mkdir()
+    sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            return_value=empty_dir,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(
+            return_value=["s3://downloads/session/invoice.pdf"]
+        )
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock()
+        result = await block.execute(
+            workflow_run_id="wr_empty",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+            browser_session_id="pbs_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is False
+    assert mock_result.await_args.kwargs["status"] == BlockStatus.failed
+    assert "browser_session_download_count=1" in mock_result.await_args.kwargs["failure_reason"]
+    mock_record.assert_not_awaited()
+    mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_upload_block_empty_scan_registered_download_timeout_fails_with_unknown_count(tmp_path) -> None:
+    """SKY-11225: unknown registered-download state fails closed with a readable failure reason."""
+    import asyncio
+
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import BlockStatus, FileStorageType
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="ak",
+        aws_secret_access_key="sk",
+        path=None,
+        continue_on_empty=False,
+    )
+    empty_dir = tmp_path / "wr_empty"
+    empty_dir.mkdir()
+    sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            return_value=empty_dir,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(side_effect=asyncio.TimeoutError)
+        result = await block.execute(
+            workflow_run_id="wr_empty",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is False
+    assert mock_result.await_args.kwargs["status"] == BlockStatus.failed
+    assert "registered_download_count=unknown" in mock_result.await_args.kwargs["failure_reason"]
+    mock_record.assert_not_awaited()
 
 
 @pytest.mark.asyncio
