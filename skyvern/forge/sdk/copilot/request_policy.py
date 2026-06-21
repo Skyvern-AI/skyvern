@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
@@ -43,7 +44,6 @@ _CLASSIFIER_FAILURE_KINDS = {
     "timeout",
     "transient_error",
     "provider_error",
-    "retry_exhausted",
 }
 _CLASSIFICATION_RESPONSE_FIELDS = {
     "testing_intent",
@@ -620,27 +620,28 @@ def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, us
 
 
 async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any | None, str, int]:
+    # Diverges from turn-intent on purpose: a retriable provider error (429/5xx) retries once
+    # within the budget, while a timeout is never retried (retrying cannot beat the budget).
+    deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
     retry_count = 0
-    last_failure_kind = "none"
-    for attempt in range(2):
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Only reachable after a retriable error consumed the budget before the retry ran.
+            return None, "transient_error", retry_count
         try:
             raw = await asyncio.wait_for(
                 handler(prompt=prompt, prompt_name=PROMPT_NAME),
-                timeout=settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS,
+                timeout=remaining,
             )
             return raw, "none", retry_count
         except asyncio.TimeoutError:
-            last_failure_kind = "timeout" if attempt == 0 else "retry_exhausted"
+            return None, "timeout", retry_count
         except Exception as exc:
-            if attempt == 0 and is_retriable_llm_error(exc):
-                last_failure_kind = "transient_error"
-            else:
-                failure_kind = "retry_exhausted" if retry_count and is_retriable_llm_error(exc) else "provider_error"
-                return None, failure_kind, retry_count
-        if attempt == 0:
-            retry_count += 1
-            continue
-    return None, last_failure_kind, retry_count
+            if retry_count == 0 and is_retriable_llm_error(exc):
+                retry_count += 1
+                continue
+            return None, "provider_error", retry_count
 
 
 async def _classify_request(

@@ -2525,17 +2525,16 @@ class TestNativeToolSurface:
 
 class TestRequestPolicyCredentialResolution:
     @pytest.mark.asyncio
-    async def test_request_policy_classifier_timeout_retries_once(self, monkeypatch) -> None:
+    async def test_request_policy_classifier_timeout_does_not_retry(self, monkeypatch) -> None:
         from skyvern.config import settings
 
-        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
         calls = 0
 
         async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
             nonlocal calls
             calls += 1
-            if calls == 1:
-                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.5)
             return {"credential_input_kind": "none", "completion_contract": None}
 
         policy = await _classify_request(
@@ -2546,10 +2545,43 @@ class TestRequestPolicyCredentialResolution:
             handler=handler,
         )
 
-        assert calls == 2
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "timeout"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_slow_but_within_budget_returns_real_policy(self, monkeypatch) -> None:
+        from skyvern.config import settings
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.5)
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.05)
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
         assert policy.classifier_status == "success"
-        assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "absent"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "present"
+        assert policy.completion_contract
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_malformed_payload_falls_back_without_retry(self) -> None:
@@ -2575,7 +2607,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.completion_contract_status == "unknown"
 
     @pytest.mark.asyncio
-    async def test_request_policy_classifier_transient_provider_error_retries_once(self) -> None:
+    async def test_request_policy_classifier_retries_transient_error_then_succeeds(self) -> None:
         class RateLimitError(Exception):
             __module__ = "openai"
 
@@ -2605,6 +2637,89 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "success"
         assert policy.classifier_retry_count == 1
         assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_retries_transient_error_then_falls_back(self) -> None:
+        class RateLimitError(Exception):
+            __module__ = "openai"
+
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            raise RateLimitError("rate limit")
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com/account.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 2
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_non_retriable_error_does_not_retry(self) -> None:
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            raise ValueError("bad request")
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com/account.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_transient_error_exhausting_budget_labels_transient(
+        self, monkeypatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as rp
+
+        class RateLimitError(Exception):
+            __module__ = "openai"
+
+        # deadline calc, then iteration-1 remaining; every later call reads past the deadline so the
+        # retry never starts and the budget-exhaustion path labels the prior retriable error.
+        clock = iter([1000.0, 1000.0])
+        monkeypatch.setattr(rp.time, "monotonic", lambda: next(clock, 1_000_000.0))
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            raise RateLimitError("rate limit")
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com/account.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "transient_error"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "unknown"
 
     @pytest.mark.asyncio
     async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
