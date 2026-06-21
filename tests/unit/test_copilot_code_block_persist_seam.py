@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -1921,6 +1922,124 @@ class TestCompiledAuthoringImposition:
             if str(block.get("block_type") or "").lower() == "code":
                 assert "other_sku_456" in str(block.get("code") or "")
                 assert "str(search)" not in str(block.get("code") or "")
+
+    def _role_name_nav_download_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": "https://example.com/billing",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "a",
+                "source_url": "https://example.com/billing",
+                "role": "link",
+                "accessible_name": "View Printable Statement",
+            },
+        ]
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/billing/statement.pdf"]',
+            affordance_text="View Printable Statement",
+            download_kind="attribute",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        return ctx
+
+    def test_role_name_bare_nav_click_imposes_with_emitted_get_by_role(self) -> None:
+        ctx = self._role_name_nav_download_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert result.violations == []
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        assert 'await page.get_by_role("link", name="View Printable Statement").click()' in block["code"]
+        assert "async with page.expect_download()" in block["code"]
+        assert "/billing/statement.pdf" in block["code"]
+
+    def test_anchorless_bare_nav_click_still_blocks_imposition(self) -> None:
+        ctx = self._role_name_nav_download_ctx()
+        ctx.scout_trajectory[1].pop("role")
+        ctx.scout_trajectory[1].pop("accessible_name")
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+
+    def test_provenance_gate_admits_self_validating_aria_role_name(self) -> None:
+        entry = {
+            "trajectory_index": 1,
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr("link", "View Statements"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "View Statements",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(entry) is True
+
+    def test_provenance_gate_rejects_tampered_aria_role_name(self) -> None:
+        tampered_literal = {
+            "selector": "a",
+            "emitted_literal": 'page.get_by_role("link", name="Spoofed")',
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "View Statements",
+        }
+        tampered_role = {
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr("link", "View Statements"),
+            "source": "aria_role_name",
+            "role": "button",
+            "name": "View Statements",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered_literal) is False
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered_role) is False
+
+    def test_provenance_gate_keeps_selector_byte_equality(self) -> None:
+        assert (
+            workflow_update_module._locator_provenance_is_self_validating(
+                {"selector": "#row", "emitted_literal": "#row", "source": "selector"}
+            )
+            is True
+        )
+        assert (
+            workflow_update_module._locator_provenance_is_self_validating(
+                {"selector": "#row", "emitted_literal": "#other", "source": "selector"}
+            )
+            is False
+        )
+        assert (
+            workflow_update_module._locator_provenance_is_self_validating(
+                {"selector": "#row", "emitted_literal": "#row", "source": "first_fallback"}
+            )
+            is False
+        )
 
 
 def test_direct_literal_rewrite_preserves_unicode_prefix_offsets() -> None:

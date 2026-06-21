@@ -315,6 +315,20 @@ def _locator_expr(
         parsed_strict = _parse_role_name(selector)
         ambiguous_role = parsed_strict is not None and not parsed_strict[1]
         if ambiguous_role or _is_bare_ambiguous_selector(selector):
+            if role and name:
+                expr = _get_by_role_expr(role, name)
+                if diagnostics is not None:
+                    diagnostics.locator_provenance.append(
+                        {
+                            "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                            "selector": selector,
+                            "emitted_literal": expr,
+                            "source": "aria_role_name",
+                            "role": role,
+                            "name": name,
+                        }
+                    )
+                return expr
             notes.append(f"dropped an interaction with an ambiguous bare selector {selector!r}")
             if diagnostics is not None:
                 diagnostics.dropped_interactions.append(
