@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -527,6 +528,366 @@ def grade_present_value_criteria(
                 )
             )
     return verdicts
+
+
+def grade_record_semantic_consistency(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    """Deterministically reject internally contradictory structured-record status outputs."""
+
+    criterion = next(iter(_status_consistency_criterion(criteria)), None)
+    if criterion is None:
+        return []
+
+    for label, payload in snapshot.block_outputs.items():
+        contradiction = _structured_record_contradiction(payload)
+        if contradiction:
+            return [
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unsatisfied",
+                    reason_code="evidence_contradicts",
+                    evidence_ref=f"block_outputs:{label}",
+                    missing_evidence=contradiction,
+                )
+            ]
+    return []
+
+
+_STRUCTURED_RECORD_CRITERION_IDS = frozenset(
+    {
+        "fallback_record_identity",
+        "fallback_record_identifier",
+        "fallback_record_groups",
+        "fallback_record_status",
+    }
+)
+
+
+def grade_structured_record_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    """Deterministically credit generic structured-record fallback criteria.
+
+    Single-block-wins: a criterion set is credited only when one block satisfies it.
+    Verdicts are never merged across blocks because a structured record is a single
+    coherent record, and crediting fields drawn from different blocks could certify a
+    record the run never produced as a whole.
+    """
+
+    criteria_by_id = {
+        criterion.id: criterion for criterion in criteria if criterion.id in _STRUCTURED_RECORD_CRITERION_IDS
+    }
+    if not criteria_by_id:
+        return []
+    best_verdicts: list[CriterionVerdict] = []
+    for label, payload in snapshot.block_outputs.items():
+        record = _structured_record_payload(payload)
+        if record is None:
+            continue
+        verdicts: list[CriterionVerdict] = []
+        if "fallback_record_identity" in criteria_by_id and structured_record_has_identity(record):
+            verdicts.append(_structured_record_satisfied("fallback_record_identity", label))
+        if "fallback_record_identifier" in criteria_by_id and _structured_record_has_identifier(record):
+            verdicts.append(_structured_record_satisfied("fallback_record_identifier", label))
+        if "fallback_record_groups" in criteria_by_id and _structured_record_has_group_entries(record):
+            verdicts.append(_structured_record_satisfied("fallback_record_groups", label))
+        if "fallback_record_status" in criteria_by_id:
+            contradiction = _structured_record_contradiction(record)
+            if contradiction:
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id="fallback_record_status",
+                        state="unsatisfied",
+                        reason_code="evidence_contradicts",
+                        evidence_ref=f"block_outputs:{label}",
+                        missing_evidence=contradiction,
+                    )
+                )
+            elif _structured_record_has_status(record):
+                verdicts.append(_structured_record_satisfied("fallback_record_status", label))
+        if verdicts:
+            if len(verdicts) == len(criteria_by_id):
+                return verdicts
+            if len(verdicts) > len(best_verdicts):
+                best_verdicts = verdicts
+    return best_verdicts
+
+
+def _structured_record_satisfied(criterion_id: str, label: str) -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=criterion_id,
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref=f"block_outputs:{label}",
+    )
+
+
+def _structured_record_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    for key, value in payload.items():
+        if (
+            isinstance(key, str)
+            and key.endswith("_output")
+            and isinstance(value, dict)
+            and _looks_like_structured_record(value)
+        ):
+            return value
+    if _looks_like_structured_record(payload):
+        return payload
+    return None
+
+
+def _looks_like_structured_record(value: dict[str, Any]) -> bool:
+    return (
+        structured_record_has_identity(value)
+        or _structured_record_has_identifier(value)
+        or _structured_record_has_group_entries(value)
+        or _structured_record_has_status(value)
+    )
+
+
+def structured_record_has_identity(record: dict[str, Any]) -> bool:
+    if any(value is True for key, value in record.items() if isinstance(key, str) and key.endswith("_found")):
+        return True
+    return any(
+        isinstance(value, str) and bool(value.strip())
+        for key, value in record.items()
+        if isinstance(key, str) and _key_has_identity_token(key)
+    )
+
+
+def _key_has_identity_token(key: str) -> bool:
+    normalized_key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", key).casefold().replace("_", " ")
+    return any(
+        re.search(rf"(?:^|[^a-z0-9]){re.escape(token)}(?:$|[^a-z0-9])", normalized_key)
+        for token in ("name", "title", "entity", "label")
+    )
+
+
+def structured_record_has_goal_content(record: dict[str, Any]) -> bool:
+    """Return True only when a structured record has the full terminal-proof shape."""
+
+    if (
+        not structured_record_has_identity(record)
+        or not _structured_record_has_identifier(record)
+        or not _record_summary_status(record)
+    ):
+        return False
+    return any(
+        bool(status.strip())
+        and any(
+            _is_meaningful_record_value(item_value)
+            for item_key, item_value in item.items()
+            if not (isinstance(item_key, str) and "status" in item_key.casefold())
+        )
+        for status, item in _record_row_statuses(record)
+    )
+
+
+def _key_word_tokens(key: str) -> set[str]:
+    """Split a (possibly dotted/camelCase) record key path into whole-word tokens."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", key).casefold()
+    return set(re.findall(r"[a-z0-9]+", spaced))
+
+
+def _structured_record_has_identifier(record: dict[str, Any]) -> bool:
+    for key, value in _walk_record_scalars(record):
+        value_text = str(value)
+        digit_runs = "".join(ch if ch.isdigit() else " " for ch in value_text).split()
+        if any(len(run) >= 6 for run in digit_runs):
+            return True
+        if _key_word_tokens(key) & {"identifier", "id", "number"} and value_text.strip():
+            return True
+    return False
+
+
+def _structured_record_has_group_entries(record: dict[str, Any]) -> bool:
+    for value in record.values():
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict) and any(_is_meaningful_record_value(nested) for nested in item.values()):
+                return True
+    return False
+
+
+def _structured_record_has_status(record: dict[str, Any]) -> bool:
+    summary_status = _record_summary_status(record)
+    row_statuses = _record_row_statuses(record)
+    return bool(summary_status and row_statuses)
+
+
+def _status_consistency_criterion(criteria: list[CompletionCriterion]) -> Iterable[CompletionCriterion]:
+    for criterion in criteria:
+        normalized = _normalize_present_value(criterion.outcome)
+        if "status" in normalized and (
+            "consistent" in normalized or "overall" in normalized or "summary" in normalized or "per-" in normalized
+        ):
+            yield criterion
+
+
+def _structured_record_contradiction(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if not (_structured_record_has_group_entries(payload) or _structured_record_has_status(payload)):
+        return None
+    summary_status = _record_summary_status(payload)
+    summary_polarity = _status_polarity(summary_status) if summary_status else None
+    row_statuses = _record_row_statuses(payload)
+    for status, item in row_statuses:
+        polarity = _status_polarity(status)
+        if polarity is None:
+            continue
+        is_negative, positive_phrase = polarity
+        if not is_negative:
+            continue
+        non_status_text = " ".join(
+            str(value)
+            for key, value in item.items()
+            if not (isinstance(key, str) and "status" in key.casefold()) and value is not None
+        )
+        if _contains_positive_status_phrase(non_status_text, positive_phrase):
+            return (
+                "a parsed row reports a negative status, but non-status fields include the positive status text; "
+                "parse name/address/status from cells in the same row"
+            )
+    if summary_polarity is not None:
+        summary_negative, summary_positive_phrase = summary_polarity
+        if summary_negative and any(
+            (row_polarity := _status_polarity(status)) is not None and row_polarity == (False, summary_positive_phrase)
+            for status, _item in row_statuses
+        ):
+            return "summary status is negative, but a parsed row has the matching positive status"
+
+    evidence_text = payload.get("evidence_text")
+    if isinstance(evidence_text, str) and summary_polarity is not None:
+        summary_negative, summary_positive_phrase = summary_polarity
+        if (
+            summary_negative
+            and row_statuses
+            and not any(_status_polarity(status) == (False, summary_positive_phrase) for status, _item in row_statuses)
+            and _contains_positive_status_phrase(evidence_text, summary_positive_phrase)
+        ):
+            return (
+                "evidence_text contains positive status rows, but structured rows and summary report a negative status"
+            )
+    return None
+
+
+def _record_summary_status(record: dict[str, Any]) -> str | None:
+    for key, value in record.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        normalized_key = key.casefold()
+        if "status" in normalized_key and ("overall" in normalized_key or "summary" in normalized_key):
+            return value
+    value = record.get("status")
+    return value if isinstance(value, str) else None
+
+
+def _record_row_statuses(record: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    statuses: list[tuple[str, dict[str, Any]]] = []
+    for value in record.values():
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            for item_key, item_value in item.items():
+                if isinstance(item_key, str) and "status" in item_key.casefold() and isinstance(item_value, str):
+                    statuses.append((item_value, item))
+    return statuses
+
+
+_NEGATIVE_STATUS_POSITIVE_COUNTERPARTS = {
+    "expired": "active",
+    "inactive": "active",
+    "lapsed": "active",
+    "pending": "active",
+    "revoked": "active",
+    "suspended": "active",
+    "terminated": "active",
+}
+
+
+def _status_polarity(value: str) -> tuple[bool, str] | None:
+    normalized = _normalize_present_value(value)
+    if not normalized:
+        return None
+    if normalized in _NEGATIVE_STATUS_POSITIVE_COUNTERPARTS:
+        return True, _NEGATIVE_STATUS_POSITIVE_COUNTERPARTS[normalized]
+    for prefix in ("not ", "non-", "non "):
+        if normalized.startswith(prefix):
+            positive_phrase = normalized[len(prefix) :].strip()
+            return (True, positive_phrase) if positive_phrase else None
+    return False, normalized
+
+
+# Negators, temporal qualifiers, and negative-status words that, near a positive-status
+# word, flip it into a negative or adjectival usage ("no longer active", "previously
+# active", "the active license expired") rather than a positive status assertion.
+_STATUS_NEGATION_QUALIFIERS = frozenset(
+    {
+        "not",
+        "non",
+        "no",
+        "longer",
+        "previously",
+        "formerly",
+        "once",
+        "currently",
+        "recently",
+        "was",
+        "were",
+        "until",
+        "never",
+        *_NEGATIVE_STATUS_POSITIVE_COUNTERPARTS,
+    }
+)
+
+
+def _status_word_tokens(text: str) -> list[str]:
+    return "".join(char if char.isalnum() else " " for char in text.casefold()).split()
+
+
+def _contains_positive_status_phrase(text: str, positive_phrase: str) -> bool:
+    tokens = _status_word_tokens(text)
+    phrase_tokens = _status_word_tokens(positive_phrase)
+    if not tokens or not phrase_tokens:
+        return False
+    span = len(phrase_tokens)
+    for start in range(len(tokens) - span + 1):
+        if tokens[start : start + span] != phrase_tokens:
+            continue
+        window = set(tokens[max(0, start - 3) : start]) | set(tokens[start + span : start + span + 3])
+        if not window & _STATUS_NEGATION_QUALIFIERS:
+            return True
+    return False
+
+
+def _walk_record_scalars(value: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_text = str(key)
+            nested_prefix = f"{prefix}.{key_text}" if prefix else key_text
+            yield from _walk_record_scalars(nested, nested_prefix)
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            yield from _walk_record_scalars(nested, f"{prefix}[{index}]")
+    elif value is not None:
+        yield prefix, value
+
+
+def _is_meaningful_record_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
 
 
 _DEFINITION_REASON_PREFIX = "definition_"

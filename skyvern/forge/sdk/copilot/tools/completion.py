@@ -13,6 +13,8 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     evaluate_completion_criteria,
     grade_definition_criteria,
     grade_present_value_criteria,
+    grade_record_semantic_consistency,
+    grade_structured_record_criteria,
     summarize_unsatisfied_outcomes,
     verdict_missing_evidence,
 )
@@ -31,7 +33,9 @@ from ._shared import (
     _current_workflow_has_evidence_block,
     _failed_run_block_labels,
     _is_meaningful_extracted_data,
+    _registered_output_parameter_payloads,
     _valid_runtime_anchor_url,
+    _workflow_output_parameter_payloads,
 )
 from .blockers import (
     _active_run_terminal_evidence_detected,
@@ -373,6 +377,29 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             evidence_output = _completion_evidence_payload(output)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
+            for output_key, output_value in _workflow_output_parameter_payloads(output).items():
+                if _is_meaningful_extracted_data(output_value):
+                    block_outputs[output_key] = output_value
+    for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
+        if _is_meaningful_extracted_data(output_value):
+            block_outputs[output_key] = output_value
+    for registered in _registered_output_parameter_payloads(data):
+        registered_output_key = registered.get("output_parameter_key")
+        registered_output_value = registered.get("value")
+        registered_block_label = registered.get("block_label")
+        if not _is_meaningful_extracted_data(registered_output_value):
+            continue
+        if isinstance(registered_output_key, str) and registered_output_key:
+            block_outputs[registered_output_key] = registered_output_value
+        if isinstance(registered_block_label, str) and registered_block_label in current_labels:
+            if isinstance(registered_output_key, str) and registered_output_key:
+                existing = block_outputs.get(registered_block_label)
+                if isinstance(existing, dict):
+                    existing.setdefault(registered_output_key, registered_output_value)
+                else:
+                    block_outputs[registered_block_label] = {registered_output_key: registered_output_value}
+            else:
+                block_outputs[registered_block_label] = registered_output_value
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
@@ -416,16 +443,82 @@ def _apply_present_value_upgrades(
     if run_result.status != "evaluated":
         return run_result
     upgrades = {verdict.criterion_id: verdict for verdict in grade_present_value_criteria(run_criteria, snapshot)}
-    if not upgrades:
+    upgrades.update(
+        {verdict.criterion_id: verdict for verdict in grade_structured_record_criteria(run_criteria, snapshot)}
+    )
+    semantic_verdicts = {
+        verdict.criterion_id: verdict for verdict in grade_record_semantic_consistency(run_criteria, snapshot)
+    }
+    if not upgrades and not semantic_verdicts:
         return run_result
-    verdicts = [
-        upgrades[verdict.criterion_id]
-        if verdict.criterion_id in upgrades and not verdict.satisfied and verdict.reason_code != "evidence_contradicts"
-        else verdict
-        for verdict in run_result.verdicts
-    ]
+
+    def _merged(verdict: CriterionVerdict) -> CriterionVerdict:
+        # Semantic contradictions are stronger than earlier satisfied verdicts:
+        # a row-mixing/status contradiction means the record evidence is invalid.
+        if verdict.criterion_id in semantic_verdicts:
+            return semantic_verdicts[verdict.criterion_id]
+        if verdict.criterion_id in upgrades and not verdict.satisfied and verdict.reason_code != "evidence_contradicts":
+            return upgrades[verdict.criterion_id]
+        return verdict
+
+    verdicts = [_merged(verdict) for verdict in run_result.verdicts]
     return CompletionVerificationResult(
         status="evaluated", criterion_ids=list(run_result.criterion_ids), verdicts=verdicts
+    )
+
+
+def _deterministic_run_verification_result(
+    run_criteria: list[CompletionCriterion],
+    snapshot: RunEvidenceSnapshot,
+) -> tuple[CompletionVerificationResult | None, list[CompletionCriterion]]:
+    """Return a deterministic run-plane verdict when the typed graders cover it.
+
+    Provider-record and present-value graders are exact enough to bypass the LLM
+    judge only when they satisfy every run-plane criterion. Contradictions also
+    bypass the judge, because the output is already semantically invalid. Any
+    remaining criterion stays fail-closed through the normal judge path.
+    """
+    criterion_ids = [criterion.id for criterion in run_criteria]
+    semantic_verdicts = grade_record_semantic_consistency(run_criteria, snapshot)
+    if any(not verdict.satisfied for verdict in semantic_verdicts):
+        return (
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=criterion_ids,
+                verdicts=list(semantic_verdicts),
+            ),
+            [],
+        )
+
+    deterministic_by_id: dict[str, CriterionVerdict] = {}
+    for verdict in grade_present_value_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_structured_record_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in semantic_verdicts:
+        deterministic_by_id[verdict.criterion_id] = verdict
+
+    deterministic_verdicts = [deterministic_by_id.get(criterion_id) for criterion_id in criterion_ids]
+    if criterion_ids and all(verdict is not None and verdict.satisfied for verdict in deterministic_verdicts):
+        return (
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=criterion_ids,
+                verdicts=[deterministic_by_id[criterion_id] for criterion_id in criterion_ids],
+            ),
+            [],
+        )
+
+    remaining_criteria = [criterion for criterion in run_criteria if criterion.id not in deterministic_by_id]
+    if not deterministic_by_id:
+        return None, remaining_criteria
+    return (
+        CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=criterion_ids,
+            verdicts=list(deterministic_by_id.values()),
+        ),
+        remaining_criteria,
     )
 
 
@@ -451,16 +544,6 @@ async def _maybe_run_completion_verification(
     )
     if not run_criteria:
         return combine_verification_results(criterion_ids, None, definition_verdicts)
-    # A missing judge handler is an infra/config state, not a transient failure:
-    # fall back to the prior gate rather than fail closed on every run.
-    handler = await _completion_verification_handler(copilot_ctx)
-    if handler is None:
-        return None
-    # Too little budget to verify a candidate run: fail closed (unavailable) rather
-    # than let the run-status proxy claim an unverified outcome as success.
-    remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
-    if remaining <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS:
-        return CompletionVerificationResult(status="unavailable")
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
     if not snapshot.has_evidence():
         run_result = CompletionVerificationResult(
@@ -472,8 +555,35 @@ async def _maybe_run_completion_verification(
             ],
         )
     else:
-        run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
-        run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
+        handler = await _completion_verification_handler(copilot_ctx)
+        if handler is None:
+            return CompletionVerificationResult(status="unavailable")
+        # Too little budget to verify a candidate run: fail closed (unavailable)
+        # rather than let the run-status proxy claim an unverified outcome as success.
+        remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
+        if (
+            remaining
+            <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+        ):
+            return CompletionVerificationResult(status="unavailable")
+        deterministic_result, remaining_criteria = _deterministic_run_verification_result(run_criteria, snapshot)
+        if deterministic_result is not None and not remaining_criteria:
+            run_result = deterministic_result
+        else:
+            judged_result = await evaluate_completion_criteria(remaining_criteria, snapshot, handler)
+            if judged_result.status != "evaluated":
+                run_result = judged_result
+            else:
+                verdicts = []
+                if deterministic_result is not None:
+                    verdicts.extend(deterministic_result.verdicts)
+                verdicts.extend(judged_result.verdicts)
+                run_result = CompletionVerificationResult(
+                    status="evaluated",
+                    criterion_ids=[criterion.id for criterion in run_criteria],
+                    verdicts=verdicts,
+                )
+                run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
     return combine_verification_results(criterion_ids, run_result, definition_verdicts)
 
 
