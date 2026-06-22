@@ -7,6 +7,7 @@ result rows; domains and person names are generic placeholders.
 from __future__ import annotations
 
 import inspect
+import re
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -203,7 +204,7 @@ def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
 
     assert ctx.turn_halt is not None
     evidence_reason = ctx.turn_halt.extra["evidence_reason"]
-    assert "https://example.com" in evidence_reason
+    assert re.search(r"https://example\.com", evidence_reason) is not None
     assert "[REDACTED_SECRET]" in evidence_reason
     assert "user:secret" not in evidence_reason
     assert "password=" not in evidence_reason
@@ -426,7 +427,7 @@ def test_display_reason_redacts_secrets_and_url_credentials() -> None:
     )
 
     assert reason is not None
-    assert "https://example.com" in reason
+    assert re.search(r"https://example\.com", reason) is not None
     assert "[REDACTED_SECRET]" in reason
     assert "user:secret" not in reason
     assert "password=" not in reason

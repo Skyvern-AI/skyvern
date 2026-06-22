@@ -680,7 +680,7 @@ class TestCodeRepairProgressClassification:
     @pytest.mark.asyncio
     async def test_code_safety_seam_reject_carries_progress_surface_kind(self) -> None:
         ctx = _code_only_ctx()
-        result = await _update_workflow({"workflow_yaml": _IMPORTING_CODE_YAML}, ctx)
+        result = await _update_workflow({"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML}, ctx)
         assert result["ok"] is False
         assert result["data"]["surface_kind"] == "code_repair_progress"
         assert result["data"]["progress_text"]
