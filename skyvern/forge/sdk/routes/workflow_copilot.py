@@ -2578,6 +2578,7 @@ async def workflow_copilot_chat_post(
 
 @base_router.get("/workflow/copilot/chats", include_in_schema=False)
 async def list_workflow_copilot_chats(
+    workflow_permanent_id: str | None = None,
     page: int = 1,
     page_size: int = 20,
     search: str | None = None,
@@ -2585,6 +2586,7 @@ async def list_workflow_copilot_chats(
 ) -> list[WorkflowCopilotChatSummary]:
     return await app.DATABASE.workflow_params.get_workflow_copilot_chats(
         organization_id=organization.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
         page=page,
         page_size=page_size,
         search=search,
