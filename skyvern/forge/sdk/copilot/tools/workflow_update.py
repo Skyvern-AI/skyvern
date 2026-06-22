@@ -19,7 +19,11 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
-from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    clear_terminal_evidence_on_workflow_edit,
+    stash_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     author_time_code_block_diagnostics,
     sandbox_unresolved_name_diagnostics,
@@ -44,9 +48,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
     POST_INTERMEDIATE_SUCCESS_NUDGE,
     _completion_contract_unknown_due_to_policy_fallback,
     _goal_likely_needs_more_blocks,
+    code_authoring_churn_stop_signal,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
@@ -65,6 +71,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_halt import blocker_signal_is_genuinely_terminal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
@@ -790,6 +797,33 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
             f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
         )
     return errors
+
+
+def _record_code_authoring_guardrail_reject(ctx: AgentContext, *, defer_churn_stop: bool = False) -> None:
+    ctx.code_authoring_guardrail_reject_count += 1
+    ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
+    if defer_churn_stop:
+        return
+    if ctx.code_authoring_guardrail_reject_count < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
+        return
+    # A genuinely-terminal held blocker keeps both the rendered reply and the
+    # halt kind, so the churn stop defers to it rather than overriding.
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    signal = code_authoring_churn_stop_signal(ctx)
+    stash_blocker_signal(ctx, signal)
+    ctx.blocker_signal = signal
+
+
+def _signal_is_churn(signal: CopilotToolBlockerSignal | None) -> bool:
+    return signal is not None and signal.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def _clear_held_churn_signals(ctx: AgentContext) -> None:
+    if _signal_is_churn(ctx.blocker_signal):
+        ctx.blocker_signal = None
+    if _signal_is_churn(ctx.latest_tool_blocker_signal):
+        ctx.latest_tool_blocker_signal = None
 
 
 def _code_block_parameter_keys(block: Mapping[str, Any]) -> frozenset[str]:
@@ -3032,6 +3066,14 @@ async def _update_workflow(
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
+    credential_scout_errors = (
+        []
+        if _request_policy_allows_untested_code_block_draft(ctx)
+        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    )
+    credential_priority_reject = bool(credential_scout_errors) and code_artifact_metadata_error is None
+    if code_safety_errors:
+        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=credential_priority_reject)
     # Per-label salvage keeps conforming metadata across a rejection; a
     # rejected code block keeps nothing, since its yaml never becomes the
     # draft. Prior-draft labels survive every rejection gate below — the
@@ -3049,11 +3091,6 @@ async def _update_workflow(
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
         params["code_artifact_metadata"] = merged_metadata
-    credential_scout_errors = (
-        []
-        if _request_policy_allows_untested_code_block_draft(ctx)
-        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
-    )
     if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
         return {
             "ok": False,
@@ -3228,6 +3265,9 @@ async def _update_workflow(
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
+        ctx.code_authoring_guardrail_reject_count = 0
+        ctx.last_code_authoring_reject_was_credential_priority = False
+        _clear_held_churn_signals(ctx)
         accepted_metadata = getattr(ctx, "code_artifact_metadata", None)
         if isinstance(accepted_metadata, dict) and accepted_metadata:
             accepted_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))

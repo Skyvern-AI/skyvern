@@ -368,6 +368,10 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
         "I couldn't get past the same problem after several attempts.",
         "Tell me what to change and I'll try a different approach.",
     ),
+    "code_authoring_guardrail_churn": (
+        "I kept rewriting the generated code, but the safety checks rejected each version.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
 }
 _LOOP_ANTI_BOT_BLOCKER_COPY = "The site's verification challenge was still keeping the submit/search control disabled."
 _LOOP_RESULT_COMPOSITION_BLOCKER_COPY = (
