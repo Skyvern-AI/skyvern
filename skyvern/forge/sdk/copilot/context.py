@@ -265,7 +265,7 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
 
     Called from agent.py's `_make_agent_result` factory so every AgentResult
     exit path — timeout, cancel, max-turns, output-policy block, request-
-    policy clarification, feasibility clarification, non-retriable nav error,
+    policy clarification, infeasibility clarification, non-retriable nav error,
     normal translate-result, missing-SDK fallback, unexpected-error fallback —
     carries the updated count.
 
@@ -294,8 +294,7 @@ class AgentResult:
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
     workflow_was_persisted: bool = False
-    # Tells the route to null any persisted proposed_workflow. Set by the
-    # feasibility-gate fast-path and by ASK_QUESTION turns.
+    # Route nulls any persisted proposed_workflow when this is set.
     clear_proposed_workflow: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from
