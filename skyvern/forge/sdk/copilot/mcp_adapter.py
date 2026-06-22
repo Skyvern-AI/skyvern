@@ -57,6 +57,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "scout_trajectory",
     "pending_scout_source_url",
     "pending_scout_typed_value",
+    "pending_scout_role_name",
     "post_budget_page_inspection_required",
     "post_budget_page_inspection_url",
     "post_budget_page_inspection_run_id",

@@ -29,7 +29,7 @@ from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _SYNTHESIZED_BLOCK_LABEL,
     SynthesisDiagnostics,
-    _get_by_role_expr,
+    _get_by_role_expr_strict,
     artifact_dependency_id,
     artifact_observation_ref_id,
     synthesize_code_block,
@@ -1123,7 +1123,7 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
     if source == "aria_role_name":
         role = str(provenance.get("role") or "")
         name = str(provenance.get("name") or "")
-        return bool(role) and bool(name) and _get_by_role_expr(role, name) == provenance.get("emitted_literal")
+        return bool(role) and bool(name) and _get_by_role_expr_strict(role, name) == provenance.get("emitted_literal")
     return False
 
 
