@@ -12,13 +12,15 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.code_block_preflight import _sandbox_shim_surface, strip_redundant_sandbox_imports
 from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr, _get_by_role_expr_strict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import MAX_CODE_AUTHORING_GUARDRAIL_REJECTS, _check_enforcement
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.tools import (
     _code_block_safety_errors,
     _detect_stale_block_metadata,
@@ -26,6 +28,7 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import _strip_redundant_sandbox_imports_in_yaml
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind, _kind_for_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -2710,3 +2713,189 @@ class TestStripRedundantSandboxImportsInYaml:
         sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(_SAFE_CODE_YAML)
         assert stripped == []
         assert sanitized == _SAFE_CODE_YAML
+
+
+def _distinct_guardrail_yaml(index: int) -> str:
+    bodies = [
+        f"value = undefined_helper_{index}()",
+        f'import os\nawait page.goto("https://example.com/{index}")',
+        f'await page.evaluate("{index} + 1")',
+    ]
+    return _code_yaml(bodies[index % len(bodies)])
+
+
+def _distinct_credential_collision_yaml(index: int) -> str:
+    unsafe = [
+        f"value = undefined_helper_{index}()",
+        "import os",
+        f'await page.evaluate("{index} + 1")',
+    ]
+    return _credential_code_yaml(
+        code=f"""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        {unsafe[index % len(unsafe)]}
+        """
+    )
+
+
+def _terminal_challenge_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="A site verification challenge blocked the run.",
+        user_facing_reason="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+    )
+
+
+class TestCodeAuthoringGuardrailChurnBackstop:
+    @pytest.mark.asyncio
+    async def test_counter_climbs_on_distinct_rejects_and_resets_on_accept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            result = await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+            assert result["ok"] is False
+            assert ctx.code_authoring_guardrail_reject_count == index + 1
+        assert ctx.blocker_signal is None
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+        assert accepted["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_counter_climbs_through_credential_scout_branch(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        unsafe_credential_yaml = _credential_code_yaml(
+            code="""
+            import os
+            await page.locator("#email").fill(login_credential.username)
+            await page.locator("input[type='password']").fill(login_credential.password)
+            await page.locator("input[type='submit']").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": unsafe_credential_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert ctx.code_authoring_guardrail_reject_count == 1
+
+    @pytest.mark.asyncio
+    async def test_clean_accept_does_not_climb_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
+        assert "safety checks rejected" in churn.user_facing_reason
+
+    @pytest.mark.asyncio
+    async def test_nth_reject_defers_to_pre_existing_terminal_blocker(self) -> None:
+        ctx = _code_only_ctx()
+        terminal = _terminal_challenge_signal()
+        ctx.blocker_signal = terminal
+        ctx.latest_tool_blocker_signal = terminal
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.blocker_signal is terminal
+        assert ctx.latest_tool_blocker_signal is terminal
+
+    @pytest.mark.asyncio
+    async def test_nth_credential_collision_reject_keeps_credential_priority_blocker(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result: dict[str, object] = {}
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert "fill_credential_field" in result["error"]
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_reject_survives_enforcement_pass(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert _check_enforcement(ctx) is None
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_name_safety_churn_still_halts_after_credential_priority_reject(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    @pytest.mark.asyncio
+    async def test_accept_after_latched_churn_clears_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert accepted["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert _check_enforcement(ctx) is None
