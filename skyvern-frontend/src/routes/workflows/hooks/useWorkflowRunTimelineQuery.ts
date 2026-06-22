@@ -11,10 +11,17 @@ import { WorkflowRunTimelineItem } from "../types/workflowRunTypes";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import {
+  getActiveOrgQueryKeyScope,
+  getOrgScopedQueryKey,
+  useActiveOrgId,
+} from "@/store/ActiveOrgContext";
 
 function useWorkflowRunTimelineQuery() {
   const workflowRunId = useFirstParam("workflowRunId", "runId");
   const credentialGetter = useCredentialGetter();
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   const queryClient = useQueryClient();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflowRun, dataUpdatedAt } =
@@ -35,15 +42,27 @@ function useWorkflowRunTimelineQuery() {
       workflowRunId
     ) {
       queryClient.invalidateQueries({
-        queryKey: ["workflowRunTimeline", workflowPermanentId, workflowRunId],
+        queryKey: getOrgScopedQueryKey(
+          ["workflowRunTimeline", workflowPermanentId, workflowRunId],
+          activeOrgQueryKeyScope,
+        ),
       });
     }
     prevDataUpdatedAtRef.current = dataUpdatedAt;
-  }, [dataUpdatedAt, workflowPermanentId, workflowRunId, queryClient]);
+  }, [
+    activeOrgQueryKeyScope,
+    dataUpdatedAt,
+    workflowPermanentId,
+    workflowRunId,
+    queryClient,
+  ]);
 
   return useQuery<Array<WorkflowRunTimelineItem>>({
-    queryKey: ["workflowRunTimeline", workflowPermanentId, workflowRunId],
-    queryFn: async () => {
+    queryKey: getOrgScopedQueryKey(
+      ["workflowRunTimeline", workflowPermanentId, workflowRunId],
+      activeOrgQueryKeyScope,
+    ),
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const isGlobalWorkflow = globalWorkflows?.some(
         (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
@@ -55,7 +74,7 @@ function useWorkflowRunTimelineQuery() {
       return client
         .get(
           `/workflows/${workflowPermanentId}/runs/${workflowRunId}/timeline`,
-          { params },
+          { params, signal },
         )
         .then((response) => response.data);
     },
