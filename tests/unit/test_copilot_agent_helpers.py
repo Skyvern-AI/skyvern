@@ -14,6 +14,7 @@ import yaml
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -33,6 +34,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_fail
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
+    CompletionCriterion,
     RequestPolicy,
     _classify_request,
     build_transcript_context,
@@ -1244,6 +1246,7 @@ def _chat_request() -> SimpleNamespace:
         workflow_id="wf-1",
         workflow_permanent_id="wfp-1",
         workflow_copilot_chat_id="chat-1",
+        workflow_yaml="",
     )
 
 
@@ -1412,6 +1415,93 @@ class TestTranslateToAgentResultGating:
 
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
+
+    def test_verified_terminal_state_surfaces_workflow_despite_weak_final_reply(self) -> None:
+        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="title: Verified Draft",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
+        ctx.verified_terminal_proposal_ready = True
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Do you want me to keep repairing?"})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.updated_workflow is workflow
+        assert agent_result.workflow_yaml == "title: Verified Draft"
+        assert agent_result.clear_proposed_workflow is False
+        assert agent_result.proposal_disposition == "auto_applicable"
+
+    def test_output_field_confirmation_question_is_blocked_when_contract_present(self) -> None:
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                user_response_policy="proceed",
+                completion_contract_status="present",
+                completion_criteria=[
+                    CompletionCriterion(id="provider", outcome="The returned record identifies the provider."),
+                ],
+            )
+        )
+        result = _fake_run_result(
+            {
+                "type": "ASK_QUESTION",
+                "user_response": "Please confirm the output fields before I build and test this workflow.",
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.updated_workflow is None
+        assert agent_result.clear_proposed_workflow is False
+        assert agent_result.proposal_disposition == "no_proposal"
+        assert agent_result.output_policy_diagnostics is not None
+        assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is False
+        assert agent_result.output_policy_diagnostics["hard_block_reason_codes"] == [
+            "avoidable_output_field_confirmation"
+        ]
+
+    def test_credential_clarification_question_remains_allowed_with_request_policy(self) -> None:
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                user_response_policy="ask_clarification",
+                clarification_question="Which saved credential should I use?",
+                clarification_reason="credential_name_unresolved",
+                completion_contract_status="present",
+                completion_criteria=[
+                    CompletionCriterion(id="provider", outcome="The returned record identifies the provider."),
+                ],
+            )
+        )
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which saved credential should I use?"})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.clear_proposed_workflow is True
+        assert agent_result.output_policy_diagnostics is not None
+        assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is True
+        assert "avoidable_output_field_confirmation" not in agent_result.output_policy_diagnostics["raw_reason_codes"]
 
     def test_inline_replace_workflow_resets_test_ok_after_prior_pass(self, monkeypatch) -> None:
         # A prior run_blocks test passed for the old workflow (ctx.last_test_ok=True,
