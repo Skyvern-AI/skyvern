@@ -61,6 +61,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     credential_priority_authoring_churn_stop_signal,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
+from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
@@ -989,6 +990,14 @@ def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
     except RecursionError:
         return "Workflow YAML nesting is too deep to validate."
     return "\n".join(errors) if errors else None
+
+
+def _code_repair_progress_data() -> dict[str, str]:
+    """Tag a code-authoring reject so the streaming adapter renders it as quiet de-duplicated progress."""
+    return {
+        "surface_kind": CODE_REPAIR_PROGRESS_SURFACE_KIND,
+        "progress_text": CODE_REPAIR_PROGRESS_TEXT,
+    }
 
 
 def _code_seam_rejection_user_summary(*, metadata_rejected: bool, code_rejected: bool) -> str:
@@ -3142,6 +3151,7 @@ async def _update_workflow(
             "ok": False,
             "error": raw_conflict_marker_error,
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     # Tool wrappers run authority/loop guards before calling here. The composition
     # gate below consumes these refs, so they must be visible before validation.
@@ -3155,6 +3165,7 @@ async def _update_workflow(
             "ok": False,
             "error": "\n".join(imposition.violations),
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     workflow_yaml = imposition.workflow_yaml
     stripped_sandbox_imports: list[str] = []
@@ -3166,6 +3177,7 @@ async def _update_workflow(
             "ok": False,
             "error": "\n".join(typed_default_violations),
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     params["workflow_yaml"] = workflow_yaml
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
@@ -3174,6 +3186,7 @@ async def _update_workflow(
             "ok": False,
             "error": parameter_contract_error,
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     missing_metadata_error = _missing_code_artifact_metadata_error(
         workflow_yaml,
@@ -3185,6 +3198,7 @@ async def _update_workflow(
             "ok": False,
             "error": missing_metadata_error,
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     normalization = _normalize_code_artifact_metadata_detailed(
@@ -3243,6 +3257,7 @@ async def _update_workflow(
                 metadata_rejected=code_artifact_metadata_error is not None,
                 code_rejected=bool(code_safety_errors),
             ),
+            "data": _code_repair_progress_data(),
         }
     if credential_scout_errors:
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
