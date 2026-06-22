@@ -6,13 +6,14 @@ import typing
 
 import structlog
 from starlette.concurrency import iterate_in_threadpool
+from starlette.requests import ClientDisconnect
+from starlette.responses import Response
 
 from skyvern.config import settings
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
 
-    from fastapi import Response
     from starlette.requests import Request
 
 LOG = structlog.get_logger()
@@ -28,6 +29,7 @@ _SENSITIVE_ENDPOINTS = {
     "GET /v1/credentials/totp",
 }
 _MAX_BODY_LENGTH = 1000
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
 _REDACTED = "****"
@@ -76,8 +78,12 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
     return first_hop or None
 
 
+def _is_sensitive_endpoint(request: Request) -> bool:
+    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS
+
+
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
-    if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
+    if _is_sensitive_endpoint(request):
         return _REDACTED
     if not body:
         return ""
@@ -124,7 +130,7 @@ def _is_loggable_content_type(content_type: str | None) -> bool:
 
 
 def _sanitize_response_body(request: Request, body_str: str | None, content_type: str | None) -> str:
-    if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
+    if _is_sensitive_endpoint(request):
         return _REDACTED
     if body_str is None:
         return _BINARY_PLACEHOLDER
@@ -169,7 +175,15 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
         return await call_next(request)
 
     start_time = time.monotonic()
-    body_bytes = await request.body()
+    try:
+        body_bytes = await request.body()
+    except ClientDisconnect:
+        # The client closed the connection before the body finished streaming, so no
+        # response will reach it. Short-circuit with a benign 499 instead of letting
+        # the disconnect escape this BaseHTTPMiddleware (which wraps it in an
+        # ExceptionGroup) and surface as an unhandled error in tracking.
+        LOG.info("api.client_disconnect", method=request.method, path=request.url.path)
+        return Response(status_code=499)
     # ensure downstream handlers can access body again
     try:
         request._body = body_bytes  # type: ignore[attr-defined]
@@ -185,6 +199,19 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     try:
         response = await call_next(request)
+
+        # Skip successful reads before buffering the response body: they are
+        # the bulk of request volume (health checks, status polling) and the
+        # 4xx/5xx and mutating paths below retain all audit/debugging value.
+        # Sensitive endpoints (credential/TOTP reads) always keep their
+        # redacted audit line.
+        if (
+            response.status_code < 400
+            and http_method in _READ_METHODS
+            and not settings.LOG_RAW_API_REQUESTS_SUCCESSFUL_READS
+            and not _is_sensitive_endpoint(request)
+        ):
+            return response
 
         if response.status_code >= 500:
             log_method = LOG.error

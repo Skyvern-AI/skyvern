@@ -441,6 +441,7 @@ _CODE_V2_DEFAULTS: dict[str, Any] = {
     "run_with": "agent",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
+_WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = ("run_sequentially", "sequential_key")
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
@@ -607,6 +608,28 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
     existing_workflow = await get_workflow_by_id(workflow_id)
     raw["proxy_location"] = existing_workflow.get("proxy_location") or _DEFAULT_MCP_PROXY_LOCATION
     return _dump_definition_dict(raw, parsed_format)
+
+
+async def _inject_workflow_update_top_level_settings(definition: str, fmt: str, workflow_id: str) -> str:
+    """Preserve workflow-level settings that schema defaults would otherwise clobber."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    missing_fields = [field for field in _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS if field not in raw]
+    if not missing_fields:
+        return definition
+
+    existing_workflow = await get_workflow_by_id(workflow_id)
+    changed = False
+    for field in missing_fields:
+        existing_value = existing_workflow.get(field)
+        if existing_value is not None:
+            raw[field] = existing_value
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
 
 
 # Parameter types that are auto-managed (credentials and secrets set via the UI) and should
@@ -1082,6 +1105,7 @@ async def skyvern_workflow_update(
 
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
+        definition = await _inject_workflow_update_top_level_settings(definition, format, workflow_id)
         definition = await _inject_workflow_update_parameters(definition, format, workflow_id)
     except NotFoundError:
         return make_result(
@@ -1094,7 +1118,7 @@ async def skyvern_workflow_update(
             ),
         )
     except Exception as e:
-        LOG.warning("workflow_update_proxy_default_injection_failed", workflow_id=workflow_id, error=str(e))
+        LOG.warning("workflow_update_preprocessing_failed", workflow_id=workflow_id, error=str(e))
         return make_result(
             "skyvern_workflow_update",
             ok=False,

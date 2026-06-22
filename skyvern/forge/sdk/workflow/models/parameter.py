@@ -232,6 +232,8 @@ class WorkflowParameterType(StrEnum):
                     raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
                 return lower_case in ["true", "1"]
             elif self == WorkflowParameterType.JSON:
+                if isinstance(value, (dict, list)):
+                    return value
                 return json.loads(value)
             elif self == WorkflowParameterType.FILE_URL:
                 return value

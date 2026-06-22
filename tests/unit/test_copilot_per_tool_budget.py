@@ -22,6 +22,15 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisFailureType,
+    DiagnosisInput,
+    DiagnosisRepairContract,
+    DiagnosisResult,
+    RepairDecision,
+    RepairNextAction,
+    VerificationResult,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PER_TOOL_BUDGET_NUDGES,
     POST_ANTI_BOT_FAILED_TEST_NUDGE,
@@ -35,13 +44,20 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     compute_failure_signature,
 )
+from skyvern.forge.sdk.copilot.run_outcome import (
+    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.tools import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     WatchdogExitReason,
     _composition_anti_bot_reason,
     _last_run_has_terminal_anti_bot_blocker,
     _mark_page_inspected,
     _mark_pending_reconciliation_run,
     _maybe_clear_reconciliation_flag,
+    _post_budget_terminal_challenge_signal,
+    _post_run_terminal_challenge_reason,
     _record_composition_page_observation,
     _record_per_tool_budget_problem_blocks_from_results,
     _record_run_blocks_result,
@@ -49,6 +65,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_loop_error,
     _watchdog_user_failure_reason,
 )
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 
 
 def _fresh_context() -> CopilotContext:
@@ -136,6 +153,7 @@ def test_record_preserves_pre_run_anti_bot_evidence_on_budget_trip() -> None:
 def test_composition_anti_bot_reason_reads_typed_challenge_state_without_legacy_indicators() -> None:
     ctx = _fresh_context()
     ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
         "challenge_state": {
             "detected": True,
             "kind": "human_verification",
@@ -150,6 +168,72 @@ def test_composition_anti_bot_reason_reads_typed_challenge_state_without_legacy_
     assert reason is not None
     assert "human_verification" in reason
     assert "challenge-gated disabled submit/search control: Search" in reason
+
+
+def test_block_running_halts_on_current_page_terminal_challenge_before_repair_loop() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_lookup"]})
+
+    assert msg is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert ctx.blocker_signal.extra["run_outcome_reason_code"] == TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE
+    assert ctx.blocker_signal.extra["evidence_source"] == "page_evidence"
+    assert ctx.blocker_signal.extra["block_labels"] == ["search_lookup"]
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def test_block_running_does_not_halt_current_page_challenge_when_results_are_present() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": False,
+            "gates_submit_controls": False,
+        },
+        "result_containers": [{"selector": "#results", "row_count": 1, "sample_rows": ["Visible result row"]}],
+    }
+
+    assert _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_lookup"]}) is None
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+
+
+def test_block_running_halts_current_page_challenge_with_empty_result_shell() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+        "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+    }
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_lookup"]})
+
+    assert msg is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
 
 
 def test_block_running_after_budget_current_url_requires_inspection_first() -> None:
@@ -198,6 +282,15 @@ def test_watchdog_user_failure_reason_excludes_next_tool_instruction() -> None:
     assert "Run ID: wr_safe" in reason
     assert "get_run_results" not in reason
     assert "update_and_run_blocks" not in reason
+
+
+def test_watchdog_user_failure_reason_for_active_terminal_evidence_is_not_success() -> None:
+    exit_reason: WatchdogExitReason = "active_run_terminal_evidence"
+    reason = _watchdog_user_failure_reason(exit_reason, "wr_active", 240, None)
+
+    assert "requested browser state" in reason
+    assert "Full workflow verification is still required" in reason
+    assert "Run ID: wr_active" in reason
 
 
 def test_record_clears_top_category_on_run_with_different_category() -> None:
@@ -269,19 +362,49 @@ def test_check_enforcement_emits_budget_nudge_before_failed_test() -> None:
     assert ctx.per_tool_budget_nudge_count == 1
 
 
-def test_check_enforcement_emits_anti_bot_nudge_before_budget_when_challenge_observed() -> None:
+def test_check_enforcement_halts_before_budget_when_structured_challenge_observed() -> None:
     ctx = _fresh_context()
     ctx.update_workflow_called = True
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
     ctx.last_test_anti_bot = "Observed anti-bot challenge evidence before the run: human-verification"
+    ctx.composition_page_evidence = {
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification password=topsecret",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        _check_enforcement(ctx)
+
+    assert exc_info.value.halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert exc_info.value.halt.extra["run_outcome_reason_code"] == "terminal_challenge_blocker"
+    assert exc_info.value.halt.extra["evidence_source"] == "page_evidence"
+    assert "[REDACTED_SECRET]" in exc_info.value.halt.extra["evidence_reason"]
+    assert "topsecret" not in exc_info.value.halt.extra["evidence_reason"]
+    assert ctx.failed_test_nudge_count == 0
+    assert ctx.per_tool_budget_nudge_count == 0
+
+
+def test_check_enforcement_keeps_text_only_anti_bot_diagnostic_non_terminal() -> None:
+    ctx = _fresh_context()
+    ctx.update_workflow_called = True
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    ctx.last_test_anti_bot = "possible challenge mentioned in free text"
 
     nudge = _check_enforcement(ctx)
 
     assert nudge == POST_ANTI_BOT_FAILED_TEST_NUDGE
     assert ctx.failed_test_nudge_count == 1
     assert ctx.per_tool_budget_nudge_count == 0
+    assert ctx.turn_halt is None
 
 
 def test_final_reply_after_post_run_observation_bypasses_stale_budget_and_anti_bot_nudges() -> None:
@@ -373,9 +496,8 @@ def test_failure_signature_is_stable_across_budget_trips_with_different_run_ids(
     assert sig_a == sig_b
 
 
-def test_failure_signature_changes_when_frontier_label_differs() -> None:
-    """A budget trip on a different frontier should still produce a different
-    signature so the streak resets when the agent meaningfully changes shape."""
+def test_failure_signature_ignores_frontier_label_drift() -> None:
+    """Block labels are UI/editing affordances, not root-cause identity."""
     failure_categories = [{"category": PER_TOOL_BUDGET_FAILURE_CATEGORY, "confidence_float": 1.0}]
     sig_a = compute_failure_signature(
         frontier_start_label="block_a",
@@ -389,7 +511,8 @@ def test_failure_signature_changes_when_frontier_label_differs() -> None:
         failure_categories=failure_categories,
         suspicious_success=False,
     )
-    assert sig_a != sig_b
+    assert sig_a is not None
+    assert sig_a == sig_b
 
 
 def test_nudge_text_advises_splitting_chain() -> None:
@@ -434,6 +557,16 @@ def test_reconciliation_clears_for_per_tool_budget_even_on_canceled_status() -> 
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
 
     _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_1", "canceled"))
+
+    assert ctx.pending_reconciliation_run_id is None
+
+
+def test_reconciliation_clears_for_active_terminal_evidence_cancel() -> None:
+    ctx = _fresh_context()
+    ctx.pending_reconciliation_run_id = "wr_active"
+    ctx.last_failure_category_top = ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+
+    _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_active", "canceled"))
 
     assert ctx.pending_reconciliation_run_id is None
 
@@ -643,6 +776,7 @@ workflow_definition:
         "The required Search button remains disabled after verification, and there is no enabled alternative."
     )
     ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
         "challenge_state": {
             "detected": True,
             "kind": "human_verification",
@@ -661,14 +795,13 @@ workflow_definition:
     )
 
     assert msg is not None
-    assert "anti-bot challenge" in msg
-    assert "disabled submit/search control" in msg
+    assert "Structured challenge evidence confirms this path is blocked" in msg
     assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "tool_error_challenge_gated_submit_disabled"
+    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
     assert ctx.blocker_signal.renders_final_reply is True
 
 
-def test_tool_loop_error_allows_challenge_gated_retry_with_changed_proxy_location() -> None:
+def test_tool_loop_error_blocks_current_page_challenge_with_changed_proxy_location() -> None:
     ctx = _fresh_context()
     ctx.last_failed_workflow_yaml = """
 title: Registry standard credential lookup
@@ -683,6 +816,7 @@ workflow_definition:
     )
     ctx.last_test_failure_reason = "The required Search button remains disabled after verification."
     ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
         "challenge_state": {
             "detected": True,
             "kind": "human_verification",
@@ -700,18 +834,20 @@ workflow_definition:
       url: https://example.com/registry/search
 """
 
-    assert (
-        _tool_loop_error(
-            ctx,
-            "update_and_run_blocks",
-            {
-                "workflow_yaml": changed_proxy_yaml,
-                "block_labels": ["fill_sample_record_search"],
-            },
-        )
-        is None
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": changed_proxy_yaml,
+            "block_labels": ["fill_sample_record_search"],
+        },
     )
-    assert ctx.challenge_gated_proxy_retry_count == 1
+
+    assert msg is not None
+    assert "do NOT try a proxy/location switch" in msg
+    assert ctx.challenge_gated_proxy_retry_count == 0
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 
 
 def test_tool_loop_error_blocks_post_budget_challenge_even_with_changed_proxy_location() -> None:
@@ -841,7 +977,7 @@ def test_terminal_anti_bot_blocker_requires_gated_submit_evidence_for_disabled_f
     assert _last_run_has_terminal_anti_bot_blocker(ctx) is False
 
 
-def test_record_run_blocks_treats_structured_anti_bot_blocker_as_failed_test() -> None:
+def test_record_run_blocks_treats_structured_anti_bot_blocker_as_terminal_challenge() -> None:
     ctx = _fresh_context()
     ctx.workflow_yaml = "workflow_definition: {blocks: []}"
     result = {
@@ -849,6 +985,7 @@ def test_record_run_blocks_treats_structured_anti_bot_blocker_as_failed_test() -
         "data": {
             "workflow_run_id": "wr_blocked",
             "overall_status": "completed",
+            "failure_categories": [{"category": "PARAMETER_BINDING_ERROR", "confidence_float": 0.95}],
             "blocks": [
                 {
                     "label": "extract_sample_credentials",
@@ -870,14 +1007,142 @@ def test_record_run_blocks_treats_structured_anti_bot_blocker_as_failed_test() -
     _record_run_blocks_result(ctx, result)
 
     assert ctx.last_test_ok is False
-    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_anti_bot is not None
     assert "Verify you are human" in ctx.last_test_failure_reason
     assert ctx.last_failed_workflow_yaml == "workflow_definition: {blocks: []}"
-    assert result["data"]["failure_reason"] == (
-        "Run completed, but extracted data reported a blocker: Verify you are human"
-    )
+    assert result["data"]["failure_reason"] == "Run output reported a blocker: Verify you are human"
+    categories = result["data"]["failure_categories"]
+    assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
+    assert categories[1]["category"] == "ANTI_BOT_DETECTION"
+    assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
+    assert ctx.turn_halt is not None
+
+
+def test_record_run_blocks_treats_structured_browser_access_blocker_as_terminal_challenge() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = "workflow_definition: {blocks: []}"
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_blocked",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "search_sample_records",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "status": "blocked",
+                        "blocker_type": "browser_port_forbidden",
+                        "blocker_evidence": (
+                            "The browser refused to render the requested localhost port before the search page loaded."
+                        ),
+                        "records": [],
+                        "record_count": 0,
+                    },
+                }
+            ],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_anti_bot is not None
+    assert result["data"]["failure_reason"] == "Run output reported a blocker: browser_port_forbidden"
     assert result["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
+    assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def test_record_run_blocks_prefers_nested_port_blocker_over_status_shell() -> None:
+    ctx = _fresh_context()
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_blocked",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "search_sample_records",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "status": "blocked",
+                        "query": "Sample",
+                        "records": [],
+                        "record_count": 0,
+                        "blocker": {
+                            "type": "browser_or_environment_port_block",
+                            "message": "The page shows a port-forbidden error instead of the target search UI.",
+                        },
+                        "evidence_text": "Requested port 8900 is forbidden",
+                    },
+                }
+            ],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
+    assert ctx.turn_halt is not None
+    assert "Requested port" in ctx.turn_halt.extra["evidence_reason"]
+
+
+def test_record_run_blocks_combines_status_blocked_with_page_challenge_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "challenge_state": {
+            "detected": True,
+            "kind": "captcha",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+        "anti_bot_indicators": ["captcha", "verify you are human"],
+    }
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_blocked",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "search_sample_records",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "status": "blocked",
+                        "records": [],
+                        "record_count": 0,
+                    },
+                }
+            ],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert "challenge-gated disabled submit/search control: Search" in ctx.turn_halt.extra["evidence_reason"]
+    assert "Run output reported" in ctx.turn_halt.extra["evidence_reason"]
 
 
 def test_tool_loop_error_blocks_upstream_replay_after_post_budget_page_evidence() -> None:
@@ -1049,3 +1314,294 @@ def test_nudge_counter_preserved_across_consecutive_budget_trips() -> None:
 
     assert ctx.per_tool_budget_nudge_count == 1
     assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+
+def _challenge_gated_post_run_evidence(**extra: object) -> dict:
+    evidence = {
+        "current_url": "https://example.com/registry/search",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+        "anti_bot_indicators": ["human-verification"],
+        "forms": [{"submit_controls": [{"text": "Search", "selector": "#search", "disabled": True}]}],
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+    evidence.update(extra)
+    return evidence
+
+
+def _armed_post_run_context() -> CopilotContext:
+    ctx = _fresh_context()
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    ctx.last_test_ok = False
+    ctx.per_tool_budget_problem_block_labels = ["submit_registry_search"]
+    return ctx
+
+
+def _anti_bot_stop_contract() -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(
+            source_tool="update_and_run_blocks",
+            workflow_run_id="wr_blocked",
+            run_status="failed",
+            failure_categories=["ANTI_BOT_DETECTION"],
+        ),
+        diagnosis_result=DiagnosisResult(
+            suspected_failure_type=DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,
+            root_cause_summary="human-verification challenge blocked a disabled submit control",
+            confidence=0.85,
+            evidence_references=["failure_category:ANTI_BOT_DETECTION"],
+        ),
+        repair_decision=RepairDecision(
+            next_action=RepairNextAction.STOP,
+            proposed_change_summary="Stop retrying the current failure and report the blocker.",
+        ),
+        verification_result=VerificationResult(
+            run_status="failed",
+            remaining_blocker="human-verification challenge blocked a disabled submit control",
+        ),
+    )
+
+
+_BLOCK_LABEL_ARGS = {"block_labels": ["submit_registry_search"]}
+_RESULT_CONTAINER_SHELL = [{"tag": "table", "selector": "#results", "row_selector": "#results tbody tr"}]
+
+
+def _stash_prior_result_evidence_bounce(ctx: CopilotContext) -> None:
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(result_containers=_RESULT_CONTAINER_SHELL)
+    prior = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+    assert prior is not None
+    assert prior.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    ctx.tool_blocker_signals.append(prior)
+
+
+def test_terminal_challenge_routes_to_answer_path_when_result_evidence_in_same_packet() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(
+        result_containers=_RESULT_CONTAINER_SHELL,
+        visible_text_excerpt="SAMPLE, PERSON Anytown, XY Exampleland Certified Active",
+    )
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    assert signal.renders_final_reply is False
+    assert signal.preserves_workflow_draft is True
+    assert "Answer from the observed page" in signal.agent_steering_text
+    assert "result container" in signal.agent_steering_text
+
+
+def test_terminal_challenge_first_container_shell_bounce_stays_retryable() -> None:
+    ctx = _armed_post_run_context()
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(result_containers=_RESULT_CONTAINER_SHELL)
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    assert signal.renders_final_reply is False
+    assert signal.extra["challenge_signature"]
+    assert signal.extra["result_evidence_signature"]
+    assert signal.extra["result_evidence_populated"] is False
+
+
+def test_terminal_challenge_repeated_container_shell_with_stop_contract_escalates() -> None:
+    ctx = _armed_post_run_context()
+    _stash_prior_result_evidence_bounce(ctx)
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert signal.renders_final_reply is True
+    assert signal.recovery_hint == "report_blocker_to_user"
+    assert signal.cleared_by_tools == frozenset()
+    assert signal.extra["escalated_from_reason_code"] == "tool_error_post_budget_challenge_result_evidence"
+    assert "human verification" in signal.user_facing_reason and "Search" in signal.user_facing_reason
+
+
+def test_terminal_challenge_changed_evidence_resets_container_shell_escalation() -> None:
+    ctx = _armed_post_run_context()
+    _stash_prior_result_evidence_bounce(ctx)
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(
+        forms=[{"submit_controls": [{"text": "Lookup", "selector": "#lookup", "disabled": True}]}],
+        challenge_state={
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Lookup", "selector": "#lookup", "disabled": True}],
+        },
+        result_containers=[{"tag": "table", "selector": "#results", "row_selector": "#results tbody tr"}],
+    )
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    assert signal.renders_final_reply is False
+
+
+@pytest.mark.parametrize(
+    "evidence_extra",
+    [
+        {
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": "#results",
+                    "row_selector": "#results tbody tr",
+                    "row_count": 1,
+                    "sample_rows": ["JANE DOE Active"],
+                }
+            ]
+        },
+        {
+            "result_containers": _RESULT_CONTAINER_SHELL,
+            "visible_text_excerpt": "SAMPLE, PERSON Anytown, XY Exampleland Certified Active",
+        },
+    ],
+)
+def test_terminal_challenge_populated_results_stay_retryable_after_stop_contract(
+    evidence_extra: dict[str, object],
+) -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(**evidence_extra)
+    prior = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+    assert prior is not None
+    ctx.tool_blocker_signals.append(prior)
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    assert signal.renders_final_reply is False
+    assert signal.extra["result_evidence_populated"] is True
+
+
+def test_terminal_challenge_chrome_visible_text_does_not_defeat_stop_escalation() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(
+        forms=[
+            {
+                "fields": [
+                    {"label": "License Number", "name": "license_number"},
+                    {"label": "County", "name": "county", "options": [{"text": "County", "value": "county"}]},
+                ],
+                "submit_controls": [{"text": "Search", "selector": "#search", "disabled": True}],
+            }
+        ],
+        result_containers=_RESULT_CONTAINER_SHELL,
+        visible_text_excerpt="License Number County Search Verify you are human",
+    )
+    prior = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+    assert prior is not None
+    ctx.tool_blocker_signals.append(prior)
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert signal.renders_final_reply is True
+
+
+def test_terminal_challenge_non_table_result_heading_does_not_defeat_stop_escalation() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(
+        result_containers=[{"tag": "div", "selector": "#results", "text_excerpt": "Search results"}],
+    )
+    prior = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+    assert prior is not None
+    ctx.tool_blocker_signals.append(prior)
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+
+    signal = _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert signal.renders_final_reply is True
+
+
+def test_tool_loop_error_replaces_retryable_container_shell_with_terminal_challenge_stop() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(result_containers=_RESULT_CONTAINER_SHELL)
+
+    first = _tool_loop_error(ctx, "update_and_run_blocks", _BLOCK_LABEL_ARGS)
+    assert first is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    assert ctx.blocker_signal.renders_final_reply is False
+
+    ctx.latest_diagnosis_repair_contract = _anti_bot_stop_contract()
+    second = _tool_loop_error(ctx, "update_and_run_blocks", _BLOCK_LABEL_ARGS)
+
+    assert second is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert ctx.blocker_signal.renders_final_reply is True
+    assert ctx.blocker_signal.recovery_hint == "report_blocker_to_user"
+
+
+def test_terminal_challenge_fires_without_result_evidence_and_names_observed_facts() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence()
+
+    signal = _post_budget_terminal_challenge_signal(ctx, None, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert signal.renders_final_reply is True
+    assert "human verification" in signal.user_facing_reason
+    assert "Search" in signal.user_facing_reason
+    assert "per-tool-call budget" not in signal.user_facing_reason
+    assert "wr_" not in signal.user_facing_reason
+
+
+def test_bare_substring_indicators_do_not_produce_terminal_reason() -> None:
+    # A passive challenge-vendor token over raw HTML plus an unrelated disabled
+    # submit control must not assert a terminal blocked claim.
+    evidence = _challenge_gated_post_run_evidence(
+        challenge_state={
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": False,
+            "gates_submit_controls": False,
+            "gated_submit_controls": [],
+        },
+    )
+    evidence["anti_bot_indicators"] = ["challenge"]
+    evidence["challenge_controls"] = [{"tag": "script", "src": "https://cdn.example/challenge-platform/api.js"}]
+
+    assert _post_run_terminal_challenge_reason(evidence) is None
+
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = evidence
+    assert _post_budget_terminal_challenge_signal(ctx, None, "update_and_run_blocks") is None
+
+
+def test_rendered_challenge_widget_still_produces_terminal_reason() -> None:
+    evidence = _challenge_gated_post_run_evidence(
+        challenge_state={
+            "detected": True,
+            "kind": "captcha",
+            "requires_human_verification": False,
+            "gates_submit_controls": False,
+            "gated_submit_controls": [],
+        },
+    )
+    evidence["challenge_controls"] = [{"tag": "div", "class": "cf-turnstile", "data_sitekey": "abc"}]
+
+    reason = _post_run_terminal_challenge_reason(evidence)
+    assert reason is not None
+    assert "disabled" in reason

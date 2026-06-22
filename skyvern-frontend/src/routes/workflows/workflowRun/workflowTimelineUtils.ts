@@ -1,12 +1,15 @@
 import { Status } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import {
+  findUnexecutedDefinedBlocks,
+  hasEvaluations,
   isBlockItem,
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
+import { WorkflowBlock } from "../types/workflowTypes";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 
 const containerBlockTypes = new Set(["for_loop", "while_loop", "conditional"]);
@@ -15,6 +18,180 @@ function parseActiveIterationParam(value: string | null): number | null {
   if (value === null || !/^\d+$/.test(value)) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function toTimelineTime(value: string): number {
+  const time = new Date(value).getTime();
+  return Number.isNaN(time) ? Number.MAX_SAFE_INTEGER : time;
+}
+
+/**
+ * Order timeline items by actual execution chronology.
+ *
+ * A conditional's children are the blocks its taken branch jumped to —
+ * lineage, not containment — so they interleave in time with the
+ * conditional's own siblings (e.g. a root-level loop can run between two of
+ * them). Hoist them to the conditional's level so depth-first rendering
+ * can't show a later branch block above an earlier sibling. Loop and
+ * task_v2 children do execute within their parent's lifespan and stay
+ * nested. Every sibling group is sorted ascending by created_at.
+ */
+function flattenTimelineChronologically(
+  items: Array<WorkflowRunTimelineItem>,
+): Array<WorkflowRunTimelineItem> {
+  if (items.length === 0) return items;
+
+  const rows: Array<WorkflowRunTimelineItem> = [];
+  const visit = (item: WorkflowRunTimelineItem) => {
+    if (isBlockItem(item) && item.block.block_type === "conditional") {
+      rows.push({ ...item, children: [] });
+      item.children.forEach(visit);
+      return;
+    }
+    rows.push({
+      ...item,
+      children: flattenTimelineChronologically(item.children),
+    });
+  };
+  items.forEach(visit);
+
+  return rows.sort(
+    (left, right) =>
+      toTimelineTime(left.created_at) - toTimelineTime(right.created_at),
+  );
+}
+
+type UnexecutedBlockReason = "branch_not_taken" | "not_reached";
+
+type UnexecutedDefinedBlock = {
+  block: WorkflowBlock;
+  reason: UnexecutedBlockReason;
+};
+
+function collectExecutedConditionals(
+  timelineItems: Array<WorkflowRunTimelineItem>,
+): Array<WorkflowRunBlock> {
+  const conditionals: Array<WorkflowRunBlock> = [];
+  const stack = [...timelineItems];
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    if (isBlockItem(item) && item.block.block_type === "conditional") {
+      conditionals.push(item.block);
+    }
+    stack.push(...item.children);
+  }
+  return conditionals;
+}
+
+/**
+ * Branch targets a conditional execution did / did not take. Prefer the
+ * runtime evaluations (they record the matched branch even when it has no
+ * redirect target); fall back to executed_branch_next_block against the
+ * definition's branch list. Returns null when the taken branch is unknowable
+ * (legacy runs) so callers can skip classification instead of guessing.
+ */
+function getBranchOutcome(
+  runtimeBlock: WorkflowRunBlock,
+  definedBlock: WorkflowBlock | undefined,
+): { takenTargets: Array<string>; notTakenTargets: Array<string> } | null {
+  if (hasEvaluations(runtimeBlock.output)) {
+    const evaluations = runtimeBlock.output.evaluations ?? [];
+    return {
+      takenTargets: evaluations
+        .filter((e) => e.is_matched && e.next_block_label)
+        .map((e) => e.next_block_label!),
+      notTakenTargets: evaluations
+        .filter((e) => !e.is_matched && e.next_block_label)
+        .map((e) => e.next_block_label!),
+    };
+  }
+  const taken = runtimeBlock.executed_branch_next_block;
+  if (!taken || !definedBlock || definedBlock.block_type !== "conditional") {
+    return null;
+  }
+  return {
+    takenTargets: [taken],
+    notTakenTargets: definedBlock.branch_conditions
+      .map((branch) => branch.next_block_label)
+      .filter((label): label is string => !!label && label !== taken),
+  };
+}
+
+/**
+ * Collect the chain of defined-block labels reachable from `start` via
+ * next_block_label. Executed conditionals end the walk (their own outcome is
+ * classified separately); unexecuted conditionals are descended into —
+ * every branch they could have taken shares the parent chain's fate.
+ */
+function traceDefinitionChain(
+  start: string,
+  blocksByLabel: ReadonlyMap<string, WorkflowBlock>,
+  executedLabels: ReadonlySet<string>,
+  into: Set<string>,
+): void {
+  const queue = [start];
+  while (queue.length > 0) {
+    const label = queue.pop()!;
+    if (into.has(label)) continue;
+    const block = blocksByLabel.get(label);
+    if (!block) continue;
+    into.add(label);
+    if (block.block_type === "conditional") {
+      if (executedLabels.has(label)) continue;
+      for (const branch of block.branch_conditions) {
+        if (branch.next_block_label) queue.push(branch.next_block_label);
+      }
+    }
+    if (block.next_block_label) queue.push(block.next_block_label);
+  }
+}
+
+/**
+ * Split unexecuted defined blocks into "skipped because a conditional took a
+ * different branch" and "never reached" (the run ended first). Labels on a
+ * taken branch win over not-taken membership: a block that the taken path
+ * should have reached but didn't is "not reached", not "skipped".
+ */
+function classifyUnexecutedDefinedBlocks(
+  definedBlocks: Array<WorkflowBlock>,
+  timelineItems: Array<WorkflowRunTimelineItem>,
+): Array<UnexecutedDefinedBlock> {
+  const unexecuted = findUnexecutedDefinedBlocks(definedBlocks, timelineItems);
+  if (unexecuted.length === 0) return [];
+
+  const blocksByLabel = new Map(
+    definedBlocks.map((block) => [block.label, block]),
+  );
+  const unexecutedLabels = new Set(unexecuted.map((block) => block.label));
+  const executedLabels = new Set(
+    definedBlocks
+      .filter((block) => !unexecutedLabels.has(block.label))
+      .map((block) => block.label),
+  );
+
+  const skipped = new Set<string>();
+  const onTakenPath = new Set<string>();
+  for (const conditional of collectExecutedConditionals(timelineItems)) {
+    const definedBlock = conditional.label
+      ? blocksByLabel.get(conditional.label)
+      : undefined;
+    const outcome = getBranchOutcome(conditional, definedBlock);
+    if (!outcome) continue;
+    for (const target of outcome.notTakenTargets) {
+      traceDefinitionChain(target, blocksByLabel, executedLabels, skipped);
+    }
+    for (const target of outcome.takenTargets) {
+      traceDefinitionChain(target, blocksByLabel, executedLabels, onTakenPath);
+    }
+  }
+
+  return unexecuted.map((block) => ({
+    block,
+    reason:
+      skipped.has(block.label) && !onTakenPath.has(block.label)
+        ? "branch_not_taken"
+        : "not_reached",
+  }));
 }
 
 function findBlockSurroundingAction(
@@ -253,6 +430,14 @@ function findTimelineBlockItem(
   return null;
 }
 
+function findTimelineBlock(
+  items: Array<WorkflowRunTimelineItem>,
+  blockId: string,
+): WorkflowRunBlock | null {
+  const item = findTimelineBlockItem(items, blockId);
+  return item && isBlockItem(item) ? item.block : null;
+}
+
 function findFirstLeafBlockId(
   items: Array<WorkflowRunTimelineItem>,
 ): string | null {
@@ -433,12 +618,16 @@ function aggregateIterationStatus(
 
 export {
   aggregateIterationStatus,
+  classifyUnexecutedDefinedBlocks,
   findActiveItem,
   findBlockSurroundingAction,
   findBlockSurroundingThought,
   findLastExecutedBlock,
   findRunningBlock,
   findThoughtsForBlock,
+  findTimelineBlock,
+  flattenTimelineChronologically,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
 };
+export type { UnexecutedBlockReason, UnexecutedDefinedBlock };

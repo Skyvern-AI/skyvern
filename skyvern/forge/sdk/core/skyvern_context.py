@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -93,6 +94,7 @@ class SkyvernContext:
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
+    downloaded_pdf_sources: set[str] = field(default_factory=set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -109,7 +111,6 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    enable_speed_optimizations: bool = False
     use_artifact_bundling: bool = False
     # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
@@ -118,10 +119,22 @@ class SkyvernContext:
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
+    # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
+    # The lock makes first-use resolution single-flight under parallel prompt builds.
+    slim_output_variant_assigned: str | None = None
+    slim_output_variant_resolved: bool = False
+    slim_output_variant_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
     # without taking a dependency on the public-API request shape.
     trigger_type: WorkflowRunTriggerType | None = None
+
+    # Screenshot attribution: set by the agent before calling scrape so the
+    # scraper can tag screenshot spans with the originating workflow phase
+    # and whether the LLM will consume the screenshots.
+    scrape_trigger: str | None = None
+    scrape_screenshots_consumed: bool | None = None
     # When true, downstream LLM handler selection may swap the resolved handler to a
     # flex-tier router. Cloud sets this at run boot via a PostHog flag for non-UI runs;
     # OSS keeps it False because OSS has no flex routers registered.
@@ -181,6 +194,10 @@ class SkyvernContext:
     # Track task_ids where proactive captcha injection has already been attempted,
     # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
     proactive_captcha_task_ids: set[str] = field(default_factory=set)
+
+    # Circuit breaker: consecutive captcha solve timeouts for this workflow run.
+    # When this reaches the threshold, further captcha solve attempts are short-circuited.
+    consecutive_captcha_timeouts: int = 0
 
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
@@ -406,20 +423,31 @@ def _restore(token: Token[SkyvernContext | None]) -> None:
 
 
 @contextmanager
-def scoped(context: SkyvernContext) -> Iterator[SkyvernContext]:
+def scoped(
+    context: SkyvernContext,
+    *,
+    propagate_captcha_timeout: bool = False,
+) -> Iterator[SkyvernContext]:
     """
     Temporarily scope the current context to a fresh child context.
 
     Args:
         context: The child context to set for the scope
+        propagate_captcha_timeout: When True, copy the child's
+            ``consecutive_captcha_timeouts`` back to the parent on exit.
+            Only enable for scopes that represent real task executions
+            (e.g. run_task_v2), not placeholder contexts.
 
     Yields:
         The child context
     """
+    parent = _context.get() if propagate_captcha_timeout else None
     token = _context.set(context)
     try:
         yield context
     finally:
+        if parent is not None:
+            parent.consecutive_captcha_timeouts = context.consecutive_captcha_timeouts
         _restore(token)
 
 

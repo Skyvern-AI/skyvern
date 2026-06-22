@@ -10,8 +10,11 @@ from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import resolve_inline_or_file, run_tool
+from .lazy import SkyvernTyperGroup
 
-block_app = typer.Typer(help="Workflow block schema and validation commands.", no_args_is_help=True)
+block_app = typer.Typer(
+    cls=SkyvernTyperGroup, help="Workflow block schema and validation commands.", no_args_is_help=True
+)
 
 
 async def tool_block_schema(**kwargs: Any) -> dict[str, Any]:

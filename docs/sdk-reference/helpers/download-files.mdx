@@ -56,7 +56,7 @@ for (const f of result.downloaded_files ?? []) {
 | `max_steps_per_run` | `int` | No | `None` | Cap AI steps. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
-| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `totp_url` | `str` | No | `None` | Endpoint Skyvern polls to fetch TOTP codes. |
 | `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
 | `max_screenshot_scrolling_times` | `int` | No | `None` | Number of screenshot scrolls. |
 | `waitForCompletion` (TS only) | `boolean` | No | `false` | Block until the download finishes. |

@@ -41,7 +41,9 @@ import {
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { ImprovePrompt } from "@/components/ImprovePrompt";
+import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { cn } from "@/util/utils";
+import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 
 const exampleCases = [
   {
@@ -292,6 +294,17 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const isSubmitting =
     generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
 
+  const {
+    isSupported: isSpeechSupported,
+    isListening: isSpeechListening,
+    isHearingSpeech: isSpeechHearing,
+    toggle: toggleSpeech,
+  } = useSpeechToTextField({
+    value: prompt,
+    onChange: setPrompt,
+    enabled: !promptImprovalIsPending && !isSubmitting,
+  });
+
   const submitPrompt = ({ prompt }: { prompt: string }) => {
     if (submitInFlightRef.current || isSubmitting) {
       return;
@@ -325,6 +338,15 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 },
               )}
             >
+              <SpeechInputButton
+                isSupported={isSpeechSupported}
+                isListening={isSpeechListening}
+                isHearingSpeech={isSpeechHearing}
+                disabled={promptImprovalIsPending || isSubmitting}
+                onToggle={toggleSpeech}
+                className="ml-2 h-9 w-9 border-0 bg-transparent shadow-none hover:bg-muted"
+                iconClassName="h-5 w-5"
+              />
               <AutoResizingTextarea
                 className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
                 value={prompt}
@@ -360,7 +382,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="flex items-center justify-center rounded-lg bg-indigo-600 p-2 text-white shadow-sm shadow-indigo-950/15 transition-colors hover:bg-indigo-500 disabled:pointer-events-none disabled:bg-indigo-600/45 disabled:text-white/65 disabled:shadow-none dark:bg-indigo-500 dark:hover:bg-indigo-400 dark:disabled:bg-indigo-500/35"
+                className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
                 onClick={() => {
                   submitPrompt({ prompt });
                 }}

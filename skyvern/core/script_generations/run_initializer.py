@@ -121,6 +121,7 @@ async def setup(
     generated_parameter_cls: type[BaseModel] | None = None,
     browser_session_id: str | None = None,
     adaptive_caching: bool = False,
+    url: str | None = None,
 ) -> tuple[SkyvernPage, RunContext]:
     # transform any secrets/credential parameters. For example, if there's only one credential in the parameters: {"cred_12345": "cred_12345"},
     # it should be transformed to {"cred_12345": {"username": "secret_5fBoa_username", "password": "secret_5fBoa_password"}}
@@ -143,7 +144,7 @@ async def setup(
     else:
         extracted_params = {}
 
-    skyvern_page = await ScriptSkyvernPage.create(browser_session_id=browser_session_id)
+    skyvern_page = await ScriptSkyvernPage.create(browser_session_id=browser_session_id, url=url)
     run_context = RunContext(
         parameters=parameters,
         page=skyvern_page,

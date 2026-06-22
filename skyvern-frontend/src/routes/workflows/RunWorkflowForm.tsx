@@ -46,6 +46,11 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
+import { isActivationRun } from "@/util/onboarding/rolloutGating";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { parseHeaderJson } from "@/util/secretHeaders";
 
@@ -61,6 +66,10 @@ import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
+import {
+  parseJsonWorkflowParameterValue,
+  validateJsonWorkflowParameterValue,
+} from "./utils";
 
 /**
  * Recursively finds all login blocks that don't have any credential parameters selected.
@@ -136,12 +145,7 @@ function parseValuesForWorkflowRun(
         (parameter) => parameter.key === key,
       );
       if (parameter?.workflow_parameter_type === "json") {
-        try {
-          return [key, JSON.parse(value as string)];
-        } catch {
-          console.error("Invalid JSON"); // this should never happen, it should fall to form error
-          return [key, value];
-        }
+        return [key, parseJsonWorkflowParameterValue(value)];
       }
       // can improve this via the type system maybe
       if (
@@ -328,6 +332,14 @@ function RunWorkflowForm({
     [workflow],
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
+  const onboarding = useOnboardingStateOptional();
+  const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
+  const onboardingLoading = onboarding != null && onboarding.isLoading;
+  // Gate on the rollout arm so a 0% rollout / rollback restores the
+  // pre-onboarding login-block alert instead of the credential prompt.
+  const isActivation = isActivationRun(onboardingFlagVariant, onboarding);
+  const showDestructiveLoginAlert =
+    hasLoginBlockValidationError && !isActivation && !onboardingLoading;
 
   const blockingParameterTypes = new Set([
     "boolean",
@@ -623,7 +635,14 @@ function RunWorkflowForm({
           </div>
         </header>
 
-        {hasLoginBlockValidationError && (
+        {hasLoginBlockValidationError && isActivation && (
+          <CredentialSetupPrompt
+            workflowPermanentId={workflowPermanentId}
+            blocksMissingCredentials={loginBlocksWithoutCredentials}
+          />
+        )}
+
+        {showDestructiveLoginAlert && (
           <Alert variant="destructive">
             <ExclamationTriangleIcon className="h-4 w-4" />
             <AlertTitle>Cannot run agent</AlertTitle>
@@ -663,22 +682,7 @@ function RunWorkflowForm({
                 rules={{
                   validate: (value) => {
                     if (parameter.workflow_parameter_type === "json") {
-                      if (value === null || value === undefined) {
-                        return "This field is required";
-                      }
-                      if (typeof value === "string") {
-                        const trimmed = value.trim();
-                        if (trimmed === "") {
-                          return "This field is required";
-                        }
-                        try {
-                          JSON.parse(trimmed);
-                          return true;
-                        } catch (e) {
-                          return "Invalid JSON";
-                        }
-                      }
-                      return;
+                      return validateJsonWorkflowParameterValue(value);
                     }
 
                     // Boolean parameters are required - show error and block submission

@@ -24,6 +24,14 @@ function broadcastCredentialsChanged() {
   credentialBroadcastChannel?.postMessage("invalidate");
 }
 
+// Falls back to the first credential even when none are valid, so a single
+// needs-reconnect account is still selected rather than left blank.
+export function getDefaultGoogleOAuthCredentialId(
+  credentials: GoogleOAuthCredential[],
+): string | undefined {
+  return credentials.find((c) => c.valid)?.id ?? credentials[0]?.id;
+}
+
 type ApiError = { response?: { data?: { detail?: string } } } & Error;
 
 function extractApiErrorMessage(error: unknown, fallback: string): string {
@@ -31,7 +39,9 @@ function extractApiErrorMessage(error: unknown, fallback: string): string {
   return err?.response?.data?.detail || err?.message || fallback;
 }
 
-export function useGoogleOAuthCredentials() {
+export function useGoogleOAuthCredentials({
+  enabled = true,
+}: { enabled?: boolean } = {}) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -54,6 +64,7 @@ export function useGoogleOAuthCredentials() {
     error,
   } = useQuery<GoogleOAuthCredential[]>({
     queryKey: ["googleOAuthCredentials"],
+    enabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const response = await client.get("/google/oauth/credentials");

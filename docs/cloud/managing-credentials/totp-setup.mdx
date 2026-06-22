@@ -92,7 +92,7 @@ When a site sends 2FA codes via email or SMS, someone (or something) needs to de
 
 ## Pushing codes to Skyvern
 
-Once a workflow is running and waiting for a 2FA code, you need to deliver it. There are two ways.
+Once an agent is running and waiting for a 2FA code, you need to deliver it. There are two ways.
 
 ### Via the UI
 
@@ -106,7 +106,7 @@ Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has t
 <img src="/images/cloud/credentials-2fa-push-form.png" alt="2FA tab showing the Push a 2FA Code form and code history table" />
 
 <Tip>
-If multiple workflows are running simultaneously, click **Add optional metadata** to link the code to a specific run using the workflow run ID, workflow ID, or task ID.
+If multiple agents are running simultaneously, click **Add optional metadata** to link the code to a specific run using the workflow run ID, workflow ID, or task ID.
 </Tip>
 
 ### Via the API
@@ -171,7 +171,13 @@ This turns email-based 2FA into something nearly as automated as an authenticato
 
 ## Server-fetched codes (totp_url)
 
-Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Pass `totp_url` when running a [task](/cloud/getting-started/run-from-code) or [workflow](/cloud/building-workflows/build-a-workflow), and Skyvern will call your endpoint when it needs a verification code.
+Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Skyvern calls your endpoint only when the automation reaches a page that asks for a verification code.
+
+<Warning>
+For saved agents or workflows, configure the endpoint on the block that performs the login. Open the browser, action, file download, or login block and set **TOTP Verification URL**. Passing `totp_url` only in the top-level workflow run request does not automatically populate a block whose **TOTP Verification URL** is empty.
+</Warning>
+
+If the endpoint changes per run, create a workflow parameter such as `totp_url`, set the block's **TOTP Verification URL** to `{{ totp_url }}`, and pass the URL in `parameters` when starting the run.
 
 Your endpoint must accept a POST request with `task_id`, `workflow_run_id`, and `workflow_permanent_id` in the body, and return:
 

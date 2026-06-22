@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
 from skyvern.schemas.steps import AgentStepOutput, BrowserMetadata
+from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
@@ -31,12 +32,24 @@ class DetailedAgentStepOutput(BaseModel):
 
     def __repr__(self) -> str:
         if settings.DEBUG_MODE:
-            return f"DetailedAgentStepOutput({self.model_dump()})"
+            return f"DetailedAgentStepOutput({self._redacted_model_dump()})"
         else:
             return f"AgentStepOutput({self.to_agent_step_output().model_dump()})"
 
     def __str__(self) -> str:
         return self.__repr__()
+
+    def _redacted_model_dump(self) -> dict[str, Any]:
+        payload = self.model_dump()
+        if self.actions is not None:
+            payload["actions"] = [redact_action_for_log(action) for action in self.actions]
+        if self.actions_and_results is not None:
+            serialized_pairs = payload.get("actions_and_results") or []
+            redacted_pairs = []
+            for (action, _), (_, serialized_results) in zip(self.actions_and_results, serialized_pairs, strict=True):
+                redacted_pairs.append((redact_action_for_log(action), serialized_results))
+            payload["actions_and_results"] = redacted_pairs
+        return payload
 
     def extract_errors(self) -> list[UserDefinedError]:
         errors = []

@@ -7,14 +7,17 @@ from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import resolve_run_download_id
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import VideoArtifact
-from skyvern.webeye.browser_factory import BrowserContextFactory
+from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import finalize_webm
 
 LOG = structlog.get_logger()
@@ -75,6 +78,7 @@ class RealBrowserManager(BrowserManager):
         if workflow_run_id and workflow_run_id in self.pages:
             LOG.info(
                 "Browser state for task not found. Using browser state for workflow run",
+                sampling=True,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
             )
@@ -164,6 +168,7 @@ class RealBrowserManager(BrowserManager):
         url: str | None = None,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        navigate: bool = True,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -208,9 +213,24 @@ class RealBrowserManager(BrowserManager):
                 )
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                browser_context = browser_state.browser_context
+                adopted_browser = browser_context.browser if browser_context else None
+                if adopted_browser is not None:
+                    try:
+                        rebind_run_id = resolve_run_download_id(
+                            skyvern_context.current(), fallback_run_id=workflow_run.workflow_run_id
+                        )
+                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to rebind download dir on adopted browser session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            exc_info=True,
+                        )
                 page = await browser_state.get_working_page()
                 if page:
-                    if url:
+                    if url and navigate:
                         await browser_state.navigate_to_url(page=page, url=url)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
@@ -218,6 +238,7 @@ class RealBrowserManager(BrowserManager):
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
+                sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             proxy_location = workflow_run.proxy_location
@@ -255,8 +276,11 @@ class RealBrowserManager(BrowserManager):
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
+        # When navigate is False, the URL has already been used for proxy selection in
+        # _create_browser_state above; we skip navigation so the caller (e.g. a generated
+        # script) performs the first goto itself, avoiding a redundant page load.
         await browser_state.get_or_create_page(
-            url=url,
+            url=url if navigate else None,
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,
@@ -419,7 +443,7 @@ class RealBrowserManager(BrowserManager):
         organization_id: str | None = None,
         child_workflow_run_ids: list[str] | None = None,
     ) -> BrowserState | None:
-        LOG.info("Cleaning up for workflow run")
+        LOG.info("Cleaning up for workflow run", sampling=True)
         browser_state_to_close = self.pages.get(workflow_run_id)
 
         # Pop child workflow_run entries first — these are orphaned because child
@@ -442,6 +466,7 @@ class RealBrowserManager(BrowserManager):
             if shared:
                 LOG.info(
                     "Browser state is shared with another workflow run, skipping browser close",
+                    sampling=True,
                     workflow_run_id=workflow_run_id,
                 )
 
@@ -458,7 +483,12 @@ class RealBrowserManager(BrowserManager):
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
             if streams_active:
-                # Defer close until the last stream disconnects
+                # Defer close until the last stream disconnects. Persist session cookies first: the
+                # deferred close() runs after store_browser_session archives the dir, too late for it.
+                await persist_session_cookies(
+                    browser_state_to_close.browser_context,
+                    browser_state_to_close.browser_artifacts.browser_session_dir,
+                )
                 LOG.info(
                     "Deferring browser close — active CDP streams",
                     workflow_run_id=workflow_run_id,
@@ -479,6 +509,7 @@ class RealBrowserManager(BrowserManager):
             if shared:
                 LOG.info(
                     "Browser state is shared with another workflow run, skipping browser close",
+                    sampling=True,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
@@ -491,7 +522,7 @@ class RealBrowserManager(BrowserManager):
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
-        LOG.info("Workflow run is cleaned up")
+        LOG.info("Workflow run is cleaned up", sampling=True)
 
         if browser_session_id:
             if organization_id:

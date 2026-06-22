@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +13,7 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import SessionState, scoped_session
 from skyvern.forge.sdk.copilot.runtime import AgentContext, mcp_to_copilot
+from skyvern.forge.sdk.copilot.tools import _same_page_ignoring_fragment
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +41,12 @@ def _make_ctx(**overrides: Any) -> AgentContext:
     )
     defaults.update(overrides)
     return AgentContext(**defaults)
+
+
+def test_copilot_same_page_ignoring_fragment_matches_trailing_slash_variants() -> None:
+    assert _same_page_ignoring_fragment("https://example.test/results#section", "https://example.test/results") is True
+    assert _same_page_ignoring_fragment("https://example.test/results/", "https://example.test/results") is True
+    assert _same_page_ignoring_fragment("https://example.test/results?page=2", "https://example.test/results") is False
 
 
 @pytest.mark.asyncio
@@ -194,6 +202,67 @@ class TestMcpBrowserContextBridge:
         assert [c[0] for c in override_calls] == ["set", "reset"]
 
     @pytest.mark.asyncio
+    async def test_sdk_action_workflow_run_id_is_reused_across_tool_contexts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+        from skyvern.forge.sdk.copilot.runtime import mcp_browser_context
+
+        _, register_mock, unregister_mock, _, _ = self._install_happy_path_mocks(monkeypatch)
+
+        first_browser = MagicMock()
+        first_browser.workflow_run_id = None
+        second_browser = MagicMock()
+        second_browser.workflow_run_id = None
+        third_browser = MagicMock()
+        third_browser.workflow_run_id = None
+        fourth_browser = MagicMock()
+        fourth_browser.workflow_run_id = None
+        fifth_browser = MagicMock()
+        fifth_browser.workflow_run_id = None
+        browsers = iter([first_browser, second_browser, third_browser, fourth_browser, fifth_browser])
+        monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *a, **kw: next(browsers))
+
+        ctx = _make_ctx()
+        assert ctx.browser_session_id is not None
+        original_cache_key = (ctx.organization_id, ctx.browser_session_id)
+
+        async with mcp_browser_context(ctx):
+            first_state = register_mock.call_args.args[1]
+            assert first_state.browser.workflow_run_id is None
+            first_state.browser.workflow_run_id = "wr_sdk_action_1"
+
+        assert ctx.sdk_action_workflow_run_ids_by_browser_session[original_cache_key] == "wr_sdk_action_1"
+
+        async with mcp_browser_context(ctx):
+            second_state = register_mock.call_args.args[1]
+            assert second_state.browser.workflow_run_id == "wr_sdk_action_1"
+            second_state.browser.workflow_run_id = None
+
+        assert original_cache_key not in ctx.sdk_action_workflow_run_ids_by_browser_session
+
+        async with mcp_browser_context(ctx):
+            third_state = register_mock.call_args.args[1]
+            assert third_state.browser.workflow_run_id is None
+
+        ctx.browser_session_id = "pbs_test_456"
+        async with mcp_browser_context(ctx):
+            fourth_state = register_mock.call_args.args[1]
+            assert fourth_state.browser.workflow_run_id is None
+
+        assert (ctx.organization_id, "pbs_test_456") not in ctx.sdk_action_workflow_run_ids_by_browser_session
+
+        ctx.organization_id = "org-2"
+        ctx.browser_session_id = "pbs_test_123"
+        async with mcp_browser_context(ctx):
+            fifth_state = register_mock.call_args.args[1]
+            assert fifth_state.browser.workflow_run_id is None
+
+        assert ("org-2", "pbs_test_123") not in ctx.sdk_action_workflow_run_ids_by_browser_session
+        assert register_mock.call_count == 5
+        assert unregister_mock.call_count == 5
+
+    @pytest.mark.asyncio
     async def test_missing_browser_context_raises_without_leaking_session_id(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -277,6 +346,43 @@ class TestScreenshotAdapter:
         assert adapted["data"]["title"] == "Example"
         assert ctx.composition_page_evidence["source_tool"] == "get_browser_screenshot"
         assert ctx.composition_page_evidence["current_url"] == "https://example.com"
+
+    @pytest.mark.asyncio
+    async def test_screenshot_post_hook_does_not_verify_from_url_title_only(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+        from skyvern.forge.sdk.copilot.tools import _screenshot_post_hook
+
+        async def handler(**_: object) -> dict[str, object]:
+            raise AssertionError("screenshot-only observation must not invoke completion verification")
+
+        async def handler_lookup(_: object) -> object:
+            return handler
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler", handler_lookup
+        )
+        ctx = _make_ctx(
+            request_policy=RequestPolicy(
+                completion_criteria=[CompletionCriterion(id="c0", outcome="the requested item is visible")]
+            ),
+            last_test_ok=False,
+            last_run_blocks_workflow_run_id="wr_failed",
+            copilot_run_start_monotonic=time.monotonic(),
+        )
+        raw = {"browser_context": {"url": "https://example.com/results", "title": "Results"}}
+        result = {
+            "ok": True,
+            "data": {"data": "iVBOR...", "mime": "image/png", "bytes": 1234},
+        }
+
+        adapted = await _screenshot_post_hook(result, raw, ctx)
+
+        assert adapted["data"]["url"] == "https://example.com/results"
+        assert ctx.post_run_page_observation_after_failed_test is True
+        assert ctx.completion_verification_result is None
 
 
 class TestNavigateAdapter:
@@ -369,7 +475,15 @@ class TestEvaluateAdapter:
         assert adapted["data"]["url"] == "https://example.com/results"
         assert ctx.composition_page_evidence["source_tool"] == "evaluate"
         assert ctx.composition_page_evidence["current_url"] == "https://example.com/results"
-        assert ctx.composition_page_evidence["result_containers"] == []
+        assert ctx.composition_page_evidence["result_containers"] == [
+            {
+                "tag": "table",
+                "id": "",
+                "selector": "",
+                "row_count": 1,
+                "sample_rows": ["Test User"],
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_evaluate_post_hook_lifts_bounded_page_schema_from_mcp_observation(self) -> None:
@@ -438,7 +552,7 @@ class TestUpdateWorkflowDirect:
         mock_workflow.workflow_definition.blocks = [MagicMock(), MagicMock()]
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             lambda **kwargs: mock_workflow,
         )
 
@@ -470,7 +584,7 @@ class TestUpdateWorkflowDirect:
         mock_workflow.workflow_definition.blocks = []
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             lambda **kwargs: mock_workflow,
         )
 
@@ -497,7 +611,7 @@ class TestUpdateWorkflowDirect:
             raise _yaml.YAMLError("bad yaml")
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             raise_yaml_error,
         )
 
@@ -525,7 +639,7 @@ class TestUpdateWorkflowDirect:
             )
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             raise_validation_error,
         )
 

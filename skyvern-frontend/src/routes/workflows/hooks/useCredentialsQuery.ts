@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { CredentialApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { useQuery } from "@tanstack/react-query";
 
 type QueryReturnType = Array<CredentialApiResponse>;
@@ -15,6 +16,7 @@ type Props = UseQueryOptions & {
   vault_type?: string;
   credential_type?: "password" | "credit_card" | "secret";
   search?: string;
+  folder_id?: string | null;
 };
 
 function useCredentialsQuery(props: Props = {}) {
@@ -24,9 +26,12 @@ function useCredentialsQuery(props: Props = {}) {
     vault_type,
     credential_type,
     search,
+    folder_id,
     ...queryOptions
   } = props;
   const credentialGetter = useCredentialGetter();
+  // Read-only version-comparison canvases never need live credential data; suppress the fetch there for every caller at once.
+  const scopeReadOnly = useWorkflowScopeReadOnly();
 
   return useQuery<Array<CredentialApiResponse>>({
     queryKey: [
@@ -36,6 +41,7 @@ function useCredentialsQuery(props: Props = {}) {
       vault_type,
       credential_type,
       search,
+      folder_id,
     ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
@@ -51,10 +57,14 @@ function useCredentialsQuery(props: Props = {}) {
       if (search) {
         params.set("search", search);
       }
+      if (folder_id) {
+        params.set("folder_id", folder_id);
+      }
       return client.get("/credentials", { params }).then((res) => res.data);
     },
     refetchOnMount: "always",
     ...queryOptions,
+    enabled: queryOptions.enabled !== false && !scopeReadOnly,
   });
 }
 

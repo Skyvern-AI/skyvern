@@ -1,6 +1,9 @@
-"""Tests for all 14 OSS repository instantiations + dependency injection."""
+"""Tests for all OSS repository instantiations + dependency injection."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def test_credential_repository_instantiation():
@@ -18,6 +21,22 @@ def test_credential_repository_instantiation():
     assert hasattr(repo, "get_organization_bitwarden_collection")
 
 
+def test_credential_folders_repository_instantiation():
+    from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
+
+    mock_session = MagicMock()
+    repo = CredentialFoldersRepository(session_factory=mock_session, debug_enabled=False)
+    assert repo.Session is mock_session
+    assert hasattr(repo, "create_credential_folder")
+    assert hasattr(repo, "get_credential_folder")
+    assert hasattr(repo, "get_credential_folders")
+    assert hasattr(repo, "update_credential_folder")
+    assert hasattr(repo, "soft_delete_credential_folder")
+    assert hasattr(repo, "get_credential_folder_credential_count")
+    assert hasattr(repo, "get_credential_folder_credential_counts_batch")
+    assert hasattr(repo, "set_credential_folder")
+
+
 def test_otp_repository_instantiation():
     from skyvern.forge.sdk.db.repositories.otp import OTPRepository
 
@@ -26,6 +45,39 @@ def test_otp_repository_instantiation():
     assert repo.Session is mock_session
     assert hasattr(repo, "get_otp_codes")
     assert hasattr(repo, "create_otp_code")
+
+
+@pytest.mark.asyncio
+async def test_otp_repository_can_include_unscoped_workflow_run_rows_in_sql():
+    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+
+    class CapturingSession:
+        query = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def scalars(self, query):
+            self.query = query
+            return SimpleNamespace(all=lambda: [])
+
+    session = CapturingSession()
+    repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
+
+    await repo.get_otp_codes(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        workflow_run_id="wr_test",
+        include_unscoped_workflow_run=True,
+    )
+
+    sql = str(session.query)
+    assert "totp_codes.workflow_run_id = :workflow_run_id_1" in sql
+    assert "totp_codes.workflow_run_id IS NULL" in sql
+    assert " OR " in sql
 
 
 def test_debug_repository_instantiation():
@@ -192,6 +244,7 @@ def test_observer_repository_with_dependency():
 
 def test_agent_db_has_typed_repo_attributes():
     """After refactoring, AgentDB should expose typed repository attributes."""
+    from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
     from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
     from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 
@@ -201,6 +254,7 @@ def test_agent_db_has_typed_repo_attributes():
         db = AgentDB("postgresql+asyncpg://test", debug_enabled=True)
         assert isinstance(db.tasks, TasksRepository)
         assert isinstance(db.credentials, CredentialRepository)
+        assert isinstance(db.credential_folders, CredentialFoldersRepository)
         assert hasattr(db, "get_task")  # backward compat delegate
         # Migrated domains no longer have delegates on AgentDB:
         assert not hasattr(db, "create_workflow")

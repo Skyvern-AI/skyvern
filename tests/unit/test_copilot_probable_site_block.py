@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _timing_only_challenge_wait_reject_message,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 
 _SCRAPE_WALL_REASON = (
     "Skyvern failed to load the website. The page may have navigated "
@@ -352,14 +353,18 @@ def test_stop_nudge_uses_different_proxy_advice_when_effective_proxy_is_active()
     ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
     ctx.effective_workflow_proxy_location = "RESIDENTIAL"
 
-    nudge = _check_enforcement(ctx)
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        _check_enforcement(ctx)
 
-    assert nudge is not None
-    assert "configure a proxy" not in nudge.lower()
-    assert "different proxy location" in nudge.lower()
-    assert "US-CA" in nudge
-    assert "US-NY" in nudge
-    assert "residential/ISP" in nudge
+    halt = exc_info.value.halt
+    assert halt.kind == TurnHaltKind.PROBABLE_SITE_BLOCK
+    assert halt.blocker_signal is ctx.blocker_signal
+    user_facing = halt.blocker_signal.user_facing_reason
+    assert "configure a proxy" not in user_facing.lower()
+    assert "different proxy location" in user_facing.lower()
+    assert "US-CA" in user_facing
+    assert "US-NY" in user_facing
+    assert "residential/ISP" in user_facing
 
 
 def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
@@ -367,10 +372,11 @@ def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
     ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
     ctx.effective_workflow_proxy_location = "NONE"
 
-    nudge = _check_enforcement(ctx)
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        _check_enforcement(ctx)
 
-    assert nudge is not None
-    assert "configure a proxy" in nudge.lower()
+    assert exc_info.value.halt.kind == TurnHaltKind.PROBABLE_SITE_BLOCK
+    assert "configure a proxy" in exc_info.value.halt.blocker_signal.user_facing_reason.lower()
 
 
 def test_detects_challenge_named_wait_block() -> None:

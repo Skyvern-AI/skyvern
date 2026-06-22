@@ -1369,7 +1369,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
             # doesn't carry navigation context.
             # Hash the post-ceiling values so two requests that differ only in
             # dropped fields (schema/extracted_text on oversized prompts) and
-            # render to the same final LLM prompt share a cache key.
+            # render to the same final LLM prompt share a cache key. On the
+            # primary path `element_tree` is the sanitized rendered form; the
+            # JSON-builder fallback above and every other field hash
+            # pre-sanitization, which can cost an extra miss but never a wrong
+            # hit (canonicalization doesn't touch backticks).
             cache_key = extraction_cache.compute_cache_key(
                 call_path="script",
                 element_tree=self.scraped_page.last_used_element_tree_html
@@ -1421,6 +1425,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         elif lookup_result is not None:
             LOG.info(
                 "ai_extract cache miss",
+                sampling=True,
                 workflow_run_id=workflow_run_id,
                 cache_key=cache_key,
                 cache_hit=False,

@@ -1,7 +1,7 @@
 // @novnc/novnc is CJS with __esModule marker. Vite 8 (Rollup 5) changed
 // CJS interop so the default import may be the namespace object instead of
 // exports.default.  This guard works across bundler versions.
-import _RFB from "@novnc/novnc/lib/rfb.js";
+import _RFB, { type RfbEvent } from "@novnc/novnc/lib/rfb.js";
 type RFB = _RFB;
 const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
 import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
@@ -26,7 +26,6 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { AnimatedWave } from "@/components/AnimatedWave";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
@@ -36,7 +35,7 @@ import {
   type MessageInExfiltratedEvent,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
+import { wssBaseUrl, newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
@@ -45,7 +44,6 @@ import {
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
 
-import { RotateThrough } from "./RotateThrough";
 import "./browser-stream.css";
 
 interface BrowserSession {
@@ -193,7 +191,7 @@ function BrowserStream({
       }
     },
     enabled: entity === "browserSession" && !!browserSessionId,
-    refetchInterval: 5000,
+    refetchInterval: (query) => (query.state.data ? 5000 : 1000),
   });
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
@@ -204,6 +202,8 @@ function BrowserStream({
   const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
   const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
+  const [terminalDiagnostic, setTerminalDiagnostic] =
+    useState<StreamDiagnostic | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [messagesDisconnectedTrigger, setMessagesDisconnectedTrigger] =
     useState(0);
@@ -229,22 +229,23 @@ function BrowserStream({
   useEffect(() => {
     setIsBrowserSessionStarted(false);
     setIsReady(false);
+    setIsVncConnected(false);
+    setIsCanvasReady(false);
+    setIsMessageConnected(false);
+    setHasBrowserSession(true);
+    setTerminalDiagnostic(null);
+    if (rfbRef.current) {
+      rfbRef.current.disconnect();
+      rfbRef.current = null;
+    }
   }, [browserSessionId]);
 
   const getWebSocketParams = useCallback(async () => {
-    const clientIdQueryParam = `client_id=${clientId}`;
-    const runtimeApiKey = getRuntimeApiKey();
-
-    let credentialQueryParam = runtimeApiKey ? `apikey=${runtimeApiKey}` : "";
-
-    if (credentialGetter) {
-      const token = await credentialGetter();
-      credentialQueryParam = token ? `token=Bearer ${token}` : "";
-    }
-
-    return credentialQueryParam
-      ? `${credentialQueryParam}&${clientIdQueryParam}`
-      : clientIdQueryParam;
+    const params = new URLSearchParams(
+      await getCredentialParam(credentialGetter),
+    );
+    params.set("client_id", clientId);
+    return params.toString();
   }, [clientId, credentialGetter]);
 
   // browser is ready
@@ -381,11 +382,29 @@ function BrowserStream({
 
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
+          setTerminalDiagnostic(null);
         });
 
-        rfb.addEventListener("disconnect", async (/* e: RfbEvent */) => {
+        rfb.addEventListener("disconnect", (e: RfbEvent) => {
           setIsVncConnected(false);
           setIsCanvasReady(false);
+          if (cancelled) return;
+          const clean = Boolean(e.detail?.clean);
+          setTerminalDiagnostic(
+            (prev) =>
+              prev ??
+              (clean
+                ? {
+                    title: "The browser stream packed up and left",
+                    detail: "The browser stream closed cleanly.",
+                  }
+                : {
+                    title: "The browser stream slipped away",
+                    detail:
+                      "The browser stream dropped before everything wrapped up.",
+                    hint: "Refresh the page or switch to local browser streaming.",
+                  }),
+          );
         });
       }
 
@@ -425,6 +444,7 @@ function BrowserStream({
     }
 
     let ws: WebSocket | null = null;
+    let cancelled = false;
 
     const connect = async () => {
       const wsParams = await getWebSocketParams();
@@ -452,6 +472,7 @@ function BrowserStream({
       ws.onopen = () => {
         setIsMessageConnected(true);
         setMessageSocket(ws);
+        setTerminalDiagnostic(null);
       };
 
       ws.onmessage = (event) => {
@@ -472,15 +493,33 @@ function BrowserStream({
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         setIsMessageConnected(false);
         setMessageSocket(null);
+        if (cancelled) return;
+        const { code, reason } = event;
+        setTerminalDiagnostic(
+          (prev) =>
+            prev ??
+            (code === 1006
+              ? {
+                  title: "The messages channel slipped away",
+                  detail:
+                    "The messages channel dropped before sending a frame.",
+                  hint: "Check that the API server is reachable from the UI.",
+                }
+              : {
+                  title: "The messages channel packed up and left",
+                  detail: `Messages channel closed with code ${code}${reason ? ` (${reason})` : ""}.`,
+                }),
+        );
       };
     };
 
     connect();
 
     return () => {
+      cancelled = true;
       try {
         ws && ws.close();
       } catch (e) {
@@ -784,33 +823,44 @@ function BrowserStream({
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
   const streamDiagnostic: StreamDiagnostic =
-    entity === "browserSession" && browserSessionId && !hasBrowserSession
+    !showStream || !runId
       ? {
-          title: "Browser session is no longer live",
-          detail: "This live browser session is no longer streaming.",
-          hint: "Refresh the page or create a new browser session.",
+          title: "Starting browser session",
+          detail: "Waiting for a live browser session to attach.",
         }
-      : !isBrowserSessionBackendReady
+      : entity === "browserSession" && browserSessionId && !hasBrowserSession
         ? {
-            title: "Waiting for browser session",
-            detail:
-              "The session exists, but the backend has not marked the browser as ready yet.",
+            title: "This browser session has wandered off",
+            detail: "Looks like it slipped away mid-stream.",
+            hint: "Refresh the page or spin up a fresh browser session.",
           }
-        : !isVncConnected
-          ? {
-              title: "Connecting to VNC stream",
-              detail: "Opening the browser stream and message WebSockets.",
-              hint: "If this stays here, check VNC support for the session or use local browser streaming.",
-            }
-          : !isCanvasReady
+        : terminalDiagnostic
+          ? terminalDiagnostic
+          : !isBrowserSessionBackendReady
             ? {
-                title: "Preparing browser display",
+                title: "Warming up your browser",
                 detail:
-                  "The VNC connection is open and the UI is waiting for the browser canvas.",
+                  "The session is here — we're just waiting for the backend to give the green light.",
+                pending: true,
               }
-            : {
-                title: "Connecting to browser stream",
-              };
+            : !isVncConnected
+              ? {
+                  title: "Reaching out to your browser",
+                  detail: "Opening up the live stream and message channels...",
+                  hint: "If this sticks around, check VNC support for the session or switch to local browser streaming.",
+                  pending: true,
+                }
+              : !isCanvasReady
+                ? {
+                    title: "Setting the stage",
+                    detail:
+                      "The connection is open — now we're waiting for the browser to paint its first frame.",
+                    pending: true,
+                  }
+                : {
+                    title: "Tuning in to your browser...",
+                    pending: true,
+                  };
 
   return (
     <>
@@ -946,18 +996,7 @@ function BrowserStream({
         )}
         {!isReady && (
           <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-neutral-200 bg-white text-sm text-neutral-600 dark:border-slate-800 dark:bg-transparent dark:text-slate-400">
-            <StreamStatusPanel diagnostic={streamDiagnostic}>
-              {isBrowserSessionBackendReady && (
-                <>
-                  <RotateThrough interval={7 * 1000}>
-                    <span>Checking browser stream readiness...</span>
-                    <span>Waiting for the browser display...</span>
-                    <span>Verifying the stream connection...</span>
-                  </RotateThrough>
-                  <AnimatedWave text=". . ." />
-                </>
-              )}
-            </StreamStatusPanel>
+            <StreamStatusPanel diagnostic={streamDiagnostic} />
           </div>
         )}
       </div>

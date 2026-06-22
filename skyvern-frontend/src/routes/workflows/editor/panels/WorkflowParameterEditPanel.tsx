@@ -12,11 +12,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "@/components/ui/use-toast";
+import { cn } from "@/util/utils";
 import CloudContext from "@/store/CloudContext";
-import { Cross2Icon } from "@radix-ui/react-icons";
-import { useContext, useState } from "react";
+import { CodeIcon, Cross2Icon } from "@radix-ui/react-icons";
+import { useContext, useEffect, useRef, useState } from "react";
+import { BitwardenItemSelector } from "../../components/BitwardenItemSelector";
 import { CredentialParameterSourceSelector } from "../../components/CredentialParameterSourceSelector";
+import { OnePasswordItemSelector } from "../../components/OnePasswordItemSelector";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
+import { useOnePasswordItemsQuery } from "../../hooks/useOnePasswordItemsQuery";
 import {
   WorkflowEditorParameterType,
   WorkflowParameterValueType,
@@ -37,6 +41,7 @@ import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialSer
 import {
   CredentialDataType,
   CredentialSource,
+  detectInitialBitwardenManualEntry,
   detectInitialCredentialDataType,
   detectInitialCredentialSource,
   detectInitialParameterTypeSelection,
@@ -135,6 +140,63 @@ function validateParameterKey(key: string): string | null {
   }
 
   return null;
+}
+
+function BitwardenItemFieldHeader({
+  manualEntry,
+  onToggle,
+  tooltip,
+}: {
+  manualEntry: boolean;
+  onToggle: () => void;
+  tooltip: string;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <div className="flex items-center gap-2">
+        <Label className="text-xs text-slate-300">Bitwarden Item</Label>
+        <HelpTooltip content={tooltip} />
+      </div>
+      <button
+        type="button"
+        aria-pressed={manualEntry}
+        title={
+          manualEntry
+            ? "Pick from your Bitwarden items"
+            : "Enter a custom value"
+        }
+        className={cn(
+          "rounded p-1 text-slate-400 transition-colors hover:text-slate-200",
+          manualEntry && "bg-slate-700 text-slate-100",
+        )}
+        onClick={onToggle}
+      >
+        <CodeIcon className="size-4" />
+      </button>
+    </div>
+  );
+}
+
+function BitwardenManualInput({
+  label,
+  onChange,
+  tooltip,
+  value,
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  tooltip: string;
+  value: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex gap-2">
+        <Label className="text-xs text-slate-300">{label}</Label>
+        <HelpTooltip content={tooltip} />
+      </div>
+      <Input value={value} onChange={(e) => onChange(e.target.value)} />
+    </div>
+  );
 }
 
 function WorkflowParameterEditPanel({
@@ -253,9 +315,21 @@ function WorkflowParameterEditPanel({
   const [opItemId, setOpItemId] = useState(
     isOnePasswordCredential ? initialValues.itemId : "",
   );
+  const [opManualEntry, setOpManualEntry] = useState(
+    isOnePasswordCredential &&
+      (initialValues.vaultId.includes("{{") ||
+        initialValues.itemId.includes("{{")),
+  );
+  const opEditModeInitializedRef = useRef(false);
+  const opUserTouchedRef = useRef(false);
+  const savedOpVaultId = isOnePasswordCredential ? initialValues.vaultId : "";
+  const savedOpItemId = isOnePasswordCredential ? initialValues.itemId : "";
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
     useState(isBitwardenCredential ? (initialValues?.itemId ?? "") : "");
+  const [bitwardenManualEntry, setBitwardenManualEntry] = useState(
+    detectInitialBitwardenManualEntry(initialValues),
+  );
 
   const [azureVaultName, setAzureVaultName] = useState(
     isAzureVaultCredential ? initialValues.vaultName : "",
@@ -273,6 +347,13 @@ function WorkflowParameterEditPanel({
   // Handle credential data type change - reset source to first available
   const handleCredentialDataTypeChange = (newDataType: CredentialDataType) => {
     setCredentialDataType(newDataType);
+    setOpVaultId("");
+    setOpItemId("");
+    setBitwardenLoginCredentialItemId("");
+    setBitwardenCollectionId("");
+    setUrlParameterKey("");
+    setSensitiveInformationItemId("");
+    setBitwardenManualEntry(false);
     const availableSources = getAvailableSourcesForDataType(
       newDataType,
       isCloud,
@@ -315,6 +396,45 @@ function WorkflowParameterEditPanel({
     showCredentialFields &&
     credentialSource === "custom" &&
     hasCustomCredentialService;
+  const onePasswordItemsQuery = useOnePasswordItemsQuery({
+    enabled: showOnePasswordFields,
+  });
+
+  useEffect(() => {
+    if (
+      !showOnePasswordFields ||
+      !isOnePasswordCredential ||
+      opEditModeInitializedRef.current ||
+      opUserTouchedRef.current
+    ) {
+      return;
+    }
+
+    // Keep the saved vault/item IDs visible (manual mode) when the item list can't load.
+    if (onePasswordItemsQuery.isError) {
+      opEditModeInitializedRef.current = true;
+      setOpManualEntry(true);
+      return;
+    }
+
+    if (!onePasswordItemsQuery.data) {
+      return;
+    }
+
+    opEditModeInitializedRef.current = true;
+    const savedItemExists = onePasswordItemsQuery.data.items.some(
+      (item) =>
+        item.vault_id === savedOpVaultId && item.item_id === savedOpItemId,
+    );
+    setOpManualEntry(!savedItemExists);
+  }, [
+    isOnePasswordCredential,
+    onePasswordItemsQuery.data,
+    onePasswordItemsQuery.isError,
+    savedOpItemId,
+    savedOpVaultId,
+    showOnePasswordFields,
+  ]);
 
   return (
     <ScrollArea>
@@ -534,46 +654,54 @@ function WorkflowParameterEditPanel({
 
           {/* Bitwarden Password Fields */}
           {showBitwardenPasswordFields && (
-            <>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    URL Parameter Key
-                  </Label>
-                  <HelpTooltip content="Optional. The agent input key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
-                </div>
-                <Input
-                  value={urlParameterKey}
-                  onChange={(e) => setUrlParameterKey(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    Bitwarden Collection ID
-                  </Label>
-                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports agent inputs." />
-                </div>
-                <Input
-                  value={bitwardenCollectionId}
-                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    Bitwarden Item ID
-                  </Label>
-                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports agent inputs." />
-                </div>
-                <Input
-                  value={bitwardenLoginCredentialItemId}
-                  onChange={(e) =>
-                    setBitwardenLoginCredentialItemId(e.target.value)
+            <div className="space-y-1">
+              <BitwardenItemFieldHeader
+                manualEntry={bitwardenManualEntry}
+                tooltip="Pick an item from your connected Bitwarden account. Click the </> button to pass in a custom value instead, for example a dynamic {{ input }} reference or raw Bitwarden IDs."
+                onToggle={() => {
+                  if (bitwardenManualEntry) {
+                    if (bitwardenLoginCredentialItemId.includes("{{")) {
+                      setBitwardenLoginCredentialItemId("");
+                    }
+                    setUrlParameterKey("");
+                    setBitwardenCollectionId("");
                   }
+                  setBitwardenManualEntry((prev) => !prev);
+                }}
+              />
+              {bitwardenManualEntry ? (
+                <div className="space-y-3">
+                  <BitwardenManualInput
+                    label="URL Parameter Key"
+                    value={urlParameterKey}
+                    onChange={setUrlParameterKey}
+                    tooltip="Optional. The agent input key that holds the URL. If provided, Skyvern will match the credential based on this URL."
+                  />
+                  <BitwardenManualInput
+                    label="Bitwarden Collection ID"
+                    value={bitwardenCollectionId}
+                    onChange={setBitwardenCollectionId}
+                    tooltip="Find in the Bitwarden collection URL. Supports agent inputs."
+                  />
+                  <BitwardenManualInput
+                    label="Bitwarden Item ID"
+                    value={bitwardenLoginCredentialItemId}
+                    onChange={setBitwardenLoginCredentialItemId}
+                    tooltip="Find in /#/vault?itemId=[ITEM_ID]. Supports agent inputs."
+                  />
+                </div>
+              ) : (
+                <BitwardenItemSelector
+                  itemId={bitwardenLoginCredentialItemId}
+                  credentialDataType="password"
+                  onSelect={(collectionId, itemId) => {
+                    setBitwardenLoginCredentialItemId(itemId);
+                    setBitwardenCollectionId(collectionId ?? "");
+                    setUrlParameterKey("");
+                  }}
                 />
-              </div>
-            </>
+              )}
+            </div>
           )}
 
           {/* Bitwarden Secret Fields */}
@@ -619,62 +747,142 @@ function WorkflowParameterEditPanel({
 
           {/* Bitwarden Credit Card Fields */}
           {showBitwardenCreditCardFields && (
-            <>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    Bitwarden Collection ID
-                  </Label>
-                  <HelpTooltip content="Collection containing the credit card. Supports agent inputs." />
-                </div>
-                <Input
-                  value={bitwardenCollectionId}
-                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    Bitwarden Item ID
-                  </Label>
-                  <HelpTooltip content="Credit card item ID. Supports agent inputs." />
-                </div>
-                <Input
-                  value={sensitiveInformationItemId}
-                  onChange={(e) =>
-                    setSensitiveInformationItemId(e.target.value)
+            <div className="space-y-1">
+              <BitwardenItemFieldHeader
+                manualEntry={bitwardenManualEntry}
+                tooltip="Pick a credit card from your connected Bitwarden account. Click the </> button to pass in custom collection/item IDs or dynamic {{ input }} references."
+                onToggle={() => {
+                  if (
+                    bitwardenManualEntry &&
+                    (bitwardenCollectionId.includes("{{") ||
+                      sensitiveInformationItemId.includes("{{"))
+                  ) {
+                    setBitwardenCollectionId("");
+                    setSensitiveInformationItemId("");
                   }
+                  setBitwardenManualEntry((prev) => !prev);
+                }}
+              />
+              {bitwardenManualEntry ? (
+                <div className="space-y-3">
+                  <BitwardenManualInput
+                    label="Bitwarden Collection ID"
+                    value={bitwardenCollectionId}
+                    onChange={setBitwardenCollectionId}
+                    tooltip="Collection containing the credit card. Supports agent inputs."
+                  />
+                  <BitwardenManualInput
+                    label="Bitwarden Item ID"
+                    value={sensitiveInformationItemId}
+                    onChange={setSensitiveInformationItemId}
+                    tooltip="Credit card item ID. Supports agent inputs."
+                  />
+                </div>
+              ) : (
+                <BitwardenItemSelector
+                  itemId={sensitiveInformationItemId}
+                  credentialDataType="creditCard"
+                  onSelect={(collectionId, itemId) => {
+                    setBitwardenCollectionId(collectionId ?? "");
+                    setSensitiveInformationItemId(itemId);
+                  }}
                 />
-              </div>
-            </>
+              )}
+            </div>
           )}
 
           {/* 1Password Fields */}
           {showOnePasswordFields && (
             <>
               <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    1Password Vault ID
-                  </Label>
-                  <HelpTooltip content="Find this in the 1Password vault URL. Supports agent inputs." />
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Label className="text-xs text-slate-300">
+                      1Password Item
+                    </Label>
+                    <HelpTooltip
+                      content={
+                        "Pick an item from your connected 1Password account. Click the </> button to pass in a custom value instead — for example a dynamic {{ input }} reference or a raw vault/item ID."
+                      }
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    aria-pressed={opManualEntry}
+                    title={
+                      opManualEntry
+                        ? "Pick from your 1Password items"
+                        : "Enter a custom value"
+                    }
+                    className={cn(
+                      "rounded p-1 text-slate-400 transition-colors hover:text-slate-200",
+                      opManualEntry && "bg-slate-700 text-slate-100",
+                    )}
+                    onClick={() => {
+                      opUserTouchedRef.current = true;
+                      if (opManualEntry) {
+                        const items = onePasswordItemsQuery.data?.items ?? [];
+                        const matches = items.some(
+                          (item) =>
+                            item.vault_id === opVaultId &&
+                            item.item_id === opItemId,
+                        );
+                        if (!matches) {
+                          setOpVaultId("");
+                          setOpItemId("");
+                        }
+                      }
+                      setOpManualEntry((prev) => !prev);
+                    }}
+                  >
+                    <CodeIcon className="size-4" />
+                  </button>
                 </div>
-                <Input
-                  value={opVaultId}
-                  onChange={(e) => setOpVaultId(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
-                    1Password Item ID
-                  </Label>
-                  <HelpTooltip content="Find this in the 1Password item URL. Supports agent inputs." />
-                </div>
-                <Input
-                  value={opItemId}
-                  onChange={(e) => setOpItemId(e.target.value)}
-                />
+                {opManualEntry ? (
+                  <div className="space-y-3">
+                    <div className="space-y-1">
+                      <div className="flex gap-2">
+                        <Label className="text-xs text-slate-300">
+                          1Password Vault ID
+                        </Label>
+                        <HelpTooltip content="Find this in the 1Password vault URL. Supports dynamic agent inputs like {{ my_input }}." />
+                      </div>
+                      <Input
+                        value={opVaultId}
+                        onChange={(e) => {
+                          opUserTouchedRef.current = true;
+                          setOpVaultId(e.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex gap-2">
+                        <Label className="text-xs text-slate-300">
+                          1Password Item ID
+                        </Label>
+                        <HelpTooltip content="Find this in the 1Password item URL. Supports dynamic agent inputs like {{ my_input }}." />
+                      </div>
+                      <Input
+                        value={opItemId}
+                        onChange={(e) => {
+                          opUserTouchedRef.current = true;
+                          setOpItemId(e.target.value);
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <OnePasswordItemSelector
+                    vaultId={opVaultId}
+                    itemId={opItemId}
+                    credentialDataType={credentialDataType}
+                    onSelect={(vaultId, itemId) => {
+                      opUserTouchedRef.current = true;
+                      setOpVaultId(vaultId);
+                      setOpItemId(itemId);
+                    }}
+                  />
+                )}
               </div>
               {credentialDataType === "creditCard" && (
                 <div className="rounded-md bg-slate-800 p-2">

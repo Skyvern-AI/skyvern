@@ -11,6 +11,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationUp
 from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import run_tool
+from .lazy import SkyvernTyperGroup
 
 _SETTABLE_KEYS: frozenset[str] = frozenset(OrganizationUpdate.model_fields)
 # ``clear_*`` keys are write-only verbs (reset to NULL); not surfaced by ``get``.
@@ -20,6 +21,7 @@ _READABLE_KEYS: frozenset[str] = frozenset(
 
 
 config_app = typer.Typer(
+    cls=SkyvernTyperGroup,
     help="Read and update organization settings (max_steps_per_run, webhook URL, retries, artifact URL expiry).",
     no_args_is_help=True,
 )

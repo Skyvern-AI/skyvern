@@ -28,6 +28,7 @@ from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
@@ -379,6 +380,12 @@ class SkyvernPage(Page):
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
+                    if is_post_dispatch_click_timeout(e):
+                        LOG.info(
+                            "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
+                            selector=selector,
+                        )
+                        return selector
                     # The click may have failed because an autocomplete dropdown
                     # or other overlay is covering the target element.  Press
                     # Escape to dismiss it and retry once before falling to AI.
@@ -547,6 +554,12 @@ class SkyvernPage(Page):
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
             await locator.fill(value, timeout=timeout, **kwargs)
+            # locator.fill already emits `input`; only the change/blur a JS gate may also need are missing.
+            for event_name in ("change", "blur"):
+                try:
+                    await locator.dispatch_event(event_name, timeout=timeout)
+                except Exception:
+                    LOG.debug("direct fill: dispatch_event failed", dispatched_event=event_name, exc_info=True)
             return value
 
         # Backward compatibility

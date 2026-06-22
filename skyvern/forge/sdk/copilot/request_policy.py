@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
-from email_validator import EmailNotValidError, validate_email
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    contains_email_password_pair,
+    redact_raw_secrets_for_prompt,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids, workflow_credential_origins
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -30,6 +37,26 @@ PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
 _RAW_SECRET_HANDLINGS = {"none", "block", "redacted_draft"}
+_CLASSIFIER_FAILURE_KINDS = {
+    "none",
+    "missing_handler",
+    "raw_secret_no_handler",
+    "timeout",
+    "transient_error",
+    "provider_error",
+}
+_CLASSIFICATION_RESPONSE_FIELDS = {
+    "testing_intent",
+    "credential_input_kind",
+    "credential_refs",
+    "login_page_urls",
+    "requires_user_clarification",
+    "completion_contract",
+    "completion_criteria",
+    "raw_secret_evidence",
+    "raw_secret_handling",
+    "clarification_reason",
+}
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -77,6 +104,9 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+# A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
+# digit-only body and length floor keep this off prose like `cred and the password`.
+_MALFORMED_CREDENTIAL_ID_RE = re.compile(r"\bcred[ \t\-]+([0-9]{12,})\b")
 _JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
     {
@@ -94,20 +124,6 @@ _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
     "I couldn't find the required credentials for the existing workflow. "
     f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
 )
-_RAW_SECRET_PATTERNS = (
-    re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
-    re.compile(
-        r"\b(?:otp|totp|mfa|2fa|verification|auth(?:entication)? code)(?:\s+code)?\s*(?:is|[:=])?\s*\d{6,8}\b",
-        re.I,
-    ),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-)
-# Reused by output-policy guardrails as syntactic leak backstops.
-RAW_SECRET_PATTERNS = _RAW_SECRET_PATTERNS
-_COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS = (",", ";", "|")
-_COLON_DELIMITED_SECRET_EDGE_CHARS = "\"'`()[]{}<>"
 _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "into the conditional",
     "inside the conditional",
@@ -116,6 +132,32 @@ _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "inside conditional",
     "within conditional",
 )
+_QUOTED_CREDENTIAL_NAME_RE = re.compile(r"(?:`([^`]{1,100})`|\"([^\"]{1,100})\"|'([^']{1,100})')")
+_NAMED_CREDENTIAL_TOKEN_RE = re.compile(
+    r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
+    re.I,
+)
+_CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
+_LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
+_CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
+
+
+_MAX_COMPLETION_CRITERIA = 8
+_COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
+
+CriterionLevel = Literal["definition", "run"]
+_CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
+
+
+@dataclass(frozen=True)
+class CompletionCriterion:
+    id: str
+    outcome: str
+    implicit: bool = False
+    method_mandated: bool = False
+    # "definition": a property of the workflow definition itself, graded against the
+    # YAML; "run": an end state only a run can evidence. Invalid input coerces to "run".
+    level: CriterionLevel = "run"
 
 
 @dataclass
@@ -130,7 +172,11 @@ class RequestPolicy:
     allow_missing_credentials_in_draft: bool = False
     user_response_policy: str = "proceed"
     completion_contract: str | None = None
+    completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
+    # Approves persisting a bound credential, not running it: run authority stays
+    # scoped to resolved_credentials (ADR 0002).
+    discovered_credentials: list[Credential] = field(default_factory=list)
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
     raw_secret_detected: bool = False
@@ -140,6 +186,10 @@ class RequestPolicy:
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
+    classifier_status: str = "not_run"
+    classifier_failure_kind: str = "none"
+    classifier_retry_count: int = 0
+    completion_contract_status: str = "absent"
 
     def to_trace_data(self) -> dict[str, Any]:
         return {
@@ -151,9 +201,20 @@ class RequestPolicy:
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "resolved_credential_count": len(self.resolved_credentials),
             "has_completion_contract": bool(self.completion_contract),
+            "completion_criteria_count": len(self.completion_criteria),
+            "completion_criteria_implicit_count": sum(
+                1 for criterion in self.completion_criteria if criterion.implicit
+            ),
+            "completion_criteria_method_mandated_count": sum(
+                1 for criterion in self.completion_criteria if criterion.method_mandated
+            ),
             "raw_secret_detected": self.raw_secret_detected,
             "has_raw_secret_evidence": self.raw_secret_evidence is not None,
             "raw_secret_handling": self.raw_secret_handling,
+            "classifier_status": self.classifier_status,
+            "classifier_failure_kind": self.classifier_failure_kind,
+            "classifier_retry_count": self.classifier_retry_count,
+            "completion_contract_status": self.completion_contract_status,
             "existing_workflow_credential_id_count": len(self.existing_workflow_credential_ids),
             "existing_workflow_credential_origin_count": sum(
                 len(origins) for origins in self.existing_workflow_credential_origins.values()
@@ -169,6 +230,8 @@ class RequestPolicy:
             f"allow_run_blocks: {self.allow_run_blocks}",
             f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
             f"raw_secret_handling: {self.raw_secret_handling}",
+            f"classifier_status: {self.classifier_status}",
+            f"completion_contract_status: {self.completion_contract_status}",
         ]
         if self.completion_contract:
             lines.append(f"completion_contract: {self.completion_contract}")
@@ -335,61 +398,19 @@ def _clean_list(values: list[Any]) -> list[str]:
 
 
 def _credential_ids(text: str) -> list[str]:
-    return list(dict.fromkeys(_CREDENTIAL_ID_RE.findall(text or "")))
+    text = text or ""
+    canonical = _CREDENTIAL_ID_RE.findall(text)
+    normalized = [f"cred_{body}" for body in _MALFORMED_CREDENTIAL_ID_RE.findall(text)]
+    return list(dict.fromkeys(canonical + normalized))
+
+
+def _canonicalize_credential_ref(ref: str) -> str:
+    malformed = _MALFORMED_CREDENTIAL_ID_RE.fullmatch(ref.strip())
+    return f"cred_{malformed.group(1)}" if malformed else ref
 
 
 def _raw_secret_detected(text: str) -> bool:
-    return any(pattern.search(text or "") for pattern in _RAW_SECRET_PATTERNS) or contains_email_password_pair(text)
-
-
-def _candidate_secret_segments(text: str) -> list[str]:
-    segments: list[str] = []
-    for raw_token in (text or "").split():
-        token_segments = [raw_token]
-        for separator in _COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS:
-            token_segments = [part for segment in token_segments for part in segment.split(separator)]
-        segments.extend(segment.strip(_COLON_DELIMITED_SECRET_EDGE_CHARS) for segment in token_segments)
-    return [segment for segment in segments if segment]
-
-
-def _is_valid_account_row_email(value: str) -> bool:
-    if any(char.isspace() for char in value) or "/" in value or ":" in value:
-        return False
-    try:
-        validate_email(value, check_deliverability=False, test_environment=True)
-    except EmailNotValidError:
-        return False
-    return True
-
-
-def _looks_like_colon_delimited_secret_value(value: str) -> bool:
-    if len(value) < 4:
-        return False
-    if any(char.isspace() for char in value):
-        return False
-    if any(char in value for char in ("/", "?", "#")):
-        return False
-    if value.isdigit() and len(value) <= 5:
-        return False
-    return True
-
-
-def _email_password_pair_segments(text: str) -> list[str]:
-    pairs: list[str] = []
-    for segment in _candidate_secret_segments(text):
-        email, separator, secret_value = segment.partition(":")
-        if not separator:
-            continue
-        if _is_valid_account_row_email(email) and _looks_like_colon_delimited_secret_value(secret_value):
-            pairs.append(segment)
-    return pairs
-
-
-def contains_email_password_pair(text: str) -> bool:
-    # Privacy backstop for pasted account dumps. The request-policy classifier
-    # owns ambiguous credential semantics; this parser keeps high-confidence raw
-    # values out of model prompts and output surfaces without a broad regex rule.
-    return bool(_email_password_pair_segments(text))
+    return any(pattern.search(text or "") for pattern in RAW_SECRET_PATTERNS) or contains_email_password_pair(text)
 
 
 _MIN_RAW_SECRET_EVIDENCE_CHARS = 4
@@ -415,19 +436,19 @@ def _coerce_raw_secret_handling(value: Any) -> RawSecretHandling:
     return "none"
 
 
-def redact_raw_secrets_for_prompt(text: str) -> str:
-    redacted = text or ""
-    for pattern in _RAW_SECRET_PATTERNS:
-        redacted = pattern.sub("[REDACTED_SECRET]", redacted)
-    for segment in _email_password_pair_segments(redacted):
-        redacted = redacted.replace(segment, "[REDACTED_SECRET]")
-    return redacted
-
-
-def _classification_from_raw(raw: Any) -> RequestPolicy:
+def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
         raw = parse_final_response(raw)
     if not isinstance(raw, dict):
+        return None
+    if not any(field in raw for field in _CLASSIFICATION_RESPONSE_FIELDS):
+        return None
+    return raw
+
+
+def _classification_from_raw(raw: Any) -> RequestPolicy:
+    raw = _coerce_classifier_payload(raw)
+    if raw is None:
         return RequestPolicy()
     testing_intent = raw.get("testing_intent")
     credential_input_kind = raw.get("credential_input_kind")
@@ -442,9 +463,12 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
+        completion_criteria=_parse_completion_criteria(raw.get("completion_criteria")),
         raw_secret_evidence=raw_secret_evidence,
         raw_secret_handling=_coerce_raw_secret_handling(raw.get("raw_secret_handling")),
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
+        classifier_status="success",
+        classifier_failure_kind="none",
     )
     if policy.credential_input_kind == "raw_secret":
         policy.clarification_reason = "raw_secret"
@@ -475,7 +499,77 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
     return None
 
 
-def _classifier_fallback_policy(ids: list[str], *, raw_secret_present: bool) -> RequestPolicy:
+def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
+    """Build outcome criteria from the classifier output.
+
+    IDs are assigned server-side by index after de-duplication; any id the
+    model emits is discarded because the downstream satisfaction check keys on
+    a unique id set.
+    """
+    if not isinstance(raw, list):
+        return []
+    criteria: list[CompletionCriterion] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        outcome_raw = item.get("outcome")
+        if not isinstance(outcome_raw, str):
+            continue
+        outcome = " ".join(outcome_raw.split())[:_COMPLETION_CRITERION_OUTCOME_MAX_CHARS].strip()
+        if not outcome:
+            continue
+        key = normalized_criterion_outcome_key(outcome)
+        if key in seen:
+            continue
+        seen.add(key)
+        level_raw = item.get("level")
+        criteria.append(
+            CompletionCriterion(
+                id=f"c{len(criteria)}",
+                outcome=outcome,
+                implicit=bool(item.get("implicit")),
+                method_mandated=bool(item.get("method_mandated")),
+                level=cast(CriterionLevel, level_raw)
+                if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
+                else "run",
+            )
+        )
+        if len(criteria) >= _MAX_COMPLETION_CRITERIA:
+            break
+    return criteria
+
+
+def normalized_criterion_outcome_key(outcome: str) -> str:
+    collapsed = " ".join((outcome or "").split())[:_COMPLETION_CRITERION_OUTCOME_MAX_CHARS]
+    return collapsed.strip().lower().rstrip(".!?;:,").strip()
+
+
+def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | None) -> str:
+    if not criteria:
+        return ""
+    return json.dumps(
+        [
+            {
+                "outcome": criterion.outcome,
+                "implicit": criterion.implicit,
+                "method_mandated": criterion.method_mandated,
+                "level": criterion.level,
+            }
+            for criterion in criteria
+        ]
+    )
+
+
+def _classifier_fallback_policy(
+    ids: list[str],
+    *,
+    raw_secret_present: bool,
+    failure_kind: str,
+    retry_count: int = 0,
+) -> RequestPolicy:
+    if failure_kind not in _CLASSIFIER_FAILURE_KINDS:
+        failure_kind = "provider_error"
     if raw_secret_present:
         return RequestPolicy(
             credential_input_kind="raw_secret",
@@ -483,8 +577,71 @@ def _classifier_fallback_policy(ids: list[str], *, raw_secret_present: bool) -> 
             raw_secret_detected=True,
             raw_secret_handling="block",
             clarification_reason="raw_secret",
+            classifier_status="fallback",
+            classifier_failure_kind=failure_kind,
+            classifier_retry_count=retry_count,
+            completion_contract_status="unknown",
         )
-    return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
+    return RequestPolicy(
+        credential_input_kind="credential_id" if ids else "none",
+        credential_refs=ids,
+        classifier_status="fallback",
+        classifier_failure_kind=failure_kind,
+        classifier_retry_count=retry_count,
+        completion_contract_status="unknown",
+    )
+
+
+def _explicit_code_block_credential_draft_requested(user_message: str) -> bool:
+    normalized = " ".join((user_message or "").lower().split())
+    if not normalized:
+        return False
+    has_code_marker = any(marker in normalized for marker in _CODE_BLOCK_AUTHORING_MARKERS)
+    if not has_code_marker:
+        return False
+    blocks_login = any(marker in normalized for marker in _LOGIN_BLOCK_BAN_MARKERS)
+    mentions_credential_code = any(marker in normalized for marker in _CREDENTIAL_CODE_MARKERS)
+    return blocks_login or mentions_credential_code
+
+
+def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, user_message: str) -> None:
+    if policy.raw_secret_detected:
+        return
+    if not _explicit_code_block_credential_draft_requested(user_message):
+        return
+    policy.testing_intent = "skip_test"
+    policy.allow_update_workflow = True
+    policy.allow_run_blocks = False
+    policy.allow_missing_credentials_in_draft = True
+    policy.requires_user_clarification = False
+    policy.user_response_policy = "proceed"
+    policy.clarification_reason = "none"
+    policy.clarification_question = None
+
+
+async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any | None, str, int]:
+    # Diverges from turn-intent on purpose: a retriable provider error (429/5xx) retries once
+    # within the budget, while a timeout is never retried (retrying cannot beat the budget).
+    deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
+    retry_count = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Only reachable after a retriable error consumed the budget before the retry ran.
+            return None, "transient_error", retry_count
+        try:
+            raw = await asyncio.wait_for(
+                handler(prompt=prompt, prompt_name=PROMPT_NAME),
+                timeout=remaining,
+            )
+            return raw, "none", retry_count
+        except asyncio.TimeoutError:
+            return None, "timeout", retry_count
+        except Exception as exc:
+            if retry_count == 0 and is_retriable_llm_error(exc):
+                retry_count += 1
+                continue
+            return None, "provider_error", retry_count
 
 
 async def _classify_request(
@@ -493,11 +650,13 @@ async def _classify_request(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
     handler: Any,
+    *,
+    active_criteria: list[CompletionCriterion] | None = None,
 ) -> RequestPolicy:
     ids = _credential_ids(user_message)
     raw_secret_present = _raw_secret_detected(user_message)
     if raw_secret_present and handler is None:
-        return _classifier_fallback_policy(ids, raw_secret_present=True)
+        return _classifier_fallback_policy(ids, raw_secret_present=True, failure_kind="raw_secret_no_handler")
     structural_reason = _structural_clarification_reason(user_message)
     if structural_reason != "none" and not raw_secret_present:
         return RequestPolicy(
@@ -507,7 +666,7 @@ async def _classify_request(
             clarification_reason=structural_reason,
         )
     if handler is None:
-        return _classifier_fallback_policy(ids, raw_secret_present=False)
+        return _classifier_fallback_policy(ids, raw_secret_present=False, failure_kind="missing_handler")
 
     # Raw-secret turns intentionally reach the classifier when available so it
     # can distinguish unsafe secret use from redacted draft/spec conversion.
@@ -524,22 +683,36 @@ async def _classify_request(
         latest_assistant_turn=transcript.latest_assistant_turn,
         retained_history=transcript.retained_history,
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)[:2048]),
+        active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
     )
-    try:
-        raw = await asyncio.wait_for(
-            handler(prompt=prompt, prompt_name=PROMPT_NAME),
-            timeout=settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS,
+    raw, failure_kind, retry_count = await _run_request_policy_classifier(handler, prompt)
+    if raw is None:
+        LOG.warning("request-policy classifier failed", failure_kind=failure_kind, retry_count=retry_count)
+        return _classifier_fallback_policy(
+            ids,
+            raw_secret_present=raw_secret_present,
+            failure_kind=failure_kind,
+            retry_count=retry_count,
         )
-    except asyncio.TimeoutError:
-        LOG.warning("request-policy classifier timed out")
-        return _classifier_fallback_policy(ids, raw_secret_present=raw_secret_present)
-    except Exception as exc:
-        LOG.warning("request-policy classifier failed", error=str(exc))
-        return _classifier_fallback_policy(ids, raw_secret_present=raw_secret_present)
 
-    policy = _classification_from_raw(raw)
+    raw_payload = _coerce_classifier_payload(raw)
+    if raw_payload is None:
+        LOG.warning("request-policy classifier returned malformed payload")
+        return _classifier_fallback_policy(
+            ids,
+            raw_secret_present=raw_secret_present,
+            failure_kind="provider_error",
+            retry_count=retry_count,
+        )
+
+    policy = _classification_from_raw(raw_payload)
+    policy.classifier_retry_count = retry_count
     policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
-    policy.credential_refs = _clean_list(policy.credential_refs + ids)
+    policy.completion_contract_status = (
+        "present" if policy.completion_contract or policy.completion_criteria else "absent"
+    )
+    classifier_credential_refs = [_canonicalize_credential_ref(ref) for ref in policy.credential_refs]
+    policy.credential_refs = _clean_list(classifier_credential_refs + ids)
     if raw_secret_present:
         policy.raw_secret_detected = True
         if policy.raw_secret_handling == "redacted_draft":
@@ -552,8 +725,16 @@ async def _classify_request(
             policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
     if policy.testing_intent == "skip_test" and policy.completion_contract:
         policy.testing_intent = "unspecified"
-    if ids and policy.credential_input_kind in ("none", "placeholder"):
-        policy.credential_input_kind = "credential_id"
+    if ids and policy.credential_input_kind != "raw_secret":
+        # A deterministically-extracted `cred_`-shaped token overrides a non-ID kind, unless the
+        # classifier pointed at another resolvable target — a saved name (an ID-shaped ref does
+        # not count) or a login-page URL — leaving the cred_ token as contextual.
+        classifier_named_a_credential = any(not _credential_ids(ref) for ref in classifier_credential_refs)
+        classifier_target_wins = (
+            policy.credential_input_kind == "credential_name" and classifier_named_a_credential
+        ) or (policy.credential_input_kind == "website_stored_credential" and bool(policy.login_page_urls))
+        if not classifier_target_wins:
+            policy.credential_input_kind = "credential_id"
     if (
         policy.credential_input_kind == "raw_secret"
         and not raw_secret_present
@@ -582,6 +763,52 @@ async def _load_credentials(organization_id: str) -> list[Credential]:
         if len(items) < 50:
             return sorted(credentials, key=lambda c: getattr(c, "created_at", None) or "", reverse=True)
         page += 1
+
+
+def _fallback_credential_name_candidates(user_message: str) -> list[str]:
+    candidates: list[str] = []
+    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(user_message or ""):
+        value = next((group for group in match.groups() if group), "")
+        if value.strip():
+            candidates.append(value.strip())
+    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(user_message or ""):
+        value = match.group(1).strip()
+        if value:
+            candidates.append(value)
+    return _clean_list(candidates)
+
+
+async def _apply_fallback_credential_name_scope(
+    policy: RequestPolicy,
+    *,
+    user_message: str,
+    organization_id: str,
+) -> None:
+    if policy.classifier_status != "fallback":
+        return
+    if policy.raw_secret_detected or policy.credential_input_kind not in ("none", "credential_name"):
+        return
+    candidates = _fallback_credential_name_candidates(user_message)
+    if not candidates:
+        return
+    credentials = await _load_credentials(organization_id)
+    matched_names = _clean_list(
+        [candidate for candidate in candidates if any(credential.name == candidate for credential in credentials)]
+    )
+    if len(matched_names) == 1:
+        policy.credential_input_kind = "credential_name"
+        policy.credential_refs = matched_names
+        policy.requires_user_clarification = False
+        policy.clarification_reason = "none"
+        policy.clarification_question = None
+    elif len(matched_names) > 1:
+        matches = [credential for credential in credentials if credential.name in matched_names]
+        _block(
+            policy,
+            "I found multiple saved credentials named in your request. Which one should I use?",
+            matches,
+            reason="credential_name_unresolved",
+        )
 
 
 def _safe_label(credential: Credential) -> str:
@@ -715,6 +942,30 @@ def _previous_credential_clarification_was_asked(global_llm_context: str) -> boo
     return any(
         decision.startswith(_CLARIFICATION_DECISION_PREFIX) and "/credential_name_unresolved" in decision
         for decision in structured.decisions_made
+    )
+
+
+def _discovered_credential_ids_from_context(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        check.credential_id
+        for check in structured.credentials_checked
+        if check.found and isinstance(check.credential_id, str) and check.credential_id.startswith("cred_")
+    }
+
+
+async def _seed_discovered_credentials(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    discovered_ids = _discovered_credential_ids_from_context(global_llm_context)
+    if not discovered_ids:
+        return
+    policy.discovered_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        sorted(discovered_ids),
+        organization_id=organization_id,
     )
 
 
@@ -969,13 +1220,48 @@ async def build_request_policy(
     global_llm_context: str,
     organization_id: str,
     handler: Any,
+    active_criteria: list[CompletionCriterion] | None = None,
 ) -> RequestPolicy:
-    policy = await _classify_request(user_message, workflow_yaml, chat_history, global_llm_context, handler)
+    policy = await _classify_request(
+        user_message,
+        workflow_yaml,
+        chat_history,
+        global_llm_context,
+        handler,
+        active_criteria=active_criteria,
+    )
     policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
+    try:
+        await _apply_fallback_credential_name_scope(
+            policy,
+            user_message=user_message,
+            organization_id=organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy fallback credential-name extraction failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+    # This narrows classifier output only after the classifier has identified
+    # credential intent; running it earlier would be overwritten by the model verdict.
+    _apply_explicit_code_block_credential_draft_policy(policy, user_message)
+    try:
+        await _seed_discovered_credentials(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy discovered-credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
     _prioritize_credential_clarification(policy)
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
@@ -1057,6 +1343,9 @@ async def build_request_policy(
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
 
-    with copilot_span("request_policy", data=policy.to_trace_data()):
-        LOG.info("request-policy decision", **policy.to_trace_data())
+    trace_data = policy.to_trace_data()
+    if policy.classifier_status == "fallback":
+        LOG.warning("request-policy fallback policy used", **trace_data)
+    with copilot_span("request_policy", data=trace_data):
+        LOG.info("request-policy decision", **trace_data)
     return policy

@@ -107,6 +107,7 @@ function renderBodyForBlock(
     case "login":
     case "validation":
     case "extraction":
+    case "file_download":
       return (
         <BlockDetailTask
           block={block}
@@ -117,7 +118,13 @@ function renderBodyForBlock(
         />
       );
     case "conditional":
-      return <BlockDetailConditional block={block} />;
+      return (
+        <BlockDetailConditional
+          block={block}
+          activeItem={activeItem}
+          onActionSelect={onActionSelect}
+        />
+      );
     case "for_loop":
     case "while_loop":
       return <BlockDetailLoop block={block} iterationIndex={activeIteration} />;

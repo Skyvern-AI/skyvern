@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import textwrap
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from skyvern.forge.sdk.copilot.request_policy import _workflow_credential_inputs_unbound
+import pytest
+
+from skyvern.forge.sdk.copilot.context import CredentialCheck, StructuredContext
+from skyvern.forge.sdk.copilot.request_policy import _workflow_credential_inputs_unbound, build_request_policy
 
 
 def _yaml(body: str) -> str:
@@ -212,3 +217,122 @@ def test_malformed_or_empty_yaml_is_inert() -> None:
     assert _workflow_credential_inputs_unbound("") == []
     assert _workflow_credential_inputs_unbound("- not a workflow yaml\n") == []
     assert _workflow_credential_inputs_unbound(":: broken yaml ::") == []
+
+
+def _discovered_context(*credential_ids: str) -> str:
+    structured = StructuredContext(
+        credentials_checked=[
+            CredentialCheck(credential_name=cid, credential_id=cid, found=True) for cid in credential_ids
+        ]
+    )
+    return structured.to_json_str()
+
+
+@pytest.mark.asyncio
+async def test_discovered_credentials_seed_approved_set_on_none_turn() -> None:
+    org_credentials = [
+        SimpleNamespace(credential_id="cred_amazon"),
+        SimpleNamespace(credential_id="cred_quicken"),
+    ]
+    with patch(
+        "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
+        new=AsyncMock(return_value=org_credentials),
+    ):
+        policy = await build_request_policy(
+            user_message="yes, use both of those",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=_discovered_context("cred_amazon", "cred_quicken"),
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert policy.credential_input_kind == "none"
+    assert [c.credential_id for c in policy.discovered_credentials] == ["cred_amazon", "cred_quicken"]
+
+
+@pytest.mark.asyncio
+async def test_discovered_credential_absent_from_org_is_not_approved() -> None:
+    with patch(
+        "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
+        new=AsyncMock(return_value=[SimpleNamespace(credential_id="cred_amazon")]),
+    ):
+        policy = await build_request_policy(
+            user_message="yes",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=_discovered_context("cred_amazon", "cred_ghost"),
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert [c.credential_id for c in policy.discovered_credentials] == ["cred_amazon"]
+
+
+@pytest.mark.asyncio
+async def test_no_discovered_credentials_leaves_approved_set_empty() -> None:
+    get_by_ids = AsyncMock(return_value=[])
+    with patch("skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids", new=get_by_ids):
+        policy = await build_request_policy(
+            user_message="add a step to download the report",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert policy.discovered_credentials == []
+    get_by_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fallback_code_block_credential_request_saves_draft_without_running() -> None:
+    credential = SimpleNamespace(
+        credential_id="cred_email_otp",
+        name="mock-portal-login-email-otp",
+        tested_url="http://localhost:8900/telco_billing/northwind/?mfa=email",
+    )
+    with patch(
+        "skyvern.forge.app.DATABASE.credentials.get_credentials",
+        new=AsyncMock(return_value=[credential]),
+    ):
+        policy = await build_request_policy(
+            user_message=(
+                "Build this as a Code block credential test using the saved credential named "
+                "mock-portal-login-email-otp. Do not create a Login block for sign-in or MFA, "
+                "and use await login_credentials.otp() for the email one-time-code."
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert policy.classifier_status == "fallback"
+    assert policy.credential_input_kind == "credential_name"
+    assert policy.credential_refs == ["mock-portal-login-email-otp"]
+    assert policy.resolved_credentials == [credential]
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is False
+    assert policy.allow_missing_credentials_in_draft is True
+    assert policy.testing_intent == "skip_test"
+    assert policy.requires_user_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_fallback_code_block_generic_one_time_code_does_not_skip_run() -> None:
+    policy = await build_request_policy(
+        user_message="Build a code block that handles a one time code after sign in.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="o_test",
+        handler=None,
+    )
+
+    assert policy.classifier_status == "fallback"
+    assert policy.allow_run_blocks is True
+    assert policy.allow_missing_credentials_in_draft is False
+    assert policy.testing_intent == "unspecified"

@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
+from skyvern.utils.action_redaction import redact_input_text_payload_for_log
 
 
 class SdkActionType(str, Enum):
@@ -61,6 +62,14 @@ class InputTextAction(SdkActionBase):
     totp_identifier: str | None = Field(None, description="TOTP identifier for input_text actions")
     totp_url: str | None = Field(None, description="TOTP URL for input_text actions")
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+
+    def __repr__(self) -> str:
+        payload = redact_input_text_payload_for_log(self.model_dump(), value_key="value")
+        fields = ", ".join(f"{key}={value!r}" for key, value in payload.items())
+        return f"{self.__class__.__name__}({fields})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     def get_navigation_goal(self) -> str | None:
         return self.intention

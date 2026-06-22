@@ -9,7 +9,9 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
+    CompletionCriterion,
     _classify_request,
+    _credential_ids,
     _raw_secret_detected,
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
@@ -266,3 +268,99 @@ class TestRawSecretEvidenceContract:
         )
         assert policy.credential_input_kind == "credential_id"
         assert policy.credential_refs == ["cred_payroll_42"]
+
+
+class TestMalformedCredentialIdExtraction:
+    def test_space_separator_is_normalized(self) -> None:
+        assert _credential_ids("use cred 530299673029518520 to log in") == ["cred_530299673029518520"]
+
+    def test_hyphen_separator_is_normalized(self) -> None:
+        assert _credential_ids("cred-530299673029518520") == ["cred_530299673029518520"]
+
+    def test_canonical_id_is_unchanged_and_not_double_counted(self) -> None:
+        assert _credential_ids("cred_530299673029518520") == ["cred_530299673029518520"]
+
+    def test_prose_after_cred_word_is_not_matched(self) -> None:
+        assert _credential_ids("set up the cred and the password later") == []
+
+    def test_short_number_is_not_matched(self) -> None:
+        assert _credential_ids("cred 530299") == []
+
+    @pytest.mark.asyncio
+    async def test_classify_promotes_malformed_id_over_credential_name_without_competing_scope(self) -> None:
+        policy = await _classify(
+            "use cred 530299673029518520 for the login",
+            kind="credential_name",
+            reason="credential_name_unresolved",
+        )
+        assert policy.credential_input_kind == "credential_id"
+        assert "cred_530299673029518520" in policy.credential_refs
+
+    @pytest.mark.asyncio
+    async def test_classify_promotes_malformed_id_over_website_stored_credential_without_url(self) -> None:
+        policy = await _classify(
+            "use cred 530299673029518520 for the login",
+            kind="website_stored_credential",
+            reason="none",
+        )
+        assert policy.credential_input_kind == "credential_id"
+        assert "cred_530299673029518520" in policy.credential_refs
+
+    @pytest.mark.asyncio
+    async def test_classify_keeps_credential_name_when_classifier_surfaced_a_name(self) -> None:
+        policy = await _classify(
+            "replace cred_530299673029518520 with my saved credential named Bank",
+            kind="credential_name",
+            refs=["Bank"],
+            reason="credential_name_unresolved",
+        )
+        assert policy.credential_input_kind == "credential_name"
+
+    @pytest.mark.asyncio
+    async def test_classify_promotes_when_classifier_mislabeled_ids_as_name(self) -> None:
+        policy = await _classify(
+            "use cred_alpha and cred_beta for the two logins",
+            kind="credential_name",
+            refs=["cred_alpha", "cred_beta"],
+            reason="none",
+        )
+        assert policy.credential_input_kind == "credential_id"
+
+
+def _capture_handler(captured: dict[str, str]):
+    async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        captured["prompt"] = prompt
+        return {"testing_intent": "unspecified", "credential_input_kind": "none"}
+
+    return handler
+
+
+class TestActiveCriteriaPromptAnchor:
+    @pytest.mark.asyncio
+    async def test_active_criteria_render_verbatim(self) -> None:
+        captured: dict[str, str] = {}
+        await _classify_request(
+            user_message="run it again to make sure it still works",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=_capture_handler(captured),
+            active_criteria=[
+                CompletionCriterion(id="c0", outcome="The main heading from https://example.com is extracted"),
+            ],
+        )
+        assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" in captured["prompt"]
+        assert "The main heading from https://example.com is extracted" in captured["prompt"]
+        assert "COPIED VERBATIM" in captured["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_no_active_criteria_omits_anchor_section(self) -> None:
+        captured: dict[str, str] = {}
+        await _classify_request(
+            user_message="build a workflow",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=_capture_handler(captured),
+        )
+        assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]

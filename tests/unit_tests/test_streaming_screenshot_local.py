@@ -34,7 +34,9 @@ async def test_run_local_screencast_happy_path(monkeypatch: pytest.MonkeyPatch) 
     )
 
     wait_for_running.assert_awaited_once()
-    wait_for_browser_state_mock.assert_awaited_once_with("task_123", "task", workflow_run_id="wr_123")
+    wait_for_browser_state_mock.assert_awaited_once_with(
+        "task_123", "task", workflow_run_id="wr_123", organization_id=None
+    )
     start_screencast_loop_mock.assert_awaited_once_with(
         websocket=websocket,
         browser_state=browser_state,
@@ -75,6 +77,7 @@ async def test_run_local_screencast_timeout_when_browser_state_not_available(
         "bs_123",
         "browser_session",
         workflow_run_id=None,
+        organization_id=None,
     )
     start_screencast_loop_mock.assert_not_awaited()
     get_current_status.assert_not_awaited()

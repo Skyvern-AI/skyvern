@@ -9,7 +9,6 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import {
   countActionsInTimeline,
   countCompletedTopLevelBlocks,
-  findUnexecutedDefinedBlocks,
   isBlockItem,
   isObserverThought,
   isThoughtItem,
@@ -24,6 +23,11 @@ import {
 import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
 import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
+import { buildCodeStepsByLabel } from "../workflowBlockUtils";
+import {
+  classifyUnexecutedDefinedBlocks,
+  flattenTimelineChronologically,
+} from "./workflowTimelineUtils";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -74,26 +78,6 @@ function buildBlockOrderIndex(
   return new Map(blocks.map((block, index) => [block.id, index + 1]));
 }
 
-function toTimelineTime(value: string): number {
-  const time = new Date(value).getTime();
-  return Number.isNaN(time) ? Number.MAX_SAFE_INTEGER : time;
-}
-
-function sortTimelineTopDown(
-  items: Array<WorkflowRunTimelineItem>,
-): Array<WorkflowRunTimelineItem> {
-  if (items.length === 0) return items;
-  return items
-    .map((item) => ({
-      ...item,
-      children: sortTimelineTopDown(item.children),
-    }))
-    .sort(
-      (left, right) =>
-        toTimelineTime(left.created_at) - toTimelineTime(right.created_at),
-    );
-}
-
 function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
@@ -109,12 +93,19 @@ function WorkflowRunTimeline({
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const displayTimeline = useMemo(
-    () => sortTimelineTopDown(workflowRunTimeline ?? []),
+    () => flattenTimelineChronologically(workflowRunTimeline ?? []),
     [workflowRunTimeline],
   );
   const blockOrder = useMemo(
     () => buildBlockOrderIndex(workflowRunTimeline ?? []),
     [workflowRunTimeline],
+  );
+  const codeStepsByLabel = useMemo(
+    () =>
+      buildCodeStepsByLabel(
+        workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+      ),
+    [workflowRun],
   );
 
   // Track known item IDs so we can animate only newly-arrived items
@@ -158,7 +149,7 @@ function WorkflowRunTimeline({
   const totalBlocks = definedBlocks.length;
   const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
   const unexecutedBlocks = workflowRunIsFinalized
-    ? findUnexecutedDefinedBlocks(definedBlocks, workflowRunTimeline)
+    ? classifyUnexecutedDefinedBlocks(definedBlocks, workflowRunTimeline)
     : [];
 
   return (
@@ -247,6 +238,7 @@ function WorkflowRunTimeline({
                       activeIteration={activeIteration}
                       block={timelineItem.block}
                       blockOrder={blockOrder}
+                      codeStepsByLabel={codeStepsByLabel}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
                       onIterationClick={onIterationSelected}
@@ -281,10 +273,11 @@ function WorkflowRunTimeline({
               }
               return null;
             })}
-            {unexecutedBlocks.map((block) => (
+            {unexecutedBlocks.map(({ block, reason }) => (
               <WorkflowRunTimelineUnexecutedBlockItem
                 key={`unexecuted-${block.label}`}
                 block={block}
+                reason={reason}
               />
             ))}
           </div>

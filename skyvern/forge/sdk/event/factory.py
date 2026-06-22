@@ -1,7 +1,7 @@
 import time
-from collections import defaultdict
 
 import structlog
+from opentelemetry import metrics
 from playwright.async_api import Locator, Page
 
 from skyvern.forge.sdk.event.base import CursorEventStrategy, InputEventStrategy, ScrollEventStrategy
@@ -11,42 +11,26 @@ from skyvern.webeye.cursor_visualization import VisualizingCursorStrategy
 
 LOG = structlog.get_logger(__name__)
 
+_meter = metrics.get_meter("skyvern.event_strategy")
+_event_duration_histogram = _meter.create_histogram(
+    name="skyvern.event_strategy.duration",
+    unit="s",
+    description="Duration of browser cursor/input/scroll events, tagged by event_type.",
+)
+
 _default_cursor = DefaultCursorStrategy()
 _default_input = DefaultInputStrategy()
 _default_scroll = DefaultScrollStrategy()
 
 
 class _EventMetrics:
-    """Accumulates per-event-type timing within a step."""
+    """Records per-event-type timing as an OTEL histogram (no-op when metrics are unconfigured)."""
 
-    def __init__(self) -> None:
-        self._counts: dict[str, int] = defaultdict(int)
-        self._durations: dict[str, float] = defaultdict(float)
+    def __init__(self, histogram: metrics.Histogram = _event_duration_histogram) -> None:
+        self._histogram = histogram
 
     def record(self, event_type: str, duration: float) -> None:
-        self._counts[event_type] += 1
-        self._durations[event_type] += duration
-
-    def flush(self, **log_kwargs: object) -> None:
-        """Log per-event-type summary and reset. No-op if nothing was recorded."""
-        if not self._counts:
-            return
-
-        total_duration = sum(self._durations.values())
-        total_count = sum(self._counts.values())
-        per_event = {
-            event_type: {"count": self._counts[event_type], "duration_seconds": round(self._durations[event_type], 4)}
-            for event_type in sorted(self._counts)
-        }
-        LOG.info(
-            "Event strategy duration metrics",
-            total_count=total_count,
-            total_duration_seconds=round(total_duration, 4),
-            per_event=per_event,
-            **log_kwargs,
-        )
-        self._counts.clear()
-        self._durations.clear()
+        self._histogram.record(duration, {"event_type": event_type})
 
 
 class EventStrategyFactory:
@@ -102,13 +86,6 @@ class EventStrategyFactory:
     def get_scroll_strategy() -> ScrollEventStrategy:
         return EventStrategyFactory.__scroll or _default_scroll
 
-    # -- metrics ----------------------------------------------------------------
-
-    @staticmethod
-    def flush_metrics(**log_kwargs: object) -> None:
-        """Log and reset accumulated event strategy metrics."""
-        EventStrategyFactory.__metrics.flush(**log_kwargs)
-
     # -- cursor convenience methods ---------------------------------------------
 
     @staticmethod
@@ -135,6 +112,34 @@ class EventStrategyFactory:
     def sync_cursor_position(page: Page, x: float, y: float) -> None:
         """Update cursor position without generating movement."""
         EventStrategyFactory.get_cursor_strategy().sync_position(page, x, y)
+
+    @staticmethod
+    async def warmup_cursor(page: Page) -> None:
+        """Run the active cursor strategy's per-page warmup hook (idempotent, no-op by default)."""
+        start = time.perf_counter()
+        try:
+            await EventStrategyFactory.get_cursor_strategy().warmup(page)
+        except Exception:
+            LOG.debug("Cursor warmup failed, proceeding with action", exc_info=True)
+        finally:
+            EventStrategyFactory.__metrics.record("warmup_cursor", time.perf_counter() - start)
+
+    @staticmethod
+    async def click_element(page: Page, locator: Locator, timeout: float | None = None) -> None:
+        """Click an element through the active cursor strategy.
+
+        The default strategy delegates to ``locator.click(timeout=...)`` so
+        Playwright's actionability checks remain in force. An alternate strategy
+        dispatches explicit ``page.mouse.down``/``page.mouse.up`` events with a
+        press dwell at the resolved destination coordinates, avoiding the implicit
+        mousemove that ``page.mouse.click``/``locator.click`` inserts before
+        mousedown.
+        """
+        start = time.perf_counter()
+        try:
+            await EventStrategyFactory.get_cursor_strategy().click(page, locator, timeout=timeout)
+        finally:
+            EventStrategyFactory.__metrics.record("click_element", time.perf_counter() - start)
 
     # -- input convenience methods ----------------------------------------------
 

@@ -6,6 +6,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.errors.errors import UserDefinedError
+from skyvern.utils.action_redaction import redact_input_text_payload_for_log
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger()
@@ -218,6 +219,10 @@ class Action(BaseModel):
                 return GoForwardAction.model_validate(value)
             elif action_type is ActionType.CLOSE_PAGE:
                 return ClosePageAction.model_validate(value)
+            elif action_type is ActionType.NEW_TAB:
+                return NewTabAction.model_validate(value)
+            elif action_type is ActionType.SWITCH_TAB:
+                return SwitchTabAction.model_validate(value)
             elif action_type is ActionType.EXECUTE_JS:
                 return ExecuteJsAction.model_validate(value)
             else:
@@ -253,6 +258,16 @@ class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
 
 
+class NewTabAction(Action):
+    action_type: ActionType = ActionType.NEW_TAB
+    url: str
+
+
+class SwitchTabAction(Action):
+    action_type: ActionType = ActionType.SWITCH_TAB
+    tab_index: int
+
+
 class ClickAction(WebAction):
     action_type: ActionType = ActionType.CLICK
     file_url: str | None = None
@@ -271,9 +286,28 @@ class InputTextAction(WebAction):
     action_type: ActionType = ActionType.INPUT_TEXT
     text: str
     totp_code_required: bool = False
+    totp_identifier: str | None = None
+    totp_url: str | None = None
 
     def __repr__(self) -> str:
-        return f"InputTextAction(element_id={self.element_id}, text={self.text}, context={self.input_or_select_context}, tool_call_id={self.tool_call_id})"
+        payload = redact_input_text_payload_for_log(
+            {
+                "action_type": self.action_type,
+                "text": self.text,
+                "totp_code_required": self.totp_code_required,
+                "totp_timing_info": self.totp_timing_info,
+                "totp_identifier": self.totp_identifier,
+                "totp_url": self.totp_url,
+            },
+            value_key="text",
+        )
+        return (
+            f"InputTextAction(element_id={self.element_id}, text={payload['text']}, "
+            f"context={self.input_or_select_context}, tool_call_id={self.tool_call_id})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 class UploadFileAction(WebAction):

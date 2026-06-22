@@ -759,6 +759,15 @@ await skyvern.create_credential(
         "card_exp_year": "2028",
         "card_brand": "visa",
         "card_holder_name": "John Doe",
+        "billing_address": {
+            "line1": "123 Main St",
+            "city": "San Francisco",
+            "state_code": "CA",
+            "postal_code": "94105",
+            "country_code": "US",
+        },
+        "billing_email": "billing@example.com",
+        "metadata": {"checkout_profile": "default"},
     },
 )
 """
@@ -774,7 +783,16 @@ await skyvern.createCredential({
         card_exp_month: "12",
         card_exp_year: "2028",
         card_brand: "visa",
-        card_holder_name: "John Doe"
+        card_holder_name: "John Doe",
+        billing_address: {
+            line1: "123 Main St",
+            city: "San Francisco",
+            state_code: "CA",
+            postal_code: "94105",
+            country_code: "US",
+        },
+        billing_email: "billing@example.com",
+        metadata: { checkout_profile: "default" }
     }
 });
 """

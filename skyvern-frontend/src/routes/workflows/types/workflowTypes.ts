@@ -216,7 +216,8 @@ export type WorkflowBlock =
   | PrintPageBlock
   | WorkflowTriggerBlock
   | GoogleSheetsReadBlock
-  | GoogleSheetsWriteBlock;
+  | GoogleSheetsWriteBlock
+  | PdfFillBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -246,6 +247,7 @@ export const WorkflowBlockTypes = {
   WorkflowTrigger: "workflow_trigger",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
+  PDFFill: "pdf_fill",
 } as const;
 
 // all of them
@@ -377,10 +379,20 @@ export type WhileLoopBlock = WorkflowBlockBase & {
   condition: BranchCriteria;
 };
 
+export type CodeBlockStep = {
+  title?: string | null;
+  description?: string | null;
+  action_type: string;
+  line_start?: number | null;
+  line_end?: number | null;
+};
+
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
   parameters: Array<WorkflowParameter>;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -611,6 +623,15 @@ export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type PdfFillBlock = WorkflowBlockBase & {
+  block_type: "pdf_fill";
+  file_url: string;
+  prompt: string;
+  payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key: string | null;
   parameters: Array<WorkflowParameter>;
 };
 

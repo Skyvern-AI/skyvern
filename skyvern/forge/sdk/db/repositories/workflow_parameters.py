@@ -29,6 +29,8 @@ from skyvern.forge.sdk.db.models import (
     TaskModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
+    WorkflowCopilotCompletionCriteriaSetModel,
+    WorkflowModel,
     WorkflowParameterModel,
 )
 from skyvern.forge.sdk.db.utils import (
@@ -36,7 +38,9 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_output_parameter,
     convert_to_workflow_copilot_chat_message,
     convert_to_workflow_parameter,
+    escape_like_term,
     hydrate_action,
+    summarize_copilot_chat_title,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
@@ -46,6 +50,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
+    WorkflowCopilotChatSummary,
+    WorkflowCopilotCompletionCriteriaSet,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -61,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -520,6 +527,7 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_copilot_chat_id: str,
         sender: WorkflowCopilotChatSender,
         content: str,
+        audio_artifact_id: str | None = None,
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: TurnNarrativePayload | dict[str, Any] | None = None,
@@ -530,6 +538,7 @@ class WorkflowParametersRepository(BaseRepository):
                 organization_id=organization_id,
                 sender=sender,
                 content=content,
+                audio_artifact_id=audio_artifact_id,
                 global_llm_context=global_llm_context,
                 turn_outcome=turn_outcome.model_dump(mode="json") if turn_outcome is not None else None,
                 narrative_payload=narrative_payload,
@@ -591,6 +600,185 @@ class WorkflowParametersRepository(BaseRepository):
                 return None
             return WorkflowCopilotChat.model_validate(chat)
 
+    @db_operation("get_workflow_copilot_chats")
+    async def get_workflow_copilot_chats(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        search: str | None = None,
+    ) -> list[WorkflowCopilotChatSummary]:
+        page = max(page, 1)
+        page_size = max(min(page_size, 100), 1)
+        async with self.Session() as session:
+            # Each chat's first message (earliest created_at) is its title source and proves the
+            # chat is non-empty; DISTINCT ON keeps one opening row per chat.
+            first_message = (
+                select(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.label("chat_id"),
+                    WorkflowCopilotChatMessageModel.content.label("title"),
+                )
+                .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
+                .order_by(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
+                    WorkflowCopilotChatMessageModel.created_at.asc(),
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                )
+                .subquery()
+            )
+            query = (
+                select(WorkflowCopilotChatModel, first_message.c.title)
+                .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
+                .where(WorkflowCopilotChatModel.organization_id == organization_id)
+            )
+            if search and search.strip():
+                # Unindexed substring match over each chat's opening message (one row per chat);
+                # add a pg_trgm index on content if per-org chat counts grow large.
+                escaped = escape_like_term(search.strip())
+                query = query.where(first_message.c.title.ilike(f"%{escaped}%", escape="\\"))
+            query = (
+                query.order_by(WorkflowCopilotChatModel.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            rows = (await session.execute(query)).all()
+
+            workflow_titles: dict[str, str] = {}
+            permanent_ids = {chat.workflow_permanent_id for chat, _ in rows}
+            if permanent_ids:
+                title_rows = (
+                    await session.execute(
+                        select(WorkflowModel.workflow_permanent_id, WorkflowModel.title)
+                        .where(WorkflowModel.organization_id == organization_id)
+                        .where(WorkflowModel.workflow_permanent_id.in_(permanent_ids))
+                        .where(WorkflowModel.deleted_at.is_(None))
+                        .order_by(WorkflowModel.created_at.desc())
+                    )
+                ).all()
+                for permanent_id, title in title_rows:
+                    workflow_titles.setdefault(permanent_id, title)
+
+            return [
+                WorkflowCopilotChatSummary(
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    workflow_permanent_id=chat.workflow_permanent_id,
+                    workflow_title=workflow_titles.get(chat.workflow_permanent_id),
+                    title=summarize_copilot_chat_title(content),
+                    created_at=chat.created_at,
+                    modified_at=chat.modified_at,
+                )
+                for chat, content in rows
+            ]
+
+    @db_operation("get_latest_workflow_copilot_completion_criteria_set")
+    async def get_latest_workflow_copilot_completion_criteria_set(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+    ) -> WorkflowCopilotCompletionCriteriaSet | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotCompletionCriteriaSetModel)
+                .filter(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
+                .filter(WorkflowCopilotCompletionCriteriaSetModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .order_by(WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc())
+                .limit(1)
+            )
+            row = (await session.scalars(query)).first()
+            if not row:
+                return None
+            return WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+
+    @db_operation("create_workflow_copilot_completion_criteria_set")
+    async def create_workflow_copilot_completion_criteria_set(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        goal_epoch: int,
+        criteria: list[dict],
+        source_turn_id: str | None = None,
+        source_goal_text: str | None = None,
+        consecutive_all_no_evidence: int = 0,
+        last_fully_satisfied_workflow_yaml: str | None = None,
+    ) -> WorkflowCopilotCompletionCriteriaSet:
+        async with self.Session() as session:
+            new_set = WorkflowCopilotCompletionCriteriaSetModel(
+                organization_id=organization_id,
+                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                goal_epoch=goal_epoch,
+                status="active",
+                criteria=criteria,
+                source_turn_id=source_turn_id,
+                source_goal_text=source_goal_text,
+                consecutive_all_no_evidence=consecutive_all_no_evidence,
+                tripwire_fired=False,
+                last_fully_satisfied_workflow_yaml=last_fully_satisfied_workflow_yaml,
+            )
+            session.add(new_set)
+            await session.commit()
+            await session.refresh(new_set)
+            return WorkflowCopilotCompletionCriteriaSet.model_validate(new_set)
+
+    @db_operation("supersede_workflow_copilot_completion_criteria_set")
+    async def supersede_workflow_copilot_completion_criteria_set(
+        self,
+        organization_id: str,
+        completion_criteria_set_id: str,
+        supersede_reason: str,
+        superseded_by_set_id: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowCopilotCompletionCriteriaSetModel)
+                    .where(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotCompletionCriteriaSetModel.completion_criteria_set_id
+                        == completion_criteria_set_id
+                    )
+                )
+            ).first()
+            if not row:
+                return
+            row.status = "superseded"
+            row.supersede_reason = supersede_reason
+            row.superseded_by_set_id = superseded_by_set_id
+            row.superseded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            if supersede_reason == "tripwire":
+                row.tripwire_fired = True
+            await session.commit()
+
+    @db_operation("update_workflow_copilot_completion_criteria_set_state")
+    async def update_workflow_copilot_completion_criteria_set_state(
+        self,
+        organization_id: str,
+        completion_criteria_set_id: str,
+        consecutive_all_no_evidence: int | None = None,
+        tripwire_fired: bool | None = None,
+        last_fully_satisfied_workflow_yaml: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowCopilotCompletionCriteriaSetModel)
+                    .where(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotCompletionCriteriaSetModel.completion_criteria_set_id
+                        == completion_criteria_set_id
+                    )
+                )
+            ).first()
+            if not row:
+                return
+            if consecutive_all_no_evidence is not None:
+                row.consecutive_all_no_evidence = consecutive_all_no_evidence
+            if tripwire_fired is not None:
+                row.tripwire_fired = tripwire_fired
+            if last_fully_satisfied_workflow_yaml is not None:
+                row.last_fully_satisfied_workflow_yaml = last_fully_satisfied_workflow_yaml
+            await session.commit()
+
     @db_operation("get_task_generation_by_prompt_hash")
     async def get_task_generation_by_prompt_hash(
         self,
@@ -613,6 +801,8 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("create_action")
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:
+            raw_action_payload = action.model_dump()
+            action_log_payload = redact_action_for_log(action)
             new_action = ActionModel(
                 action_type=action.action_type,
                 source_action_id=action.source_action_id,
@@ -625,12 +815,12 @@ class WorkflowParametersRepository(BaseRepository):
                 status=action.status,
                 reasoning=action.reasoning,
                 intention=action.intention,
-                response=action.response,
+                response=action_log_payload.get("response"),
                 element_id=action.element_id,
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
                 screenshot_artifact_id=action.screenshot_artifact_id,
-                action_json=action.model_dump(),
+                action_json=raw_action_payload,
                 confidence_float=action.confidence_float,
                 created_by=action.created_by,
             )

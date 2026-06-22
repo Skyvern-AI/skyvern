@@ -31,6 +31,7 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
     UpdateBrowserProfileRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import export_profile_storage_id
 from skyvern.forge.sdk.services import org_auth_service
 
 LOG = structlog.get_logger()
@@ -371,6 +372,20 @@ async def delete_browser_profile(
         )
         raise
 
+    # Reap the stored blob so soft-deleted profiles don't leave orphaned S3 objects behind.
+    # Best-effort: the soft-delete already succeeded, so a reap failure must not fail the request.
+    try:
+        await app.STORAGE.delete_browser_profile(
+            organization_id=organization_id,
+            profile_id=profile_id,
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to delete browser profile blob after soft-delete",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+        )
+
     LOG.info(
         "Deleted browser profile",
         organization_id=organization_id,
@@ -396,11 +411,53 @@ async def _create_profile_from_session(
         )
         raise BrowserSessionNotFound(browser_session_id)
 
+    # Read the storage id the session actually exported to: reuse writes back to its bp_, but a fallback
+    # (saved profile failed to load) exported under the session id, so resolve from the loaded profile.
+    loaded_profile_id = browser_session.browser_profile_id if browser_session.browser_profile_loaded else None
+    # Non-None only for a pure-reuse session; it drives the terminal "archive unavailable" error below.
+    reused_profile_id = loaded_profile_id if not browser_session.generate_browser_profile else None
+    source_profile_id = export_profile_storage_id(
+        session_id=browser_session_id,
+        browser_profile_id=loaded_profile_id,
+        generate_browser_profile=browser_session.generate_browser_profile,
+    )
     session_dir = await app.STORAGE.retrieve_browser_profile(
         organization_id=organization_id,
-        profile_id=browser_session_id,
+        profile_id=source_profile_id,
     )
     if not session_dir:
+        # An opted-out session never uploads an archive, so retrying can't help — fail fast with a
+        # distinct message the client can tell apart from the transient "upload not finished yet" case.
+        if not browser_session.should_export_profile():
+            LOG.info(
+                "Browser session was not configured to generate a browser profile",
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "This browser session was not configured to generate a browser profile. "
+                    "Start a session with generate_browser_profile enabled to capture a profile."
+                ),
+            )
+        if reused_profile_id is not None:
+            # A reuse session writes back over its own profile, which already existed before the session, so a
+            # missing archive is terminal (a deleted/absent profile) — retrying can't conjure it.
+            LOG.warning(
+                "Reused browser profile archive not found for profile creation",
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                browser_profile_id=reused_profile_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"This browser session reused profile {reused_profile_id}, whose archive is unavailable. "
+                    "Create a profile from that session's source profile instead, or start a session with "
+                    "generate_browser_profile enabled to capture a new profile."
+                ),
+            )
         LOG.warning(
             "Browser session archive not found for profile creation",
             organization_id=organization_id,
@@ -444,6 +501,22 @@ async def _create_profile_from_session(
             exc_info=True,
         )
         raise
+
+    # The promote copied the session's own export (profiles/{pbs_session}.zip) into the new bp_, so
+    # reap that source now that it's redundant. Keyed on the session id, never a reused bp_ profile.
+    # Best-effort: only after a successful promote, and a reap failure must not fail the request.
+    try:
+        await app.STORAGE.delete_browser_profile(
+            organization_id=organization_id,
+            profile_id=browser_session_id,
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to delete source session profile blob after promote",
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            browser_profile_id=profile.browser_profile_id,
+        )
 
     LOG.info(
         "Created browser profile from session",

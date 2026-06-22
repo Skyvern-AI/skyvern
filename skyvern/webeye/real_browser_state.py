@@ -7,7 +7,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import BrowserContext, Page, Playwright
+from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_PAGE_CLOSE_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
@@ -27,12 +27,26 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
+from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
 
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
+
+
+def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
+    right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
+    return left_url == right_url
 
 
 class RealBrowserState(BrowserState):
@@ -45,6 +59,13 @@ class RealBrowserState(BrowserState):
         browser_cleanup: BrowserCleanupFunc = None,
     ):
         self.__page = page
+        # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
+        # last-page default in get_working_page so multi-tab targeting is deterministic.
+        self.__active_page: Page | None = None
+        # Snapshot of the valid pages present when the active tab was pinned. If a page appears
+        # that was not in this set, a new tab opened and auto-takes focus (legacy behavior),
+        # so the pin is dropped.
+        self.__active_page_known_pages: set[Page] = set()
         self.pw = pw
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
@@ -117,7 +138,7 @@ class RealBrowserState(BrowserState):
             use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
-                if len(pages) > 0:
+                if pages:
                     page = pages[-1]
                     use_existing_page = True
             if page is None:
@@ -127,7 +148,7 @@ class RealBrowserState(BrowserState):
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url and page.url.rstrip("/") != url.rstrip("/"):
+            if url and not _same_page_ignoring_fragment(page.url, url):
                 await self.navigate_to_url(page=page, url=url)
 
     async def _wait_for_settle(self) -> None:
@@ -156,18 +177,31 @@ class RealBrowserState(BrowserState):
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
 
     async def get_working_page(self) -> Page | None:
-        # HACK: currently, assuming the last page is always the working page.
-        # Need to refactor this logic when we want to manipulate multi pages together
-        # TODO: do not use index of pages, it should be more robust if we want to fully support multi pages manipulation
         if self.__page is None or self.browser_context is None:
             return None
 
-        # pick the last and http/https page as the working page
         pages = await self.list_valid_pages()
         if len(pages) == 0:
             LOG.info("No http, https or blank page found in the browser context, return None")
             return None
 
+        # Honor a tab explicitly selected via NEW_TAB/SWITCH_TAB while it is still open and no
+        # new tab has appeared since selection. A newly-opened tab (any page not in the snapshot)
+        # auto-takes focus, preserving the legacy last-page behavior; closing an unrelated tab
+        # does not drop the pin.
+        active_page = self.__active_page
+        if (
+            active_page is not None
+            and not active_page.is_closed()
+            and active_page in pages
+            and all(page in self.__active_page_known_pages for page in pages)
+        ):
+            self.__page = active_page
+            return active_page
+
+        # No (or stale) pin: fall back to the last http/https page as the working page.
+        self.__active_page = None
+        self.__active_page_known_pages = set()
         last_page = pages[-1]
         if self.__page == last_page:
             return self.__page
@@ -243,6 +277,14 @@ class RealBrowserState(BrowserState):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page
+        if page is None:
+            self.__active_page = None
+            self.__active_page_known_pages = set()
+
+    async def set_active_page(self, page: Page) -> None:
+        self.__active_page = page
+        self.__page = page
+        self.__active_page_known_pages = set(await self.list_valid_pages())
 
     async def get_or_create_page(
         self,
@@ -319,6 +361,69 @@ class RealBrowserState(BrowserState):
             )
             page = await self.__assert_page()
         return page
+
+    def is_connected(self) -> bool:
+        # A reused browser state (e.g. a persistent debug session) can have a stopped driver
+        # after a prior owner's cleanup; page.goto then raises "Connection closed while reading
+        # from the driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
+        # _close_was_called, so also inspect the shared driver Connection's closed-error.
+        context = self.browser_context
+        if context is None:
+            return False
+        impl = getattr(context, "_impl_obj", None)
+        if getattr(impl, "_close_was_called", False) is True or getattr(impl, "_closed", False) is True:
+            return False
+        connection = getattr(impl, "_connection", None)
+        if getattr(connection, "_closed_error", None) is not None:
+            return False
+        browser = getattr(context, "browser", None)
+        if browser is None:
+            return True
+        try:
+            return browser.is_connected()
+        except Exception:
+            return False
+
+    async def reconnect(
+        self,
+        proxy_location: ProxyLocationInput = None,
+        workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
+        browser_profile_id: str | None = None,
+    ) -> None:
+        # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
+        # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
+        stale_pw = self.pw
+        self.browser_context = None
+        await self.set_working_page(None)
+        self.pw = await async_playwright().start()
+        try:
+            await self.check_and_fix_state(
+                proxy_location=proxy_location,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
+            )
+        except Exception:
+            # The caller abandons this state on failure, so stop the just-started driver too or it leaks.
+            try:
+                await self.pw.stop()
+            except Exception:
+                LOG.debug("Failed to stop the new Playwright driver after a failed reconnect", exc_info=True)
+            raise
+        finally:
+            try:
+                await stale_pw.stop()
+            except Exception:
+                LOG.debug("Failed to stop the stale Playwright driver during reconnect", exc_info=True)
 
     async def close_current_open_page(self) -> bool:
         try:
@@ -399,7 +504,10 @@ class RealBrowserState(BrowserState):
         max_retries: int = settings.MAX_SCRAPING_RETRIES,
         scrape_exclude: ScrapeExcludeFunc | None = None,
         take_screenshots: bool = True,
-        draw_boxes: bool = True,
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # The parameter is retained for backwards compatibility and is scheduled for removal.
+        # New call sites must not pass ``draw_boxes=True``.
+        draw_boxes: bool = False,
         max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
         support_empty_page: bool = False,
@@ -427,11 +535,13 @@ class RealBrowserState(BrowserState):
         )
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
-        LOG.info("Closing browser state")
+        LOG.info("Closing browser state", sampling=True)
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
                     LOG.info("Closing browser context and its pages")
+                    session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+                    await persist_session_cookies(self.browser_context, session_dir)
                     try:
                         await self.browser_context.close()
                     except Exception:

@@ -1,8 +1,29 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
+import { getClient } from "@/api/AxiosClient";
 import { BrowserIcon } from "@/components/icons/BrowserIcon";
+import { GarbageIcon } from "@/components/icons/GarbageIcon";
+import { SelectionBar } from "@/components/SelectionBar";
+import { SelectionHeaderCheckboxCell } from "@/components/SelectionCheckbox";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useRowSelection } from "@/hooks/useRowSelection";
+import { bulkResultToast } from "@/util/bulkResultToast";
+import {
+  BULK_CONCURRENCY_LIMIT,
+  runWithConcurrency,
+} from "@/util/runWithConcurrency";
 import {
   Pagination,
   PaginationContent,
@@ -79,6 +100,86 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
   const hasSearch = Boolean(searchKey && searchKey.length > 0);
   const showPlaceholderRow = Boolean(activeCreate && page === 1 && !hasSearch);
 
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+  const [isBulkOperating, setIsBulkOperating] = useState(false);
+  const [deleteDialog, setDeleteDialog] = useState<{
+    open: boolean;
+    targets: string[];
+  }>({ open: false, targets: [] });
+
+  // Selection indices must address the same array the table renders; keep one source for both.
+  const pageItems = profiles ?? [];
+
+  const {
+    selected,
+    selectedItems: selectedProfiles,
+    isSelected,
+    allSelected,
+    someSelected,
+    handleSelect,
+    toggleSelectAll,
+    clearSelection,
+    replaceSelection,
+  } = useRowSelection({
+    items: pageItems,
+    getId: (profile) => profile.browser_profile_id,
+    resetKey: JSON.stringify([page, itemsPerPage, searchKey ?? ""]),
+  });
+
+  async function handleBulkDeleteConfirm() {
+    const targets = deleteDialog.targets;
+    if (targets.length === 0) {
+      return;
+    }
+    setIsBulkOperating(true);
+    try {
+      // Browser-profile endpoints live on /v1 (no /api prefix).
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const results = await runWithConcurrency(
+        targets.map(
+          (profileId) => () => client.delete(`/browser_profiles/${profileId}`),
+        ),
+        BULK_CONCURRENCY_LIMIT,
+      );
+      const failedIds = new Set<string>();
+      const succeededIds: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          succeededIds.push(targets[index]!);
+        } else {
+          failedIds.add(targets[index]!);
+        }
+      });
+      bulkResultToast({
+        succeeded: succeededIds.length,
+        total: targets.length,
+        results,
+        successTitle: (n) => `Deleted ${n} profile${n !== 1 ? "s" : ""}.`,
+        failureTitle: (n) =>
+          `Failed to delete ${n} profile${n !== 1 ? "s" : ""}.`,
+        partialTitle: (successCount, failedCount) =>
+          `Deleted ${successCount} profile${successCount !== 1 ? "s" : ""}. ${failedCount} failed.`,
+      });
+      if (failedIds.size === 0) {
+        clearSelection();
+      } else {
+        replaceSelection(failedIds);
+      }
+      if (succeededIds.length > 0) {
+        queryClient.invalidateQueries({ queryKey: ["browserProfiles"] });
+        succeededIds.forEach((profileId) => {
+          queryClient.invalidateQueries({
+            queryKey: ["browserProfile", profileId],
+          });
+        });
+      }
+    } finally {
+      setIsBulkOperating(false);
+      setDeleteDialog({ open: false, targets: [] });
+    }
+  }
+
   if (isLoading) {
     return (
       <div className="space-y-3">
@@ -105,8 +206,6 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
     );
   }
 
-  const pageItems = profiles ?? [];
-
   if (pageItems.length === 0 && page === 1 && !showPlaceholderRow) {
     return (
       <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-neutral-600 dark:text-slate-300">
@@ -132,30 +231,29 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border">
+      <div className="overflow-hidden rounded-lg border border-border">
         <Table className="w-full table-fixed">
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
-            <TableRow>
-              <TableHead className="w-1/4 truncate rounded-tl-lg text-neutral-600 dark:text-slate-400">
-                Name
-              </TableHead>
-              <TableHead className="w-1/3 truncate text-neutral-600 dark:text-slate-400">
-                Description
-              </TableHead>
-              <TableHead className="w-1/6 truncate text-neutral-600 dark:text-slate-400">
-                Source Browser
-              </TableHead>
-              <TableHead className="w-1/6 truncate text-neutral-600 dark:text-slate-400">
-                Created
-              </TableHead>
-              <TableHead className="w-32 truncate rounded-tr-lg text-right text-neutral-600 dark:text-slate-400">
-                Actions
-              </TableHead>
+          <TableHeader>
+            <TableRow className="group/header">
+              <SelectionHeaderCheckboxCell
+                className="w-10"
+                allSelected={allSelected}
+                someSelected={someSelected}
+                hasSelection={selected.size > 0}
+                onToggleAll={toggleSelectAll}
+                ariaLabel="Select all browser profiles"
+              />
+              <TableHead className="w-[20%] truncate">Name</TableHead>
+              <TableHead className="w-[37%] truncate">Description</TableHead>
+              <TableHead className="w-[15%] truncate">Source Browser</TableHead>
+              <TableHead className="w-[15%] truncate">Created</TableHead>
+              <TableHead className="w-32 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {showPlaceholderRow && activeCreate ? (
               <TableRow className="opacity-70">
+                <TableCell />
                 <TableCell className="truncate">
                   <div className="flex min-w-0 items-center gap-2">
                     <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
@@ -178,10 +276,14 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
                 </TableCell>
               </TableRow>
             ) : null}
-            {pageItems.map((profile) => (
+            {pageItems.map((profile, index) => (
               <BrowserProfileItem
                 key={profile.browser_profile_id}
                 profile={profile}
+                index={index}
+                selected={isSelected(profile.browser_profile_id)}
+                hasSelection={selected.size > 0}
+                onSelect={handleSelect}
               />
             ))}
           </TableBody>
@@ -192,7 +294,7 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
               Items per page
             </span>
             <select
-              className="h-9 rounded-md border border-slate-300 bg-background px-3"
+              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
               value={itemsPerPage}
               onChange={(e) => {
                 const next = Number(e.target.value);
@@ -233,6 +335,73 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
           </Pagination>
         </div>
       </div>
+      {selectedProfiles.length > 0 && (
+        <SelectionBar
+          count={selectedProfiles.length}
+          isOperating={isBulkOperating}
+          onClear={clearSelection}
+        >
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            disabled={isBulkOperating}
+            onClick={() =>
+              setDeleteDialog({
+                open: true,
+                targets: selectedProfiles.map(
+                  (profile) => profile.browser_profile_id,
+                ),
+              })
+            }
+          >
+            <GarbageIcon className="mr-1.5 h-4 w-4" />
+            Delete
+          </Button>
+        </SelectionBar>
+      )}
+      <Dialog
+        open={deleteDialog.open}
+        onOpenChange={(open) => {
+          if (!open && !isBulkOperating) {
+            setDeleteDialog({ open: false, targets: [] });
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Delete {deleteDialog.targets.length} Browser Profile
+              {deleteDialog.targets.length === 1 ? "" : "s"}
+            </DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete {deleteDialog.targets.length}{" "}
+              {deleteDialog.targets.length === 1
+                ? "browser profile"
+                : "browser profiles"}
+              ? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="secondary"
+              disabled={isBulkOperating}
+              onClick={() => setDeleteDialog({ open: false, targets: [] })}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={isBulkOperating}
+              onClick={() => {
+                void handleBulkDeleteConfirm();
+              }}
+            >
+              {isBulkOperating ? "Deleting..." : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

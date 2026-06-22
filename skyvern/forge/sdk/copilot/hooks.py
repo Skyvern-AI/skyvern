@@ -12,9 +12,18 @@ from agents.lifecycle import RunHooksBase
 from agents.run_context import RunContextWrapper
 from agents.tool import Tool
 
-from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied, verified_goal_satisfied_context
+from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotGoalSatisfied,
+    gate_decision_trace_fields,
+    outcome_fully_verified,
+)
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
+from skyvern.forge.sdk.copilot.turn_halt import (
+    raise_if_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -33,19 +42,32 @@ _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
         "last_full_workflow_test_ok",
         "last_update_block_count",
         "latest_diagnosis_repair_contract",
+        "completion_verification_result",
         "user_message",
     }
 )
 
 
+def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
+    return {
+        "workflow_permanent_id": getattr(ctx, "workflow_permanent_id", None),
+        "turn_id": getattr(ctx, "turn_id", None),
+        "workflow_copilot_chat_id": getattr(ctx, "workflow_copilot_chat_id", None),
+    }
+
+
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
     if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
         return False
-    if parsed.get("ok") is not True:
-        return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False
-    return verified_goal_satisfied_context(ctx)
+    # An unfinished run (ok != True) can still satisfy the turn when the outcome
+    # judge confirmed the goal from evidence: recognition must not key on run status.
+    if parsed.get("ok") is not True and not outcome_fully_verified(ctx):
+        return False
+    gate_fields = gate_decision_trace_fields(ctx)
+    record_gate_decision(ctx, gate_fields)
+    return gate_fields["gate_satisfied"]
 
 
 class CopilotRunHooks(RunHooksBase):
@@ -76,7 +98,19 @@ class CopilotRunHooks(RunHooksBase):
                 ok=parsed.get("ok"),
                 summary=summary,
                 total_tokens=getattr(self._ctx, "total_tokens_used", None),
+                **_copilot_log_fields(self._ctx),
             )
+
+            if tool_name == "list_credentials" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                listed = data.get("credentials", []) if isinstance(data, dict) else []
+                resolved = [
+                    {"credential_id": c.get("credential_id"), "name": c.get("name")}
+                    for c in listed
+                    if isinstance(c, dict) and isinstance(c.get("credential_id"), str)
+                ]
+                if resolved:
+                    activity_entry["credentials"] = resolved
 
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
@@ -99,9 +133,17 @@ class CopilotRunHooks(RunHooksBase):
             LOG.warning(
                 "CopilotRunHooks.on_tool_end recording failed, skipping entry",
                 tool=getattr(tool, "name", None),
+                **_copilot_log_fields(self._ctx),
                 exc_info=True,
             )
             return
+
+        stash_turn_halt_from_blocker_signal(
+            self._ctx,
+            getattr(self._ctx, "latest_tool_blocker_signal", None) or getattr(self._ctx, "blocker_signal", None),
+            source="hook",
+        )
+        raise_if_turn_halt(self._ctx)
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
             LOG.info(
@@ -110,5 +152,8 @@ class CopilotRunHooks(RunHooksBase):
                 workflow_run_id=(parsed.get("data") or {}).get("workflow_run_id")
                 if isinstance(parsed.get("data"), dict)
                 else None,
+                **_copilot_log_fields(self._ctx),
             )
+            self._ctx.goal_satisfied_tool_name = tool_name
+            self._ctx.goal_satisfied_tool_output = dict(parsed)
             raise CopilotGoalSatisfied()

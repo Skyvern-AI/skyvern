@@ -14,6 +14,7 @@ import type {
   WorkflowRunTimelineBlockItem as TimelineBlockItem,
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
+import type { CodeBlockStep } from "../types/workflowTypes";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
 
 function buildBlock(
@@ -148,11 +149,11 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.queryByText("0 actions")).toBeNull();
   });
 
-  it("renders action rows under a leaf block and lets the user select an action", () => {
+  it("renders action rows under a code block and lets the user select an action", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({
       workflow_run_block_id: "wrb_action_block",
-      block_type: "task_v2",
+      block_type: "code",
       label: "Open account page",
       actions: [
         {
@@ -203,7 +204,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     });
   });
 
-  it("renders action rows under a container block without requiring expansion", () => {
+  it("renders child blocks and action rows under a non-code container block", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_container_with_actions",
       block_type: "conditional",
@@ -235,23 +236,24 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
+    expect(screen.getByText("Next step")).toBeDefined();
     expect(
       screen.getByText(/Extract the condition result from the page/),
     ).toBeDefined();
   });
 
-  it("renders extract action rows for conditional blocks", () => {
+  it("renders action rows under a non-code leaf block and lets the user select an action", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({
-      workflow_run_block_id: "wrb_condition_action",
-      block_type: "conditional",
-      label: "check_signin_ok",
+      workflow_run_block_id: "wrb_login_actions",
+      block_type: "login",
+      label: "block_1",
       actions: [
         {
-          action_id: "act_condition_extract",
-          action_type: ActionTypes.extract,
+          action_id: "act_login_click",
+          action_type: ActionTypes.Click,
           status: Status.Completed,
-          reasoning: "Extract whether sign-in succeeded from the page",
+          reasoning: "Click the login link in the top navigation",
           created_by: null,
           confidence_float: 1,
         },
@@ -269,16 +271,15 @@ describe("WorkflowRunTimelineBlockItem", () => {
     );
 
     expect(screen.getByText("1 action")).toBeDefined();
-    expect(screen.getByText("Extract Data")).toBeDefined();
     expect(
-      screen.getByText(/Extract whether sign-in succeeded from the page/),
+      screen.getByText(/Click the login link in the top navigation/),
     ).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: /#1/i }));
 
     expect(onActionClick).toHaveBeenCalledWith({
       block,
-      action: expect.objectContaining({ action_id: "act_condition_extract" }),
+      action: expect.objectContaining({ action_id: "act_login_click" }),
     });
   });
 
@@ -354,6 +355,192 @@ describe("WorkflowRunTimelineBlockItem", () => {
     );
   });
 
+  it("appends code line and duration to recorded action summaries in code blocks", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code",
+      block_type: "code",
+      label: "run_script",
+      actions: [
+        // Newest-first payload, matching the task-action DESC convention.
+        {
+          action_id: "wrb_code_action_1",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: null,
+          description: "locator.click #submit",
+          output: { code_line: 3, duration_ms: 1500 },
+          created_by: null,
+          confidence_float: null,
+        },
+        {
+          action_id: "wrb_code_action_0",
+          action_type: ActionTypes.GotoUrl,
+          status: Status.Completed,
+          reasoning: null,
+          description: "page.goto https://example.com",
+          output: { code_line: 1, duration_ms: 65000 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    const gotoRow = screen.getByText(
+      /page\.goto https:\/\/example\.com · line 1 · 1m 5s/,
+    );
+    const clickRow = screen.getByText(
+      /locator\.click #submit · line 3 · 1\.5s/,
+    );
+    expect(
+      gotoRow.compareDocumentPosition(clickRow) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("labels a recorded page.evaluate action as Execute JS instead of a blank badge", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_eval",
+      block_type: "code",
+      label: "run_script",
+      actions: [
+        {
+          action_id: "wrb_code_eval_action_0",
+          action_type: "execute_js",
+          status: Status.Completed,
+          reasoning: null,
+          description: "page.evaluate () => document.title",
+          output: { code_line: 3, duration_ms: 800 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Execute JS")).toBeDefined();
+  });
+
+  it("humanizes an unmapped recorded action type rather than rendering a blank badge", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_unmapped",
+      block_type: "code",
+      label: "run_script",
+      actions: [
+        {
+          action_id: "wrb_code_unmapped_action_0",
+          action_type: "go_forward",
+          status: Status.Completed,
+          reasoning: null,
+          description: "page.go_forward",
+          output: { code_line: 2, duration_ms: 100 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Go Forward")).toBeDefined();
+  });
+
+  it("labels the synthetic code error row as Error instead of Screenshot", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_failed",
+      block_type: "code",
+      label: "run_script",
+      status: Status.Failed,
+      actions: [
+        {
+          action_id: "wrb_code_failed_action_0",
+          action_type: ActionTypes.NullAction,
+          status: Status.Failed,
+          reasoning: null,
+          description: "code error at line 7",
+          response: "ValueError: boom",
+          output: { code_line: 7 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Error")).toBeDefined();
+    expect(screen.queryByText("Screenshot")).toBeNull();
+    expect(screen.getByText(/ValueError: boom · line 7/)).toBeDefined();
+  });
+
+  it("renders non-code action rows without code line metadata", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_task_null_action",
+      block_type: "task_v2",
+      label: "Capture page",
+      actions: [
+        {
+          action_id: "act_screenshot",
+          action_type: ActionTypes.NullAction,
+          status: Status.Failed,
+          reasoning: "Capture failed",
+          output: { code_line: 5, duration_ms: 2000 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Screenshot")).toBeDefined();
+    expect(screen.queryByText("Error")).toBeNull();
+    expect(screen.getByText(/Capture failed/)).toBeDefined();
+    expect(screen.queryByText(/line 5/)).toBeNull();
+  });
+
   it("keeps an iteration collapsed after the user clicks the chevron, even when an active descendant appears", () => {
     // Render an expanded iteration (groupIndex 0 default-opens), then user
     // collapses via chevron. Re-render the same component with an active
@@ -407,5 +594,112 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(
       screen.getByRole("button", { name: /expand iteration/i }),
     ).toBeDefined();
+  });
+
+  it("renders the code block step outline when the block has no recorded actions", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_outline",
+      block_type: "code",
+      label: "run_script",
+      actions: [],
+    });
+    const steps: Array<CodeBlockStep> = [
+      {
+        action_type: "goto",
+        title: "Open the homepage",
+        line_start: 1,
+        line_end: 1,
+      },
+      {
+        action_type: "click",
+        description: "Click the top post",
+        line_start: 3,
+        line_end: 5,
+      },
+    ];
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        codeStepsByLabel={new Map([["run_script", steps]])}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText(/Open the homepage/)).toBeDefined();
+    expect(screen.getByText(/Click the top post/)).toBeDefined();
+    expect(screen.getByText("goto")).toBeDefined();
+    expect(screen.getByText("click")).toBeDefined();
+    expect(screen.getByText("L1")).toBeDefined();
+    expect(screen.getByText("L3-5")).toBeDefined();
+  });
+
+  it("selects the block when a code step row is clicked", () => {
+    const onBlockItemClick = vi.fn();
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_outline_click",
+      block_type: "code",
+      label: "run_script",
+      actions: [],
+    });
+    const steps: Array<CodeBlockStep> = [
+      { action_type: "goto", title: "Open the homepage", line_start: 1 },
+    ];
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        codeStepsByLabel={new Map([["run_script", steps]])}
+        onActionClick={noop}
+        onBlockItemClick={onBlockItemClick}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/Open the homepage/));
+    expect(onBlockItemClick).toHaveBeenCalledWith(block);
+  });
+
+  it("prefers recorded actions over the step outline for code blocks", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_code_actions_win",
+      block_type: "code",
+      label: "run_script",
+      actions: [
+        {
+          action_id: "wrb_code_action_0",
+          action_type: ActionTypes.GotoUrl,
+          status: Status.Completed,
+          reasoning: null,
+          description: "page.goto https://example.com",
+          output: { code_line: 1, duration_ms: 500 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+    const steps: Array<CodeBlockStep> = [
+      { action_type: "goto", title: "Outline step that should be hidden" },
+    ];
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        codeStepsByLabel={new Map([["run_script", steps]])}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(
+      screen.getByText(/page\.goto https:\/\/example\.com · line 1/),
+    ).toBeDefined();
+    expect(screen.queryByText("Outline step that should be hidden")).toBeNull();
   });
 });

@@ -84,16 +84,22 @@ async def verify_browser_session(
             browser_address = ""
         else:
             LOG.info(
-                "Waiting for browser session address.",
+                "Checking browser session address readiness.",
                 browser_session_id=browser_session_id,
                 organization_id=organization_id,
             )
 
             try:
-                browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
-                    session_id=browser_session_id,
-                    organization_id=organization_id,
-                )
+                if settings.ENV == "local":
+                    browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address_if_ready(
+                        session_id=browser_session_id,
+                        organization_id=organization_id,
+                    )
+                else:
+                    browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+                        session_id=browser_session_id,
+                        organization_id=organization_id,
+                    )
             except Exception as ex:
                 LOG.info(
                     "Browser session address not found for browser session.",
@@ -101,6 +107,8 @@ async def verify_browser_session(
                     organization_id=organization_id,
                     ex=ex,
                 )
+                return None
+            if not browser_address:
                 return None
 
     try:

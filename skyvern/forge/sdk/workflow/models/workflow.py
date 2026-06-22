@@ -1,8 +1,8 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, List
+from typing import Any, List, Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -16,7 +16,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -36,7 +36,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
-    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
@@ -66,6 +66,16 @@ class WorkflowRequestBody(BaseModel):
 class RunWorkflowResponse(BaseModel):
     workflow_id: str
     workflow_run_id: str
+
+    @computed_field(description="Alias of `workflow_id` (the agent's `wpid_` permanent ID).")  # type: ignore[prop-decorator]
+    @property
+    def agent_id(self) -> str:
+        return self.workflow_id
+
+    @computed_field(description="Alias of `workflow_run_id`.")  # type: ignore[prop-decorator]
+    @property
+    def agent_run_id(self) -> str:
+        return self.workflow_run_id
 
 
 class WorkflowDefinition(BaseModel):
@@ -110,6 +120,14 @@ class Workflow(BaseModel):
     title: str
     workflow_permanent_id: str
     version: int
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description="Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`)."
+    )
+    @property
+    def agent_id(self) -> str:
+        return self.workflow_permanent_id
+
     is_saved_task: bool
     is_template: bool = False
     description: str | None = None
@@ -308,11 +326,23 @@ class WorkflowRunOutputParameter(BaseModel):
 class WorkflowRunResponseBase(BaseModel):
     workflow_id: str
     workflow_run_id: str
+
+    @computed_field(description="Alias of `workflow_id` (the agent's `wpid_` permanent ID).")  # type: ignore[prop-decorator]
+    @property
+    def agent_id(self) -> str:
+        return self.workflow_id
+
+    @computed_field(description="Alias of `workflow_run_id`.")  # type: ignore[prop-decorator]
+    @property
+    def agent_run_id(self) -> str:
+        return self.workflow_run_id
+
     status: WorkflowRunStatus
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
+    webhook_delivery_status: Literal["pending", "failed"] | None = None
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
@@ -334,8 +364,11 @@ class WorkflowRunResponseBase(BaseModel):
     total_steps: int | None = None
     total_cost: float | None = Field(
         default=None,
-        deprecated=True,
-        description="Deprecated. Public workflow-run responses no longer expose cost; use credits_used fields instead.",
+        description=(
+            "Estimated workflow-run cost as the list-price value of credits consumed "
+            "(credits x list credit rate), not the amount invoiced; enterprise contract "
+            "pricing and legacy billing may differ. Null when cost is unavailable."
+        ),
     )
     credits_used: int = 0
     cached_credits_used: int = 0

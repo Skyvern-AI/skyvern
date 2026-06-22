@@ -29,8 +29,11 @@ if TYPE_CHECKING:
     from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 
-def _get_browser_session_url(browser_session_id: str) -> str:
-    return f"https://app.skyvern.com/browser-session/{browser_session_id}"
+def _get_browser_session_url(browser_session: BrowserSessionResponse) -> str:
+    """Return the app URL for a browser session, using the server-provided URL when available."""
+    if browser_session.app_url:
+        return browser_session.app_url
+    return f"https://app.skyvern.com/browser-session/{browser_session.browser_session_id}"
 
 
 class Skyvern(AsyncSkyvern):
@@ -539,7 +542,7 @@ class Skyvern(AsyncSkyvern):
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(
                 "Connecting to existing cloud browser session",
-                url=_get_browser_session_url(browser_session.browser_session_id),
+                url=_get_browser_session_url(browser_session),
             )
         else:
             LOG.info(
@@ -579,7 +582,7 @@ class Skyvern(AsyncSkyvern):
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(
                 "Launched new cloud browser session",
-                url=_get_browser_session_url(browser_session.browser_session_id),
+                url=_get_browser_session_url(browser_session),
             )
         else:
             LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
@@ -623,7 +626,7 @@ class Skyvern(AsyncSkyvern):
             if self._environment == SkyvernEnvironment.CLOUD:
                 LOG.info(
                     "Launched new cloud browser session",
-                    url=_get_browser_session_url(browser_session.browser_session_id),
+                    url=_get_browser_session_url(browser_session),
                 )
             else:
                 LOG.info("Launched new cloud browser session", browser_session_id=browser_session.browser_session_id)
@@ -631,7 +634,7 @@ class Skyvern(AsyncSkyvern):
             if self._environment == SkyvernEnvironment.CLOUD:
                 LOG.info(
                     "Reusing existing cloud browser session",
-                    url=_get_browser_session_url(browser_session.browser_session_id),
+                    url=_get_browser_session_url(browser_session),
                 )
             else:
                 LOG.info(

@@ -18,6 +18,10 @@ describe("blockTypeFromNode", () => {
     );
   });
 
+  it("maps pdfFill to pdf_fill", () => {
+    expect(blockTypeFromNode({ type: "pdfFill" })).toBe("pdf_fill");
+  });
+
   it("maps url to goto_url", () => {
     expect(blockTypeFromNode({ type: "url" })).toBe("goto_url");
   });

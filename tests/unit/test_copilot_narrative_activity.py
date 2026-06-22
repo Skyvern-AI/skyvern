@@ -38,9 +38,10 @@ def test_tool_call_activity_shape_and_denylist() -> None:
     entry = build_tool_call_activity("update_workflow", 3, "abc")
     assert entry == {
         "kind": "tool_call",
-        "text": "Calling update_workflow…",
+        "text": "Updating workflow…",
         "iteration": 3,
         "toolName": "update_workflow",
+        "displayLabel": "Updating workflow",
         "id": "tc-abc",
     }
     assert "success" not in entry
@@ -54,10 +55,11 @@ def test_tool_result_activity_shape_falls_back_to_tool_name_and_denylist() -> No
         "text": "Updated 2 blocks",
         "iteration": 4,
         "toolName": "update_workflow",
+        "displayLabel": "Updating workflow",
         "success": True,
         "id": "tr-abc",
     }
-    assert build_tool_result_activity("update_workflow", "", False, 4, "abc")["text"] == "update_workflow"
+    assert build_tool_result_activity("update_workflow", "", False, 4, "abc")["text"] == "Updating workflow"
     assert build_tool_result_activity("get_browser_screenshot", "s", True, 0, "x") is None
     assert build_tool_result_activity("get_run_results", "s", True, 0, "x") is None
 
@@ -71,6 +73,15 @@ def test_narration_activity_shape() -> None:
         "id": "n-5-2026-01-01T00:00:00+00:00",
     }
     assert "toolName" not in entry
+
+
+def test_emitted_progress_texts_is_a_fresh_per_state_set() -> None:
+    # NarratorState is born and dies with one turn's CopilotContext, so the
+    # set is per-turn by construction (no cross-turn leakage between states).
+    first = NarratorState()
+    first.emitted_progress_texts.add("Refining the workflow's code")
+    second = NarratorState()
+    assert second.emitted_progress_texts == set()
 
 
 def test_record_activity_routes_to_design_when_no_block_running() -> None:
@@ -142,6 +153,7 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
             "text": "ran step_1",
             "iteration": 1,
             "toolName": "run_blocks_and_collect_debug",
+            "displayLabel": "Testing workflow",
             "success": True,
             "id": "tr-c1",
         }

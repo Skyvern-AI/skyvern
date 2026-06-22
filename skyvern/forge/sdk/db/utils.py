@@ -89,11 +89,13 @@ from skyvern.webeye.actions.actions import (
     KeypressAction,
     LeftMouseAction,
     MoveAction,
+    NewTabAction,
     NullAction,
     ReloadPageAction,
     ScrollAction,
     SelectOptionAction,
     SolveCaptchaAction,
+    SwitchTabAction,
     TerminateAction,
     UploadFileAction,
     VerificationCodeAction,
@@ -104,6 +106,19 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 
 LOG = structlog.get_logger()
+
+
+def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
+    # Collapse the opening message to one line so multi-line prompts read cleanly in the history dropdown.
+    collapsed = " ".join(content.split())
+    if len(collapsed) <= max_length:
+        return collapsed
+    return collapsed[: max_length - 1].rstrip() + "…"
+
+
+def escape_like_term(term: str) -> str:
+    # Escape SQL LIKE metacharacters so user input matches literally; pair with ilike(escape="\\").
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def nullable_column_equals(column: Any, value: Any) -> Any:
@@ -223,6 +238,8 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
     ActionType.RELOAD_PAGE: ReloadPageAction,
     ActionType.CLOSE_PAGE: ClosePageAction,
+    ActionType.NEW_TAB: NewTabAction,
+    ActionType.SWITCH_TAB: SwitchTabAction,
     ActionType.EXTRACT: ExtractAction,
     ActionType.SCROLL: ScrollAction,
     ActionType.KEYPRESS: KeypressAction,
@@ -387,6 +404,7 @@ def convert_to_workflow_copilot_chat_message(
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
         sender=message_model.sender,
         content=message_model.content,
+        audio_artifact_id=message_model.audio_artifact_id,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,
@@ -781,6 +799,14 @@ def convert_to_workflow_run_parameter(
     )
 
 
+def downloaded_file_count_from_output(output: dict | list | str | None) -> int | None:
+    if isinstance(output, dict):
+        downloaded_files = output.get("downloaded_files")
+        if isinstance(downloaded_files, list):
+            return len(downloaded_files)
+    return None
+
+
 def convert_to_workflow_run_block(
     workflow_run_block_model: WorkflowRunBlockModel,
     task: Task | None = None,
@@ -820,6 +846,7 @@ def convert_to_workflow_run_block(
         script_run=ScriptRunResponse.model_validate(workflow_run_block_model.script_run)
         if workflow_run_block_model.script_run
         else None,
+        downloaded_file_count=workflow_run_block_model.downloaded_file_count,
     )
     if task:
         if task.finished_at and task.started_at:

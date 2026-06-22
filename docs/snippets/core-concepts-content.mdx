@@ -38,7 +38,7 @@ Tasks are best for one-off automations, quick data extraction, and prototyping. 
     Write multi-step automations in Python or TypeScript with full Playwright control. Version, test, and deploy automation code like any other software.
   </Card>
   <Card
-    title="Workflows (Visual)"
+    title="Agents (Visual)"
     href="#workflows"
   >
     Build multi-step automations visually in the Cloud UI with drag-and-drop blocks. No code required. Share templates across your team.
@@ -110,9 +110,9 @@ Agents are useful when you want to mix precise Playwright control with open-ende
 Full method reference: [Page](/sdk-reference/browser-automation/act), [Agent](/sdk-reference/browser-automation/agent-run-task), [Browser](/sdk-reference/browser-automation/launch-cloud-browser). Developer guide: [Multi-Step Automations](/developers/browser-automations/overview).
 </Note>
 
-## Workflows
+## Agents
 
-A Workflow is a reusable automation template built in the [Cloud UI workflow editor](/cloud/building-workflows/build-a-workflow). You drag and drop blocks onto a canvas, wire them together, and save. Workflows can be versioned, shared across your team, scheduled on a cron, and run repeatedly with different parameters.
+An Agent is a reusable automation template built in the [Cloud UI agent editor](/cloud/building-agents/build-an-agent). You drag and drop blocks onto a canvas, wire them together, and save. Agents can be versioned, shared across your team, scheduled on a cron, and run repeatedly with different parameters.
 
 ```mermaid
 flowchart LR
@@ -131,15 +131,15 @@ flowchart LR
 
 Each block can reference outputs from previous blocks using Jinja templating: `{{search_query}}` for parameters, `{{extract_block.product_name}}` for upstream block outputs.
 
-Workflows are the right choice when you want no-code automation, team-shared templates, scheduled recurring jobs, or visual drag-and-drop logic.
+Agents are the right choice when you want no-code automation, team-shared templates, scheduled recurring jobs, or visual drag-and-drop logic.
 
 <Tip>
-**Building workflows?** See the [Workflow Editor guide](/cloud/building-workflows/build-a-workflow). **Need to trigger a workflow from code?** See [Run from Code](/cloud/building-workflows/run-from-code) in the Cloud UI docs.
+**Building agents?** See the [Agent Editor guide](/cloud/building-agents/build-an-agent). **Need to trigger an agent from code?** See [Run from Code](/cloud/building-agents/run-from-code) in the Cloud UI docs.
 </Tip>
 
 ### Blocks
 
-Blocks are the building units of workflows. Each block performs one operation.
+Blocks are the building units of agents. Each block performs one operation.
 
 **Navigation and interaction:** Navigate (AI-guided navigation toward a goal), Action (click, type, select, upload), Go to URL (direct navigation), Login (authenticate with stored credentials), Wait (pause for a duration), and Human Interaction (pause for manual intervention).
 
@@ -149,11 +149,11 @@ Blocks are the building units of workflows. Each block performs one operation.
 
 **Communication:** HTTP Request (external API calls), Text Prompt (text-only LLM prompt, no browser), and Send Email.
 
-For detailed block configuration, see [Block Types and Configuration](/cloud/building-workflows/configure-blocks).
+For detailed block configuration, see [Block Types and Configuration](/cloud/building-agents/configure-blocks).
 
 ## Runs
 
-Every time you execute a task or kick off a workflow, Skyvern creates a Run to track progress and store outputs. A run moves through a lifecycle:
+Every time you execute a task or kick off an agent, Skyvern creates a Run to track progress and store outputs. A run moves through a lifecycle:
 
 ```mermaid
 flowchart LR
@@ -184,7 +184,7 @@ You're billed per step. A step is one AI decision + action cycle. Use `max_steps
 
 ## Schedules
 
-A Schedule runs a workflow automatically on a recurring basis. You define a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+A Schedule runs an agent automatically on a recurring basis. You define a cron expression and timezone, and Skyvern triggers the agent at each interval.
 
 <CodeGroup>
 ```python Python
@@ -281,7 +281,7 @@ See [Browser Sessions](/developers/optimization/browser-sessions) for details.
 
 ## Artifacts
 
-Every run generates artifacts for observability, debugging, and audit trails: end-to-end video recordings, screenshots captured after each action, downloaded files, JSON-structured logs at step/task/workflow levels, and HAR files for network debugging.
+Every run generates artifacts for observability, debugging, and audit trails: end-to-end video recordings, screenshots captured after each action, downloaded files, JSON-structured logs at step/task/agent levels, and HAR files for network debugging.
 
 ```python
 result = await skyvern.run_task(
@@ -298,7 +298,7 @@ In the Skyvern UI, go to **Runs**, click a run, and view the **Actions** and **R
 
 ## Engines
 
-Skyvern supports multiple AI engines. `skyvern-1.0` is the default for the Cloud UI and SDK. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. Other options include `openai-cua` (OpenAI Computer Use Agent), `anthropic-cua` (Anthropic Computer Use Agent), and `ui-tars`.
+Skyvern supports multiple AI engines. `skyvern-1.0` is the default for the Cloud UI and SDK. `skyvern-2.0` remains available for existing V2 agents and explicitly requested V2 task runs. Other options include `openai-cua` (OpenAI Computer Use Agent), `anthropic-cua` (Anthropic Computer Use Agent), and `ui-tars`.
 
 ```python
 from skyvern.schemas.runs import RunEngine
@@ -316,8 +316,8 @@ result = await skyvern.run_task(
 |--------------|-----|
 | Run a one-off automation | [Task](#tasks) |
 | Build multi-step automation in code | [Browser Automation](#browser-automation) |
-| Build multi-step automation visually | [Workflow](#workflows) |
-| Trigger a UI-built workflow from code | [Run from Code](/cloud/building-workflows/run-from-code) |
+| Build multi-step automation visually | [Agent](#workflows) |
+| Trigger a UI-built agent from code | [Run from Code](/cloud/building-agents/run-from-code) |
 | Keep a browser open between operations | [Browser Session](#browser-sessions-and-profiles) |
 | Skip login on repeated runs | [Browser Profile](#browser-sessions-and-profiles) |
 | Store secrets securely | [Credentials](#credentials) |
@@ -330,7 +330,7 @@ result = await skyvern.run_task(
     title="Use the dashboard"
     href="/cloud/getting-started/overview"
   >
-    Run tasks, build workflows visually, and monitor runs. No code required.
+    Run tasks, build agents visually, and monitor runs. No code required.
   </Card>
   <Card
     title="Build with the API"

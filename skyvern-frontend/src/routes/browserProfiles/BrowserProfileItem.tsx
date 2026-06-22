@@ -3,6 +3,7 @@ import { Pencil1Icon } from "@radix-ui/react-icons";
 import { useNavigate } from "react-router-dom";
 
 import { BrowserProfileApiResponse } from "@/api/types";
+import { SelectionCheckboxCell } from "@/components/SelectionCheckbox";
 import { Button } from "@/components/ui/button";
 import { TableCell, TableRow } from "@/components/ui/table";
 import {
@@ -11,16 +12,26 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 
 import { DeleteBrowserProfileButton } from "./DeleteBrowserProfileButton";
 import { RenameBrowserProfileDialog } from "./RenameBrowserProfileDialog";
 
 type Props = {
   profile: BrowserProfileApiResponse;
+  index?: number;
+  selected?: boolean;
+  hasSelection?: boolean;
+  onSelect?: (index: number, shiftKey: boolean) => void;
 };
 
-function BrowserProfileItem({ profile }: Props) {
+function BrowserProfileItem({
+  profile,
+  index = -1,
+  selected = false,
+  hasSelection = false,
+  onSelect,
+}: Props) {
   const navigate = useNavigate();
   const [renameOpen, setRenameOpen] = useState(false);
 
@@ -42,27 +53,37 @@ function BrowserProfileItem({ profile }: Props) {
 
   return (
     <TableRow
-      className="cursor-pointer hover:bg-slate-elevation2"
+      className="group/row cursor-pointer"
+      data-state={selected ? "selected" : undefined}
       onClick={handleRowClick}
     >
+      {onSelect && (
+        <SelectionCheckboxCell
+          index={index}
+          checked={selected}
+          hasSelection={hasSelection}
+          onSelect={onSelect}
+          ariaLabel={`Select ${profile.name}`}
+        />
+      )}
       <TableCell className="truncate">
         <span title={profile.name}>{profile.name}</span>
       </TableCell>
-      <TableCell className="truncate text-neutral-600 dark:text-slate-400">
+      <TableCell className="truncate text-muted-foreground">
         {profile.description ? (
           <span title={profile.description}>{profile.description}</span>
         ) : (
           <span className="opacity-50">—</span>
         )}
       </TableCell>
-      <TableCell className="truncate text-neutral-600 dark:text-slate-400">
+      <TableCell className="truncate text-muted-foreground">
         {profile.source_browser_type ?? <span className="opacity-50">—</span>}
       </TableCell>
       <TableCell
-        className="text-neutral-600 dark:text-slate-400"
+        className="text-muted-foreground"
         title={basicTimeFormat(profile.created_at)}
       >
-        {basicLocalTimeFormat(profile.created_at)}
+        {compactLocalDateTime(profile.created_at)}
       </TableCell>
       <TableCell onClick={stopRowClick}>
         <div className="flex justify-end gap-2">
@@ -71,9 +92,10 @@ function BrowserProfileItem({ profile }: Props) {
               <TooltipTrigger asChild>
                 <Button
                   size="icon"
-                  variant="outline"
+                  variant="ghost"
                   onClick={() => setRenameOpen(true)}
                   aria-label="Rename browser profile"
+                  className="text-muted-foreground hover:text-foreground"
                 >
                   <Pencil1Icon className="h-4 w-4" />
                 </Button>

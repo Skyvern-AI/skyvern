@@ -61,7 +61,7 @@ def test_is_localhost_url_handles_garbage_input() -> None:
 @pytest.mark.asyncio
 async def test_navigate_rejects_localhost_on_cloud_session(monkeypatch: pytest.MonkeyPatch) -> None:
     page = object()
-    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
 
     result = await mcp_browser.skyvern_navigate(url="http://localhost:3000")
@@ -75,7 +75,7 @@ async def test_navigate_rejects_localhost_on_cloud_session(monkeypatch: pytest.M
 @pytest.mark.asyncio
 async def test_navigate_rejects_127_0_0_1_on_cloud_session(monkeypatch: pytest.MonkeyPatch) -> None:
     page = object()
-    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
 
     result = await mcp_browser.skyvern_navigate(url="http://127.0.0.1:5173/dashboard")
@@ -118,6 +118,39 @@ async def test_navigate_allows_localhost_on_cdp_session(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_navigate_attempts_localhost_when_cloud_session_can_access_localhost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = AsyncMock()
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=True)
+    do_navigate = AsyncMock(return_value=AsyncMock(url="http://localhost:3000", title="App"))
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    monkeypatch.setattr(mcp_browser, "do_navigate", do_navigate)
+
+    result = await mcp_browser.skyvern_navigate(url="http://localhost:3000")
+
+    assert result["ok"] is True
+    do_navigate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_navigate_unknown_localhost_reachability_reports_real_navigation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = AsyncMock()
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=RuntimeError("connection refused")))
+
+    result = await mcp_browser.skyvern_navigate(url="http://localhost:3000")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["message"] == "connection refused"
+    assert result["error"]["message"] != "Cloud browsers cannot reach localhost URLs"
+
+
+@pytest.mark.asyncio
 async def test_navigate_allows_public_url_on_cloud_session(monkeypatch: pytest.MonkeyPatch) -> None:
     page = AsyncMock()
     ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
@@ -141,7 +174,7 @@ async def test_navigate_allows_public_url_on_cloud_session(monkeypatch: pytest.M
 @pytest.mark.asyncio
 async def test_run_task_rejects_localhost_on_cloud_session(monkeypatch: pytest.MonkeyPatch) -> None:
     page = object()
-    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
 
     result = await mcp_browser.skyvern_run_task(
@@ -153,6 +186,31 @@ async def test_run_task_rejects_localhost_on_cloud_session(monkeypatch: pytest.M
     assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
     assert "localhost" in result["error"]["message"].lower()
     assert "skyvern browser serve --tunnel" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_run_task_attempts_localhost_when_cloud_session_can_access_localhost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = AsyncMock()
+    page.agent = AsyncMock()
+    page.agent.run_task = AsyncMock(
+        return_value=AsyncMock(
+            run_id="r_1",
+            status="completed",
+            output=None,
+            failure_reason=None,
+            recording_url=None,
+            app_url=None,
+        )
+    )
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=True)
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+    result = await mcp_browser.skyvern_run_task(prompt="Extract the page title", url="http://localhost:5173")
+
+    assert result["ok"] is True
+    page.agent.run_task.assert_awaited_once()
 
 
 @pytest.mark.asyncio

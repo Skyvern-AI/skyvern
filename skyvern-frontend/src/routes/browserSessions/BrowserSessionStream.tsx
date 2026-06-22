@@ -13,6 +13,7 @@ import {
   isTerminalStreamStatus,
   shouldReconnectStream,
 } from "./BrowserSessionStream.utils";
+import { useSettingsStore } from "@/store/SettingsStore";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -25,9 +26,9 @@ type StreamMessage = {
 };
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
-  title: "Starting local browser stream",
-  detail:
-    "Opening the stream WebSocket and waiting for the first browser frame.",
+  title: "Waking up your local browser",
+  detail: "Opening the stream and waiting for the first frame...",
+  pending: true,
 };
 
 function diagnosticForReconnectExhausted(): StreamDiagnostic {
@@ -42,28 +43,28 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
   switch (status) {
     case "not_found":
       return {
-        title: "Browser session not found",
-        detail:
-          "The backend could not find this browser session for the current organization.",
-        hint: "Refresh the page or create a new browser session.",
+        title: "We've misplaced this browser session",
+        detail: "The backend can't find it for your org.",
+        hint: "Refresh the page or spin up a fresh browser session.",
       };
     case "timeout":
       return {
-        title: "Timed out waiting for browser state",
+        title: "The browser's gone strangely quiet",
         detail:
-          "The stream connected, but the backend did not find an active page to screencast.",
+          "The stream connected, but no active page showed up to screencast.",
         hint: "Check backend logs for browser launch errors and verify BROWSER_STREAMING_MODE=cdp.",
       };
     case "completed":
     case "failed":
       return {
-        title: "Browser session is no longer live",
-        detail: `The browser session status is ${status}.`,
+        title: "This browser session has wandered off",
+        detail: `It's no longer live — status: ${status}.`,
       };
     default:
       return {
         title: "Waiting for browser frames",
         detail: `The stream is connected and the session status is ${status}.`,
+        pending: true,
       };
   }
 }
@@ -71,21 +72,21 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
 function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
   if (event.code === 4001 || event.reason === "use-vnc-streaming") {
     return {
-      title: "Backend is using VNC streaming",
+      title: "Backend wants to use VNC streaming",
       detail:
-        "The UI tried local browser streaming, but the backend closed the stream with use-vnc-streaming.",
+        "The UI tried local browser streaming, but the backend asked for VNC instead.",
       hint: "Check BROWSER_STREAMING_MODE on the backend and the runtime config response.",
     };
   }
   if (event.code === 1006) {
     return {
-      title: "Stream connection dropped",
+      title: "The connection slipped away",
       detail: "The browser stream WebSocket closed before sending a frame.",
       hint: "Check that the API server is running and reachable from the UI.",
     };
   }
   return {
-    title: "Stream connection closed",
+    title: "The stream packed up and left",
     detail: `WebSocket closed with code ${event.code}${event.reason ? ` (${event.reason})` : ""}.`,
   };
 }
@@ -111,6 +112,7 @@ function BrowserSessionStream({
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const credentialGetter = useCredentialGetter();
+  const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
   const hasFrameRef = useRef(false);
@@ -169,8 +171,9 @@ function BrowserSessionStream({
 
       socketRef.current.addEventListener("open", () => {
         setDiagnostic({
-          title: "Connected to stream",
-          detail: "Waiting for the backend to attach to the browser page.",
+          title: "Hooked up to the stream",
+          detail: "Just waiting for the backend to hand us a browser.",
+          pending: true,
         });
       });
 
@@ -204,17 +207,16 @@ function BrowserSessionStream({
         } catch (e) {
           console.error("Failed to parse message", e);
           setDiagnostic({
-            title: "Unexpected stream message",
-            detail: "The browser stream sent a message the UI could not parse.",
+            title: "The stream said something funny",
+            detail: "The browser sent a message the UI couldn't parse.",
           });
         }
       });
 
       socketRef.current.addEventListener("error", () => {
         setDiagnostic({
-          title: "Stream WebSocket error",
-          detail:
-            "The browser stream connection hit a network or server error.",
+          title: "The stream hit a snag",
+          detail: "The connection ran into a network or server error.",
         });
       });
 
@@ -280,6 +282,7 @@ function BrowserSessionStream({
     // browserSessionId intentionally not a dep: re-firing on prop change
     // before isReady resets would spuriously report (true, newSessionId).
     onReadyChange?.(isReady, isReady ? browserSessionId : null);
+    // Zustand store setters are stable; omit browserSessionId from deps on purpose.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, onReadyChange]);
 
@@ -288,6 +291,13 @@ function BrowserSessionStream({
       onReadyChange?.(false, null);
     };
   }, [onReadyChange]);
+
+  useEffect(() => {
+    settingsStore.setIsUsingABrowser(isReady);
+    settingsStore.setBrowserSessionId(isReady ? browserSessionId : null);
+    // Zustand store setters are stable; only sync when stream readiness changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, browserSessionId]);
 
   if (isReady) {
     return (

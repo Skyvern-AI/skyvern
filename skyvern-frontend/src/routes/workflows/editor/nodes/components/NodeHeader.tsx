@@ -6,13 +6,17 @@ import {
   ReloadIcon,
   StopIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
 
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation, Status } from "@/api/types";
+import {
+  ProxyLocation,
+  Status,
+  type DebugLoginBlockCompatibilityResponse,
+} from "@/api/types";
 import { NoticeMe } from "@/components/NoticeMe";
 import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
@@ -26,9 +30,18 @@ import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useReques
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserSessionRateLimit";
+import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { DebugSessionProfileIncompatibleDialog } from "@/routes/workflows/debugger/DebugSessionProfileIncompatibleDialog";
+import {
+  DEBUG_LOGIN_GATE_CREDENTIALS_PAGE_SIZE,
+  decideDebugLoginPlayGate,
+  gateActionFromBackendCompatibility,
+  type CredentialsLoadState,
+  type DebugSessionProfileIncompatibilityReason,
+} from "@/routes/workflows/debugger/debugSessionProfileCompatibility";
 import {
   debuggableWorkflowBlockTypes,
   scriptableWorkflowBlockTypes,
@@ -127,6 +140,7 @@ interface Props {
   totpUrl: string | null;
   transmutations?: Transmutations;
   type: WorkflowBlockType;
+  viewToggle?: React.ReactNode;
 }
 
 type Payload = Record<string, unknown> & {
@@ -221,6 +235,7 @@ function NodeHeader({
   totpUrl,
   transmutations,
   type,
+  viewToggle,
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
@@ -278,6 +293,18 @@ function NodeHeader({
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
   );
+  const {
+    data: credentials,
+    isLoading: credentialsIsLoading,
+    isError: credentialsIsError,
+    refetch: refetchCredentials,
+  } = useCredentialsQuery({
+    enabled: type === "login" && !!debugSession,
+    page_size: DEBUG_LOGIN_GATE_CREDENTIALS_PAGE_SIZE,
+  });
+  const [profileIncompatibilityReason, setProfileIncompatibilityReason] =
+    useState<DebugSessionProfileIncompatibilityReason | null>(null);
+  const compatibilityLookupInFlightRef = useRef(false);
   const [showParamsDialog, setShowParamsDialog] = useState(false);
   const [parametersToPrompt, setParametersToPrompt] = useState<
     WorkflowParameter[]
@@ -601,7 +628,7 @@ function NodeHeader({
     },
   });
 
-  const handleOnPlay = () => {
+  const proceedWithPlay = () => {
     const blocks = workflow?.workflow_definition?.blocks ?? [];
     const numBlocksInWorkflow = blocks.length;
 
@@ -642,6 +669,126 @@ function NodeHeader({
     }
 
     runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
+  };
+
+  const handleOnPlay = async () => {
+    // Fail-closed pre-flight: a still-loading credentials list (or an
+    // errored / pagination-missed credential) can produce a null credential
+    // profile that the compatibility check would misread as "compatible",
+    // silently bypassing the mismatch modal. Block the play with a recovery
+    // affordance until we have a definitive answer.
+    const credentialsState: CredentialsLoadState = credentialsIsLoading
+      ? "loading"
+      : credentialsIsError
+        ? "error"
+        : "ready";
+    const blocks = workflow?.workflow_definition?.blocks ?? [];
+    const block = findWorkflowBlockByLabel(blocks, blockLabel);
+
+    const gate = decideDebugLoginPlayGate({
+      blockType: type,
+      hasDebugSession: !!debugSession,
+      credentialsState,
+      block,
+      credentials,
+      pbsBrowserProfileId: debugSession?.pbs_browser_profile_id ?? null,
+    });
+
+    if (gate.kind === "block-loading") {
+      toast({
+        variant: "warning",
+        title: "Loading credentials",
+        description:
+          "Credentials are still loading. Please try again in a moment.",
+      });
+      return;
+    }
+
+    if (gate.kind === "block-retry" && gate.reason === "credentials-error") {
+      // Settled-in-error leaves the gate permanently blocked until React
+      // Query refetches. Trigger a refetch and tell the user to try again;
+      // the next click re-evaluates against the fresh query state.
+      void refetchCredentials();
+      toast({
+        variant: "warning",
+        title: "Couldn't load credentials",
+        description: "Retrying — try Play again once the toast clears.",
+      });
+      return;
+    }
+
+    if (gate.kind === "block-retry" && gate.reason === "credential-not-found") {
+      // The credential the LoginBlock references is not in the bounded
+      // useCredentialsQuery window (paginated past it, deleted, etc.).
+      // Refetching the same page can't fix that, so ask the backend to
+      // resolve the credential through the org-scoped lookup the run path
+      // uses, and apply that verdict directly.
+      if (!workflowPermanentId) {
+        toast({
+          variant: "warning",
+          title: "Couldn't verify credential",
+          description:
+            "Workflow context not ready. Refresh the page and try again.",
+        });
+        return;
+      }
+      if (compatibilityLookupInFlightRef.current) {
+        toast({
+          variant: "warning",
+          title: "Checking compatibility…",
+          description: "Already verifying the credential — please wait.",
+        });
+        return;
+      }
+      compatibilityLookupInFlightRef.current = true;
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<
+          unknown,
+          { data: DebugLoginBlockCompatibilityResponse }
+        >(`/debug-session/${workflowPermanentId}/login-block-compatibility`, {
+          params: { block_label: blockLabel },
+        });
+        const verdict = gateActionFromBackendCompatibility(response.data);
+        if (verdict.kind === "show-modal") {
+          setProfileIncompatibilityReason(verdict.reason);
+          return;
+        }
+        if (verdict.kind === "block-retry") {
+          toast({
+            variant: "warning",
+            title: "Couldn't verify credential",
+            description:
+              "The credential lookup returned an unexpected response. Try Play again, or refresh the page.",
+          });
+          return;
+        }
+        proceedWithPlay();
+        return;
+      } catch (error) {
+        log.error("Compatibility lookup failed", {
+          workflowPermanentId,
+          blockLabel,
+          error,
+        });
+        toast({
+          variant: "warning",
+          title: "Couldn't verify credential",
+          description:
+            "The credential lookup didn't complete. Try Play again, or refresh the page.",
+        });
+        return;
+      } finally {
+        compatibilityLookupInFlightRef.current = false;
+      }
+    }
+
+    if (gate.kind === "show-modal") {
+      setProfileIncompatibilityReason(gate.reason);
+      return;
+    }
+
+    proceedWithPlay();
   };
 
   const handleOnCancel = () => {
@@ -830,6 +977,7 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {viewToggle}
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
@@ -866,7 +1014,7 @@ function NodeHeader({
                       isRecording,
                   })}
                   onClick={() => {
-                    handleOnPlay();
+                    void handleOnPlay();
                   }}
                 />
               )}
@@ -927,6 +1075,15 @@ function NodeHeader({
           );
         }}
         isLoading={runBlock.isPending}
+      />
+      <DebugSessionProfileIncompatibleDialog
+        open={profileIncompatibilityReason !== null}
+        reason={profileIncompatibilityReason}
+        onContinue={() => {
+          setProfileIncompatibilityReason(null);
+          proceedWithPlay();
+        }}
+        onCancel={() => setProfileIncompatibilityReason(null)}
       />
     </>
   );

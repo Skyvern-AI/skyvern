@@ -183,10 +183,8 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
     outer_workflow_run = SimpleNamespace(proxy_location=None, max_screenshot_scrolls=None)
     child_workflow_run = SimpleNamespace(failure_reason=None)
     organization = SimpleNamespace(organization_id="org_1", organization_name="Org 1")
-    downloaded_files = [
-        _file("file:///app/downloads/wr_parent/a.zip", "a.zip", "abc"),
-        _file("file:///app/downloads/wr_parent/b.zip", "b.zip", "def"),
-    ]
+    a_zip = _file("file:///app/downloads/wr_parent/a.zip", "a.zip", "abc")
+    b_zip = _file("file:///app/downloads/wr_parent/b.zip", "b.zip", "def")
 
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(
@@ -204,7 +202,9 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
             get_recent_task_screenshot_artifacts=AsyncMock(return_value=[]),
             get_recent_workflow_screenshot_artifacts=AsyncMock(return_value=[]),
         ),
-        STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(return_value=downloaded_files)),
+        # First read is the block's own baseline capture (only a.zip exists yet); the
+        # second is the post-run read (a.zip from before + b.zip downloaded this block).
+        STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(side_effect=[[a_zip], [a_zip, b_zip]])),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
 

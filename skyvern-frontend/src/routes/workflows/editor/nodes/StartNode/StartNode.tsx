@@ -147,7 +147,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
             <div className="relative">
               <header className="mb-6 mt-2">Start</header>
               <Separator />
-              <BuildModeOnly>
+              <BuildModeOnly renderInReadOnlyComparison={false}>
                 <Accordion
                   type="single"
                   collapsible

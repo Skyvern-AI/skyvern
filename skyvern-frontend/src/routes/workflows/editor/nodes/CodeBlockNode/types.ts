@@ -1,10 +1,16 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
-import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import {
+  debuggableWorkflowBlockTypes,
+  type CodeBlockStep,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type CodeBlockNodeData = NodeBaseData & {
   code: string;
   parameterKeys: Array<string> | null;
+  prompt: string | null;
+  steps: Array<CodeBlockStep> | null;
+  dataSchema: string;
 };
 
 export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;
@@ -27,5 +33,8 @@ export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   code: codeLead,
   continueOnFailure: false,
   parameterKeys: null,
+  prompt: "",
+  steps: null,
+  dataSchema: "null",
   model: null,
 } as const;

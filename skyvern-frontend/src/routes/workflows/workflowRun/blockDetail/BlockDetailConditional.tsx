@@ -1,13 +1,25 @@
+import type { ActionsApiResponse } from "@/api/types";
 import {
   hasEvaluations,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
 import { JsonExplorer } from "./BlockInspector";
-import { BlockDetailFailure, CodeBlock, Section } from "./shared";
+import {
+  BlockActionList,
+  BlockDetailFailure,
+  CodeBlock,
+  Section,
+} from "./shared";
 import { cn } from "@/util/utils";
 
 type Props = {
   block: WorkflowRunBlock;
+  activeItem?: WorkflowRunOverviewActiveElement;
+  onActionSelect?: (payload: {
+    block: WorkflowRunBlock;
+    action: ActionsApiResponse;
+  }) => void;
 };
 
 function tryParseJson(value: string): unknown | null {
@@ -32,7 +44,11 @@ function RenderedExpression({ value }: { value: string }) {
   );
 }
 
-function BlockDetailConditional({ block }: Props) {
+function BlockDetailConditional({
+  block,
+  activeItem = null,
+  onActionSelect,
+}: Props) {
   const evaluations =
     hasEvaluations(block.output) && block.output.evaluations
       ? block.output.evaluations
@@ -45,6 +61,11 @@ function BlockDetailConditional({ block }: Props) {
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
       <BlockDetailFailure block={block} />
+      <BlockActionList
+        block={block}
+        activeItem={activeItem}
+        onActionSelect={onActionSelect}
+      />
       {hasExecutedBranch && evaluations && evaluations.length > 0 ? (
         <Section title="Branches">
           <div className="space-y-2">

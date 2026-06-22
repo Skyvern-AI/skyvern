@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
+
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     RepairNextAction,
     build_diagnosis_repair_contract,
+)
+from skyvern.forge.sdk.copilot.run_outcome import (
+    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
@@ -116,6 +126,166 @@ def test_repairable_block_failure_contract_is_queryable_and_safe() -> None:
     assert "hunter2" not in contract.model_dump_json()
 
 
+def test_credentialed_runtime_auth_failure_repairs_failed_code_block() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "error": "The code block used saved credentials but the browser ended on Login Failure.",
+            "data": {
+                "workflow_run_id": "wr_auth",
+                "overall_status": "failed",
+                "requested_block_labels": ["login"],
+                "executed_block_labels": ["login"],
+                "frontier_start_label": "login",
+                "current_url": "https://example.test/loginFail/",
+                "page_title": "Login Failure",
+                "failure_categories": [{"category": "AUTH_FAILURE", "reasoning": "login rejected"}],
+                "blocks": [
+                    {
+                        "label": "login",
+                        "block_type": "CODE",
+                        "status": "failed",
+                        "failure_reason": "Saved credentials were submitted, but the page showed Login Failure.",
+                    }
+                ],
+            },
+        },
+        ctx=_ctx(),
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["login"]
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action != RepairNextAction.ASK
+
+
+def test_contradictory_completion_auth_evidence_repairs_frontier_block() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                evidence_ref="current_url,page_title",
+            )
+        ],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": (
+                "Completion verification contradicted code output: login_succeeded=True, "
+                "but saved credentials landed on /loginFail/ with Login Failure page evidence."
+            ),
+            "data": {
+                "workflow_run_id": "wr_outcome",
+                "overall_status": "completed",
+                "frontier_start_label": "login",
+                "current_url": "https://example.test/loginFail/",
+                "page_title": "Login Failure",
+                "failure_categories": [
+                    {
+                        "category": "OUTCOME_UNVERIFIED",
+                        "reasoning": "success flag contradicted by current page evidence",
+                    }
+                ],
+                "completion_verification": ctx.completion_verification_result.to_trace_data(),
+                "blocks": [{"label": "login", "block_type": "CODE", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["login"]
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action != RepairNextAction.ASK
+
+
+def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> None:
+    unbound = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "message": "Skipped test run: required credentials are not configured.",
+            "data": {
+                "workflow_updated": True,
+                "skipped_run": True,
+                "skip_reason": "workflow_credential_inputs_unbound",
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+    binding_error = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Missing required workflow parameter for credential binding.",
+            "data": {
+                "overall_status": "failed",
+                "failure_categories": [{"category": "PARAMETER_BINDING_ERROR"}],
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert (
+        unbound.diagnosis_result.suspected_failure_type,
+        unbound.repair_decision.next_action,
+        binding_error.diagnosis_result.suspected_failure_type,
+        binding_error.repair_decision.next_action,
+    ) == (
+        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
+        RepairNextAction.ASK,
+        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
+        RepairNextAction.ASK,
+    )
+
+
+def test_active_run_terminal_evidence_contract_stops_without_marking_workflow_success() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Active run terminal evidence was observed.",
+            "data": {
+                "workflow_run_id": "wr_active",
+                "overall_status": "canceled",
+                "active_run_terminal_evidence_detected": True,
+                "active_run_terminal_completion_verification": {
+                    "status": "evaluated",
+                    "criterion_count": 1,
+                    "satisfied_count": 1,
+                    "fully_satisfied": True,
+                    "reason_codes": ["evidence_confirms"],
+                },
+                "failure_categories": [{"category": "ACTIVE_RUN_TERMINAL_EVIDENCE"}],
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert "not verified end-to-end" in contract.repair_decision.proposed_change_summary
+
+
 def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> None:
     ctx = _ctx()
     ctx.last_test_suspicious_success = True
@@ -144,10 +314,140 @@ def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> No
         workflow_updated=True,
     )
 
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
     assert contract.repair_decision.next_action == RepairNextAction.STOP
     assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
     assert "Verify you are human" in contract.verification_result.remaining_blocker
+    assert contract.to_trace_data()["failure_type"] == "terminal_challenge_blocker"
+
+
+def test_challenge_category_preempts_clean_run_ok_contract() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Typed run analysis reported an anti-bot challenge."
+    ctx.last_test_failure_reason = "Run output reported a blocker: Verify you are human."
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_blocked",
+                "overall_status": "completed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "completed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+
+
+def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contract() -> None:
+    ctx = _ctx()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_clean",
+                "overall_status": "completed",
+                "failure_categories": [
+                    {
+                        "category": "ANTI_BOT_DETECTION",
+                        "confidence_float": 0.2,
+                        "reasoning": "Low-confidence upstream category.",
+                    }
+                ],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "completed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+
+
+def test_pre_run_challenge_observation_does_not_force_stop_on_repairable_failure() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = (
+        "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
+    )
+    ctx.last_test_failure_reason = "The search button selector changed before submit."
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_repair",
+                "overall_status": "failed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "blocks": [{"label": "submit_search", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+
+
+def test_post_run_gated_challenge_observation_forces_stop_on_repairable_failure() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = (
+        "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
+    )
+    ctx.last_test_failure_reason = "The Search button remains disabled after verification."
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_terminal",
+                "overall_status": "failed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "blocks": [{"label": "submit_search", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
 
 
 def test_user_goal_urls_are_reduced_to_origins() -> None:
@@ -229,3 +529,110 @@ def test_unrecoverable_browser_session_contract_stops_with_blocker() -> None:
     assert contract.repair_decision.next_action == RepairNextAction.STOP
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.remaining_blocker == reason
+
+
+def test_contract_trace_exposes_stable_root_cause_identity() -> None:
+    def result(reason: str, status: str, label: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "error": reason,
+            "data": {
+                "workflow_run_id": f"wr_{label}",
+                "overall_status": status,
+                "failure_reason": reason,
+                "frontier_start_label": label,
+                "failure_categories": [{"category": "UNRECOVERABLE_TOOL_ERROR"}],
+                "blocks": [{"label": label, "status": status, "failure_reason": reason}],
+            },
+        }
+
+    base = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result=result('Browser session not found while waiting for locator("#submit")', "failed", "login_v1"),
+        ctx=_ctx(),
+    )
+    renamed = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result=result('No browser context while waiting for locator("#submit")', "terminated", "login_v2"),
+        ctx=_ctx(),
+    )
+
+    base_trace = base.to_trace_data()
+    renamed_trace = renamed.to_trace_data()
+    assert base_trace["root_cause_signature"] == renamed_trace["root_cause_signature"]
+    assert base_trace["root_cause_error_class"] == "browser_session_not_found"
+    assert base_trace["root_cause_selector_kind"] == "locator"
+    assert base_trace["root_cause_selector"] == "#submit"
+    assert (
+        base.model_dump()["diagnosis_result"]["root_cause_identity"]["root_cause_signature"]
+        == base_trace["root_cause_signature"]
+    )
+    assert base_trace["run_status"] != renamed_trace["run_status"]
+    assert {base.diagnosis_result.suspected_failure_type, renamed.diagnosis_result.suspected_failure_type} == {
+        DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_failure_records_diagnosis_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.copilot import tools as tools_module
+
+    error = (
+        "Unable to impose synthesized code block: dropped scout interaction 0 from `click` (ambiguous_bare_selector)."
+    )
+    recorded: list[tuple[str, dict[str, object], str]] = []
+
+    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_request_policy_allows_credential_deferred_draft", lambda *args: False)
+    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_update_workflow", AsyncMock(return_value={"ok": False, "error": error}))
+
+    def fake_record_contract(ctx: CopilotContext, *, source_tool: str, result: dict[str, object]) -> None:
+        contract = build_diagnosis_repair_contract(source_tool=source_tool, result=result, ctx=ctx)
+        recorded.append((source_tool, result, contract.to_trace_data()["root_cause_error_class"]))
+
+    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", fake_record_contract)
+
+    result = await tools_module.update_workflow_tool.on_invoke_tool(
+        SimpleNamespace(context=_ctx(), tool_name="update_workflow"),
+        json.dumps({"workflow_yaml": "title: Test\nworkflow_definition:\n  parameters: []\n  blocks: []\n"}),
+    )
+
+    assert json.loads(result)["ok"] is False
+    assert recorded == [
+        ("update_workflow", {"ok": False, "error": error}, "code_block_synthesis_ambiguous_bare_selector")
+    ]
+
+
+def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() -> None:
+    from skyvern.forge.sdk.copilot.tools.run_execution import _diagnosis_repair_tool_error
+
+    ctx = _ctx()
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="terminal challenge",
+        user_facing_reason="The page is gated by a site verification challenge.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+        extra={
+            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+            "evidence_source": "page_evidence",
+            "evidence_reason": "human verification requires human verification",
+        },
+    )
+
+    payload = json.loads(_diagnosis_repair_tool_error(ctx, "update_and_run_blocks", "terminal challenge"))
+
+    assert payload["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
+    assert ctx.latest_diagnosis_repair_contract is not None
+    assert (
+        ctx.latest_diagnosis_repair_contract.diagnosis_result.suspected_failure_type
+        == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    )
+    assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == RepairNextAction.STOP

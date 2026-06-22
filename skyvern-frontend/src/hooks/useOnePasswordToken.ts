@@ -7,6 +7,7 @@ import {
   OnePasswordTokenApiResponse,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
 export function useOnePasswordToken() {
   const credentialGetter = useCredentialGetter();
@@ -14,7 +15,7 @@ export function useOnePasswordToken() {
   const { toast } = useToast();
 
   const { data: onePasswordToken, isLoading } =
-    useQuery<OnePasswordTokenApiResponse>({
+    useQuery<OnePasswordTokenApiResponse | null>({
       queryKey: ["onePasswordToken"],
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
@@ -33,7 +34,8 @@ export function useOnePasswordToken() {
         .then((response) => response.data as CreateOnePasswordTokenResponse);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["onePasswordToken"] });
+      void queryClient.invalidateQueries({ queryKey: ["onePasswordToken"] });
+      void queryClient.invalidateQueries({ queryKey: ["onepasswordItems"] });
       toast({
         title: "Success",
         description: "1Password service account token updated successfully",
@@ -53,10 +55,20 @@ export function useOnePasswordToken() {
     },
   });
 
+  const clearTokenMutation = useClearOrganizationAuthToken({
+    providerPath: "onepassword",
+    queryKey: "onePasswordToken",
+    invalidateQueryKeys: ["onepasswordItems"],
+    successDescription: "1Password service account token cleared successfully",
+    errorDescription: "Failed to clear 1Password token",
+  });
+
   return {
     onePasswordToken,
     isLoading,
     createOrUpdateToken: createOrUpdateTokenMutation.mutate,
     isUpdating: createOrUpdateTokenMutation.isPending,
+    clearToken: clearTokenMutation.mutate,
+    isClearing: clearTokenMutation.isPending,
   };
 }

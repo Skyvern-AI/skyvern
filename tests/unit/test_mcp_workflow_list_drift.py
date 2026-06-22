@@ -38,6 +38,10 @@ def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step
         block["range"] = "A1:D100"
         block["credential_id"] = "{{ google_credential_id }}"
         block["has_header_row"] = True
+    elif block_type == "pdf_fill":
+        block["file_url"] = "{{ source_pdf }}"
+        block["prompt"] = "Fill the PDF using the payload."
+        block["payload"] = {"name": "{{ applicant.name }}"}
     elif block_type == "navigation":
         block["url"] = "https://example.com"
         block["navigation_goal"] = "do the thing"
@@ -91,6 +95,7 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
     payload = [
         _make_workflow_dict("wpid_ok", "navigation"),
         _make_workflow_dict("wpid_sheets", "google_sheets_read"),
+        _make_workflow_dict("wpid_pdf_fill", "pdf_fill"),
     ]
     request_mock = _patch_skyvern_list_response(monkeypatch, payload=payload)
 
@@ -98,10 +103,10 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
 
     assert result["ok"] is True, result
     data = result["data"]
-    assert data["count"] == 2
+    assert data["count"] == 3
     assert data["page"] == 1
     ids = {wf["workflow_permanent_id"] for wf in data["workflows"]}
-    assert ids == {"wpid_ok", "wpid_sheets"}
+    assert ids == {"wpid_ok", "wpid_sheets", "wpid_pdf_fill"}
 
     request_mock.assert_awaited_once()
     call = request_mock.await_args

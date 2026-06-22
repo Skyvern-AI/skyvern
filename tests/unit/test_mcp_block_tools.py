@@ -58,5 +58,22 @@ async def test_block_schema_no_type_lists_all() -> None:
     block_types = result["data"]["block_types"]
     assert "navigation" in block_types
     assert "extraction" in block_types
+    assert "pdf_fill" in block_types
     assert "task" not in block_types
     assert result["data"]["count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_block_validate_pdf_fill() -> None:
+    block = {
+        "block_type": "pdf_fill",
+        "label": "fill_pdf",
+        "file_url": "{{ source_pdf }}",
+        "prompt": "Fill the PDF using the payload.",
+        "payload": {"name": "{{ applicant.name }}"},
+        "parameter_keys": ["source_pdf", "applicant"],
+    }
+    result = await skyvern_block_validate(block_json=json.dumps(block))
+
+    assert result["ok"] is True
+    assert result["data"]["valid"] is True

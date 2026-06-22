@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import time
 from enum import StrEnum
 from mimetypes import add_type, guess_type
@@ -9,7 +10,7 @@ from urllib.parse import urlparse
 
 import aioboto3
 import structlog
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ProfileNotFound
 
 from skyvern.config import settings
 
@@ -50,6 +51,10 @@ class AWSClientType(StrEnum):
     BATCH = "batch"
 
 
+class AWSSessionConfigurationError(RuntimeError):
+    pass
+
+
 class AsyncAWSClient:
     def __init__(
         self,
@@ -64,14 +69,35 @@ class AsyncAWSClient:
         self._aws_access_key_id = aws_access_key_id
         self._aws_secret_access_key = aws_secret_access_key
         self._profile_name = profile_name
-        self._create_session()
+        self._session: aioboto3.Session | None = None
 
-    def _create_session(self) -> None:
-        self.session = aioboto3.Session(
-            aws_access_key_id=self._aws_access_key_id,
-            aws_secret_access_key=self._aws_secret_access_key,
-            profile_name=self._profile_name,
-        )
+    @property
+    def session(self) -> aioboto3.Session:
+        return self._get_session()
+
+    @session.setter
+    def session(self, session: aioboto3.Session) -> None:
+        self._session = session
+
+    def _create_session(self, client_type_hint: AWSClientType | None = None) -> None:
+        try:
+            self._session = aioboto3.Session(
+                aws_access_key_id=self._aws_access_key_id,
+                aws_secret_access_key=self._aws_secret_access_key,
+                profile_name=self._profile_name,
+            )
+        except ProfileNotFound as e:
+            profile_name = self._profile_name or os.environ.get("AWS_PROFILE") or "default"
+            client_scope = f" while creating the {client_type_hint.value} client" if client_type_hint else ""
+            raise AWSSessionConfigurationError(
+                f"AWS profile {profile_name!r} could not be resolved{client_scope}. "
+                "Unset AWS_PROFILE, create the profile, or pass explicit AWS credentials."
+            ) from e
+
+    def _get_session(self, client_type_hint: AWSClientType | None = None) -> aioboto3.Session:
+        if self._session is None:
+            self._create_session(client_type_hint)
+        return self._session
 
     def refresh_session(self) -> None:
         """Recreate the session to pick up refreshed credentials (e.g., rotated web identity tokens)."""
@@ -81,6 +107,11 @@ class AsyncAWSClient:
     def _is_expired_token_error(self, error: Exception) -> bool:
         """Check if an exception is an AWS ExpiredTokenException."""
         return isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") == "ExpiredTokenException"
+
+    def _error_code(self, error: Exception) -> str:
+        if isinstance(error, ClientError):
+            return error.response.get("Error", {}).get("Code", error.__class__.__name__)
+        return error.__class__.__name__
 
     async def _s3_with_retry(
         self,
@@ -116,21 +147,29 @@ class AsyncAWSClient:
                 raise
 
     def _ecs_client(self) -> ECSClient:
-        return self.session.client(AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url)
+        return self._get_session(AWSClientType.ECS).client(
+            AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url
+        )
 
     def _secrets_manager_client(self) -> SecretsManagerClient:
-        return self.session.client(
+        return self._get_session(AWSClientType.SECRETS_MANAGER).client(
             AWSClientType.SECRETS_MANAGER, region_name=self.region_name, endpoint_url=self._endpoint_url
         )
 
     def _s3_client(self) -> S3Client:
-        return self.session.client(AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url)
+        return self._get_session(AWSClientType.S3).client(
+            AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url
+        )
 
     def _ec2_client(self) -> EC2Client:
-        return self.session.client(AWSClientType.EC2, region_name=self.region_name, endpoint_url=self._endpoint_url)
+        return self._get_session(AWSClientType.EC2).client(
+            AWSClientType.EC2, region_name=self.region_name, endpoint_url=self._endpoint_url
+        )
 
     def _batch_client(self) -> BatchClient:
-        return self.session.client(AWSClientType.BATCH, region_name=self.region_name, endpoint_url=self._endpoint_url)
+        return self._get_session(AWSClientType.BATCH).client(
+            AWSClientType.BATCH, region_name=self.region_name, endpoint_url=self._endpoint_url
+        )
 
     def _create_tag_string(self, tags: dict[str, str]) -> str:
         return "&".join([f"{k}={v}" for k, v in tags.items()])
@@ -142,10 +181,7 @@ class AsyncAWSClient:
                 response = await client.get_secret_value(SecretId=secret_name)
                 return response["SecretString"]
         except Exception as e:
-            try:
-                error_code = e.response["Error"]["Code"]  # type: ignore
-            except Exception:
-                error_code = "failed-to-get-error-code"
+            error_code = self._error_code(e)
             LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code)
             return None
 

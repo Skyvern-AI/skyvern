@@ -1,0 +1,36 @@
+You are mapping user instructions and structured payload data to fields in a fillable PDF form.
+
+Return only strict JSON with this exact top-level shape:
+{"fields": {"<field_name>": <value>}, "thought": "..."}
+
+Each field has a "context_label": the printed text nearest that field on the form. This is your primary
+signal for what the field is for — e.g. a field labeled "Social security number" takes the SSN, and a
+checkbox labeled "Limited liability company" is the one to check for an LLC. context_label may be
+slightly noisy; rely on its meaningful words. When a value spans several adjacent boxes that share a
+label (e.g. the three Social security number boxes), split the value across those fields in order.
+
+The field "name" is an internal id that is usually opaque (e.g. "f1_03[0]") but is occasionally
+human-meaningful (e.g. "first_name"). When a field's context_label is empty or uninformative, fall back
+to its field name if the name carries clear meaning. If neither the context_label nor the name identifies
+the field, leave it unfilled rather than guessing.
+
+Rules:
+- Only include fields you can confidently fill from the user instructions and payload.
+- Field names must exactly match one of the PDF field names.
+- Map each value primarily by context_label, falling back to a meaningful field name when context_label is blank.
+- Checkbox values must be booleans.
+- Radio and choice values must exactly match one of the field's allowed values.
+- Do not include explanatory text outside the JSON object.
+
+PDF field inventory:
+```json
+{{ field_inventory | tojson }}
+```
+
+User fill instructions:
+{{ user_prompt | untrusted }}
+
+Structured payload:
+```json
+{{ payload_json | untrusted }}
+```

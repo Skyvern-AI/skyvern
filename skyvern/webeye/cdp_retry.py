@@ -8,6 +8,8 @@ from playwright._impl._errors import TargetClosedError as PWTargetClosedError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
 from playwright.async_api import Browser, Playwright
 
+from skyvern.webeye.cdp_connection import strip_browser_address_discriminator
+
 LOG = structlog.get_logger()
 
 _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
@@ -19,7 +21,7 @@ _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
 )
 
 
-def _is_cdp_connection_error(exc: Exception) -> bool:
+def is_cdp_connection_error(exc: Exception) -> bool:
     if isinstance(
         exc, (PWTimeoutError, PWTargetClosedError, ConnectionRefusedError, ConnectionResetError, TimeoutError)
     ):
@@ -31,25 +33,36 @@ def _is_cdp_connection_error(exc: Exception) -> bool:
 
 _CDP_RETRY_ATTEMPTS = 3
 _CDP_RETRY_BACKOFF_SECONDS = (1, 3)
+# Patch this module alias in tests so shard-wide asyncio.sleep mocks do not leak call counts.
+_sleep = asyncio.sleep
 
 
 async def connect_over_cdp_with_retry(
     playwright: Playwright,
     browser_address: str,
     headers: dict[str, str] | None = None,
+    log_browser_address: str | None = None,
 ) -> Browser:
+    browser_address = strip_browser_address_discriminator(browser_address)
+    browser_address_for_logs = log_browser_address or browser_address
     for attempt in range(1, _CDP_RETRY_ATTEMPTS + 1):
         try:
             browser = await playwright.chromium.connect_over_cdp(browser_address, headers=headers)
             if attempt > 1:
                 LOG.info(
                     "CDP connection recovered after retry",
-                    browser_address=browser_address,
+                    browser_address=browser_address_for_logs,
                     successful_attempt=attempt,
                 )
             return browser
         except Exception as e:
-            if not _is_cdp_connection_error(e) or attempt == _CDP_RETRY_ATTEMPTS:
+            if not is_cdp_connection_error(e) or attempt == _CDP_RETRY_ATTEMPTS:
+                # When the caller passed log_browser_address as a safe label, the raw
+                # browser_address may carry session tokens in path/query — Playwright's
+                # exception text would otherwise expose them. Re-raise a RuntimeError
+                # with only the safe label + error class name.
+                if log_browser_address is not None:
+                    raise RuntimeError(f"CDP connection to {log_browser_address} failed ({type(e).__name__})") from None
                 raise
             backoff = (
                 _CDP_RETRY_BACKOFF_SECONDS[attempt - 1]
@@ -58,11 +71,11 @@ async def connect_over_cdp_with_retry(
             )
             LOG.warning(
                 "CDP connection failed, retrying",
-                browser_address=browser_address,
+                browser_address=browser_address_for_logs,
                 attempt=attempt,
                 max_attempts=_CDP_RETRY_ATTEMPTS,
                 backoff_seconds=backoff,
                 error_type=type(e).__name__,
             )
-            await asyncio.sleep(backoff)
+            await _sleep(backoff)
     raise RuntimeError("unreachable")

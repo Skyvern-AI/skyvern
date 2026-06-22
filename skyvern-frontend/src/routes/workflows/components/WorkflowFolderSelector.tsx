@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   CheckIcon,
   Cross2Icon,
@@ -18,20 +18,32 @@ import { useInfiniteFoldersQuery } from "../hooks/useInfiniteFoldersQuery";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
 import { useDebounce } from "use-debounce";
 import { Skeleton } from "@/components/ui/skeleton";
+import { toast } from "@/components/ui/use-toast";
 
 interface WorkflowFolderSelectorProps {
-  workflowPermanentId: string;
+  workflowPermanentId?: string;
   currentFolderId: string | null;
+  bulkCount?: number;
+  onBulkFolderSelect?: (folderId: string | null) => Promise<void>;
+  bulkHasFolders?: boolean;
+  disabled?: boolean;
+  trigger?: React.ReactNode;
 }
 
 function WorkflowFolderSelector({
   workflowPermanentId,
   currentFolderId,
+  bulkCount,
+  onBulkFolderSelect,
+  bulkHasFolders = true,
+  disabled = false,
+  trigger,
 }: WorkflowFolderSelectorProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const isTyping = search !== debouncedSearch;
+  const isBulkMode = (bulkCount ?? 0) > 0 && Boolean(onBulkFolderSelect);
 
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching } =
     useInfiniteFoldersQuery({
@@ -39,35 +51,61 @@ function WorkflowFolderSelector({
       page_size: 20,
     });
 
-  // Flatten pages into a single array
   const folders = useMemo(() => {
     return data?.pages.flatMap((page) => page) ?? [];
   }, [data]);
 
   const updateFolderMutation = useUpdateWorkflowFolderMutation();
 
-  const handleFolderSelect = async (folderId: string | null) => {
-    await updateFolderMutation.mutateAsync({
-      workflowPermanentId,
-      data: { folder_id: folderId },
-    });
+  async function handleFolderSelect(folderId: string | null) {
+    // Close before the request; progress feedback lives in the caller (toast
+    // or the bulk bar's Processing label), not in a hanging popover.
     setOpen(false);
     setSearch("");
-  };
+    if (isBulkMode && onBulkFolderSelect) {
+      await onBulkFolderSelect(folderId);
+    } else if (workflowPermanentId) {
+      try {
+        await updateFolderMutation.mutateAsync({
+          workflowPermanentId,
+          data: { folder_id: folderId },
+        });
+      } catch (error) {
+        toast({
+          variant: "destructive",
+          title: folderId
+            ? "Failed to move agent to folder"
+            : "Failed to remove agent from folder",
+          description: error instanceof Error ? error.message : undefined,
+        });
+      }
+    } else if (import.meta.env.DEV) {
+      console.warn(
+        "WorkflowFolderSelector needs workflowPermanentId (single mode) or onBulkFolderSelect (bulk mode).",
+      );
+    }
+  }
+
+  const showRemoveFromFolder = isBulkMode
+    ? bulkHasFolders
+    : Boolean(currentFolderId);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          className={cn(
-            "h-8 w-8",
-            currentFolderId ? "text-blue-400" : "text-slate-400",
-          )}
-        >
-          <FolderIcon className="h-4 w-4" />
-        </Button>
+        {trigger ?? (
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={disabled}
+            className={cn(
+              "text-muted-foreground hover:text-foreground",
+              currentFolderId && "text-blue-400 hover:text-blue-400",
+            )}
+          >
+            <FolderIcon className="h-4 w-4" />
+          </Button>
+        )}
       </PopoverTrigger>
       <PopoverContent
         className="w-80 p-0"
@@ -75,7 +113,11 @@ function WorkflowFolderSelector({
         onCloseAutoFocus={(e) => e.preventDefault()}
       >
         <div className="border-b p-3">
-          <h4 className="mb-2 text-sm font-medium">Move to folder</h4>
+          <h4 className="mb-2 text-sm font-medium">
+            {isBulkMode
+              ? `Move ${bulkCount} agent${bulkCount === 1 ? "" : "s"} to folder`
+              : "Move to folder"}
+          </h4>
           <div className="relative">
             <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
             <Input
@@ -88,7 +130,7 @@ function WorkflowFolderSelector({
           </div>
         </div>
         <div
-          className="max-h-[300px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
+          className="max-h-[300px] overflow-y-auto overflow-x-hidden [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
           onScroll={(e) =>
             handleInfiniteScroll(
               e,
@@ -98,10 +140,14 @@ function WorkflowFolderSelector({
             )
           }
         >
-          {currentFolderId && (
+          {showRemoveFromFolder && (
             <button
-              onClick={() => handleFolderSelect(null)}
-              className="flex w-full items-center justify-between border-b px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 dark:hover:bg-slate-800"
+              type="button"
+              onClick={() => {
+                void handleFolderSelect(null);
+              }}
+              disabled={disabled || updateFolderMutation.isPending}
+              className="flex w-full items-center justify-between border-b px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
             >
               <div className="flex items-center gap-2">
                 <Cross2Icon className="h-4 w-4 text-red-400" />
@@ -111,7 +157,6 @@ function WorkflowFolderSelector({
           )}
 
           {(isFetching || isTyping) && folders.length === 0 ? (
-            // Show 8 skeleton rows while typing or fetching
             <>
               {Array.from({ length: 8 }).map((_, index) => (
                 <div
@@ -133,20 +178,28 @@ function WorkflowFolderSelector({
           ) : (
             <>
               {folders.map((folder) => {
-                const isCurrentFolder = currentFolderId === folder.folder_id;
+                const isCurrentFolder =
+                  !isBulkMode && currentFolderId === folder.folder_id;
                 return (
                   <button
                     key={folder.folder_id}
-                    onClick={() => handleFolderSelect(folder.folder_id)}
-                    disabled={isCurrentFolder}
+                    type="button"
+                    onClick={() => {
+                      void handleFolderSelect(folder.folder_id);
+                    }}
+                    disabled={
+                      disabled ||
+                      updateFolderMutation.isPending ||
+                      isCurrentFolder
+                    }
                     className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
                   >
-                    <div className="flex items-center gap-2">
-                      <FolderIcon className="h-4 w-4 text-blue-400" />
-                      <div className="flex flex-col">
-                        <span>{folder.title}</span>
+                    <div className="flex min-w-0 items-center gap-2">
+                      <FolderIcon className="h-4 w-4 shrink-0 text-blue-400" />
+                      <div className="flex min-w-0 flex-col">
+                        <span className="break-words">{folder.title}</span>
                         {folder.description && (
-                          <span className="text-xs text-slate-400">
+                          <span className="line-clamp-2 break-words text-xs text-slate-400 [overflow-wrap:anywhere]">
                             {folder.description}
                           </span>
                         )}

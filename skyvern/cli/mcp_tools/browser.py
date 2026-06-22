@@ -5,7 +5,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -59,6 +59,28 @@ _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Treat a blank/whitespace string as omitted: MCP clients serialize an omitted optional
+    selector/intent as "", and a "" target would route a deterministic action onto nothing."""
+    return value if value is None or value.strip() else None
+
+
+def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
+    return bool(url and is_localhost_url(url) and getattr(ctx, "can_access_localhost", None) is False)
+
+
+_SelectorMode = Annotated[
+    Literal["resilient", "direct"],
+    Field(
+        description=(
+            "Selector resolution when a `selector` is given. 'resilient' (default) tries the selector, then "
+            "dismisses overlays and falls back to AI if it breaks. 'direct' acts only on the exact selector with "
+            "no overlay-dismiss or AI fall-back — a missed target fails fast. No effect when only `intent` is given."
+        )
+    ),
+]
+
+
 async def skyvern_navigate(
     url: Annotated[str, "The URL to navigate to"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
@@ -93,7 +115,7 @@ async def skyvern_navigate(
     except BrowserNotAvailableError:
         return make_result("skyvern_navigate", ok=False, error=no_browser_error())
 
-    if ctx.mode == "cloud_session" and is_localhost_url(url):
+    if _must_reject_localhost_url(ctx, url):
         return make_result(
             "skyvern_navigate",
             ok=False,
@@ -160,6 +182,7 @@ async def skyvern_click(
             "Use standard CSS: 'button.class', 'a[href*=\"pdf\"]', '#id', ':nth-of-type()'."
         ),
     ] = None,
+    selector_mode: _SelectorMode = "resilient",
     timeout: Annotated[
         int,
         Field(
@@ -181,6 +204,8 @@ async def skyvern_click(
             error=make_error(ErrorCode.INVALID_INPUT, f"Invalid button: {button}", "Use left, right, or middle"),
         )
 
+    selector = _blank_to_none(selector)
+    intent = _blank_to_none(intent)
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
         return make_result(
@@ -198,6 +223,7 @@ async def skyvern_click(
     except BrowserNotAvailableError:
         return make_result("skyvern_click", ok=False, error=no_browser_error())
 
+    deterministic = selector is not None and selector_mode == "direct"
     with Timer() as timer:
         try:
             kwargs: dict[str, Any] = {"timeout": timeout}
@@ -206,7 +232,11 @@ async def skyvern_click(
             if click_count is not None:
                 kwargs["click_count"] = click_count
 
-            if ai_mode is not None:
+            if deterministic:
+                # selector_mode="direct": pin the selector, no overlay-dismiss or AI re-target, so a
+                # missed target fails fast and the agent re-derives it instead of AI scout-scrolling.
+                resolved = await page.click(selector=selector, mode="direct", **kwargs)
+            elif ai_mode is not None:
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
@@ -225,7 +255,7 @@ async def skyvern_click(
                 ),
             )
         except Exception as e:
-            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
             return make_result(
                 "skyvern_click",
                 ok=False,
@@ -420,8 +450,8 @@ async def skyvern_file_upload(
             ),
         )
 
-    has_urls = any(fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
-    has_local = any(not fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
+    has_urls = any(fp.startswith(("http://", "https://", "s3://", "gs://", "azure://")) for fp in file_paths)
+    has_local = any(not fp.startswith(("http://", "https://", "s3://", "gs://", "azure://")) for fp in file_paths)
 
     if has_urls and has_local:
         return make_result(
@@ -626,6 +656,7 @@ async def skyvern_type(
         ),
     ] = None,
     selector: Annotated[str | None, Field(description="CSS selector or XPath for the input element")] = None,
+    selector_mode: _SelectorMode = "resilient",
     timeout: Annotated[
         int,
         Field(
@@ -653,6 +684,8 @@ async def skyvern_type(
             ),
         )
 
+    selector = _blank_to_none(selector)
+    intent = _blank_to_none(intent)
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
         return make_result(
@@ -693,10 +726,17 @@ async def skyvern_type(
                 ),
             )
 
+    deterministic = selector is not None and selector_mode == "direct"
     with Timer() as timer:
         try:
+            # selector_mode="direct" pins the selector with no AI fall-back. Resilient (default) and
+            # intent-only calls keep AI; emitted scripts keep the selector+prompt fallback via
+            # sdk_equivalent for DOM-drift resilience.
             if clear:
-                if ai_mode is not None:
+                if deterministic:
+                    assert selector is not None
+                    await page.fill(selector, text, mode="direct", timeout=timeout)
+                elif ai_mode is not None:
                     await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
                 else:
                     assert selector is not None
@@ -705,7 +745,9 @@ async def skyvern_type(
                 kwargs: dict[str, Any] = {"timeout": timeout}
                 if delay is not None:
                     kwargs["delay"] = delay
-                if ai_mode is not None:
+                if deterministic:
+                    await page.type(selector, text, ai=None, **kwargs)
+                elif ai_mode is not None:
                     loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
                     await loc.type(text, **kwargs)
                 else:
@@ -725,7 +767,7 @@ async def skyvern_type(
                 ),
             )
         except Exception as e:
-            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
             return make_result(
                 "skyvern_type",
                 ok=False,
@@ -923,6 +965,7 @@ async def skyvern_select_option(
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     intent: Annotated[str | None, Field(description="Natural language description of the dropdown (uses AI)")] = None,
     selector: Annotated[str | None, Field(description="CSS selector for the select element")] = None,
+    selector_mode: _SelectorMode = "resilient",
     timeout: Annotated[
         int, Field(description="Max time to wait for the dropdown in ms. Default 30000 (30s)", ge=1000, le=60000)
     ] = 30000,
@@ -932,6 +975,8 @@ async def skyvern_select_option(
 
     For free-text input fields, use skyvern_type instead. For non-dropdown buttons or links, use skyvern_click.
     """
+    selector = _blank_to_none(selector)
+    intent = _blank_to_none(intent)
     ai_mode, err = _resolve_ai_mode(selector, intent)
     if err:
         return make_result(
@@ -949,22 +994,25 @@ async def skyvern_select_option(
     except BrowserNotAvailableError:
         return make_result("skyvern_select_option", ok=False, error=no_browser_error())
 
+    deterministic = selector is not None and selector_mode == "direct"
     with Timer() as timer:
         try:
-            if ai_mode is not None:
-                # AI paths: pass value= directly -- the AI interprets the text
-                # regardless of whether it represents a value or label.
+            # selector_mode="direct" pins the selector with no AI fall-back. Only an intent-only call
+            # (no selector) uses AI to interpret the option text.
+            if ai_mode is not None and not deterministic:
                 await page.select_option(selector=selector, value=value, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
             else:
                 assert selector is not None
                 if by_label:
                     # Bypass SkyvernPage to avoid value="" coercion conflicting with label kwarg.
                     await page.page.locator(selector).select_option(label=value, timeout=timeout)
+                elif deterministic:
+                    await page.select_option(selector, value=value, ai=None, timeout=timeout)
                 else:
                     await page.select_option(selector, value=value, timeout=timeout)
             timer.mark("sdk")
         except Exception as e:
-            code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
             return make_result(
                 "skyvern_select_option",
                 ok=False,
@@ -1411,7 +1459,7 @@ async def skyvern_run_task(
     except BrowserNotAvailableError:
         return make_result("skyvern_run_task", ok=False, error=no_browser_error())
 
-    if url and ctx.mode == "cloud_session" and is_localhost_url(url):
+    if _must_reject_localhost_url(ctx, url):
         return make_result(
             "skyvern_run_task",
             ok=False,

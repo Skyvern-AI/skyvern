@@ -403,6 +403,38 @@ def test_content_endpoint_non_download_stays_inline():
     assert disposition == "inline"
 
 
+def test_content_endpoint_audio_artifact_serves_audio_webm():
+    from skyvern.forge.sdk.routes.agent_protocol import _artifact_response_config
+
+    audio = Artifact(
+        artifact_id="a_audio",
+        artifact_type=ArtifactType.AUDIO,
+        uri="s3://skyvern-artifacts/.../dictation.webm",
+        organization_id="o_1",
+        created_at="2026-04-23T00:00:00Z",
+        modified_at="2026-04-23T00:00:00Z",
+    )
+    media_type, disposition = _artifact_response_config(audio)
+    assert media_type == "audio/webm"
+    assert disposition == "inline"
+
+
+def test_content_endpoint_session_replay_falls_back_to_mp4_for_unknown_extension():
+    from skyvern.forge.sdk.routes.agent_protocol import _artifact_response_config
+
+    replay = Artifact(
+        artifact_id="a_replay",
+        artifact_type=ArtifactType.SESSION_REPLAY,
+        uri="s3://skyvern-artifacts/.../session_replay",
+        organization_id="o_1",
+        created_at="2026-04-23T00:00:00Z",
+        modified_at="2026-04-23T00:00:00Z",
+    )
+    media_type, disposition = _artifact_response_config(replay)
+    assert media_type == "video/mp4"
+    assert disposition == "inline"
+
+
 def test_content_endpoint_download_non_ascii_filename_does_not_crash_header_encoding():
     """Starlette encodes response headers as Latin-1. Unicode filenames must use RFC 5987
     (filename*=UTF-8''...) with an ASCII fallback so the endpoint does not 500."""

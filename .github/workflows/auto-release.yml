@@ -50,6 +50,7 @@ jobs:
     if: needs.check-version-change.outputs.version_changed == 'true'
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Check out Git repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -94,7 +95,17 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+      - name: Trigger Docker image build
+        # The release above is created with the built-in GITHUB_TOKEN, and events
+        # raised by GITHUB_TOKEN don't trigger other workflows (e.g. build-docker-image's
+        # `release: published`). workflow_dispatch is the documented exception, so we
+        # dispatch the build explicitly instead of relying on a separate PAT that has to
+        # be kept rotated (see SKY-10674).
         env:
-          # Using PAT instead of GITHUB_TOKEN to trigger downstream workflows (e.g., build-docker-image)
-          # GITHUB_TOKEN events don't trigger other workflows to prevent infinite loops
-          GITHUB_TOKEN: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          NEW_VERSION: ${{ needs.check-version-change.outputs.new_version }}
+        run: |
+          gh workflow run build-docker-image.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f tag_name="v${NEW_VERSION}"

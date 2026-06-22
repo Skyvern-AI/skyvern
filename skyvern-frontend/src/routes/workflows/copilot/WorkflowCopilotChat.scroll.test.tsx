@@ -64,7 +64,7 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 async function renderChat() {
   render(<WorkflowCopilotChat />);
   await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Type your message/)).toBeTruthy(),
+    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
   );
 }
 

@@ -1,7 +1,7 @@
 ---
 title: Zapier
 subtitle: Trigger browser automations from Zapier workflows
-description: Connect Skyvern to 7,000+ apps through Zapier. Create and run tasks or workflows, retrieve results, and trigger browser automations from any Zap.
+description: Connect Skyvern to 7,000+ apps through Zapier. Create and run tasks or agents, retrieve results, and trigger browser automations from any Zap.
 slug: integrations/zapier
 keywords:
   - Zapier
@@ -17,15 +17,15 @@ Connect Skyvern to 7,000+ apps through Zapier. Trigger browser automations from 
 
 ## Available Triggers
 
-- **New or Updated Skyvern Workflow**: Starts a Zap whenever a workflow is created or modified.
+- **New or Updated Skyvern Agent**: Starts a Zap whenever an agent is created or modified.
 
 ## Available Actions
 
 - **Create and Run a Task**: Run an automation using **Skyvern 1.0** (simple, single-step goals)
 - **Create and Run Task V2**: Legacy action for explicitly requested V2 task runs
-- **Run a Workflow**: Run a pre-built Skyvern workflow with parameters
+- **Run an Agent**: Run a pre-built Skyvern agent with parameters
 - **Get a Task / Get a Task V2**: Retrieve results from a previously run task
-- **Get a Workflow**: Retrieve results from a previously run workflow
+- **Get an Agent**: Retrieve results from a previously run agent
 
 ## Setup
 
@@ -93,26 +93,26 @@ The navigation goal describes what to do *after* loading the URL. Don't include 
   <img src="/images/zapier/z.3.png" alt="Configure task fields in Zapier" />
 </Frame>
 
-### Run a Workflow
+### Run an Agent
 
-First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
+First, create your agent in the [Skyvern UI](https://app.skyvern.com).
 
-- **Workflow** (required): Select the workflow to run
-- **Parameters**: Fill in any parameters defined in your workflow
+- **Agent** (required): Select the agent to run
+- **Parameters**: Fill in any parameters defined in your agent
 
 <Frame>
-  <img src="/images/zapier/z.7w.png" alt="Select workflow in Zapier" />
+  <img src="/images/zapier/z.7w.png" alt="Select agent in Zapier" />
 </Frame>
 <Frame>
-  <img src="/images/zapier/z.8w.png" alt="Configure workflow parameters in Zapier" />
+  <img src="/images/zapier/z.8w.png" alt="Configure agent parameters in Zapier" />
 </Frame>
 
-### Get a Task / Workflow
+### Get a Task / Agent
 
 Retrieve the output of a completed run.
 
 - **Task ID** (required): Starts with `tsk_`
-- **Workflow Run ID** (required): Starts with `wr_`
+- **Agent Run ID** (required): Starts with `wr_`
 
 <Frame>
   <img src="/images/zapier/z.11ag.png" alt="Enter Task ID field in Zapier" />
@@ -122,9 +122,9 @@ Retrieve the output of a completed run.
 
 <CardGroup cols={2}>
   <Card
-    title="Build Workflows"
+    title="Build Agents"
     icon="diagram-project"
-    href="/cloud/manage-workflows"
+    href="/cloud/building-agents/manage-agents"
   >
     Create reusable multi-step automations in Skyvern
   </Card>

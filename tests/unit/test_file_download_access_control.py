@@ -32,6 +32,10 @@ def _artifact_s3_uri(organization_id: str) -> str:
     )
 
 
+def _legacy_gcs_uri(organization_id: str) -> str:
+    return f"gs://{settings.GCS_BUCKET_UPLOADS}/{settings.ENV}/{organization_id}/secret.pdf"
+
+
 @pytest.fixture(autouse=True)
 def storage(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     def assert_managed_file_access(uri: str, organization_id: str) -> None:
@@ -39,6 +43,7 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             uri == _legacy_s3_uri(ATTACKER_ORG_ID)
             or uri == _downloads_s3_uri(ATTACKER_ORG_ID)
             or uri == _artifact_s3_uri(ATTACKER_ORG_ID)
+            or uri == _legacy_gcs_uri(ATTACKER_ORG_ID)
         ):
             return
         raise PermissionError(f"No permission to access storage URI: {uri}")
@@ -214,3 +219,26 @@ async def test_download_file_reraises_permission_error() -> None:
     with pytest.raises(PermissionError, match="No permission") as exc_info:
         await files.download_file(_legacy_s3_uri(VICTIM_ORG_ID), organization_id=ATTACKER_ORG_ID)
     assert "No permission" in str(exc_info.value)
+
+
+def test_validate_download_url_allows_same_org_gcs_uri() -> None:
+    # Discriminating check: a gs:// URI must be routed to the managed-storage
+    # access check, not rejected as an unsupported scheme.
+    assert files.validate_download_url(_legacy_gcs_uri(ATTACKER_ORG_ID), organization_id=ATTACKER_ORG_ID) is True
+
+
+def test_validate_download_url_rejects_cross_org_gcs_uri() -> None:
+    assert files.validate_download_url(_legacy_gcs_uri(VICTIM_ORG_ID), organization_id=ATTACKER_ORG_ID) is False
+
+
+@pytest.mark.asyncio
+async def test_download_file_routes_gcs_uri_to_managed_storage(storage: SimpleNamespace) -> None:
+    path = await files.download_file(_legacy_gcs_uri(ATTACKER_ORG_ID), organization_id=ATTACKER_ORG_ID)
+
+    storage.assert_managed_file_access.assert_called_once_with(_legacy_gcs_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
+    storage.download_managed_file.assert_awaited_once_with(_legacy_gcs_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
+    try:
+        with open(path, "rb") as f:
+            assert f.read() == b"tenant-secret-bytes"
+    finally:
+        os.unlink(path)

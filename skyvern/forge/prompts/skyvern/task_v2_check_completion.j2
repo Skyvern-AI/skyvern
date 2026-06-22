@@ -6,9 +6,15 @@ Reply in JSON format with the following keys:
   "extraction_thought": str, // Think step by step. Should any information be extracted given the user goal? If yes, has all the information been extracted? If the user is searching for something, looking for information or specifically trying to extract information along side the goal, consider it an intention to extract information. Phrases like "find something", "show me something", "search something" and so on indicate the intention to extract information.
   "require_extraction": bool, // True if the user goal requires information extraction. False otherwise.
   "task_history_information": str, // Think step by step. In task history, what information has been collected that's helpful and relevant to the user goal, and what information is missing if any.
-  "information_extracted": optional[bool], // True if the needed information has been extracted. False if the needed information has not been extracted (no extract task in history). Null if the user goal does not require information extraction.
+  "information_extracted": optional[bool], // True if the needed information has been captured in the task history — by an extract task, OR present as extracted_data on a completed navigate/loop record. False if it has not been captured anywhere in history. Null if the user goal does not require information extraction.
   "thoughts": str, // Think step by step. Would completing the tasks in the task history be good enough to achieve the user goal? If more tasks need to be completed to achieve the goal, what would be the next task? If the goal appears impossible, explain why.
-  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information and it has not been done, the user goal is not achieved. If info extraction is not required, use the task history, assisted by the screenshot to decide if the user goal has been achieved.
+  "required_subgoals": array, // Decompose the user goal into its distinct required parts/legs. For a multi-part goal (e.g. "do A, and B, and C"), list each required part separately. For each part, decide whether the task history and current page actually satisfy it.
+    [{
+        "subgoal": str, // one required part of the user goal
+        "satisfied": bool, // true ONLY if this part is fully met based on task history / extracted information. A part that requires information is satisfied once that information has actually been captured in task history — by an extract task, or already present as extracted_data on a completed navigate/loop record. A navigate that merely reached the page WITHOUT capturing the data does NOT satisfy it.
+        "evidence": str // brief evidence it is satisfied, or a description of what is still missing
+    }],
+  "user_goal_achieved": bool, // True ONLY if EVERY required subgoal is satisfied. If task_history_information OR any entry in required_subgoals indicates a required part is missing, unmet, or not yet found, this MUST be false. Never set this true while simultaneously acknowledging that a required part is missing. If the user wants to extract information and it has not been done, the goal is not achieved. If info extraction is not required, use the task history, assisted by the screenshot to decide if every required part has been achieved.
   "should_terminate": bool, // True ONLY if there is CLEAR, EXPLICIT, UNAMBIGUOUS evidence that the goal is IMPOSSIBLE. The page must explicitly state the action cannot be done. False if there's ANY chance the goal can still be achieved.
   "termination_reason": str, // If should_terminate is true, quote the EXACT error message or text from the page that proves impossibility. Null if should_terminate is false.
   "failure_categories": array // Only populate when should_terminate is true. Classify the root cause. Categories: ANTI_BOT_DETECTION (CAPTCHA, Cloudflare, bot detection), BROWSER_ERROR (crash, page closed), NAVIGATION_FAILURE (404, redirect), PAGE_LOAD_TIMEOUT (timeout), AUTH_FAILURE (login failed, MFA), LLM_REASONING_ERROR (wrong element, wrong action), CREDENTIAL_ERROR (missing credentials), ELEMENT_NOT_FOUND (target missing), WRONG_PAGE_STATE (unexpected page), DATA_EXTRACTION_FAILURE (extraction failed), INFRASTRUCTURE_ERROR (network, OOM), UNKNOWN (cannot determine). Return one or more categories ordered by likelihood.
@@ -27,6 +33,11 @@ CRITICAL - Be very conservative about termination. Only terminate when:
 - NOT when you're on a wrong page that could be navigated away from
 
 When in doubt, set should_terminate to false and continue trying.
+
+CRITICAL - Do not declare success on a partially-complete multi-part goal:
+- Many goals have multiple required parts/legs (e.g. "find X AND find Y AND find Z"). The goal is achieved ONLY when ALL required parts are done.
+- If your own analysis (task_history_information, thoughts, or required_subgoals) identifies ANY required part as missing, unmet, or not yet found, you MUST set user_goal_achieved to false so the agent attempts the missing part next.
+- Setting user_goal_achieved to false here does NOT fail the task — it lets the agent keep working on the missing part. Only set should_terminate to true if a required part is genuinely IMPOSSIBLE per the termination rules above; in that case give a termination_reason.
 
 User goal:
 ```

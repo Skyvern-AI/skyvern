@@ -310,6 +310,7 @@ class ArtifactManager:
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            file_size=len(data) if data is not None else _safe_file_size_from_path(path),
             data=data,
             path=path,
         )
@@ -424,6 +425,53 @@ class ArtifactManager:
             uri=uri,
             filename=filename,
             artifact_type=ArtifactType.RECORDING,
+            checksum=checksum,
+            file_size=file_size,
+        )
+
+    async def create_run_recording_artifact(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        uri: str,
+        workflow_run_id: str | None = None,
+        checksum: str | None = None,
+        file_size: int | None = None,
+    ) -> str:
+        """Register a per-run clip as a RECORDING Artifact scoped to ``run_id`` (``browser_session_id``
+        unset). Idempotency is the caller's responsibility.
+        """
+        artifact_id = generate_artifact_id()
+        await app.DATABASE.artifacts.create_artifact(
+            artifact_id=artifact_id,
+            artifact_type=ArtifactType.RECORDING,
+            uri=uri,
+            organization_id=organization_id,
+            run_id=run_id,
+            workflow_run_id=workflow_run_id,
+            checksum=checksum,
+            file_size=file_size,
+        )
+        LOG.debug("Registered run-scoped recording artifact", artifact_id=artifact_id, run_id=run_id, uri=uri)
+        return artifact_id
+
+    async def create_browser_session_replay_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        checksum: str | None = None,
+        file_size: int | None = None,
+    ) -> str:
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.SESSION_REPLAY,
             checksum=checksum,
             file_size=file_size,
         )
@@ -1017,18 +1065,22 @@ class ArtifactManager:
         organization_id: str | None,
         data: bytes,
         primary_key: str = "task_id",
-    ) -> None:
+    ) -> str | None:
         if not artifact_id or not organization_id:
             return None
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
-            return
+            return None
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
 
-        if not artifact[primary_key]:
-            raise ValueError(f"{primary_key} is required to update artifact data.")
-        self.upload_aiotasks_map[artifact[primary_key]].append(aio_task)
+        # A code-block recording artifact is workflow-run-block-scoped rather than task-scoped, so
+        # key the upload tracking on the first available scope id instead of failing on a null task_id.
+        aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
+        if not aio_task_key:
+            raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")
+        self.upload_aiotasks_map[aio_task_key].append(aio_task)
+        return aio_task_key
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)

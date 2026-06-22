@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
+from skyvern.forge.sdk.schemas.credentials import (
+    CredentialVaultType,
+    CreditCardBillingAddress,
+    CreditCardCredential,
+    PasswordCredential,
+)
 from skyvern.forge.sdk.workflow import context_manager as cm
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
@@ -23,7 +28,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
             self.totp_identifier = None
             self.totp = None
 
-        def model_dump(self) -> dict:
+        def model_dump(self, exclude_none: bool = False) -> dict:
             return {}
 
     class FakeCredentialItem:
@@ -66,9 +71,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
     assert context.get_credential_totp_identifier("credential_param") == "user@example.com"
 
 
-async def _register_with_credential(
-    monkeypatch: pytest.MonkeyPatch, credential: PasswordCredential
-) -> WorkflowRunContext:
+async def _register_with_credential(monkeypatch: pytest.MonkeyPatch, credential: object) -> WorkflowRunContext:
     db_credential = SimpleNamespace(
         credential_id="cred-1",
         organization_id="org-1",
@@ -158,6 +161,58 @@ async def test_find_credential_parameter_key_for_secret_round_trip(
     username_secret_id = context.values["credential_param"]["username"]
     assert context.find_credential_parameter_key_for_secret(username_secret_id) == "credential_param"
     assert context.find_credential_parameter_key_for_secret("nonexistent") is None
+
+
+@pytest.mark.asyncio
+async def test_register_credit_card_flattens_billing_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = CreditCardCredential(
+        card_number="4111111111111111",
+        card_cvv="123",
+        card_exp_month="12",
+        card_exp_year="2030",
+        card_brand="visa",
+        card_holder_name="Jane Doe",
+        billing_address=CreditCardBillingAddress(
+            line1="123 Main St",
+            state_code="CA",
+            country_code="US",
+        ),
+        billing_email="billing@example.com",
+        metadata={"customer_id": "cus_123"},
+    )
+    context = await _register_with_credential(monkeypatch, credential)
+
+    values = context.values["credential_param"]
+    assert context.secrets[values["billing_address_line1"]] == "123 Main St"
+    assert context.secrets[values["billing_address_state_code"]] == "CA"
+    assert context.secrets[values["billing_address_country_code"]] == "US"
+    assert context.secrets[values["billing_email"]] == "billing@example.com"
+    assert context.secrets[values["metadata_customer_id"]] == "cus_123"
+
+
+@pytest.mark.asyncio
+async def test_register_credit_card_preserves_colliding_metadata_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = CreditCardCredential(
+        card_number="4111111111111111",
+        card_cvv="123",
+        card_exp_month="12",
+        card_exp_year="2030",
+        card_brand="visa",
+        card_holder_name="Jane Doe",
+        metadata={
+            "Customer ID": "cus_upper",
+            "customer-id": "cus_dash",
+        },
+    )
+    context = await _register_with_credential(monkeypatch, credential)
+
+    values = context.values["credential_param"]
+    assert context.secrets[values["metadata_customer_id"]] == "cus_upper"
+    assert context.secrets[values["metadata_customer_id_2"]] == "cus_dash"
 
 
 def test_task_v2_block_resolves_totp_identifier_from_context() -> None:

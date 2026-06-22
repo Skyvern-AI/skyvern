@@ -27,8 +27,7 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.forge import app
-from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
     WorkflowCopilotNarrationUpdate,
@@ -66,15 +65,44 @@ MAX_DESIGN_ACTIVITY_ENTRIES = 50
 # Mirror of the FE ACTIVITY_TOOL_DENYLIST in narrativeState.ts.
 ACTIVITY_TOOL_DENYLIST = frozenset({"list_credentials", "get_run_results", "get_browser_screenshot"})
 
+# Shared classification for a code-authoring reject the streaming adapter renders
+# as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
+# consumed by the SSE layer (streaming_adapter) — one source of truth for both.
+CODE_REPAIR_PROGRESS_SURFACE_KIND = "code_repair_progress"
+CODE_REPAIR_PROGRESS_TEXT = "Refining the workflow's code"
+
+_TOOL_ACTIVITY_DISPLAY_LABELS = {
+    # Mirror of the FE ACTIVITY_TOOL_DISPLAY_LABELS in narrativeState.ts.
+    "update_workflow": "Updating workflow",
+    "update_and_run_blocks": "Testing workflow",
+    "run_blocks_and_collect_debug": "Testing workflow",
+    "evaluate": "Inspecting page",
+    "click": "Interacting with page",
+    "type_text": "Entering text",
+    "scroll": "Interacting with page",
+    "select_option": "Selecting option",
+    "press_key": "Interacting with page",
+    "navigate_browser": "Opening page",
+    "get_block_schema": "Checking workflow block options",
+    "inspect_current_workflow": "Inspecting workflow",
+}
+
+
+def tool_activity_display_label(tool_name: str) -> str:
+    """Return a product-safe label for user-visible activity rows."""
+    return _TOOL_ACTIVITY_DISPLAY_LABELS.get(tool_name, "Working")
+
 
 def build_tool_call_activity(tool_name: str, iteration: int, tool_call_id: str) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
+    display_label = tool_activity_display_label(tool_name)
     return {
         "kind": "tool_call",
-        "text": f"Calling {tool_name}…",
+        "text": f"{display_label}…",
         "iteration": iteration,
         "toolName": tool_name,
+        "displayLabel": display_label,
         "id": f"tc-{tool_call_id}",
     }
 
@@ -84,11 +112,13 @@ def build_tool_result_activity(
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
+    display_label = tool_activity_display_label(tool_name)
     return {
         "kind": "tool_result",
-        "text": summary or tool_name,
+        "text": summary or display_label,
         "iteration": iteration,
         "toolName": tool_name,
+        "displayLabel": display_label,
         "success": success,
         "id": f"tr-{tool_call_id}",
     }
@@ -158,6 +188,8 @@ class NarratorState:
     block_activity: dict[str, list[NarrativeActivityEntry]] = field(default_factory=dict)
     design_activity: list[NarrativeActivityEntry] = field(default_factory=list)
     running_block_label: str | None = None
+    # Per-turn (NarratorState lives one turn); collapses repeated code-repair progress to one entry.
+    emitted_progress_texts: set[str] = field(default_factory=set)
 
     def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
         if entry is None:
@@ -401,34 +433,11 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -
 
 
 def _get_narrator_handler() -> Any:
-    # SECONDARY also serves the scraper and other non-copilot paths; prefer
-    # the copilot-scoped fast handler so narration tunes independently.
-    try:
-        handler = app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
-    except (RuntimeError, AttributeError):
-        handler = None
-    if handler is not None:
-        return handler
-    try:
-        return app.SECONDARY_LLM_API_HANDLER
-    except (RuntimeError, AttributeError):
-        return None
+    return get_fast_copilot_handler()
 
 
 async def resolve_narrator_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any:
-    # Resolution order: PostHog LLM_CONFIG_BY_PROMPT_TYPE["workflow-copilot-narration"]
-    # → env-driven WORKFLOW_COPILOT_FAST_LLM_API_HANDLER → SECONDARY_LLM_API_HANDLER.
-    if workflow_permanent_id and organization_id:
-        try:
-            posthog_handler = await get_llm_handler_for_prompt_type(
-                "workflow-copilot-narration", workflow_permanent_id, organization_id
-            )
-        except Exception as exc:
-            LOG.warning("narrator PostHog lookup failed, falling back", error=str(exc))
-            posthog_handler = None
-        if posthog_handler is not None:
-            return posthog_handler
-    return _get_narrator_handler()
+    return await resolve_fast_copilot_handler(workflow_permanent_id, organization_id)
 
 
 def handler_available() -> bool:

@@ -20,21 +20,29 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
-from skyvern.forge.sdk.routes.workflow_copilot import COPILOT_V2_FLAG_KEY, workflow_copilot_chat_post
+from skyvern.forge.sdk.routes.workflow_copilot import (
+    COPILOT_V2_FLAG_KEY,
+    _validate_copilot_audio_artifact_id,
+    workflow_copilot_chat_audio,
+    workflow_copilot_chat_post,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
 
 
-def _make_chat_request() -> WorkflowCopilotChatRequest:
+def _make_chat_request(mode: str | None = None, code_block: bool | None = None) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
         workflow_id="wf-request",
@@ -42,7 +50,177 @@ def _make_chat_request() -> WorkflowCopilotChatRequest:
         workflow_run_id=None,
         message="Please update it",
         workflow_yaml="title: Example",
+        mode=mode,
+        code_block=code_block,
     )
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_upload_stores_artifact_for_existing_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(
+            get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
+            create_workflow_copilot_chat=AsyncMock(),
+        ),
+    )
+    artifact_manager = SimpleNamespace(
+        create_log_artifact=AsyncMock(return_value="a_audio"),
+        wait_for_upload_aiotasks=AsyncMock(),
+    )
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", artifact_manager)
+    file = SimpleNamespace(
+        content_type="audio/webm",
+        read=AsyncMock(return_value=b"audio-bytes"),
+        close=AsyncMock(),
+    )
+
+    response = await workflow_copilot_chat_audio(
+        workflow_permanent_id="wpid-1",
+        workflow_copilot_chat_id="chat-1",
+        file=file,
+        organization=SimpleNamespace(organization_id="org-1"),
+    )
+
+    assert response.workflow_copilot_chat_id == "chat-1"
+    assert response.audio_artifact_id == "a_audio"
+    app.DATABASE.workflow_params.create_workflow_copilot_chat.assert_not_called()
+    artifact_manager.create_log_artifact.assert_awaited_once()
+    artifact_manager.wait_for_upload_aiotasks.assert_awaited_once_with(["chat-1"])
+    file.read.assert_awaited_once_with(settings.MAX_UPLOAD_FILE_SIZE + 1)
+    file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_upload_rejects_unsupported_audio_content_type() -> None:
+    file = SimpleNamespace(
+        content_type="audio/fake-binary",
+        read=AsyncMock(return_value=b"audio-bytes"),
+        close=AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_audio(
+            workflow_permanent_id="wpid-1",
+            workflow_copilot_chat_id="chat-1",
+            file=file,
+            organization=SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Unsupported audio format"
+    file.read.assert_not_awaited()
+    file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_upload_rejects_oversized_audio_without_reading_past_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "MAX_UPLOAD_FILE_SIZE", 4)
+    file = SimpleNamespace(
+        content_type="audio/webm;codecs=opus",
+        read=AsyncMock(return_value=b"12345"),
+        close=AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_audio(
+            workflow_permanent_id="wpid-1",
+            workflow_copilot_chat_id="chat-1",
+            file=file,
+            organization=SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 413
+    file.read.assert_awaited_once_with(5)
+    file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_validate_copilot_audio_artifact_id_rejects_foreign_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = SimpleNamespace(
+        artifact_type=ArtifactType.AUDIO,
+        uri="s3://bucket/v1/local/org-1/logs/workflow_copilot_chat/chat-2/t.webm",
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "artifacts",
+        SimpleNamespace(get_artifact_by_id=AsyncMock(return_value=artifact)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _validate_copilot_audio_artifact_id(
+            audio_artifact_id="a_audio",
+            organization_id="org-1",
+            workflow_copilot_chat_id="chat-1",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "not linked" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_validate_copilot_audio_artifact_id_accepts_chat_scoped_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = SimpleNamespace(
+        artifact_type=ArtifactType.AUDIO,
+        uri="s3://bucket/v1/local/org-1/logs/workflow_copilot_chat/chat-1/t.webm",
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "artifacts",
+        SimpleNamespace(get_artifact_by_id=AsyncMock(return_value=artifact)),
+    )
+
+    validated = await _validate_copilot_audio_artifact_id(
+        audio_artifact_id="a_audio",
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+    )
+
+    assert validated == "a_audio"
+
+
+def test_terminal_narrative_metadata_preserves_payload_and_adds_contract_fields() -> None:
+    payload = {
+        "turnId": "turn-1",
+        "turnIndex": 0,
+        "mode": "build",
+        "designStarted": True,
+        "designEnded": True,
+        "draft": {"blockCount": 1, "blockLabels": ["open_page"], "summary": None},
+        "blocks": [],
+        "terminal": "response",
+        "terminalMessage": "Cancelled.",
+        "narrativeSummary": "Cancelled.",
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": "2026-05-25T00:00:00Z",
+        "endedAt": "2026-05-25T00:00:05Z",
+    }
+
+    enriched = workflow_copilot_route._with_terminal_narrative_metadata(
+        payload,
+        cancelled=True,
+        proposal_disposition="review_untested",
+    )
+
+    assert enriched is not None
+    assert enriched["cancelled"] is True
+    assert enriched["proposalDisposition"] == "review_untested"
+    assert enriched["draft"] == payload["draft"]
+    assert "cancelled" not in payload
+    assert "proposalDisposition" not in payload
 
 
 def _install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -130,6 +308,78 @@ async def test_flag_on_dispatches_to_new_copilot(monkeypatch: pytest.MonkeyPatch
     new_copilot_mock.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mode='ask' must take the v1 path even when the settings flag is on."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    new_copilot_mock = AsyncMock(side_effect=AssertionError("mode='ask' must not reach the v2 path"))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    captured = _install_fake_create(monkeypatch)
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode="ask"), organization)
+
+    assert response is captured["sentinel"]
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_mode_build_forces_v2_over_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mode='build' must take the v2 path even when the settings flag is off."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    _install_mock_provider(monkeypatch, return_value=False)
+
+    sentinel = object()
+    new_copilot_mock = AsyncMock(return_value=sentinel)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode="build"), organization)
+
+    assert response is sentinel
+    new_copilot_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mode absent (None) keeps following the settings flag in both directions."""
+    new_copilot_mock = AsyncMock(return_value=object())
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+    captured = _install_fake_create(monkeypatch)
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    _install_mock_provider(monkeypatch, return_value=False)
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
+    assert response is captured["sentinel"]
+    new_copilot_mock.assert_not_awaited()
+
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
+    assert response is new_copilot_mock.return_value
+    new_copilot_mock.assert_awaited_once()
+
+
 def _setup_new_copilot_mocks(
     monkeypatch: pytest.MonkeyPatch,
     chat: SimpleNamespace,
@@ -158,7 +408,7 @@ def _setup_new_copilot_mocks(
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
 
@@ -193,6 +443,7 @@ def _setup_new_copilot_mocks(
     )
     app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
 
     return restore_mock
 
@@ -301,7 +552,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
     monkeypatch.setattr(
@@ -332,6 +583,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
     )
     app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
     app.AGENT_FUNCTION.resolve_org_api_key = AsyncMock(return_value="sk-test-key")
 
     request = MagicMock()
@@ -438,6 +690,19 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     assert expected_summary in assistant_contents[0]
     assert "The workflow was not modified" in assistant_contents[0]
     assert "reference cpe_" in assistant_contents[0]
+
+    assistant_messages = [
+        call.kwargs
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    ]
+    assert len(assistant_messages) == 1
+    turn_outcome = assistant_messages[0]["turn_outcome"]
+    assert turn_outcome is not None
+    assert turn_outcome.response_kind == "recover"
+    assert turn_outcome.terminal_reason == workflow_copilot_route.COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    assert turn_outcome.copilot_effective_mode == "build"
+    assert turn_outcome.copilot_turn_id is not None
 
     frames = [call.args[0] for call in stream.send.await_args_list if call.args]
     response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
@@ -639,6 +904,105 @@ async def test_proposed_workflow_cleared_on_restore(
     assert len(response_frames) == 1, f"expected exactly one RESPONSE frame, got {response_frames!r}"
     expected_payload_workflow = proposal.model_dump.return_value if has_valid_proposal else None
     assert response_frames[0].updated_workflow == expected_payload_workflow
+    if not auto_accept:
+        assert response_frames[0].workflow_applied is False
+
+
+@pytest.mark.asyncio
+async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    proposal = MagicMock()
+    proposal.model_dump.return_value = {"workflow_id": "wf-applied"}
+    proposal.title = "Applied"
+    proposal.description = "Applied description"
+    proposal.workflow_definition = SimpleNamespace(blocks=[])
+    proposal.proxy_location = None
+    proposal.webhook_callback_url = None
+    proposal.totp_verification_url = None
+    proposal.totp_identifier = None
+    proposal.persist_browser_session = False
+    proposal.browser_profile_id = None
+    proposal.model = None
+    proposal.max_screenshot_scrolls = None
+    proposal.extra_http_headers = None
+    proposal.cdp_connect_headers = None
+    proposal.run_with = "agent"
+    proposal.ai_fallback = None
+    proposal.cache_key = None
+    proposal.adaptive_caching = False
+    proposal.code_version = 2
+    proposal.run_sequentially = False
+    proposal.sequential_key = None
+    agent_result = SimpleNamespace(
+        user_response="done",
+        updated_workflow=proposal,
+        global_llm_context=None,
+        workflow_yaml="title: Applied",
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        proposal_disposition="auto_applicable",
+        apply_without_review=True,
+        has_staged_proposal=True,
+        staged_workflow=proposal,
+        turn_outcome=None,
+    )
+
+    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_service = SimpleNamespace(update_workflow_definition=AsyncMock())
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "resolve_copilot_created_by_stamp",
+        AsyncMock(return_value="copilot"),
+    )
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_not_awaited()
+    workflow_service.update_workflow_definition.assert_awaited_once()
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None] == []
+    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].workflow_applied is True
+    assert response_frames[0].updated_workflow == {"workflow_id": "wf-applied"}
 
 
 @pytest.mark.asyncio
@@ -662,13 +1026,15 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         description="Original description",
         workflow_definition=None,
     )
+    terminal_message = "I could not safely return that chat reply."
     agent_result = SimpleNamespace(
-        user_response="I could not safely return that chat reply.",
+        user_response=terminal_message,
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        response_type="ASK_QUESTION",
         unvalidated=False,
         output_policy_diagnostics={
             "final_output_policy_allowed": False,
@@ -697,6 +1063,23 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert not clear_calls, f"did not expect a clear call, got {update_calls!r}"
+
+    assistant_call = next(
+        call
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    )
+    assert assistant_call.kwargs["content"] == terminal_message
+
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1
+    frame = response_frames[0]
+    assert frame.message == terminal_message
+    assert frame.response_type == "ASK_QUESTION"
 
 
 @pytest.mark.asyncio
@@ -733,6 +1116,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
         output_policy_diagnostics={
             "raw_output_kind": "informational_answer",
             "final_output_kind": "informational_answer",
+            "raw_reason_codes": ["internal_block_taxonomy_leak"],
             "hard_block_reason_codes": [],
             "soft_rewrite_reason_codes": ["internal_block_taxonomy_leak"],
             "raw_would_have_failed": True,

@@ -1,4 +1,11 @@
-import { useState, useRef, useEffect, ReactNode, Fragment } from "react";
+import {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  ReactNode,
+  Fragment,
+} from "react";
 
 export interface RadialMenuItem {
   id: string;
@@ -40,6 +47,11 @@ interface RadialMenuProps {
    * Defaults to "radial".
    */
   layout?: "radial" | "vertical";
+  /**
+   * Called when the menu's pinned (click-locked) state changes, so a consumer
+   * can reflect the active selection (e.g. a highlight ring on the trigger).
+   */
+  onPinnedChange?: (pinned: boolean) => void;
 }
 
 const proportionalAngle = (
@@ -82,13 +94,47 @@ export function RadialMenu({
   startAt,
   rotateText,
   layout = "radial",
+  onPinnedChange,
 }: RadialMenuProps) {
   const [isOpen, setIsOpen] = useState(false);
+  const [isPinned, setIsPinned] = useState(false);
   const [calculatedRadius, setCalculatedRadius] = useState<number>(100);
+
+  const close = useCallback(() => {
+    setIsOpen(false);
+    setIsPinned(false);
+  }, []);
   const wrapperRef = useRef<HTMLDivElement>(null);
-  const dom = {
-    root: useRef<HTMLDivElement>(null),
-  };
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    const handleMouseDown = (event: MouseEvent) => {
+      const root = rootRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        close();
+      }
+    };
+    const handleEscKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        close();
+      }
+    };
+
+    document.addEventListener("mousedown", handleMouseDown, true);
+    document.addEventListener("keydown", handleEscKey);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown, true);
+      document.removeEventListener("keydown", handleEscKey);
+    };
+  }, [isOpen, close]);
+
+  useEffect(() => {
+    onPinnedChange?.(isPinned);
+  }, [isPinned, onPinnedChange]);
 
   // effect to calculate radius based on wrapped component size if not provided
   useEffect(() => {
@@ -110,19 +156,22 @@ export function RadialMenu({
 
   return (
     <div
-      ref={dom.root}
+      ref={rootRef}
       className="relative z-[1000000]"
       onMouseLeave={() => {
-        setIsOpen(false);
+        if (!isPinned) {
+          setIsOpen(false);
+        }
       }}
     >
-      {/* a pad (buffer) to increase the deactivation area when leaving the component */}
+      {/* a pad (buffer) to widen the hover deactivation area; disabled while
+          pinned so outside clicks pass through to the canvas underneath */}
       <div
         className="absolute left-1/2 top-1/2 z-10"
         style={{
           width: `${padSizeHorizontal}px`,
           height: `${padSizeVertical}px`,
-          pointerEvents: isOpen ? "auto" : "none",
+          pointerEvents: isOpen && !isPinned ? "auto" : "none",
           transform: "translate(-50%, -50%)",
         }}
       />
@@ -133,7 +182,12 @@ export function RadialMenu({
         onClick={(e) => {
           e.preventDefault();
           e.stopPropagation();
-          setIsOpen(!isOpen);
+          if (isPinned) {
+            close();
+          } else {
+            setIsOpen(true);
+            setIsPinned(true);
+          }
         }}
         onMouseEnter={() => {
           setIsOpen(true);
@@ -164,7 +218,7 @@ export function RadialMenu({
               onClick={() => {
                 if (isEnabled) {
                   item.onClick();
-                  setIsOpen(false);
+                  close();
                 }
               }}
               className="absolute left-1/2 top-1/2 z-30 flex cursor-pointer items-center gap-2 transition-all duration-300 ease-out"
@@ -230,7 +284,7 @@ export function RadialMenu({
             <button
               onClick={() => {
                 item.onClick();
-                setIsOpen(false);
+                close();
               }}
               disabled={!isEnabled}
               className="absolute left-1/2 top-1/2 z-30 flex items-center justify-center rounded-full bg-white shadow-lg transition-all duration-300 ease-out hover:bg-gray-50 disabled:cursor-not-allowed"
@@ -252,7 +306,7 @@ export function RadialMenu({
                 key={`${item.id}-text`}
                 onClick={() => {
                   item.onClick();
-                  setIsOpen(false);
+                  close();
                 }}
                 className="absolute left-1/2 top-1/2 z-30 cursor-pointer whitespace-nowrap rounded bg-white px-2 py-1 text-xs text-gray-700 shadow-md transition-all duration-300 ease-out"
                 style={{

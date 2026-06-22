@@ -110,7 +110,11 @@ async def skyvern_browser_session_create(
                     create_kwargs["extensions"] = extensions
                 session = await skyvern.create_browser_session(**create_kwargs)
                 timer.mark("sdk")
-                ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
+                ctx = BrowserContext(
+                    mode="cloud_session",
+                    session_id=session.browser_session_id,
+                    can_access_localhost=False,
+                )
                 return make_result(
                     "skyvern_browser_session_create",
                     browser_context=ctx,
@@ -132,9 +136,13 @@ async def skyvern_browser_session_create(
             timer.mark("sdk")
 
             if result.local:
-                ctx = BrowserContext(mode="local")
+                ctx = BrowserContext(mode="local", can_access_localhost=True)
             else:
-                ctx = BrowserContext(mode="cloud_session", session_id=result.session_id)
+                ctx = BrowserContext(
+                    mode="cloud_session",
+                    session_id=result.session_id,
+                    can_access_localhost=False,
+                )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
 
         except ValueError as e:
@@ -175,11 +183,29 @@ async def skyvern_browser_session_create(
     )
 
 
+async def _fetch_session_recording_data(skyvern: Any, sid: str | None) -> dict[str, Any]:
+    """Best-effort fetch of recording data from a closed session."""
+    if not sid:
+        return {}
+    try:
+        session = await skyvern.get_browser_session(sid)
+        recordings = [{"url": r.url, "filename": r.filename} for r in (session.recordings or [])]
+        downloaded_files = [{"url": f.url, "filename": f.filename} for f in (session.downloaded_files or [])]
+        return {
+            "app_url": session.app_url,
+            "recordings": recordings,
+            "downloaded_files": downloaded_files,
+        }
+    except Exception:
+        return {}
+
+
 async def skyvern_browser_session_close(
     session_id: Annotated[str | None, Field(description="Session ID to close (uses current if not specified)")] = None,
 ) -> dict[str, Any]:
     """Close a browser session when you're done. Frees cloud resources.
 
+    Returns session_id, closed status, plus app_url and recording URLs for the session.
     Closes the specified session or the current active session.
     """
     current = get_current_session()
@@ -222,9 +248,10 @@ async def skyvern_browser_session_close(
                     raise RuntimeError("Expected session close result after successful close operation")
 
                 timer.mark("sdk")
+                recording_data = await _fetch_session_recording_data(skyvern, session_id)
                 return make_result(
                     "skyvern_browser_session_close",
-                    data={"session_id": result.session_id, "closed": result.closed},
+                    data={"session_id": result.session_id, "closed": result.closed, **recording_data},
                     timing_ms=timer.timing_ms,
                 )
 
@@ -252,9 +279,11 @@ async def skyvern_browser_session_close(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to close session"),
             )
 
+    skyvern = get_skyvern()
+    recording_data = await _fetch_session_recording_data(skyvern, closed_id)
     return make_result(
         "skyvern_browser_session_close",
-        data={"session_id": closed_id, "closed": True},
+        data={"session_id": closed_id, "closed": True, **recording_data},
         timing_ms=timer.timing_ms,
     )
 
@@ -332,6 +361,9 @@ async def skyvern_browser_session_get(
     current = get_current_session()
     is_current = current.context and current.context.session_id == session_id
 
+    recordings = [{"url": r.url, "filename": r.filename} for r in (session.recordings or [])]
+    downloaded_files = [{"url": f.url, "filename": f.filename} for f in (session.downloaded_files or [])]
+
     return make_result(
         "skyvern_browser_session_get",
         browser_context=BrowserContext(mode="cloud_session", session_id=session_id) if is_current else None,
@@ -343,6 +375,9 @@ async def skyvern_browser_session_get(
             "timeout": session.timeout,
             "runnable_id": session.runnable_id,
             "is_current": is_current,
+            "app_url": session.app_url,
+            "recordings": recordings,
+            "downloaded_files": downloaded_files,
         },
         timing_ms=timer.timing_ms,
     )

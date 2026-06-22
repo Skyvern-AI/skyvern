@@ -67,7 +67,8 @@ function GoogleSheetsReadNode({
           type="google_sheets_read"
         />
         <NodeBody>
-          <BuildModeOnly>
+          {/* Editor mounts live Google credential/Sheets queries; keep it out of read-only version diffs. */}
+          <BuildModeOnly renderInReadOnlyComparison={false}>
             <GoogleSheetsReadEditor blockId={id} />
           </BuildModeOnly>
         </NodeBody>

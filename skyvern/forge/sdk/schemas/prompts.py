@@ -63,6 +63,28 @@ class GenerateWorkflowTitleResponse(BaseModel):
 
 MAX_SUMMARIZE_OUTPUT_JSON_LENGTH = 100_000
 MAX_SUMMARIZE_CONTEXT_STRING_LENGTH = 500
+MAX_SUMMARIZE_OUTPUT_JSON_DEPTH = 200
+
+
+def _json_nesting_depth(value: str) -> int:
+    depth = max_depth = 0
+    in_string = escaped = False
+    for char in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            max_depth = max(max_depth, depth)
+        elif char in "]}":
+            depth -= 1
+    return max_depth
 
 
 class SummarizeOutputRequest(BaseModel):
@@ -86,12 +108,14 @@ class SummarizeOutputRequest(BaseModel):
     @field_validator("output_json")
     @classmethod
     def _validate_output_json(cls, value: str) -> str:
+        # Bound nesting before json.loads: whether it raises RecursionError on deep
+        # input is Python-version-dependent, so enforce the limit ourselves.
+        if _json_nesting_depth(value) > MAX_SUMMARIZE_OUTPUT_JSON_DEPTH:
+            raise ValueError("output_json is too deeply nested")
         try:
             json.loads(value)
         except json.JSONDecodeError as exc:
             raise ValueError(f"output_json must be valid JSON: {exc.msg}") from exc
-        except RecursionError as exc:
-            raise ValueError("output_json is too deeply nested") from exc
         return value
 
 

@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.protocols import TaskReader
 from skyvern.forge.sdk.db.utils import (
     convert_to_task_v2,
     convert_to_workflow_run_block,
+    downloaded_file_count_from_output,
     serialize_proxy_location,
     truncate_oversized_jsonb_value,
 )
@@ -502,6 +503,9 @@ class ObserverRepository(BaseRepository):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
     ) -> WorkflowRunBlock:
+        # Read before truncation: truncate_oversized_jsonb_value strips downloaded_files
+        # from oversized payloads, which would zero out an otherwise-real count.
+        derived_downloaded_file_count = downloaded_file_count_from_output(output)
         if output is not None:
             output = truncate_oversized_jsonb_value(
                 output,
@@ -589,6 +593,10 @@ class ObserverRepository(BaseRepository):
                     workflow_run_block.executed_branch_result = executed_branch_result
                 if executed_branch_next_block is not None:
                     workflow_run_block.executed_branch_next_block = executed_branch_next_block
+                # Count derives from the output; rewrite it whenever output is written
+                # (a non-download output clears a stale count). Falsy output leaves it.
+                if output:
+                    workflow_run_block.downloaded_file_count = derived_downloaded_file_count
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
@@ -600,6 +608,32 @@ class ObserverRepository(BaseRepository):
                 raise RuntimeError("task_reader dependency not set")
             task = await self._task_reader.get_task(task_id, organization_id=workflow_run_block.organization_id)
         return convert_to_workflow_run_block(workflow_run_block, task=task)
+
+    @db_operation("bulk_update_workflow_run_blocks_by_workflow_run_id")
+    async def bulk_update_workflow_run_blocks_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        new_status: str,
+        only_if_status_in: list[str],
+        failure_reason: str | None = None,
+    ) -> int:
+        if not only_if_status_in:
+            return 0
+
+        async with self.Session() as session:
+            update_values: dict[str, Any] = {"status": new_status}
+            if failure_reason is not None:
+                update_values["failure_reason"] = failure_reason
+
+            stmt = (
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.status.in_(only_if_status_in))
+                .values(**update_values)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
 
     @db_operation("get_workflow_run_block")
     async def get_workflow_run_block(

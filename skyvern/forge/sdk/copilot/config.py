@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from skyvern.config import settings
+
+
+class BlockAuthoringPolicy(StrEnum):
+    STANDARD = "standard"
+    CODE_ONLY_BROWSER = "code_only_browser"
+
+
+def normalize_block_authoring_policy(value: object) -> BlockAuthoringPolicy:
+    if isinstance(value, BlockAuthoringPolicy):
+        return value
+    if isinstance(value, str):
+        try:
+            return BlockAuthoringPolicy(value)
+        except ValueError:
+            return BlockAuthoringPolicy.STANDARD
+    return BlockAuthoringPolicy.STANDARD
+
+
+def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringPolicy:
+    return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
+
+
+def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:
+    return normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
 
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 35
 DEFAULT_TOKEN_BUDGET = 90_000
+SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD = 3
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
@@ -57,6 +84,20 @@ POST_FAILED_TEST_NUDGE = (
     "and the evidence strongly suggests the site cannot satisfy the request, "
     "respond explaining exactly what you tried and what blocked you.\n"
     "Do NOT resubmit the same workflow — you must change something substantive."
+)
+
+POST_FAILED_TEST_INSPECT_FIRST_NUDGE = (
+    "STOP — your last test run FAILED and the browser is still on the page it reached. "
+    "Do NOT respond to the user, and do NOT re-run a changed block goal blind.\n"
+    "1. Call get_run_results (pass the workflow_run_id) for the per-block failure_reason.\n"
+    '2. Then OBSERVE where it failed: call inspect_page_for_composition(target_url="current_page") '
+    "(or evaluate / get_browser_screenshot) on the reached page BEFORE changing anything. A failed "
+    "navigation/action often left the page in a state the block's goal did not expect — a popup or "
+    "overlay, a different layout, or an effect that already applied.\n"
+    "3. Use that observed evidence to decide HOW to change the workflow: keep the same block with a "
+    "corrected goal, swap to a different block type, or redesign the step. Do NOT guess a new goal "
+    "for the same block and re-run without first observing the page.\n"
+    "Do NOT resubmit the same workflow unchanged."
 )
 
 POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE = (
@@ -206,6 +247,18 @@ POST_PER_TOOL_BUDGET_NUDGE = (
     "with a blocker explanation."
 )
 
+POST_PER_TOOL_BUDGET_STOP_NUDGE = (
+    "STOP — you have now hit the per-tool-call time budget MORE THAN ONCE on this goal, "
+    "including after you already shrank the frontier. The page is too heavy to finish a "
+    "page-changing block within one tool call, and each retry has LESS budget than the last — "
+    "running again will fail faster, not succeed.\n"
+    "Do NOT call update_and_run_blocks or run_blocks_and_collect_debug again, and do NOT "
+    "redesign the workflow hoping a different shape runs faster. Reply to the user now: keep "
+    "the verified prefix, name the block that could not finish within the time budget, and "
+    "state exactly what was and was not verified end-to-end. Do not repeat this message as the "
+    "user-facing answer."
+)
+
 POST_NO_WORKFLOW_DELIVERY_NUDGE = (
     "STOP — you are telling the user you created or are showing a workflow, "
     "but no workflow update tool has succeeded in this turn. The user will see "
@@ -213,6 +266,22 @@ POST_NO_WORKFLOW_DELIVERY_NUDGE = (
     "workflow and test it, or respond with ASK_QUESTION if required input is "
     'missing. Do NOT say "Here\'s the workflow" until there is an actual '
     "workflow proposal behind the response."
+)
+
+POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE = (
+    "STOP — discover_workflow_entrypoint already resolved a candidate_url for this build turn, "
+    "but you have not inspected the resolved page or composed from it yet. Use the resolved "
+    "candidate_url as the goto_url entrypoint, inspect the page if needed, then call "
+    "update_and_run_blocks. Only ask a clarifying question after using the resolved page evidence "
+    "and only when a separate required non-URL input is still missing."
+)
+
+PRE_DISCOVERY_URL_QUESTION_NUDGE = (
+    "STOP — you are asking the user for an entry-point URL before resolving it yourself. "
+    "discover_workflow_entrypoint has not run this turn. Call "
+    "discover_workflow_entrypoint(site_or_url, intent_hint) to resolve the entrypoint from the "
+    "site the user named, then compose from the resolved page. Only ask for a URL if discovery "
+    "runs and cannot resolve a site."
 )
 
 PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
@@ -277,6 +346,7 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_navigate": POST_NAVIGATE_NUDGE,
     "post_intermediate_success": POST_INTERMEDIATE_SUCCESS_NUDGE,
     "post_failed_test": POST_FAILED_TEST_NUDGE,
+    "post_failed_test_inspect_first": POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
     "post_suspicious_success": POST_SUSPICIOUS_SUCCESS_NUDGE,
     "post_repeated_null_data": POST_REPEATED_NULL_DATA_NUDGE,
@@ -286,7 +356,10 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_non_retriable_nav_error_stop": POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
     "post_parameter_binding_stop": POST_PARAMETER_BINDING_STOP_NUDGE,
     "post_per_tool_budget": POST_PER_TOOL_BUDGET_NUDGE,
+    "post_per_tool_budget_stop": POST_PER_TOOL_BUDGET_STOP_NUDGE,
     "post_no_workflow_delivery": POST_NO_WORKFLOW_DELIVERY_NUDGE,
+    "post_discovery_entrypoint_url_question": POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
+    "pre_discovery_url_question": PRE_DISCOVERY_URL_QUESTION_NUDGE,
     "post_probable_site_block_stop_prefix": PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX,
     "post_probable_site_block_stop": POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     "post_anti_bot_failed_test": POST_ANTI_BOT_FAILED_TEST_NUDGE,
@@ -310,6 +383,8 @@ class CopilotConfig:
     security_rules: str = ""
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

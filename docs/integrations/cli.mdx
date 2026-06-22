@@ -1,7 +1,7 @@
 ---
 title: CLI & Skills
-subtitle: Automate browsers and manage workflows from the command line
-description: Use the skyvern CLI to run browser automations, manage workflows, store credentials, and configure MCP servers from the terminal. Supports shell scripts, CI/CD pipelines, and one-off tasks.
+subtitle: Automate browsers and manage agents from the command line
+description: Use the skyvern CLI to run browser automations, manage agents, store credentials, and configure MCP servers from the terminal. Supports shell scripts, CI/CD pipelines, and one-off tasks.
 slug: going-to-production/cli
 keywords:
   - CLI
@@ -14,7 +14,7 @@ keywords:
   - one-liner
 ---
 
-The `skyvern` CLI gives you direct access to browser automation, workflow management, credential storage, and more, all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
+The `skyvern` CLI gives you direct access to browser automation, agent management, credential storage, and more, all from your terminal. Use it in shell scripts, CI/CD pipelines, or for quick one-off tasks.
 
 ## Install
 
@@ -116,7 +116,7 @@ Always pass `--api-key` when using `--tunnel`. Without it, anyone with the ngrok
 
 See the [full guide](/developers/optimization/browser-tunneling) for all options, manual tunnel setup, and security details.
 
-### Workflows
+### Agents
 
 ```bash
 skyvern workflow list                              # List all workflows
@@ -143,7 +143,7 @@ skyvern credential delete --id cred_xxx
 
 Note: `credentials` (plural) is used for the interactive `add` command; `credential` (singular) for list/get/delete. Both forms are intentional.
 
-### Workflow blocks
+### Agent blocks
 
 ```bash
 skyvern block schema --block-type task     # Show the JSON schema for a block type
@@ -162,6 +162,7 @@ skyvern setup claude                  # Register with Claude Desktop
 skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
 skyvern setup openclaw           # Register with OpenClaw
+skyvern setup opencode           # Register with OpenCode (API key auth; avoids OAuth timeouts)
 skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
 skyvern mcp switch --dry-run          # Preview changes without writing files
 skyvern mcp profile list              # List saved switch sources

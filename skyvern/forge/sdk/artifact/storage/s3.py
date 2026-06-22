@@ -30,11 +30,17 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
 )
+from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
+    RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
+    RUN_RECORDING_PATH_SEGMENT,
+    sync_run_recording_clips,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
 
@@ -48,6 +54,12 @@ def _safe_get_file_size(path: str) -> int | None:
     except OSError:
         LOG.warning("Failed to get file size", path=path, exc_info=True)
         return None
+
+
+def _replace_file_extension(path: str, extension: str) -> str:
+    normalized_extension = extension.lstrip(".")
+    stem, _ = os.path.splitext(path)
+    return f"{stem}.{normalized_extension}" if normalized_extension else path
 
 
 class S3Storage(BaseStorage):
@@ -317,6 +329,21 @@ class S3Storage(BaseStorage):
         unzip_files(temp_zip_file_path, temp_dir)
         temp_zip_file.close()
         return temp_dir
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a browser profile from S3."""
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        LOG.info(
+            "Deleting browser profile",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            profile_uri=profile_uri,
+        )
+        # DeleteObject is idempotent: deleting a missing key is a no-op. Best-effort — log and
+        # swallow so a reap failure never breaks the promote or the soft-delete that triggered it.
+        await self.async_client.delete_file(profile_uri, log_exception=True)
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -869,6 +896,55 @@ class S3Storage(BaseStorage):
         """Sync a file from local browser session to S3."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         sc = await self._get_storage_class_for_org(organization_id, self.bucket)
+
+        if artifact_type == "videos":
+            # Anchor per-run clip offsets to browser close, captured before the (potentially
+            # slow) compress+upload below so a long upload doesn't shift every clip window.
+            recording_finalized_at = datetime.now(timezone.utc)
+            # Compress finalized Playwright recordings before upload. The raw
+            # local file remains the source of truth if ffmpeg fails; the S3
+            # object and artifact metadata reflect the prepared upload file.
+            async with prepare_recording_for_upload(local_file_path) as prepared_upload:
+                upload_file_path = prepared_upload.path
+                upload_remote_path = _replace_file_extension(remote_path, prepared_upload.file_extension)
+                uri = self._build_browser_session_uri(
+                    organization_id, browser_session_id, artifact_type, upload_remote_path, date
+                )
+                await self.async_client.upload_file_from_path(uri, upload_file_path, storage_class=sc)
+                # Register the uploaded recording for signed artifact serving.
+                checksum = calculate_sha256_for_file(upload_file_path)
+                file_size = _safe_get_file_size(upload_file_path)
+                await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    uri=uri,
+                    filename=os.path.basename(upload_remote_path),
+                    checksum=checksum,
+                    file_size=file_size,
+                )
+
+                async def _upload_clip(run_id: str, clip_path: str, filename: str) -> str:
+                    clip_uri = self._build_browser_session_uri(
+                        organization_id, browser_session_id, RUN_RECORDING_PATH_SEGMENT, f"{run_id}/{filename}", date
+                    )
+                    await self.async_client.upload_file_from_path(clip_uri, clip_path, storage_class=sc)
+                    return clip_uri
+
+                try:
+                    async with asyncio.timeout(RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS):
+                        await sync_run_recording_clips(
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            source_path=upload_file_path,
+                            upload_clip=_upload_clip,
+                            now=recording_finalized_at,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True
+                    )
+            return uri
+
         await self.async_client.upload_file_from_path(uri, local_file_path, storage_class=sc)
 
         if artifact_type == "downloads":
@@ -887,45 +963,16 @@ class S3Storage(BaseStorage):
             # overwrite) and ``create_browser_session_download_artifact``
             # (idempotent on ``(session, uri)``) are safe to retry.
             is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
-            checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
-            file_size = None if is_partial else _safe_get_file_size(local_file_path)
+            download_checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            download_file_size = None if is_partial else _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
-                checksum=checksum,
-                file_size=file_size,
+                checksum=download_checksum,
+                file_size=download_file_size,
             )
-        elif artifact_type == "videos":
-            # Register a RECORDING artifact row so
-            # ``GET /v1/browser_sessions/{id}`` serves the recording via a
-            # short signed ``/v1/artifacts/{id}/content`` URL instead of a
-            # raw S3 presigned URL. Recordings are uploaded once at session
-            # close (Playwright finalizes the file when the browser context
-            # closes — there's no partial / mid-write state to track).
-            #
-            # Artifact-row creation is best-effort here. The only caller
-            # (``DefaultPersistentSessionsManager.close_session``) wraps the
-            # whole final-sync in ``except Exception: LOG.exception(...)``
-            # without retry, so propagating doesn't recover from a missed
-            # write the way the watcher's retry does for downloads. The
-            # safety net is the gated legacy listing fallback in
-            # ``get_shared_recordings_in_browser_session``: when the session
-            # has no RECORDING rows we fall through to the S3 LIST path, so
-            # a row-less recording still surfaces via the legacy presigned
-            # URL until a subsequent close writes the row.
-            checksum = calculate_sha256_for_file(local_file_path)
-            file_size = _safe_get_file_size(local_file_path)
-            await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-                uri=uri,
-                filename=os.path.basename(remote_path),
-                checksum=checksum,
-                file_size=file_size,
-            )
-
         return uri
 
     async def delete_browser_session_file(

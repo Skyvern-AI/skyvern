@@ -34,9 +34,9 @@ Below the input, you'll see quick-action chips like "Add a product to cart" and 
 The more specific your prompt, the better. "Get the title of the #1 post" works much better than "get some data." Include the exact fields you want, what success looks like, and any constraints.
 </Tip>
 
-## Step 2: Create and run the workflow
+## Step 2: Create and run the agent
 
-Click the **send button** (arrow icon to the right of the input). Skyvern generates a workflow from your prompt using the default Skyvern 1.0 task engine and opens it in the workflow editor. Click **Run** in the top right, confirm the parameters, then click **Run workflow** to start execution.
+Click the **send button** (arrow icon to the right of the input). Skyvern generates an agent from your prompt using the default Skyvern 1.0 task engine and opens it in the agent editor. Click **Run** in the top right, confirm the parameters, then click **Run agent** to start execution.
 
 <Accordion title="Optional: Advanced settings">
 Click the **gear icon** next to send to configure additional options before running:
@@ -50,7 +50,7 @@ Click the **gear icon** next to send to configure additional options before runn
 | **2FA Identifier** | Identifier for a 2FA code to handle two-factor auth automatically |
 | **Extra HTTP Headers** | Custom HTTP request headers (dict format) |
 | **Generate Script** | Auto-generate reusable scripts from a successful run |
-| **Publish Workflow** | Create a workflow alongside this task run |
+| **Publish Agent** | Create an agent alongside this task run |
 | **Max Steps Override** | Cap the number of steps the AI can take |
 | **Data Schema** | Define structured JSON output format |
 | **Max Screenshot Scrolls** | Limit scrolls for post-action screenshots (default: 3) |
@@ -106,7 +106,7 @@ Now that you've seen the basic flow, here are a few ideas to try next:
 
 - **Fill a form**: Point Skyvern at a contact form and tell it what to enter in each field
 - **Compare prices**: Extract product names and prices from an e-commerce page using a data schema
-- **Navigate a flow**: Build a workflow to walk through a multi-page checkout or signup process
+- **Navigate a flow**: Build an agent to walk through a multi-page checkout or signup process
 - **Use an Agent template**: Check the **Agents** section in the sidebar for pre-built automations you can run instantly
 
 ---
@@ -126,6 +126,6 @@ Now that you've seen the basic flow, here are a few ideas to try next:
     icon="book"
     href="/developers/getting-started/core-concepts"
   >
-    Understand tasks, workflows, and other building blocks
+    Understand tasks, agents, and other building blocks
   </Card>
 </CardGroup>

@@ -79,22 +79,30 @@ def _patch_skyvern_http(
     return request_mock
 
 
-def _google_sheets_definition(block_type: str) -> dict[str, object]:
+def _known_drift_definition(block_type: str) -> dict[str, object]:
     block: dict[str, object] = {
         "block_type": block_type,
         "label": f"{block_type}_step",
-        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit",
-        "sheet_name": "Sheet1",
-        "range": "A1:D100",
-        "credential_id": "{{ google_credential_id }}",
     }
     if block_type == "google_sheets_read":
+        block["spreadsheet_url"] = "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+        block["sheet_name"] = "Sheet1"
+        block["range"] = "A1:D100"
+        block["credential_id"] = "{{ google_credential_id }}"
         block["has_header_row"] = True
     elif block_type == "google_sheets_write":
+        block["spreadsheet_url"] = "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+        block["sheet_name"] = "Sheet1"
+        block["range"] = "A1:D100"
+        block["credential_id"] = "{{ google_credential_id }}"
         block["write_mode"] = "append"
         block["values"] = "{{ output_data | tojson }}"
+    elif block_type == "pdf_fill":
+        block["file_url"] = "{{ source_pdf }}"
+        block["prompt"] = "Fill the PDF using the payload."
+        block["payload"] = {"name": "{{ applicant.name }}"}
     else:
-        raise ValueError(f"Unsupported google sheets block type: {block_type}")
+        raise ValueError(f"Unsupported known drift block type: {block_type}")
 
     return {
         "title": f"{block_type} workflow",
@@ -155,13 +163,13 @@ def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dic
     }
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write"])
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill"])
 @pytest.mark.asyncio
-async def test_workflow_create_sends_google_sheets_json_definition_as_raw_dict(
+async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
-    definition = _google_sheets_definition(block_type)
+    definition = _known_drift_definition(block_type)
 
     result = await workflow_tools.skyvern_workflow_create(definition=json.dumps(definition), format="json")
 
@@ -171,12 +179,15 @@ async def test_workflow_create_sends_google_sheets_json_definition_as_raw_dict(
     assert not hasattr(sent_definition, "model_dump")
     sent_block = sent_definition["workflow_definition"]["blocks"][0]
     assert sent_block["block_type"] == block_type
-    assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    if block_type.startswith("google_sheets"):
+        assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    else:
+        assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write"])
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill"])
 @pytest.mark.asyncio
-async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
+async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
@@ -193,7 +204,7 @@ async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
         }
 
     _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
-    definition = _google_sheets_definition(block_type)
+    definition = _known_drift_definition(block_type)
 
     result = await workflow_tools.skyvern_workflow_update(
         workflow_id="wpid_test",
@@ -207,7 +218,10 @@ async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
     assert not hasattr(sent_definition, "model_dump")
     sent_block = sent_definition["workflow_definition"]["blocks"][0]
     assert sent_block["block_type"] == block_type
-    assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    if block_type.startswith("google_sheets"):
+        assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    else:
+        assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
 @pytest.mark.asyncio
@@ -491,6 +505,199 @@ async def test_workflow_update_defaults_proxy_when_existing_is_null(monkeypatch:
     sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
     assert result["ok"] is True
     assert sent_definition.get("proxy_location") == "RESIDENTIAL"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_sequential_settings_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "run_sequentially": True,
+            "sequential_key": "existing-sequential-key",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.get("run_sequentially") is True
+    assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_respects_explicit_run_sequentially_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "run_sequentially": True,
+            "sequential_key": "existing-sequential-key",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "run_sequentially": False,
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.get("run_sequentially") is False
+    assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_overlap_and_credentials_via_mcp_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise workflow update through the registered FastMCP tool boundary."""
+
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "run_sequentially": True,
+            "sequential_key": "existing-sequential-key",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                        "credential_parameter_id": "cp_xyz",
+                        "workflow_id": "wf_test",
+                    },
+                    {
+                        "parameter_type": "workflow",
+                        "key": "url_input",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://example.com",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "url_input",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://new-url.com",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": [],
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "skyvern_workflow_update",
+            {
+                "workflow_id": "wpid_test",
+                "definition": json.dumps(definition),
+                "format": "json",
+            },
+        )
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is True
+
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert sent_definition.get("run_sequentially") is True
+    assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+    params = sent_definition["workflow_definition"]["parameters"]
+    cred_params = [p for p in params if p.get("parameter_type") == "credential"]
+    assert len(cred_params) == 1
+    assert cred_params[0]["key"] == "credentials"
+    assert cred_params[0]["credential_id"] == "cred_abc123"
+
+    blocks = sent_definition["workflow_definition"]["blocks"]
+    login_block = next(b for b in blocks if b.get("label") == "login_block")
+    assert "credentials" in login_block.get("parameter_keys", [])
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,7 @@ from skyvern.exceptions import (
     UnknownErrorWhileCreatingBrowserContext,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
+from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
@@ -55,6 +55,7 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.session_cookies import restore_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -105,6 +106,29 @@ def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrow
         use_fresh_context=use_fresh_context,
         enable_download=enable_download,
     )
+
+
+# RFC 7230 field-name token: the only characters Chromium accepts in a header name.
+_VALID_HEADER_NAME_RE = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+# Chromium rejects the whole batch if any value carries these header-injection chars.
+_INVALID_HEADER_VALUE_RE = re.compile(r"[\r\n\x00]")
+
+
+def sanitize_browser_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
+    """Drop entries whose name or value is malformed, so one bad header can't make Chromium
+    reject the whole Network.setExtraHTTPHeaders batch and fail the launch."""
+    if not headers:
+        return None
+    sanitized: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not _VALID_HEADER_NAME_RE.fullmatch(name):
+            LOG.warning("Dropping invalid extra HTTP header name before browser launch", header_name=name)
+            continue
+        if not isinstance(value, str) or _INVALID_HEADER_VALUE_RE.search(value):
+            LOG.warning("Dropping extra HTTP header with invalid value before browser launch", header_name=name)
+            continue
+        sanitized[name] = value
+    return sanitized or None
 
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
@@ -174,15 +198,34 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
         asyncio.ensure_future(_on_page(page))
 
 
+def _redact_url_query(url: str) -> str:
+    # Download URLs are often S3 presigned, carrying an X-Amz signature in the query — drop it before logging.
+    try:
+        return urlparse(url)._replace(query="").geturl()
+    except Exception:
+        return "<redacted>"
+
+
 def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
     async def listen_to_download(download: Download) -> None:
-        workflow_run_id = kwargs.get("workflow_run_id")
-        task_id = kwargs.get("task_id")
+        context = current()
+        workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
+        task_id = (context.task_id if context else None) or kwargs.get("task_id")
         try:
             async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
+                if not file_path.exists():
+                    # On an adopted persistent session the bytes live on the run connection, not
+                    # this worker connection; saving is the run side's job, so skip rather than crash.
+                    LOG.debug(
+                        "Download artifact absent on this connection; skipping worker-side rename",
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        suggested_filename=download.suggested_filename,
+                    )
+                    return
                 if file_path.suffix:
                     return
 
@@ -191,7 +234,7 @@ def set_download_file_listener(
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                     suggested_filename=download.suggested_filename,
-                    url=download.url,
+                    url=_redact_url_query(download.url),
                 )
                 suffix = Path(download.suggested_filename).suffix
                 if suffix:
@@ -253,16 +296,16 @@ def set_download_file_listener(
 
 def initialize_download_dir() -> str:
     context = ensure_context()
-    return get_download_dir(
-        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
-    )
+    return get_download_dir(resolve_run_download_id(context))
 
 
-async def _apply_download_behaviour(browser: Browser) -> None:
-    context = ensure_context()
-    download_dir = get_download_dir(
-        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
-    )
+async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
+    if not run_id:
+        # No run_id means no run-scoped dir to bind to, so the session keeps its current download
+        # binding. Adoption callers always pass a run id, so warn on the unexpected miss.
+        LOG.warning("rebind_download_dir skipped: missing run_id")
+        return
+    download_dir = get_download_dir(run_id)
     cdp_session = await browser.new_browser_cdp_session()
     await cdp_session.send(
         "Browser.setDownloadBehavior",
@@ -271,8 +314,24 @@ async def _apply_download_behaviour(browser: Browser) -> None:
             "downloadPath": download_dir,
         },
     )
+    rebound_interceptors = 0
+    for context in browser.contexts:
+        interceptor = getattr(context, "_skyvern_cdp_download_interceptor", None)
+        if interceptor is not None:
+            interceptor.set_download_dir(download_dir)
+            rebound_interceptors += 1
 
-    LOG.info("setDownloadBehavior applied", download_dir=download_dir)
+    LOG.info(
+        "setDownloadBehavior applied",
+        download_dir=download_dir,
+        run_id=run_id,
+        rebound_interceptors=rebound_interceptors,
+    )
+
+
+async def _apply_download_behaviour(browser: Browser) -> None:
+    context = ensure_context()
+    await rebind_download_dir(browser, resolve_run_download_id(context))
 
 
 class BrowserContextCreator(Protocol):
@@ -363,8 +422,13 @@ class BrowserContextFactory:
                 "width": settings.BROWSER_WIDTH,
                 "height": settings.BROWSER_HEIGHT,
             },
-            "extra_http_headers": extra_http_headers,
+            "extra_http_headers": sanitize_browser_headers(extra_http_headers),
         }
+        if settings.BROWSER_RECORDING_WIDTH and settings.BROWSER_RECORDING_HEIGHT:
+            args["record_video_size"] = {
+                "width": settings.BROWSER_RECORDING_WIDTH,
+                "height": settings.BROWSER_RECORDING_HEIGHT,
+            }
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
@@ -419,6 +483,7 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
@@ -923,6 +988,7 @@ async def _connect_to_cdp_browser(
         )
         browser_context = await browser.new_context(
             record_video_dir=browser_args["record_video_dir"],
+            record_video_size=browser_args.get("record_video_size"),
             viewport=browser_args["viewport"],
             extra_http_headers=browser_args["extra_http_headers"],
         )
@@ -952,6 +1018,7 @@ async def _connect_to_cdp_browser(
 
         browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
         browser_context._skyvern_cdp_download_active = True  # type: ignore[attr-defined]
+        browser_context._skyvern_cdp_download_interceptor = interceptor  # type: ignore[attr-defined]
         LOG.info(
             "CDP download interceptor enabled",
             download_dir=download_dir,

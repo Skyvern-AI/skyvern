@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
+    VIDEO_COMPRESSION_ENABLED: bool = True
+    VIDEO_COMPRESSION_CRF: int = 28
+    VIDEO_COMPRESSION_PRESET: str = "veryfast"
+    VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
+    VIDEO_FINAL_SYNC_TIMEOUT_SECONDS: float = 750.0
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
@@ -107,15 +112,25 @@ class Settings(BaseSettings):
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
+    CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
+    # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+    # so one fetch can't consume the whole block. TOTP re-mint is instant and unaffected.
+    CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS: int = 120
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
-    MAX_ITERATIONS_PER_TASK_V2: int = 10
+    MAX_ITERATIONS_PER_TASK_V2: int = 50
     MAX_NUM_SCREENSHOTS: int = 10
+    # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
+    # screenshot spend can be monitored independently of the provider's blended tokens.
+    LLM_IMAGE_COST_TRACKING_ENABLED: bool = True
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
+    # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
+    # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
+    FAIL_FAST_SHADOW: bool = False
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
@@ -131,13 +146,40 @@ class Settings(BaseSettings):
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
+    # Successful (<400) GET/HEAD/OPTIONS are skipped by default: they dominate
+    # log volume (health checks, polling) while carrying no mutation to audit.
+    LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
-    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
+    # Opt-in INFO-log sampling for high-volume orgs. A log call marked
+    # sampling=True is dropped from stdout/Datadog with probability
+    # (1 - LOG_SAMPLING_RATE) when its org is in LOG_SAMPLING_ORG_IDS. The full
+    # line is still captured in the per-run S3 log artifact. Both defaults make
+    # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
+    LOG_SAMPLING_RATE: float = 1.0
+    LOG_SAMPLING_ORG_IDS: list[str] = []
+    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
+    # Consecutive repair runs that make no newly-verified forward progress before the
+    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
+    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
+    # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
+    RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
     # Per-environment canary; default off until we are confident.
     ENABLE_WORKFLOW_COPILOT_V2: bool = False
+    # Experimental Workflow Copilot v2 branch mode.
+    # Off = standard block authoring. On = prefer code blocks for browser work.
+    WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
+    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
+    # already-authenticated session (the first run and every login-replaying repair re-run alike).
+    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
+    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -180,6 +222,15 @@ class Settings(BaseSettings):
     AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AZURE_STORAGE_CONTAINER_UPLOADS: str = "skyvern-uploads"
 
+    # Google Cloud Storage settings (bucket names are globally unique — override per deployment)
+    GCS_PROJECT_ID: str | None = None
+    GCS_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
+    GCS_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
+    GCS_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
+    GCS_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # GSA email used to sign V4 URLs when running under Workload Identity (no local private key).
+    GCS_SIGNER_SA_EMAIL: str | None = None
+
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
     ANALYTICS_TEST_ID: str | None = None
@@ -204,6 +255,11 @@ class Settings(BaseSettings):
     DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
+    # Playwright's ffmpeg encoder runs continuously while the browser is open and its CPU cost
+    # scales with pixel count. Unset means Playwright's default (viewport scaled to fit 800x800);
+    # set both to record at an explicit resolution.
+    BROWSER_RECORDING_WIDTH: int | None = None
+    BROWSER_RECORDING_HEIGHT: int | None = None
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
@@ -462,8 +518,12 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
-    # Where credentials are stored: bitwarden or azure_vault
+    # Where credentials are stored: bitwarden, azure_vault, gcp, or custom
     CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+
+    # GCP Secret Manager credential vault settings
+    GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
+    GCP_CREDENTIAL_VAULT_PREFIX: str = "skyvern-cred-"  # secret-id prefix; must be unique per deployment
 
     # Azure Setting
     AZURE_TENANT_ID: str | None = None
@@ -589,6 +649,14 @@ class Settings(BaseSettings):
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
 
+    # Workflow Schedule Settings
+    ENABLE_WORKFLOW_SCHEDULES: bool = True
+    """Enable recurring workflow schedules in the OSS/local server."""
+    WORKFLOW_SCHEDULE_POLL_INTERVAL_SECONDS: float = 60.0
+    """How often the OSS/local scheduler scans for due workflow schedules."""
+    WORKFLOW_SCHEDULE_MAX_CONCURRENT_RUNS: int = 1
+    """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
+
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
@@ -613,6 +681,7 @@ class Settings(BaseSettings):
             ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
+            ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
         ]
         for model_name, vertex_key, gemini_key, label in gemini_models:
             mapping[model_name] = {
@@ -701,6 +770,18 @@ class Settings(BaseSettings):
             mapping["claude-opus-4-6"] = {
                 "llm_key": "ANTHROPIC_CLAUDE4.6_OPUS",
                 "label": "Anthropic Claude 4.6 Opus",
+            }
+
+        # Anthropic Claude Fable 5: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-fable-5"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Fable 5",
+            }
+        else:
+            mapping["claude-fable-5"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5_FABLE",
+                "label": "Anthropic Claude Fable 5",
             }
 
         return mapping

@@ -36,6 +36,19 @@ LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
+def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
+    """A Playwright `TimeoutError` whose message references the post-click
+    auto-wait for scheduled navigations means the click was physically
+    dispatched (Playwright logs ``click action done`` immediately before this
+    wait) and only the post-action wait timed out — typical for clicks that
+    trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
+    chain would duplicate the already-applied side effect.
+    """
+    if not isinstance(exc, TimeoutError):
+        return False
+    return "scheduled navigation" in str(exc).lower()
+
+
 async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
@@ -159,19 +172,11 @@ class SkyvernElement:
             return True
 
         autocomplete: str | None = await self.get_attr("aria-autocomplete")
-        if autocomplete and autocomplete.lower() in ("list", "both", "inline"):
+        if autocomplete and autocomplete.lower() == "list":
             return True
 
         class_name: str | None = await self.get_attr("class")
         if class_name and "autocomplete-input" in class_name.lower():
-            return True
-
-        # Combobox inputs (role="combobox") present a list of options — treat as
-        # auto-completion so the agent uses the dropdown-selection flow instead of
-        # the Tab hack.  This covers account-search fields in many apps that use
-        # role="combobox" without setting aria-autocomplete.
-        role: str | None = await self.get_attr("role")
-        if role and role.lower() == "combobox":
             return True
 
         # Tag inputs where typing surfaces a suggestion list to select from
@@ -258,13 +263,21 @@ class SkyvernElement:
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
 
-    async def is_disabled(self, dynamic: bool = False) -> bool:
-        # if attr not exist, return None
-        # if attr is like 'disabled', return empty string or True
-        # if attr is like `disabled=false`, return the value
-        disabled = False
-        aria_disabled = False
+    @staticmethod
+    def _disabled_attrs_indicate_disabled(attrs: dict) -> bool:
+        for key in ("disabled", "aria-disabled"):
+            val = attrs.get(key)
+            if val is None:
+                continue
+            if isinstance(val, bool):
+                if val is True:
+                    return True
+            elif isinstance(val, str):
+                if val.lower() != "false":
+                    return True
+        return False
 
+    async def is_disabled(self, dynamic: bool = False) -> bool:
         disabled_attr: bool | str | None = None
         aria_disabled_attr: bool | str | None = None
         style_disabled: bool = False
@@ -277,28 +290,22 @@ class SkyvernElement:
             style_disabled = await skyvern_frame.get_disabled_from_style(await self.get_element_handler())
 
         except Exception:
-            # FIXME: maybe it should be considered as "disabled" element if failed to get the attributes?
+            # Preserve existing fail-open behavior when disabled attributes cannot be read.
             LOG.exception(
                 "Failed to get the disabled attribute",
                 element=self.__static_element,
                 element_id=self.get_id(),
             )
 
-        if disabled_attr is not None:
-            # disabled_attr should be bool or str
-            if isinstance(disabled_attr, bool):
-                disabled = disabled_attr
-            if isinstance(disabled_attr, str):
-                disabled = disabled_attr.lower() != "false"
-
-        if aria_disabled_attr is not None:
-            # aria_disabled_attr should be bool or str
-            if isinstance(aria_disabled_attr, bool):
-                aria_disabled = aria_disabled_attr
-            if isinstance(aria_disabled_attr, str):
-                aria_disabled = aria_disabled_attr.lower() != "false"
-
-        return disabled or aria_disabled or style_disabled
+        return (
+            self._disabled_attrs_indicate_disabled(
+                {
+                    "disabled": disabled_attr,
+                    "aria-disabled": aria_disabled_attr,
+                }
+            )
+            or style_disabled
+        )
 
     async def is_readonly(self, dynamic: bool = False) -> bool:
         # if attr not exist, return None
@@ -546,6 +553,63 @@ class SkyvernElement:
                 return child.get("id")
 
         return None
+
+    def find_deepest_interactable_descendant_in_single_chain(self) -> str | None:
+        children = self.__static_element.get("children")
+        if not isinstance(children, list):
+            return None
+        entries: list[tuple[tuple[int, ...], str]] = []
+
+        # Descendants are raw static dicts, not SkyvernElement instances; use the shared attr parser.
+        def _walk(nodes: list[dict], path: tuple[int, ...]) -> None:
+            for idx, item in enumerate(nodes):
+                if not isinstance(item, dict):
+                    continue
+                child_path = (*path, idx)
+                node_id = item.get("id")
+                if not (isinstance(node_id, str) and node_id):
+                    grandchildren = item.get("children")
+                    if isinstance(grandchildren, list):
+                        _walk(grandchildren, child_path)
+                    continue
+                if not (item.get("interactable", False) and not item.get("hoverOnly", False)):
+                    grandchildren = item.get("children")
+                    if isinstance(grandchildren, list):
+                        _walk(grandchildren, child_path)
+                    continue
+                attrs = item.get("attributes")
+                # Static children expose attrs only; CSS style-disabled is caught by the later dynamic check.
+                if isinstance(attrs, dict) and self._disabled_attrs_indicate_disabled(attrs):
+                    grandchildren = item.get("children")
+                    if isinstance(grandchildren, list):
+                        _walk(grandchildren, child_path)
+                    continue
+                entries.append((child_path, node_id))
+                grandchildren = item.get("children")
+                if isinstance(grandchildren, list):
+                    _walk(grandchildren, child_path)
+
+        _walk(children, ())
+        if not entries:
+            return None
+
+        # When viable candidates appear in separate ancestor-descendant
+        # branches there is no unambiguous target — retargeting would
+        # guess.  Keep the original disabled-element failure instead.
+        for i in range(len(entries)):
+            pi = entries[i][0]
+            for j in range(i + 1, len(entries)):
+                pj = entries[j][0]
+                if not (pi[: len(pj)] == pj or pj[: len(pi)] == pi):
+                    LOG.warning(
+                        "Multiple viable single-chain descendants in separate branches; no retarget",
+                        parent_id=self.get_id(),
+                        candidate_ids=[e[1] for e in entries],
+                    )
+                    return None
+
+        entries.sort(key=lambda x: len(x[0]), reverse=True)
+        return entries[0][1]
 
     async def find_children_element_id_by_callback(
         self, cb: typing.Callable[[dict], typing.Awaitable[bool]]
@@ -849,12 +913,22 @@ class SkyvernElement:
         if await self.is_disabled(dynamic=True):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
-        await EventStrategyFactory.move_to_element(page, self.get_locator())
         try:
-            await self.get_locator().click(timeout=timeout)
+            # Route through the active cursor strategy so alternate profiles can
+            # dispatch their own click sequence (explicit mouse.down/up).
+            # The strategy is responsible for moving to the element first; the
+            # DEFAULT path still ends up calling locator.click(timeout=timeout)
+            # so Playwright actionability is preserved.
+            await EventStrategyFactory.click_element(page, self.get_locator(), timeout=timeout)
             return
-        except Exception:
+        except Exception as exc:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
+            if is_post_dispatch_click_timeout(exc):
+                LOG.info(
+                    "Click side effect detected via navigation-wait timeout — skipping fallback chain",
+                    element_id=self.get_id(),
+                )
+                return
 
         if dom is not None:
             # try to click on the blocking element
@@ -1107,7 +1181,7 @@ class DomUtil:
                 # It can only represent the element position in the DOM tree with tag name, it's not 100% reliable.
                 # As long as the current position has the same element with the tag name, the locator can be found.
                 # (maybe) we should validate the element hash to make sure the element is the same?
-                LOG.warning("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id)
+                LOG.info("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id, sampling=True)
                 locator = frame_content.locator(f"xpath={xpath}")
                 num_elements = await locator.count()
                 if num_elements < 1:

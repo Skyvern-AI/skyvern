@@ -82,17 +82,23 @@ class ScriptSkyvernPage(SkyvernPage):
         self._record = recorder or (lambda ac: None)
 
     @classmethod
-    async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:
+    async def _get_or_create_browser_state(
+        cls, browser_session_id: str | None = None, url: str | None = None
+    ) -> BrowserState:
         context = skyvern_context.current()
         if context and context.workflow_run_id and context.organization_id:
             workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
             )
             if workflow_run:
+                # url selects the proxy at browser-context creation; navigate=False because the
+                # generated script issues its own goto, so navigating here would double-load.
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
+                    url=url,
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
+                    navigate=False,
                 )
             else:
                 raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
@@ -119,8 +125,9 @@ class ScriptSkyvernPage(SkyvernPage):
     async def create(
         cls,
         browser_session_id: str | None = None,
+        url: str | None = None,
     ) -> ScriptSkyvernPage:
-        scraped_page = await cls.create_scraped_page(browser_session_id=browser_session_id)
+        scraped_page = await cls.create_scraped_page(browser_session_id=browser_session_id, url=url)
         page = await scraped_page._browser_state.must_get_working_page()
         ai = RealSkyvernPageAi(scraped_page, page)
         return cls(scraped_page=scraped_page, page=page, ai=ai)
@@ -129,16 +136,20 @@ class ScriptSkyvernPage(SkyvernPage):
     async def create_scraped_page(
         cls,
         browser_session_id: str | None = None,
+        url: str | None = None,
     ) -> ScrapedPage:
         # initialize browser state
         # TODO: add workflow_run_id or eventually script_id/script_run_id
-        browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id)
+        browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id, url=url)
         return await browser_state.scrape_website(
             url="",
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
-            draw_boxes=True,
+            # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+            # ``draw_boxes`` is wired through the scrape pipeline as False; the overlay helpers
+            # are retained briefly for backwards compatibility and scheduled for removal.
+            draw_boxes=False,
             scroll=True,
             support_empty_page=True,
         )

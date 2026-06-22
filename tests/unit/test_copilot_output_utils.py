@@ -11,6 +11,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     parse_final_response,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
+    summarize_tool_result_detail,
     truncate_output,
 )
 
@@ -434,6 +435,129 @@ class TestFormatToolResultForUser:
     def _format(tool_name: str, result: dict) -> str:
         return format_tool_result_for_user(tool_name, result)
 
+    def test_blocker_signal_overrides_activity_summary_and_detail(self) -> None:
+        from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text=(
+                "Less than 90 seconds remain in this Copilot turn. "
+                "Do NOT start another block-running tool call; reply from gathered progress."
+            ),
+            user_facing_reason="I'm running out of time on this turn. I'll wrap up with what I have so far.",
+            recovery_hint="stop",
+            renders_final_reply=False,
+            internal_reason_code="tool_error_late_block_running",
+            blocked_tool="update_and_run_blocks",
+        )
+        result = {"ok": False, "error": signal.agent_steering_text}
+
+        summary = format_tool_result_for_user("update_and_run_blocks", result, blocker_signal=signal)
+        detail = summarize_tool_result_detail(result, blocker_signal=signal)
+
+        assert summary == signal.user_facing_reason
+        assert detail == signal.user_facing_reason
+        assert "Do NOT" not in summary
+        assert "Do NOT" not in detail
+        assert "update_and_run_blocks" not in summary
+        assert "tool_error_late_block_running" not in summary
+        agent_summary = summarize_tool_result("update_and_run_blocks", result)
+        assert "Do NOT start another block-running tool call" in agent_summary
+
+    def test_blocker_signal_does_not_reverse_match_unrelated_short_error(self) -> None:
+        from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="A long, specific blocker for an unrelated timeout.",
+            user_facing_reason="A specific timeout summary.",
+            recovery_hint="stop",
+            internal_reason_code="tool_error_specific_timeout",
+            blocked_tool="update_and_run_blocks",
+        )
+        result = {"ok": False, "error": "timeout"}
+
+        summary = format_tool_result_for_user("update_and_run_blocks", result, blocker_signal=signal)
+
+        assert summary != signal.user_facing_reason
+        assert summary == "Failed: timeout"
+
+    def test_active_terminal_blocker_matches_structured_failure_category(self) -> None:
+        from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+        from skyvern.forge.sdk.copilot.failure_tracking import (
+            ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+            ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+        )
+
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="The prior active workflow run emitted typed terminal evidence.",
+            user_facing_reason="I reached the requested browser state, but the workflow still needs review.",
+            recovery_hint="report_blocker_to_user",
+            internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        result = {
+            "ok": False,
+            "error": "The active run reached the requested browser state.",
+            "data": {
+                "failure_categories": [
+                    {"category": ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY, "confidence_float": 1.0}
+                ]
+            },
+        }
+
+        summary = format_tool_result_for_user("update_and_run_blocks", result, blocker_signal=signal)
+        detail = summarize_tool_result_detail(result, blocker_signal=signal)
+
+        assert summary == signal.user_facing_reason
+        assert detail == signal.user_facing_reason
+
+    def test_watchdog_control_signal_summary_overrides_raw_detail(self) -> None:
+        result = {
+            "ok": False,
+            "error": (
+                "The run has not made progress. Run ID: wr_stalled. Outcome is uncertain. "
+                "Do NOT re-invoke block-running tools without first calling get_run_results."
+            ),
+            "data": {
+                "failure_reason": (
+                    "The run stopped after no observable progress for 120s. Run ID: wr_stalled. Outcome is uncertain."
+                ),
+                "control_signal": {
+                    "kind": "watchdog_stagnation",
+                    "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                },
+                "user_facing_summary": "The run stopped after no observable progress for 120s.",
+            },
+        }
+
+        summary = self._format("run_blocks_and_collect_debug", result)
+        detail = summarize_tool_result_detail(result, tool_name="run_blocks_and_collect_debug")
+
+        assert summary == "The run stopped after no observable progress for 120s."
+        assert detail == summary
+        assert "wr_stalled" not in summary
+        assert "get_run_results" not in detail
+        assert "Do NOT" not in detail
+
+    def test_unsafe_structured_summary_falls_back_for_summary_and_detail(self) -> None:
+        result = {
+            "ok": False,
+            "error": "STOP - do NOT respond to the user yet.",
+            "data": {
+                "user_facing_summary": "The update_and_run_blocks tool could not continue.",
+            },
+        }
+
+        summary = self._format("update_and_run_blocks", result)
+        detail = summarize_tool_result_detail(result, tool_name="update_and_run_blocks")
+
+        assert summary == "Couldn't complete that step."
+        assert detail == "Couldn't complete that step."
+        assert "update_and_run_blocks" not in summary
+        assert "STOP" not in detail
+
     def test_loop_detected_failure_drops_use_a_different_tool_tail(self) -> None:
         summary = self._format(
             "click",
@@ -632,6 +756,20 @@ class TestFormatToolResultForUser:
             {"ok": True, "data": {"selector": "#submit"}},
         )
         assert agent_summary == "Clicked '#submit'"
+
+    def test_summarize_tool_result_uses_effective_click_target(self) -> None:
+        agent_summary = summarize_tool_result(
+            "click",
+            {"ok": True, "data": {"selector": "", "effective_target": "xpath=//button[normalize-space(.)='Accept']"}},
+        )
+        assert agent_summary == "Clicked 'xpath=//button[normalize-space(.)='Accept']'"
+
+    def test_summarize_tool_result_falls_back_to_resolved_selector(self) -> None:
+        agent_summary = summarize_tool_result(
+            "click",
+            {"ok": True, "data": {"selector": None, "resolved_selector": "xpath=//button[2]"}},
+        )
+        assert agent_summary == "Clicked 'xpath=//button[2]'"
 
 
 class TestParseFinalResponse:

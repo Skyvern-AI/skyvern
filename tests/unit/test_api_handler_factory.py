@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from asyncio import CancelledError
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -237,6 +239,60 @@ def test_normalize_llm_model_strips_provider_prefix() -> None:
     assert api_handler_factory._normalize_llm_model("openai/gpt-4.1-mini") == "gpt-4.1-mini"
     assert api_handler_factory._normalize_llm_model("gpt-4") == "gpt-4"
     assert api_handler_factory._normalize_llm_model(None) is None
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-fable-5",
+        "anthropic-claude-opus-4-8",
+        "anthropic-claude-fable-5",
+    ],
+)
+def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str) -> None:
+    assert LLMAPIHandlerFactory.requires_adaptive_thinking(model_name) is True
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "bedrock/us.anthropic.claude-opus-4-8",
+        "bedrock/us.anthropic.claude-fable-5",
+        "anthropic/claude-sonnet-4-6",
+        None,
+    ],
+)
+def test_requires_adaptive_thinking_does_not_rewrite_other_providers(model_name: str | None) -> None:
+    assert LLMAPIHandlerFactory.requires_adaptive_thinking(model_name) is False
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-fable-5",
+    ],
+)
+def test_apply_anthropic_thinking_optimization_uses_adaptive_shape(model_name: str) -> None:
+    llm_config = LLMConfig(
+        model_name=model_name,
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    params: dict[str, Any] = {}
+
+    LLMAPIHandlerFactory._apply_anthropic_thinking_optimization(
+        params,
+        new_budget=2048,
+        llm_config=llm_config,
+        prompt_name="workflow-copilot-request-policy",
+    )
+
+    assert params["thinking"] == {"type": "adaptive"}
+    assert params["output_config"] == {"effort": LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT}
 
 
 def test_assert_step_thought_block_exclusive_rejects_both_set() -> None:
@@ -746,3 +802,65 @@ def test_router_fallback_chain_no_duplicate_keys_or_overlapping_chains(monkeypat
             f"each chain must drop one head from the previous (strict suffix); got chains={chains}. "
             "Non-suffix expansion could re-list already-tried hops and amplify retries."
         )
+
+
+def test_completion_cost_halves_vertex_flex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vertex flex responses (trafficType ON_DEMAND_FLEX) bill at 50%: litellm reports
+    them at the standard rate, so the helper applies the flex discount itself."""
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.10)
+
+    flex = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
+    standard = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND"}})
+    no_meta = SimpleNamespace(_hidden_params={})
+
+    assert LLMAPIHandlerFactory._completion_cost(flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory._completion_cost(standard) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost(no_meta) == pytest.approx(0.10)
+
+
+def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(completion_response: Any) -> float:
+        raise RuntimeError("provider unsupported")
+
+    monkeypatch.setattr(litellm, "completion_cost", _raise)
+    resp = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
+    assert LLMAPIHandlerFactory._completion_cost(resp) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_non_speculative_cancelled_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run-level cancellation (elapsed-time timeout / user stop) landing inside an LLM call must
+    propagate as CancelledError so the timeout actually halts the run. It must NOT be converted into
+    a retryable LLMProviderError, which the step loop would treat as a failure and retry."""
+    context = MagicMock()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = False
+    context.cached_static_prompt = None
+    context.hashed_href_map = {}
+
+    llm_config = LLMConfig(
+        model_name="gpt-4",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.get_config", lambda _: llm_config
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.is_router_config", lambda _: False
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.skyvern_context.current", lambda: context)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", AsyncMock(side_effect=CancelledError()))
+
+    # No step is passed, so is_speculative_step is False (the non-speculative branch).
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("gpt-4")
+    with pytest.raises(BaseException) as exc_info:
+        await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+    assert isinstance(exc_info.value, CancelledError), (
+        f"expected CancelledError to propagate, got {type(exc_info.value).__name__}"
+    )

@@ -19,7 +19,7 @@ profile = await client.create_browser_profile(
     name="production-login",
     workflow_run_id="wr_abc123",
 )
-print(profile.browser_profile_id)  # bpf_abc123
+print(profile.browser_profile_id)  # bp_abc123
 ```
 
 ```typescript TypeScript
@@ -27,7 +27,7 @@ const profile = await skyvern.createBrowserProfile({
   name: "production-login",
   workflow_run_id: "wr_abc123",
 });
-console.log(profile.browser_profile_id); // bpf_abc123
+console.log(profile.browser_profile_id); // bp_abc123
 ```
 </CodeGroup>
 
@@ -38,7 +38,7 @@ console.log(profile.browser_profile_id); // bpf_abc123
 | `name` | `str` | Yes | Display name for the profile. |
 | `description` | `str` | No | Optional description. |
 | `workflow_run_id` | `str` | Conditional | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. Required if `browser_session_id` is not provided. |
-| `browser_session_id` | `str` | Conditional | The browser session ID to snapshot. Required if `workflow_run_id` is not provided. |
+| `browser_session_id` | `str` | Conditional | The browser session ID to snapshot. The session must have had `generate_browser_profile` enabled or been started from a saved profile. Required if `workflow_run_id` is not provided. |
 | `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
 
 You must provide either `workflow_run_id` or `browser_session_id`.
@@ -47,7 +47,7 @@ You must provide either `workflow_run_id` or `browser_session_id`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `browser_profile_id` | `str` | Unique ID. Starts with `bpf_`. |
+| `browser_profile_id` | `str` | Unique ID. Starts with `bp_`. |
 | `name` | `str` | Profile name. |
 | `description` | `str \| None` | Profile description. |
 | `created_at` | `datetime` | When the profile was created. |
@@ -105,7 +105,7 @@ const result = await skyvern.runWorkflow({
 </CodeGroup>
 
 <Info>
-Session archiving is asynchronous. If `create_browser_profile` fails immediately after a workflow completes, wait a few seconds and retry.
+Session archiving is asynchronous. If `create_browser_profile` fails immediately after a run or session ends, wait a few seconds and retry. A `400` error saying the session was not configured to generate a browser profile is permanent — recreate the session with `generate_browser_profile` enabled. See [Save a session's profile](/developers/optimization/browser-sessions#save-a-sessions-profile).
 </Info>
 
 ---

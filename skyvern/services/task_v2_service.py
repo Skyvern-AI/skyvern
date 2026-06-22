@@ -41,8 +41,8 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
-    ProxyLocation,
     ProxyLocationInput,
     RunEngine,
     RunStatus,
@@ -68,6 +68,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
+from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -78,6 +79,13 @@ RANDOM_STRING_POOL = string.ascii_letters + string.digits
 # Maximum number of planning iterations for TaskV2
 # This limits how many times the LLM can plan and execute actions
 DEFAULT_MAX_ITERATIONS = 50
+
+# Cap a navigate block's recovered terminal output: task_history is re-fed to the
+# planner every iteration, so an unbounded reasoning blob would grow context.
+NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS = 2000
+# Structured (dict/list) output can't be sliced without corrupting it; one that exceeds
+# this is dropped entirely rather than written uncapped to task_history.
+NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS = 10 * NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -467,6 +475,7 @@ async def run_task_v2(
     task_v2_id: str,
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
+    max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
@@ -505,17 +514,19 @@ async def run_task_v2(
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
+        consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
     # work for subsequent blocks in the same loop iteration.
-    with skyvern_context.scoped(context):
+    with skyvern_context.scoped(context, propagate_captcha_timeout=True):
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,
                 task_v2=task_v2,
                 request_id=request_id,
                 max_steps_override=max_steps_override,
+                max_iterations_override=max_iterations_override,
                 browser_session_id=browser_session_id,
             )
         except TaskTerminationError as e:
@@ -565,11 +576,29 @@ async def run_task_v2(
     return task_v2
 
 
+def _resolve_max_iterations(max_iterations_override: str | int | None) -> int:
+    """Resolve the planner-iteration budget, never below the historical floor.
+
+    The planner always ran DEFAULT_MAX_ITERATIONS regardless of the block field, so workflows
+    persisted with the old (smaller) default must not regress — floor every value at it.
+    """
+    if max_iterations_override:
+        try:
+            return max(int(max_iterations_override), DEFAULT_MAX_ITERATIONS)
+        except (ValueError, TypeError):
+            LOG.info(
+                "max_iterations_override isn't an integer, won't override",
+                max_iterations_override=max_iterations_override,
+            )
+    return DEFAULT_MAX_ITERATIONS
+
+
 async def run_task_v2_helper(
     organization: Organization,
     task_v2: TaskV2,
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
+    max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
@@ -699,11 +728,12 @@ async def run_task_v2_helper(
     url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
+    max_iterations = _resolve_max_iterations(max_iterations_override)
 
     # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
-    # The DEFAULT_MAX_ITERATIONS limit applies to this single TaskV2 execution
-    for i in range(DEFAULT_MAX_ITERATIONS):
+    # The max_iterations limit applies to this single TaskV2 execution
+    for i in range(max_iterations):
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
             organization_id=organization_id,
@@ -998,7 +1028,7 @@ async def run_task_v2_helper(
         workflow_create_request = WorkflowCreateYAMLRequest(
             title=workflow.title,
             description=workflow.description,
-            proxy_location=task_v2.proxy_location or ProxyLocation.RESIDENTIAL,
+            proxy_location=runtime_proxy_location(task_v2.proxy_location),
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
@@ -1027,6 +1057,30 @@ async def run_task_v2_helper(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
         )
+        # Fallback for navigate: recover from the COMPLETE action only when extraction was
+        # expected but came back null (extracted_information present and None). A navigate
+        # block's output is always a TaskOutput dump, so the key is always present here.
+        block_output = block_result.output_parameter_value
+        if (
+            extracted_data is None
+            and task_type == "navigate"
+            and block_result.success
+            and isinstance(block_output, dict)
+            and "extracted_information" in block_output
+            and block_output["extracted_information"] is None
+        ):
+            extracted_data = await _get_navigate_complete_output(
+                block_result,
+                organization_id,
+                task_v2_id=task_v2_id,
+                workflow_run_id=workflow_run_id,
+            )
+            if extracted_data is not None:
+                LOG.info(
+                    "Recovered navigate terminal output from COMPLETE action",
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                )
         if extracted_data is not None:
             task_history_record["extracted_data"] = extracted_data
         task_history.append(task_history_record)
@@ -1193,13 +1247,13 @@ async def run_task_v2_helper(
             return workflow, workflow_run, task_v2
     else:
         # Loop completed without early exit - task exceeded max iterations
-        max_iterations_failure_reason = f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps."
+        max_iterations_failure_reason = f"Task exceeded maximum of {max_iterations} planning iterations. Consider simplifying the task or breaking it into smaller steps."
         max_iterations_failure_category = classify_from_failure_reason(
             max_iterations_failure_reason, fallback_to_unknown=True
         )
         LOG.info(
             "Task v2 failed - exceeded maximum iterations",
-            max_iterations=DEFAULT_MAX_ITERATIONS,
+            max_iterations=max_iterations,
             workflow_run_id=workflow_run_id,
         )
         LOG.info(
@@ -1438,7 +1492,9 @@ async def _generate_loop_task(
     else:
         LOG.info("Loop values are not links", loop_values=loop_values)
         url = None
-        context_parameter_key = "target"
+        # Suffix with the per-loop random string so multiple non-link loop tasks in one run
+        # don't all emit a parameter keyed "target", which fails duplicate-key validation.
+        context_parameter_key = f"target_{loop_random_string}"
 
     # create ContextParameter for the value
     url_value_context_parameter = ContextParameter(
@@ -1899,14 +1955,14 @@ def _get_extracted_data_from_block_result(
 
     Args:
         block_result: The result from block execution
-        task_type: Type of task ("extract" or "loop")
+        task_type: Type of task ("extract", "navigate", or "loop")
         task_v2_id: Optional ID for logging
         workflow_run_id: Optional ID for logging
 
     Returns:
         Extracted data if available, None otherwise
     """
-    if task_type == "extract":
+    if task_type in ("extract", "navigate"):
         if (
             isinstance(block_result.output_parameter_value, dict)
             and "extracted_information" in block_result.output_parameter_value
@@ -1955,6 +2011,70 @@ def _get_extracted_data_from_block_result(
                             inner_loop_output_overall.append(output_value["extracted_information"])
                 loop_output_overall.append(inner_loop_output_overall)
             return loop_output_overall if loop_output_overall else None
+    return None
+
+
+async def _get_navigate_complete_output(
+    block_result: BlockResult,
+    organization_id: str | None,
+    task_v2_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> Any:
+    """Recover a navigate block's terminal answer from its verifying COMPLETE action.
+
+    Falls back through response, output, then reasoning, capping str candidates.
+    """
+    if not isinstance(block_result.output_parameter_value, dict):
+        return None
+    task_id = block_result.output_parameter_value.get("task_id")
+    if not task_id:
+        return None
+    try:
+        actions = await app.DATABASE.tasks.get_task_actions(task_id=task_id, organization_id=organization_id)
+    except Exception:
+        LOG.warning(
+            "Failed to load navigate task actions; skipping terminal-output recovery",
+            task_id=task_id,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    for action in reversed(actions):
+        if action.action_type != ActionType.COMPLETE:
+            continue
+        for candidate in (action.response, action.output, action.reasoning):
+            if not candidate:
+                continue
+            if isinstance(candidate, str):
+                if len(candidate) > NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS:
+                    LOG.warning(
+                        "Truncating navigate terminal output before writing to task_history",
+                        task_id=task_id,
+                        original_length=len(candidate),
+                        cap=NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS,
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return candidate[:NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS]
+                return candidate
+            # Structured output (dict/list from CUA engines) can't be sliced without
+            # corrupting it, so drop an oversized one entirely (forcing a separate extract
+            # task) rather than let it bloat the task_history fed to the planner.
+            structured_len = len(str(candidate))
+            if structured_len > NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS:
+                LOG.warning(
+                    "Dropping oversized structured navigate terminal output; expecting a separate extract task",
+                    task_id=task_id,
+                    approx_length=structured_len,
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                return None
+            return candidate
+        # Only the terminal COMPLETE is authoritative: if it carries no data,
+        # don't fall back to a stale earlier COMPLETE.
+        return None
     return None
 
 

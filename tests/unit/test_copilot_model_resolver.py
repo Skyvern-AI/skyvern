@@ -35,9 +35,13 @@ class TestModelResolver:
         with pytest.raises(InvalidLLMConfigError, match="empty model_list"):
             resolve_model_config(handler)
 
-    def test_router_config_degrades_to_main_model_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Shim for SKY-9257: a router key resolves to its main_model_group entry as a direct
-        LLMConfig so copilot-v2 can run until SKY-9256 lands the real bridge.
+    def test_router_config_resolves_primary_model_with_litellm_fallbacks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Router keys resolve to a primary model while preserving LiteLLM fallbacks.
+
+        This is still not full router parity: deployment load-balancing and
+        cooldowns remain outside the Agents SDK path until SKY-9256. The
+        fallback chain itself must be carried through so Bedrock-primary
+        Copilot keys can fall through when the primary provider is unavailable.
         """
         from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 
@@ -53,14 +57,18 @@ class TestModelResolver:
             model_name="gpt-4-1-mini-fallback",
             litellm_params={"model": "azure/gpt-4-1-mini"},
         )
+        final_fallback = LLMRouterModelConfig(
+            model_name="claude-fallback",
+            litellm_params={"model": "anthropic/claude-sonnet-4-20250514"},
+        )
         router_config = LLMRouterConfig(
             model_name="gemini-2.5-flash-fallback-router",
-            model_list=[main, fallback],
+            model_list=[main, fallback, final_fallback],
             required_env_vars=["VERTEX_CREDENTIALS"],
             supports_vision=True,
             add_assistant_prefix=False,
             main_model_group="vertex-gemini-2.5-flash",
-            fallback_model_group="gpt-4-1-mini-fallback",
+            fallback_model_group=["gpt-4-1-mini-fallback", "claude-fallback"],
             temperature=0.3,
             max_completion_tokens=8192,
         )
@@ -84,6 +92,10 @@ class TestModelResolver:
         assert run_config.model_settings.max_tokens == 8192
         assert run_config.model_settings.extra_args is not None
         assert run_config.model_settings.extra_args["timeout"] == 900.0
+        assert run_config.model_settings.extra_args["fallbacks"] == [
+            "azure/gpt-4-1-mini",
+            "anthropic/claude-sonnet-4-20250514",
+        ]
 
     def test_router_config_no_main_group_match_falls_back_to_first_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
@@ -428,3 +440,60 @@ class TestModelResolver:
 
         joined = " ".join(str(record.get("event", "")) for record in logs)
         assert "unrouted" not in joined
+
+    def test_github_copilot_endpoint_restores_openai_compatible_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GitHub Copilot via OPENAI_COMPATIBLE exposes the handler's .llm_key as the bare
+        model name ("gpt-4o"), which is not a registry key. The resolver must restore the
+        OPENAI_COMPATIBLE key so the githubcopilot api_base/api_key thread through instead of
+        resolving to a credential-less OpenAI model that 401s."""
+        from skyvern.config import settings
+        from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+        openai_compatible_config = LLMConfig(
+            model_name="openai/gpt-4o",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_key="gho_test",
+                api_base="https://api.githubcopilot.com",
+                api_version=None,
+                model_info={"model_name": "openai/gpt-4o"},
+            ),
+        )
+
+        seen_keys: list[str] = []
+
+        def fake_get_config(key: str) -> LLMConfig:
+            seen_keys.append(key)
+            return openai_compatible_config
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
+            fake_get_config,
+        )
+        # The rewritten label "gpt-4o" is not a registered registry key.
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.is_registered",
+            lambda key: False,
+        )
+        # Force the GitHub Copilot endpoint branch on.
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMAPIHandlerFactory.is_github_copilot_endpoint",
+            lambda: True,
+        )
+        monkeypatch.setattr(settings, "OPENAI_COMPATIBLE_MODEL_KEY", "OPENAI_COMPATIBLE")
+        monkeypatch.setattr(settings, "OPENAI_COMPATIBLE_MODEL_NAME", "gpt-4o")
+
+        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+
+        handler = MagicMock()
+        handler.llm_key = "gpt-4o"  # the rewritten observability label
+
+        model_name, run_config, llm_key, _ = resolve_model_config(handler)
+
+        assert llm_key == "OPENAI_COMPATIBLE"
+        assert seen_keys == ["OPENAI_COMPATIBLE"]
+        assert model_name == "openai/gpt-4o"
+        assert run_config.model_provider._base_url == "https://api.githubcopilot.com"
+        assert run_config.model_provider._api_key == "gho_test"
