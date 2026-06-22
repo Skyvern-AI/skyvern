@@ -93,6 +93,33 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
     ) == (DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT, RepairNextAction.ASK, ["may_answer_without_mutation"])
 
 
+def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_verified",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+
+
 def test_repairable_block_failure_contract_is_queryable_and_safe() -> None:
     contract = build_diagnosis_repair_contract(
         source_tool="run_blocks_and_collect_debug",

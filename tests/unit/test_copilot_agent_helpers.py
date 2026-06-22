@@ -13,6 +13,12 @@ import yaml
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.agent import (
+    _VERIFIED_WORKFLOW_SUCCESS_REPLY,
+    _build_goal_satisfied_exit_result,
+    _resolve_wrapped_exception_exit_result,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
@@ -29,6 +35,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
+    verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -40,8 +47,14 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
+from skyvern.forge.sdk.copilot.turn_halt import (
+    TurnHalt,
+    TurnHaltKind,
+    raise_if_turn_halt,
+    stash_repair_ceiling_turn_halt,
+)
 from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentAuthority,
@@ -784,6 +797,159 @@ class TestVerifiedGoalSatisfiedStop:
         )
 
         assert verified_goal_satisfied_context(ctx)
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_fallback_reaches_goal_satisfied_after_verified_consume(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="repair ceiling",
+            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            recovery_hint="report_blocker_to_user",
+            preserves_workflow_draft=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+        raise_if_turn_halt(ctx, verified=True)
+
+        assert not isinstance(ctx.turn_halt, TurnHalt)
+        assert verified_goal_satisfied_context(ctx)
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        assert result.proposal_disposition != "no_proposal"
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_resolver_renders_success_over_involuntary_halt(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="repair ceiling",
+            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            recovery_hint="report_blocker_to_user",
+            preserves_workflow_draft=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+        result = await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context=None,
+            goal_satisfied=True,
+            error=RuntimeError("sdk-wrapped hook exception"),
+            workflow_permanent_id="wfp-1",
+        )
+
+        assert result.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        assert result.proposal_disposition != "no_proposal"
+        assert result.updated_workflow is ctx.last_workflow
+        assert not isinstance(ctx.turn_halt, TurnHalt)
+        assert ctx.blocker_signal is None
+        assert signal.user_facing_reason not in result.user_response
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_resolver_surfaces_voluntary_challenge(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        challenge_text = "The site requires a verification challenge I can't complete on my own."
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="stop on terminal challenge",
+            user_facing_reason=challenge_text,
+            recovery_hint="stop",
+            internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=signal)
+
+        result = await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context=None,
+            goal_satisfied=True,
+            error=RuntimeError("sdk-wrapped hook exception"),
+            workflow_permanent_id="wfp-1",
+        )
+
+        assert result.user_response == challenge_text
+        assert result.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_resolver_renders_blocker_when_not_judge_verified(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        # The broad legacy gate passes (goal_satisfied) but the judge confirmed nothing, so
+        # outcome_fully_verified is False and the involuntary halt must not be suppressed.
+        ctx.completion_verification_result = None
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="repair ceiling",
+            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            recovery_hint="report_blocker_to_user",
+            preserves_workflow_draft=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+        result = await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context=None,
+            goal_satisfied=True,
+            error=RuntimeError("sdk-wrapped hook exception"),
+            workflow_permanent_id="wfp-1",
+        )
+
+        assert result.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        assert signal.user_facing_reason in result.user_response
 
     def test_wrapped_goal_satisfied_error_context_requires_no_change(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
