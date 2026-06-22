@@ -546,7 +546,7 @@ function WorkflowRunParametersInline({
       workflowRunId,
       "params-inline",
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -558,6 +558,7 @@ function WorkflowRunParametersInline({
       return client
         .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
           params,
+          signal,
         })
         .then((r) => r.data);
     },
