@@ -2108,10 +2108,9 @@ def _record_run_blocks_result(
                 ),
             )
         if completion_fully_satisfied:
-            # Terminal proposal promotion is authoritative only after the same
-            # run has satisfied completion verification; clear stale
-            # suspicious-success state before agent/enforcement exits consume
-            # ``verified_terminal_proposal_ready``.
+            # ``verified_terminal_proposal_ready`` is telemetry only (the barrier keys
+            # on ``outcome_fully_verified(ctx)``); clearing the stale suspicious-success
+            # state below is the load-bearing step.
             copilot_ctx.verified_terminal_proposal_ready = True
             copilot_ctx.last_test_suspicious_success = False
             copilot_ctx.last_test_failure_reason = None

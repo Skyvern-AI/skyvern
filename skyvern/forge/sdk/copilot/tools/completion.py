@@ -6,6 +6,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_verification import (
+    _STRUCTURED_RECORD_CRITERION_IDS,
     CompletionVerificationResult,
     CriterionVerdict,
     RunEvidenceSnapshot,
@@ -542,6 +543,30 @@ async def _maybe_run_completion_verification(
         if definition_criteria
         else []
     )
+    if run_criteria and all(criterion.id in _STRUCTURED_RECORD_CRITERION_IDS for criterion in run_criteria):
+        # Classifier-fallback criteria are value-agnostic (graded on record shape, not the
+        # requested entity) and the judge cannot disambiguate them either, so a well-shaped record
+        # for the wrong entity must not read as verified. Treat the run plane as criteria-less and
+        # surface only a structural contradiction as a suspicious-success signal.
+        snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
+        contradictions = [
+            verdict for verdict in grade_structured_record_criteria(run_criteria, snapshot) if not verdict.satisfied
+        ]
+        if contradictions:
+            return combine_verification_results(
+                criterion_ids,
+                CompletionVerificationResult(
+                    status="evaluated",
+                    criterion_ids=[criterion.id for criterion in run_criteria],
+                    verdicts=contradictions,
+                ),
+                definition_verdicts,
+            )
+        if not definition_verdicts:
+            return None
+        return combine_verification_results(
+            [criterion.id for criterion in definition_criteria], None, definition_verdicts
+        )
     if not run_criteria:
         return combine_verification_results(criterion_ids, None, definition_verdicts)
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
