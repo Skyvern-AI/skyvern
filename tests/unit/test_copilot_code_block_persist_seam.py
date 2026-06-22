@@ -13,7 +13,8 @@ import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
-from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr
+from skyvern.forge.sdk.copilot.code_block_preflight import _sandbox_shim_surface, strip_redundant_sandbox_imports
+from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr, _get_by_role_expr_strict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -24,7 +25,10 @@ from skyvern.forge.sdk.copilot.tools import (
     _update_workflow,
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.workflow_update import _strip_redundant_sandbox_imports_in_yaml
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
+from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
 
 def _yaml(body: str) -> str:
@@ -41,6 +45,32 @@ _IMPORTING_CODE_YAML = _yaml(
         code: |
           import asyncio
           await page.goto("https://example.com/search")
+    """
+)
+
+_REQUESTS_IMPORT_CODE_YAML = _yaml(
+    """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          import requests
+          await page.goto("https://example.com/search")
+    """
+)
+
+_ASYNCIO_GATHER_IMPORT_CODE_YAML = _yaml(
+    """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          import asyncio
+          await asyncio.gather(page.goto("https://example.com/search"))
     """
 )
 
@@ -418,6 +448,29 @@ class TestCodeSafetySeam:
         assert "search_registry" in errors[0]
         assert "Not allowed to import modules" in errors[0]
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import requests\nawait page.goto('https://example.com')",
+            "import os as json\nvalue = json",
+            "import json.decoder\nvalue = 1",
+            "from re import search\nmatch = search(r'x', 'x')",
+        ],
+    )
+    def test_unsafe_import_classifications_are_seam_errors(self, code: str) -> None:
+        errors = _code_block_safety_errors(_code_yaml(code), None)
+        assert any("Not allowed to import modules" in str(error) for error in errors)
+
+    def test_dunder_and_blocked_attr_use_are_seam_errors(self) -> None:
+        dunder_errors = _code_block_safety_errors(_code_yaml("value = page.__class__"), None)
+        assert any("private methods or attributes" in str(error) for error in dunder_errors)
+        blocked_errors = _code_block_safety_errors(_code_yaml("value = page.modules"), None)
+        assert any("Not allowed to access 'modules'" in str(error) for error in blocked_errors)
+
+    def test_stripped_shim_import_keeps_name_resolvable_at_seam(self) -> None:
+        sanitized, _ = strip_redundant_sandbox_imports("import json\nvalue = json.dumps({'a': 1})")
+        assert _code_block_safety_errors(_code_yaml(sanitized), None) == []
+
     def test_unchanged_legacy_code_block_is_not_rechecked(self) -> None:
         assert _code_block_safety_errors(_IMPORTING_CODE_YAML, _IMPORTING_CODE_YAML) == []
 
@@ -569,20 +622,42 @@ class TestCodeSafetySeam:
         assert "not valid Python" in errors[0]
 
     @pytest.mark.asyncio
-    async def test_update_workflow_rejects_import_before_any_run(self) -> None:
+    async def test_update_workflow_strips_redundant_import_before_any_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
         result = await _update_workflow({"workflow_yaml": _IMPORTING_CODE_YAML}, ctx)
+        assert result["ok"] is True
+        assert "import asyncio" not in ctx.workflow_yaml
+        assert result["data"]["stripped_redundant_imports"] == ["asyncio"]
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_still_rejects_third_party_import_before_any_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML}, ctx)
         assert result["ok"] is False
         assert "Not allowed to import modules" in result["error"]
-        assert "import" not in result["user_facing_summary"]
-        assert result["user_facing_summary"]
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_still_rejects_surface_exceeding_shim_import_before_any_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _ASYNCIO_GATHER_IMPORT_CODE_YAML}, ctx)
+        assert result["ok"] is False
+        assert "Not allowed to import modules" in result["error"]
 
     @pytest.mark.asyncio
     async def test_code_rejection_does_not_salvage_metadata_into_ctx(self) -> None:
         ctx = _code_only_ctx()
         metadata = [_terminal_metadata("search_registry", "search the registry")]
         result = await _update_workflow(
-            {"workflow_yaml": _IMPORTING_CODE_YAML, "code_artifact_metadata": metadata}, ctx
+            {"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML, "code_artifact_metadata": metadata}, ctx
         )
         assert result["ok"] is False
         assert ctx.code_artifact_metadata == {}
@@ -1968,7 +2043,7 @@ class TestCompiledAuthoringImposition:
 
         assert result.violations == []
         block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
-        assert 'await page.get_by_role("link", name="View Printable Statement").click()' in block["code"]
+        assert 'await page.get_by_role("link", name="View Printable Statement", exact=True).click()' in block["code"]
         assert "async with page.expect_download()" in block["code"]
         assert "/billing/statement.pdf" in block["code"]
 
@@ -1996,7 +2071,7 @@ class TestCompiledAuthoringImposition:
         entry = {
             "trajectory_index": 1,
             "selector": "a",
-            "emitted_literal": _get_by_role_expr("link", "View Statements"),
+            "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
             "source": "aria_role_name",
             "role": "link",
             "name": "View Statements",
@@ -2013,7 +2088,7 @@ class TestCompiledAuthoringImposition:
         }
         tampered_role = {
             "selector": "a",
-            "emitted_literal": _get_by_role_expr("link", "View Statements"),
+            "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
             "source": "aria_role_name",
             "role": "button",
             "name": "View Statements",
@@ -2040,6 +2115,27 @@ class TestCompiledAuthoringImposition:
             )
             is False
         )
+
+    def test_provenance_gate_admits_self_validating_exact_aria_role_name(self) -> None:
+        entry = {
+            "trajectory_index": 1,
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr_strict("link", "Download"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "Download",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(entry) is True
+
+    def test_provenance_gate_rejects_non_exact_aria_role_name_literal(self) -> None:
+        tampered = {
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr("link", "Download"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "Download",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered) is False
 
 
 def test_direct_literal_rewrite_preserves_unicode_prefix_offsets() -> None:
@@ -2302,7 +2398,7 @@ class TestCredentialScoutPersistGate:
     )
     _UNSAFE_SUBMIT_CODE_YAML = _credential_code_yaml(
         code="""
-        import asyncio
+        leaked = page.__class__
         await page.locator("#email").fill(login_credential.username)
         await page.locator("input[type='password']").fill(login_credential.password)
         await page.locator("input[type='submit']").click()
@@ -2375,7 +2471,7 @@ class TestCredentialScoutPersistGate:
         )
         assert result["data"]["failure_type"] == "missing_credential_or_init"
         code_safety_diagnostics = result["data"]["diagnostic_code_safety_errors"]
-        assert any("Not allowed to import modules" in error for error in code_safety_diagnostics)
+        assert any("private methods or attributes" in error for error in code_safety_diagnostics)
 
     @pytest.mark.asyncio
     async def test_allows_submit_code_gate_once_matching_fills_and_submit_are_scouted(self) -> None:
@@ -2485,3 +2581,132 @@ class TestCredentialScoutPersistGate:
 def test_run_id_leak_check_covers_non_numeric_ids() -> None:
     with pytest.raises(ValueError):
         assert_clean_user_facing_text("Outcome uncertain for wr_sample_123abc.")
+
+
+class TestStripRedundantSandboxImports:
+    @pytest.mark.parametrize(
+        ("code", "expected_module"),
+        [
+            ("import asyncio\nawait page.goto('https://example.com')", "asyncio"),
+            ("import asyncio\nawait asyncio.sleep(1)", "asyncio"),
+            ("import json\nvalue = json.dumps({})", "json"),
+            ("import json\nvalue = json.loads('{}')", "json"),
+            ("import re\nmatch = re.search(r'x', 'x')", "re"),
+            ("import html\nvalue = html.escape('<')", "html"),
+        ],
+    )
+    def test_strips_redundant_shim_import(self, code: str, expected_module: str) -> None:
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == [expected_module]
+        assert f"import {expected_module}" not in sanitized
+        CodeBlock.is_safe_code(sanitized)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import asyncio\nawait asyncio.gather(page.goto('https://example.com'))",
+            "import json\ntry:\n    json.loads('x')\nexcept json.JSONDecodeError:\n    pass",
+            "import html\nvalue = html.unescape('&amp;')",
+            "import re\nvalue = re.subn(r'a', 'b', 'a')",
+            "import json\nvalue = json",
+        ],
+    )
+    def test_does_not_strip_surface_exceeding_or_bare_use(self, code: str) -> None:
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == []
+        assert sanitized == code
+        with pytest.raises(InsecureCodeDetected):
+            CodeBlock.is_safe_code(sanitized)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import os as json\nvalue = json",
+            "import json.decoder\nvalue = 1",
+            "from re import search\nmatch = search(r'x', 'x')",
+            "import json; value = json.dumps({})",
+            "import requests\nvalue = requests",
+            "import os\nvalue = 1",
+            'import re; import os\nresult = os.environ.get("AWS_SECRET_ACCESS_KEY")',
+            'import os; import re\nresult = os.environ.get("AWS_SECRET_ACCESS_KEY")',
+            'import json; import requests\nresult = requests.get("https://example.com")',
+        ],
+    )
+    def test_does_not_strip_unsafe_classifications(self, code: str) -> None:
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == []
+        assert sanitized == code
+        with pytest.raises(InsecureCodeDetected):
+            CodeBlock.is_safe_code(sanitized)
+
+    def test_preserves_surrounding_comments(self) -> None:
+        code = "import asyncio  # drop me\n# keep this comment\nawait asyncio.sleep(1)  # trailing"
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == ["asyncio"]
+        assert "# keep this comment" in sanitized
+        assert "# trailing" in sanitized
+        assert "import asyncio" not in sanitized
+
+    def test_syntax_error_is_returned_unchanged(self) -> None:
+        code = "import asyncio\nawait page.goto("
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == []
+        assert sanitized == code
+
+    def test_shim_surface_is_derived_from_build_safe_vars(self) -> None:
+        expected = {
+            name: frozenset(vars(value))
+            for name, value in CodeBlock.build_safe_vars().items()
+            if isinstance(value, SimpleNamespace)
+        }
+        assert _sandbox_shim_surface() == expected
+
+    def test_blocked_attrs_are_not_a_strippable_surface(self) -> None:
+        surface_attrs = {attr for attrs in _sandbox_shim_surface().values() for attr in attrs}
+        assert surface_attrs.isdisjoint(CodeBlock.BLOCKED_ATTRS)
+
+
+class TestStripRedundantSandboxImportsInYaml:
+    def test_malformed_yaml_is_returned_unchanged(self) -> None:
+        malformed = "title: [unterminated\n"
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(malformed)
+        assert stripped == []
+        assert sanitized == malformed
+
+    def test_non_workflow_yaml_is_returned_unchanged(self) -> None:
+        non_workflow = "just: a mapping\n"
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(non_workflow)
+        assert stripped == []
+        assert sanitized == non_workflow
+
+    def test_multi_block_strips_per_block(self) -> None:
+        multi_block = _yaml(
+            """
+            title: Multi
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: first
+                code: |
+                  import asyncio
+                  await asyncio.sleep(1)
+              - block_type: code
+                label: second
+                code: |
+                  await page.goto("https://example.com")
+              - block_type: code
+                label: third
+                code: |
+                  import json
+                  value = json.dumps({})
+            """
+        )
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(multi_block)
+        assert sorted(stripped) == ["asyncio", "json"]
+        assert "import asyncio" not in sanitized
+        assert "import json" not in sanitized
+
+    def test_no_change_returns_original_text(self) -> None:
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(_SAFE_CODE_YAML)
+        assert stripped == []
+        assert sanitized == _SAFE_CODE_YAML

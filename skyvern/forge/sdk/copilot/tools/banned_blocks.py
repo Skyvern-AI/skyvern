@@ -248,6 +248,8 @@ Code-native capabilities still pending plumbing:
 
 Runtime facts:
 - `code` is async Python with a Playwright `page` object and workflow parameters by key.
+- The runtime pre-injects its helper namespaces; do not write `import` statements and do
+  not access dunder (`__name__`) names or attributes.
 - Valid Python identifier parameter keys are local variables; normalize before page inputs.
 - Use deterministic, bounded Playwright calls: `goto`, `click`, `fill`, `press`,
   `wait_for_load_state`, `locator`, `get_by_role`, and locator text/count APIs.

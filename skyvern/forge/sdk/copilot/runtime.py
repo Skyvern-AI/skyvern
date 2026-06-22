@@ -285,6 +285,9 @@ class AgentContext:
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_typed_value: str | None = None
+    # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
+    # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
+    pending_scout_role_name: tuple[str, str, str] | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.

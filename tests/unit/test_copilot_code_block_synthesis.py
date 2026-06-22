@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     _get_by_role_expr,
+    _get_by_role_expr_strict,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     is_optional_dismissal_only_trajectory,
@@ -263,7 +264,7 @@ class TestLocatorSynthesis:
         ]
         result = synthesize_code_block(trajectory, strict_selectors=True)
         assert result is not None
-        assert 'await page.get_by_role("link", name="View Statements").click()' in result.code
+        assert 'await page.get_by_role("link", name="View Statements", exact=True).click()' in result.code
         assert ".first" not in result.code
         assert result.diagnostics.dropped_interactions == []
         provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
@@ -271,7 +272,7 @@ class TestLocatorSynthesis:
             {
                 "trajectory_index": 1,
                 "selector": "a",
-                "emitted_literal": _get_by_role_expr("link", "View Statements"),
+                "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
                 "source": "aria_role_name",
                 "role": "link",
                 "name": "View Statements",
@@ -291,7 +292,7 @@ class TestLocatorSynthesis:
         ]
         result = synthesize_code_block(trajectory, strict_selectors=True)
         assert result is not None
-        assert 'await page.get_by_role("link", name="Continue").click()' in result.code
+        assert 'await page.get_by_role("link", name="Continue", exact=True).click()' in result.code
         assert result.diagnostics.dropped_interactions == []
 
     def test_strict_bare_selector_without_role_name_is_still_dropped(self) -> None:
@@ -321,9 +322,41 @@ class TestLocatorSynthesis:
         result = synthesize_code_block(trajectory, strict_selectors=True)
         assert result is not None
         assert result.diagnostics.dropped_interactions == []
-        emitted = _get_by_role_expr("link", 'Say "hi"\nplease')
+        emitted = _get_by_role_expr_strict("link", 'Say "hi"\nplease')
+        assert "exact=True" in emitted
         assert "\n" not in emitted
         assert f"await {emitted}.click()" in result.code
+
+    def test_strict_reanchor_emits_exact_name_match_for_repeated_affordance(self) -> None:
+        # AC1: a re-anchored named get_by_role on a page with a repeated accessible name must emit an
+        # exact (single (role, name) group) match, never the substring default that over-matches.
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/billing"),
+            _interaction(
+                "click",
+                selector="a",
+                source_url="https://example.com/billing",
+                role="link",
+                accessible_name="Download",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="Download", exact=True).click()' in result.code
+        assert ".nth(" not in result.code
+        assert result.diagnostics.dropped_interactions == []
+        provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
+        assert provenance == [
+            {
+                "trajectory_index": 1,
+                "selector": "a",
+                "emitted_literal": _get_by_role_expr_strict("link", "Download"),
+                "source": "aria_role_name",
+                "role": "link",
+                "name": "Download",
+            }
+        ]
+        assert provenance[0]["emitted_literal"] != _get_by_role_expr("link", "Download")
 
 
 class TestActionSynthesis:

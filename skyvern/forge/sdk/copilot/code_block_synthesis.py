@@ -280,6 +280,13 @@ def _get_by_role_expr(role: str, name: str) -> str:
     return f"page.get_by_role({_py_str(role)}).first"
 
 
+def _get_by_role_expr_strict(role: str, name: str) -> str:
+    """Strict re-anchor: exact name match so a repeated affordance resolves to a single (role, name)
+    element where the substring default over-matches. N identical exact names still strict-mode-violate
+    at run time (SKY-11297) — an honest failure beats a silent wrong-element click."""
+    return f"page.get_by_role({_py_str(role)}, name={_py_str(name)}, exact=True)"
+
+
 def _locator_expr(
     interaction: Mapping[str, Any],
     notes: list[str],
@@ -316,7 +323,7 @@ def _locator_expr(
         ambiguous_role = parsed_strict is not None and not parsed_strict[1]
         if ambiguous_role or _is_bare_ambiguous_selector(selector):
             if role and name:
-                expr = _get_by_role_expr(role, name)
+                expr = _get_by_role_expr_strict(role, name)
                 if diagnostics is not None:
                     diagnostics.locator_provenance.append(
                         {
