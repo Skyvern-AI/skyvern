@@ -604,6 +604,7 @@ class WorkflowParametersRepository(BaseRepository):
     async def get_workflow_copilot_chats(
         self,
         organization_id: str,
+        workflow_permanent_id: str | None = None,
         page: int = 1,
         page_size: int = 20,
         search: str | None = None,
@@ -632,6 +633,8 @@ class WorkflowParametersRepository(BaseRepository):
                 .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
                 .where(WorkflowCopilotChatModel.organization_id == organization_id)
             )
+            if workflow_permanent_id is not None:
+                query = query.where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
             if search and search.strip():
                 # Unindexed substring match over each chat's opening message (one row per chat);
                 # add a pg_trgm index on content if per-org chat counts grow large.
