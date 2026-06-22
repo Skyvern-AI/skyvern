@@ -33,6 +33,8 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "loop_detected_repeated_failed_step",
         "loop_detected_consecutive_same_tool",
         "loop_detected_generic",
+        "code_authoring_guardrail_churn",
+        "credential_priority_authoring_churn",
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
@@ -46,6 +48,17 @@ _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     }
 )
 _PROBABLE_SITE_BLOCK_REASON_CODES = frozenset({"probable_site_block_stop"})
+
+# A held blocker whose reason code is in this set must win both the rendered
+# reply and the typed halt kind over a later non-terminal trip (e.g. the
+# code-authoring churn backstop), which defers entirely when one is present.
+GENUINELY_TERMINAL_BLOCKER_REASON_CODES = (
+    _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES | _PROBABLE_SITE_BLOCK_REASON_CODES | frozenset({"repair_ceiling_reached"})
+)
+
+
+def blocker_signal_is_genuinely_terminal(signal: CopilotToolBlockerSignal | None) -> bool:
+    return signal is not None and signal.internal_reason_code in GENUINELY_TERMINAL_BLOCKER_REASON_CODES
 
 
 @dataclass(frozen=True)

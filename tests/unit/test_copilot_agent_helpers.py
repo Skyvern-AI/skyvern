@@ -40,7 +40,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentMode,
+    TurnIntentReasonCode,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -4473,9 +4478,6 @@ class TestCopilotConfig:
 
         FakeRateLimitError.__module__ = "openai"
 
-        async def fake_feasibility_gate(**_kwargs):
-            return SimpleNamespace(verdict="proceed", question=None, rationale=None)
-
         class FakeMCPServerManager:
             def __init__(self, servers):
                 self.active_servers = servers
@@ -4501,10 +4503,6 @@ class TestCopilotConfig:
             ]
         )
 
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.feasibility_gate.run_feasibility_gate",
-            fake_feasibility_gate,
-        )
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
             AsyncMock(return_value=None),
@@ -5100,3 +5098,53 @@ class TestCredentialClarificationIncludesUiDirections:
         assert (
             policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
         )
+
+
+class TestStructuralInfeasibilityQuestion:
+    def _intent(
+        self,
+        *,
+        mode: TurnIntentMode,
+        reason_codes: list[TurnIntentReasonCode],
+        question: str | None,
+    ) -> TurnIntent:
+        return TurnIntent(
+            mode=mode,
+            reason_codes=reason_codes,
+            missing_context_question=question,
+        )
+
+    def test_returns_question_for_clarify_infeasible_with_question(self) -> None:
+        intent = self._intent(
+            mode=TurnIntentMode.CLARIFY,
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+            question="Which source has the filings?",
+        )
+        assert agent_module._structural_infeasibility_question(intent) == "Which source has the filings?"
+
+    def test_returns_none_when_reason_code_absent(self) -> None:
+        intent = self._intent(
+            mode=TurnIntentMode.CLARIFY,
+            reason_codes=[TurnIntentReasonCode.LOW_CONFIDENCE_CLARIFICATION],
+            question="What workflow should I build or change?",
+        )
+        assert agent_module._structural_infeasibility_question(intent) is None
+
+    def test_returns_none_when_mode_not_clarify(self) -> None:
+        intent = self._intent(
+            mode=TurnIntentMode.BUILD,
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+            question="Which source has the filings?",
+        )
+        assert agent_module._structural_infeasibility_question(intent) is None
+
+    def test_returns_none_for_blank_question(self) -> None:
+        intent = self._intent(
+            mode=TurnIntentMode.CLARIFY,
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+            question="   ",
+        )
+        assert agent_module._structural_infeasibility_question(intent) is None
+
+    def test_returns_none_for_non_turn_intent(self) -> None:
+        assert agent_module._structural_infeasibility_question(None) is None

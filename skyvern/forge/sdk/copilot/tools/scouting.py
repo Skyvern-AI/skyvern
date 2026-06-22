@@ -768,7 +768,16 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
 
     post_url = await _live_working_page_url(ctx) or url
     post_evidence = await _scout_act_observe_page_evidence(ctx, url=post_url)
-    _record_scouted_interaction(ctx, tool_name="click", selector=selector, source_url=pre_url)
+    navigated = bool(pre_url) and bool(post_url) and pre_url != post_url
+    role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+    _record_scouted_interaction(
+        ctx,
+        tool_name="click",
+        selector=selector,
+        source_url=pre_url,
+        role=role,
+        accessible_name=accessible_name,
+    )
 
     for key in ("next_action", "next_action_reason", "actionable_targets"):
         data.pop(key, None)

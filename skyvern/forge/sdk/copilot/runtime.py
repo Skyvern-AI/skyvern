@@ -201,6 +201,8 @@ class AgentContext:
     code_native_pending_capability: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    code_authoring_guardrail_reject_count: int = 0
+    last_code_authoring_reject_was_credential_priority: bool = False
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
