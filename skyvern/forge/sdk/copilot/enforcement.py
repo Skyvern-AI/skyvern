@@ -1270,6 +1270,9 @@ def _check_enforcement(
     raise_if_turn_halt(ctx)
     _raise_if_unrecoverable_contract_stop(ctx)
 
+    if getattr(ctx, "verified_terminal_proposal_ready", False) is True and verified_goal_satisfied_context(ctx):
+        raise CopilotGoalSatisfied()
+
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
         state = _repair_loop_state(ctx)

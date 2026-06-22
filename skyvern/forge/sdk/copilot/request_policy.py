@@ -567,6 +567,7 @@ def _classifier_fallback_policy(
     raw_secret_present: bool,
     failure_kind: str,
     retry_count: int = 0,
+    user_message: str = "",
 ) -> RequestPolicy:
     if failure_kind not in _CLASSIFIER_FAILURE_KINDS:
         failure_kind = "provider_error"
@@ -582,14 +583,79 @@ def _classifier_fallback_policy(
             classifier_retry_count=retry_count,
             completion_contract_status="unknown",
         )
+    fallback_criteria = _fallback_structured_record_completion_criteria(user_message)
+    if fallback_criteria:
+        LOG.info(
+            "copilot request policy synthesized fallback structured-record criteria",
+            classifier_failure_kind=failure_kind,
+            completion_criterion_ids=[criterion.id for criterion in fallback_criteria],
+        )
     return RequestPolicy(
         credential_input_kind="credential_id" if ids else "none",
         credential_refs=ids,
+        completion_criteria=fallback_criteria,
         classifier_status="fallback",
         classifier_failure_kind=failure_kind,
         classifier_retry_count=retry_count,
-        completion_contract_status="unknown",
+        completion_contract_status="present" if fallback_criteria else "unknown",
     )
+
+
+def _word_tokens(text: str) -> list[str]:
+    return "".join(char if char.isalnum() else " " for char in text.casefold()).split()
+
+
+def _fallback_structured_record_completion_criteria(user_message: str) -> list[CompletionCriterion]:
+    """Conservative structured-record criteria when the request-policy classifier is unavailable."""
+
+    words = _word_tokens(user_message)
+    if not words:
+        return []
+    haystack = f" {' '.join(words)} "
+
+    def _mentions(*terms: str) -> bool:
+        # Whole-word/phrase match so "id" can't fire on "consider" nor "name" on "filename".
+        return any(f" {' '.join(_word_tokens(term))} " in haystack for term in terms)
+
+    has_long_number = any(word.isdigit() and len(word) >= 6 for word in words)
+    if not _mentions("return", "record", "capture", "read", "extract"):
+        return []
+    if not _mentions("name", "entity", "person"):
+        return []
+    if not _mentions("identifier", "id", "number") and not has_long_number:
+        return []
+    if not _mentions("status"):
+        return []
+    if not _mentions("locations", "items", "rows", "groups", "entries", "per location", "per item", "per row"):
+        return []
+    return [
+        CompletionCriterion(
+            id="fallback_record_identity",
+            outcome="The returned record identifies the target entity.",
+            implicit=True,
+            level="run",
+        ),
+        CompletionCriterion(
+            id="fallback_record_identifier",
+            outcome="The returned record includes the requested identifier-like value.",
+            implicit=True,
+            level="run",
+        ),
+        CompletionCriterion(
+            id="fallback_record_groups",
+            outcome="The returned record includes the requested grouped row entries.",
+            implicit=True,
+            level="run",
+        ),
+        CompletionCriterion(
+            id="fallback_record_status",
+            outcome=(
+                "The returned record's per-row statuses and summary status are present and internally consistent."
+            ),
+            implicit=True,
+            level="run",
+        ),
+    ]
 
 
 def _explicit_code_block_credential_draft_requested(user_message: str) -> bool:
@@ -656,7 +722,12 @@ async def _classify_request(
     ids = _credential_ids(user_message)
     raw_secret_present = _raw_secret_detected(user_message)
     if raw_secret_present and handler is None:
-        return _classifier_fallback_policy(ids, raw_secret_present=True, failure_kind="raw_secret_no_handler")
+        return _classifier_fallback_policy(
+            ids,
+            raw_secret_present=True,
+            failure_kind="raw_secret_no_handler",
+            user_message=user_message,
+        )
     structural_reason = _structural_clarification_reason(user_message)
     if structural_reason != "none" and not raw_secret_present:
         return RequestPolicy(
@@ -666,7 +737,12 @@ async def _classify_request(
             clarification_reason=structural_reason,
         )
     if handler is None:
-        return _classifier_fallback_policy(ids, raw_secret_present=False, failure_kind="missing_handler")
+        return _classifier_fallback_policy(
+            ids,
+            raw_secret_present=False,
+            failure_kind="missing_handler",
+            user_message=user_message,
+        )
 
     # Raw-secret turns intentionally reach the classifier when available so it
     # can distinguish unsafe secret use from redacted draft/spec conversion.
@@ -693,6 +769,7 @@ async def _classify_request(
             raw_secret_present=raw_secret_present,
             failure_kind=failure_kind,
             retry_count=retry_count,
+            user_message=user_message,
         )
 
     raw_payload = _coerce_classifier_payload(raw)
@@ -703,6 +780,7 @@ async def _classify_request(
             raw_secret_present=raw_secret_present,
             failure_kind="provider_error",
             retry_count=retry_count,
+            user_message=user_message,
         )
 
     policy = _classification_from_raw(raw_payload)

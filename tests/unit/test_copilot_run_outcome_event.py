@@ -325,7 +325,9 @@ async def test_satisfied_adjudication_emits_demonstrated_with_unverified_prefix(
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
     assert frames[-1].reason_code is None
-    assert ctx.last_full_workflow_test_ok is False
+    # A fully-verified completion promotes the full-workflow test result; this is the
+    # deterministic terminal path that lets a verified run finalize success.
+    assert ctx.last_full_workflow_test_ok is True
     assert ctx.last_run_outcome == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
 
 

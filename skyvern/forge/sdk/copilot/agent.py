@@ -1284,7 +1284,7 @@ async def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_cont
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     clean_test = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
     if clean_test and verified_goal_claim_authorized(ctx):
-        user_response = "I created and tested the workflow successfully."
+        user_response = _VERIFIED_WORKFLOW_SUCCESS_REPLY
     elif clean_test:
         user_response = (
             "I built the workflow and the test run completed, but the goal outcome was not "
@@ -1411,6 +1411,7 @@ _MAX_TURNS_REPLY_UNVALIDATED = (
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
+_VERIFIED_WORKFLOW_SUCCESS_REPLY = "I created and tested the workflow successfully."
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
     "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
@@ -1514,9 +1515,7 @@ def _render_typed_run_outcome_reply(
         if not has_verified_workflow or not verified_goal_claim_authorized(ctx):
             return None
         return _TypedRunOutcomeReply(
-            user_response=(
-                "I created and tested the workflow successfully. The latest run demonstrated the requested outcome."
-            ),
+            user_response=f"{_VERIFIED_WORKFLOW_SUCCESS_REPLY} The latest run demonstrated the requested outcome.",
             demonstrated=True,
         )
 
@@ -1973,6 +1972,38 @@ def _build_wip_exit_result(
             terminal_reason=effective_terminal,
         )
 
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    if ctx.verified_terminal_proposal_ready is True and verified_workflow is not None:
+        final_text, outcome = _guard(tested_reply)
+        return _finalize_result_with_blocker_override(
+            ctx,
+            _make_agent_result(
+                ctx,
+                user_response=final_text,
+                updated_workflow=verified_workflow,
+                global_llm_context=global_llm_context,
+                workflow_yaml=verified_yaml,
+                workflow_was_persisted=ctx.workflow_persisted,
+                has_staged_proposal=ctx.has_staged_proposal,
+                staged_workflow_yaml=ctx.staged_workflow_yaml,
+                staged_workflow=ctx.staged_workflow,
+                canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+                total_tokens=ctx.total_tokens_used,
+                proposal_disposition="auto_applicable",
+                cancelled=cancelled,
+                turn_outcome=outcome,
+                turn_id=ctx.turn_id,
+                narrative_summary=ctx.narrative_summary,
+                narrative_payload=_build_narrative_payload(
+                    ctx,
+                    terminal="response",
+                    terminal_message=final_text,
+                    narrative_summary=ctx.narrative_summary,
+                ),
+            ),
+            exit_site="wip_verified_terminal_proposal",
+        )
+
     # When an unverified edit/run has overwritten ``last_workflow``, prefer the
     # verified shape while still forcing explicit review.
     if (
@@ -2356,10 +2387,21 @@ async def _translate_to_agent_result(
         elif not salvaged_reply:
             user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    # Default-true preserves backwards-compat with stale prompts and missing fields.
-    agent_admits_incomplete = _is_explicit_false(
-        action_data.get("goal_reached")
-    ) and not verified_goal_claim_authorized(ctx)
+    verified_terminal_ready = (
+        ctx.verified_terminal_proposal_ready is True
+        and verified_workflow is not None
+        and verified_goal_claim_authorized(ctx)
+        and not blocker_active
+    )
+    if verified_terminal_ready:
+        resp_type = "REPLY"
+        user_response = _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        agent_admits_incomplete = False
+    else:
+        # Default-true preserves backwards-compat with stale prompts and missing fields.
+        agent_admits_incomplete = _is_explicit_false(
+            action_data.get("goal_reached")
+        ) and not verified_goal_claim_authorized(ctx)
     typed_outcome_reply = _render_typed_run_outcome_reply(
         ctx,
         response_type=resp_type,

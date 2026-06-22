@@ -3444,10 +3444,17 @@ async def _update_workflow(
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
-        return {
+        result: dict[str, Any] = {
             "ok": False,
             "error": f"Workflow validation failed: {e}",
         }
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            result["data"] = _code_repair_progress_data()
+            result["user_facing_summary"] = _code_seam_rejection_user_summary(
+                metadata_rejected=False,
+                code_rejected=True,
+            )
+        return result
 
 
 def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:

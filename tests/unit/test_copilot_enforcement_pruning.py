@@ -15,11 +15,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
     NULL_DATA_STREAK_ESCALATE_AT,
     POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
+    CopilotGoalSatisfied,
     _check_enforcement,
     _needs_repeated_null_data_nudge,
     _needs_suspicious_success_nudge,
@@ -64,6 +66,10 @@ class _Ctx:
         self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
+        self.verified_terminal_proposal_ready = False
+        self.completion_verification_result = None
+        self.last_artifact_health_blocker_reason = None
+        self.latest_diagnosis_repair_contract = None
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +250,26 @@ _EXTRACTION_ENVELOPE_CASES: list[tuple[str, dict[str, Any], bool]] = [
     ("empty_payload_trace_repro", {}, True),
     ("real_extraction", {"extracted_information": [{"price": "260.48"}]}, False),
     (
+        "nested_code_output_record",
+        {
+            "extracted_information": [],
+            "extract_record_status_info_output": {
+                "entity_found": True,
+                "entity_name": "Jordan Example",
+                "record_number": "1234567890",
+                "items": [
+                    {
+                        "item_name": "Sample Practice",
+                        "address": "100 Main St, Example City, ST 12345",
+                        "status": "Active",
+                    }
+                ],
+                "overall_status": "Active",
+            },
+        },
+        False,
+    ),
+    (
         "download_only_files",
         {"downloaded_files": [{"url": "https://example.com/a.pdf", "checksum": "abc123"}]},
         False,
@@ -384,6 +410,7 @@ def test_record_run_blocks_result_promotes_when_verified_prefix_covers_workflow(
     )
     ctx.last_workflow_yaml = "workflow: yaml"
     ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.last_unverified_block_labels = ["stale_extract"]
 
     result = {
         "ok": True,
@@ -402,6 +429,121 @@ def test_record_run_blocks_result_promotes_when_verified_prefix_covers_workflow(
     assert ctx.last_unverified_block_labels == []
     assert ctx.last_good_workflow is ctx.last_workflow
     assert ctx.last_good_workflow_yaml == ctx.last_workflow_yaml
+
+
+def test_record_run_blocks_result_promotes_structured_record_top_level_output_to_terminal_proposal() -> None:
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(label="open_search_search"),
+                SimpleNamespace(label="search_and_open_record_details"),
+                SimpleNamespace(label="extract_record_status_record"),
+            ]
+        )
+    )
+    ctx.last_workflow_yaml = "title: Record lookup"
+    ctx.verified_prefix_labels = ["open_search_search"]
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structured_record",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_record_status_record"],
+            "blocks": [
+                {
+                    "label": "extract_record_status_record",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"extracted_information": []},
+                }
+            ],
+            "output": {
+                "search_and_open_record_details_output": {
+                    "found": True,
+                    "entity_name": "Jordan Example",
+                    "opened_record_details": True,
+                    "evidence_text": "Opened Details page for the selected record.",
+                },
+                "extract_record_status_record_output": {
+                    "found": True,
+                    "entity_name": "Jordan Example",
+                    "record_number": "1234567890",
+                    "items": [
+                        {
+                            "item_label": "Sample Practice",
+                            "address": "100 Main St, Example City, ST 12345",
+                            "status": "Active",
+                        }
+                    ],
+                    "overall_status": "Active",
+                    "evidence_text": "Opened Details page; read Overview/Affiliations items and More Details identifier.",
+                },
+                "extracted_information": [],
+            },
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[
+            "fallback_record_identity",
+            "fallback_record_identifier",
+            "fallback_record_groups",
+            "fallback_record_status",
+        ],
+        verdicts=[
+            CriterionVerdict(criterion_id=cid, state="satisfied", reason_code="evidence_confirms")
+            for cid in (
+                "fallback_record_identity",
+                "fallback_record_identifier",
+                "fallback_record_groups",
+                "fallback_record_status",
+            )
+        ],
+    )
+
+    _record_run_blocks_result(ctx, result, completion_verification=verification)
+
+    assert ctx.verified_terminal_proposal_ready is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+
+
+def test_record_run_blocks_result_resets_stale_verified_terminal_proposal_latch() -> None:
+    ctx = _fresh_ctx_for_record()
+    ctx.verified_terminal_proposal_ready = True
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_unverified",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "blocks": [],
+            "output": {},
+        },
+    }
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.verified_terminal_proposal_ready is False
+
+
+def test_enforcement_stops_after_verified_terminal_proposal() -> None:
+    ctx = _Ctx()
+    ctx.verified_terminal_proposal_ready = True
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    ctx.last_test_suspicious_success = True
+
+    with pytest.raises(CopilotGoalSatisfied):
+        _check_enforcement(ctx)
 
 
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:
