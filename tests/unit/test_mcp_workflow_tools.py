@@ -508,6 +508,199 @@ async def test_workflow_update_defaults_proxy_when_existing_is_null(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_workflow_update_preserves_sequential_settings_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "run_sequentially": True,
+            "sequential_key": "existing-sequential-key",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.get("run_sequentially") is True
+    assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_respects_explicit_run_sequentially_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "run_sequentially": True,
+            "sequential_key": "existing-sequential-key",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "run_sequentially": False,
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "visit",
+                    "url": "https://example.com",
+                    "title": "Visit",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert result["ok"] is True
+    assert sent_definition.get("run_sequentially") is False
+    assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_overlap_and_credentials_via_mcp_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise workflow update through the registered FastMCP tool boundary."""
+
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "run_sequentially": True,
+            "sequential_key": "existing-sequential-key",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": "credentials",
+                        "credential_id": "cred_abc123",
+                        "credential_parameter_id": "cp_xyz",
+                        "workflow_id": "wf_test",
+                    },
+                    {
+                        "parameter_type": "workflow",
+                        "key": "url_input",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://example.com",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_block",
+                        "parameter_keys": ["credentials"],
+                    }
+                ],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "url_input",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://new-url.com",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "login",
+                    "label": "login_block",
+                    "parameter_keys": [],
+                    "navigation_goal": "Login to the site",
+                }
+            ],
+        },
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "skyvern_workflow_update",
+            {
+                "workflow_id": "wpid_test",
+                "definition": json.dumps(definition),
+                "format": "json",
+            },
+        )
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is True
+
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert sent_definition.get("run_sequentially") is True
+    assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+    params = sent_definition["workflow_definition"]["parameters"]
+    cred_params = [p for p in params if p.get("parameter_type") == "credential"]
+    assert len(cred_params) == 1
+    assert cred_params[0]["key"] == "credentials"
+    assert cred_params[0]["credential_id"] == "cred_abc123"
+
+    blocks = sent_definition["workflow_definition"]["blocks"]
+    login_block = next(b for b in blocks if b.get("label") == "login_block")
+    assert "credentials" in login_block.get("parameter_keys", [])
+
+
+@pytest.mark.asyncio
 async def test_workflow_create_falls_back_on_schema_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """If the internal schema rejects the payload, normalization is skipped and the raw dict is forwarded."""
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
