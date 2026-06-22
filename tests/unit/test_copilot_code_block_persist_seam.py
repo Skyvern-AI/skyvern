@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
-from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr
+from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr, _get_by_role_expr_strict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -1968,7 +1968,7 @@ class TestCompiledAuthoringImposition:
 
         assert result.violations == []
         block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
-        assert 'await page.get_by_role("link", name="View Printable Statement").click()' in block["code"]
+        assert 'await page.get_by_role("link", name="View Printable Statement", exact=True).click()' in block["code"]
         assert "async with page.expect_download()" in block["code"]
         assert "/billing/statement.pdf" in block["code"]
 
@@ -1996,7 +1996,7 @@ class TestCompiledAuthoringImposition:
         entry = {
             "trajectory_index": 1,
             "selector": "a",
-            "emitted_literal": _get_by_role_expr("link", "View Statements"),
+            "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
             "source": "aria_role_name",
             "role": "link",
             "name": "View Statements",
@@ -2013,7 +2013,7 @@ class TestCompiledAuthoringImposition:
         }
         tampered_role = {
             "selector": "a",
-            "emitted_literal": _get_by_role_expr("link", "View Statements"),
+            "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
             "source": "aria_role_name",
             "role": "button",
             "name": "View Statements",
@@ -2040,6 +2040,27 @@ class TestCompiledAuthoringImposition:
             )
             is False
         )
+
+    def test_provenance_gate_admits_self_validating_exact_aria_role_name(self) -> None:
+        entry = {
+            "trajectory_index": 1,
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr_strict("link", "Download"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "Download",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(entry) is True
+
+    def test_provenance_gate_rejects_non_exact_aria_role_name_literal(self) -> None:
+        tampered = {
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr("link", "Download"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "Download",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered) is False
 
 
 def test_direct_literal_rewrite_preserves_unicode_prefix_offsets() -> None:
