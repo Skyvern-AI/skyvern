@@ -14,8 +14,10 @@ import structlog
 from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
 from skyvern.forge.sdk.copilot.narration import (
+    CODE_REPAIR_PROGRESS_SURFACE_KIND,
     NarratorState,
     TransitionKind,
+    build_narration_activity,
     build_tool_call_activity,
     build_tool_result_activity,
     cancel_in_flight,
@@ -30,6 +32,7 @@ from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, 
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotDesignEndUpdate,
     WorkflowCopilotDesignStartUpdate,
+    WorkflowCopilotNarrationUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotToolCallUpdate,
     WorkflowCopilotToolResultUpdate,
@@ -58,6 +61,17 @@ _OBSERVATION_TOOLS = {
     "select_option",
     "press_key",
 }
+
+
+def _code_repair_progress_text(parsed: dict[str, Any]) -> str | None:
+    """Return the classified code-repair progress text carried on a reject's ``data``, else None."""
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return None
+    if data.get("surface_kind") != CODE_REPAIR_PROGRESS_SURFACE_KIND:
+        return None
+    progress_text = data.get("progress_text")
+    return progress_text if isinstance(progress_text, str) and progress_text else None
 
 
 async def stream_to_sse(
@@ -188,48 +202,61 @@ async def stream_to_sse(
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
-                blocker_signals = _tool_blocker_signal_candidates(ctx)
-                summary = format_tool_result_for_user(tool_name, parsed, blocker_signal=blocker_signals)
-                success = parsed.get("ok", True)
-                detail = summarize_tool_result_detail(parsed, tool_name=tool_name, blocker_signal=blocker_signals)
-                narrator_state.record_activity(
-                    build_tool_result_activity(tool_name, summary, success, iteration, call_id)
-                )
-
-                if not client_gone:
-                    await stream.send(
-                        WorkflowCopilotToolResultUpdate(
-                            type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
-                            tool_name=tool_name,
-                            success=success,
-                            summary=summary,
-                            iteration=iteration,
-                            tool_call_id=call_id,
-                            detail=detail,
-                        )
-                    )
-
-                if narrator_enabled:
-                    ctx_before = snapshot_ctx(ctx)
-                    _update_enforcement_from_tool(ctx, tool_name, parsed)
-                    ctx_after = snapshot_ctx(ctx)
-
-                    prior_tool_name = (
-                        narrator_state.pending_activity[-1].tool_name if narrator_state.pending_activity else None
-                    )
-                    narrator_state.record_tool(
-                        tool_name=tool_name,
-                        summary=summary,
-                        success=success,
+                progress_text = _code_repair_progress_text(parsed)
+                if progress_text is not None:
+                    # Presentation-only: render the reject as quiet de-duplicated progress;
+                    # enforcement and the turn-halt below still run.
+                    await _emit_code_repair_progress(
+                        narrator_state=narrator_state,
+                        stream=stream,
+                        progress_text=progress_text,
                         iteration=iteration,
-                        details=extract_tool_details(tool_name, parsed),
+                        client_gone=client_gone,
                     )
-                    for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
-                        narrator_state.record_transition(transition)
-                    narrator_state.current_iteration = iteration
-                    schedule_narration(narrator_state, stream, iteration)
-                else:
                     _update_enforcement_from_tool(ctx, tool_name, parsed)
+                else:
+                    blocker_signals = _tool_blocker_signal_candidates(ctx)
+                    summary = format_tool_result_for_user(tool_name, parsed, blocker_signal=blocker_signals)
+                    success = parsed.get("ok", True)
+                    detail = summarize_tool_result_detail(parsed, tool_name=tool_name, blocker_signal=blocker_signals)
+                    narrator_state.record_activity(
+                        build_tool_result_activity(tool_name, summary, success, iteration, call_id)
+                    )
+
+                    if not client_gone:
+                        await stream.send(
+                            WorkflowCopilotToolResultUpdate(
+                                type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
+                                tool_name=tool_name,
+                                success=success,
+                                summary=summary,
+                                iteration=iteration,
+                                tool_call_id=call_id,
+                                detail=detail,
+                            )
+                        )
+
+                    if narrator_enabled:
+                        ctx_before = snapshot_ctx(ctx)
+                        _update_enforcement_from_tool(ctx, tool_name, parsed)
+                        ctx_after = snapshot_ctx(ctx)
+
+                        prior_tool_name = (
+                            narrator_state.pending_activity[-1].tool_name if narrator_state.pending_activity else None
+                        )
+                        narrator_state.record_tool(
+                            tool_name=tool_name,
+                            summary=summary,
+                            success=success,
+                            iteration=iteration,
+                            details=extract_tool_details(tool_name, parsed),
+                        )
+                        for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
+                            narrator_state.record_transition(transition)
+                        narrator_state.current_iteration = iteration
+                        schedule_narration(narrator_state, stream, iteration)
+                    else:
+                        _update_enforcement_from_tool(ctx, tool_name, parsed)
 
                 try:
                     _maybe_raise_unrecoverable_tool_error(ctx, tool_name, parsed)
@@ -260,6 +287,42 @@ async def stream_to_sse(
         # Cancel any in-flight narration before the stream tears down so
         # tasks don't try to send on a disconnected channel.
         await cancel_in_flight(narrator_state)
+
+
+async def _emit_code_repair_progress(
+    *,
+    narrator_state: NarratorState,
+    stream: EventSourceStream,
+    progress_text: str,
+    iteration: int,
+    client_gone: bool,
+) -> None:
+    """Surface a code-authoring reject as one quiet progress entry per turn. The persisted activity
+    record runs unconditionally (so a disconnected client gets it on rehydration); only the live
+    frame is gated on the client."""
+    # Advance the narrator iteration on every classified round-trip, including a de-duplicated one,
+    # so readers (e.g. the run-outcome frame) don't see a stale value.
+    narrator_state.current_iteration = iteration
+    if progress_text in narrator_state.emitted_progress_texts:
+        return
+    narrator_state.emitted_progress_texts.add(progress_text)
+
+    # An LLM tool-start narration scheduled at tool_called would otherwise double
+    # up with this progress entry for the same iteration; drop it.
+    await cancel_in_flight(narrator_state)
+
+    narration_ts = datetime.now(timezone.utc)
+    narrator_state.record_activity(build_narration_activity(progress_text, iteration, narration_ts))
+    if client_gone:
+        return
+    await stream.send(
+        WorkflowCopilotNarrationUpdate(
+            type=WorkflowCopilotStreamMessageType.NARRATION,
+            narration=progress_text,
+            iteration=iteration,
+            timestamp=narration_ts,
+        )
+    )
 
 
 async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: CopilotContext) -> None:
