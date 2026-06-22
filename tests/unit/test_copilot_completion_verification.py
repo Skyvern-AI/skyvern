@@ -243,7 +243,6 @@ async def test_evaluate_handler_exception_is_unavailable() -> None:
 @pytest.mark.asyncio
 async def test_evaluate_uses_completion_judge_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(settings, "COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS", 10.0)
 
     async def handler(**_: object) -> dict[str, object]:
         await asyncio.sleep(0.05)

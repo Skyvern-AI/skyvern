@@ -55,6 +55,10 @@ def _signal(
             TurnHaltKind.LOOP_DETECTED,
         ),
         (
+            _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn"),
+            TurnHaltKind.LOOP_DETECTED,
+        ),
+        (
             _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE),
             TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
         ),

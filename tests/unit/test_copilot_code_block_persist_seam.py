@@ -12,20 +12,33 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CREDENTIAL_SCOUT_VERIFY_REPLY,
+    CopilotToolBlockerSignal,
+    assert_clean_user_facing_text,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import _sandbox_shim_surface, strip_redundant_sandbox_imports
 from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr, _get_by_role_expr_strict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
+    MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
+    _check_enforcement,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _code_block_safety_errors,
     _detect_stale_block_metadata,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import _strip_redundant_sandbox_imports_in_yaml
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind, _kind_for_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -2710,3 +2723,659 @@ class TestStripRedundantSandboxImportsInYaml:
         sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(_SAFE_CODE_YAML)
         assert stripped == []
         assert sanitized == _SAFE_CODE_YAML
+
+
+def _distinct_guardrail_yaml(index: int) -> str:
+    bodies = [
+        f"value = undefined_helper_{index}()",
+        f'import os\nawait page.goto("https://example.com/{index}")',
+        f'await page.evaluate("{index} + 1")',
+    ]
+    return _code_yaml(bodies[index % len(bodies)])
+
+
+def _distinct_credential_collision_yaml(index: int) -> str:
+    unsafe = [
+        f"value = undefined_helper_{index}()",
+        "import os",
+        f'await page.evaluate("{index} + 1")',
+    ]
+    return _credential_code_yaml(
+        code=f"""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        {unsafe[index % len(unsafe)]}
+        """
+    )
+
+
+def _safe_credential_collision_yaml(index: int) -> str:
+    return _credential_code_yaml(
+        code=f"""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        landing_url_{index} = "https://example.com/portal/{index}"
+        """
+    )
+
+
+def _terminal_challenge_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="A site verification challenge blocked the run.",
+        user_facing_reason="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+    )
+
+
+class TestCodeAuthoringGuardrailChurnBackstop:
+    @pytest.mark.asyncio
+    async def test_counter_climbs_on_distinct_rejects_and_resets_on_accept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            result = await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+            assert result["ok"] is False
+            assert ctx.code_authoring_guardrail_reject_count == index + 1
+        assert ctx.blocker_signal is None
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+        assert accepted["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_counter_climbs_through_credential_scout_branch(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        unsafe_credential_yaml = _credential_code_yaml(
+            code="""
+            import os
+            await page.locator("#email").fill(login_credential.username)
+            await page.locator("input[type='password']").fill(login_credential.password)
+            await page.locator("input[type='submit']").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": unsafe_credential_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert ctx.code_authoring_guardrail_reject_count == 1
+
+    @pytest.mark.asyncio
+    async def test_clean_accept_does_not_climb_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
+        assert "safety checks rejected" in churn.user_facing_reason
+
+    @pytest.mark.asyncio
+    async def test_nth_reject_defers_to_pre_existing_terminal_blocker(self) -> None:
+        ctx = _code_only_ctx()
+        terminal = _terminal_challenge_signal()
+        ctx.blocker_signal = terminal
+        ctx.latest_tool_blocker_signal = terminal
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.blocker_signal is terminal
+        assert ctx.latest_tool_blocker_signal is terminal
+
+    @pytest.mark.asyncio
+    async def test_single_credential_priority_reject_defers_to_credential_scout_reply(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_reject_defers_below_higher_bound(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1):
+            await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_churn_stashes_credential_blocker_at_higher_bound(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result: dict[str, object] = {}
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS):
+            result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "credential_priority_authoring_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_churn_renders_credential_scout_reply_through_enforcement(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "credential_priority_authoring_churn"
+        assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
+
+    @pytest.mark.asyncio
+    async def test_single_pure_credential_reject_defers_to_credential_scout_reply(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert "diagnostic_code_safety_errors" not in result["data"]
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_pure_credential_priority_churn_climbs_and_halts(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result: dict[str, object] = {}
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1):
+            result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(index)}, ctx)
+            assert result["ok"] is False
+            assert result["data"]["failure_type"] == "missing_credential_or_init"
+            assert "diagnostic_code_safety_errors" not in result["data"]
+            assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+            assert ctx.code_authoring_guardrail_reject_count == index + 1
+
+        assert ctx.blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+        result = await _update_workflow(
+            {"workflow_yaml": _safe_credential_collision_yaml(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1)}, ctx
+        )
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "credential_priority_authoring_churn"
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
+
+    @pytest.mark.asyncio
+    async def test_name_safety_churn_still_halts_after_credential_priority_reject(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(index)}, ctx)
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    @pytest.mark.asyncio
+    async def test_non_credential_reject_halts_immediately_when_count_pre_charged(self) -> None:
+        # Credential-priority rejects can push the shared counter into the 4..8 band where the
+        # credential bound still defers; a later non-credential reject flips the flag and halts at
+        # once on the non-credential N=4, since the count is already past it.
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 1):
+            await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(index)}, ctx)
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 1
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+        assert ctx.blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 2
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    @pytest.mark.asyncio
+    async def test_accept_after_latched_churn_clears_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert accepted["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+
+_RESALE_URL = "https://example.com/orders"
+
+
+def _resale_ctx(*, refiner_selector: str = 'button[data-action="status"]') -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#order-id",
+            "source_url": _RESALE_URL,
+            "typed_length": 6,
+            "typed_value": "abc123",
+            "role": "textbox",
+            "accessible_name": "Order ID",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": "button",
+            "source_url": _RESALE_URL,
+            "trajectory_index": 1,
+        },
+        {
+            "tool_name": "click",
+            "selector": refiner_selector,
+            "source_url": _RESALE_URL,
+            "trajectory_index": 2,
+        },
+    ]
+    return ctx
+
+
+def _resale_submitted_yaml(refiner_selector: str = 'button[data-action="status"]') -> str:
+    escaped = refiner_selector.replace('"', '\\"')
+    return _yaml(
+        f"""
+        title: Order status
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: order_status
+            code: |
+              await page.locator("#order-id").fill(str(order_id))
+              await page.locator("{escaped}").click()
+        """
+    )
+
+
+class TestBareDropSupersession:
+    def test_selector_refines_css_accepts_identity_qualifiers(self) -> None:
+        for candidate in (
+            'button[data-action="status"]',
+            "button#submit",
+            "button.primary",
+            'button[aria-label="Close ]"]',  # a literal ] inside the attribute value must not read as a combinator
+        ):
+            assert workflow_update_module._selector_refines("button", candidate) is True
+
+    def test_selector_refines_role_accepts_named_same_role(self) -> None:
+        assert workflow_update_module._selector_refines("role=button", 'role=button[name="Next"]') is True
+
+    def test_selector_refines_rejects_positional_structural_and_cross_shape(self) -> None:
+        bare = "button"
+        for candidate in (
+            "button:nth-child(2)",
+            "button:nth-of-type(2)",
+            "button >> nth=1",
+            "button.primary span",
+            "button#x + button",
+            "button[data-x] > svg",
+            "button:visible",
+            "button:enabled",
+            "button:not(.foo)",
+            'button:has-text("Next")',
+            "a[href]",
+            "buttonx[id=1]",
+            "button",
+        ):
+            assert workflow_update_module._selector_refines(bare, candidate) is False
+        assert workflow_update_module._selector_refines("role=button", 'role=link[name="Next"]') is False
+        assert workflow_update_module._selector_refines("role=button", 'button[data-action="x"]') is False
+        assert workflow_update_module._selector_refines("button", 'role=button[name="x"]') is False
+        assert workflow_update_module._selector_refines("role=button", 'role=button[name="N"] >> nth=1') is False
+
+    def test_supersession_true_returns_pairing_record(self) -> None:
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        ctx = _resale_ctx()
+        claimed: set[int] = set()
+        forgiven, record = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=claimed
+        )
+        assert forgiven is True
+        assert record == {
+            "dropped_index": 1,
+            "dropped_selector": "button",
+            "refiner_index": 2,
+            "refiner_selector": 'button[data-action="status"]',
+            "source_url": _RESALE_URL,
+        }
+        assert claimed == {2}
+
+    def test_supersession_false_across_different_source_url(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory[2]["source_url"] = "https://example.com/other"
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        forgiven, record = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+        )
+        assert forgiven is False
+        assert record is None
+
+    def test_supersession_false_without_later_refiner(self) -> None:
+        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        forgiven, _ = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+        )
+        assert forgiven is False
+
+    def test_supersession_false_on_empty_source_url(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory[1]["source_url"] = ""
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        forgiven, _ = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+        )
+        assert forgiven is False
+
+    def test_supersession_false_on_out_of_bounds_index(self) -> None:
+        ctx = _resale_ctx()
+        for bad_index in (-1, 99, "1", None):
+            dropped = {
+                "reason_code": "ambiguous_bare_selector",
+                "tool_name": "click",
+                "selector": "button",
+                "trajectory_index": bad_index,
+            }
+            forgiven, _ = workflow_update_module._bare_drop_superseded_on_screen(
+                dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+            )
+            assert forgiven is False
+
+    def test_imposition_forgives_mid_trajectory_bare_drop_and_records_substitution(self) -> None:
+        ctx = _resale_ctx()
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_resale_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        forgiven = result.substitutions["forgiven_superseded_bare_drops"]
+        assert forgiven == [
+            {
+                "dropped_index": 1,
+                "dropped_selector": "button",
+                "refiner_index": 2,
+                "refiner_selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+            }
+        ]
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        assert 'button[data-action=\\"status\\"]' in str(block["code"])
+
+    def test_imposition_keeps_bare_drop_fatal_when_sibling_is_positional(self) -> None:
+        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            _resale_submitted_yaml("button:nth-of-type(2)"), ctx
+        )
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_imposition_one_refiner_does_not_forgive_two_bare_drops(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 3,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#start").click()
+                  await page.locator("button[data-action=\\"status\\"]").click()
+            """
+        )
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+
+    def test_imposition_two_refiners_forgive_two_bare_drops(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="open"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 3,
+            },
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 4,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#start").click()
+                  await page.locator("button[data-action=\\"open\\"]").click()
+                  await page.locator("button[data-action=\\"status\\"]").click()
+            """
+        )
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        forgiven = result.substitutions["forgiven_superseded_bare_drops"]
+        assert {record["dropped_index"] for record in forgiven} == {1, 2}
+        assert {record["refiner_index"] for record in forgiven} == {3, 4}
+
+    @pytest.mark.asyncio
+    async def test_auto_act_non_navigating_reads_role_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _auto_act_scout_ctx()
+        captured: dict[str, object] = {}
+
+        async def _fake_resolve(
+            _ctx: AgentContext, selector: str | None, *, allow_browser_read: bool
+        ) -> tuple[str, str]:
+            captured["allow_browser_read"] = allow_browser_read
+            return "button", "Continue"
+
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _fake_resolve)
+
+        async def _same_url(_ctx: AgentContext) -> str:
+            return "https://example.com/orders"
+
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", _same_url)
+
+        async def _evidence(_ctx: AgentContext, *, url: str) -> dict[str, object] | None:
+            return None
+
+        monkeypatch.setattr(scouting_module, "_scout_act_observe_page_evidence", _evidence)
+
+        acted = await scouting_module._auto_act_on_repeat(
+            ctx,
+            {"data": {}},
+            url="https://example.com/orders",
+            target={"selector": "#continue", "text": "Continue"},
+        )
+
+        assert acted is True
+        assert captured["allow_browser_read"] is True
+        last = ctx.scout_trajectory[-1]
+        assert last["role"] == "button"
+        assert last["accessible_name"] == "Continue"
+
+    @pytest.mark.asyncio
+    async def test_auto_act_navigating_skips_browser_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _auto_act_scout_ctx()
+        captured: dict[str, object] = {}
+
+        async def _fake_resolve(
+            _ctx: AgentContext, selector: str | None, *, allow_browser_read: bool
+        ) -> tuple[str, str]:
+            captured["allow_browser_read"] = allow_browser_read
+            return "", ""
+
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _fake_resolve)
+
+        urls = iter(["https://example.com/orders", "https://example.com/status"])
+
+        async def _moving_url(_ctx: AgentContext) -> str:
+            return next(urls)
+
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", _moving_url)
+
+        async def _evidence(_ctx: AgentContext, *, url: str) -> dict[str, object] | None:
+            return None
+
+        monkeypatch.setattr(scouting_module, "_scout_act_observe_page_evidence", _evidence)
+
+        acted = await scouting_module._auto_act_on_repeat(
+            ctx,
+            {"data": {}},
+            url="https://example.com/orders",
+            target={"selector": "#continue", "text": "Continue"},
+        )
+
+        assert acted is True
+        assert captured["allow_browser_read"] is False
+
+
+def _auto_act_scout_ctx() -> AgentContext:
+    ctx = AgentContext.__new__(AgentContext)
+    ctx.browser_session_id = None
+    ctx.scouted_interactions = []
+    ctx.scout_trajectory = []
+    ctx.discovery_mcp_server = _AutoActClickServer()
+    return ctx
+
+
+class _AutoActClickServer:
+    async def call_internal_tool(self, tool_name: str, args: dict[str, object]) -> dict[str, object]:
+        return {"ok": True, "data": {"selector": args.get("selector")}}
