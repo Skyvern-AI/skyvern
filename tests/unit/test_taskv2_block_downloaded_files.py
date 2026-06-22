@@ -180,7 +180,13 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
     )
     skyvern_context.set(parent_context)
 
-    outer_workflow_run = SimpleNamespace(proxy_location=None, max_screenshot_scrolls=None)
+    outer_workflow_run = SimpleNamespace(
+        proxy_location=None,
+        max_screenshot_scrolls=None,
+        browser_address=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+    )
     child_workflow_run = SimpleNamespace(failure_reason=None)
     organization = SimpleNamespace(organization_id="org_1", organization_name="Org 1")
     a_zip = _file("file:///app/downloads/wr_parent/a.zip", "a.zip", "abc")
