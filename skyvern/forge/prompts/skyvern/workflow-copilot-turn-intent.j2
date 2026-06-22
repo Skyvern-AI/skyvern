@@ -23,6 +23,15 @@ Rules:
 - Docs questions mentioning block/step names or run modes stay docs_answer unless the user asks to change the workflow.
 - Failure/run-result language is diagnose unless the user explicitly asks to implement a repair.
 
+Structural feasibility:
+- Default is the task-shape mode above. Only return mode=clarify with reason_codes=[structurally_infeasible] when the resolved request cannot be satisfied on the resolved target by any means — no on-site search, category browse, sibling property, or interpretation of the goal makes it feasible. The main copilot can inspect the live page and ask its own follow-up later; your job here is only to catch impossible requests, not to disambiguate words or route to a "better" URL.
+- A structurally_infeasible verdict requires a single one-sentence missing_context_question that would resolve the impasse and that has not already been asked-and-answered in the transcript anchors or global context. If you cannot supply such a question, do NOT use structurally_infeasible.
+- Resolve refinements, corrections, and bare-value replies against the earliest/prior user turns and the latest assistant turn first, then judge feasibility on the resolved request. A prior turn that named a site, brand, product, or service resolves the target even without a URL — never ask which website/URL to use.
+- When a concrete URL is present in the message or workflow YAML, default harder away from structurally_infeasible: ambiguous words ("level", "latest", "best"), multi-part asks, and portal/marketplace/aggregator-vs-sibling choices are runtime decisions, not impossibilities.
+- A diagnostic turn against the existing workflow is feasible by definition (diagnose), never structurally_infeasible.
+- A mid-session pivot that introduces a NEW target structurally incapable of the new task (e.g. "do this on a video-streaming site" for a download-filings task) is the canonical structurally_infeasible case; judge it on its own merits even though prior history exists.
+- On the fence: do not use structurally_infeasible. The cost of a wrong proceed is one wasted iteration; the cost of a wrong clarify is blocking a solvable request.
+
 Latest user message:
 ```{{ user_message }}```
 Request policy summary:

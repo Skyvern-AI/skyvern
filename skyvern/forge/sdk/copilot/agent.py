@@ -134,6 +134,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentClassifierResult,
     TurnIntentMode,
+    TurnIntentReasonCode,
     build_turn_intent,
     classify_turn_intent,
 )
@@ -635,9 +636,7 @@ def _build_user_context(
     ``escape_code_fences`` before the template interpolates it into a
     triple-backtick block. Without this, a value containing a literal
     ``` would close the fence early and let the model see the rest as
-    system-level content (the classic code-fence breakout). The old
-    copilot path in ``workflow_copilot.py`` and ``feasibility_gate.py``
-    both apply the same guard.
+    system-level content (the classic code-fence breakout).
     """
     workflow_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
     return prompt_engine.load_prompt(
@@ -2563,26 +2562,41 @@ async def _translate_to_agent_result(
     )
 
 
-def _build_feasibility_clarification_result(
+def _structural_infeasibility_question(turn_intent: TurnIntent | None) -> str | None:
+    """The clarifying question for a turn the classifier judged structurally infeasible.
+
+    Returns the question only when the turn-intent landed on CLARIFY carrying the
+    structurally_infeasible reason and a usable question, so a questionless verdict
+    (already failed open in build_turn_intent) cannot trigger the pre-loop bail.
+    """
+    if not isinstance(turn_intent, TurnIntent):
+        return None
+    # Defense-in-depth: build_turn_intent already forces CLARIFY or drops a questionless verdict.
+    if turn_intent.mode != TurnIntentMode.CLARIFY:
+        return None
+    if TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in turn_intent.reason_codes:
+        return None
+    question = (turn_intent.missing_context_question or "").strip()
+    return question or None
+
+
+def _build_infeasibility_clarification_result(
     question: str,
-    rationale: str | None,
     user_message: str,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
     ctx: CopilotContext,
 ) -> AgentResult:
-    """Construct an AgentResult for the feasibility-gate fast-path.
+    """Construct an AgentResult for the structural-infeasibility fast-path.
 
-    Preserves structured cross-turn context, sets user_goal from the
-    classifier's rationale (or the raw user message as a fallback), and
-    appends a decisions_made entry so a follow-up turn can see that a
-    clarification was already asked and return ``proceed`` instead of
-    re-asking.
+    Preserves structured cross-turn context, sets user_goal from the user message
+    when unset, and appends a decisions_made entry so a follow-up turn can see that
+    a clarification was already asked and proceed instead of re-asking.
     """
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     if not structured.user_goal:
-        structured.user_goal = (rationale or user_message)[:300]
-    structured.decisions_made.append(f"feasibility-gate clarification asked: {question}")
+        structured.user_goal = user_message[:300]
+    structured.decisions_made.append(f"infeasibility clarification asked: {question}")
     enriched_context = structured.to_json_str()
 
     final_text, outcome = apply_repeated_reply_guard(
@@ -3282,7 +3296,7 @@ async def _run_copilot_turn_impl(
         policy_inputs=policy_inputs,
     )
     # Run the request-policy guardrail as the authoritative input gate before
-    # feasibility checks, browser/session setup, model execution, or tool calls.
+    # browser/session setup, model execution, or tool calls.
     # Do not also attach it to the main Agent; the SDK would invoke it again and
     # duplicate policy telemetry.
     request_policy_guardrail_result = await request_policy_guardrails[0].run(
@@ -3347,21 +3361,11 @@ async def _run_copilot_turn_impl(
         prior_page_inspection_calls_made=ctx.prior_page_inspection_calls_made,
     )
 
-    # Preflight feasibility classifier — fires on every turn so mid-session pivots
-    # to impossible targets are caught the same as first-turn structural mismatches.
-    from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
-
-    feasibility_verdict = await run_feasibility_gate(
-        user_message=agent_user_message,
-        workflow_yaml=safe_workflow_yaml,
-        chat_history=safe_chat_history_text,
-        global_llm_context=safe_global_llm_context,
-        handler=llm_api_handler,
-    )
-    if feasibility_verdict.verdict == "ask_clarification" and feasibility_verdict.question:
-        return _build_feasibility_clarification_result(
-            question=feasibility_verdict.question,
-            rationale=feasibility_verdict.rationale,
+    # Infeasibility rides on turn_intent: a verdict carrying a question bails to a pre-loop clarification.
+    infeasibility_question = _structural_infeasibility_question(ctx.turn_intent)
+    if infeasibility_question is not None:
+        return _build_infeasibility_clarification_result(
+            question=infeasibility_question,
             user_message=agent_user_message,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,

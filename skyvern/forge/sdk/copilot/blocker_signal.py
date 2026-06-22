@@ -351,6 +351,9 @@ def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSigna
 _LOOP_CREDENTIAL_TEMPLATE = (
     "I couldn't run this with the current credential or parameter setup. Update them and ask me to try again."
 )
+CREDENTIAL_SCOUT_VERIFY_REPLY = (
+    "I need to verify the saved-credential login in the browser before I can save or run this code."
+)
 _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     "loop_detected_repeated_failed_step": (
         "I retried without making progress.",
@@ -366,6 +369,10 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     ),
     "repair_ceiling_reached": (
         "I couldn't get past the same problem after several attempts.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
+    "code_authoring_guardrail_churn": (
+        "I kept rewriting the generated code, but the safety checks rejected each version.",
         "Tell me what to change and I'll try a different approach.",
     ),
 }
@@ -497,6 +504,8 @@ def compose_loop_blocker_user_facing_reason(
     draft_tier = ("draft",) if evidence is not None and evidence.has_draft else ()
     if internal_reason_code == "loop_detected_credential_or_parameter_misconfig":
         return _LOOP_CREDENTIAL_TEMPLATE, draft_tier
+    if internal_reason_code == "credential_priority_authoring_churn":
+        return CREDENTIAL_SCOUT_VERIFY_REPLY, draft_tier
     framing, ask = _LOOP_BRANCH_COPY.get(internal_reason_code or "", _LOOP_BRANCH_COPY["loop_detected_generic"])
     result_steer = evidence.latest_evaluate_result_composition_steer if evidence is not None else None
     if (
