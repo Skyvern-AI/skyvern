@@ -6930,6 +6930,12 @@ class TaskV2Block(Block):
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
                 workflow_system_prompt=self.workflow_system_prompt,
                 trigger_type=inherited_v2_trigger_type,
+                # Pin the child to the parent's remote browser (CDP address + the
+                # headers its handshake authenticates with) so a cloud-browser run
+                # doesn't fall back to a fresh local Chrome.
+                browser_address=workflow_run.browser_address,
+                extra_http_headers=workflow_run.extra_http_headers,
+                cdp_connect_headers=workflow_run.cdp_connect_headers,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
