@@ -1475,6 +1475,7 @@ class ScriptBlockModel(Base):
 
 class WorkflowCopilotChatModel(Base):
     __tablename__ = "workflow_copilot_chats"
+    __table_args__ = (Index("wcc_org_created_at_index", "organization_id", "created_at"),)
 
     workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
     organization_id = Column(String, nullable=False)
@@ -1493,6 +1494,7 @@ class WorkflowCopilotChatModel(Base):
 
 class WorkflowCopilotChatMessageModel(Base):
     __tablename__ = "workflow_copilot_chat_messages"
+    __table_args__ = (Index("wccm_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
     workflow_copilot_chat_message_id = Column(
         String, primary_key=True, default=generate_workflow_copilot_chat_message_id
