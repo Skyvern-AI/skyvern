@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
+    CREDENTIAL_SCOUT_VERIFY_REPLY,
     BlockerKind,
     CopilotToolBlockerSignal,
     RecoveryHint,
@@ -511,3 +512,55 @@ def test_turn_halt_exit_keeps_halt_signal_when_context_signal_is_cleared() -> No
     result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
 
     assert result.user_response == signal.user_facing_reason
+
+
+def test_turn_halt_exit_renders_code_authoring_churn_reason() -> None:
+    ctx = _ctx()
+    signal = _signal(
+        kind="loop_detected",
+        user_facing="I kept rewriting the generated code, but the safety checks rejected each version.",
+        internal_reason_code="code_authoring_guardrail_churn",
+        blocked_tool="update_workflow",
+    )
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert "safety checks rejected" in result.user_response
+    assert "update_workflow" not in result.user_response
+
+
+def test_turn_halt_exit_keeps_credential_scout_reply_through_refresh_with_draft() -> None:
+    ctx = _ctx()
+    ctx.last_workflow_yaml = "title: Draft\nworkflow_definition:\n  blocks: []\n"
+    signal = _signal(
+        kind="loop_detected",
+        user_facing=CREDENTIAL_SCOUT_VERIFY_REPLY,
+        internal_reason_code="credential_priority_authoring_churn",
+        blocked_tool="update_workflow",
+    )
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == CREDENTIAL_SCOUT_VERIFY_REPLY
+    assert "update_workflow" not in result.user_response
+
+
+def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> None:
+    ctx = _ctx()
+    terminal = _signal(
+        kind="tool_error",
+        user_facing="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="tool_error_terminal_challenge_blocker",
+        blocked_tool="update_and_run_blocks",
+    )
+    ctx.blocker_signal = terminal
+    halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=terminal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == terminal.user_facing_reason
