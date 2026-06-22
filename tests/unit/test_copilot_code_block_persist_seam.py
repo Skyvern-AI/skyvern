@@ -676,6 +676,54 @@ class TestCodeSafetySeam:
         assert ctx.code_artifact_metadata == {}
 
 
+class TestCodeRepairProgressClassification:
+    @pytest.mark.asyncio
+    async def test_code_safety_seam_reject_carries_progress_surface_kind(self) -> None:
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML}, ctx)
+        assert result["ok"] is False
+        assert result["data"]["surface_kind"] == "code_repair_progress"
+        assert result["data"]["progress_text"]
+        # The substantive copy is unchanged; the progress text is a separate carrier.
+        assert result["user_facing_summary"] == (
+            "I need to adjust the workflow's code so it can run safely before testing."
+        )
+        assert result["data"]["progress_text"] != result["user_facing_summary"]
+
+    @pytest.mark.asyncio
+    async def test_raw_conflict_marker_reject_carries_progress_surface_kind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": f"<<<<<<< HEAD\n{_SAFE_CODE_YAML}"}, ctx)
+        assert result["ok"] is False
+        assert result["data"]["surface_kind"] == "code_repair_progress"
+        assert result["data"]["progress_text"]
+
+    @pytest.mark.asyncio
+    async def test_credential_scout_reject_is_not_classified_as_progress(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        result = await _update_workflow(
+            {
+                "workflow_yaml": _credential_code_yaml(
+                    code="""
+                    await page.locator("#email").fill(login_credential.username)
+                    await page.locator("input[type='password']").fill(login_credential.password)
+                    await page.locator("#totpmfa").fill(login_credential.totp)
+                    await page.locator("input[type='submit']").click()
+                    await page.wait_for_load_state("load")
+                    """
+                )
+            },
+            ctx,
+        )
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["data"].get("surface_kind") is None
+
+
 class TestCodeBlockParameterPersistSeam:
     @pytest.mark.asyncio
     async def test_undeclared_parameter_key_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
