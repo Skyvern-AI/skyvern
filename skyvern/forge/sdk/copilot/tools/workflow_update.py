@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     author_time_code_block_diagnostics,
     sandbox_unresolved_name_diagnostics,
+    strip_redundant_sandbox_imports,
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
@@ -1546,6 +1547,27 @@ def _allocate_promoted_parameter_key(
             suffix += 1
 
 
+def _strip_redundant_sandbox_imports_in_yaml(workflow_yaml: str) -> tuple[str, list[str]]:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml, []
+    stripped_modules: list[str] = []
+    any_change = False
+    for block in _workflow_code_blocks(parsed):
+        code = block.get("code")
+        if not isinstance(code, str) or not code.strip():
+            continue
+        sanitized, modules = strip_redundant_sandbox_imports(code)
+        if sanitized == code:
+            continue
+        block["code"] = sanitized
+        stripped_modules.extend(modules)
+        any_change = True
+    if not any_change:
+        return workflow_yaml, []
+    return yaml.safe_dump(parsed, sort_keys=False), stripped_modules
+
+
 def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContext) -> tuple[str, list[str]]:
     if not getattr(ctx, "impose_synthesized_code_block", False):
         return workflow_yaml, []
@@ -2968,6 +2990,9 @@ async def _update_workflow(
             "user_facing_summary": _compiled_authoring_user_summary(),
         }
     workflow_yaml = imposition.workflow_yaml
+    stripped_sandbox_imports: list[str] = []
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        workflow_yaml, stripped_sandbox_imports = _strip_redundant_sandbox_imports_in_yaml(workflow_yaml)
     workflow_yaml, typed_default_violations = _apply_scouted_typed_default_promotions(workflow_yaml, ctx)
     if typed_default_violations:
         return {
@@ -3226,6 +3251,8 @@ async def _update_workflow(
         }
         if imposition.substitutions is not None:
             data["imposed_substitutions"] = imposition.substitutions
+        if stripped_sandbox_imports:
+            data["stripped_redundant_imports"] = stripped_sandbox_imports
         return {
             "ok": True,
             "data": data,
