@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import structlog
-from sqlalchemy import asc, case, or_, select
+from sqlalchemy import case, desc, or_, select
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
@@ -97,7 +97,13 @@ class BrowserSessionsRepository(BaseRepository):
                         BrowserProfileModel.description.ilike(search_like),
                     )
                 )
-            query = query.order_by(asc(BrowserProfileModel.created_at)).limit(page_size).offset(db_page * page_size)
+            # The id tie-break only needs to be deterministic so pagination stays
+            # stable when created_at collides; it isn't meant to encode recency.
+            query = (
+                query.order_by(desc(BrowserProfileModel.created_at), desc(BrowserProfileModel.browser_profile_id))
+                .limit(page_size)
+                .offset(db_page * page_size)
+            )
             browser_profiles = await session.scalars(query)
             return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
 
