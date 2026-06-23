@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable
 
+from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
 
@@ -275,7 +276,7 @@ def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiag
     tree, _ = _parse_static_ast(code)
     if tree is None:
         return []
-    return _author_time_ast_diagnostics(tree)
+    return [*_author_time_security_diagnostics(code), *_author_time_ast_diagnostics(tree)]
 
 
 def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
@@ -285,7 +286,7 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     if tree is None:
         return []
 
-    diagnostics = _author_time_ast_diagnostics(tree)
+    diagnostics = [*_author_time_security_diagnostics(code), *_author_time_ast_diagnostics(tree)]
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -316,6 +317,24 @@ def _parse_static_ast(code: str) -> tuple[ast.AST | None, CodeBlockPreflightDiag
             message=f"Code block does not parse as Python: {exc.msg}. Fix the snippet before persisting it.",
         )
     return tree, None
+
+
+def _author_time_security_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+    normalized_code = textwrap.dedent(code).strip()
+    return [
+        _author_time_security_diagnostic(error)
+        for error in author_time_code_security_errors(label="code", code=normalized_code)
+    ]
+
+
+def _author_time_security_diagnostic(error: CodeBlockSecurityError) -> CodeBlockPreflightDiagnostic:
+    return CodeBlockPreflightDiagnostic(
+        code=error.reason_code,
+        message=(
+            f"{error.reason_code}: {error.surface} is not allowed in persisted workflow code blocks. "
+            "Use locators and locator DOM-reading methods instead."
+        ),
+    )
 
 
 def _author_time_ast_diagnostics(tree: ast.AST) -> list[CodeBlockPreflightDiagnostic]:
