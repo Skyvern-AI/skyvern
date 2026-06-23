@@ -67,6 +67,16 @@ export interface WorkflowCopilotChatHistoryResponse {
   auto_accept?: boolean | null;
 }
 
+export interface WorkflowCopilotChatSummary {
+  workflow_copilot_chat_id: string;
+  workflow_permanent_id: string;
+  // Returned by the API; not rendered since the list is already scoped to one workflow.
+  workflow_title?: string | null;
+  title: string;
+  created_at: string;
+  modified_at: string;
+}
+
 export interface WorkflowCopilotClearProposedWorkflowRequest {
   workflow_copilot_chat_id: string;
   auto_accept: boolean;
