@@ -806,6 +806,32 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
     return errors
 
 
+def _human_facing_code_safety_errors(errors: list[str | CodeBlockSecurityError]) -> list[str | CodeBlockSecurityError]:
+    preflight_reason_codes = {
+        reason_code for error in errors if (reason_code := _generated_code_preflight_reason_code(error)) is not None
+    }
+    if not preflight_reason_codes:
+        return errors
+    return [
+        error
+        for error in errors
+        if not isinstance(error, CodeBlockSecurityError) or error.reason_code not in preflight_reason_codes
+    ]
+
+
+def _generated_code_preflight_reason_code(error: str | CodeBlockSecurityError) -> str | None:
+    if isinstance(error, CodeBlockSecurityError):
+        return None
+    marker = "failed the generated-code preflight check: "
+    if marker not in error:
+        return None
+    detail = error.split(marker, 1)[1]
+    reason_code = detail.split(":", 1)[0]
+    if not reason_code.startswith("AUTHOR_PAGE_"):
+        return None
+    return reason_code
+
+
 _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
 
 
@@ -3248,7 +3274,14 @@ async def _update_workflow(
                 "diagnostic_code_safety_errors": code_safety_errors,
             },
         }
-    seam_errors = [error for error in (code_artifact_metadata_error, *code_safety_errors) if error]
+    seam_errors = [
+        error
+        for error in (
+            code_artifact_metadata_error,
+            *_human_facing_code_safety_errors(code_safety_errors),
+        )
+        if error
+    ]
     if seam_errors:
         return {
             "ok": False,

@@ -179,7 +179,11 @@ def _render_code_only_browser_authoring_prompt() -> str:
         "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
         "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
         "re-derive its locators. Only hand-author the steps it does not cover, such as the\n"
-        "extraction or report block that returns the structured result."
+        "extraction or report block that returns the structured result. Direct browser\n"
+        "evaluate is a scouting tool; persisted code blocks must not use page.evaluate,\n"
+        "page.evaluate_handle, page.request, or page.context. Use locators and locator\n"
+        "DOM-reading methods such as inner_text, text_content, get_attribute, count, and\n"
+        "is_visible instead."
     )
 
 
