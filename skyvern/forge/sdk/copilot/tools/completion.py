@@ -41,6 +41,7 @@ from ._shared import (
 from .blockers import (
     _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
+    _looks_like_anti_bot_blocker,
     _run_blocks_structured_blocker_message,
 )
 
@@ -274,9 +275,10 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
     """
     if not bool(result.get("ok", False)):
         return False
-    if _run_blocks_structured_blocker_message(result, copilot_ctx):
+    structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
+    anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
+    if structured_blocker and (anti_bot or _looks_like_anti_bot_blocker(structured_blocker)):
         return False
-    _anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
     return not empty_data_blocks
 
 
