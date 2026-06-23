@@ -41,10 +41,12 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
+  WorkflowCopilotChatSummary,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
   WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
+import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
   QueuedPromptReason,
@@ -666,6 +668,91 @@ export function WorkflowCopilotChat({
     repin();
   };
 
+  const applyHistoryResponse = useCallback(
+    (data: WorkflowCopilotChatHistoryResponse) => {
+      const historyMessages = data.chat_history.map((message, index) => ({
+        id: `${index}-${Date.now()}`,
+        sender: message.sender,
+        content: message.content,
+        timestamp: message.created_at,
+        narrative: (() => {
+          const hydrated = hydrateHistoryNarrative(
+            message.narrative_payload,
+            message.turn_outcome,
+          );
+          if (!hydrated) return undefined;
+          // Fall back to the legacy message body when the persisted payload
+          // predates terminal-text capture.
+          if (!hydrated.terminalMessage && message.content) {
+            return {
+              ...hydrated,
+              terminalMessage: message.content,
+              narrativeSummary: hydrated.narrativeSummary ?? message.content,
+            };
+          }
+          return hydrated;
+        })(),
+      }));
+      setMessages(historyMessages);
+      setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
+      setProposedWorkflow(data.proposed_workflow ?? null);
+      setAutoAccept(data.auto_accept ?? false);
+    },
+    // Only stable state setters are referenced, so the callback never needs to change.
+    [],
+  );
+
+  const loadChatInPlace = useCallback(
+    async (chatId: string) => {
+      if (!workflowPermanentId) return;
+      setIsLoadingHistory(true);
+      updateQueuedPrompt(null);
+      setNarrative(EMPTY_NARRATIVE);
+      turnSnapshots.current.clear();
+      pendingSubmitSnapshot.current = null;
+      latestTurnId.current = null;
+      repin();
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+          "/workflow/copilot/chat-history",
+          {
+            params: {
+              workflow_permanent_id: workflowPermanentId,
+              workflow_copilot_chat_id: chatId,
+            },
+          },
+        );
+        applyHistoryResponse(response.data);
+        // Mark history loaded for this workflow so the mount effect won't reload
+        // the latest chat over the one the user just selected.
+        historyLoadedForRef.current = workflowPermanentId;
+      } catch (error) {
+        console.error("Failed to load chat:", error);
+        toast({ title: "Failed to load chat", variant: "destructive" });
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    },
+    [
+      credentialGetter,
+      workflowPermanentId,
+      applyHistoryResponse,
+      updateQueuedPrompt,
+      repin,
+    ],
+  );
+
+  const handleSelectHistoryChat = useCallback(
+    (chat: WorkflowCopilotChatSummary) => {
+      if (chat.workflow_copilot_chat_id === workflowCopilotChatIdRef.current) {
+        return;
+      }
+      void loadChatInPlace(chat.workflow_copilot_chat_id);
+    },
+    [loadChatInPlace],
+  );
+
   const applyWorkflowUpdate = useCallback(
     (
       workflow: WorkflowApiResponse,
@@ -923,36 +1010,7 @@ export function WorkflowCopilotChat({
 
         if (!isMounted) return;
 
-        const historyMessages = response.data.chat_history.map(
-          (message, index) => ({
-            id: `${index}-${Date.now()}`,
-            sender: message.sender,
-            content: message.content,
-            timestamp: message.created_at,
-            narrative: (() => {
-              const hydrated = hydrateHistoryNarrative(
-                message.narrative_payload,
-                message.turn_outcome,
-              );
-              if (!hydrated) return undefined;
-              // Fall back to the legacy message body when the persisted
-              // payload predates terminal-text capture.
-              if (!hydrated.terminalMessage && message.content) {
-                return {
-                  ...hydrated,
-                  terminalMessage: message.content,
-                  narrativeSummary:
-                    hydrated.narrativeSummary ?? message.content,
-                };
-              }
-              return hydrated;
-            })(),
-          }),
-        );
-        setMessages(historyMessages);
-        setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
-        setProposedWorkflow(response.data.proposed_workflow ?? null);
-        setAutoAccept(response.data.auto_accept ?? false);
+        applyHistoryResponse(response.data);
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
@@ -968,7 +1026,13 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, repin, updateQueuedPrompt, workflowPermanentId]);
+  }, [
+    credentialGetter,
+    repin,
+    updateQueuedPrompt,
+    workflowPermanentId,
+    applyHistoryResponse,
+  ]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -1925,6 +1989,12 @@ export function WorkflowCopilotChat({
           Agent Copilot (Beta)
         </h3>
         <div className="flex items-center gap-2">
+          <WorkflowCopilotHistory
+            workflowPermanentId={workflowPermanentId}
+            currentChatId={workflowCopilotChatId}
+            onSelect={handleSelectHistoryChat}
+            disabled={isLoading || isLoadingHistory}
+          />
           <button
             type="button"
             onClick={handleNewChat}
