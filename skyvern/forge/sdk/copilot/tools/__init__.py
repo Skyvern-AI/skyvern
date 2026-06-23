@@ -244,7 +244,6 @@ from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
 from .workflow_update import _code_block_safety_errors as _code_block_safety_errors
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
-from .workflow_update import _pre_run_workflow_coverage_error as _pre_run_workflow_coverage_error
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
 from .workflow_update import _update_workflow as _update_workflow
@@ -667,34 +666,6 @@ async def update_and_run_blocks_tool(
         )
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
-
-    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
-    if coverage_error:
-        user_facing_summary = (
-            "Workflow draft saved; I still need to add the remaining requested actions before testing it."
-        )
-        result = {
-            "ok": False,
-            "error": coverage_error,
-            "data": {
-                "block_count": copilot_ctx.last_update_block_count,
-                "workflow_updated": True,
-                "workflow_run_skipped": True,
-                "control_signal": {
-                    "kind": "intermediate_success",
-                    "user_facing_summary": user_facing_summary,
-                },
-                "user_facing_summary": user_facing_summary,
-            },
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=result,
-            workflow_updated=True,
-        )
-        return json.dumps(result)
 
     if skip_run_after_update:
         skip_message = "Skipped test run: required credentials are not configured."

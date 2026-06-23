@@ -161,9 +161,14 @@ def build_diagnosis_repair_contract(
         blocks=[block for block in blocks if isinstance(block, dict)],
         detected_challenge=bool(getattr(ctx, "last_test_anti_bot", None)),
     )
+    outcome_verified = outcome_fully_verified(ctx)
+    completion_verification = getattr(ctx, "completion_verification_result", None)
+    completion_verification_failed = _completion_verification_failed(completion_verification)
     failure_type = _failure_type(
         run_ok,
         suspicious,
+        outcome_verified,
+        completion_verification_failed,
         failed_blocks,
         categories,
         terminal_challenge_categories,
@@ -177,9 +182,18 @@ def build_diagnosis_repair_contract(
         run_ok,
         suspicious,
         run_status,
-        getattr(ctx, "completion_verification_result", None),
+        completion_verification,
         data,
         failure_type,
+    )
+    remaining_blocker = (
+        None
+        if (
+            next_action == RepairNextAction.NO_CHANGE
+            and user_goal_satisfied is True
+            and completion_contract_satisfied is True
+        )
+        else summary or "Run did not pass."
     )
     confidence = (
         0.9
@@ -269,7 +283,7 @@ def build_diagnosis_repair_contract(
             run_status=run_status,
             user_goal_satisfied=user_goal_satisfied,
             completion_contract_satisfied=completion_contract_satisfied,
-            remaining_blocker=None if run_ok and not suspicious else summary or "Run did not pass.",
+            remaining_blocker=remaining_blocker,
         ),
     )
 
@@ -359,7 +373,7 @@ def _failed_block_labels(blocks: list[Any]) -> list[str]:
 
 
 def _failure_summary(result: dict[str, Any], data: dict[str, Any], blocks: list[Any]) -> str:
-    candidates = [result.get("error"), data.get("failure_reason")]
+    candidates = [result.get("error"), result.get("message"), data.get("failure_reason")]
     candidates += [block.get("failure_reason") for block in blocks if isinstance(block, dict)]
     for candidate in candidates:
         if isinstance(candidate, str) and candidate.strip():
@@ -370,6 +384,8 @@ def _failure_summary(result: dict[str, Any], data: dict[str, Any], blocks: list[
 def _failure_type(
     run_ok: bool,
     suspicious: bool,
+    outcome_verified: bool,
+    completion_verification_failed: bool,
     failed_blocks: list[str],
     categories: list[str],
     terminal_challenge_categories: list[str],
@@ -384,8 +400,6 @@ def _failure_type(
     if terminal_challenge_categories:
         return DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
     category_set = set(categories)
-    if run_ok:
-        return DiagnosisFailureType.SUSPICIOUS_SUCCESS if suspicious else DiagnosisFailureType.NO_FAILURE
     error_text = " ".join(
         str(value).lower()
         for value in (result.get("error"), data.get("failure_reason"), data.get("skip_reason"))
@@ -411,8 +425,14 @@ def _failure_type(
         or "browser session" in error_text
     ):
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    if outcome_verified:
+        return DiagnosisFailureType.NO_FAILURE
     if failed_blocks or category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    if completion_verification_failed:
+        return DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    if run_ok:
+        return DiagnosisFailureType.SUSPICIOUS_SUCCESS if suspicious else DiagnosisFailureType.NO_FAILURE
     if "credential" in error_text:
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
@@ -420,10 +440,6 @@ def _failure_type(
 
 def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: dict[str, Any]) -> RepairNextAction:
     if failure_type == DiagnosisFailureType.NO_FAILURE:
-        return RepairNextAction.NO_CHANGE
-    # The judge confirmed every criterion; no failure_type may drive a repair
-    # that overwrites an already-verified terminal proposal.
-    if outcome_fully_verified(ctx):
         return RepairNextAction.NO_CHANGE
     if (
         data.get("skip_reason") == "workflow_credential_inputs_unbound"
@@ -444,6 +460,8 @@ def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: 
         DiagnosisFailureType.SUSPICIOUS_SUCCESS,
     }:
         return RepairNextAction.STOP
+    if outcome_fully_verified(ctx):
+        return RepairNextAction.NO_CHANGE
     authority = getattr(getattr(ctx, "turn_intent", None), "authority", None)
     if getattr(authority, "requires_user_input", False) or getattr(authority, "may_update_workflow", True) is False:
         return RepairNextAction.ASK
@@ -503,6 +521,16 @@ def _verification_satisfaction(
         trace = data.get("active_run_terminal_completion_verification")
         fully_satisfied = isinstance(trace, dict) and trace.get("fully_satisfied") is True
         return fully_satisfied, fully_satisfied
+    if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
+        return False, False
+    if (
+        failure_type == DiagnosisFailureType.NO_FAILURE
+        and completion_verification is not None
+        and completion_verification.is_fully_satisfied()
+    ):
+        return True, True
+    if completion_verification is not None and not completion_verification.is_fully_satisfied():
+        return False, False
     user_goal_satisfied = (not suspicious) if run_ok else None if run_status is None else False
     # When the verification judge was required (a non-null result), its verdict
     # is authoritative: an unmet or unavailable verdict cannot claim the outcome.
@@ -512,6 +540,10 @@ def _verification_satisfaction(
     else:
         completion_contract_satisfied = user_goal_satisfied
     return user_goal_satisfied, completion_contract_satisfied
+
+
+def _completion_verification_failed(completion_verification: CompletionVerificationResult | None) -> bool:
+    return completion_verification is not None and not completion_verification.is_fully_satisfied()
 
 
 def _missing_context(result: dict[str, Any], data: dict[str, Any], failure_type: DiagnosisFailureType) -> list[str]:

@@ -54,9 +54,6 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
-    POST_INTERMEDIATE_SUCCESS_NUDGE,
-    _completion_contract_unknown_due_to_policy_fallback,
-    _goal_likely_needs_more_blocks,
     code_authoring_churn_stop_signal,
     credential_priority_authoring_churn_stop_signal,
 )
@@ -93,7 +90,6 @@ from ._shared import (
     _enum_or_string_name,
     _proxy_location_trace_value,
     _raw_yaml_proxy_location,
-    _workflow_definition_as_dict,
 )
 from .banned_blocks import (
     _banned_block_reject_message,
@@ -3552,47 +3548,3 @@ def _record_workflow_update_result(
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
 
     _invalidate_verified_state_on_edit(copilot_ctx, prior_definition, getattr(wf, "workflow_definition", None))
-
-
-def _last_update_is_single_goto_bootstrap(copilot_ctx: CopilotContext) -> bool:
-    last_workflow = copilot_ctx.last_workflow
-    definition = _workflow_definition_as_dict(last_workflow.workflow_definition if last_workflow is not None else None)
-    blocks = definition.get("blocks")
-    if not isinstance(blocks, list) or len(blocks) != 1:
-        return False
-    block = blocks[0]
-    if not isinstance(block, dict):
-        return False
-    return str(block.get("block_type") or "").strip().lower() == "goto_url"
-
-
-def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
-    block_count = getattr(copilot_ctx, "last_update_block_count", None)
-    if not isinstance(block_count, int):
-        return None
-    if block_count == 1 and _last_update_is_single_goto_bootstrap(copilot_ctx):
-        return None
-
-    user_message = getattr(copilot_ctx, "user_message", "")
-    request_policy = getattr(copilot_ctx, "request_policy", None)
-    completion_contract = getattr(request_policy, "completion_contract", None)
-    if isinstance(completion_contract, str):
-        completion_contract = completion_contract.strip() or None
-    else:
-        completion_contract = None
-
-    if _completion_contract_unknown_due_to_policy_fallback(copilot_ctx):
-        return None
-
-    if not _goal_likely_needs_more_blocks(user_message, block_count, completion_contract):
-        return None
-
-    nudge_count = getattr(copilot_ctx, "coverage_nudge_count", 0)
-    if nudge_count >= 1:
-        return None
-    copilot_ctx.coverage_nudge_count = nudge_count + 1
-    return (
-        f"{POST_INTERMEDIATE_SUCCESS_NUDGE} The workflow was saved with {block_count} block"
-        f"{'' if block_count == 1 else 's'}, but it has not been run because the request-policy "
-        "completion contract still leaves distinct requested actions uncovered."
-    )
