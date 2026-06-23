@@ -4070,32 +4070,6 @@ function clone<T>(objectToClone: T): T {
   return JSON.parse(JSON.stringify(objectToClone));
 }
 
-export function upgradeWorkflowBlocksV1toV2(
-  blocks: Array<WorkflowBlock>,
-): Array<WorkflowBlock> {
-  if (!blocks || blocks.length === 0) {
-    return blocks;
-  }
-
-  return blocks.map((block, index) => {
-    const nextBlock = blocks[index + 1];
-    const upgradedBlock = {
-      ...block,
-      next_block_label: nextBlock?.label ?? null,
-    };
-
-    // Recursively handle loop blocks
-    if (isNestedLoopWorkflowBlock(block)) {
-      return {
-        ...upgradedBlock,
-        loop_blocks: upgradeWorkflowBlocksV1toV2(block.loop_blocks),
-      } as WorkflowBlock;
-    }
-
-    return upgradedBlock;
-  });
-}
-
 export function upgradeWorkflowDefinitionToVersionTwo(
   blocks: Array<BlockYAML>,
   currentVersion?: number | null,
