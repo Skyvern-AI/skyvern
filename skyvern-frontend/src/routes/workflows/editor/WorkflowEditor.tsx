@@ -3,10 +3,7 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { useEffect } from "react";
 import { usePostHog } from "posthog-js/react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
-import {
-  getElements,
-  upgradeWorkflowBlocksV1toV2,
-} from "./workflowEditorUtils";
+import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
@@ -72,12 +69,8 @@ function WorkflowEditor() {
       globalWorkflow.workflow_permanent_id === workflowPermanentId,
   );
 
-  // Auto-upgrade v1 workflows to v2 by assigning sequential next_block_label values
-  const workflowVersion = workflow.workflow_definition.version ?? 1;
-  const blocksToRender =
-    workflowVersion < 2
-      ? upgradeWorkflowBlocksV1toV2(workflow.workflow_definition.blocks)
-      : workflow.workflow_definition.blocks;
+  // getElements derives display routing (sequential defaulting + validation); the stored blocks are passed through unchanged.
+  const blocksToRender = workflow.workflow_definition.blocks;
 
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,

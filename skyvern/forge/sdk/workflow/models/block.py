@@ -2211,6 +2211,9 @@ class ForLoopBlock(Block):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
 
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
 
@@ -2850,6 +2853,9 @@ class WhileLoopBlock(Block):
                 for idx, block in enumerate(blocks[:-1]):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
+
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
@@ -9552,3 +9558,40 @@ BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 
 BranchCriteriaSubclasses = Union[JinjaBranchCriteria, PromptBranchCriteria]
 BranchCriteriaTypeVar = Annotated[BranchCriteriaSubclasses, Field(discriminator="criteria_type")]
+
+
+def resolve_conditional_merge_edges(
+    blocks: list[BlockTypeVar],
+    label_to_block: dict[str, BlockTypeVar],
+    default_next_map: dict[str, str | None],
+) -> None:
+    """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
+
+    SKY-8571: iterates to convergence so an outer conditional patched on one pass can let an inner
+    conditional's branch terminals be patched on the next. Mutates default_next_map in place.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for block in blocks:
+            if not isinstance(block, ConditionalBlock):
+                continue
+            successor = default_next_map.get(block.label)
+            if not successor:
+                continue
+            for branch in block.ordered_branches:
+                target = branch.next_block_label
+                if not target or target == successor:
+                    continue
+                cur: str | None = target
+                visited: set[str] = set()
+                while cur and cur in label_to_block and cur not in visited:
+                    if cur == successor:
+                        break
+                    visited.add(cur)
+                    nxt = default_next_map.get(cur)
+                    if nxt is None:
+                        default_next_map[cur] = successor
+                        changed = True
+                        break
+                    cur = nxt

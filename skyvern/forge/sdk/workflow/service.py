@@ -93,6 +93,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
+    resolve_conditional_merge_edges,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -3797,46 +3798,8 @@ class WorkflowService:
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
 
-        # SKY-8571: Connect terminal blocks in conditional branch chains to the
-        # conditional's successor (merge-point block).
-        #
-        # Bug scenario: nested conditionals where the inner conditional has no
-        # merge-point (next_block_label=null).  The outer conditional's branch
-        # chain ends at the inner conditional, whose own branches terminate
-        # without reconnecting to the outer merge-point.
-        #
-        # The fix iterates until convergence because patching an outer
-        # conditional may give an inner conditional a successor, which in turn
-        # lets the inner conditional's branch terminals be patched on the next
-        # pass.  E.g.:
-        #   Pass 1: outer_cond patches inner_cond.next → outer_merge
-        #   Pass 2: inner_cond (now has successor) patches block_57.next → outer_merge
-        changed = True
-        while changed:
-            changed = False
-            for block in all_blocks:
-                if not isinstance(block, ConditionalBlock):
-                    continue
-                successor = default_next_map.get(block.label)
-                if not successor:
-                    continue
-                for branch in block.ordered_branches:
-                    target = branch.next_block_label
-                    if not target or target == successor:
-                        continue
-                    # Trace the branch chain via default_next_map to find the terminal block.
-                    cur = target
-                    visited: set[str] = set()
-                    while cur and cur in label_to_block and cur not in visited:
-                        if cur == successor:
-                            break
-                        visited.add(cur)
-                        nxt = default_next_map.get(cur)
-                        if nxt is None:
-                            default_next_map[cur] = successor
-                            changed = True
-                            break
-                        cur = nxt
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(all_blocks, label_to_block, default_next_map)
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
