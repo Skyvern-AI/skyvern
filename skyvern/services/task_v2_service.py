@@ -1247,12 +1247,17 @@ async def run_task_v2_helper(
                 failure_category_source="llm" if llm_failure_categories else "code_level",
                 failure_category_path="v2_max_steps",
             )
+            summary_description, summarized_output = await _best_effort_failure_deliverable(
+                task_v2, task_history, context
+            )
             task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 failure_reason=full_failure_reason,
                 organization_id=organization_id,
                 failure_category=failure_category,
+                summary=summary_description,
+                output=summarized_output,
             )
             return workflow, workflow_run, task_v2
     else:
@@ -1279,12 +1284,15 @@ async def run_task_v2_helper(
             failure_category_source="code_level",
             failure_category_path="v2_max_iterations",
         )
+        summary_description, summarized_output = await _best_effort_failure_deliverable(task_v2, task_history, context)
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
             failure_reason=max_iterations_failure_reason,
             organization_id=organization_id,
             failure_category=max_iterations_failure_category,
+            summary=summary_description,
+            output=summarized_output,
         )
 
     return workflow, workflow_run, task_v2
@@ -1829,11 +1837,15 @@ async def mark_task_v2_as_failed(
     failure_reason: str | None = None,
     organization_id: str | None = None,
     failure_category: list[dict] | None = None,
+    summary: str | None = None,
+    output: dict[str, Any] | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.failed,
+        summary=summary,
+        output=output,
         failure_category=failure_category,
     )
     if workflow_run_id:
@@ -2141,12 +2153,14 @@ async def _persist_completion_tab_screenshots(browser_state: BrowserState, thoug
     return captured
 
 
-async def _summarize_task_v2(
+async def _generate_task_v2_deliverable(
     task_v2: TaskV2,
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
-) -> TaskV2:
+    is_partial: bool = False,
+) -> tuple[str | None, Any]:
+    # is_partial=True renders the best-effort variant of the summary prompt; does not change task status.
     thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=task_v2.organization_id,
@@ -2162,6 +2176,7 @@ async def _summarize_task_v2(
         user_goal=task_v2.prompt,
         task_history=task_history,
         extracted_information_schema=task_v2.extracted_information_schema,
+        is_partial=is_partial,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
@@ -2171,7 +2186,7 @@ async def _summarize_task_v2(
         prompt_name="task_v2_summary",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
+    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
 
     summary_description = task_v2_summary_resp.get("description")
     summarized_output = task_v2_summary_resp.get("output")
@@ -2181,7 +2196,49 @@ async def _summarize_task_v2(
         thought=summary_description,
         output=task_v2_summary_resp,
     )
+    return summary_description, summarized_output
 
+
+async def _best_effort_failure_deliverable(
+    task_v2: TaskV2,
+    task_history: list[dict],
+    context: SkyvernContext,
+) -> tuple[str | None, Any]:
+    # Never raises: deliverable synthesis must not interfere with terminal failure handling.
+    # Screenshots are skipped — synthesized from task_history; the failure paths already screenshot.
+    if not task_history:
+        return None, None
+    try:
+        return await _generate_task_v2_deliverable(
+            task_v2=task_v2,
+            task_history=task_history,
+            context=context,
+            screenshots=None,
+            is_partial=True,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to synthesize best-effort deliverable for failing task v2",
+            exc_info=True,
+            task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=task_v2.workflow_run_id,
+        )
+        return None, None
+
+
+async def _summarize_task_v2(
+    task_v2: TaskV2,
+    task_history: list[dict],
+    context: SkyvernContext,
+    screenshots: list[bytes] | None = None,
+) -> TaskV2:
+    summary_description, summarized_output = await _generate_task_v2_deliverable(
+        task_v2=task_v2,
+        task_history=task_history,
+        context=context,
+        screenshots=screenshots,
+        is_partial=False,
+    )
     return await mark_task_v2_as_completed(
         task_v2_id=task_v2.observer_cruise_id,
         workflow_run_id=task_v2.workflow_run_id,
