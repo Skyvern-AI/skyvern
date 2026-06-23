@@ -820,6 +820,159 @@ def _typed_child_blocks(block: Any) -> list[Any]:
     return children
 
 
+def _workflow_output_parameter_indexes(
+    workflow: Workflow | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    if workflow is None:
+        return {}, {}
+    workflow_definition = getattr(workflow, "workflow_definition", None)
+    blocks = getattr(workflow_definition, "blocks", None)
+    if not isinstance(blocks, list):
+        return {}, {}
+
+    by_id: dict[str, dict[str, Any]] = {}
+    by_key: dict[str, dict[str, Any]] = {}
+
+    def visit(block: Any) -> None:
+        output_parameter = (
+            block.get("output_parameter") if isinstance(block, Mapping) else getattr(block, "output_parameter", None)
+        )
+        output_parameter_id = (
+            output_parameter.get("output_parameter_id")
+            if isinstance(output_parameter, Mapping)
+            else getattr(output_parameter, "output_parameter_id", None)
+        )
+        output_parameter_key = (
+            output_parameter.get("key")
+            if isinstance(output_parameter, Mapping)
+            else getattr(output_parameter, "key", None)
+        )
+        label = block.get("label") if isinstance(block, Mapping) else getattr(block, "label", None)
+        block_type = block.get("block_type") if isinstance(block, Mapping) else getattr(block, "block_type", None)
+        block_type_name = getattr(block_type, "value", getattr(block_type, "name", block_type))
+        entry = {
+            "block_label": label if isinstance(label, str) and label else None,
+            "block_type": str(block_type_name) if block_type_name is not None else None,
+            "output_parameter_id": output_parameter_id if isinstance(output_parameter_id, str) else None,
+            "output_parameter_key": output_parameter_key if isinstance(output_parameter_key, str) else None,
+        }
+        if entry["output_parameter_id"]:
+            by_id[entry["output_parameter_id"]] = entry
+        if entry["output_parameter_key"]:
+            by_key[entry["output_parameter_key"]] = entry
+        for child in _mapping_child_blocks(block) if isinstance(block, Mapping) else _typed_child_blocks(block):
+            visit(child)
+
+    for block in blocks:
+        visit(block)
+    return by_id, by_key
+
+
+def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) -> None:
+    """Mutate ``data["blocks"]`` so registered output parameters share the block-output evidence path."""
+
+    registered = data.get("registered_output_parameter_values")
+    if not isinstance(registered, list) or not registered:
+        return
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        blocks = []
+        data["blocks"] = blocks
+    by_label: dict[str, dict[str, Any]] = {
+        block["label"]: block
+        for block in blocks
+        if isinstance(block, dict) and isinstance(block.get("label"), str) and block.get("label")
+    }
+    for item in registered:
+        if not isinstance(item, Mapping):
+            continue
+        label = item.get("block_label")
+        key = item.get("output_parameter_key")
+        if not isinstance(label, str) or not label or not isinstance(key, str) or not key:
+            continue
+        value = item.get("value")
+        block = by_label.get(label)
+        if block is None:
+            block = {
+                "label": label,
+                "block_type": item.get("block_type") or "CODE",
+                "status": WorkflowRunStatus.completed.value,
+            }
+            blocks.append(block)
+            by_label[label] = block
+        extracted = block.get("extracted_data")
+        if isinstance(extracted, dict):
+            extracted.setdefault(key, value)
+        elif extracted is None:
+            block["extracted_data"] = {key: value}
+
+
+async def _attach_registered_output_parameter_values(
+    *,
+    workflow_run_id: str,
+    workflow: Workflow | None,
+    data: dict[str, Any],
+    persisted_output_parameters: list[Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        registered_rows = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
+            workflow_run_id=workflow_run_id
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read workflow run output parameters for copilot run evidence; "
+            "deterministic graders lose authoritative output-parameter evidence",
+            workflow_run_id=workflow_run_id,
+            organization_id=workflow.organization_id if workflow is not None else None,
+            exc_info=True,
+        )
+        return {}
+    if not registered_rows:
+        return {}
+
+    index_by_id, index_by_key = _workflow_output_parameter_indexes(workflow)
+    persisted_key_by_id = {
+        output_parameter_id: key
+        for parameter in persisted_output_parameters or []
+        if isinstance((output_parameter_id := getattr(parameter, "output_parameter_id", None)), str)
+        and isinstance((key := getattr(parameter, "key", None)), str)
+    }
+    normalized: list[dict[str, Any]] = []
+    values_by_label: dict[str, Any] = {}
+    for row in registered_rows:
+        output_parameter_id = getattr(row, "output_parameter_id", None)
+        if not isinstance(output_parameter_id, str) or not output_parameter_id:
+            continue
+        block_info = dict(index_by_id.get(output_parameter_id, {}))
+        output_parameter_key = block_info.get("output_parameter_key")
+        if not isinstance(output_parameter_key, str) or not output_parameter_key:
+            output_parameter_key = persisted_key_by_id.get(output_parameter_id)
+            if isinstance(output_parameter_key, str):
+                block_info["output_parameter_key"] = output_parameter_key
+        if output_parameter_key and not block_info.get("block_label"):
+            block_info.update(index_by_key.get(output_parameter_key, {}))
+        value = getattr(row, "value", None)
+        item = {
+            "workflow_run_id": workflow_run_id,
+            "output_parameter_id": output_parameter_id,
+            "output_parameter_key": block_info.get("output_parameter_key"),
+            "block_label": block_info.get("block_label"),
+            "block_type": block_info.get("block_type"),
+            "value": value,
+        }
+        normalized.append(item)
+        label = item.get("block_label")
+        key = item.get("output_parameter_key")
+        if isinstance(label, str) and label and isinstance(key, str) and key:
+            values_by_label.setdefault(label, {})[key] = value
+
+    if not normalized:
+        return {}
+    data["registered_output_parameter_values"] = normalized
+    _merge_registered_output_parameter_values_into_blocks(data)
+    return values_by_label
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -1412,6 +1565,16 @@ async def _run_blocks_and_collect_debug(
     if not run_ok and run and getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
 
+    registered_outputs_by_label = await _attach_registered_output_parameter_values(
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow=runtime_workflow,
+        data=result_data,
+        persisted_output_parameters=all_output_params,
+    )
+    for label, output in registered_outputs_by_label.items():
+        if isinstance(output, dict) and output:
+            block_outputs_by_label[label] = output
+
     # Update verified prefix state ONLY on a fully-successful run. A failed
     # suffix run leaves the browser in post-failure state, so we must not
     # trust blocks that individually succeeded inside it.
@@ -1790,6 +1953,9 @@ def _record_run_blocks_result(
     timeout_latched = bool(copilot_ctx.copilot_total_timeout_exceeded)
     copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
     copilot_ctx.last_full_workflow_test_ok = False
+    # Re-affirmed per run below only when this run satisfies completion; never let a
+    # prior run's terminal-ready latch leak into a run that did not verify.
+    copilot_ctx.verified_terminal_proposal_ready = False
     copilot_ctx.last_unverified_block_labels = _unverified_current_workflow_labels(copilot_ctx)
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.last_artifact_health_blocker_reason = None
@@ -1912,6 +2078,11 @@ def _record_run_blocks_result(
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
+        completion_fully_satisfied = (
+            completion_verification is not None
+            and completion_verification.status == "evaluated"
+            and completion_verification.is_fully_satisfied()
+        )
         if structured_blocker:
             # Terminal anti-bot blockers are handled before run_ok; this branch
             # remains for non-challenge structured blockers that still make a
@@ -1936,7 +2107,16 @@ def _record_run_blocks_result(
                     display_reason=run_outcome_display_reason(structured_blocker),
                 ),
             )
-        if empty_data_blocks:
+        if completion_fully_satisfied:
+            # ``verified_terminal_proposal_ready`` is telemetry only (the barrier keys
+            # on ``outcome_fully_verified(ctx)``); clearing the stale suspicious-success
+            # state below is the load-bearing step.
+            copilot_ctx.verified_terminal_proposal_ready = True
+            copilot_ctx.last_test_suspicious_success = False
+            copilot_ctx.last_test_failure_reason = None
+            copilot_ctx.null_data_streak_count = 0
+            copilot_ctx.suspicious_success_nudge_count = 0
+        if empty_data_blocks and not completion_fully_satisfied:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
             copilot_ctx.null_data_streak_count = getattr(copilot_ctx, "null_data_streak_count", 0) + 1
@@ -1983,8 +2163,15 @@ def _record_run_blocks_result(
             # Real success: clear the signature latch so a subsequent bad URL in
             # the same session can re-fire the stop nudge.
             copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
-        if outcome_unverified_reason is None and not unverified:
+        if outcome_unverified_reason is None and completion_fully_satisfied:
             copilot_ctx.last_full_workflow_test_ok = True
+            copilot_ctx.last_unverified_block_labels = []
+            copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+            copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+            copilot_ctx.last_test_failure_reason = None
+        elif outcome_unverified_reason is None and not unverified:
+            copilot_ctx.last_full_workflow_test_ok = True
+            copilot_ctx.last_unverified_block_labels = []
             copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
             copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         elif outcome_unverified_reason is None:

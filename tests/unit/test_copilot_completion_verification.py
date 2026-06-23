@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -18,7 +19,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     RunEvidenceSnapshot,
     _coerce_result,
+    _structured_record_has_identifier,
     evaluate_completion_criteria,
+    grade_record_semantic_consistency,
+    grade_structured_record_criteria,
+    structured_record_has_identity,
     summarize_unsatisfied_outcomes,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -64,6 +69,87 @@ def _criterion(cid: str, outcome: str, *, method_mandated: bool = False) -> Comp
     return CompletionCriterion(id=cid, outcome=outcome, method_mandated=method_mandated)
 
 
+_STRUCTURED_RECORD_CRITERIA = (
+    ("fallback_record_identity", "The returned record identifies the target record."),
+    ("fallback_record_identifier", "The returned record includes the record identifier."),
+    ("fallback_record_groups", "The returned record includes record items."),
+    (
+        "fallback_record_status",
+        "The returned record's per-location statuses and overall status are present and consistent.",
+    ),
+)
+_STRUCTURED_RECORD_CRITERION_IDS = {cid for cid, _ in _STRUCTURED_RECORD_CRITERIA}
+
+
+def _structured_record_criteria() -> list[CompletionCriterion]:
+    return [CompletionCriterion(id=cid, outcome=outcome) for cid, outcome in _STRUCTURED_RECORD_CRITERIA]
+
+
+def _status_consistency_criteria() -> list[CompletionCriterion]:
+    return [
+        CompletionCriterion(
+            id="fallback_record_status",
+            outcome="The returned record's per-location statuses and overall status are present and consistent.",
+        )
+    ]
+
+
+def test_structured_record_identity_ignores_substring_only_keys() -> None:
+    assert structured_record_has_identity({"provider_name": "Alex Example"}) is True
+    assert structured_record_has_identity({"providerName": "Alex Example"}) is True
+    assert structured_record_has_identity({"title": "Permit A"}) is True
+    assert structured_record_has_identity({"filename": "report.pdf"}) is False
+    assert structured_record_has_identity({"tablename": "providers"}) is False
+
+
+def test_structured_record_identifier_ignores_substring_only_keys() -> None:
+    assert _structured_record_has_identifier({"providerId": "abc"}) is True
+    assert _structured_record_has_identifier({"record_number": "x"}) is True
+    assert _structured_record_has_identifier({"idea": "some text"}) is False
+    assert _structured_record_has_identifier({"_identical": "yes"}) is False
+    assert structured_record_has_identity({"subtitle": "detail"}) is False
+    assert structured_record_has_identity({"mislabeled": "detail"}) is False
+
+
+def _satisfied_criterion_ids(verdicts: list[CriterionVerdict]) -> set[str]:
+    return {verdict.criterion_id for verdict in verdicts if verdict.satisfied}
+
+
+def _record_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "entity_found": True,
+        "entity_name": "Jordan Example",
+        "record_number": "1234567890",
+        "items": [
+            {"item_name": "Sample Practice", "address": "100 Main St, Example City, ST 12345", "status": "Active"},
+            {
+                "item_name": "Secondary Practice",
+                "address": "300 Market St, Example City, ST 12345",
+                "status": "Inactive",
+            },
+        ],
+        "overall_status": "Active",
+        "evidence_text": "Opened Details page; read Overview/Affiliations items and More Details identifier.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _status_snapshot(
+    status: str,
+    *,
+    item_name: str = "Sample Practice",
+    evidence_text: str | None = None,
+) -> RunEvidenceSnapshot:
+    payload = _record_payload(
+        items=[{"item_name": item_name, "address": "100 Main St, Example City, ST 12345", "status": status}],
+        overall_status=status,
+    )
+    if evidence_text is not None:
+        payload["evidence_text"] = evidence_text
+    return RunEvidenceSnapshot(block_outputs={"lookup_record_status": payload})
+
+
 def _evaluated(*satisfied_by_id: tuple[str, bool]) -> CompletionVerificationResult:
     ids = [cid for cid, _ in satisfied_by_id]
     verdicts = [
@@ -82,6 +168,13 @@ def _completion_handler_lookup(handler: object) -> Callable[[object], Awaitable[
         return handler
 
     return _lookup
+
+
+def _patch_completion_handler(monkeypatch: pytest.MonkeyPatch, handler: object) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
 
 
 def test_is_fully_satisfied_requires_every_criterion() -> None:
@@ -223,6 +316,119 @@ def test_coerce_accepts_bytes_and_rejects_malformed() -> None:
     assert _coerce_result({"no_verdicts_key": 1}, ["c0"]).status == "unavailable"
 
 
+@pytest.mark.parametrize(
+    ("negative_status", "item_name", "missing_text"),
+    [
+        ("Inactive", "Sample Practice 200 Oak Ave, Example City, ST 12345 Active", "non-status fields include"),
+        *[
+            (status, "Sample Practice Active", None)
+            for status in ["Expired", "Suspended", "Terminated", "Revoked", "Lapsed", "Pending"]
+        ],
+    ],
+)
+def test_record_semantic_consistency_flags_status_contradictions(
+    negative_status: str, item_name: str, missing_text: str | None
+) -> None:
+    verdicts = grade_record_semantic_consistency(
+        _status_consistency_criteria(),
+        _status_snapshot(negative_status, item_name=item_name),
+    )
+
+    assert len(verdicts) == 1
+    assert verdicts[0].criterion_id == "fallback_record_status"
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    if missing_text:
+        assert missing_text in (verdicts[0].missing_evidence or "")
+
+
+@pytest.mark.parametrize(
+    ("status", "item_name", "evidence_text"),
+    [
+        ("Non-active", "Sample Practice non-active listing", "Sample Practice non-active listing 100 Main St"),
+        ("Active", "Sample Practice", "Sample Practice 100 Main St, Example City, ST 12345 Active"),
+        *[
+            ("Expired", "Sample Practice", text)
+            for text in [
+                "License is no longer active",
+                "Provider was previously active",
+                "Status note: not currently active",
+                "The active license expired",
+            ]
+        ],
+    ],
+)
+def test_record_semantic_consistency_accepts_non_contradictory_status_text(
+    status: str, item_name: str, evidence_text: str
+) -> None:
+    assert (
+        grade_record_semantic_consistency(
+            _status_consistency_criteria(), _status_snapshot(status, item_name=item_name, evidence_text=evidence_text)
+        )
+        == []
+    )
+
+
+def test_structured_record_identifier_requires_consecutive_digit_run() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "lookup_record": _record_payload(
+                phone="555-1234",
+                record_number=None,
+                items=[{"item_name": "Sample Practice", "address": "1234 Main St, Apt 56", "status": "Active"}],
+            )
+        }
+    )
+
+    satisfied = _satisfied_criterion_ids(grade_structured_record_criteria(_structured_record_criteria(), snapshot))
+
+    assert "fallback_record_identifier" not in satisfied
+    assert "fallback_record_identity" in satisfied
+
+
+@pytest.mark.parametrize(
+    "block_outputs",
+    [
+        {
+            "extract_record_status_info": {
+                "extract_record_status_info_output": _record_payload(),
+                "extracted_information": [],
+            }
+        },
+        {"extract_record_status_record_output": _record_payload(found=True, entity_found=None)},
+    ],
+)
+def test_structured_record_criteria_satisfy_structured_record_outputs(block_outputs: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs=block_outputs)
+
+    verdicts = grade_structured_record_criteria(_structured_record_criteria(), snapshot)
+
+    assert _satisfied_criterion_ids(verdicts) == _STRUCTURED_RECORD_CRITERION_IDS
+
+
+def test_structured_record_partial_matches_do_not_combine_across_blocks() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "identity_block": _record_payload(items=[], overall_status=None),
+            "status_block": {
+                "items": [{"item_name": "Sample Practice", "address": "100 Main St", "status": "Active"}],
+                "overall_status": "Active",
+            },
+        }
+    )
+
+    criteria = _structured_record_criteria()
+    verdicts = grade_structured_record_criteria(criteria, snapshot)
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[criterion.id for criterion in criteria],
+        verdicts=verdicts,
+    )
+
+    assert _satisfied_criterion_ids(verdicts) < _STRUCTURED_RECORD_CRITERION_IDS
+    assert result.is_fully_satisfied() is False
+
+
 @pytest.mark.asyncio
 async def test_evaluate_no_handler_or_no_criteria_is_unavailable() -> None:
     snapshot = RunEvidenceSnapshot(current_url="https://example.com")
@@ -243,7 +449,6 @@ async def test_evaluate_handler_exception_is_unavailable() -> None:
 @pytest.mark.asyncio
 async def test_evaluate_uses_completion_judge_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(settings, "COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS", 10.0)
 
     async def handler(**_: object) -> dict[str, object]:
         await asyncio.sleep(0.05)
@@ -570,6 +775,40 @@ def _clean_success_result() -> dict:
     }
 
 
+def _structured_record_top_level_output_result() -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structured_record",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_record_status_record"],
+            "current_url": "https://structured_record.test/entity-details",
+            "blocks": [
+                {
+                    "label": "extract_record_status_record",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"extracted_information": []},
+                }
+            ],
+            "output": {
+                "open_search_search_output": {
+                    "page_state": "search_search_open",
+                    "evidence_text": "Opened search search page with search-by-doctor typeahead #searchInput.",
+                },
+                "search_and_open_record_details_output": {
+                    "found": True,
+                    "entity_name": "Jordan Example",
+                    "opened_record_details": True,
+                    "evidence_text": "Opened Details page for the selected record.",
+                },
+                "extract_record_status_record_output": _record_payload(found=True, entity_found=None),
+                "extracted_information": [],
+            },
+        },
+    }
+
+
 def _run_ctx() -> CopilotContext:
     ctx = CopilotContext(
         organization_id="o",
@@ -590,6 +829,12 @@ def _ctx_with_blocks(*block_types: str) -> CopilotContext:
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks))
     ctx.verified_prefix_labels = [b.label for b in blocks]
     return ctx
+
+
+def _set_workflow_labels(ctx: CopilotContext, *labels: str) -> None:
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=label) for label in labels])
+    )
 
 
 def _contradicted(cid: str) -> CompletionVerificationResult:
@@ -689,10 +934,7 @@ async def test_goto_only_run_still_fails_extraction_verification(monkeypatch: py
             ]
         }
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _ctx_with_blocks("goto_url")
     ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "heading and paragraph are extracted")])
 
@@ -712,10 +954,7 @@ async def test_structured_blocker_run_skips_completion_verification(monkeypatch:
     async def handler(**_: object) -> dict:
         raise AssertionError("structured blocker runs must not be sent to the completion judge")
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _ctx_with_blocks("code")
     result = {
         "ok": True,
@@ -741,6 +980,84 @@ async def test_structured_blocker_run_skips_completion_verification(monkeypatch:
     verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
 
     assert verification is None
+
+
+@pytest.mark.asyncio
+async def test_classifier_fallback_record_is_not_verified_without_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("value-agnostic fallback criteria must not reach the completion judge")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+
+    result = _structured_record_top_level_output_result()
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+    assert verification is None
+
+    _record_run_blocks_result(ctx, result, completion_verification=verification)
+    # The strict barrier predicate and its telemetry flag stay false, so the proposal is
+    # not preserved as a verified success; legacy clean-run flags may still promote, as
+    # they do for any genuine zero-criteria run.
+    assert getattr(ctx, "verified_terminal_proposal_ready", False) is not True
+    assert outcome_fully_verified(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_non_fallback_judge_confirmed_run_still_fires_barrier(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("extraction")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "item in cart")])
+
+    result = _clean_success_result()
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+
+    _record_run_blocks_result(ctx, result, completion_verification=verification)
+    assert outcome_fully_verified(ctx) is True
+    assert verified_goal_satisfied_context(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_classifier_fallback_record_contradiction_still_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("structural contradictions are deterministic, not judged")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+
+    contradictory_record = _record_payload(
+        items=[{"item_name": "Sample Practice Active", "address": "100 Main St", "status": "Expired"}],
+        overall_status="Expired",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_contradiction",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_record_status_record"],
+            "current_url": "https://structured_record.test/entity-details",
+            "blocks": [
+                {
+                    "label": "extract_record_status_record",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"extracted_information": []},
+                }
+            ],
+            "output": {"extract_record_status_record_output": contradictory_record},
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert any(not verdict.satisfied for verdict in verification.verdicts)
 
 
 def _failed_code_block_result() -> dict:
@@ -1002,10 +1319,7 @@ async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatc
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     result = await _maybe_run_completion_verification(ctx, _canceled_budget_result(), time.monotonic())
     assert result is not None
@@ -1255,10 +1569,7 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
         seen_prompt["prompt"] = str(kwargs.get("prompt") or "")
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
@@ -1301,10 +1612,7 @@ async def test_page_observation_verification_does_not_overwrite_satisfied_verdic
     async def handler(**_: object) -> dict:
         raise AssertionError("handler should not be called once the outcome is verified")
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
@@ -1338,10 +1646,7 @@ async def test_page_observation_verification_preserves_existing_unsatisfied_verd
         handler_calls += 1
         return {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
@@ -1372,10 +1677,7 @@ async def test_page_observation_verification_can_upgrade_unsatisfied_verdict(
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
@@ -1478,10 +1780,7 @@ async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monke
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _ctx_unverified_prefix()
     result = await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic())
     assert result is not None
@@ -1508,10 +1807,7 @@ async def test_method_mandated_criteria_excluded_from_verification(monkeypatch: 
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
@@ -1562,11 +1858,237 @@ def test_snapshot_uses_current_run_blocks_not_stale_outputs() -> None:
     assert snap2.block_outputs.get("b3") == {"extracted_information": {"price": "9.99"}}
 
 
+def test_snapshot_indexes_workflow_output_parameter_records() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(
+        ctx,
+        "open_search_search_page",
+        "search_and_open_record_details",
+        "extract_record_status_record",
+    )
+    run = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structured_record",
+            "blocks": [
+                {
+                    "label": "open_search_search_page",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "open_search_search_page_output": {"evidence_text": "Opened search search page"}
+                    },
+                },
+                {
+                    "label": "search_and_open_record_details",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "search_and_open_record_details_output": {
+                            "entity_found": True,
+                            "evidence_text": "Opened Details page",
+                        }
+                    },
+                },
+                {
+                    "label": "extract_record_status_record",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"extract_record_status_record_output": _record_payload(evidence_text=None)},
+                },
+            ],
+        },
+    }
+
+    snap = _build_run_evidence_snapshot(ctx, run)
+
+    assert "open_search_search_page_output" in snap.block_outputs
+    assert snap.block_outputs["search_and_open_record_details_output"]["evidence_text"] == ("Opened Details page")
+    assert snap.block_outputs["extract_record_status_record_output"]["record_number"] == "1234567890"
+
+
+def test_snapshot_uses_current_run_registered_output_parameters() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_record_status_details")
+    run = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structured_record",
+            "overall_status": "completed",
+            "blocks": [],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_structured_record",
+                    "output_parameter_id": "op_record",
+                    "output_parameter_key": "extract_record_status_details_output",
+                    "block_label": "extract_record_status_details",
+                    "block_type": "CODE",
+                    "value": _record_payload(evidence_text="Opened Details page"),
+                }
+            ],
+        },
+    }
+
+    snap = _build_run_evidence_snapshot(ctx, run)
+    verdicts = grade_structured_record_criteria(_structured_record_criteria(), snap)
+
+    assert snap.block_outputs["extract_record_status_details_output"]["record_number"] == "1234567890"
+    assert (
+        snap.block_outputs["extract_record_status_details"]["extract_record_status_details_output"]["record_number"]
+        == "1234567890"
+    )
+    assert _satisfied_criterion_ids(verdicts) == _STRUCTURED_RECORD_CRITERION_IDS
+
+
+def test_snapshot_uses_structured_record_top_level_output_parameters() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_record_status_record")
+
+    snap = _build_run_evidence_snapshot(ctx, _structured_record_top_level_output_result())
+    verdicts = grade_structured_record_criteria(_structured_record_criteria(), snap)
+
+    assert snap.block_outputs["extract_record_status_record_output"]["record_number"] == "1234567890"
+    assert _satisfied_criterion_ids(verdicts) == _STRUCTURED_RECORD_CRITERION_IDS
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_treats_fallback_record_as_criteria_less(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_lookup_calls = 0
+
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-agnostic fallback criteria must not call the judge")
+
+    async def handler_lookup(_ctx: object) -> object:
+        nonlocal handler_lookup_calls
+        handler_lookup_calls += 1
+        return fail_handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        handler_lookup,
+    )
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _structured_record_top_level_output_result(),
+        time.monotonic(),
+    )
+
+    # Value-agnostic fallback criteria are criteria-less; a well-shaped record is not a
+    # verified result, and the path short-circuits before any judge lookup.
+    assert verification is None
+    assert handler_lookup_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fails_closed_on_no_judge_for_judge_needed_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_completion_handler(monkeypatch, None)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "item in cart")])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _structured_record_top_level_output_result(),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "unavailable"
+    assert verification.is_fully_satisfied() is False
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fails_closed_on_low_budget_for_judge_needed_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("low-budget verification must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "item in cart")])
+    starved = time.monotonic() - 100_000
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _structured_record_top_level_output_result(),
+        starved,
+    )
+
+    assert verification is not None
+    assert verification.status == "unavailable"
+    assert verification.is_fully_satisfied() is False
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_mixed_criteria_still_fail_closed_on_judge_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def slow_handler(**_: object) -> dict:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(1)
+        return {"verdicts": []}
+
+    monkeypatch.setattr(settings, "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
+    _patch_completion_handler(monkeypatch, slow_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            *_structured_record_criteria(),
+            CompletionCriterion(
+                id="source_timestamp_visible", outcome="The source page shows the latest update timestamp."
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _structured_record_top_level_output_result(),
+        time.monotonic(),
+    )
+
+    assert calls == 1
+    assert verification is not None
+    assert verification.status == "unavailable"
+    assert verification.is_fully_satisfied() is False
+
+
+def test_snapshot_ignores_registered_output_parameters_from_prior_run() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_record_status_details")
+    run = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_current",
+            "blocks": [],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_prior",
+                    "output_parameter_key": "extract_record_status_details_output",
+                    "block_label": "extract_record_status_details",
+                    "value": {"entity_name": "Jordan Example", "record_number": "1234567890"},
+                }
+            ],
+        },
+    }
+
+    snap = _build_run_evidence_snapshot(ctx, run)
+
+    assert snap.block_outputs == {}
+
+
 def test_snapshot_summarizes_registered_download_outputs() -> None:
     ctx = _run_ctx()
-    ctx.last_workflow = SimpleNamespace(
-        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="download_statement")])
-    )
+    _set_workflow_labels(ctx, "download_statement")
     run = {
         "ok": True,
         "data": {
@@ -1682,10 +2204,7 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
             ]
         }
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
@@ -1751,10 +2270,7 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(handler),
-    )
+    _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     starved = time.monotonic() - 100_000  # no budget left to verify this candidate run
     result = await _maybe_run_completion_verification(ctx, _clean_success_result(), starved)
@@ -1764,12 +2280,13 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
     assert result.status == "unavailable"
     assert result.is_fully_satisfied() is False
 
-    # A missing judge handler stays a soft fallback (None), not a hard block.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
-        _completion_handler_lookup(None),
-    )
-    assert await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic()) is None
+    # A missing judge handler means the required completion contract could not be
+    # verified, so the run must not pass through on status alone.
+    _patch_completion_handler(monkeypatch, None)
+    no_handler_result = await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic())
+    assert no_handler_result is not None
+    assert no_handler_result.status == "unavailable"
+    assert no_handler_result.is_fully_satisfied() is False
 
 
 def test_completion_contract_not_violated_unavailable_blocks_surfacing() -> None:

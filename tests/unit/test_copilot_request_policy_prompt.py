@@ -6,14 +6,17 @@ from pathlib import Path
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
     CompletionCriterion,
+    _classifier_fallback_policy,
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
     contains_email_password_pair,
+    is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -364,3 +367,101 @@ class TestActiveCriteriaPromptAnchor:
             handler=_capture_handler(captured),
         )
         assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]
+
+
+class TestClassifierFallbackCompletionCriteria:
+    @pytest.mark.parametrize(
+        ("user_message", "expect_criteria"),
+        [
+            (
+                (
+                    "I want to build a reusable workflow that checks record status. "
+                    "Capture the identifier and the list of practice items with each location's status, "
+                    "and the result should come out as a record with the entity name, identifier, items, "
+                    "and an overall status."
+                ),
+                True,
+            ),
+            (
+                (
+                    "Build a reusable fixture directory lookup workflow for Jordan Example. Return a record with "
+                    "the entity name, identifier 1234567890, items, per-location status, overall status, and "
+                    "no-results behavior."
+                ),
+                True,
+            ),
+            ("Extract the user's name, id, address, and status from the portal.", False),
+            ("Open https://example.com and click the pricing link.", False),
+            # Substring matches ("read" in "already", "name" in "filename", "id" in "decided")
+            # must not satisfy the whole-word gate.
+            ("I already decided the filename and reviewed the status of locations.", False),
+            # Generic structural group term ("entries") satisfies the group gate.
+            ("Return a record with the entity name, identifier 1234567890, status, and the grouped entries.", True),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_classifier_fallback_structured_record_criteria(
+        self, user_message: str, expect_criteria: bool
+    ) -> None:
+        policy = await _classify_request(
+            user_message=user_message,
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=None,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.completion_contract_status == ("present" if expect_criteria else "unknown")
+        if not expect_criteria:
+            assert policy.completion_criteria
+            assert all(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
+            return
+
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
+        assert [criterion.id for criterion in policy.completion_criteria] == [
+            "fallback_record_identity",
+            "fallback_record_identifier",
+            "fallback_record_groups",
+            "fallback_record_status",
+        ]
+        assert policy.requires_user_clarification is False
+        assert policy.user_response_policy == "proceed"
+        assert all(criterion.implicit for criterion in policy.completion_criteria)
+        assert all(criterion.level == "run" for criterion in policy.completion_criteria)
+
+    def test_classifier_fallback_logs_synthesized_structured_record_criteria(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeLogger:
+            def info(self, event: str, **kwargs: object) -> None:
+                calls.append((event, kwargs))
+
+        monkeypatch.setattr(request_policy_module, "LOG", FakeLogger())
+
+        policy = _classifier_fallback_policy(
+            [],
+            raw_secret_present=False,
+            failure_kind="missing_handler",
+            user_message=(
+                "Return a record with the entity name, identifier, items, per-location status, and overall status."
+            ),
+        )
+
+        assert policy.completion_contract_status == "present"
+        assert calls == [
+            (
+                "copilot request policy synthesized fallback structured-record criteria",
+                {
+                    "classifier_failure_kind": "missing_handler",
+                    "completion_criterion_ids": [
+                        "fallback_record_identity",
+                        "fallback_record_identifier",
+                        "fallback_record_groups",
+                        "fallback_record_status",
+                    ],
+                },
+            )
+        ]

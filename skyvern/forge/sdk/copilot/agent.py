@@ -127,13 +127,20 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHalt, turn_halt_to_trace_data
+from skyvern.forge.sdk.copilot.turn_halt import (
+    _INVOLUNTARY_BLOCKER_REASON_CODES,
+    CopilotTurnHalt,
+    TurnHalt,
+    raise_if_turn_halt,
+    turn_halt_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
     RequiredContextKey,
     TurnIntent,
     TurnIntentClassifierResult,
     TurnIntentMode,
+    TurnIntentReasonCode,
     build_turn_intent,
     classify_turn_intent,
 )
@@ -172,7 +179,11 @@ def _render_code_only_browser_authoring_prompt() -> str:
         "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
         "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
         "re-derive its locators. Only hand-author the steps it does not cover, such as the\n"
-        "extraction or report block that returns the structured result."
+        "extraction or report block that returns the structured result. Direct browser\n"
+        "evaluate is a scouting tool; persisted code blocks must not use page.evaluate,\n"
+        "page.evaluate_handle, page.request, or page.context. Use locators and locator\n"
+        "DOM-reading methods such as inner_text, text_content, get_attribute, count, and\n"
+        "is_visible instead."
     )
 
 
@@ -635,9 +646,7 @@ def _build_user_context(
     ``escape_code_fences`` before the template interpolates it into a
     triple-backtick block. Without this, a value containing a literal
     ``` would close the fence early and let the model see the rest as
-    system-level content (the classic code-fence breakout). The old
-    copilot path in ``workflow_copilot.py`` and ``feasibility_gate.py``
-    both apply the same guard.
+    system-level content (the classic code-fence breakout).
     """
     workflow_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
     return prompt_engine.load_prompt(
@@ -1285,7 +1294,7 @@ async def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_cont
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     clean_test = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
     if clean_test and verified_goal_claim_authorized(ctx):
-        user_response = "I created and tested the workflow successfully."
+        user_response = _VERIFIED_WORKFLOW_SUCCESS_REPLY
     elif clean_test:
         user_response = (
             "I built the workflow and the test run completed, but the goal outcome was not "
@@ -1412,6 +1421,7 @@ _MAX_TURNS_REPLY_UNVALIDATED = (
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
+_VERIFIED_WORKFLOW_SUCCESS_REPLY = "I created and tested the workflow successfully."
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
     "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
@@ -1515,9 +1525,7 @@ def _render_typed_run_outcome_reply(
         if not has_verified_workflow or not verified_goal_claim_authorized(ctx):
             return None
         return _TypedRunOutcomeReply(
-            user_response=(
-                "I created and tested the workflow successfully. The latest run demonstrated the requested outcome."
-            ),
+            user_response=f"{_VERIFIED_WORKFLOW_SUCCESS_REPLY} The latest run demonstrated the requested outcome.",
             demonstrated=True,
         )
 
@@ -1571,6 +1579,72 @@ except ValueError as _fallback_validation_error:
     )
 
 
+def _verified_terminal_preserve_result(
+    ctx: CopilotContext, result: AgentResult, *, exit_site: str
+) -> AgentResult | None:
+    """When the judge confirmed the outcome, hold the tested proposal and the
+    success reply instead of letting an involuntary blocker render over it."""
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    if verified_workflow is None:
+        return None
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=_VERIFIED_WORKFLOW_SUCCESS_REPLY,
+        attempted_kind=derive_response_kind(ctx.turn_intent),
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason="verified_goal_satisfied",
+        turn_intent=ctx.turn_intent,
+    )
+    output_kind = derive_output_kind(
+        response_type="REPLY",
+        request_policy=ctx.request_policy,
+        updated_workflow=verified_workflow,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+    )
+    verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type="REPLY",
+        user_response=final_text,
+        global_llm_context=None,
+        workflow_yaml=verified_yaml,
+        has_workflow_proposal=True,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+        output_kind=output_kind,
+    )
+    if not verdict.allowed:
+        return None
+    LOG.info(
+        "copilot verified outcome preserved tested proposal over blocker",
+        exit_site=exit_site,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+    )
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=verified_workflow,
+        global_llm_context=result.global_llm_context,
+        response_type="REPLY",
+        workflow_yaml=verified_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+        clear_proposed_workflow=False,
+        total_tokens=result.total_tokens,
+        cancelled=result.cancelled,
+        proposal_disposition="review_tested",
+        turn_outcome=outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
+    )
+
+
 def _finalize_result_with_blocker_override(
     ctx: CopilotContext, result: AgentResult, *, exit_site: str = "unspecified"
 ) -> AgentResult:
@@ -1583,6 +1657,10 @@ def _finalize_result_with_blocker_override(
         return result
     if not local_signal.renders_final_reply:
         return result
+    if local_signal.internal_reason_code in _INVOLUNTARY_BLOCKER_REASON_CODES and outcome_fully_verified(ctx):
+        preserved = _verified_terminal_preserve_result(ctx, result, exit_site=exit_site)
+        if preserved is not None:
+            return preserved
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
 
@@ -1974,6 +2052,38 @@ def _build_wip_exit_result(
             terminal_reason=effective_terminal,
         )
 
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    if outcome_fully_verified(ctx) and verified_workflow is not None:
+        final_text, outcome = _guard(tested_reply)
+        return _finalize_result_with_blocker_override(
+            ctx,
+            _make_agent_result(
+                ctx,
+                user_response=final_text,
+                updated_workflow=verified_workflow,
+                global_llm_context=global_llm_context,
+                workflow_yaml=verified_yaml,
+                workflow_was_persisted=ctx.workflow_persisted,
+                has_staged_proposal=ctx.has_staged_proposal,
+                staged_workflow_yaml=ctx.staged_workflow_yaml,
+                staged_workflow=ctx.staged_workflow,
+                canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+                total_tokens=ctx.total_tokens_used,
+                proposal_disposition="auto_applicable",
+                cancelled=cancelled,
+                turn_outcome=outcome,
+                turn_id=ctx.turn_id,
+                narrative_summary=ctx.narrative_summary,
+                narrative_payload=_build_narrative_payload(
+                    ctx,
+                    terminal="response",
+                    terminal_message=final_text,
+                    narrative_summary=ctx.narrative_summary,
+                ),
+            ),
+            exit_site="wip_verified_terminal_proposal",
+        )
+
     # When an unverified edit/run has overwritten ``last_workflow``, prefer the
     # verified shape while still forcing explicit review.
     if (
@@ -2157,6 +2267,48 @@ def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | Non
         tested_reply=_CANCEL_REPLY_TESTED,
         cancelled=True,
     )
+
+
+async def _resolve_wrapped_exception_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    *,
+    goal_satisfied: bool,
+    error: BaseException,
+    workflow_permanent_id: str | None,
+) -> AgentResult:
+    error_type = type(error).__name__
+    try:
+        raise_if_turn_halt(ctx, verified=outcome_fully_verified(ctx))
+    except CopilotTurnHalt as halt_exc:
+        LOG.info(
+            "Copilot run stopped after typed turn halt from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            error_type=error_type,
+            **turn_halt_to_trace_data(halt_exc.halt),
+        )
+        return _build_turn_halt_exit_result(ctx, global_llm_context, halt_exc.halt)
+    turn_halt = ctx.turn_halt
+    if isinstance(turn_halt, TurnHalt):
+        LOG.info(
+            "Copilot run stopped after typed turn halt from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            error_type=error_type,
+            **turn_halt_to_trace_data(turn_halt),
+        )
+        return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
+    if goal_satisfied:
+        # The Agents SDK can wrap exceptions raised from hooks; keep this
+        # fallback so a verified-goal stop is not rendered as a generic error.
+        LOG.info(
+            "Copilot run stopped after verified goal satisfaction from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
+            error_type=error_type,
+        )
+        return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
+    LOG.error("Copilot agent error", error=str(error), exc_info=True)
+    return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
 
 
 async def _translate_to_agent_result(
@@ -2357,10 +2509,18 @@ async def _translate_to_agent_result(
         elif not salvaged_reply:
             user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    # Default-true preserves backwards-compat with stale prompts and missing fields.
-    agent_admits_incomplete = _is_explicit_false(
-        action_data.get("goal_reached")
-    ) and not verified_goal_claim_authorized(ctx)
+    verified_terminal_ready = (
+        verified_workflow is not None and verified_goal_claim_authorized(ctx) and not blocker_active
+    )
+    if verified_terminal_ready:
+        resp_type = "REPLY"
+        user_response = _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        agent_admits_incomplete = False
+    else:
+        # Default-true preserves backwards-compat with stale prompts and missing fields.
+        agent_admits_incomplete = _is_explicit_false(
+            action_data.get("goal_reached")
+        ) and not verified_goal_claim_authorized(ctx)
     typed_outcome_reply = _render_typed_run_outcome_reply(
         ctx,
         response_type=resp_type,
@@ -2563,26 +2723,41 @@ async def _translate_to_agent_result(
     )
 
 
-def _build_feasibility_clarification_result(
+def _structural_infeasibility_question(turn_intent: TurnIntent | None) -> str | None:
+    """The clarifying question for a turn the classifier judged structurally infeasible.
+
+    Returns the question only when the turn-intent landed on CLARIFY carrying the
+    structurally_infeasible reason and a usable question, so a questionless verdict
+    (already failed open in build_turn_intent) cannot trigger the pre-loop bail.
+    """
+    if not isinstance(turn_intent, TurnIntent):
+        return None
+    # Defense-in-depth: build_turn_intent already forces CLARIFY or drops a questionless verdict.
+    if turn_intent.mode != TurnIntentMode.CLARIFY:
+        return None
+    if TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in turn_intent.reason_codes:
+        return None
+    question = (turn_intent.missing_context_question or "").strip()
+    return question or None
+
+
+def _build_infeasibility_clarification_result(
     question: str,
-    rationale: str | None,
     user_message: str,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
     ctx: CopilotContext,
 ) -> AgentResult:
-    """Construct an AgentResult for the feasibility-gate fast-path.
+    """Construct an AgentResult for the structural-infeasibility fast-path.
 
-    Preserves structured cross-turn context, sets user_goal from the
-    classifier's rationale (or the raw user message as a fallback), and
-    appends a decisions_made entry so a follow-up turn can see that a
-    clarification was already asked and return ``proceed`` instead of
-    re-asking.
+    Preserves structured cross-turn context, sets user_goal from the user message
+    when unset, and appends a decisions_made entry so a follow-up turn can see that
+    a clarification was already asked and proceed instead of re-asking.
     """
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     if not structured.user_goal:
-        structured.user_goal = (rationale or user_message)[:300]
-    structured.decisions_made.append(f"feasibility-gate clarification asked: {question}")
+        structured.user_goal = user_message[:300]
+    structured.decisions_made.append(f"infeasibility clarification asked: {question}")
     enriched_context = structured.to_json_str()
 
     final_text, outcome = apply_repeated_reply_guard(
@@ -2601,7 +2776,7 @@ def _build_feasibility_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=True,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -2652,7 +2827,7 @@ def _build_request_policy_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=True,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -3282,7 +3457,7 @@ async def _run_copilot_turn_impl(
         policy_inputs=policy_inputs,
     )
     # Run the request-policy guardrail as the authoritative input gate before
-    # feasibility checks, browser/session setup, model execution, or tool calls.
+    # browser/session setup, model execution, or tool calls.
     # Do not also attach it to the main Agent; the SDK would invoke it again and
     # duplicate policy telemetry.
     request_policy_guardrail_result = await request_policy_guardrails[0].run(
@@ -3347,21 +3522,11 @@ async def _run_copilot_turn_impl(
         prior_page_inspection_calls_made=ctx.prior_page_inspection_calls_made,
     )
 
-    # Preflight feasibility classifier — fires on every turn so mid-session pivots
-    # to impossible targets are caught the same as first-turn structural mismatches.
-    from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
-
-    feasibility_verdict = await run_feasibility_gate(
-        user_message=agent_user_message,
-        workflow_yaml=safe_workflow_yaml,
-        chat_history=safe_chat_history_text,
-        global_llm_context=safe_global_llm_context,
-        handler=llm_api_handler,
-    )
-    if feasibility_verdict.verdict == "ask_clarification" and feasibility_verdict.question:
-        return _build_feasibility_clarification_result(
-            question=feasibility_verdict.question,
-            rationale=feasibility_verdict.rationale,
+    # Infeasibility rides on turn_intent: a verdict carrying a question bails to a pre-loop clarification.
+    infeasibility_question = _structural_infeasibility_question(ctx.turn_intent)
+    if infeasibility_question is not None:
+        return _build_infeasibility_clarification_result(
+            question=infeasibility_question,
             user_message=agent_user_message,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
@@ -3681,24 +3846,10 @@ async def _run_copilot_turn_impl(
         except Exception:
             LOG.error("Copilot agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
-        turn_halt = getattr(ctx, "turn_halt", None)
-        if isinstance(turn_halt, TurnHalt):
-            LOG.info(
-                "Copilot run stopped after typed turn halt from wrapped exception",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                error_type=type(e).__name__,
-                **turn_halt_to_trace_data(turn_halt),
-            )
-            return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
-        if goal_satisfied:
-            # The Agents SDK can wrap exceptions raised from hooks; keep this
-            # fallback so a verified-goal stop is not rendered as a generic error.
-            LOG.info(
-                "Copilot run stopped after verified goal satisfaction from wrapped exception",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
-                error_type=type(e).__name__,
-            )
-            return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
-        LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
+        return await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context,
+            goal_satisfied=goal_satisfied,
+            error=e,
+            workflow_permanent_id=chat_request.workflow_permanent_id,
+        )

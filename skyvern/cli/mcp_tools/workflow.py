@@ -441,6 +441,7 @@ _CODE_V2_DEFAULTS: dict[str, Any] = {
     "run_with": "agent",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
+_WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = ("run_sequentially", "sequential_key")
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
@@ -609,6 +610,28 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
     return _dump_definition_dict(raw, parsed_format)
 
 
+async def _inject_workflow_update_top_level_settings(definition: str, fmt: str, workflow_id: str) -> str:
+    """Preserve workflow-level settings that schema defaults would otherwise clobber."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    missing_fields = [field for field in _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS if field not in raw]
+    if not missing_fields:
+        return definition
+
+    existing_workflow = await get_workflow_by_id(workflow_id)
+    changed = False
+    for field in missing_fields:
+        existing_value = existing_workflow.get(field)
+        if existing_value is not None:
+            raw[field] = existing_value
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
 # Parameter types that are auto-managed (credentials and secrets set via the UI) and should
 # always be preserved from the existing workflow during MCP updates, regardless of what the
 # caller sends. These should NEVER be modifiable via MCP — only via the UI credential picker.
@@ -687,6 +710,53 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _iter_positional_block_matches(
+    existing_blocks: list[dict[str, Any]],
+    update_blocks: list[dict[str, Any]],
+    *,
+    parent_has_identity: bool = True,
+) -> list[tuple[str | None, bool]]:
+    """Return positional block types plus whether position identifies the block.
+
+    A position is considered identifying only when the sibling shape is unchanged
+    and the block either kept its label or is the sole child under an identified
+    parent. This lets us repair dropped block_type values for singleton edits
+    without using bare index to swap credentials across reordered siblings.
+    """
+    result: list[tuple[str | None, bool]] = []
+    existing_dict_blocks = [block for block in existing_blocks if isinstance(block, dict)]
+    update_dict_blocks = [block for block in update_blocks if isinstance(block, dict)]
+    same_sibling_count = len(existing_dict_blocks) == len(update_dict_blocks)
+
+    for index, update_block in enumerate(update_dict_blocks):
+        existing_block = existing_dict_blocks[index] if same_sibling_count else None
+        raw_existing_block_type = existing_block.get("block_type") if existing_block else None
+        existing_block_type = raw_existing_block_type if isinstance(raw_existing_block_type, str) else None
+        existing_label = existing_block.get("label") if existing_block else None
+        update_label = update_block.get("label")
+        stable_label_match = bool(existing_label and update_label and existing_label == update_label)
+        singleton_position = same_sibling_count and len(update_dict_blocks) == 1
+        has_identity = parent_has_identity and same_sibling_count and (stable_label_match or singleton_position)
+        result.append((existing_block_type, has_identity))
+
+        update_loop_blocks = update_block.get("loop_blocks")
+        if not isinstance(update_loop_blocks, list):
+            continue
+
+        existing_loop_blocks = existing_block.get("loop_blocks") if existing_block else None
+        if not isinstance(existing_loop_blocks, list):
+            existing_loop_blocks = []
+        result.extend(
+            _iter_positional_block_matches(
+                existing_loop_blocks,
+                update_loop_blocks,
+                parent_has_identity=has_identity,
+            )
+        )
+
+    return result
+
+
 async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> str:
     """Preserve protected credential/secret parameters during MCP workflow updates.
 
@@ -694,9 +764,8 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
     values always win. This function:
       1. Always replaces protected parameters with the existing workflow's versions
          (even if the caller includes them — they may have stale/wrong data).
-      2. Injects credential parameter_keys into blocks using type-based matching
-         (login blocks always get ALL credential keys) with label-based fallback
-         for non-login blocks.
+      2. Injects credential parameter_keys into blocks using per-block matches
+         with label-based fallback.
     """
 
     raw, parsed_format = _load_definition_dict(definition, fmt)
@@ -742,11 +811,6 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
         wf_def["parameters"] = update_params
 
     # --- Step 2: Inject credential parameter keys into blocks ---
-    # Login blocks get credential-type keys via type-based matching (resilient to label
-    # renames by Claude). Non-login blocks fall back to label-based matching — so if Claude
-    # renames a non-login block that references aws_secret/bitwarden/etc., the key reference
-    # is lost. This asymmetry is accepted because login blocks are the critical path for
-    # credential injection; non-login secret refs are rare and still work when labels match.
     all_cred_keys: set[str] = set()
     login_cred_keys: set[str] = set()
     for param in existing_params:
@@ -758,29 +822,92 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
     if all_cred_keys:
         existing_blocks: list[dict[str, Any]] = existing_wf_def.get("blocks", [])
         update_blocks: list[dict[str, Any]] = wf_def.get("blocks", [])
+        existing_blocks_flat = _iter_blocks_flat(existing_blocks)
+        update_blocks_flat = _iter_blocks_flat(update_blocks)
+        n_existing_blocks = len(existing_blocks_flat)
+        n_update_blocks = len(update_blocks_flat)
+        positional_block_matches = _iter_positional_block_matches(existing_blocks, update_blocks)
 
-        # Build label-based map for fallback (non-login blocks)
+        existing_block_type_by_label: dict[str, str] = {}
+        # Login labels resolve through existing_block_login_cred_keys; this map
+        # keeps all protected keys for non-login label recovery.
         existing_block_cred_keys: dict[str, list[str]] = {}
-        for block in _iter_blocks_flat(existing_blocks):
+        existing_block_login_cred_keys: dict[str, list[str]] = {}
+        existing_login_block_login_keys: list[list[str]] = []
+        existing_login_block_count = 0
+        for block in existing_blocks_flat:
+            raw_existing_block_type = block.get("block_type")
+            existing_block_type = raw_existing_block_type if isinstance(raw_existing_block_type, str) else None
+            existing_pkeys = block.get("parameter_keys") or []
+            cred_keys = sorted(k for k in existing_pkeys if k in all_cred_keys)
+            login_keys = sorted(k for k in existing_pkeys if k in login_cred_keys)
+            if existing_block_type == "login":
+                existing_login_block_count += 1
+                if login_keys:
+                    existing_login_block_login_keys.append(login_keys)
+
             label = block.get("label")
             if not label:
                 continue
-            existing_pkeys = block.get("parameter_keys") or []
-            cred_keys = [k for k in existing_pkeys if k in all_cred_keys]
+            if existing_block_type:
+                existing_block_type_by_label[label] = existing_block_type
             if cred_keys:
                 existing_block_cred_keys[label] = cred_keys
+            if login_keys:
+                existing_block_login_cred_keys[label] = login_keys
 
-        for block in _iter_blocks_flat(update_blocks):
+        # Label matches identify block ownership. Positional reuse can only restore
+        # a dropped login type when the login credential choice is unambiguous.
+        use_positional_correspondence = n_existing_blocks == n_update_blocks
+        single_global_login_cred_keys = sorted(login_cred_keys) if len(login_cred_keys) == 1 else []
+        single_existing_login_block_keys = (
+            existing_login_block_login_keys[0]
+            if len(existing_login_block_login_keys) == 1 and existing_login_block_count == 1
+            else []
+        )
+        single_login_cred_keys = single_existing_login_block_keys or single_global_login_cred_keys
+
+        for index, block in enumerate(update_blocks_flat):
             block_type = block.get("block_type")
             label = block.get("label")
+            positional_block_type: str | None = None
+            positional_has_identity = False
+            if use_positional_correspondence and index < len(positional_block_matches):
+                positional_block_type, positional_has_identity = positional_block_matches[index]
 
             keys_to_inject: list[str] = []
+            block_type_to_restore: str | None = None
             if block_type == "login":
-                keys_to_inject = sorted(login_cred_keys)
+                if label and label in existing_block_login_cred_keys:
+                    keys_to_inject = existing_block_login_cred_keys[label]
+                elif single_login_cred_keys:
+                    keys_to_inject = single_login_cred_keys
+            elif not block_type:
+                # Recover by stable label first. If identity is gone, only recover
+                # the single-login case; leave other ambiguous secrets untouched.
+                label_block_type = existing_block_type_by_label.get(label) if label else None
+                if label_block_type == "login":
+                    if label and label in existing_block_login_cred_keys:
+                        keys_to_inject = existing_block_login_cred_keys[label]
+                        block_type_to_restore = label_block_type
+                    elif single_login_cred_keys:
+                        keys_to_inject = single_login_cred_keys
+                        block_type_to_restore = label_block_type
+                elif label_block_type:
+                    if label and label in existing_block_cred_keys:
+                        keys_to_inject = existing_block_cred_keys[label]
+                        block_type_to_restore = label_block_type
+                elif positional_has_identity and positional_block_type == "login":
+                    if single_login_cred_keys:
+                        keys_to_inject = single_login_cred_keys
+                        block_type_to_restore = positional_block_type
             elif label and label in existing_block_cred_keys:
-                keys_to_inject = sorted(existing_block_cred_keys[label])
+                keys_to_inject = existing_block_cred_keys[label]
 
             if keys_to_inject:
+                if block_type_to_restore:
+                    block["block_type"] = block_type_to_restore
+                    modified = True
                 block_pkeys: list[str] = list(block.get("parameter_keys") or [])
                 current_keys = set(block_pkeys)
                 for cred_key in keys_to_inject:
@@ -1082,6 +1209,7 @@ async def skyvern_workflow_update(
 
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
+        definition = await _inject_workflow_update_top_level_settings(definition, format, workflow_id)
         definition = await _inject_workflow_update_parameters(definition, format, workflow_id)
     except NotFoundError:
         return make_result(
@@ -1094,7 +1222,7 @@ async def skyvern_workflow_update(
             ),
         )
     except Exception as e:
-        LOG.warning("workflow_update_proxy_default_injection_failed", workflow_id=workflow_id, error=str(e))
+        LOG.warning("workflow_update_preprocessing_failed", workflow_id=workflow_id, error=str(e))
         return make_result(
             "skyvern_workflow_update",
             ok=False,

@@ -157,8 +157,7 @@ class Settings(BaseSettings):
     # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
-    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
-    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 6.0
+    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     # Consecutive repair runs that make no newly-verified forward progress before the

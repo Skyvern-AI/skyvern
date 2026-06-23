@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { ParametersState } from "../types";
 import {
+  detectInitialBitwardenManualEntry,
   detectInitialCredentialDataType,
   detectInitialCredentialSource,
   detectInitialParameterTypeSelection,
   header,
 } from "./WorkflowParameterEditPanel.helpers";
+import { validateBitwardenLoginCredential } from "./util";
 
 type Parameter = ParametersState[number];
 
@@ -182,5 +184,72 @@ describe("detectInitialCredentialSource", () => {
     expect(detectInitialCredentialSource(azureCredential, true)).toBe(
       "azurevault",
     );
+  });
+});
+
+describe("validateBitwardenLoginCredential", () => {
+  it("requires a collection or item reference", () => {
+    expect(validateBitwardenLoginCredential(null, null, null)).toBe(
+      "Collection ID or Item ID is required",
+    );
+  });
+
+  it("allows picker-selected items with collection IDs and no URL lookup key", () => {
+    expect(
+      validateBitwardenLoginCredential("collection-id", "item-id", null),
+    ).toBeNull();
+  });
+
+  it("still requires URL lookup key for collection-only login credentials", () => {
+    expect(validateBitwardenLoginCredential("collection-id", null, null)).toBe(
+      "URL Input Key is required when collection ID is used",
+    );
+  });
+
+  it("allows item-only login credentials", () => {
+    expect(validateBitwardenLoginCredential(null, "item-id", null)).toBeNull();
+  });
+});
+
+describe("detectInitialBitwardenManualEntry", () => {
+  it("keeps picker-selected password items with collection IDs in picker mode", () => {
+    expect(detectInitialBitwardenManualEntry(bitwardenLogin)).toBe(false);
+  });
+
+  it("uses manual entry for URL-based Bitwarden password lookup", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...bitwardenLogin,
+        itemId: null,
+        urlParameterKey: "url",
+      }),
+    ).toBe(true);
+  });
+
+  it("uses manual entry for templated Bitwarden password item IDs", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...bitwardenLogin,
+        itemId: "{{ item_id }}",
+      }),
+    ).toBe(true);
+  });
+
+  it("uses manual entry for templated Bitwarden password collection IDs", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...bitwardenLogin,
+        collectionId: "{{ collection_id }}",
+      }),
+    ).toBe(true);
+  });
+
+  it("uses manual entry for templated Bitwarden credit-card IDs", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...creditCardCredential,
+        collectionId: "{{ collection_id }}",
+      }),
+    ).toBe(true);
   });
 });
