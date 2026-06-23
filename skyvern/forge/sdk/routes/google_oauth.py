@@ -60,9 +60,12 @@ async def google_oauth_authorize(
             organization_id=current_org.organization_id,
             redirect_uri=request.redirect_uri,
             credential_name=request.credential_name,
+            scope_profile=request.scope_profile,
             app_origin=request.app_origin,
         )
     except InvalidAppOriginError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except google_oauth_service.UnsupportedScopeProfileError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except google_oauth_service.InvalidRedirectURIError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
