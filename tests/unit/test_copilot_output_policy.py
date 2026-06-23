@@ -547,6 +547,65 @@ def test_rejects_reply_when_request_policy_required_clarification() -> None:
     assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
 
 
+def test_avoidable_output_field_confirmation_is_hard_blocked() -> None:
+    policy = _policy(
+        user_response_policy="proceed",
+        completion_contract_status="present",
+        completion_criteria=[
+            SimpleNamespace(id="record_identity", outcome="The returned record identifies the target record."),
+        ],
+    )
+
+    verdict = evaluate_output_policy(
+        request_policy=policy,
+        response_type="ASK_QUESTION",
+        user_response="Please confirm the output fields before I build this record status workflow.",
+        has_workflow_proposal=False,
+        workflow_attempted=False,
+    )
+    hard = hard_block_output_policy_verdict(verdict)
+
+    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION in verdict.reason_codes
+    assert hard.reason_codes == [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION]
+
+
+def test_output_field_confirmation_allowed_when_request_policy_requires_clarification() -> None:
+    policy = _policy(
+        user_response_policy="ask_clarification",
+        clarification_question="Which saved credential should I use?",
+        clarification_reason="credential_name_unresolved",
+        completion_contract_status="present",
+        completion_criteria=[
+            SimpleNamespace(id="record_identity", outcome="The returned record identifies the target record."),
+        ],
+    )
+
+    verdict = evaluate_output_policy(
+        request_policy=policy,
+        response_type="ASK_QUESTION",
+        user_response="Which saved credential should I use?",
+        has_workflow_proposal=False,
+        workflow_attempted=False,
+    )
+
+    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
+    assert verdict.allowed is True
+
+
+def test_url_clarification_does_not_trigger_output_field_confirmation_guard() -> None:
+    policy = _policy(user_response_policy="proceed", completion_contract_status="present")
+
+    verdict = evaluate_output_policy(
+        request_policy=policy,
+        response_type="ASK_QUESTION",
+        user_response="Which URL should I use for this workflow?",
+        has_workflow_proposal=False,
+        workflow_attempted=False,
+    )
+
+    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
+
+
 def test_classifies_unbacked_workflow_delivery_claim() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),

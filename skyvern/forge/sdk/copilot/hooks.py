@@ -143,7 +143,7 @@ class CopilotRunHooks(RunHooksBase):
             getattr(self._ctx, "latest_tool_blocker_signal", None) or getattr(self._ctx, "blocker_signal", None),
             source="hook",
         )
-        raise_if_turn_halt(self._ctx)
+        raise_if_turn_halt(self._ctx, verified=outcome_fully_verified(self._ctx))
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
             LOG.info(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
@@ -43,7 +44,6 @@ _CLASSIFIER_FAILURE_KINDS = {
     "timeout",
     "transient_error",
     "provider_error",
-    "retry_exhausted",
 }
 _CLASSIFICATION_RESPONSE_FIELDS = {
     "testing_intent",
@@ -144,6 +144,12 @@ _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "
 
 _MAX_COMPLETION_CRITERIA = 8
 _COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
+
+FALLBACK_FLOOR_CRITERION_ID_PREFIX = "__copilot_fallback_floor__"
+_FALLBACK_FLOOR_BASE_ID = f"{FALLBACK_FLOOR_CRITERION_ID_PREFIX}run"
+_FALLBACK_FLOOR_CREDENTIAL_ID = f"{FALLBACK_FLOOR_CRITERION_ID_PREFIX}credential"
+_FALLBACK_FLOOR_BASE_OUTCOME = "The workflow runs to its intended end state with the expected output."
+_FALLBACK_FLOOR_CREDENTIAL_OUTCOME = "The credentialed step authenticates and reaches the post-login state."
 
 CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
@@ -561,12 +567,40 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
     )
 
 
+def is_fallback_floor_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id.startswith(FALLBACK_FLOOR_CRITERION_ID_PREFIX)
+
+
+def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
+    floor = [
+        CompletionCriterion(
+            id=_FALLBACK_FLOOR_BASE_ID,
+            outcome=_FALLBACK_FLOOR_BASE_OUTCOME,
+            implicit=True,
+            method_mandated=True,
+            level="run",
+        )
+    ]
+    if ids:
+        floor.append(
+            CompletionCriterion(
+                id=_FALLBACK_FLOOR_CREDENTIAL_ID,
+                outcome=_FALLBACK_FLOOR_CREDENTIAL_OUTCOME,
+                implicit=True,
+                method_mandated=True,
+                level="run",
+            )
+        )
+    return floor[:_MAX_COMPLETION_CRITERIA]
+
+
 def _classifier_fallback_policy(
     ids: list[str],
     *,
     raw_secret_present: bool,
     failure_kind: str,
     retry_count: int = 0,
+    user_message: str = "",
 ) -> RequestPolicy:
     if failure_kind not in _CLASSIFIER_FAILURE_KINDS:
         failure_kind = "provider_error"
@@ -582,14 +616,79 @@ def _classifier_fallback_policy(
             classifier_retry_count=retry_count,
             completion_contract_status="unknown",
         )
+    fallback_criteria = _fallback_structured_record_completion_criteria(user_message)
+    if fallback_criteria:
+        LOG.info(
+            "copilot request policy synthesized fallback structured-record criteria",
+            classifier_failure_kind=failure_kind,
+            completion_criterion_ids=[criterion.id for criterion in fallback_criteria],
+        )
     return RequestPolicy(
         credential_input_kind="credential_id" if ids else "none",
         credential_refs=ids,
+        completion_criteria=fallback_criteria or build_classifier_fallback_floor(ids),
         classifier_status="fallback",
         classifier_failure_kind=failure_kind,
         classifier_retry_count=retry_count,
-        completion_contract_status="unknown",
+        completion_contract_status="present" if fallback_criteria else "unknown",
     )
+
+
+def _word_tokens(text: str) -> list[str]:
+    return "".join(char if char.isalnum() else " " for char in text.casefold()).split()
+
+
+def _fallback_structured_record_completion_criteria(user_message: str) -> list[CompletionCriterion]:
+    """Conservative structured-record criteria when the request-policy classifier is unavailable."""
+
+    words = _word_tokens(user_message)
+    if not words:
+        return []
+    haystack = f" {' '.join(words)} "
+
+    def _mentions(*terms: str) -> bool:
+        # Whole-word/phrase match so "id" can't fire on "consider" nor "name" on "filename".
+        return any(f" {' '.join(_word_tokens(term))} " in haystack for term in terms)
+
+    has_long_number = any(word.isdigit() and len(word) >= 6 for word in words)
+    if not _mentions("return", "record", "capture", "read", "extract"):
+        return []
+    if not _mentions("name", "entity", "person"):
+        return []
+    if not _mentions("identifier", "id", "number") and not has_long_number:
+        return []
+    if not _mentions("status"):
+        return []
+    if not _mentions("locations", "items", "rows", "groups", "entries", "per location", "per item", "per row"):
+        return []
+    return [
+        CompletionCriterion(
+            id="fallback_record_identity",
+            outcome="The returned record identifies the target entity.",
+            implicit=True,
+            level="run",
+        ),
+        CompletionCriterion(
+            id="fallback_record_identifier",
+            outcome="The returned record includes the requested identifier-like value.",
+            implicit=True,
+            level="run",
+        ),
+        CompletionCriterion(
+            id="fallback_record_groups",
+            outcome="The returned record includes the requested grouped row entries.",
+            implicit=True,
+            level="run",
+        ),
+        CompletionCriterion(
+            id="fallback_record_status",
+            outcome=(
+                "The returned record's per-row statuses and summary status are present and internally consistent."
+            ),
+            implicit=True,
+            level="run",
+        ),
+    ]
 
 
 def _explicit_code_block_credential_draft_requested(user_message: str) -> bool:
@@ -620,27 +719,28 @@ def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, us
 
 
 async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any | None, str, int]:
+    # Diverges from turn-intent on purpose: a retriable provider error (429/5xx) retries once
+    # within the budget, while a timeout is never retried (retrying cannot beat the budget).
+    deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
     retry_count = 0
-    last_failure_kind = "none"
-    for attempt in range(2):
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Only reachable after a retriable error consumed the budget before the retry ran.
+            return None, "transient_error", retry_count
         try:
             raw = await asyncio.wait_for(
                 handler(prompt=prompt, prompt_name=PROMPT_NAME),
-                timeout=settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS,
+                timeout=remaining,
             )
             return raw, "none", retry_count
         except asyncio.TimeoutError:
-            last_failure_kind = "timeout" if attempt == 0 else "retry_exhausted"
+            return None, "timeout", retry_count
         except Exception as exc:
-            if attempt == 0 and is_retriable_llm_error(exc):
-                last_failure_kind = "transient_error"
-            else:
-                failure_kind = "retry_exhausted" if retry_count and is_retriable_llm_error(exc) else "provider_error"
-                return None, failure_kind, retry_count
-        if attempt == 0:
-            retry_count += 1
-            continue
-    return None, last_failure_kind, retry_count
+            if retry_count == 0 and is_retriable_llm_error(exc):
+                retry_count += 1
+                continue
+            return None, "provider_error", retry_count
 
 
 async def _classify_request(
@@ -655,7 +755,12 @@ async def _classify_request(
     ids = _credential_ids(user_message)
     raw_secret_present = _raw_secret_detected(user_message)
     if raw_secret_present and handler is None:
-        return _classifier_fallback_policy(ids, raw_secret_present=True, failure_kind="raw_secret_no_handler")
+        return _classifier_fallback_policy(
+            ids,
+            raw_secret_present=True,
+            failure_kind="raw_secret_no_handler",
+            user_message=user_message,
+        )
     structural_reason = _structural_clarification_reason(user_message)
     if structural_reason != "none" and not raw_secret_present:
         return RequestPolicy(
@@ -665,7 +770,12 @@ async def _classify_request(
             clarification_reason=structural_reason,
         )
     if handler is None:
-        return _classifier_fallback_policy(ids, raw_secret_present=False, failure_kind="missing_handler")
+        return _classifier_fallback_policy(
+            ids,
+            raw_secret_present=False,
+            failure_kind="missing_handler",
+            user_message=user_message,
+        )
 
     # Raw-secret turns intentionally reach the classifier when available so it
     # can distinguish unsafe secret use from redacted draft/spec conversion.
@@ -692,6 +802,7 @@ async def _classify_request(
             raw_secret_present=raw_secret_present,
             failure_kind=failure_kind,
             retry_count=retry_count,
+            user_message=user_message,
         )
 
     raw_payload = _coerce_classifier_payload(raw)
@@ -702,6 +813,7 @@ async def _classify_request(
             raw_secret_present=raw_secret_present,
             failure_kind="provider_error",
             retry_count=retry_count,
+            user_message=user_message,
         )
 
     policy = _classification_from_raw(raw_payload)

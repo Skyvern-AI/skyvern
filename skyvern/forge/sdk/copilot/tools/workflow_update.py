@@ -19,16 +19,26 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
-from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CREDENTIAL_SCOUT_VERIFY_REPLY,
+    CopilotToolBlockerSignal,
+    clear_terminal_evidence_on_workflow_edit,
+    stash_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     author_time_code_block_diagnostics,
     sandbox_unresolved_name_diagnostics,
+    strip_redundant_sandbox_imports,
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _BARE_TAG_RE,
     _SYNTHESIZED_BLOCK_LABEL,
     SynthesisDiagnostics,
+    _get_by_role_expr_strict,
+    _is_positional_selector,
+    _parse_role_name,
     artifact_dependency_id,
     artifact_observation_ref_id,
     synthesize_code_block,
@@ -42,11 +52,16 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
+    MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
     POST_INTERMEDIATE_SUCCESS_NUDGE,
     _completion_contract_unknown_due_to_policy_fallback,
     _goal_likely_needs_more_blocks,
+    code_authoring_churn_stop_signal,
+    credential_priority_authoring_churn_stop_signal,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
+from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
@@ -63,6 +78,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_halt import blocker_signal_is_genuinely_terminal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
@@ -790,6 +806,70 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
     return errors
 
 
+def _human_facing_code_safety_errors(errors: list[str | CodeBlockSecurityError]) -> list[str | CodeBlockSecurityError]:
+    preflight_reason_codes = {
+        reason_code for error in errors if (reason_code := _generated_code_preflight_reason_code(error)) is not None
+    }
+    if not preflight_reason_codes:
+        return errors
+    return [
+        error
+        for error in errors
+        if not isinstance(error, CodeBlockSecurityError) or error.reason_code not in preflight_reason_codes
+    ]
+
+
+def _generated_code_preflight_reason_code(error: str | CodeBlockSecurityError) -> str | None:
+    if isinstance(error, CodeBlockSecurityError):
+        return None
+    marker = "failed the generated-code preflight check: "
+    if marker not in error:
+        return None
+    detail = error.split(marker, 1)[1]
+    reason_code = detail.split(":", 1)[0]
+    if not reason_code.startswith("AUTHOR_PAGE_"):
+        return None
+    return reason_code
+
+
+_CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
+
+
+def _record_code_authoring_guardrail_reject(ctx: AgentContext, *, defer_churn_stop: bool = False) -> None:
+    ctx.code_authoring_guardrail_reject_count += 1
+    ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
+    LOG.info(
+        "copilot code-authoring guardrail reject recorded",
+        reject_count=ctx.code_authoring_guardrail_reject_count,
+        credential_priority=defer_churn_stop,
+    )
+    if defer_churn_stop:
+        if ctx.code_authoring_guardrail_reject_count < MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS:
+            return
+        signal: CopilotToolBlockerSignal = credential_priority_authoring_churn_stop_signal(ctx)
+    elif ctx.code_authoring_guardrail_reject_count < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
+        return
+    else:
+        signal = code_authoring_churn_stop_signal(ctx)
+    # A genuinely-terminal held blocker keeps both the rendered reply and the
+    # halt kind, so the churn stop defers to it rather than overriding.
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    stash_blocker_signal(ctx, signal)
+    ctx.blocker_signal = signal
+
+
+def _signal_is_churn(signal: CopilotToolBlockerSignal | None) -> bool:
+    return signal is not None and signal.internal_reason_code in _CHURN_REASON_CODES
+
+
+def _clear_held_churn_signals(ctx: AgentContext) -> None:
+    if _signal_is_churn(ctx.blocker_signal):
+        ctx.blocker_signal = None
+    if _signal_is_churn(ctx.latest_tool_blocker_signal):
+        ctx.latest_tool_blocker_signal = None
+
+
 def _code_block_parameter_keys(block: Mapping[str, Any]) -> frozenset[str]:
     raw_keys = block.get("parameter_keys")
     keys = {key for key in raw_keys if isinstance(key, str) and key} if isinstance(raw_keys, list) else set()
@@ -936,6 +1016,14 @@ def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
     except RecursionError:
         return "Workflow YAML nesting is too deep to validate."
     return "\n".join(errors) if errors else None
+
+
+def _code_repair_progress_data() -> dict[str, str]:
+    """Tag a code-authoring reject so the streaming adapter renders it as quiet de-duplicated progress."""
+    return {
+        "surface_kind": CODE_REPAIR_PROGRESS_SURFACE_KIND,
+        "progress_text": CODE_REPAIR_PROGRESS_TEXT,
+    }
 
 
 def _code_seam_rejection_user_summary(*, metadata_rejected: bool, code_rejected: bool) -> str:
@@ -1113,6 +1201,122 @@ def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: Syn
         and str(dropped.get("selector") or "").strip() in {"button", "role=button"}
         and bool(diagnostics.locator_provenance)
     )
+
+
+def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> bool:
+    source = provenance.get("source")
+    if source == "selector":
+        return provenance.get("selector") == provenance.get("emitted_literal")
+    if source == "aria_role_name":
+        role = str(provenance.get("role") or "")
+        name = str(provenance.get("name") or "")
+        return bool(role) and bool(name) and _get_by_role_expr_strict(role, name) == provenance.get("emitted_literal")
+    return False
+
+
+_IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
+_FILTERING_PSEUDO_CLASSES = (
+    ":visible",
+    ":enabled",
+    ":disabled",
+    ":checked",
+    ":not(",
+    ":has(",
+    ":has-text(",
+    ":text(",
+    ":is(",
+)
+
+
+def _qualifier_narrows_to_identity(qualifier: str) -> bool:
+    if not qualifier or qualifier[0] not in _IDENTITY_QUALIFIER_BOUNDARY:
+        return False
+    if any(pseudo in qualifier for pseudo in _FILTERING_PSEUDO_CLASSES):
+        return False
+    bracket_depth = 0
+    quote: str | None = None
+    for char in qualifier:
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif bracket_depth == 0 and (char.isspace() or char in ">+~"):
+            return False
+    return True
+
+
+def _selector_refines(bare: str, candidate: str) -> bool:
+    bare = bare.strip()
+    candidate = candidate.strip()
+    if not bare or not candidate or bare == candidate:
+        return False
+
+    bare_role = _parse_role_name(bare)
+    candidate_role = _parse_role_name(candidate)
+    if bare_role is not None or candidate_role is not None:
+        if bare_role is None or candidate_role is None:
+            return False
+        bare_role_name, bare_name, bare_suffix = bare_role
+        candidate_role_name, candidate_name, candidate_suffix = candidate_role
+        return (
+            bare_role_name == candidate_role_name
+            and not bare_name
+            and not bare_suffix
+            and bool(candidate_name)
+            and not candidate_suffix
+        )
+
+    if not _BARE_TAG_RE.match(bare):
+        return False
+    if not candidate.startswith(bare) or _is_positional_selector(candidate):
+        return False
+    return _qualifier_narrows_to_identity(candidate[len(bare) :])
+
+
+def _bare_drop_superseded_on_screen(
+    dropped: Mapping[str, Any],
+    scout_trajectory: list[ScoutedInteraction],
+    *,
+    claimed_refiner_indices: set[int],
+) -> tuple[bool, dict[str, Any] | None]:
+    if dropped.get("reason_code") != "ambiguous_bare_selector" or dropped.get("tool_name") != "click":
+        return False, None
+    dropped_selector = str(dropped.get("selector") or "").strip()
+    if not dropped_selector:
+        return False, None
+
+    dropped_index = dropped.get("trajectory_index")
+    if not isinstance(dropped_index, int) or dropped_index < 0 or dropped_index >= len(scout_trajectory):
+        return False, None
+    source_url = str(scout_trajectory[dropped_index].get("source_url") or "").strip()
+    if not source_url:
+        return False, None
+
+    for refiner_index in range(dropped_index + 1, len(scout_trajectory)):
+        if refiner_index in claimed_refiner_indices:
+            continue
+        later = scout_trajectory[refiner_index]
+        if later.get("tool_name") != "click":
+            continue
+        if str(later.get("source_url") or "").strip() != source_url:
+            continue
+        later_selector = str(later.get("selector") or "").strip()
+        if not _selector_refines(dropped_selector, later_selector):
+            continue
+        claimed_refiner_indices.add(refiner_index)
+        return True, {
+            "dropped_index": dropped_index,
+            "dropped_selector": dropped_selector,
+            "refiner_index": refiner_index,
+            "refiner_selector": later_selector,
+            "source_url": source_url,
+        }
+    return False, None
 
 
 def _submitted_suffix_after_synthesized_code(submitted_code: str, synthesized_code: str) -> str:
@@ -1532,6 +1736,27 @@ def _allocate_promoted_parameter_key(
         while candidate in reserved_keys:
             candidate = f"{base}_{suffix}"
             suffix += 1
+
+
+def _strip_redundant_sandbox_imports_in_yaml(workflow_yaml: str) -> tuple[str, list[str]]:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml, []
+    stripped_modules: list[str] = []
+    any_change = False
+    for block in _workflow_code_blocks(parsed):
+        code = block.get("code")
+        if not isinstance(code, str) or not code.strip():
+            continue
+        sanitized, modules = strip_redundant_sandbox_imports(code)
+        if sanitized == code:
+            continue
+        block["code"] = sanitized
+        stripped_modules.extend(modules)
+        any_change = True
+    if not any_change:
+        return workflow_yaml, []
+    return yaml.safe_dump(parsed, sort_keys=False), stripped_modules
 
 
 def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContext) -> tuple[str, list[str]]:
@@ -2083,8 +2308,17 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     violations: list[str] = []
     if diagnostics.truncated:
         violations.append("Unable to impose synthesized code block: scout trajectory was truncated.")
+    claimed_refiner_indices: set[int] = set()
+    forgiven_superseded_bare_drops: list[dict[str, Any]] = []
     for dropped in diagnostics.dropped_interactions:
         if _is_ignorable_entry_opener_drop(dropped, diagnostics):
+            continue
+        forgiven, refiner_record = _bare_drop_superseded_on_screen(
+            dropped, scout_trajectory, claimed_refiner_indices=claimed_refiner_indices
+        )
+        if forgiven and refiner_record is not None:
+            forgiven_superseded_bare_drops.append(refiner_record)
+            LOG.info("copilot_imposition_forgave_superseded_bare_drop", **refiner_record)
             continue
         reason = str(dropped.get("reason_code") or "unknown")
         tool_name = str(dropped.get("tool_name") or "unknown")
@@ -2093,7 +2327,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             f"Unable to impose synthesized code block: dropped scout interaction {index} from `{tool_name}` ({reason})."
         )
     for provenance in diagnostics.locator_provenance:
-        if provenance.get("source") != "selector" or provenance.get("selector") != provenance.get("emitted_literal"):
+        if not _locator_provenance_is_self_validating(provenance):
             violations.append("Unable to impose synthesized code block: locator provenance was not byte-equal.")
             break
 
@@ -2143,6 +2377,8 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         substitutions["preserved_extraction_suffix"] = True
     if preserve_submitted_extraction:
         substitutions["preserved_submitted_extraction_code"] = True
+    if forgiven_superseded_bare_drops:
+        substitutions["forgiven_superseded_bare_drops"] = forgiven_superseded_bare_drops
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
         substitutions=substitutions,
@@ -2941,6 +3177,7 @@ async def _update_workflow(
             "ok": False,
             "error": raw_conflict_marker_error,
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     # Tool wrappers run authority/loop guards before calling here. The composition
     # gate below consumes these refs, so they must be visible before validation.
@@ -2954,14 +3191,19 @@ async def _update_workflow(
             "ok": False,
             "error": "\n".join(imposition.violations),
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     workflow_yaml = imposition.workflow_yaml
+    stripped_sandbox_imports: list[str] = []
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        workflow_yaml, stripped_sandbox_imports = _strip_redundant_sandbox_imports_in_yaml(workflow_yaml)
     workflow_yaml, typed_default_violations = _apply_scouted_typed_default_promotions(workflow_yaml, ctx)
     if typed_default_violations:
         return {
             "ok": False,
             "error": "\n".join(typed_default_violations),
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     params["workflow_yaml"] = workflow_yaml
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
@@ -2970,6 +3212,7 @@ async def _update_workflow(
             "ok": False,
             "error": parameter_contract_error,
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     missing_metadata_error = _missing_code_artifact_metadata_error(
         workflow_yaml,
@@ -2981,6 +3224,7 @@ async def _update_workflow(
             "ok": False,
             "error": missing_metadata_error,
             "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
         }
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     normalization = _normalize_code_artifact_metadata_detailed(
@@ -2995,6 +3239,14 @@ async def _update_workflow(
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
+    credential_scout_errors = (
+        []
+        if _request_policy_allows_untested_code_block_draft(ctx)
+        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    )
+    credential_priority_reject = bool(credential_scout_errors) and code_artifact_metadata_error is None
+    if code_safety_errors:
+        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=credential_priority_reject)
     # Per-label salvage keeps conforming metadata across a rejection; a
     # rejected code block keeps nothing, since its yaml never becomes the
     # draft. Prior-draft labels survive every rejection gate below — the
@@ -3012,24 +3264,24 @@ async def _update_workflow(
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
         params["code_artifact_metadata"] = merged_metadata
-    credential_scout_errors = (
-        []
-        if _request_policy_allows_untested_code_block_draft(ctx)
-        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
-    )
     if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
         return {
             "ok": False,
             "error": "\n".join(credential_scout_errors),
-            "user_facing_summary": (
-                "I need to verify the saved-credential login in the browser before I can save or run this code."
-            ),
+            "user_facing_summary": CREDENTIAL_SCOUT_VERIFY_REPLY,
             "data": {
                 "failure_type": "missing_credential_or_init",
                 "diagnostic_code_safety_errors": code_safety_errors,
             },
         }
-    seam_errors = [error for error in (code_artifact_metadata_error, *code_safety_errors) if error]
+    seam_errors = [
+        error
+        for error in (
+            code_artifact_metadata_error,
+            *_human_facing_code_safety_errors(code_safety_errors),
+        )
+        if error
+    ]
     if seam_errors:
         return {
             "ok": False,
@@ -3038,14 +3290,14 @@ async def _update_workflow(
                 metadata_rejected=code_artifact_metadata_error is not None,
                 code_rejected=bool(code_safety_errors),
             ),
+            "data": _code_repair_progress_data(),
         }
     if credential_scout_errors:
+        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
         return {
             "ok": False,
             "error": "\n".join(credential_scout_errors),
-            "user_facing_summary": (
-                "I need to verify the saved-credential login in the browser before I can save or run this code."
-            ),
+            "user_facing_summary": CREDENTIAL_SCOUT_VERIFY_REPLY,
             "data": {"failure_type": "missing_credential_or_init"},
         }
     if allow_missing_credentials is None:
@@ -3191,6 +3443,9 @@ async def _update_workflow(
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
+        ctx.code_authoring_guardrail_reject_count = 0
+        ctx.last_code_authoring_reject_was_credential_priority = False
+        _clear_held_churn_signals(ctx)
         accepted_metadata = getattr(ctx, "code_artifact_metadata", None)
         if isinstance(accepted_metadata, dict) and accepted_metadata:
             accepted_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
@@ -3214,16 +3469,25 @@ async def _update_workflow(
         }
         if imposition.substitutions is not None:
             data["imposed_substitutions"] = imposition.substitutions
+        if stripped_sandbox_imports:
+            data["stripped_redundant_imports"] = stripped_sandbox_imports
         return {
             "ok": True,
             "data": data,
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
-        return {
+        result: dict[str, Any] = {
             "ok": False,
             "error": f"Workflow validation failed: {e}",
         }
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            result["data"] = _code_repair_progress_data()
+            result["user_facing_summary"] = _code_seam_rejection_user_summary(
+                metadata_rejected=False,
+                code_rejected=True,
+            )
+        return result
 
 
 def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:

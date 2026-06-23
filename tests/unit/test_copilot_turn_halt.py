@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHaltKind,
     raise_if_turn_halt,
+    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
     turn_halt_from_blocker_signal,
 )
@@ -52,6 +53,10 @@ def _signal(
     [
         (
             _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step"),
+            TurnHaltKind.LOOP_DETECTED,
+        ),
+        (
+            _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn"),
             TurnHaltKind.LOOP_DETECTED,
         ),
         (
@@ -91,7 +96,13 @@ def test_stash_and_raise_turn_halt_sets_context_once() -> None:
 
 
 def test_enforcement_backstop_converts_existing_terminal_blocker_signal() -> None:
-    ctx = SimpleNamespace(turn_halt=None, latest_tool_blocker_signal=None, blocker_signal=None)
+    ctx = SimpleNamespace(
+        turn_halt=None,
+        latest_tool_blocker_signal=None,
+        blocker_signal=None,
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+    )
     signal = _signal()
     stash_blocker_signal(ctx, signal)
 
@@ -302,3 +313,149 @@ def test_current_page_challenge_signal_defers_to_populated_result_container_evid
     )
 
     assert signal is None
+
+
+def _involuntary_repair_ceiling_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="repair ceiling",
+        user_facing_reason="I could not get the run to pass after several repair attempts.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="repair_ceiling_reached",
+        blocked_tool="update_and_run_blocks",
+        extra={},
+    )
+
+
+def _consume_ctx(
+    *,
+    turn_halt: object = None,
+    blocker_signal: CopilotToolBlockerSignal | None = None,
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None,
+    tool_blocker_signals: list[CopilotToolBlockerSignal] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        turn_halt=turn_halt,
+        blocker_signal=blocker_signal,
+        latest_tool_blocker_signal=latest_tool_blocker_signal,
+        tool_blocker_signals=tool_blocker_signals if tool_blocker_signals is not None else [],
+    )
+
+
+def test_verified_outcome_suppresses_and_consumes_involuntary_halt() -> None:
+    signal = _involuntary_repair_ceiling_signal()
+    halt = stash_repair_ceiling_turn_halt(SimpleNamespace(turn_halt=None), signal, consecutive_identical_repair_count=3)
+    ctx = _consume_ctx(
+        turn_halt=halt,
+        blocker_signal=signal,
+        latest_tool_blocker_signal=signal,
+        tool_blocker_signals=[signal],
+    )
+
+    raise_if_turn_halt(ctx, verified=True)
+
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+    assert ctx.latest_tool_blocker_signal is None
+    assert ctx.tool_blocker_signals == []
+
+
+def test_verified_outcome_consumes_loop_blocker_signal() -> None:
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    ctx = _consume_ctx(blocker_signal=signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="hook")
+
+    raise_if_turn_halt(ctx, verified=True)
+
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+
+
+def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:
+    signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    ctx = _consume_ctx(blocker_signal=signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="hook")
+
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx, verified=True)
+
+    assert ctx.turn_halt is not None
+    assert ctx.blocker_signal is signal
+
+
+def test_verified_outcome_does_not_clear_voluntary_blocker_when_involuntary_absent() -> None:
+    challenge_signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    loop_halt = stash_turn_halt_from_blocker_signal(
+        SimpleNamespace(turn_halt=None),
+        _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step"),
+        source="hook",
+    )
+    ctx = _consume_ctx(
+        turn_halt=loop_halt,
+        blocker_signal=challenge_signal,
+        latest_tool_blocker_signal=challenge_signal,
+        tool_blocker_signals=[challenge_signal],
+    )
+
+    raise_if_turn_halt(ctx, verified=True)
+
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is challenge_signal
+    assert ctx.latest_tool_blocker_signal is challenge_signal
+    assert ctx.tool_blocker_signals == [challenge_signal]
+
+
+def test_verified_outcome_consumes_involuntary_tool_blocker_history() -> None:
+    involuntary = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    voluntary = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    ctx = _consume_ctx(blocker_signal=involuntary)
+    ctx.latest_tool_blocker_signal = involuntary
+    ctx.tool_blocker_signals = [voluntary, involuntary]
+    stash_turn_halt_from_blocker_signal(ctx, involuntary, source="hook")
+
+    raise_if_turn_halt(ctx, verified=True)
+
+    assert ctx.latest_tool_blocker_signal is None
+    assert ctx.tool_blocker_signals == [voluntary]
+
+
+def test_involuntary_suppression_lets_later_voluntary_challenge_raise() -> None:
+    signal = _involuntary_repair_ceiling_signal()
+    ctx = _consume_ctx(blocker_signal=signal)
+    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+    raise_if_turn_halt(ctx, verified=True)
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+
+    challenge_signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    ctx.blocker_signal = challenge_signal
+    stash_turn_halt_from_blocker_signal(ctx, challenge_signal, source="hook")
+
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx, verified=True)
+    assert ctx.blocker_signal is challenge_signal
+
+
+def test_unverified_involuntary_halt_still_raises() -> None:
+    signal = _involuntary_repair_ceiling_signal()
+    ctx = _consume_ctx(blocker_signal=signal)
+    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx, verified=False)
+
+    assert ctx.turn_halt is not None
+    assert ctx.blocker_signal is signal
+
+
+def test_default_verified_argument_is_fail_safe_and_raises() -> None:
+    signal = _involuntary_repair_ceiling_signal()
+    ctx = _consume_ctx(blocker_signal=signal)
+    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx)

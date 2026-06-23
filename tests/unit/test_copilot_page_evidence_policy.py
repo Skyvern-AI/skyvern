@@ -84,6 +84,14 @@ def test_agent_prompt_requires_result_page_evidence_before_expansion_blocks() ->
     assert "omit the expansion block and proceed to extraction from the visible results" in rendered
 
 
+def test_agent_prompt_requires_details_evidence_label() -> None:
+    rendered = _render_agent_prompt()
+
+    assert "details or profile page" in rendered
+    assert "visible details/profile page label" in rendered
+    assert "page label only as supporting evidence" in rendered
+
+
 def test_tool_descriptions_ground_composition_without_prescribing_extra_workflow_blocks() -> None:
     for tool in (update_workflow_tool, run_blocks_tool, update_and_run_blocks_tool):
         desc = tool.description  # type: ignore[attr-defined]

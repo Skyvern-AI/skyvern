@@ -75,6 +75,15 @@ def test_narration_activity_shape() -> None:
     assert "toolName" not in entry
 
 
+def test_emitted_progress_texts_is_a_fresh_per_state_set() -> None:
+    # NarratorState is born and dies with one turn's CopilotContext, so the
+    # set is per-turn by construction (no cross-turn leakage between states).
+    first = NarratorState()
+    first.emitted_progress_texts.add("Refining the workflow's code")
+    second = NarratorState()
+    assert second.emitted_progress_texts == set()
+
+
 def test_record_activity_routes_to_design_when_no_block_running() -> None:
     state = NarratorState()
     state.record_activity(build_tool_call_activity("update_workflow", 0, "c1"))

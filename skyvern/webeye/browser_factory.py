@@ -219,7 +219,7 @@ def set_download_file_listener(
                 if not file_path.exists():
                     # On an adopted persistent session the bytes live on the run connection, not
                     # this worker connection; saving is the run side's job, so skip rather than crash.
-                    LOG.warning(
+                    LOG.debug(
                         "Download artifact absent on this connection; skipping worker-side rename",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,

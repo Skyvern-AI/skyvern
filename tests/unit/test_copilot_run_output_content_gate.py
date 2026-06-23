@@ -24,7 +24,39 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
 )
+from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
+from skyvern.forge.sdk.copilot.tools.run_execution import _attach_registered_output_parameter_values
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (
+            {
+                "registered_output_parameter_values": [
+                    {"workflow_run_id": "wr_prior", "value": {"x": 1}},
+                    {"value": {"y": 2}},
+                ]
+            },
+            [],
+        ),
+        (
+            {
+                "workflow_run_id": "wr_now",
+                "registered_output_parameter_values": [
+                    {"workflow_run_id": "wr_now", "value": {"x": 1}},
+                    {"workflow_run_id": "wr_prior", "value": {"y": 2}},
+                ],
+            },
+            [{"x": 1}],
+        ),
+    ],
+)
+def test_registered_output_parameter_payloads_scope_to_current_run(
+    data: dict[str, Any], expected: list[dict[str, int]]
+) -> None:
+    assert [dict(p["value"]) for p in _registered_output_parameter_payloads(data)] == expected
 
 
 def _code_block(label: str, extracted: Any, *, block_type: str = "CODE") -> dict[str, Any]:
@@ -41,6 +73,21 @@ def _run_result(blocks: list[dict[str, Any]], *, ok: bool = True) -> dict[str, A
             "blocks": blocks,
         },
     }
+
+
+def _structured_record_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "entity_found": True,
+        "entity_name": "Jordan Example",
+        "record_number": "1234567890",
+        "items": [
+            {"item_label": "Sample Practice", "address": "100 Main St, Example City, ST 12345", "status": "Active"}
+        ],
+        "overall_status": "Active",
+        "evidence_text": "Opened Details page",
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
@@ -67,6 +114,17 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
 def _no_evidence(cid: str) -> CompletionVerificationResult:
     verdict = CriterionVerdict(criterion_id=cid, state="unsatisfied", reason_code="no_evidence")
     return CompletionVerificationResult(status="evaluated", criterion_ids=[cid], verdicts=[verdict])
+
+
+def _satisfied(*criterion_ids: str) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=list(criterion_ids),
+        verdicts=[
+            CriterionVerdict(criterion_id=criterion_id, state="satisfied", reason_code="evidence_confirms")
+            for criterion_id in criterion_ids
+        ],
+    )
 
 
 def _blocked_flag_run_result() -> dict[str, Any]:
@@ -166,6 +224,80 @@ def _goal_field_success_run_result() -> dict[str, Any]:
             )
         ]
     )
+
+
+def _nested_code_output_extraction_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "extract_record_status_info",
+                {
+                    "extract_record_status_info_output": _structured_record_payload(),
+                    "extracted_information": [],
+                },
+                block_type="EXTRACTION",
+            )
+        ]
+    )
+
+
+def _empty_extraction_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "extract_empty_results",
+                {"extracted_information": [], "downloaded_files": [], "downloaded_file_urls": None},
+                block_type="EXTRACTION",
+            )
+        ]
+    )
+
+
+def _registered_code_output_parameter_run_result(*, workflow_run_id: str = "wr_test") -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_test",
+            "overall_status": "completed",
+            "blocks": [],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": workflow_run_id,
+                    "output_parameter_id": "op_details",
+                    "output_parameter_key": "extract_record_status_details_output",
+                    "block_label": "extract_record_status_details",
+                    "block_type": "CODE",
+                    "value": _structured_record_payload(),
+                }
+            ],
+        },
+    }
+
+
+def _structured_record_qa_top_level_output_run_result() -> dict[str, Any]:
+    result = _run_result(
+        [
+            _code_block(
+                "extract_record_status_record",
+                {"extracted_information": []},
+            )
+        ]
+    )
+    result["data"]["output"] = {
+        "open_search_search_output": {
+            "page_state": "search_search_open",
+            "evidence_text": "Opened search search page with search-by-doctor typeahead #searchInput.",
+        },
+        "search_and_open_record_details_output": {
+            "found": True,
+            "entity_name": "Jordan Example",
+            "opened_record_details": True,
+            "evidence_text": "Opened Details page for the selected record.",
+        },
+        "extract_record_status_record_output": _structured_record_payload(found=True, entity_found=None),
+        "extracted_information": [],
+    }
+    return result
 
 
 def _partial_goal_field_run_result() -> dict[str, Any]:
@@ -333,6 +465,133 @@ def test_genuine_success_run_keeps_clean_path() -> None:
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
+
+
+def test_nested_code_output_record_is_meaningful_and_not_suspicious_when_verified() -> None:
+    result = _nested_code_output_extraction_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+    _record_run_blocks_result(
+        ctx,
+        result,
+        completion_verification=_satisfied("fallback_record_identity", "fallback_record_identifier"),
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True
+    assert verified_goal_satisfied_context(ctx) is True
+
+
+def test_registered_code_output_parameter_record_is_meaningful() -> None:
+    result = _registered_code_output_parameter_run_result()
+    ctx = _ctx([])
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+
+    assert empty_data_blocks is False
+
+
+def test_registered_code_output_parameter_record_is_current_run_scoped() -> None:
+    result = _empty_extraction_run_result()
+    result["data"]["registered_output_parameter_values"] = _registered_code_output_parameter_run_result(
+        workflow_run_id="wr_prior"
+    )["data"]["registered_output_parameter_values"]
+    ctx = _ctx(result["data"]["blocks"])
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+
+    assert empty_data_blocks is True
+
+
+def test_structured_record_top_level_output_record_is_meaningful() -> None:
+    result = _structured_record_qa_top_level_output_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
+@pytest.mark.asyncio
+async def test_registered_output_adapter_fetches_db_values_and_synthesizes_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.copilot.tools import run_execution
+
+    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
+        assert workflow_run_id == "wr_test"
+        return [
+            SimpleNamespace(
+                workflow_run_id="wr_test",
+                output_parameter_id="op_details",
+                value={
+                    "entity_name": "Jordan Example",
+                    "record_number": "1234567890",
+                    "evidence_text": "Opened Details page",
+                },
+            )
+        ]
+
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
+    )
+    workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(
+                    label="extract_record_status_details",
+                    block_type="CODE",
+                    output_parameter=SimpleNamespace(
+                        output_parameter_id="op_details",
+                        key="extract_record_status_details_output",
+                    ),
+                )
+            ]
+        )
+    )
+    data: dict[str, Any] = {"workflow_run_id": "wr_test", "blocks": []}
+
+    by_label = await _attach_registered_output_parameter_values(
+        workflow_run_id="wr_test",
+        workflow=workflow,  # type: ignore[arg-type]
+        data=data,
+    )
+
+    assert by_label == {
+        "extract_record_status_details": {
+            "extract_record_status_details_output": {
+                "entity_name": "Jordan Example",
+                "record_number": "1234567890",
+                "evidence_text": "Opened Details page",
+            }
+        }
+    }
+    assert data["registered_output_parameter_values"][0]["value"]["record_number"] == "1234567890"
+    assert data["blocks"][0]["label"] == "extract_record_status_details"
+    assert data["blocks"][0]["extracted_data"]["extract_record_status_details_output"]["record_number"] == "1234567890"
+
+
+def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None:
+    result = _empty_extraction_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is True
+
+    _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+    assert verified_goal_satisfied_context(ctx) is True
 
 
 def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
