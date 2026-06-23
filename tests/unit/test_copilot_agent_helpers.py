@@ -140,72 +140,6 @@ class TestFailedTestResponseNormalization:
         assert "test failed" in rewritten.lower()
         assert "Call log:" not in rewritten
 
-    def test_pre_run_coverage_guard_uses_completion_contract(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Go to https://the-internet.herokuapp.com/download and then download the first file.",
-            request_policy=SimpleNamespace(completion_contract="complete when the download starts"),
-            last_update_block_count=1,
-            coverage_nudge_count=0,
-        )
-
-        error = _pre_run_workflow_coverage_error(ctx)
-
-        assert error is not None
-        assert "has not been run" in error
-        assert ctx.coverage_nudge_count == 1
-
-    def test_pre_run_coverage_guard_skips_unknown_completion_contract(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Go to https://example.com/contact. Fill out the contact form and submit it.",
-            request_policy=SimpleNamespace(completion_contract_status="unknown"),
-            last_update_block_count=1,
-            coverage_nudge_count=0,
-        )
-
-        assert _pre_run_workflow_coverage_error(ctx) is None
-        assert ctx.coverage_nudge_count == 0
-
-    def test_pre_run_coverage_guard_allows_single_final_action_contract(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Click Delete. Your goal is complete when the Delete button disappears.",
-            request_policy=SimpleNamespace(completion_contract="complete when the Delete button disappears"),
-            last_update_block_count=1,
-            coverage_nudge_count=0,
-        )
-
-        assert _pre_run_workflow_coverage_error(ctx) is None
-        assert ctx.coverage_nudge_count == 0
-
-    def test_pre_run_coverage_guard_allows_single_goto_bootstrap(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Go to example.com, fill the search form, and extract the results.",
-            request_policy=SimpleNamespace(completion_contract="complete when result rows are extracted"),
-            last_update_block_count=1,
-            last_workflow=SimpleNamespace(
-                workflow_definition={
-                    "blocks": [
-                        {
-                            "label": "open_search_page",
-                            "block_type": "goto_url",
-                            "url": "https://example.com/search",
-                        }
-                    ]
-                }
-            ),
-            coverage_nudge_count=0,
-        )
-
-        assert _pre_run_workflow_coverage_error(ctx) is None
-        assert ctx.coverage_nudge_count == 0
-
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
 
@@ -1531,7 +1465,7 @@ workflow_definition:
       label: submit
       navigation_goal: Submit the contact form.
 """
-        captured: dict[str, str] = {}
+        captured: dict[str, str | bool] = {}
 
         async def fake_update_workflow(payload, ctx, allow_missing_credentials=False):
             captured["workflow_yaml"] = payload["workflow_yaml"]
@@ -1545,6 +1479,7 @@ workflow_definition:
             return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
 
         async def fake_run_blocks(params, ctx, **kwargs):
+            captured["run_called"] = True
             return {
                 "ok": True,
                 "data": {
@@ -1559,15 +1494,15 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
         monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit"))
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
 
         ctx = _ctx(
-            user_message="Submit a contact form.",
+            user_message="Go to https://the-internet.herokuapp.com/download and then download the first file.",
             block_goal_main_goal="Submit a contact form.",
+            request_policy=RequestPolicy(completion_contract="complete when the download starts"),
         )
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
@@ -1576,6 +1511,8 @@ workflow_definition:
 
         assert json.loads(result)["ok"] is True
         assert captured["workflow_yaml"] == clean_yaml
+        assert captured["run_called"] is True
+        assert ctx.coverage_nudge_count == 0
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 
@@ -1844,15 +1781,10 @@ workflow_definition:
         assert agent_result.workflow_yaml is None
 
     def test_inline_replace_with_invalid_yaml_keeps_prior_pass(self, monkeypatch) -> None:
-        # _process_workflow_yaml raising on a malformed REPLACE must leave
-        # ctx untouched — no spurious last_test_ok reset, no workflow swap —
-        # so a prior tested workflow remains available.
-        import yaml as yaml_mod
-
         tested_wf = SimpleNamespace(name="tested")
 
         def boom(**kwargs):
-            raise yaml_mod.YAMLError("mangled yaml")
+            raise yaml.YAMLError("mangled yaml")
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", boom)
 
@@ -4619,7 +4551,6 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
         monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["login"], {}, "login"))
         monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
         monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
