@@ -274,10 +274,13 @@ async def scrape_website(
         )
 
 
-async def get_frame_text(iframe: Frame) -> str:
+async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None = None) -> str:
     """
     Get all the visible text in the iframe.
     :param iframe: Frame instance to get the text from.
+    :param scrape_exclude: Optional ``filter_frames``-style predicate; True
+        means skip. The top-level caller must pass a starting frame the
+        predicate would not itself exclude.
     :return: All the visible text from the iframe.
     """
     js_script = "() => document.body.innerText"
@@ -297,6 +300,10 @@ async def get_frame_text(iframe: Frame) -> str:
         if child_frame.is_detached():
             continue
 
+        # Skip excluded frames before any CDP probe.
+        if scrape_exclude is not None and await scrape_exclude(child_frame.page, child_frame):
+            continue
+
         try:
             child_frame_element = await child_frame.frame_element()
         except Exception:
@@ -310,7 +317,7 @@ async def get_frame_text(iframe: Frame) -> str:
         if not await child_frame_element.is_visible():
             continue
 
-        text += await get_frame_text(child_frame)
+        text += await get_frame_text(child_frame, scrape_exclude)
 
     return text
 
@@ -505,7 +512,7 @@ async def scrape_web_unsafe(
     if not elements and not support_empty_page:
         raise NoElementFound()
 
-    text_content = await get_frame_text(page.main_frame)
+    text_content = await get_frame_text(page.main_frame, scrape_exclude)
 
     html = ""
     window_dimension = None
