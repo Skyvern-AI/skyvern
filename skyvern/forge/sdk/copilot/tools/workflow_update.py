@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
@@ -3376,6 +3377,9 @@ async def _update_workflow(
             target_url=workflow_target_url(workflow_yaml),
         )
         return {"ok": False, "error": composition_evidence_error}
+
+    # New data-write blocks default to surfacing failures rather than swallowing them.
+    workflow_yaml = default_data_write_continue_on_failure(workflow_yaml, ctx.workflow_yaml)
 
     try:
         # A code block renders code-first (goal + plain step timeline) only when it

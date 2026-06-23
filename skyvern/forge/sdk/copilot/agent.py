@@ -73,6 +73,7 @@ from skyvern.forge.sdk.copilot.context import (
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     artifact_health_blocked,
     outcome_fully_verified,
@@ -2433,6 +2434,10 @@ async def _translate_to_agent_result(
                 ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
+            # Inline REPLACE_WORKFLOW bypasses the update_workflow tool, so apply the same default here.
+            workflow_yaml = default_data_write_continue_on_failure(
+                workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml
+            )
             try:
                 last_workflow = _process_workflow_yaml(
                     workflow_id=chat_request.workflow_id,
