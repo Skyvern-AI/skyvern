@@ -145,6 +145,12 @@ _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "
 _MAX_COMPLETION_CRITERIA = 8
 _COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
 
+FALLBACK_FLOOR_CRITERION_ID_PREFIX = "__copilot_fallback_floor__"
+_FALLBACK_FLOOR_BASE_ID = f"{FALLBACK_FLOOR_CRITERION_ID_PREFIX}run"
+_FALLBACK_FLOOR_CREDENTIAL_ID = f"{FALLBACK_FLOOR_CRITERION_ID_PREFIX}credential"
+_FALLBACK_FLOOR_BASE_OUTCOME = "The workflow runs to its intended end state with the expected output."
+_FALLBACK_FLOOR_CREDENTIAL_OUTCOME = "The credentialed step authenticates and reaches the post-login state."
+
 CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
 
@@ -561,6 +567,33 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
     )
 
 
+def is_fallback_floor_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id.startswith(FALLBACK_FLOOR_CRITERION_ID_PREFIX)
+
+
+def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
+    floor = [
+        CompletionCriterion(
+            id=_FALLBACK_FLOOR_BASE_ID,
+            outcome=_FALLBACK_FLOOR_BASE_OUTCOME,
+            implicit=True,
+            method_mandated=True,
+            level="run",
+        )
+    ]
+    if ids:
+        floor.append(
+            CompletionCriterion(
+                id=_FALLBACK_FLOOR_CREDENTIAL_ID,
+                outcome=_FALLBACK_FLOOR_CREDENTIAL_OUTCOME,
+                implicit=True,
+                method_mandated=True,
+                level="run",
+            )
+        )
+    return floor[:_MAX_COMPLETION_CRITERIA]
+
+
 def _classifier_fallback_policy(
     ids: list[str],
     *,
@@ -593,7 +626,7 @@ def _classifier_fallback_policy(
     return RequestPolicy(
         credential_input_kind="credential_id" if ids else "none",
         credential_refs=ids,
-        completion_criteria=fallback_criteria,
+        completion_criteria=fallback_criteria or build_classifier_fallback_floor(ids),
         classifier_status="fallback",
         classifier_failure_kind=failure_kind,
         classifier_retry_count=retry_count,
