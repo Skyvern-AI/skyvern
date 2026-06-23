@@ -38,6 +38,26 @@ def _ctx() -> CopilotContext:
     )
 
 
+def _satisfied_completion_verification() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+
+
+def _clean_completed_result() -> dict[str, object]:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_clean",
+            "overall_status": "completed",
+            "frontier_start_label": "extract",
+            "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+        },
+    }
+
+
 def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() -> None:
     failed = build_diagnosis_repair_contract(
         source_tool="run_blocks_and_collect_debug",
@@ -96,11 +116,7 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
 def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
     ctx = _ctx()
     ctx.last_test_suspicious_success = True
-    ctx.completion_verification_result = CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=["c0"],
-        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-    )
+    ctx.completion_verification_result = _satisfied_completion_verification()
     contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
         result={
@@ -116,8 +132,260 @@ def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
         workflow_updated=True,
     )
 
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
     assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert contract.diagnosis_result.missing_context == []
+    assert contract.verification_result.remaining_blocker is None
+    trace = contract.to_trace_data()
+    assert trace["failure_type"] == "no_failure"
+    assert trace["missing_context"] == []
+
+
+def test_verified_success_ignores_incidental_login_prose_without_structured_blocker() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.completion_verification_result = _satisfied_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "error": "The extracted public instructions mention login credentials, but no login was attempted.",
+            "data": {
+                "workflow_run_id": "wr_verified_login_text",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert contract.verification_result.remaining_blocker is None
+
+
+@pytest.mark.parametrize(
+    "completion_verification",
+    [
+        CompletionVerificationResult(status="unavailable"),
+        CompletionVerificationResult(status="evaluated", criterion_ids=[]),
+        CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts")],
+        ),
+    ],
+)
+def test_clean_run_with_present_unsatisfied_completion_verification_fails_safe(
+    completion_verification: CompletionVerificationResult,
+) -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = completion_verification
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert contract.verification_result.remaining_blocker is not None
+
+
+def test_clean_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = _satisfied_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert contract.verification_result.remaining_blocker is None
+
+
+def test_no_change_contracts_do_not_carry_remaining_blocker() -> None:
+    satisfied_ctx = _ctx()
+    satisfied_ctx.completion_verification_result = _satisfied_completion_verification()
+    partial_ctx = _ctx()
+    partial_ctx.completion_verification_result = _satisfied_completion_verification()
+
+    contracts = [
+        build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result=_clean_completed_result(),
+            ctx=satisfied_ctx,
+            workflow_updated=True,
+        ),
+        build_diagnosis_repair_contract(
+            source_tool="run_blocks_and_collect_debug",
+            result={"ok": True, "data": {"workflow_run_id": "wr_4", "overall_status": "completed", "blocks": []}},
+            ctx=_ctx(),
+        ),
+        build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result={
+                "ok": False,
+                "error": "Completion verification confirmed the requested outcome despite partial run status.",
+                "data": {
+                    "workflow_run_id": "wr_partial_verified",
+                    "overall_status": "failed",
+                    "frontier_start_label": "extract",
+                    "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
+                    "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "failed"}],
+                },
+            },
+            ctx=partial_ctx,
+            workflow_updated=True,
+        ),
+    ]
+
+    for contract in contracts:
+        assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+        assert contract.verification_result.remaining_blocker is None
+
+
+def test_failed_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = _satisfied_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Completion verification confirmed the requested outcome despite partial run status.",
+            "data": {
+                "workflow_run_id": "wr_partial_verified",
+                "overall_status": "failed",
+                "frontier_start_label": "extract",
+                "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "failed",
+                        "failure_reason": "Extraction result was empty before verification.",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert contract.verification_result.remaining_blocker is None
+    assert contract.diagnosis_result.missing_context == []
+
+
+@pytest.mark.parametrize(
+    "completion_verification",
+    [
+        None,
+        CompletionVerificationResult(status="unavailable"),
+        CompletionVerificationResult(status="evaluated", criterion_ids=[]),
+        CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts")],
+        ),
+    ],
+)
+def test_unverified_completion_evidence_does_not_suppress_suspicious_success(
+    completion_verification: CompletionVerificationResult | None,
+) -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.completion_verification_result = completion_verification
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.verification_result.user_goal_satisfied is False
+
+
+@pytest.mark.parametrize(
+    "completion_verification",
+    [
+        None,
+        CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts")],
+        ),
+    ],
+)
+def test_run_ok_with_failed_blocks_repairs_unless_outcome_is_fully_verified(
+    completion_verification: CompletionVerificationResult | None,
+) -> None:
+    ctx = _ctx()
+    ctx.last_test_ok = True
+    ctx.completion_verification_result = completion_verification
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_run_ok_failed_block",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "failed",
+                        "failure_reason": "Required output was not produced.",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.NO_FAILURE
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["extract"]
+    if completion_verification is not None:
+        assert contract.verification_result.user_goal_satisfied is False
+        assert contract.verification_result.completion_contract_satisfied is False
 
 
 def test_repairable_block_failure_contract_is_queryable_and_safe() -> None:
@@ -272,11 +540,17 @@ def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> Non
     assert (
         unbound.diagnosis_result.suspected_failure_type,
         unbound.repair_decision.next_action,
+        unbound.verification_result.user_goal_satisfied,
+        unbound.verification_result.completion_contract_satisfied,
+        unbound.verification_result.remaining_blocker,
         binding_error.diagnosis_result.suspected_failure_type,
         binding_error.repair_decision.next_action,
     ) == (
         DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
         RepairNextAction.ASK,
+        False,
+        False,
+        "Skipped test run: required credentials are not configured.",
         DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
         RepairNextAction.ASK,
     )
@@ -318,6 +592,7 @@ def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> No
     ctx.last_test_suspicious_success = True
     ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
     ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
+    ctx.completion_verification_result = _satisfied_completion_verification()
 
     contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
@@ -347,6 +622,64 @@ def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> No
     assert contract.verification_result.completion_contract_satisfied is False
     assert "Verify you are human" in contract.verification_result.remaining_blocker
     assert contract.to_trace_data()["failure_type"] == "terminal_challenge_blocker"
+
+
+def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_verification() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.last_test_failure_reason = "Run failed after challenge-gated submit controls were observed."
+    ctx.completion_verification_result = _satisfied_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_blocked_failed",
+                "overall_status": "failed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "blocks": [{"label": "submit", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert contract.verification_result.remaining_blocker is not None
+
+
+def test_terminal_challenge_preempts_clean_run_even_with_satisfied_completion_verification() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
+    ctx.completion_verification_result = _satisfied_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_blocked_clean",
+                "overall_status": "completed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert contract.verification_result.remaining_blocker is not None
 
 
 def test_challenge_category_preempts_clean_run_ok_contract() -> None:
@@ -413,6 +746,7 @@ def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contrac
 
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
     assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.remaining_blocker is None
 
 
 def test_pre_run_challenge_observation_does_not_force_stop_on_repairable_failure() -> None:
@@ -535,6 +869,7 @@ def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() ->
     assert no_change.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
     assert no_change.repair_decision.next_action == RepairNextAction.NO_CHANGE
     assert no_change.verification_result.completion_contract_satisfied is True
+    assert no_change.verification_result.remaining_blocker is None
 
 
 def test_unrecoverable_browser_session_contract_stops_with_blocker() -> None:
