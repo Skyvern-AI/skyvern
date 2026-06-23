@@ -129,6 +129,7 @@ interface Transmutations {
 
 interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
+  blockTitle?: string;
   disabled?: boolean;
   editable: boolean;
   extraActions?: React.ReactNode;
@@ -140,7 +141,6 @@ interface Props {
   totpUrl: string | null;
   transmutations?: Transmutations;
   type: WorkflowBlockType;
-  viewToggle?: React.ReactNode;
 }
 
 type Payload = Record<string, unknown> & {
@@ -226,6 +226,7 @@ const getPayload = (opts: {
 
 function NodeHeader({
   blockLabel,
+  blockTitle: blockTitleOverride,
   disabled = false,
   editable,
   extraActions,
@@ -235,7 +236,6 @@ function NodeHeader({
   totpUrl,
   transmutations,
   type,
-  viewToggle,
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
@@ -256,7 +256,7 @@ function NodeHeader({
     id: nodeId,
     initialValue: blockLabel,
   });
-  const blockTitle = workflowBlockTitle[type];
+  const blockTitle = blockTitleOverride ?? workflowBlockTitle[type];
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
@@ -966,7 +966,12 @@ function NodeHeader({
                   </NoticeMe>
                 </div>
               ) : (
-                <span className="text-xs text-slate-400">{blockTitle}</span>
+                <span
+                  className="min-w-0 flex-1 truncate text-xs text-slate-400"
+                  title={blockTitle}
+                >
+                  {blockTitle}
+                </span>
               )}
               {workflowSettingsStore.finallyBlockLabel === blockLabel && (
                 <span className="rounded bg-amber-600/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
@@ -977,7 +982,6 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
-          {viewToggle}
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
