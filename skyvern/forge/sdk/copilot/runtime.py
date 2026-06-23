@@ -201,6 +201,8 @@ class AgentContext:
     code_native_pending_capability: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    code_authoring_guardrail_reject_count: int = 0
+    last_code_authoring_reject_was_credential_priority: bool = False
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
@@ -232,6 +234,7 @@ class AgentContext:
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     completion_verification_result: CompletionVerificationResult | None = None
+    verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
     # Ordered, bounded list of typed page-evidence packets — one per page observed
@@ -285,6 +288,9 @@ class AgentContext:
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_typed_value: str | None = None
+    # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
+    # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
+    pending_scout_role_name: tuple[str, str, str] | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.

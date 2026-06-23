@@ -202,7 +202,11 @@ def convert_workflow_definition(
                     workflow_parameter_key=parameter.key,
                     required_value="bitwarden_collection_id or bitwarden_item_id",
                 )
-            if parameter.bitwarden_collection_id and not parameter.url_parameter_key:
+            if (
+                parameter.bitwarden_collection_id
+                and not parameter.bitwarden_item_id
+                and not parameter.url_parameter_key
+            ):
                 raise WorkflowParameterMissingRequiredValue(
                     workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
                     workflow_parameter_key=parameter.key,
@@ -323,10 +327,8 @@ def convert_workflow_definition(
         blocks.append(block)
         block_label_mapping[block.label] = block
 
-    # Set the blocks for the workflow definition and derive DAG version metadata
-    dag_version = workflow_definition_yaml.version
-    if dag_version is None:
-        dag_version = 2 if _has_dag_metadata(workflow_definition_yaml.blocks) else 1
+    # version is populated by the WorkflowDefinitionYAML after-validator; `or 1` only narrows int | None.
+    dag_version = workflow_definition_yaml.version or 1
 
     workflow_definition = WorkflowDefinition(
         parameters=parameters.values(),
@@ -939,12 +941,3 @@ def _resolve_block_parameters(
 ) -> list[PARAMETER_TYPE]:
     parameter_keys = getattr(block_yaml, "parameter_keys", None)
     return [parameters[parameter_key] for parameter_key in parameter_keys] if parameter_keys else []
-
-
-def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
-    for block_yaml in block_yamls:
-        if block_yaml.next_block_label:
-            return True
-        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and _has_dag_metadata(block_yaml.loop_blocks):
-            return True
-    return False

@@ -14,9 +14,11 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import hooks as hooks_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.tools import _click_post_hook, _click_pre_hook
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
 
 
@@ -27,6 +29,8 @@ class _FakeContext:
     turn_id: str = "turn_example"
     workflow_copilot_chat_id: str = "chat_example"
     total_tokens_used: int | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    completion_verification_result: Any = None
 
 
 # `on_tool_end(context, agent, tool, result)` only reads `tool` and `result`;
@@ -1004,6 +1008,7 @@ class TestBrowserInteractionObservationHooks:
         ctx = SimpleNamespace(
             pending_browser_interaction_observation=None,
             pending_scout_typed_value=None,
+            pending_scout_role_name=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1036,6 +1041,7 @@ class TestBrowserInteractionObservationHooks:
                 url="https://example.com/results",
             ),
             pending_scout_typed_value=None,
+            pending_scout_role_name=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1089,7 +1095,9 @@ class TestScoutedInteractionCapture:
         ns = SimpleNamespace(
             pending_browser_interaction_observation=None,
             pending_scout_typed_value=None,
+            pending_scout_role_name=None,
             discovery_mcp_server=None,
+            browser_session_id=None,
             scouted_interactions=[],
             scout_trajectory=[],
             observed_browser_urls=[],
@@ -1211,6 +1219,83 @@ class TestScoutedInteractionCapture:
         assert ctx.scouted_interactions == [
             {"tool_name": "click", "selector": "#add-to-cart", "source_url": "https://example.com/product"}
         ]
+
+    @pytest.mark.asyncio
+    async def test_navigating_bare_click_records_prenav_role_name(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/billing")
+        ctx.pending_scout_role_name = ("a", "link", "View Printable Statement")
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "a"}},
+            {"browser_context": {"url": "https://example.com/statement.pdf", "title": "Statement"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == [
+            {
+                "tool_name": "click",
+                "selector": "a",
+                "source_url": "https://example.com/billing",
+                "role": "link",
+                "accessible_name": "View Printable Statement",
+            }
+        ]
+        assert ctx.pending_scout_role_name is None
+
+    @pytest.mark.asyncio
+    async def test_prenav_role_name_lets_strict_synthesis_emit_get_by_role(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/billing")
+        ctx.pending_scout_role_name = ("a", "link", "View Printable Statement")
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": "https://example.com/billing",
+                "trajectory_index": 0,
+            }
+        ]
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "a"}},
+            {"browser_context": {"url": "https://example.com/statement.pdf", "title": "Statement"}},
+            ctx,
+        )
+        result = synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="View Printable Statement", exact=True).click()' in result.code
+        assert result.diagnostics.dropped_interactions == []
+
+    @pytest.mark.asyncio
+    async def test_prenav_role_name_stash_ignored_on_selector_mismatch(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/billing")
+        ctx.pending_scout_role_name = ("a", "link", "View Printable Statement")
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#concrete-row"}},
+            {"browser_context": {"url": "https://example.com/statement.pdf", "title": "Statement"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[-1]
+        assert "role" not in recorded
+        assert "accessible_name" not in recorded
+        assert ctx.pending_scout_role_name is None
+
+    @pytest.mark.asyncio
+    async def test_click_pre_hook_stashes_role_name_from_role_selector(self) -> None:
+        ctx = self._ctx()
+        ctx.pending_scout_source_url = None
+        await _click_pre_hook({"selector": 'role=link[name="Continue"]'}, ctx)
+        assert ctx.pending_scout_role_name == ('role=link[name="Continue"]', "link", "Continue")
+
+    @pytest.mark.asyncio
+    async def test_click_pre_hook_stashes_role_name_from_bare_css_via_browser_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Bare CSS selector cannot be parsed, so the stash comes from the TIER-2 pre-navigation read.
+        async def _fake_read(_ctx: object, _selector: str, *, timeout_seconds: float) -> tuple[str, str]:
+            return "link", "Download"
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.scouting._capture_accessible_role_name", _fake_read)
+        ctx = self._ctx()
+        ctx.pending_scout_source_url = None
+        await _click_pre_hook({"selector": "a"}, ctx)
+        assert ctx.pending_scout_role_name == ("a", "link", "Download")
 
     @pytest.mark.asyncio
     async def test_click_post_hook_omits_source_url_when_unavailable(self) -> None:

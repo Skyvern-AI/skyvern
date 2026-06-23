@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 if TYPE_CHECKING:
@@ -419,6 +420,10 @@ def _failure_type(
 
 def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: dict[str, Any]) -> RepairNextAction:
     if failure_type == DiagnosisFailureType.NO_FAILURE:
+        return RepairNextAction.NO_CHANGE
+    # The judge confirmed every criterion; no failure_type may drive a repair
+    # that overwrites an already-verified terminal proposal.
+    if outcome_fully_verified(ctx):
         return RepairNextAction.NO_CHANGE
     if (
         data.get("skip_reason") == "workflow_credential_inputs_unbound"

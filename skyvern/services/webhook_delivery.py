@@ -7,7 +7,6 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
 
 import httpx
 import structlog
@@ -26,27 +25,8 @@ NON_5XX_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
 )
 
 WEBHOOK_DELIVERY_MAX_ATTEMPTS = 3
-WEBHOOK_DELIVERY_HTTP_TIMEOUT_SECONDS = 30.0
 WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS = 1.0
 WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS = 30.0
-# Persisted in workflow_runs.webhook_failure_reason; changing requires migrating in-progress rows.
-WEBHOOK_DELIVERY_IN_PROGRESS_REASON = "Webhook delivery is in progress"
-# Persisted in workflow_runs.webhook_failure_reason for successful deliveries; changing requires
-# migrating historical success rows.
-WEBHOOK_DELIVERY_SUCCESS_REASON = ""
-WEBHOOK_DELIVERY_MISSING_SIGNING_KEY_REASON = "Workflow webhook delivery skipped because no API key was available"
-WEBHOOK_DELIVERY_MISSING_WORKFLOW_REASON = "Workflow webhook delivery skipped because the workflow was unavailable"
-
-
-def scrub_internal_webhook_delivery_state(payload: dict[str, Any]) -> dict[str, Any]:
-    scrubbed = dict(payload)
-    scrubbed.pop("webhook_delivery_status", None)
-    if scrubbed.get("webhook_failure_reason") in {
-        WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
-        WEBHOOK_DELIVERY_SUCCESS_REASON,
-    }:
-        scrubbed["webhook_failure_reason"] = None
-    return scrubbed
 
 
 @dataclass(frozen=True)

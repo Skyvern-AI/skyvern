@@ -2,6 +2,9 @@ import asyncio
 import copy
 import hashlib
 import os
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List
@@ -9,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List
 import aiohttp
 import httpx
 import structlog
+from cachetools import TTLCache
 from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
@@ -26,6 +30,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
 from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -53,6 +58,23 @@ USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
 INVALID_SHAPE = "N/A"
+DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG = "DISABLE_SVG_CONVERT_CACHE_RESILIENCE"
+SVG_LOCAL_CACHE_MAX_ITEMS = 4096
+SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME = timedelta(hours=1)
+SVGLocalCacheValue = tuple[str, float | None]
+
+# TTLCache has one global TTL, so each value also carries an optional shorter
+# expiry timestamp for negative cache entries.
+_SVG_LOCAL_SHAPE_CACHE: TTLCache[str, SVGLocalCacheValue] = TTLCache(
+    maxsize=SVG_LOCAL_CACHE_MAX_ITEMS,
+    ttl=CACHE_EXPIRE_TIME.total_seconds(),
+)
+# Best-effort single-flight cache: eviction under extreme distinct-key pressure can
+# allow duplicate conversions, but does not affect conversion correctness.
+_SVG_CONVERSION_LOCKS: TTLCache[str, asyncio.Lock] = TTLCache(
+    maxsize=SVG_LOCAL_CACHE_MAX_ITEMS,
+    ttl=CACHE_EXPIRE_TIME.total_seconds(),
+)
 
 
 @dataclass
@@ -113,6 +135,158 @@ def _get_svg_cache_key(hash: str) -> str:
 
 def _get_shape_cache_key(hash: str) -> str:
     return f"skyvern:shape:{hash}"
+
+
+def _get_svg_conversion_lock(svg_key: str) -> asyncio.Lock:
+    lock = _SVG_CONVERSION_LOCKS.get(svg_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SVG_CONVERSION_LOCKS[svg_key] = lock
+    return lock
+
+
+@asynccontextmanager
+async def _svg_conversion_lock_scope(svg_key: str, *, use_lock: bool) -> AsyncIterator[None]:
+    if not use_lock:
+        yield
+        return
+
+    async with _get_svg_conversion_lock(svg_key):
+        yield
+
+
+async def _is_svg_convert_cache_resilience_disabled() -> bool:
+    context = skyvern_context.current()
+    if context is None:
+        return False
+
+    distinct_id = context.run_id or context.workflow_run_id or context.task_id
+    organization_id = context.organization_id
+    if not distinct_id or not organization_id:
+        return False
+
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+
+    try:
+        flag_enabled = await experimentation_provider.is_feature_enabled_cached(
+            DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG,
+            distinct_id,
+            properties={"organization_id": organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate SVG convert cache resilience flag; defaulting to enabled",
+            exc_info=True,
+            distinct_id=distinct_id,
+            organization_id=organization_id,
+        )
+        return False
+
+    return bool(flag_enabled)
+
+
+def _get_local_cache_ttl_seconds(svg_shape: str, ex: int | timedelta | None) -> float | None:
+    if ex is None:
+        ttl_seconds = None
+    else:
+        ttl_seconds = ex.total_seconds() if isinstance(ex, timedelta) else float(ex)
+
+    if svg_shape == INVALID_SHAPE:
+        negative_ttl_seconds = SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME.total_seconds()
+        if ttl_seconds is None:
+            return negative_ttl_seconds
+        return min(ttl_seconds, negative_ttl_seconds)
+    return ttl_seconds
+
+
+def _get_local_cache_expires_at(svg_shape: str, ex: int | timedelta | None) -> float | None:
+    ttl_seconds = _get_local_cache_ttl_seconds(svg_shape, ex)
+    if ttl_seconds is None:
+        return None
+    return time.monotonic() + max(ttl_seconds, 0.0)
+
+
+def _get_svg_shape_from_local_cache(svg_key: str) -> str | None:
+    cached_value = _SVG_LOCAL_SHAPE_CACHE.get(svg_key)
+    if cached_value is None:
+        return None
+
+    svg_shape, expires_at = cached_value
+    if expires_at is not None and expires_at <= time.monotonic():
+        _SVG_LOCAL_SHAPE_CACHE.pop(svg_key, None)
+        return None
+    return svg_shape
+
+
+def _cache_svg_shape_locally(
+    svg_key: str,
+    svg_shape: str | None,
+    *,
+    ex: int | timedelta | None = CACHE_EXPIRE_TIME,
+) -> None:
+    if svg_shape:
+        _SVG_LOCAL_SHAPE_CACHE[svg_key] = (svg_shape, _get_local_cache_expires_at(svg_shape, ex))
+
+
+async def _get_cached_svg_shape(svg_key: str, *, use_local_cache: bool = True) -> str | None:
+    if use_local_cache:
+        local_shape = _get_svg_shape_from_local_cache(svg_key)
+        if local_shape:
+            return local_shape
+
+    try:
+        cached_svg_shape = await app.CACHE.get(svg_key)
+    except Exception:
+        LOG.warning(
+            "Failed to loaded SVG cache",
+            exc_info=True,
+            key=svg_key,
+        )
+        if use_local_cache:
+            return _get_svg_shape_from_local_cache(svg_key)
+        return None
+
+    svg_shape = cached_svg_shape if isinstance(cached_svg_shape, str) else None
+    if use_local_cache:
+        _cache_svg_shape_locally(svg_key, svg_shape)
+    return svg_shape
+
+
+async def _set_svg_cache(
+    svg_key: str,
+    svg_shape: str,
+    *,
+    ex: int | timedelta | None = CACHE_EXPIRE_TIME,
+    cache_locally: bool = True,
+) -> None:
+    if cache_locally:
+        _cache_svg_shape_locally(svg_key, svg_shape, ex=ex)
+    try:
+        await app.CACHE.set(svg_key, svg_shape, ex=ex)
+    except Exception:
+        LOG.warning(
+            "Failed to store SVG cache",
+            exc_info=True,
+            key=svg_key,
+        )
+
+
+async def _set_css_shape_cache(
+    shape_key: str,
+    css_shape: str,
+    *,
+    ex: int | timedelta | None = CACHE_EXPIRE_TIME,
+) -> None:
+    try:
+        await app.CACHE.set(shape_key, css_shape, ex=ex)
+    except Exception:
+        LOG.warning(
+            "Failed to store CSS shape cache",
+            exc_info=True,
+            key=shape_key,
+        )
 
 
 def _remove_skyvern_attributes(element: Dict) -> Dict:
@@ -223,99 +397,107 @@ async def _convert_svg_to_string(
     svg_key = _get_svg_cache_key(svg_hash)
 
     svg_shape: str | None = None
-    try:
-        svg_shape = await app.CACHE.get(svg_key)
-    except Exception:
-        LOG.warning(
-            "Failed to loaded SVG cache",
-            exc_info=True,
-            key=svg_key,
-        )
+    refresh_svg_cache = False
+    use_cache_resilience = not await _is_svg_convert_cache_resilience_disabled()
+    async with _svg_conversion_lock_scope(svg_key, use_lock=use_cache_resilience):
+        svg_shape = await _get_cached_svg_shape(svg_key, use_local_cache=use_cache_resilience)
 
-    if svg_shape:
-        LOG.debug("SVG loaded from cache", element_id=element_id, key=svg_key, shape=svg_shape)
-    else:
-        if _is_element_already_dropped(svg_key):
-            LOG.debug("SVG is already dropped, going to abort conversion", element_id=element_id, key=svg_key)
-            _mark_element_as_dropped(element, hashed_key=svg_key)
-            return
+        if svg_shape:
+            LOG.debug("SVG loaded from cache", element_id=element_id, key=svg_key, shape=svg_shape)
+            refresh_svg_cache = True
+        else:
+            if _is_element_already_dropped(svg_key):
+                LOG.debug("SVG is already dropped, going to abort conversion", element_id=element_id, key=svg_key)
+                _mark_element_as_dropped(element, hashed_key=svg_key)
+                return
 
-        if len(svg_html) > settings.SVG_MAX_LENGTH:
-            # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
-            LOG.warning(
-                "SVG element is too large to convert, going to drop the svg element.",
-                element_id=element_id,
-                length=len(svg_html),
-                key=svg_key,
-            )
-            _mark_element_as_dropped(element, hashed_key=svg_key)
-            return
-
-        LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
-        svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
-
-        for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
-            try:
-                async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                    if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
-                        raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
-                    json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
-                        prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
-                    )
-                svg_shape = json_response.get("shape", "")
-                recognized = json_response.get("recognized", False)
-                if not svg_shape or not recognized:
-                    raise Exception("Empty or unrecognized SVG shape replied by secondary llm")
-                LOG.info("SVG converted by LLM", element_id=element_id, key=svg_key, shape=svg_shape)
-                await app.CACHE.set(svg_key, svg_shape)
-                break
-            except LLMProviderError:
-                LOG.info(
-                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt.",
-                    exc_info=True,
-                    element_id=element_id,
-                    key=svg_key,
-                    retry=retry,
-                )
-                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
-                    # set the invalid css shape to cache to avoid retry in the near future
-                    await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(hours=1))
-                else:
-                    await asyncio.sleep(0.5 * (2**retry))
-            except asyncio.TimeoutError:
+            if len(svg_html) > settings.SVG_MAX_LENGTH:
+                # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
                 LOG.warning(
-                    "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
+                    "SVG element is too large to convert, going to drop the svg element.",
                     element_id=element_id,
+                    length=len(svg_html),
                     key=svg_key,
                 )
                 _mark_element_as_dropped(element, hashed_key=svg_key)
                 return
-            except Exception:
-                LOG.info(
-                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt.",
-                    exc_info=True,
+
+            LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
+            svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
+
+            for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
+                try:
+                    async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                            raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
+                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
+                            prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
+                        )
+                    svg_shape = json_response.get("shape", "")
+                    recognized = json_response.get("recognized", False)
+                    if not svg_shape or not recognized:
+                        raise Exception("Empty or unrecognized SVG shape replied by secondary llm")
+                    LOG.info("SVG converted by LLM", element_id=element_id, key=svg_key, shape=svg_shape)
+                    await _set_svg_cache(svg_key, svg_shape, cache_locally=use_cache_resilience)
+                    break
+                except LLMProviderError:
+                    LOG.info(
+                        "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt.",
+                        exc_info=True,
+                        element_id=element_id,
+                        key=svg_key,
+                        retry=retry,
+                    )
+                    if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
+                        # set the invalid css shape to cache to avoid retry in the near future
+                        await _set_svg_cache(
+                            svg_key,
+                            INVALID_SHAPE,
+                            ex=timedelta(hours=1),
+                            cache_locally=use_cache_resilience,
+                        )
+                    else:
+                        await asyncio.sleep(0.5 * (2**retry))
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
+                        element_id=element_id,
+                        key=svg_key,
+                    )
+                    _mark_element_as_dropped(element, hashed_key=svg_key)
+                    return
+                except Exception:
+                    LOG.info(
+                        "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt.",
+                        exc_info=True,
+                        element_id=element_id,
+                        retry=retry,
+                    )
+                    if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
+                        # set the invalid css shape to cache to avoid retry in the near future
+                        await _set_svg_cache(
+                            svg_key,
+                            INVALID_SHAPE,
+                            ex=timedelta(weeks=1),
+                            cache_locally=use_cache_resilience,
+                        )
+                    else:
+                        await asyncio.sleep(0.5 * (2**retry))
+            else:
+                LOG.warning(
+                    "Reaching the max try to convert svg element, going to drop the svg element.",
                     element_id=element_id,
-                    retry=retry,
+                    key=svg_key,
+                    length=len(svg_html),
                 )
-                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
-                    # set the invalid css shape to cache to avoid retry in the near future
-                    await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(weeks=1))
-                else:
-                    await asyncio.sleep(0.5 * (2**retry))
-        else:
-            LOG.warning(
-                "Reaching the max try to convert svg element, going to drop the svg element.",
-                element_id=element_id,
-                key=svg_key,
-                length=len(svg_html),
-            )
-            _mark_element_as_dropped(element, hashed_key=svg_key)
-            return
+                _mark_element_as_dropped(element, hashed_key=svg_key)
+                return
 
     element["attributes"] = dict()
     if svg_shape != INVALID_SHAPE:
         # refresh the cache expiration
-        await app.CACHE.set(svg_key, svg_shape)
+        if refresh_svg_cache:
+            await _set_svg_cache(svg_key, svg_shape, cache_locally=use_cache_resilience)
         element["attributes"]["alt"] = svg_shape
     if "children" in element:
         del element["children"]
@@ -404,7 +586,7 @@ async def _convert_css_shape_to_string(
                     if not css_shape or not recognized:
                         raise Exception("Empty or unrecognized css shape replied by secondary llm")
                     LOG.info("CSS Shape converted by LLM", element_id=element_id, key=shape_key, shape=css_shape)
-                    await app.CACHE.set(shape_key, css_shape)
+                    await _set_css_shape_cache(shape_key, css_shape)
                     break
                 except LLMProviderError:
                     LOG.info(
@@ -416,7 +598,7 @@ async def _convert_css_shape_to_string(
                     )
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
-                        await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
+                        await _set_css_shape_cache(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
@@ -435,7 +617,7 @@ async def _convert_css_shape_to_string(
                     )
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
-                        await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
+                        await _set_css_shape_cache(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
             else:
                 LOG.info(
                     "Max css shape convertion retry, going to abort the convertion.",
@@ -458,7 +640,7 @@ async def _convert_css_shape_to_string(
         element["attributes"] = dict()
     if css_shape != INVALID_SHAPE:
         # refresh the cache expiration
-        await app.CACHE.set(shape_key, css_shape)
+        await _set_css_shape_cache(shape_key, css_shape)
         element["attributes"]["shape-description"] = css_shape
     return None
 

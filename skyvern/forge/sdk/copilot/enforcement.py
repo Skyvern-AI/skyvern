@@ -76,6 +76,11 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     run_outcome_display_reason,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.terminal_predicates import (
+    artifact_health_blocked,
+    outcome_criteria_evaluated,
+    outcome_fully_verified,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
@@ -130,6 +135,15 @@ MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
 # trips the agent should already be at single-block granularity; further
 # trips fall through to the repeated-frontier escalation path.
 MAX_PER_TOOL_BUDGET_NUDGES = 2
+# Code-authoring guardrail churn: distinct-reject convergence backstop. An
+# accepted persist resets the counter, so this many unaccepted rejections is
+# pathological and leaves three free repair attempts before the halt fires —
+# far inside both the 900s budget and the SDK max-turns cap.
+MAX_CODE_AUTHORING_GUARDRAIL_REJECTS = 4
+# Credential-priority rejects defer to the credential-scout message until this
+# higher bound, which must stay above MAX_CODE_AUTHORING_GUARDRAIL_REJECTS so the
+# non-credential backstop and the low-count credential deferral are untouched.
+MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS = 8
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -310,6 +324,67 @@ def repair_ceiling_stop_signal(
     )
 
 
+def code_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "code_authoring_guardrail_reject_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "code_authoring_guardrail_churn", evidence, blocked_tool="update_workflow"
+    )
+    agent_steering = (
+        f"The generated code has been rejected {count} times without an accepted save; "
+        "stop rewriting it and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="code_authoring_guardrail_churn",
+        blocked_tool="update_workflow",
+    )
+
+
+def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "code_authoring_guardrail_reject_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "credential_priority_authoring_churn", evidence, blocked_tool="update_workflow"
+    )
+    agent_steering = (
+        f"The credential-scout gate has rejected the generated code {count} times without an accepted save; "
+        "stop rewriting it and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="credential_priority_authoring_churn",
+        blocked_tool="update_workflow",
+    )
+
+
+def _needs_code_authoring_churn_halt(ctx: Any) -> bool:
+    count = _get_int(ctx, "code_authoring_guardrail_reject_count")
+    if getattr(ctx, "last_code_authoring_reject_was_credential_priority", False) is True:
+        return count >= MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+    return count >= MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+
+
+def _churn_signal_if_halting(ctx: Any) -> CopilotToolBlockerSignal | None:
+    if not _needs_code_authoring_churn_halt(ctx):
+        return None
+    if getattr(ctx, "last_code_authoring_reject_was_credential_priority", False) is True:
+        return credential_priority_authoring_churn_stop_signal(ctx)
+    return code_authoring_churn_stop_signal(ctx)
+
+
 def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
     outcome = getattr(ctx, "last_run_outcome", None)
     if not isinstance(outcome, RecordedRunOutcome):
@@ -488,28 +563,7 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
 
 
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
-    result = ctx.completion_verification_result
-    return result is not None and result.status == "evaluated"
-
-
-def artifact_health_blocked(ctx: CopilotContext) -> bool:
-    reason = ctx.last_artifact_health_blocker_reason
-    return isinstance(reason, str) and bool(reason.strip())
-
-
-def outcome_fully_verified(ctx: CopilotContext) -> bool:
-    """The judge confirmed every outcome criterion from the evidence this run produced.
-
-    This evidence is authoritative over run status: a run that reached the goal is
-    recognized even when it was canceled or only partially completed. Run status must
-    never suppress recognition of an outcome the user can observe was achieved.
-    """
-    if artifact_health_blocked(ctx):
-        return False
-    if not _outcome_criteria_evaluated(ctx):
-        return False
-    result = ctx.completion_verification_result
-    return result is not None and result.is_fully_satisfied()
+    return outcome_criteria_evaluated(ctx)
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
@@ -1193,12 +1247,16 @@ def _check_enforcement(
     result: RunResultStreaming | None = None,
     config: CopilotConfig | None = None,
 ) -> str | None:
+    verified = outcome_fully_verified(ctx)
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
     terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
     if terminal_signal is not None:
         stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
+
+    if verified:
+        raise CopilotGoalSatisfied()
 
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
@@ -1211,7 +1269,7 @@ def _check_enforcement(
             signal,
             consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
         )
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
@@ -1241,7 +1299,7 @@ def _check_enforcement(
         return None
 
     _maybe_stash_terminal_challenge_halt(ctx)
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
 
     # If the last run had confirmed challenge evidence, do not misdiagnose a
     # challenge-solving loop as a long-chain budgeting problem.
@@ -1291,13 +1349,25 @@ def _check_enforcement(
         signal = _probable_site_block_stop_signal(ctx, config)
         stash_blocker_signal(ctx, signal)
         stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
         if _needs_inspect_before_repair_nudge(ctx):
             return _nudge(config, "post_failed_test_inspect_first")
         return _nudge(config, "post_failed_test")
+
+    # The convergence floor for code-authoring guardrail churn. It is the last
+    # halt so every genuinely-terminal stop and recoverable nudge above gets its
+    # turn first. The permanent non-retriable nav raise is the one stop ordering
+    # cannot front-run (it lives after _check_enforcement returns None, at the
+    # run_with_enforcement return sites), so the floor yields to it explicitly.
+    if not getattr(ctx, "last_test_non_retriable_nav_error", None):
+        churn_signal = _churn_signal_if_halting(ctx)
+        if churn_signal is not None:
+            stash_blocker_signal(ctx, churn_signal)
+            stash_turn_halt_from_blocker_signal(ctx, churn_signal, source="enforcement_backstop")
+            raise_if_turn_halt(ctx)
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
     # (always allowed) from a REPLY with a coverage gap or progress-narration.

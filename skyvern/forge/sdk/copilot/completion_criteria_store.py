@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
 )
 
@@ -159,6 +160,8 @@ def reconcile_completion_criteria(
     """
     stored = snapshot.active if snapshot is not None else None
     next_epoch = snapshot.next_epoch if snapshot is not None else 1
+    if fresh and all(is_fallback_floor_criterion(criterion) for criterion in fresh):
+        fresh = []
     if stored is None:
         if not fresh:
             return ReconcileDecision(action="none", reason="no_criteria", epoch=0, criteria=())

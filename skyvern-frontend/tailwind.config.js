@@ -104,6 +104,9 @@ export default {
         elevated: "var(--shadow-elevated)",
         popover: "var(--shadow-popover)",
       },
+      transitionTimingFunction: {
+        sidebar: "cubic-bezier(0.32, 0.72, 0, 1)",
+      },
       keyframes: {
         "accordion-down": {
           from: { height: "0" },
