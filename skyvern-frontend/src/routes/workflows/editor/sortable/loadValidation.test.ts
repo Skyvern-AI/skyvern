@@ -280,3 +280,84 @@ describe("validateWorkflowBlocks", () => {
     );
   });
 });
+
+function conditional(
+  label: string,
+  next: string | null,
+  branchTargets: Array<string | null>,
+): ConditionalBlock {
+  return {
+    label,
+    block_type: "conditional",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: next,
+    output_parameter: op(label),
+    branch_conditions: branchTargets.map((target, index) => ({
+      id: `br-${label}-${index}`,
+      description: null,
+      next_block_label: target,
+      criteria: null,
+      is_default: index === branchTargets.length - 1,
+    })),
+  };
+}
+
+function forLoop(
+  label: string,
+  loopBlocks: Array<WorkflowBlock>,
+): ForLoopBlock {
+  return {
+    label,
+    block_type: "for_loop",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: null,
+    output_parameter: op(label),
+    loop_over: { key: "items" } as never,
+    loop_blocks: loopBlocks,
+    loop_variable_reference: null,
+    complete_if_empty: false,
+    data_schema: null,
+  };
+}
+
+// SKY-10988: MCP/API workflows stored as v1 that contain v2 graph constructs must not have their
+// routing rewritten by array-order defaulting when rendered in the editor/debugger.
+describe("applySequentialDefaulting (SKY-10988 conditional routing)", () => {
+  test("preserves explicit conditional branch + merge routing instead of array-ordering it", () => {
+    const result = applySequentialDefaulting([
+      conditional("choose", "merge", ["branch_a", "branch_b"]),
+      code("branch_a", "merge"),
+      code("branch_b", "merge"),
+      code("merge", null),
+    ]);
+
+    expect(result.map((b) => [b.label, b.next_block_label])).toEqual([
+      ["choose", "merge"],
+      ["branch_a", "merge"],
+      ["branch_b", "merge"],
+      ["merge", null],
+    ]);
+    expect(() => validateWorkflowBlocks(result)).not.toThrow();
+  });
+
+  test("connects a sequential top level while preserving a conditional nested in a loop", () => {
+    const loop = forLoop("loop", [
+      conditional("inner_choice", "inner_merge", ["leaf"]),
+      code("leaf", null),
+      code("inner_merge", null),
+    ]);
+
+    const result = applySequentialDefaulting([loop, code("after", null)]);
+
+    expect(result[0]!.next_block_label).toBe("after");
+    expect(result[1]!.next_block_label).toBeNull();
+    const loopBlocks = (result[0] as ForLoopBlock).loop_blocks;
+    expect(loopBlocks.map((b) => b.next_block_label)).toEqual([
+      "inner_merge",
+      null,
+      null,
+    ]);
+  });
+});

@@ -12,6 +12,7 @@ spurious "invalid credentials" errors during runs because the real value never g
 typed into the login form.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -191,3 +192,58 @@ async def test_get_credit_card_data_includes_billing_custom_fields(
     assert result["billing_address_country_code"] == "US"
     assert result["billing_email"] == "billing@example.com"
     assert result["metadata_customer_id"] == "cus_123"
+
+
+@pytest.mark.asyncio
+async def test_list_item_overviews_serializes_cli_session_workflows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_list_entered = asyncio.Event()
+    release_first_list = asyncio.Event()
+    second_list_entered = asyncio.Event()
+    list_entries: list[str] = []
+
+    async def fake_list_items_using_cli(**_: object) -> list[dict]:
+        if not list_entries:
+            list_entries.append("first")
+            first_list_entered.set()
+            await release_first_list.wait()
+        else:
+            list_entries.append("second")
+            second_list_entered.set()
+        return []
+
+    monkeypatch.setattr(BitwardenService, "_list_items_using_cli", fake_list_items_using_cli)
+
+    first_request = asyncio.create_task(
+        BitwardenService.list_item_overviews(
+            client_id=None,
+            client_secret=None,
+            master_password="master-password",
+            bw_organization_id="org-id",
+            bw_collection_ids=None,
+            email="first@example.com",
+            timeout=5,
+        )
+    )
+    await first_list_entered.wait()
+
+    second_request = asyncio.create_task(
+        BitwardenService.list_item_overviews(
+            client_id=None,
+            client_secret=None,
+            master_password="master-password",
+            bw_organization_id="org-id",
+            bw_collection_ids=None,
+            email="second@example.com",
+            timeout=5,
+        )
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(second_list_entered.wait(), timeout=0.05)
+
+    release_first_list.set()
+    await asyncio.gather(first_request, second_request)
+
+    assert list_entries == ["first", "second"]

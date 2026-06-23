@@ -68,6 +68,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
     return SimpleNamespace(
         pending_browser_interaction_observation=None,
         pending_scout_typed_value=None,
+        pending_scout_role_name=None,
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],

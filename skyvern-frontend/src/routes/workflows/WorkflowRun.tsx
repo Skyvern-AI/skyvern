@@ -66,7 +66,6 @@ import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowR
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
-import { WebhookDeliveryStatus } from "@/routes/workflows/workflowRun/WebhookDeliveryStatus";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecoveryGuidance";
@@ -430,25 +429,18 @@ function WorkflowRun() {
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
-  const taskWebhookFailureReason =
-    workflowRun?.task_v2?.webhook_failure_reason ?? null;
-  const workflowWebhookFailureReason =
-    workflowRun?.webhook_failure_reason ?? null;
   const webhookFailureReasonData =
-    taskWebhookFailureReason ?? workflowWebhookFailureReason;
-  // TaskV2 webhook state is legacy failure-only data; workflow-level pending
-  // delivery status is surfaced separately by webhook_delivery_status.
-  const webhookDeliveryStatusData = taskWebhookFailureReason
-    ? "failed"
-    : (workflowRun?.webhook_delivery_status ??
-      (workflowWebhookFailureReason ? "failed" : null));
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
 
-  const webhookDeliveryStatus = (
-    <WebhookDeliveryStatus
-      webhookDeliveryStatus={webhookDeliveryStatusData}
-      webhookFailureReason={webhookFailureReasonData}
-    />
-  );
+  const webhookFailureReason = webhookFailureReasonData ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {webhookFailureReasonData}
+      </div>
+    </div>
+  ) : null;
 
   const outputs = workflowRun?.outputs;
   const extractedInformation =
@@ -751,9 +743,9 @@ function WorkflowRun() {
               </ScrollArea>
             </div>
           )}
+          {webhookFailureReason}
         </div>
       )}
-      {webhookDeliveryStatus}
       {workflowFailureReason}
       {fallbackEpisodes && fallbackEpisodes.episodes.length > 0 && (
         <ScriptUpdateCard

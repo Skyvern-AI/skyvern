@@ -28,6 +28,24 @@ LOGGING_LEVEL_MAP: dict[str, int] = {
 # Resolved once at setup time and injected into every log event.
 _entrypoint: str = "unknown"
 
+_DRIVER_PIPE_CLOSED_ERROR = "Connection closed while reading from the driver"
+_ORPHANED_FUTURE_MESSAGE = "Future exception was never retrieved"
+
+
+class _DriverPipeNoiseFilter(logging.Filter):
+    """Drop asyncio's orphaned-future noise from a torn-down Playwright driver pipe"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if _ORPHANED_FUTURE_MESSAGE not in message:
+            return True
+        if _DRIVER_PIPE_CLOSED_ERROR in message:
+            return False
+        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
+        if exc is not None and _DRIVER_PIPE_CLOSED_ERROR in str(exc):
+            return False
+        return True
+
 
 def _get_entrypoint() -> str:
     """Derive a human-readable entrypoint name for the current process.
@@ -479,3 +497,15 @@ def setup_logger() -> None:
 
     # Anthropic Bedrock SDK emits high-volume WARN noise; keep only its errors.
     logging.getLogger("anthropic").setLevel(logging.ERROR)
+
+    # Mute LiteLLM's high-volume library logs; our own LLM handler already logs calls/errors.
+    logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
+    logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
+    logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
+
+    # Drop asyncio's orphaned-future noise from torn-down Playwright driver pipes (logged at
+    # ERROR but non-actionable). setup_logger may run more than once (uvicorn reload), so keep
+    # exactly one instance instead of stacking duplicates.
+    asyncio_logger = logging.getLogger("asyncio")
+    asyncio_logger.filters = [f for f in asyncio_logger.filters if not isinstance(f, _DriverPipeNoiseFilter)]
+    asyncio_logger.addFilter(_DriverPipeNoiseFilter())

@@ -1,12 +1,32 @@
 import { getClient } from "@/api/AxiosClient";
 import { BrowserProfileApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { InfiniteData, useInfiniteQuery } from "@tanstack/react-query";
 
 interface UseInfiniteBrowserProfilesQueryParams {
   page_size?: number;
   searchKey?: string;
   enabled?: boolean;
+}
+
+// Dedupe by id so concurrent-insert page-boundary repeats don't duplicate rows;
+// module-scoped to keep the select reference stable across renders.
+function dedupeProfilePagesById<TPageParam>(
+  data: InfiniteData<Array<BrowserProfileApiResponse>, TPageParam>,
+): InfiniteData<Array<BrowserProfileApiResponse>, TPageParam> {
+  const seen = new Set<string>();
+  return {
+    ...data,
+    pages: data.pages.map((page) =>
+      page.filter((profile) => {
+        if (seen.has(profile.browser_profile_id)) {
+          return false;
+        }
+        seen.add(profile.browser_profile_id);
+        return true;
+      }),
+    ),
+  };
 }
 
 function useInfiniteBrowserProfilesQuery(
@@ -40,6 +60,7 @@ function useInfiniteBrowserProfilesQuery(
     },
     initialPageParam: 1,
     enabled: params?.enabled ?? true,
+    select: dedupeProfilePagesById,
   });
 }
 

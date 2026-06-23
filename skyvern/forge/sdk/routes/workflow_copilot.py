@@ -66,6 +66,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotChatSummary,
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotStreamErrorUpdate,
@@ -2575,26 +2576,55 @@ async def workflow_copilot_chat_post(
     return FastAPIEventSourceStream.create(request, stream_handler)
 
 
-@base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
-async def workflow_copilot_chat_history(
-    workflow_permanent_id: str,
+@base_router.get("/workflow/copilot/chats", include_in_schema=False)
+async def list_workflow_copilot_chats(
+    workflow_permanent_id: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    search: str | None = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
-) -> WorkflowCopilotChatHistoryResponse:
-    latest_chat = await app.DATABASE.workflow_params.get_latest_workflow_copilot_chat(
+) -> list[WorkflowCopilotChatSummary]:
+    return await app.DATABASE.workflow_params.get_workflow_copilot_chats(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
+        page=page,
+        page_size=page_size,
+        search=search,
     )
-    if latest_chat:
+
+
+@base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
+async def workflow_copilot_chat_history(
+    workflow_permanent_id: str | None = None,
+    workflow_copilot_chat_id: str | None = None,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowCopilotChatHistoryResponse:
+    if workflow_copilot_chat_id:
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=workflow_copilot_chat_id,
+        )
+    elif workflow_permanent_id:
+        chat = await app.DATABASE.workflow_params.get_latest_workflow_copilot_chat(
+            organization_id=organization.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="workflow_permanent_id or workflow_copilot_chat_id is required",
+        )
+    if chat:
         chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
-            latest_chat.workflow_copilot_chat_id
+            chat.workflow_copilot_chat_id
         )
     else:
         chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
-        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id if latest_chat else None,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         chat_history=convert_to_history_messages(chat_messages),
-        proposed_workflow=latest_chat.proposed_workflow if latest_chat else None,
-        auto_accept=latest_chat.auto_accept if latest_chat else None,
+        proposed_workflow=chat.proposed_workflow if chat else None,
+        auto_accept=chat.auto_accept if chat else None,
     )
 
 

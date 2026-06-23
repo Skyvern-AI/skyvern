@@ -149,6 +149,15 @@ _SELF_PRESCRIPTIVE_CONTINUATION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_OUTPUT_FIELD_CONFIRMATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:confirm|verify|approve|check|tell me|let me know)\b"
+    r"(?=[\s\S]{0,180}\b(?:output|record|schema|field|fields)\b)"
+    r"(?=[\s\S]{0,220}\b(?:field|fields|schema|record)\b)"
+    r"|\b(?:which|what)\s+fields\s+should\b"
+    r")",
+    re.IGNORECASE,
+)
 
 # Response types whose `user_response` is rendered verbatim as the agent's final
 # message — REPLY and REPLACE_WORKFLOW. ASK_QUESTION is excluded because legitimate
@@ -187,6 +196,7 @@ class OutputPolicyReason(StrEnum):
     INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
     SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
     WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
+    AVOIDABLE_OUTPUT_FIELD_CONFIRMATION = "avoidable_output_field_confirmation"
 
 
 @dataclass
@@ -219,6 +229,7 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
+        OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION,
     }
 )
 
@@ -422,6 +433,15 @@ def evaluate_output_policy(
     if isinstance(request_policy, RequestPolicy):
         if request_policy.user_response_policy == "ask_clarification" and response_type != "ASK_QUESTION":
             verdict.add(OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS)
+        if (
+            response_type == "ASK_QUESTION"
+            and request_policy.user_response_policy != "ask_clarification"
+            and _request_policy_has_present_completion_contract(request_policy)
+            and not has_workflow_proposal
+            and not workflow_attempted
+            and _asks_to_confirm_output_fields(user_response)
+        ):
+            verdict.add(OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION)
         _apply_credential_policy(verdict, request_policy, values, workflow_yaml)
 
     if output_kind == CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL and not workflow_was_persisted:
@@ -430,6 +450,16 @@ def evaluate_output_policy(
         verdict.add(OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
     return verdict
+
+
+def _request_policy_has_present_completion_contract(request_policy: RequestPolicy) -> bool:
+    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def _asks_to_confirm_output_fields(user_response: str | None) -> bool:
+    if not isinstance(user_response, str) or not user_response.strip():
+        return False
+    return bool(_OUTPUT_FIELD_CONFIRMATION_RE.search(user_response[:500]))
 
 
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
