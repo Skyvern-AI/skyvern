@@ -982,6 +982,84 @@ async def test_structured_blocker_run_skips_completion_verification(monkeypatch:
     assert verification is None
 
 
+@pytest.mark.asyncio
+async def test_classifier_fallback_record_is_not_verified_without_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("value-agnostic fallback criteria must not reach the completion judge")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+
+    result = _structured_record_top_level_output_result()
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+    assert verification is None
+
+    _record_run_blocks_result(ctx, result, completion_verification=verification)
+    # The strict barrier predicate and its telemetry flag stay false, so the proposal is
+    # not preserved as a verified success; legacy clean-run flags may still promote, as
+    # they do for any genuine zero-criteria run.
+    assert getattr(ctx, "verified_terminal_proposal_ready", False) is not True
+    assert outcome_fully_verified(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_non_fallback_judge_confirmed_run_still_fires_barrier(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("extraction")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "item in cart")])
+
+    result = _clean_success_result()
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+
+    _record_run_blocks_result(ctx, result, completion_verification=verification)
+    assert outcome_fully_verified(ctx) is True
+    assert verified_goal_satisfied_context(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_classifier_fallback_record_contradiction_still_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("structural contradictions are deterministic, not judged")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+
+    contradictory_record = _record_payload(
+        items=[{"item_name": "Sample Practice Active", "address": "100 Main St", "status": "Expired"}],
+        overall_status="Expired",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_contradiction",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_record_status_record"],
+            "current_url": "https://structured_record.test/entity-details",
+            "blocks": [
+                {
+                    "label": "extract_record_status_record",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"extracted_information": []},
+                }
+            ],
+            "output": {"extract_record_status_record_output": contradictory_record},
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert any(not verdict.satisfied for verdict in verification.verdicts)
+
+
 def _failed_code_block_result() -> dict:
     raw = (
         "code block failed. failure reason: Failed to execute code block. Reason: TimeoutError: "
@@ -1874,13 +1952,13 @@ def test_snapshot_uses_structured_record_top_level_output_parameters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_deterministically_satisfies_structured_record_without_judge_call(
+async def test_maybe_run_completion_verification_treats_fallback_record_as_criteria_less(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     handler_lookup_calls = 0
 
     async def fail_handler(**_: object) -> object:
-        raise AssertionError("deterministically covered structured-record criteria must not call the judge")
+        raise AssertionError("value-agnostic fallback criteria must not call the judge")
 
     async def handler_lookup(_ctx: object) -> object:
         nonlocal handler_lookup_calls
@@ -1900,20 +1978,19 @@ async def test_maybe_run_completion_verification_deterministically_satisfies_str
         time.monotonic(),
     )
 
-    assert verification is not None
-    assert verification.status == "evaluated"
-    assert verification.is_fully_satisfied() is True
-    assert handler_lookup_calls == 1
-    assert _satisfied_criterion_ids(verification.verdicts) == _STRUCTURED_RECORD_CRITERION_IDS
+    # Value-agnostic fallback criteria are criteria-less; a well-shaped record is not a
+    # verified result, and the path short-circuits before any judge lookup.
+    assert verification is None
+    assert handler_lookup_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_fails_closed_on_no_judge_for_deterministic_success(
+async def test_maybe_run_completion_verification_fails_closed_on_no_judge_for_judge_needed_criteria(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_completion_handler(monkeypatch, None)
     ctx = _run_ctx()
-    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "item in cart")])
 
     verification = await _maybe_run_completion_verification(
         ctx,
@@ -1927,15 +2004,15 @@ async def test_maybe_run_completion_verification_fails_closed_on_no_judge_for_de
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_fails_closed_on_low_budget_for_deterministic_success(
+async def test_maybe_run_completion_verification_fails_closed_on_low_budget_for_judge_needed_criteria(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fail_handler(**_: object) -> object:
-        raise AssertionError("low-budget deterministic verification must not call the judge")
+        raise AssertionError("low-budget verification must not call the judge")
 
     _patch_completion_handler(monkeypatch, fail_handler)
     ctx = _run_ctx()
-    ctx.request_policy = RequestPolicy(completion_criteria=_structured_record_criteria())
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "item in cart")])
     starved = time.monotonic() - 100_000
 
     verification = await _maybe_run_completion_verification(

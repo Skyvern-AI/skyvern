@@ -319,6 +319,22 @@ def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reaso
         ctx.blocker_signal = None
 
 
+def clear_tool_blocker_signals_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
+    clear_blocker_signal_for_reason_codes(ctx, internal_reason_codes)
+    # getattr matches stash_blocker_signal's defensive read: real contexts type
+    # both fields, but partial test shims may omit them.
+    latest = getattr(ctx, "latest_tool_blocker_signal", None)
+    if isinstance(latest, CopilotToolBlockerSignal) and latest.internal_reason_code in internal_reason_codes:
+        ctx.latest_tool_blocker_signal = None
+    history = getattr(ctx, "tool_blocker_signals", None)
+    if isinstance(history, list):
+        history[:] = [
+            entry
+            for entry in history
+            if not (isinstance(entry, CopilotToolBlockerSignal) and entry.internal_reason_code in internal_reason_codes)
+        ]
+
+
 def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSignal) -> str:
     """Mostly first-wins stash + observability log; returns the LLM-visible payload."""
     ctx.latest_tool_blocker_signal = signal

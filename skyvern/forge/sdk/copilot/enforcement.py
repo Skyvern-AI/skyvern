@@ -76,6 +76,11 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     run_outcome_display_reason,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.terminal_predicates import (
+    artifact_health_blocked,
+    outcome_criteria_evaluated,
+    outcome_fully_verified,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
@@ -558,28 +563,7 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
 
 
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
-    result = ctx.completion_verification_result
-    return result is not None and result.status == "evaluated"
-
-
-def artifact_health_blocked(ctx: CopilotContext) -> bool:
-    reason = ctx.last_artifact_health_blocker_reason
-    return isinstance(reason, str) and bool(reason.strip())
-
-
-def outcome_fully_verified(ctx: CopilotContext) -> bool:
-    """The judge confirmed every outcome criterion from the evidence this run produced.
-
-    This evidence is authoritative over run status: a run that reached the goal is
-    recognized even when it was canceled or only partially completed. Run status must
-    never suppress recognition of an outcome the user can observe was achieved.
-    """
-    if artifact_health_blocked(ctx):
-        return False
-    if not _outcome_criteria_evaluated(ctx):
-        return False
-    result = ctx.completion_verification_result
-    return result is not None and result.is_fully_satisfied()
+    return outcome_criteria_evaluated(ctx)
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
@@ -1263,14 +1247,15 @@ def _check_enforcement(
     result: RunResultStreaming | None = None,
     config: CopilotConfig | None = None,
 ) -> str | None:
+    verified = outcome_fully_verified(ctx)
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
     terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
     if terminal_signal is not None:
         stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    if getattr(ctx, "verified_terminal_proposal_ready", False) is True and verified_goal_satisfied_context(ctx):
+    if verified:
         raise CopilotGoalSatisfied()
 
     if _needs_repair_ceiling_halt(ctx):
@@ -1284,7 +1269,7 @@ def _check_enforcement(
             signal,
             consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
         )
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
@@ -1314,7 +1299,7 @@ def _check_enforcement(
         return None
 
     _maybe_stash_terminal_challenge_halt(ctx)
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
 
     # If the last run had confirmed challenge evidence, do not misdiagnose a
     # challenge-solving loop as a long-chain budgeting problem.
@@ -1364,7 +1349,7 @@ def _check_enforcement(
         signal = _probable_site_block_stop_signal(ctx, config)
         stash_blocker_signal(ctx, signal)
         stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1

@@ -101,6 +101,7 @@ async def stream_to_sse(
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotUnrecoverableToolError,
         _maybe_raise_unrecoverable_tool_error,
+        outcome_fully_verified,
     )
     from skyvern.forge.sdk.copilot.turn_halt import (
         CopilotTurnHalt,
@@ -269,7 +270,7 @@ async def stream_to_sse(
                     source="streaming_adapter",
                 )
                 try:
-                    raise_if_turn_halt(ctx)
+                    raise_if_turn_halt(ctx, verified=outcome_fully_verified(ctx))
                 except CopilotTurnHalt:
                     result.cancel()
                     raise

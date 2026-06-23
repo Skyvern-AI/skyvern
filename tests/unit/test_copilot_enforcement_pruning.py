@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
@@ -126,7 +127,7 @@ def test_unrecoverable_browser_session_error_stops_after_second_failure() -> Non
         _maybe_raise_unrecoverable_tool_error,
     )
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
     output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
 
     _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
@@ -544,6 +545,36 @@ def test_enforcement_stops_after_verified_terminal_proposal() -> None:
 
     with pytest.raises(CopilotGoalSatisfied):
         _check_enforcement(ctx)
+
+
+def test_verified_outcome_out_orders_same_turn_involuntary_blocker() -> None:
+    ctx = _Ctx()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    involuntary = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="repeated failed step",
+        user_facing_reason="I'm stuck retrying the same step.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_and_run_blocks",
+        extra={},
+    )
+    ctx.turn_halt = None
+    ctx.blocker_signal = involuntary
+    ctx.latest_tool_blocker_signal = involuntary
+
+    with pytest.raises(CopilotGoalSatisfied):
+        _check_enforcement(ctx)
+
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
 
 
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:

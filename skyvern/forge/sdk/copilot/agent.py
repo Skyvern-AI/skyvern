@@ -127,7 +127,13 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHalt, turn_halt_to_trace_data
+from skyvern.forge.sdk.copilot.turn_halt import (
+    _INVOLUNTARY_BLOCKER_REASON_CODES,
+    CopilotTurnHalt,
+    TurnHalt,
+    raise_if_turn_halt,
+    turn_halt_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
     RequiredContextKey,
@@ -1569,6 +1575,72 @@ except ValueError as _fallback_validation_error:
     )
 
 
+def _verified_terminal_preserve_result(
+    ctx: CopilotContext, result: AgentResult, *, exit_site: str
+) -> AgentResult | None:
+    """When the judge confirmed the outcome, hold the tested proposal and the
+    success reply instead of letting an involuntary blocker render over it."""
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    if verified_workflow is None:
+        return None
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=_VERIFIED_WORKFLOW_SUCCESS_REPLY,
+        attempted_kind=derive_response_kind(ctx.turn_intent),
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason="verified_goal_satisfied",
+        turn_intent=ctx.turn_intent,
+    )
+    output_kind = derive_output_kind(
+        response_type="REPLY",
+        request_policy=ctx.request_policy,
+        updated_workflow=verified_workflow,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+    )
+    verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type="REPLY",
+        user_response=final_text,
+        global_llm_context=None,
+        workflow_yaml=verified_yaml,
+        has_workflow_proposal=True,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+        output_kind=output_kind,
+    )
+    if not verdict.allowed:
+        return None
+    LOG.info(
+        "copilot verified outcome preserved tested proposal over blocker",
+        exit_site=exit_site,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+    )
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=verified_workflow,
+        global_llm_context=result.global_llm_context,
+        response_type="REPLY",
+        workflow_yaml=verified_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+        clear_proposed_workflow=False,
+        total_tokens=result.total_tokens,
+        cancelled=result.cancelled,
+        proposal_disposition="review_tested",
+        turn_outcome=outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
+    )
+
+
 def _finalize_result_with_blocker_override(
     ctx: CopilotContext, result: AgentResult, *, exit_site: str = "unspecified"
 ) -> AgentResult:
@@ -1581,6 +1653,10 @@ def _finalize_result_with_blocker_override(
         return result
     if not local_signal.renders_final_reply:
         return result
+    if local_signal.internal_reason_code in _INVOLUNTARY_BLOCKER_REASON_CODES and outcome_fully_verified(ctx):
+        preserved = _verified_terminal_preserve_result(ctx, result, exit_site=exit_site)
+        if preserved is not None:
+            return preserved
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
 
@@ -1973,7 +2049,7 @@ def _build_wip_exit_result(
         )
 
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    if ctx.verified_terminal_proposal_ready is True and verified_workflow is not None:
+    if outcome_fully_verified(ctx) and verified_workflow is not None:
         final_text, outcome = _guard(tested_reply)
         return _finalize_result_with_blocker_override(
             ctx,
@@ -2189,6 +2265,48 @@ def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | Non
     )
 
 
+async def _resolve_wrapped_exception_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    *,
+    goal_satisfied: bool,
+    error: BaseException,
+    workflow_permanent_id: str | None,
+) -> AgentResult:
+    error_type = type(error).__name__
+    try:
+        raise_if_turn_halt(ctx, verified=outcome_fully_verified(ctx))
+    except CopilotTurnHalt as halt_exc:
+        LOG.info(
+            "Copilot run stopped after typed turn halt from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            error_type=error_type,
+            **turn_halt_to_trace_data(halt_exc.halt),
+        )
+        return _build_turn_halt_exit_result(ctx, global_llm_context, halt_exc.halt)
+    turn_halt = ctx.turn_halt
+    if isinstance(turn_halt, TurnHalt):
+        LOG.info(
+            "Copilot run stopped after typed turn halt from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            error_type=error_type,
+            **turn_halt_to_trace_data(turn_halt),
+        )
+        return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
+    if goal_satisfied:
+        # The Agents SDK can wrap exceptions raised from hooks; keep this
+        # fallback so a verified-goal stop is not rendered as a generic error.
+        LOG.info(
+            "Copilot run stopped after verified goal satisfaction from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
+            error_type=error_type,
+        )
+        return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
+    LOG.error("Copilot agent error", error=str(error), exc_info=True)
+    return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
+
+
 async def _translate_to_agent_result(
     result: RunResultStreaming,
     ctx: CopilotContext,
@@ -2388,10 +2506,7 @@ async def _translate_to_agent_result(
             user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     verified_terminal_ready = (
-        ctx.verified_terminal_proposal_ready is True
-        and verified_workflow is not None
-        and verified_goal_claim_authorized(ctx)
-        and not blocker_active
+        verified_workflow is not None and verified_goal_claim_authorized(ctx) and not blocker_active
     )
     if verified_terminal_ready:
         resp_type = "REPLY"
@@ -2657,7 +2772,7 @@ def _build_infeasibility_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=True,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -2708,7 +2823,7 @@ def _build_request_policy_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=True,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -3727,24 +3842,10 @@ async def _run_copilot_turn_impl(
         except Exception:
             LOG.error("Copilot agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
-        turn_halt = getattr(ctx, "turn_halt", None)
-        if isinstance(turn_halt, TurnHalt):
-            LOG.info(
-                "Copilot run stopped after typed turn halt from wrapped exception",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                error_type=type(e).__name__,
-                **turn_halt_to_trace_data(turn_halt),
-            )
-            return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
-        if goal_satisfied:
-            # The Agents SDK can wrap exceptions raised from hooks; keep this
-            # fallback so a verified-goal stop is not rendered as a generic error.
-            LOG.info(
-                "Copilot run stopped after verified goal satisfaction from wrapped exception",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
-                error_type=type(e).__name__,
-            )
-            return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
-        LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
+        return await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context,
+            goal_satisfied=goal_satisfied,
+            error=e,
+            workflow_permanent_id=chat_request.workflow_permanent_id,
+        )

@@ -119,7 +119,11 @@ async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) ->
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
 
-    await stream_to_sse(result, stream, SimpleNamespace())
+    await stream_to_sse(
+        result,
+        stream,
+        SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None),
+    )
 
     tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
     assert len(tool_results) == 1
