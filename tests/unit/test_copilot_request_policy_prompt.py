@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _credential_ids,
     _raw_secret_detected,
     contains_email_password_pair,
+    is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -413,9 +414,11 @@ class TestClassifierFallbackCompletionCriteria:
         assert policy.classifier_status == "fallback"
         assert policy.completion_contract_status == ("present" if expect_criteria else "unknown")
         if not expect_criteria:
-            assert policy.completion_criteria == []
+            assert policy.completion_criteria
+            assert all(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
             return
 
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
         assert [criterion.id for criterion in policy.completion_criteria] == [
             "fallback_record_identity",
             "fallback_record_identifier",

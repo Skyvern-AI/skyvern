@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import yaml
 
+from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import (
@@ -20,6 +21,13 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    StoredCriteriaSet,
+    StoredCriteriaSnapshot,
+    build_turn_state,
+    plan_persistence,
+    reconcile_completion_criteria,
+)
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -39,15 +47,20 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
+    _MAX_COMPLETION_CRITERIA,
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     CompletionCriterion,
     RequestPolicy,
+    _classifier_fallback_policy,
     _classify_request,
+    build_classifier_fallback_floor,
     build_transcript_context,
+    is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools.completion import _completion_verification_criteria
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     TurnHalt,
@@ -5404,3 +5417,117 @@ class TestStructuralInfeasibilityQuestion:
 
     def test_returns_none_for_non_turn_intent(self) -> None:
         assert agent_module._structural_infeasibility_question(None) is None
+
+
+class TestClassifierFallbackCompletionFloor:
+    @pytest.mark.asyncio
+    async def test_timeout_fallback_emits_method_mandated_run_floor(self, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            await asyncio.sleep(0.5)
+            return {"credential_input_kind": "none", "completion_contract": None}
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "timeout"
+        assert policy.completion_criteria
+        assert all(c.level == "run" for c in policy.completion_criteria)
+        assert all(c.implicit for c in policy.completion_criteria)
+        assert all(c.method_mandated for c in policy.completion_criteria)
+        assert all(is_fallback_floor_criterion(c) for c in policy.completion_criteria)
+        assert policy.completion_contract is None
+        assert policy.completion_contract_status == "unknown"
+
+        trace = policy.to_trace_data()
+        assert trace["completion_criteria_count"] > 0
+        assert trace["has_completion_contract"] is False
+
+    def test_floor_is_excluded_from_judge_satisfaction_set(self) -> None:
+        policy = _classifier_fallback_policy([], raw_secret_present=False, failure_kind="timeout")
+        ctx = SimpleNamespace(request_policy=policy)
+
+        assert policy.completion_criteria
+        assert _completion_verification_criteria(ctx) == []
+
+    def test_credential_aware_floor_adds_one_run_plane_criterion(self) -> None:
+        base = build_classifier_fallback_floor([])
+        credentialed = build_classifier_fallback_floor(["cred_1"])
+
+        assert len(credentialed) == len(base) + 1
+        assert all(c.level == "run" for c in credentialed)
+        assert all(c.implicit and c.method_mandated for c in credentialed)
+        assert len({c.id for c in credentialed}) == len(credentialed)
+
+    def test_floor_respects_max_criteria_cap(self) -> None:
+        floor = build_classifier_fallback_floor([f"cred_{i}" for i in range(50)])
+
+        assert len(floor) <= _MAX_COMPLETION_CRITERIA
+
+    def test_raw_secret_fallback_still_blocks_with_empty_criteria(self) -> None:
+        policy = _classifier_fallback_policy(["cred_1"], raw_secret_present=True, failure_kind="timeout")
+
+        assert policy.raw_secret_handling == "block"
+        assert policy.completion_criteria == []
+        assert policy.completion_contract_status == "unknown"
+
+    def test_reconcile_all_floor_fresh_with_no_stored_set_does_not_create(self) -> None:
+        snapshot = StoredCriteriaSnapshot(active=None, next_epoch=1)
+        floor = build_classifier_fallback_floor(["cred_1"])
+
+        decision = reconcile_completion_criteria(snapshot, list(floor), actionable=True)
+
+        assert decision.action == "none"
+        assert decision.reason == "no_criteria"
+        assert decision.criteria == ()
+
+        turn_state = build_turn_state(snapshot, decision)
+        plan = plan_persistence(turn_state)
+
+        assert plan is None or plan.create_epoch is None
+
+    def test_reconcile_all_floor_fresh_keeps_stored_real_epoch(self) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_real",
+            goal_epoch=3,
+            criteria=(CompletionCriterion(id="c0", outcome="The confirmation number is captured"),),
+        )
+        snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=4)
+        floor = build_classifier_fallback_floor(["cred_1"])
+
+        decision = reconcile_completion_criteria(snapshot, list(floor), actionable=True)
+
+        assert decision.action == "adopt_stored"
+        assert decision.reason == "empty_fresh"
+        assert decision.superseded_set_id is None
+        assert decision.criteria == stored.criteria
+
+    def test_reconcile_real_all_implicit_set_still_supersedes(self) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_old",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="The old goal is reached", implicit=True),),
+        )
+        snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
+        real_fresh = [CompletionCriterion(id="c0", outcome="A different goal is reached", implicit=True)]
+
+        decision = reconcile_completion_criteria(snapshot, real_fresh, actionable=True)
+
+        assert decision.action == "create"
+        assert decision.reason == "not_subset"
+        assert decision.superseded_set_id == "wccs_old"
+
+    def test_successful_classifier_turn_keeps_full_criteria_without_sentinel(self) -> None:
+        criteria = [
+            CompletionCriterion(id="c0", outcome="The account page is visible"),
+            CompletionCriterion(id="c1", outcome="The confirmation number is captured"),
+        ]
+
+        assert not any(is_fallback_floor_criterion(c) for c in criteria)
