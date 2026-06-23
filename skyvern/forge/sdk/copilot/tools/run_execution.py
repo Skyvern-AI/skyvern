@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
+    CriterionVerdict,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -1821,6 +1822,29 @@ def _terminal_challenge_evidence(
     return None
 
 
+def _terminal_challenge_completion_verification(
+    completion_verification: CompletionVerificationResult | None, reason: str
+) -> CompletionVerificationResult | None:
+    if completion_verification is None or completion_verification.status != "evaluated":
+        return completion_verification
+    criterion_ids = list(completion_verification.criterion_ids)
+    if not criterion_ids:
+        return completion_verification
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=criterion_ids,
+        verdicts=[
+            CriterionVerdict(
+                criterion_id=criterion_id,
+                state="unsatisfied",
+                reason_code=TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+                missing_evidence=reason,
+            )
+            for criterion_id in criterion_ids
+        ],
+    )
+
+
 # Generic failure-reason template emitted by the shared agent when the
 # browser-side scraper catches ScrapingFailed / NoElementFound. Matching on
 # the template (not the shared classifier) lets the copilot notice a repeated
@@ -2047,6 +2071,14 @@ def _record_run_blocks_result(
     if terminal_challenge is not None:
         # A structured challenge is the more actionable terminal blocker when
         # artifact-health evidence and challenge evidence appear in the same run.
+        blocked_verification = _terminal_challenge_completion_verification(
+            completion_verification, terminal_challenge.reason
+        )
+        if blocked_verification is not completion_verification:
+            completion_verification = blocked_verification
+            copilot_ctx.completion_verification_result = blocked_verification
+            record_completion_verification(copilot_ctx, blocked_verification)
+            _record_adjudication_on_turn_state(copilot_ctx, blocked_verification)
         _mark_page_inspected(copilot_ctx)
         result["ok"] = False
         result.setdefault("error", terminal_challenge.reason)
@@ -2083,7 +2115,7 @@ def _record_run_blocks_result(
             and completion_verification.status == "evaluated"
             and completion_verification.is_fully_satisfied()
         )
-        if structured_blocker:
+        if structured_blocker and not completion_fully_satisfied:
             # Terminal anti-bot blockers are handled before run_ok; this branch
             # remains for non-challenge structured blockers that still make a
             # completed run suspicious.

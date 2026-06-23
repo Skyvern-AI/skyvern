@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     _coerce_result,
     _structured_record_has_identifier,
     evaluate_completion_criteria,
+    grade_definition_criteria,
     grade_record_semantic_consistency,
     grade_structured_record_criteria,
     structured_record_has_identity,
@@ -952,7 +953,7 @@ async def test_goto_only_run_still_fails_extraction_verification(monkeypatch: py
 @pytest.mark.asyncio
 async def test_structured_blocker_run_skips_completion_verification(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        raise AssertionError("structured blocker runs must not be sent to the completion judge")
+        raise AssertionError("terminal challenge runs must not be sent to the completion judge")
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _ctx_with_blocks("code")
@@ -980,6 +981,21 @@ async def test_structured_blocker_run_skips_completion_verification(monkeypatch:
     verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
 
     assert verification is None
+
+
+def test_proxy_location_none_definition_criterion_stays_unknown() -> None:
+    verdicts = grade_definition_criteria(
+        [
+            CompletionCriterion(
+                id="c7",
+                outcome="The workflow definition sets proxy_location to NONE.",
+                level="definition",
+            )
+        ],
+        "proxy_location: NONE\nworkflow_definition:\n  blocks: []\n",
+    )
+
+    assert verdicts == [CriterionVerdict(criterion_id="c7", state="unknown", reason_code="definition_unknown")]
 
 
 @pytest.mark.asyncio

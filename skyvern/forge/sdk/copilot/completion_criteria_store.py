@@ -214,8 +214,9 @@ def note_adjudication_on_turn_state(
         return
     turn_state.adjudication_all_no_evidence_events.append(run_plane_all_no_evidence(verification))
     turn_state.last_verdict_state_counts = verification.verdict_state_counts()
-    if verification.is_fully_satisfied() and fully_satisfied_workflow_yaml:
-        turn_state.fully_satisfied_workflow_yaml = fully_satisfied_workflow_yaml
+    turn_state.fully_satisfied_workflow_yaml = (
+        fully_satisfied_workflow_yaml if verification.is_fully_satisfied() and fully_satisfied_workflow_yaml else None
+    )
 
 
 def plan_persistence(turn_state: CompletionCriteriaTurnState | None) -> PersistencePlan | None:
