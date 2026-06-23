@@ -7,6 +7,7 @@ import shutil
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List
@@ -4584,6 +4585,62 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
+def _collect_option_texts(elements: list[dict]) -> list[str]:
+    """BFS over an element tree, returning option-like text in document order with duplicates removed.
+
+    Native ``<select>`` options live on the element's ``options`` field
+    (``[{text, value, optionIndex}, ...]``); the scraper skips their child
+    ``<option>`` nodes, so this walker must inspect that field directly.
+    """
+    queue: deque[dict] = deque(elements)
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _record(text: str) -> None:
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+
+    while queue:
+        node = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes") or {}
+        role = str(attrs.get("role") or "").lower()
+        tag = str(node.get("tagName") or "").lower()
+        if role == "option" or tag in ("li", "option"):
+            _record(str(node.get("text") or "").strip())
+        for option in node.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            # Strip text before falling back to value so whitespace-only text
+            # (e.g. "   ") is treated as missing rather than recorded as empty.
+            option_text = str(option.get("text") or "").strip()
+            if not option_text:
+                option_text = str(option.get("value") or "").strip()
+            _record(option_text)
+        for child in node.get("children") or []:
+            queue.append(child)
+    return out
+
+
+def _no_match_exception_for_dropdown(
+    *,
+    reasoning: str | None,
+    target_value: str | None,
+    observed_options: list[str],
+    transient_fallback_element_id: str | None,
+) -> Exception:
+    """Return the right no-match exception: transient when the dropdown opened with zero options, permanent otherwise."""
+    if not observed_options and transient_fallback_element_id is not None:
+        return NoIncrementalElementFoundForCustomSelection(element_id=transient_fallback_element_id)
+    return NoAvailableOptionFoundForCustomSelection(
+        reason=reasoning,
+        target_value=target_value or None,
+        observed_options=observed_options,
+    )
+
+
 def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
     """Walk *elements* and return the minimal set of subtrees rooted at new IDs.
 
@@ -4702,11 +4759,18 @@ async def select_from_emerging_elements(
         response=json_response,
     )
 
-    action_type_str: str = json_response.get("action_type", "") or ""
-    action_type = ActionType(action_type_str.lower())
+    # Check the no-match shape before ``ActionType`` coercion — coercing an empty
+    # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
+    raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
-        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+        raise _no_match_exception_for_dropdown(
+            reasoning=json_response.get("reasoning"),
+            target_value=options.target_value,
+            observed_options=_collect_option_texts(new_element_subtrees),
+            transient_fallback_element_id=None,
+        )
+    action_type = ActionType(raw_action_type)
 
     new_ids_set = set(new_interactable_element_ids)
     if element_id not in new_ids_set:
@@ -4840,12 +4904,19 @@ async def select_from_dropdown(
         response=json_response,
     )
 
-    action_type: str = json_response.get("action_type", "") or ""
-    action_type = action_type.lower()
-    single_select_result.action_type = ActionType(action_type)
+    # Check the no-match shape before ``ActionType`` coercion — coercing an empty
+    # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
+    raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
-        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+        raise _no_match_exception_for_dropdown(
+            reasoning=json_response.get("reasoning"),
+            target_value=target_value,
+            observed_options=_collect_option_texts(trimmed_element_tree),
+            transient_fallback_element_id=skyvern_element.get_id(),
+        )
+    single_select_result.action_type = ActionType(raw_action_type)
+    action_type = single_select_result.action_type
 
     if not force_select and target_value:
         if not json_response.get("relevant", False):

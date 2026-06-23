@@ -65,6 +65,12 @@ MAX_DESIGN_ACTIVITY_ENTRIES = 50
 # Mirror of the FE ACTIVITY_TOOL_DENYLIST in narrativeState.ts.
 ACTIVITY_TOOL_DENYLIST = frozenset({"list_credentials", "get_run_results", "get_browser_screenshot"})
 
+# Shared classification for a code-authoring reject the streaming adapter renders
+# as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
+# consumed by the SSE layer (streaming_adapter) — one source of truth for both.
+CODE_REPAIR_PROGRESS_SURFACE_KIND = "code_repair_progress"
+CODE_REPAIR_PROGRESS_TEXT = "Refining the workflow's code"
+
 _TOOL_ACTIVITY_DISPLAY_LABELS = {
     # Mirror of the FE ACTIVITY_TOOL_DISPLAY_LABELS in narrativeState.ts.
     "update_workflow": "Updating workflow",
@@ -182,6 +188,8 @@ class NarratorState:
     block_activity: dict[str, list[NarrativeActivityEntry]] = field(default_factory=dict)
     design_activity: list[NarrativeActivityEntry] = field(default_factory=list)
     running_block_label: str | None = None
+    # Per-turn (NarratorState lives one turn); collapses repeated code-repair progress to one entry.
+    emitted_progress_texts: set[str] = field(default_factory=set)
 
     def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
         if entry is None:

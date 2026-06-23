@@ -148,7 +148,9 @@ def _role_name_from_selector(selector: str | None) -> tuple[str, str] | None:
     return role, name
 
 
-async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None) -> tuple[str, str] | None:
+async def _capture_accessible_role_name(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> tuple[str, str] | None:
     """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
 
     A failed read degrades gracefully to None so the selector-only auto-credit
@@ -166,7 +168,7 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None)
                 "skyvern_evaluate",
                 {"expression": _scout_accessible_role_name_expression(selector)},
             ),
-            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except Exception:
         return None
@@ -179,6 +181,47 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None)
     name = str(value.get("accessible_name") or "").strip()
     if not role and not name:
         return None
+    return role, name
+
+
+# A click pre-hook runs inline before the click dispatch, so the read is bounded well under the
+# discovery timeout to avoid delaying the action when the element resists a fast a11y read.
+_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS = 2.0
+
+
+async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
+    """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
+
+    A navigating click leaves only the landing page, so the post-action read returns the wrong
+    element; this captures the source-page anchor so a bare-selector navigating click still carries a
+    role/name into the trajectory."""
+    ctx.pending_scout_role_name = None
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    parsed = _role_name_from_selector(selector)
+    if parsed is not None:
+        role, name = parsed
+    else:
+        captured = await _capture_accessible_role_name(
+            ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+        )
+        if captured is None:
+            return
+        role, name = captured
+    if not role or not name:
+        return
+    ctx.pending_scout_role_name = (selector, role, name)
+
+
+def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
+    """Return the pre-navigation (role, accessible_name) only when the recorded selector matches the
+    stashed one, so a navigating click's anchor is never applied to a different element."""
+    if pending is None:
+        return "", ""
+    stashed_selector, role, name = pending
+    if stashed_selector != _selector_text(selector):
+        return "", ""
     return role, name
 
 
@@ -725,7 +768,16 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
 
     post_url = await _live_working_page_url(ctx) or url
     post_evidence = await _scout_act_observe_page_evidence(ctx, url=post_url)
-    _record_scouted_interaction(ctx, tool_name="click", selector=selector, source_url=pre_url)
+    navigated = bool(pre_url) and bool(post_url) and pre_url != post_url
+    role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+    _record_scouted_interaction(
+        ctx,
+        tool_name="click",
+        selector=selector,
+        source_url=pre_url,
+        role=role,
+        accessible_name=accessible_name,
+    )
 
     for key in ("next_action", "next_action_reason", "actionable_targets"):
         data.pop(key, None)

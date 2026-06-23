@@ -39,9 +39,10 @@ export function useBitwardenCredential() {
         .then((response) => response.data as BitwardenCredentialResponse);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["bitwardenOrganizationAuthToken"],
       });
+      void queryClient.invalidateQueries({ queryKey: ["bitwardenItems"] });
       toast({
         title: "Success",
         description: "Bitwarden credential updated successfully",
@@ -64,6 +65,7 @@ export function useBitwardenCredential() {
   const clearCredentialMutation = useClearOrganizationAuthToken({
     providerPath: "bitwarden",
     queryKey: "bitwardenOrganizationAuthToken",
+    invalidateQueryKeys: ["bitwardenItems"],
     successDescription: "Bitwarden credential cleared successfully",
     errorDescription: "Failed to clear Bitwarden credential",
   });

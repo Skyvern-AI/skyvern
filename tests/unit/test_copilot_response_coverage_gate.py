@@ -61,6 +61,8 @@ class _Ctx:
         self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
+        self.last_artifact_health_blocker_reason = None
+        self.completion_verification_result = None
 
 
 @dataclass

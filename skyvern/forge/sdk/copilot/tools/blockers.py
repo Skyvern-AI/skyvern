@@ -17,6 +17,9 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     loop_blocker_evidence_from_ctx,
     refresh_held_loop_blocker_evidence,
 )
+from skyvern.forge.sdk.copilot.completion_verification import (
+    structured_record_has_goal_content as _structured_record_candidate_has_goal_content,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
@@ -52,6 +55,8 @@ from ._shared import (
     _is_meaningful_extracted_data,
     _parse_workflow_blocks,
     _raw_yaml_proxy_location,
+    _registered_output_parameter_payloads,
+    _workflow_output_parameter_payloads,
 )
 
 LOG = structlog.get_logger()
@@ -1641,6 +1646,7 @@ def _analyze_run_blocks(
     has_data_blocks = False
     any_data_output = False
     missing_metadata_goal_content = False
+    complete_structured_record_output = False
 
     blocks = data.get("blocks")
     if isinstance(blocks, list):
@@ -1675,6 +1681,13 @@ def _analyze_run_blocks(
                 )
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)
+                output_parameter_payloads = _workflow_output_parameter_payloads(extracted)
+                if output_parameter_payloads:
+                    has_data_blocks = True
+                    if any(_is_meaningful_extracted_data(value) for value in output_parameter_payloads.values()):
+                        any_data_output = True
+                    if any(_structured_record_has_goal_content(value) for value in output_parameter_payloads.values()):
+                        complete_structured_record_output = True
                 extraction_schema = _extraction_schema_for_code_block(copilot_ctx, block.get("label"))
                 # Array-typed schemas would coerce the keyed dict return to [] (fill_missing_fields), making the
                 # goal-path check below read a real extraction as empty; the keyed-return floor guarantees a dict.
@@ -1687,8 +1700,10 @@ def _analyze_run_blocks(
                 goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
                 if goal_value_paths:
                     has_data_blocks = True
-                    if _code_output_has_registered_download_content(extracted) or _code_output_goal_paths_have_content(
-                        extracted, goal_value_paths
+                    if (
+                        _code_output_has_registered_download_content(extracted)
+                        or _code_output_goal_paths_have_content(extracted, goal_value_paths)
+                        or _structured_record_has_goal_content(extracted)
                     ):
                         any_data_output = True
                     else:
@@ -1706,6 +1721,32 @@ def _analyze_run_blocks(
                 if _code_output_has_goal_content(extracted, declared_keys=declared_keys):
                     any_data_output = True
 
+    top_level_output_payloads = _workflow_output_parameter_payloads(data.get("output"))
+    if top_level_output_payloads:
+        has_data_blocks = True
+        if any(_is_meaningful_extracted_data(value) for value in top_level_output_payloads.values()):
+            any_data_output = True
+        if any(_structured_record_has_goal_content(value) for value in top_level_output_payloads.values()):
+            complete_structured_record_output = True
+
+    registered_payloads = _registered_output_parameter_payloads(data)
+    if registered_payloads:
+        has_data_blocks = True
+        for registered in registered_payloads:
+            value = registered.get("value")
+            if _is_meaningful_extracted_data(value):
+                any_data_output = True
+            if _structured_record_has_goal_content(value):
+                complete_structured_record_output = True
+            structured_blocker = _structured_blocker_message(
+                value,
+                include_flag_keys=True,
+                key_terms=_STRICT_BLOCKER_FLAG_TERMS,
+                scan_all_values_for_anti_bot=True,
+            )
+            if structured_blocker:
+                texts_to_scan.append(structured_blocker)
+
     combined = "\n".join(texts_to_scan)
     categories = classify_from_failure_reason(combined)
     if categories:
@@ -1714,5 +1755,25 @@ def _analyze_run_blocks(
                 anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
                 break
 
+    if complete_structured_record_output:
+        if missing_metadata_goal_content:
+            LOG.info(
+                "copilot run evidence: a complete structured-record output suppressed a "
+                "per-block missing-metadata-goal-content signal",
+                workflow_run_id=data.get("workflow_run_id"),
+            )
+        missing_metadata_goal_content = False
     empty_data_blocks = (has_data_blocks and not any_data_output) or missing_metadata_goal_content
     return anti_bot_match, empty_data_blocks, categories
+
+
+def _structured_record_has_goal_content(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    candidates = [value]
+    candidates.extend(
+        nested
+        for key, nested in value.items()
+        if isinstance(key, str) and key.endswith("_output") and isinstance(nested, dict)
+    )
+    return any(_structured_record_candidate_has_goal_content(candidate) for candidate in candidates)

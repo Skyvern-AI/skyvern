@@ -9,16 +9,20 @@ import ast
 import json
 import keyword
 import sys
+import textwrap
 from typing import Any
 
 import pytest
 
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
+from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
     _MAX_STEPS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    _get_by_role_expr,
+    _get_by_role_expr_strict,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     is_optional_dismissal_only_trajectory,
@@ -248,6 +252,113 @@ class TestLocatorSynthesis:
         assert result is not None
         assert 'await page.locator("*[data-id]").click()' in result.code
         assert ".first" not in result.code
+
+    def test_strict_bare_selector_with_role_name_reanchors_to_get_by_role(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#statement-row", source_url="https://example.com/billing"),
+            _interaction(
+                "click",
+                selector="a",
+                source_url="https://example.com/billing",
+                role="link",
+                accessible_name="View Statements",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="View Statements", exact=True).click()' in result.code
+        assert ".first" not in result.code
+        assert result.diagnostics.dropped_interactions == []
+        provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
+        assert provenance == [
+            {
+                "trajectory_index": 1,
+                "selector": "a",
+                "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
+                "source": "aria_role_name",
+                "role": "link",
+                "name": "View Statements",
+            }
+        ]
+
+    def test_strict_bare_role_selector_with_name_reanchors_to_get_by_role(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="role=link",
+                source_url="https://example.com/home",
+                role="link",
+                accessible_name="Continue",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="Continue", exact=True).click()' in result.code
+        assert result.diagnostics.dropped_interactions == []
+
+    def test_strict_bare_selector_without_role_name_is_still_dropped(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open-login", source_url="https://example.com/home"),
+            _interaction("click", selector="a", source_url="https://example.com/account"),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "get_by_role" not in result.code
+        dropped = [
+            d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
+        ]
+        assert dropped
+
+    def test_strict_reanchor_escapes_quotes_and_newlines_in_name(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="a",
+                source_url="https://example.com/home",
+                role="link",
+                accessible_name='Say "hi"\nplease',
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert result.diagnostics.dropped_interactions == []
+        emitted = _get_by_role_expr_strict("link", 'Say "hi"\nplease')
+        assert "exact=True" in emitted
+        assert "\n" not in emitted
+        assert f"await {emitted}.click()" in result.code
+
+    def test_strict_reanchor_emits_exact_name_match_for_repeated_affordance(self) -> None:
+        # AC1: a re-anchored named get_by_role on a page with a repeated accessible name must emit an
+        # exact (single (role, name) group) match, never the substring default that over-matches.
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/billing"),
+            _interaction(
+                "click",
+                selector="a",
+                source_url="https://example.com/billing",
+                role="link",
+                accessible_name="Download",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert 'await page.get_by_role("link", name="Download", exact=True).click()' in result.code
+        assert ".nth(" not in result.code
+        assert result.diagnostics.dropped_interactions == []
+        provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
+        assert provenance == [
+            {
+                "trajectory_index": 1,
+                "selector": "a",
+                "emitted_literal": _get_by_role_expr_strict("link", "Download"),
+                "source": "aria_role_name",
+                "role": "link",
+                "name": "Download",
+            }
+        ]
+        assert provenance[0]["emitted_literal"] != _get_by_role_expr("link", "Download")
 
 
 class TestActionSynthesis:
@@ -1251,6 +1362,47 @@ class TestPreflightSurfacesSyntaxError:
         # A malformed block must be caught at authoring time, not swallowed into a silent run-time failure.
         diagnostics = preflight_code_block('await page.goto("unterminated)\n', parameter_keys=())
         assert any(d.code == "SYNTAX_ERROR" for d in diagnostics)
+
+    @pytest.mark.parametrize(
+        ("code", "reason"),
+        [
+            ("await page.request.post('https://example.com/collect')", "AUTHOR_PAGE_REQUEST"),
+            ("state = await page.context.storage_state()", "AUTHOR_PAGE_CONTEXT"),
+            ("text = await page.evaluate('() => document.body.innerText')", "AUTHOR_PAGE_EVALUATE"),
+            ("handle = await page.evaluate_handle('() => document.body')", "AUTHOR_PAGE_EVALUATE"),
+        ],
+    )
+    def test_denied_page_api_attributes_surface_preflight_reason_codes(self, code: str, reason: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert [diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")] == [reason]
+        assert any("not allowed in persisted workflow code blocks" in diagnostic.message for diagnostic in diagnostics)
+
+    def test_denied_page_api_preflight_reason_codes_match_author_time_security_source(self) -> None:
+        code = """
+        await page.request.post("https://example.com/collect")
+        state = await page.context.storage_state()
+        text = await page.evaluate("() => document.body.innerText")
+        handle = await page.evaluate_handle("() => document.body")
+        """
+
+        normalized_code = textwrap.dedent(code).strip()
+        diagnostics = preflight_code_block(code, parameter_keys=())
+        security_errors = author_time_code_security_errors(label="search_registry", code=normalized_code)
+
+        preflight_reasons = {
+            diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")
+        }
+        security_reasons = {error.reason_code for error in security_errors}
+        assert (
+            preflight_reasons
+            == security_reasons
+            == {
+                "AUTHOR_PAGE_REQUEST",
+                "AUTHOR_PAGE_CONTEXT",
+                "AUTHOR_PAGE_EVALUATE",
+            }
+        )
 
     def test_broad_body_text_wait_for_function_surfaces_selection_diagnostic(self) -> None:
         code = (

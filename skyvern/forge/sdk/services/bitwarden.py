@@ -27,6 +27,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.schemas.credentials import (
+    BitwardenItemOverview,
     CredentialItem,
     CredentialType,
     CreditCardBillingAddress,
@@ -185,6 +186,55 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
         raise BitwardenGetItemError(f"Unsupported item type: {item['type']}")
 
 
+def get_bitwarden_item_overview_from_bitwarden_item(
+    item: dict,
+    allowed_collection_ids: list[str] | None = None,
+    preferred_collection_id: str | None = None,
+) -> BitwardenItemOverview | None:
+    item_id, title, item_type = item.get("id"), item.get("name"), item.get("type")
+    if not isinstance(item_type, int):
+        return None
+    try:
+        credential_type = {
+            BitwardenItemType.LOGIN: CredentialType.PASSWORD,
+            BitwardenItemType.CREDIT_CARD: CredentialType.CREDIT_CARD,
+            BitwardenItemType.SECURE_NOTE: CredentialType.SECRET,
+            BitwardenItemType.IDENTITY: CredentialType.SECRET,
+        }[BitwardenItemType(item_type)]
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(item_id, str) or not isinstance(title, str):
+        return None
+
+    collection_ids = [str(collection_id) for collection_id in item.get("collectionIds") or [] if collection_id]
+    allowed_collection_ids = allowed_collection_ids or []
+    # Collection-scoped CLI queries can omit collectionIds, so keep the queried collection as a fallback.
+    collection_id = (
+        preferred_collection_id
+        if preferred_collection_id and preferred_collection_id in collection_ids
+        else next((cid for cid in collection_ids if cid in allowed_collection_ids), None)
+        or (collection_ids[0] if collection_ids else preferred_collection_id)
+    )
+    login = item.get("login")
+    uris = login.get("uris") if isinstance(login, dict) else []
+    url = next(
+        (
+            uri.get("uri")
+            for uri in uris or []
+            if isinstance(uri, dict) and isinstance(uri.get("uri"), str) and uri.get("uri")
+        ),
+        None,
+    )
+
+    return BitwardenItemOverview(
+        item_id=item_id,
+        title=title,
+        collection_id=collection_id,
+        credential_type=credential_type,
+        url=url,
+    )
+
+
 def is_valid_email(email: str | None) -> bool:
     if not email:
         return False
@@ -233,6 +283,8 @@ class RunCommandResult(BaseModel):
 
 
 class BitwardenService:
+    _cli_session_lock: asyncio.Lock = asyncio.Lock()
+
     @staticmethod
     def _is_ignorable_login_stderr(stderr: str) -> bool:
         lines = [line.strip() for line in stderr.splitlines() if line.strip()]
@@ -323,6 +375,98 @@ class BitwardenService:
         return None
 
     @staticmethod
+    async def _list_items_using_cli(
+        session_key: str,
+        bw_organization_id: str | None = None,
+        collection_id: str | None = None,
+        timeout: int = 60,
+    ) -> list[dict]:
+        list_command = ["bw", "list", "items", "--session", session_key]
+        if bw_organization_id:
+            list_command.extend(["--organizationid", bw_organization_id])
+        if collection_id:
+            list_command.extend(["--collectionid", collection_id])
+
+        items_result = await BitwardenService.run_command(list_command, timeout=timeout)
+        if items_result.returncode != 0:
+            raise BitwardenListItemsError(f"Failed to list Bitwarden items. Error: {items_result.stderr}")
+
+        try:
+            items = json.loads(items_result.stdout)
+            if isinstance(items, list):
+                return items
+        except json.JSONDecodeError:
+            pass
+        raise BitwardenListItemsError("Failed to parse items JSON")
+
+    @staticmethod
+    async def list_item_overviews(
+        client_id: str | None,
+        client_secret: str | None,
+        master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
+        email: str,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+    ) -> list[BitwardenItemOverview]:
+        if not email or not master_password:
+            raise BitwardenLoginError("Bitwarden item listing requires org-scoped email and master password")
+
+        await BitwardenService._apply_jitter()
+        async with asyncio.timeout(timeout):
+            async with BitwardenService._cli_session_lock:
+                try:
+                    # The Bitwarden CLI stores active login state globally, so the whole session workflow is locked.
+                    await BitwardenService.logout()
+                    await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
+                    await BitwardenService.sync()
+                    session_key = await BitwardenService.unlock(master_password)
+                    raw_items_with_preferred_collection: list[tuple[dict, str | None]] = []
+
+                    if bw_organization_id:
+                        raw_items = await BitwardenService._list_items_using_cli(
+                            session_key=session_key,
+                            bw_organization_id=bw_organization_id,
+                            timeout=timeout,
+                        )
+                        allowed_collection_ids = set(bw_collection_ids or [])
+                        if allowed_collection_ids:
+                            raw_items = [
+                                item
+                                for item in raw_items
+                                if any(cid in allowed_collection_ids for cid in item.get("collectionIds") or [])
+                            ]
+                        raw_items_with_preferred_collection = [(item, None) for item in raw_items]
+                    elif bw_collection_ids:
+                        for collection_id in bw_collection_ids:
+                            raw_items = await BitwardenService._list_items_using_cli(
+                                session_key=session_key,
+                                collection_id=collection_id,
+                                timeout=timeout,
+                            )
+                            raw_items_with_preferred_collection.extend((item, collection_id) for item in raw_items)
+                    else:
+                        raw_items = await BitwardenService._list_items_using_cli(
+                            session_key=session_key, timeout=timeout
+                        )
+                        raw_items_with_preferred_collection = [(item, None) for item in raw_items]
+
+                    overviews: list[BitwardenItemOverview] = []
+                    seen_item_ids: set[str] = set()
+                    for item, preferred_collection_id in raw_items_with_preferred_collection:
+                        overview = get_bitwarden_item_overview_from_bitwarden_item(
+                            item,
+                            allowed_collection_ids=bw_collection_ids,
+                            preferred_collection_id=preferred_collection_id,
+                        )
+                        if overview is not None and overview.item_id not in seen_item_ids:
+                            seen_item_ids.add(overview.item_id)
+                            overviews.append(overview)
+                    return overviews
+                finally:
+                    await BitwardenService.logout()
+
+    @staticmethod
     async def get_secret_value_from_url(
         client_id: str | None,
         client_secret: str | None,
@@ -352,18 +496,19 @@ class BitwardenService:
             timeout = (i + 1) * timeout
             try:
                 async with asyncio.timeout(timeout):
-                    return await BitwardenService._get_secret_value_from_url(
-                        client_id=client_id,
-                        client_secret=client_secret,
-                        master_password=master_password,
-                        bw_organization_id=bw_organization_id,
-                        bw_collection_ids=bw_collection_ids,
-                        url=url,
-                        collection_id=collection_id,
-                        item_id=item_id,
-                        timeout=timeout,
-                        email=email,
-                    )
+                    async with BitwardenService._cli_session_lock:
+                        return await BitwardenService._get_secret_value_from_url(
+                            client_id=client_id,
+                            client_secret=client_secret,
+                            master_password=master_password,
+                            bw_organization_id=bw_organization_id,
+                            bw_collection_ids=bw_collection_ids,
+                            url=url,
+                            collection_id=collection_id,
+                            item_id=item_id,
+                            timeout=timeout,
+                            email=email,
+                        )
             except BitwardenAccessDeniedError as e:
                 raise e
             except Exception as e:
@@ -548,17 +693,18 @@ class BitwardenService:
             await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(timeout):
-                return await BitwardenService._get_sensitive_information_from_identity(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    master_password=master_password,
-                    bw_organization_id=bw_organization_id,
-                    bw_collection_ids=bw_collection_ids,
-                    collection_id=collection_id,
-                    identity_key=identity_key,
-                    identity_fields=identity_fields,
-                    email=email,
-                )
+                async with BitwardenService._cli_session_lock:
+                    return await BitwardenService._get_sensitive_information_from_identity(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        master_password=master_password,
+                        bw_organization_id=bw_organization_id,
+                        bw_collection_ids=bw_collection_ids,
+                        collection_id=collection_id,
+                        identity_key=identity_key,
+                        identity_fields=identity_fields,
+                        email=email,
+                    )
         except BitwardenAccessDeniedError as e:
             raise e
         except Exception as e:
@@ -852,16 +998,17 @@ class BitwardenService:
             await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
-                return await BitwardenService._get_credit_card_data(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    master_password=master_password,
-                    bw_organization_id=bw_organization_id,
-                    bw_collection_ids=bw_collection_ids,
-                    collection_id=collection_id,
-                    item_id=item_id,
-                    email=email,
-                )
+                async with BitwardenService._cli_session_lock:
+                    return await BitwardenService._get_credit_card_data(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        master_password=master_password,
+                        bw_organization_id=bw_organization_id,
+                        bw_collection_ids=bw_collection_ids,
+                        collection_id=collection_id,
+                        item_id=item_id,
+                        email=email,
+                    )
         except BitwardenAccessDeniedError as e:
             raise e
         except Exception as e:

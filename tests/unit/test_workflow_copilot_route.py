@@ -1341,3 +1341,36 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest
         "legacy V1 path must stash the LLM-emitted YAML on the proposal so "
         "/apply-proposed-workflow can re-create the workflow version"
     )
+
+
+@pytest.mark.asyncio
+async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = SimpleNamespace(
+        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "built"}),
+        workflow_yaml="title: built\n",
+        clear_proposed_workflow=False,
+        proposal_disposition="review_tested",
+        cancelled=False,
+        apply_without_review=False,
+        output_policy_diagnostics=None,
+        canonical_was_persisted_due_to_param_change=False,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    persisted = calls[0].kwargs["proposed_workflow"]
+    assert persisted is not None
+    assert persisted.get("_copilot_unvalidated") is not True
