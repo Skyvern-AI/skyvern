@@ -504,10 +504,20 @@ export const ReadableActionTypes: {
   execute_js: "Execute JS",
 };
 
+type GetReadableActionTypeOptions = {
+  nullActionLabel?: string;
+};
+
 // Recorded code-block actions can carry an action_type the readable map doesn't
 // list yet (the runtime recorder maps more Playwright calls than the UI enumerates).
 // Humanize unknown types instead of rendering a blank badge.
-export function getReadableActionType(actionType: string): string {
+export function getReadableActionType(
+  actionType: string,
+  options: GetReadableActionTypeOptions = {},
+): string {
+  if (actionType === ActionTypes.NullAction && options.nullActionLabel) {
+    return options.nullActionLabel;
+  }
   const known = ReadableActionTypes[actionType as ActionType];
   if (known) {
     return known;
