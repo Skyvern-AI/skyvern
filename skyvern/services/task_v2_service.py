@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import string
@@ -28,7 +29,14 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
+from skyvern.forge.sdk.schemas.task_v2 import (
+    TaskV2,
+    TaskV2Metadata,
+    TaskV2Status,
+    Thought,
+    ThoughtScenario,
+    ThoughtType,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import (
@@ -908,6 +916,7 @@ async def run_task_v2_helper(
                     iteration=i,
                     workflow_run_id=workflow_run_id,
                 )
+                await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
@@ -1176,6 +1185,7 @@ async def run_task_v2_helper(
                     workflow_run_id=workflow_run_id,
                     completion_resp=completion_resp,
                 )
+                await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
@@ -2076,6 +2086,59 @@ async def _get_navigate_complete_output(
         # don't fall back to a stale earlier COMPLETE.
         return None
     return None
+
+
+async def _persist_completion_tab_screenshots(browser_state: BrowserState, thought: Thought) -> int:
+    """Capture one screenshot per open tab at completion, persisting each as a SCREENSHOT_LLM artifact.
+
+    Best-effort: runs after the goal is already achieved, so nothing here may raise into the
+    completion path and flip a successful run to failed.
+    """
+    captured = 0
+    try:
+        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
+        # close the very tabs we are trying to prove remain open.
+        pages = await browser_state.list_valid_pages(max_pages=0)
+        # A lone tab is already captured by the completion check; only multi-tab runs need this.
+        if len(pages) <= 1:
+            return 0
+
+        per_tab_timeout = settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
+        # Overall budget so a handful of still-loading tabs can't stall the post-success path.
+        async with asyncio.timeout(settings.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
+            for page in pages[: settings.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
+                screenshots: list[bytes] = []
+                try:
+                    # Bound each tab: a slow tab's bring_to_front / load-wait must not stall completion.
+                    async with asyncio.timeout(per_tab_timeout):
+                        try:
+                            # Front each tab so Chromium paints lazily-rendered background content.
+                            await page.bring_to_front()
+                        except Exception:
+                            LOG.debug("Failed to bring tab to front before completion screenshot", exc_info=True)
+                        screenshots = await SkyvernFrame.take_split_screenshots(page=page, scroll=False)
+                except Exception:
+                    LOG.warning("Failed to capture completion screenshot for an open tab", exc_info=True)
+                    continue
+                for screenshot in screenshots:
+                    try:
+                        await app.ARTIFACT_MANAGER.create_thought_artifact(
+                            thought=thought,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
+                        captured += 1
+                    except Exception:
+                        LOG.warning("Failed to persist completion tab screenshot artifact", exc_info=True)
+    except Exception:
+        LOG.warning("Aborted capturing completion tab screenshots", captured=captured, exc_info=True)
+
+    LOG.info(
+        "Captured end-state per-tab screenshots at task_v2 completion",
+        captured=captured,
+        observer_thought_id=thought.observer_thought_id,
+    )
+    return captured
 
 
 async def _summarize_task_v2(

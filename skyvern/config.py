@@ -120,6 +120,11 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
+    # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
+    MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
+    # Overall wall-clock budget for the completion screenshot loop.
+    COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS: float = 60.0
     MAX_NUM_SCREENSHOTS: int = 10
     # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
     # screenshot spend can be monitored independently of the provider's blended tokens.
