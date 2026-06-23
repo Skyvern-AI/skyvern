@@ -96,12 +96,16 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-function renderEditor(readOnly: boolean = false, view?: "plain" | "code") {
+function renderEditor(readOnly: boolean = false) {
   return render(
     <WorkflowScopeContext.Provider value={{ workflowId: "w", readOnly }}>
-      <CodeBlockEditor blockId="cb1" view={view} />
+      <CodeBlockEditor blockId="cb1" />
     </WorkflowScopeContext.Provider>,
   );
+}
+
+function switchToCode() {
+  fireEvent.click(screen.getByRole("button", { name: /Code/ }));
 }
 
 const codeFirstData: Partial<CodeBlockNodeData> = {
@@ -138,29 +142,29 @@ test("wires the jinja highlight into the code editor", () => {
 });
 
 describe("CodeBlockEditor for a code-first block", () => {
-  test("renders goal, steps, and code panel in order", () => {
-    node.data = { ...baseData, ...codeFirstData };
-    const { container } = renderEditor();
-
-    expect(screen.getByText("Goal")).toBeTruthy();
-    expect(screen.getByText("Steps (1)")).toBeTruthy();
-    expect(screen.getByText("Open the page")).toBeTruthy();
-    expect(screen.getByText("goto_url")).toBeTruthy();
-
-    const text = container.textContent ?? "";
-    const order = ["Goal", "Steps (1)", "Code Input"].map((label) =>
-      text.indexOf(label),
-    );
-    expect(order).toEqual([...order].sort((a, b) => a - b));
-    expect(order.every((index) => index >= 0)).toBe(true);
-  });
-
-  test("renders the inputs selector alongside the code panel", () => {
+  test("defaults to the plain view: goal and steps, no inputs or code editor", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor();
 
+    expect(screen.getByText("Goal")).toBeTruthy();
+    expect(screen.getByText("Open the page")).toBeTruthy();
+    // The readable action label is the per-step subtitle.
+    expect(screen.getByText("Goto URL")).toBeTruthy();
+    // Inputs and the code editor live in the code view, not the plain view.
+    expect(screen.queryByText("Inputs")).toBeNull();
+    expect(screen.queryByTestId("code-editor")).toBeNull();
+  });
+
+  test("exposes the inputs selector and code panel in the code view", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+    switchToCode();
+
     expect(screen.getByText("Inputs")).toBeTruthy();
     expect(screen.getByText("Code Input")).toBeTruthy();
+    expect(screen.getByTestId("code-editor")).toBeTruthy();
+    // The goal lives in the plain view only.
+    expect(screen.queryByText("Goal")).toBeNull();
   });
 
   test("uses the parameter-autocomplete textarea for the goal", () => {
@@ -187,9 +191,10 @@ describe("CodeBlockEditor for a code-first block", () => {
     });
   });
 
-  test("collapses and expands the step list", () => {
+  test("collapses and expands the step list in the code view", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor();
+    switchToCode();
 
     const toggle = () => screen.getByRole("button", { name: /Steps \(1\)/ });
     expect(screen.getByText("Open the page")).toBeTruthy();
@@ -204,11 +209,12 @@ describe("CodeBlockEditor for a code-first block", () => {
     expect(toggle().getAttribute("aria-expanded")).toBe("true");
   });
 
-  test("omits the step list when the block has no steps", () => {
+  test("omits the code-view step list when the block has no steps", () => {
     node.data = { ...baseData, ...codeFirstData, steps: [] };
     renderEditor();
+    switchToCode();
 
-    expect(screen.getByText("Goal")).toBeTruthy();
+    expect(screen.getByText("Code Input")).toBeTruthy();
     expect(screen.queryByText(/Steps \(/)).toBeNull();
   });
 });
@@ -232,9 +238,10 @@ describe("CodeBlockEditor step-to-code highlighting", () => {
     ],
   };
 
-  test("shows each step's line range", () => {
+  test("shows each step's line range in the code view", () => {
     node.data = { ...baseData, ...steppedData };
     renderEditor();
+    switchToCode();
 
     expect(screen.getByText("L2-3")).toBeTruthy();
     expect(screen.getByText("L5")).toBeTruthy();
@@ -243,6 +250,7 @@ describe("CodeBlockEditor step-to-code highlighting", () => {
   test("highlights the clicked step's lines and toggles off", () => {
     node.data = { ...baseData, ...steppedData };
     renderEditor();
+    switchToCode();
 
     const editor = () => screen.getByTestId("code-editor");
     // Baseline: jinja only (2 extensions), no active step.
@@ -267,7 +275,7 @@ describe("CodeBlockEditor for a legacy block", () => {
     expect(screen.getByText("Inputs")).toBeTruthy();
     expect(screen.getByText("Code Input")).toBeTruthy();
     expect(screen.queryByText("Goal")).toBeNull();
-    expect(screen.queryByText(/Steps \(/)).toBeNull();
+    expect(screen.queryByText("View")).toBeNull();
     expect(screen.queryAllByTestId("block-input-textarea")).toHaveLength(0);
   });
 
@@ -286,55 +294,42 @@ describe("CodeBlockEditor for a legacy block", () => {
 });
 
 describe("CodeBlockEditor for a newly-added block from the node adder", () => {
-  test("renders the code-first layout because the default goal is non-null", () => {
+  test("renders the code-first plain view because the default goal is non-null", () => {
     node.data = { ...codeBlockNodeDefaultData, label: "code_block" };
     renderEditor();
 
     expect(screen.getByText("Goal")).toBeTruthy();
+    expect(screen.getByText("View")).toBeTruthy();
     // Steps are copilot-authored annotations, so a hand-added block has none yet.
-    expect(screen.queryByText(/Steps \(/)).toBeNull();
+    expect(screen.getByText(/No steps yet/)).toBeTruthy();
   });
 });
 
-describe("CodeBlockEditor plain view", () => {
-  test("shows goal and steps but not inputs or the code editor", () => {
+describe("CodeBlockEditor view toggle", () => {
+  test("switches between the plain and code views", () => {
     node.data = { ...baseData, ...codeFirstData };
-    renderEditor(false, "plain");
+    renderEditor(false);
 
-    expect(screen.getByText("Goal")).toBeTruthy();
-    expect(screen.getByText("What Skyvern will do")).toBeTruthy();
-    expect(screen.getByText("Open the page")).toBeTruthy();
-    // The readable action label is the per-step subtitle.
-    expect(screen.getByText("Goto URL")).toBeTruthy();
-    // Inputs and the code editor live outside the plain view now.
-    expect(screen.queryByText("Inputs")).toBeNull();
+    // Plain by default.
+    expect(screen.getByTitle("Open the page")).toBeTruthy();
     expect(screen.queryByTestId("code-editor")).toBeNull();
-  });
 
-  test("shows an empty hint when a code-first block has no steps", () => {
-    node.data = { ...baseData, ...codeFirstData, steps: [] };
-    renderEditor(false, "plain");
-
-    expect(screen.getByText("What Skyvern will do")).toBeTruthy();
-    expect(screen.getByText(/No steps yet/)).toBeTruthy();
-    expect(screen.queryByTestId("code-editor")).toBeNull();
-  });
-
-  test("renders inputs and the code editor when the view is code", () => {
-    node.data = { ...baseData, ...codeFirstData };
-    renderEditor(false, "code");
-
+    switchToCode();
     expect(screen.getByTestId("code-editor")).toBeTruthy();
     expect(screen.getByText("Inputs")).toBeTruthy();
-    expect(screen.queryByText("Goal")).toBeNull();
-    expect(screen.queryByText("What Skyvern will do")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Plain" }));
+    expect(screen.queryByTestId("code-editor")).toBeNull();
+    expect(screen.getByText("Goal")).toBeTruthy();
   });
 
-  test("ignores the split view for a legacy block without a goal", () => {
-    renderEditor(false, "plain");
+  test("shows an empty hint in the plain view when there are no steps", () => {
+    node.data = { ...baseData, ...codeFirstData, steps: [] };
+    renderEditor(false);
 
-    expect(screen.queryByText("What Skyvern will do")).toBeNull();
-    expect(screen.getByText("Code Input")).toBeTruthy();
+    expect(screen.getByText("Goal")).toBeTruthy();
+    expect(screen.getByText(/No steps yet/)).toBeTruthy();
+    expect(screen.queryByTestId("code-editor")).toBeNull();
   });
 });
 
@@ -346,7 +341,7 @@ describe("CodeBlockEditor without code-first access", () => {
 
     expect(screen.getByText("Code Input")).toBeTruthy();
     expect(screen.queryByText("Goal")).toBeNull();
-    expect(screen.queryByText(/Steps \(/)).toBeNull();
+    expect(screen.queryByText("View")).toBeNull();
   });
 });
 
