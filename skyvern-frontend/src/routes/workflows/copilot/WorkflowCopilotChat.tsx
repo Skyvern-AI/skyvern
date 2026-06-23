@@ -2321,7 +2321,10 @@ export function WorkflowCopilotChat({
                       setCodeWorkflow(false);
                       setCodeBlockRequestOverride(null);
                     }}
-                    className="flex items-start gap-2.5"
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      !isBuild && "bg-accent",
+                    )}
                   >
                     <ModeGlyph mode="ask" />
                     <span className="flex flex-1 flex-col">
@@ -2341,7 +2344,10 @@ export function WorkflowCopilotChat({
                       setCodeWorkflow(false);
                       setCodeBlockRequestOverride(false);
                     }}
-                    className="flex items-start gap-2.5"
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      isBuild && !codeWorkflow && "bg-accent",
+                    )}
                   >
                     <ModeGlyph mode="build" />
                     <span className="flex flex-1 flex-col">
@@ -2357,18 +2363,21 @@ export function WorkflowCopilotChat({
                   </DropdownMenuItem>
                   {codeOptionAvailable ? (
                     <DropdownMenuItem
-                      aria-label="Build with code"
+                      aria-label="Build workflow as code"
                       onSelect={() => {
                         setComposerMode("build");
                         setCodeWorkflow(true);
                         setCodeBlockRequestOverride(true);
                       }}
-                      className="flex items-start gap-2.5"
+                      className={cn(
+                        "flex items-start gap-2.5",
+                        isBuild && codeWorkflow && "bg-accent",
+                      )}
                     >
                       <ModeGlyph mode="build" glow />
                       <span className="flex flex-1 flex-col">
                         <span className="text-sm font-medium">
-                          Build with code
+                          Build workflow as code
                         </span>
                         <span className="text-xs leading-snug text-muted-foreground">
                           Build the workflow as code. Faster and more flexible,
