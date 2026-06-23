@@ -493,6 +493,22 @@ class TestCodeSafetySeam:
     def test_safe_code_passes(self) -> None:
         assert _code_block_safety_errors(_SAFE_CODE_YAML, None) == []
 
+    @pytest.mark.asyncio
+    async def test_denied_page_api_attribute_is_repairable_preflight_error_without_duplicate_generic_message(
+        self,
+    ) -> None:
+        result = await _update_workflow(
+            {"workflow_yaml": _code_yaml("text = await page.evaluate('() => document.body.innerText')")},
+            _standard_ctx(),
+        )
+
+        assert result["ok"] is False
+        joined = result["error"]
+        assert "AUTHOR_PAGE_EVALUATE" in joined
+        assert "failed the generated-code preflight check" in joined
+        assert joined.count("failed the sandbox safety check") == 0
+        assert joined.count("page.evaluate is not allowed") == 1
+
     def test_unresolved_sandbox_names_are_seam_errors(self) -> None:
         errors = _code_block_safety_errors(
             _code_yaml(
