@@ -307,35 +307,6 @@ class WorkflowRunsRepository(BaseRepository):
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
-    @db_operation("claim_workflow_run_webhook_delivery")
-    async def claim_workflow_run_webhook_delivery(
-        self,
-        *,
-        workflow_run_id: str,
-        in_progress_reason: str,
-        claim_older_than: datetime | None = None,
-    ) -> bool:
-        delivery_state_filter = WorkflowRunModel.webhook_failure_reason.is_(None)
-        if claim_older_than is not None:
-            stale_claim_cutoff = to_naive_utc(claim_older_than)
-            delivery_state_filter = or_(
-                delivery_state_filter,
-                and_(
-                    WorkflowRunModel.webhook_failure_reason == in_progress_reason,
-                    WorkflowRunModel.modified_at <= stale_claim_cutoff,
-                ),
-            )
-
-        async with self.Session() as session:
-            result = await session.execute(
-                update(WorkflowRunModel)
-                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
-                .where(delivery_state_filter)
-                .values(webhook_failure_reason=in_progress_reason, modified_at=naive_utc_now())
-            )
-            await session.commit()
-            return result.rowcount == 1
-
     @db_operation("increment_workflow_run_credits")
     async def increment_workflow_run_credits(
         self,
@@ -852,48 +823,6 @@ class WorkflowRunsRepository(BaseRepository):
         """
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(depends_on_workflow_run_id=workflow_run_id)
-            workflow_runs = (await session.scalars(query)).all()
-            return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
-
-    @db_operation("get_workflow_runs_with_pending_webhook_delivery")
-    async def get_workflow_runs_with_pending_webhook_delivery(
-        self,
-        *,
-        older_than: datetime,
-        limit: int = 100,
-        in_progress_reason: str | None = None,
-    ) -> list[WorkflowRun]:
-        terminal_statuses = [status.value for status in WorkflowRunStatus if status.is_final()]
-        cutoff = to_naive_utc(older_than)
-        run_age_filter = or_(
-            WorkflowRunModel.finished_at <= cutoff,
-            and_(
-                WorkflowRunModel.finished_at.is_(None),
-                WorkflowRunModel.modified_at <= cutoff,
-            ),
-        )
-        delivery_state_filter = WorkflowRunModel.webhook_failure_reason.is_(None)
-        if in_progress_reason is not None:
-            delivery_state_filter = or_(
-                delivery_state_filter,
-                and_(
-                    WorkflowRunModel.webhook_failure_reason == in_progress_reason,
-                    WorkflowRunModel.modified_at <= cutoff,
-                ),
-            )
-
-        async with self.Session() as session:
-            query = (
-                select(WorkflowRunModel)
-                .filter(WorkflowRunModel.status.in_(terminal_statuses))
-                .filter(WorkflowRunModel.webhook_callback_url.isnot(None))
-                # TODO: add a partial index for the finalized pending-webhook sweep if production scan cost grows.
-                .filter(func.length(func.trim(WorkflowRunModel.webhook_callback_url)) > 0)
-                .filter(delivery_state_filter)
-                .filter(run_age_filter)
-                .order_by(func.coalesce(WorkflowRunModel.finished_at, WorkflowRunModel.modified_at).asc())
-                .limit(limit)
-            )
             workflow_runs = (await session.scalars(query)).all()
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 

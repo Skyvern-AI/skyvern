@@ -1243,8 +1243,17 @@ BLOCK_YAML_SUBCLASSES = (
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
 
+def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASSES]) -> bool:
+    """Whether top-level routing requires version 2: a conditional block or explicit next_block_label.
+
+    Loop interiors are not inspected - `version` describes only top-level routing, and loop bodies are
+    graph-built independently by Block._build_loop_graph regardless of the workflow version.
+    """
+    return any(isinstance(block, ConditionalBlockYAML) or block.next_block_label is not None for block in blocks)
+
+
 class WorkflowDefinitionYAML(BaseModel):
-    version: int = 1
+    version: int | None = None
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
@@ -1267,6 +1276,15 @@ class WorkflowDefinitionYAML(BaseModel):
             raise ValueError(
                 f"finally_block_label '{self.finally_block_label}' does not reference a valid block. "
                 f"Available labels: {', '.join(labels) if labels else '(none)'}"
+            )
+
+        has_v2_graph_constructs = workflow_definition_has_v2_graph_constructs(self.blocks)
+        if self.version is None:
+            self.version = 2 if has_v2_graph_constructs else 1
+        elif self.version < 2 and has_v2_graph_constructs:
+            raise ValueError(
+                "workflow_definition.version must be 2 or greater when using conditional blocks "
+                "or explicit next_block_label routing."
             )
 
         return self
