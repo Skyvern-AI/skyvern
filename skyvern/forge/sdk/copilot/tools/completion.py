@@ -48,11 +48,11 @@ from .blockers import (
 LOG = structlog.get_logger()
 
 
-def _completion_verification_criteria(copilot_ctx: Any) -> list[Any]:
+def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
     policy = getattr(copilot_ctx, "request_policy", None)
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
-    return [c for c in (policy.completion_criteria if policy is not None else []) if not c.method_mandated]
+    return policy.graded_completion_criteria() if policy is not None else []
 
 
 def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
