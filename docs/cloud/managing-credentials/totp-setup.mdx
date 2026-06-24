@@ -39,8 +39,8 @@ The preferred method. Skyvern generates valid 6-digit codes on demand during log
   <Step title="Select Authenticator App">
     Choose **Authenticator App** from the three options.
   </Step>
-  <Step title="Paste your TOTP secret key">
-    Enter the secret key into the **Authenticator Key** field and click **Save**.
+  <Step title="Add your TOTP setup key">
+    Enter the secret key into the **Authenticator Key** field, or click **Scan QR** to upload a QR code image from the site's 2FA setup screen. Then click **Save**.
     <img src="/images/cloud/totp-setup-2.png" alt="Add Credential dialog with Authenticator App selected and the Authenticator Key field" />
   </Step>
 </Steps>
@@ -53,7 +53,7 @@ The secret key is the base32-encoded string behind the QR code you'd normally sc
 - **LastPass**: Edit the login → Advanced Settings → copy the TOTP secret
 - **Site settings**: Many sites show a "Can't scan?" link during 2FA setup that reveals the text key
 
-If you only have a QR code, decode it to extract the `secret=` parameter from the `otpauth://totp/...?secret=BASE32KEY` URI.
+If you only have a QR code, use **Scan QR** in the credential form or paste the full `otpauth://totp/...?secret=BASE32KEY` URI.
 </Accordion>
 
 ---
@@ -252,7 +252,7 @@ curl -X GET "https://api.skyvern.com/v1/credentials/totp?totp_identifier=user@ex
 | `otp_type` | Filter by `totp` or `magic_link` |
 | `limit` | Number of records (default 50, max 200) |
 
-Returns a list ordered newest first. Only codes created within the last 10 minutes (configurable via `TOTP_LIFESPAN_MINUTES`) are returned.
+Returns historical records ordered newest first, capped by `limit`. Runtime polling still only uses unexpired codes within `TOTP_LIFESPAN_MINUTES`.
 
 <CardGroup cols={2}>
   <Card
