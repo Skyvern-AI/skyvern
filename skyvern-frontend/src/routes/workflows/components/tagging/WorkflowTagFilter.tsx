@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { type TagFilterTerm, type TagKey } from "../../types/tagTypes";
+import { type TagColorMap } from "../../types/tagColors";
 import { useDeleteTagKeyMutation } from "../../hooks/useWorkflowTagMutations";
 import { TagFilterControl } from "./TagFilterControl";
 
@@ -21,6 +22,9 @@ type Props = {
   labelSuggestions?: Array<string>;
   // Grouped values observed per key (for exact suggestions after `group:`).
   valueSuggestionsByKey?: Map<string, Array<string>>;
+  // (key, value) -> palette color; forwarded to the filter control to color
+  // exact group:value chips.
+  colors?: TagColorMap;
 };
 
 // Tag filter pill for the workflows list. Wraps the shared TagFilterControl and

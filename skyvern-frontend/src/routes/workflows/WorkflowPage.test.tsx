@@ -72,6 +72,10 @@ vi.mock("./hooks/useTagKeysQuery", () => ({
   useTagKeysQuery: () => ({ data: [] }),
 }));
 
+vi.mock("./hooks/useTagValuesQuery", () => ({
+  useTagValuesQuery: () => ({ data: new Map() }),
+}));
+
 vi.mock("./hooks/useKeywordSearch", () => ({
   useKeywordSearch: () => ({
     matchesParameter: () => false,

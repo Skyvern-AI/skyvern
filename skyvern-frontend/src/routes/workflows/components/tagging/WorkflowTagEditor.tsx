@@ -35,7 +35,14 @@ import {
   type TagKey,
 } from "../../types/tagTypes";
 import { useApplyWorkflowTagsMutation } from "../../hooks/useWorkflowTagMutations";
+import {
+  randomPaletteColor,
+  tagColorFor,
+  type PaletteColorName,
+  type TagColorMap,
+} from "../../types/tagColors";
 import { TagChip } from "./TagChip";
+import { TagColorSwatchPicker } from "./TagColorSwatchPicker";
 
 type Props = {
   workflowPermanentId: string;
@@ -46,6 +53,9 @@ type Props = {
   labelSuggestions?: Array<string>;
   // Grouped values observed per key, suggested after typing `group:`.
   valueSuggestionsByKey?: Map<string, Array<string>>;
+  // (key, value) -> palette color, to color existing chips and preselect the
+  // swatch when re-adding an already-colored grouped tag.
+  colorMap?: TagColorMap;
 };
 
 // Inline tag editor: type a bare `label` for a standalone tag or `group:label`
@@ -56,10 +66,15 @@ function WorkflowTagEditor({
   tagKeys,
   labelSuggestions = [],
   valueSuggestionsByKey,
+  colorMap,
 }: Props) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
+  // Default a new grouped tag to a random swatch (re-seeded after each add); the
+  // user can override, or it syncs to the existing color when re-adding one.
+  const [selectedColor, setSelectedColor] =
+    React.useState<PaletteColorName>(randomPaletteColor);
 
   const applyMutation = useApplyWorkflowTagsMutation();
   const isPending = applyMutation.isPending;
@@ -73,7 +88,7 @@ function WorkflowTagEditor({
 
   const sortedTags = React.useMemo(() => sortTags(tags), [tags]);
 
-  function addTag(tag: Tag) {
+  function addTag(tag: Tag, color?: PaletteColorName) {
     // A write is in flight; ignore further adds so a quick double Enter/click
     // can't queue racing POSTs whose arrival order would decide the final tag.
     if (isPending) {
@@ -106,12 +121,19 @@ function WorkflowTagEditor({
     applyMutation.mutate(
       {
         workflowPermanentId,
-        data: { tags: [{ key: tag.key, value: tag.value }] },
+        data: {
+          tags: [{ key: tag.key, value: tag.value }],
+          // Color is key-scoped and only applies to grouped tags.
+          ...(tag.key !== null && color
+            ? { colors: { [tag.key]: color } }
+            : {}),
+        },
       },
       {
         onSuccess: () => {
           setQuery("");
           setError(null);
+          setSelectedColor(randomPaletteColor());
           if (isOverwrite && previousInGroup) {
             toast({
               title: "Tag overwritten",
@@ -143,6 +165,19 @@ function WorkflowTagEditor({
     candidate !== null &&
     tags.some((t) => t.key === candidate.key && t.value === candidate.value);
   const showAdd = candidate !== null && !candidateExists;
+  const isGroupedCandidate = candidate !== null && candidate.key !== null;
+
+  // Re-adding an already-colored (key, value) should keep its color, so sync the
+  // swatch to it; brand-new values keep the random/user-picked selection.
+  const candidateExistingColor =
+    candidate !== null
+      ? tagColorFor(colorMap, candidate.key, candidate.value)
+      : undefined;
+  React.useEffect(() => {
+    if (candidateExistingColor) {
+      setSelectedColor(candidateExistingColor);
+    }
+  }, [candidateExistingColor]);
 
   // When the user has typed `group:partial`, suggest existing values for that
   // group; otherwise suggest groups (to start a grouped tag) and labels.
@@ -199,6 +234,7 @@ function WorkflowTagEditor({
                   key={tagElementKey(tag)}
                   tagKey={tag.key}
                   value={tag.value}
+                  color={tagColorFor(colorMap, tag.key, tag.value)}
                   onRemove={() => removeTag(tag)}
                 />
               ))}
@@ -221,17 +257,34 @@ function WorkflowTagEditor({
             onKeyDown={(event) => {
               if (event.key === "Enter" && candidate && showAdd) {
                 event.preventDefault();
-                addTag(candidate);
+                addTag(
+                  candidate,
+                  isGroupedCandidate ? selectedColor : undefined,
+                );
               }
             }}
           />
+          {showAdd && isGroupedCandidate ? (
+            <div className="border-b px-3 py-2">
+              <div className="mb-1.5 text-xs text-muted-foreground">Color</div>
+              <TagColorSwatchPicker
+                value={selectedColor}
+                onChange={setSelectedColor}
+              />
+            </div>
+          ) : null}
           <CommandList>
             <CommandEmpty>Type a label or group:label.</CommandEmpty>
             {showAdd && candidate ? (
               <CommandGroup>
                 <CommandItem
                   value={`__add__,${trimmedQuery}`}
-                  onSelect={() => addTag(candidate)}
+                  onSelect={() =>
+                    addTag(
+                      candidate,
+                      isGroupedCandidate ? selectedColor : undefined,
+                    )
+                  }
                 >
                   {isPending ? (
                     <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

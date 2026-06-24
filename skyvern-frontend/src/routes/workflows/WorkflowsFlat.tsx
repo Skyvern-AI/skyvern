@@ -91,6 +91,7 @@ import { HighlightText } from "./components/HighlightText";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { TagChipList } from "./components/tagging/TagChipList";
@@ -416,6 +417,8 @@ function WorkflowsFlat() {
       ),
     [tagKeys],
   );
+  // (key, value) -> palette color for grouped tag chips.
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   // One batch fetch of current tags for every workflow on the page (no N+1).
   const workflowIds = useMemo(
@@ -787,6 +790,7 @@ function WorkflowsFlat() {
                 onChange={setTagFilters}
                 labelSuggestions={labelSuggestions}
                 valueSuggestionsByKey={valueSuggestionsByKey}
+                colors={tagColors}
               />
             ) : null}
           </div>
@@ -1038,6 +1042,7 @@ function WorkflowsFlat() {
                                 <TagChipList
                                   tags={workflowTags}
                                   descriptions={tagDescriptions}
+                                  colors={tagColors}
                                 />
                               ) : null}
                             </div>
@@ -1119,6 +1124,7 @@ function WorkflowsFlat() {
                                       valueSuggestionsByKey={
                                         valueSuggestionsByKey
                                       }
+                                      colorMap={tagColors}
                                     />
                                   ) : null}
                                 </>

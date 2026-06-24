@@ -54,6 +54,7 @@ import {
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowActions } from "./WorkflowActions";
@@ -155,6 +156,7 @@ function WorkflowPage() {
       ),
     [tagKeys],
   );
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   if (!workflowPermanentId) {
     return null; // this should never happen
@@ -184,6 +186,7 @@ function WorkflowPage() {
             <TagChipList
               tags={workflowTags}
               descriptions={tagDescriptions}
+              colors={tagColors}
               maxVisible={6}
             />
           ) : null}
