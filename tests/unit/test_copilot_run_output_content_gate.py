@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tools import (
     _analyze_run_blocks,
     _current_workflow_has_evidence_block,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
 from skyvern.forge.sdk.copilot.tools.blockers import _code_output_has_goal_content
+from skyvern.forge.sdk.copilot.tools.completion import _apply_present_value_upgrades, _build_run_evidence_snapshot
 from skyvern.forge.sdk.copilot.tools.run_execution import _attach_registered_output_parameter_values
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 
@@ -780,13 +782,15 @@ def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
     assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    # The candidate gate no longer rejects empty output: a completed run reaches the
+    # judge, which requires positive evidence per criterion. With no verifier verdict
+    # (no criteria) the empty-output floor still marks the run suspicious.
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
     assert ctx.last_test_ok is None
     assert ctx.last_test_suspicious_success is True
-    assert ctx.null_data_streak_count == 1
     assert ctx.last_full_workflow_test_ok is False
     assert getattr(ctx, "last_good_workflow", None) is None
 
@@ -834,7 +838,7 @@ def test_goal_path_alias_without_exact_declared_path_is_flagged_as_no_goal_conte
 
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
 def test_null_goal_path_value_does_not_fall_back_to_alias_field() -> None:
@@ -844,7 +848,7 @@ def test_null_goal_path_value_does_not_fall_back_to_alias_field() -> None:
 
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
 def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
@@ -854,7 +858,7 @@ def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
 
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
 def test_undeclared_boolean_flags_are_not_goal_content() -> None:
@@ -912,7 +916,7 @@ def test_array_goal_value_path_does_not_match_scalar_root() -> None:
 
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
 def test_candidacy_and_recording_agree_on_all_null_metadata_goal_fields() -> None:
@@ -920,7 +924,7 @@ def test_candidacy_and_recording_agree_on_all_null_metadata_goal_fields() -> Non
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
     assert ctx.last_test_ok is None
@@ -934,7 +938,7 @@ def test_empty_goal_collections_without_blocker_are_flagged() -> None:
     assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
     assert ctx.last_test_ok is None
@@ -1125,13 +1129,65 @@ def test_judge_unmet_on_detector_clean_run_does_not_reset_streaks_or_promote(met
         entry["completion_criteria"][0]["terminal"] = False
         ctx.code_artifact_metadata = {"search_registry_person": entry}
     ctx.failed_test_nudge_count = 2
-    ctx.null_data_streak_count = 3
     ctx.probable_site_block_streak_count = 4
 
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
 
     assert ctx.failed_test_nudge_count == 2
-    assert ctx.null_data_streak_count == 3
     assert ctx.probable_site_block_streak_count == 4
     assert ctx.last_full_workflow_test_ok is False
+
+
+def test_reached_goal_unfinished_run_is_recognized_when_verifier_fully_satisfied() -> None:
+    result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=False)
+    ctx = _ctx(result["data"]["blocks"])
+
+    assert _is_unfinished_run_verification_candidate(ctx, result) is True
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
+
+    assert outcome_fully_verified(ctx) is True
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+
+
+def test_unfinished_run_with_unsatisfied_verifier_stays_unrecognized() -> None:
+    result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=False)
+    ctx = _ctx(result["data"]["blocks"])
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert outcome_fully_verified(ctx) is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert recorded is None or recorded.verdict != "demonstrated"
     assert getattr(ctx, "last_good_workflow", None) is None
+
+
+def test_present_value_upgrade_flips_lone_judge_unknown_to_demonstrated_on_ok_run() -> None:
+    result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=True)
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c0", outcome="the submitted request returns confirmation number WTR-1842-DEMO")
+        ]
+    )
+
+    run_criteria = ctx.request_policy.completion_criteria
+    snapshot = _build_run_evidence_snapshot(ctx, result)
+    judge_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")],
+    )
+    upgraded = _apply_present_value_upgrades(judge_result, run_criteria, snapshot)
+    assert upgraded.is_fully_satisfied() is True
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=upgraded)
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert outcome_fully_verified(ctx) is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True

@@ -183,6 +183,38 @@ def test_is_fully_satisfied_requires_every_criterion() -> None:
     assert _evaluated(("c0", True), ("c1", False)).is_fully_satisfied() is False
 
 
+def _mixed(*verdicts: CriterionVerdict) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated", criterion_ids=[v.criterion_id for v in verdicts], verdicts=list(verdicts)
+    )
+
+
+def test_definition_plane_abstention_does_not_sink_evidence_confirmed_run() -> None:
+    definition_unknown = CriterionVerdict(
+        criterion_id="c0", state="unknown", reason_code="definition_parameters_absent"
+    )
+    confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
+    assert _mixed(definition_unknown, confirmed).is_fully_satisfied() is True
+
+
+def test_run_plane_unknown_still_blocks() -> None:
+    run_unknown = CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")
+    confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
+    assert _mixed(run_unknown, confirmed).is_fully_satisfied() is False
+
+
+def test_all_definition_abstentions_do_not_vacuously_satisfy() -> None:
+    abstain_a = CriterionVerdict(criterion_id="c0", state="unknown", reason_code="definition_unknown")
+    abstain_b = CriterionVerdict(criterion_id="c1", state="unknown", reason_code="definition_parameters_absent")
+    assert _mixed(abstain_a, abstain_b).is_fully_satisfied() is False
+
+
+def test_definition_plane_unsatisfied_still_blocks() -> None:
+    unreferenced = CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="definition_parameters_missing")
+    confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
+    assert _mixed(unreferenced, confirmed).is_fully_satisfied() is False
+
+
 def test_empty_verdicts_with_criteria_is_not_vacuously_satisfied() -> None:
     result = CompletionVerificationResult(status="evaluated", criterion_ids=["c0"], verdicts=[])
     assert result.is_fully_satisfied() is False
@@ -899,6 +931,22 @@ def test_record_run_blocks_downgrades_on_contradiction_without_confirmation_bloc
     _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_contradicted("c0"))
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_full_workflow_test_ok is False
+
+
+def test_record_run_blocks_demonstrated_when_lone_definition_abstention_with_confirmed_run() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    verification = _mixed(
+        CriterionVerdict(criterion_id="c0", state="unknown", reason_code="definition_parameters_absent"),
+        CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+    )
+
+    recorded = _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=verification)
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True
+    assert verified_goal_satisfied_context(ctx) is True
 
 
 def _goto_only_result() -> dict:
@@ -1786,8 +1834,9 @@ def test_outcome_evidence_candidate_admits_clean_run_despite_unverified_prefix()
     # A clean run is admitted for the judge even though b0/b1 are not in the verified
     # prefix -- recognition is governed by the outcome judge, not the per-block prefix.
     assert _is_outcome_evidence_candidate(ctx, _clean_success_result()) is True
-    # It still rejects empty-data runs (no clean outcome to judge) and ok=False runs.
-    assert _is_outcome_evidence_candidate(ctx, _empty_data_result()) is False
+    # An empty-data completed run is admitted for the judge (the judge requires positive
+    # evidence per criterion, so it grades unsatisfied); only ok=False runs are rejected.
+    assert _is_outcome_evidence_candidate(ctx, _empty_data_result()) is True
     assert _is_outcome_evidence_candidate(ctx, {"ok": False, "data": {}}) is False
 
 
