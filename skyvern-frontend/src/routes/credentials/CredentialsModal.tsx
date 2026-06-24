@@ -49,6 +49,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import { getAuthenticatorKeyError } from "./credentialTotpValidation";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -891,6 +892,9 @@ function CredentialsModal({
         });
         return;
       }
+      if (authenticatorKeyError) {
+        return;
+      }
 
       // If test passed, rename the temp credential instead of creating a new one
       if (testAndSave && testStatus === "completed" && testCredentialId) {
@@ -1086,6 +1090,13 @@ function CredentialsModal({
       </div>
     ) : undefined;
 
+  const shouldValidateAuthenticatorKey =
+    type === CredentialModalTypes.PASSWORD &&
+    (!isEditMode || editingGroups.values);
+  const authenticatorKeyError = shouldValidateAuthenticatorKey
+    ? getAuthenticatorKeyError(passwordCredentialValues)
+    : null;
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -1100,6 +1111,7 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          totpError={authenticatorKeyError}
           beforeCredentialFields={customVaultCheckbox}
           afterUrl={
             <div className="space-y-3">
@@ -1262,6 +1274,9 @@ function CredentialsModal({
       });
       return;
     }
+    if (authenticatorKeyError) {
+      return;
+    }
 
     // Set testing state immediately to avoid button flash
     pollCancelledRef.current = false;
@@ -1316,6 +1331,7 @@ function CredentialsModal({
     testUrl.trim() !== "" &&
     passwordCredentialValues.username.trim() !== "" &&
     passwordCredentialValues.password.trim() !== "" &&
+    !authenticatorKeyError &&
     !isTestInProgress;
 
   return (
