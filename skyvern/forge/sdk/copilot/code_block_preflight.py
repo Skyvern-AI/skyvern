@@ -17,11 +17,24 @@ from typing import Iterable
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
+SANDBOX_UNRESOLVED_NAME_REASON_CODE = "SANDBOX_UNRESOLVED_NAME"
+
 
 @dataclass(frozen=True)
 class CodeBlockPreflightDiagnostic:
     code: str
     message: str
+
+
+@dataclass(frozen=True)
+class CodeBlockSandboxNameDiagnostic:
+    code: str
+    message: str
+    unresolved_names: tuple[str, ...]
+    class_names: tuple[str, ...]
+    parameter_keys: tuple[str, ...]
+    allowed_global_names: tuple[str, ...]
+    allowed_helper_surface: dict[str, tuple[str, ...]]
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")
@@ -55,6 +68,14 @@ def _sandbox_shim_surface() -> dict[str, frozenset[str]]:
         for name, value in CodeBlock.build_safe_vars().items()
         if isinstance(value, SimpleNamespace)
     }
+
+
+def sandbox_allowed_global_names() -> list[str]:
+    return sorted(_sandbox_global_names())
+
+
+def sandbox_allowed_helper_surface() -> dict[str, list[str]]:
+    return {name: sorted(surface) for name, surface in sorted(_sandbox_shim_surface().items())}
 
 
 def strip_redundant_sandbox_imports(code: str) -> tuple[str, list[str]]:
@@ -240,14 +261,26 @@ def sandbox_unresolved_name_diagnostics(
     ambiguous control-flow bindings do not satisfy later reads.
     """
 
+    repair_diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+    if repair_diagnostic is None:
+        return []
+    return [CodeBlockPreflightDiagnostic(code=repair_diagnostic.code, message=repair_diagnostic.message)]
+
+
+def sandbox_unresolved_name_repair_diagnostic(
+    code: str,
+    *,
+    parameter_keys: Iterable[str] = (),
+) -> CodeBlockSandboxNameDiagnostic | None:
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
     except SyntaxError:
-        return []
+        return None
 
-    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_keys).analyze(tree.body)
+    parameter_key_list = sorted(key for key in dict.fromkeys(parameter_keys) if _valid_python_identifier(key))
+    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_key_list).analyze(tree.body)
     if not unresolved_names and not class_names:
-        return []
+        return None
 
     names = sorted(unresolved_names)
     rejected_classes = sorted(class_names)
@@ -259,17 +292,22 @@ def sandbox_unresolved_name_diagnostics(
             "class definitions unavailable in the code sandbox: " + ", ".join(f"`{name}`" for name in rejected_classes)
         )
     detail = "; ".join(detail_parts)
-    return [
-        CodeBlockPreflightDiagnostic(
-            code="SANDBOX_UNRESOLVED_NAME",
-            message=(
-                f"Code block references names that are unavailable in the runtime code sandbox or are not "
-                f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
-                "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
-                "exception type."
-            ),
-        )
-    ]
+    return CodeBlockSandboxNameDiagnostic(
+        code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        message=(
+            f"Code block references names that are unavailable in the runtime code sandbox or are not "
+            f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
+            "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
+            "exception type."
+        ),
+        unresolved_names=tuple(names),
+        class_names=tuple(rejected_classes),
+        parameter_keys=tuple(parameter_key_list),
+        allowed_global_names=tuple(sandbox_allowed_global_names()),
+        allowed_helper_surface={
+            helper: tuple(attributes) for helper, attributes in sandbox_allowed_helper_surface().items()
+        },
+    )
 
 
 def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:

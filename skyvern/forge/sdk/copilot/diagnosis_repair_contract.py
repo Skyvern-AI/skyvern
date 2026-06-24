@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     RepairRootCauseIdentity,
@@ -29,6 +33,8 @@ _CREDENTIAL_INPUT_MISSING_SKIP_REASONS = {"workflow_credential_inputs_unbound", 
 _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES = {"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"}
 _REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE", "OUTCOME_UNVERIFIED"}
 _TERMINAL_ANTI_BOT_TERMS = ("captcha", "challenge", "verification", "anti-bot", "anti bot", "turnstile")
+_AUTHORING_REPAIR_SIGNATURE_VERSION = "authoring_repair_context:v1"
+_AUTHORING_REPAIR_CATEGORY = "CODE_AUTHORING_REPAIR"
 
 
 class StrictModel(BaseModel):
@@ -154,7 +160,8 @@ def build_diagnosis_repair_contract(
     run_status = _safe_str(data.get("overall_status"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     summary = _failure_summary(result, data, blocks)
-    root_cause_identity = compute_repair_root_cause_signature(
+    repair_context = _current_code_authoring_repair_context(data)
+    root_cause_identity = _repair_context_root_cause_identity(repair_context) or compute_repair_root_cause_signature(
         failure_categories=categories,
         failure_reason=_safe_str(data.get("failure_reason")),
         error_texts=[_safe_str(result.get("error"))],
@@ -174,10 +181,13 @@ def build_diagnosis_repair_contract(
         terminal_challenge_categories,
         result,
         data,
+        repair_context,
     )
-    next_action = _next_action(failure_type, ctx, data)
+    next_action = _next_action(failure_type, ctx, data, repair_context)
     frontier = _safe_str(data.get("frontier_start_label"))
     target_blocks = failed_blocks or ([frontier] if frontier else []) if next_action == RepairNextAction.REPAIR else []
+    if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
+        target_blocks = [repair_context.block_label]
     user_goal_satisfied, completion_contract_satisfied = _verification_satisfaction(
         run_ok,
         suspicious,
@@ -303,6 +313,50 @@ def _safe_text(value: str | None, max_chars: int = _TEXT_MAX) -> str:
     return text if len(text) <= max_chars else text[: max_chars - 3].rstrip() + "..."
 
 
+def _safe_identity_list(values: list[str]) -> list[str]:
+    return sorted(dict.fromkeys(item for value in values for item in [_safe_text(str(value), 80)] if item))
+
+
+def _identity_token(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_") or "unknown"
+
+
+def _repair_context_root_cause_identity(
+    repair_context: CodeAuthoringRepairContext | None,
+) -> RepairRootCauseIdentity | None:
+    if repair_context is None:
+        return None
+    reason_code = _safe_text(repair_context.reason_code, 80)
+    if not reason_code:
+        return None
+    block_label = _safe_text(repair_context.block_label, 80)
+    selector = ""
+    selector_kind = ""
+    payload: dict[str, Any] = {
+        "version": _AUTHORING_REPAIR_SIGNATURE_VERSION,
+        "reason_code": reason_code,
+        "block_label": block_label,
+    }
+    if reason_code == "ambiguous_bare_selector":
+        selector = _safe_text(repair_context.selector, 120)
+        refiner_selector = _safe_text(repair_context.refiner_selector, 120)
+        payload["selector"] = selector
+        payload["refiner_selector"] = refiner_selector
+        selector_kind = "selector" if selector else ""
+    elif repair_context.unresolved_names:
+        payload["unresolved_names"] = _safe_identity_list(repair_context.unresolved_names)
+
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return RepairRootCauseIdentity(
+        root_cause_signature=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        primary_category=_AUTHORING_REPAIR_CATEGORY,
+        failure_categories=(_AUTHORING_REPAIR_CATEGORY,),
+        error_class=f"code_authoring_{_identity_token(reason_code)}",
+        selector_kind=selector_kind,
+        selector=selector,
+    )
+
+
 def _str_list(value: Any) -> list[str]:
     return (
         [_safe_text(str(item), 80) for item in value[:_MAX_ITEMS] if str(item).strip()]
@@ -391,6 +445,7 @@ def _failure_type(
     terminal_challenge_categories: list[str],
     result: dict[str, Any],
     data: dict[str, Any],
+    repair_context: CodeAuthoringRepairContext | None,
 ) -> DiagnosisFailureType:
     skip_reason = _safe_str(data.get("skip_reason"))
     if skip_reason in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS:
@@ -425,6 +480,10 @@ def _failure_type(
         or "browser session" in error_text
     ):
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    if _safe_str(data.get("failure_type")) == "missing_credential_or_init":
+        return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    if repair_context is not None:
+        return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if outcome_verified:
         return DiagnosisFailureType.NO_FAILURE
     if failed_blocks or category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
@@ -438,14 +497,14 @@ def _failure_type(
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
 
 
-def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: dict[str, Any]) -> RepairNextAction:
+def _next_action(
+    failure_type: DiagnosisFailureType,
+    ctx: CopilotContext,
+    data: dict[str, Any],
+    repair_context: CodeAuthoringRepairContext | None,
+) -> RepairNextAction:
     if failure_type == DiagnosisFailureType.NO_FAILURE:
         return RepairNextAction.NO_CHANGE
-    if (
-        data.get("skip_reason") == "workflow_credential_inputs_unbound"
-        or failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    ):
-        return RepairNextAction.ASK
     if failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR:
         return RepairNextAction.STOP
     if failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
@@ -460,8 +519,16 @@ def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: 
         DiagnosisFailureType.SUSPICIOUS_SUCCESS,
     }:
         return RepairNextAction.STOP
+    # The judge confirmed every criterion; no repair path should overwrite an already-verified terminal proposal.
     if outcome_fully_verified(ctx):
         return RepairNextAction.NO_CHANGE
+    if repair_context is not None:
+        return RepairNextAction.REPAIR
+    if (
+        data.get("skip_reason") == "workflow_credential_inputs_unbound"
+        or failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    ):
+        return RepairNextAction.ASK
     authority = getattr(getattr(ctx, "turn_intent", None), "authority", None)
     if getattr(authority, "requires_user_input", False) or getattr(authority, "may_update_workflow", True) is False:
         return RepairNextAction.ASK
@@ -472,6 +539,16 @@ def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: 
     }:
         return RepairNextAction.REPAIR
     return RepairNextAction.ESCALATE
+
+
+def _current_code_authoring_repair_context(data: dict[str, Any]) -> CodeAuthoringRepairContext | None:
+    raw_context = data.get("authoring_repair_context")
+    if not isinstance(raw_context, dict):
+        return None
+    try:
+        return CodeAuthoringRepairContext.model_validate(raw_context)
+    except ValidationError:
+        return None
 
 
 def _last_test_anti_bot_is_terminal(ctx: CopilotContext, data: dict[str, Any]) -> bool:

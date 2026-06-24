@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.copilot.config import (
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     AgentResult,
+    CodeAuthoringRepairContext,
     CopilotContext,
     NarrativeActivityEntry,
     NarrativeBlock,
@@ -531,6 +533,125 @@ def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
     )
 
 
+def _clean_authoring_repair_prompt_atom(value: str, *, max_chars: int = 160) -> str:
+    cleaned = redact_raw_secrets_for_prompt(value).replace("\r", " ").replace("\n", " ").strip()
+    if contains_internal_machinery_leak(cleaned):
+        return ""
+    return cleaned[:max_chars]
+
+
+def _render_authoring_repair_prompt_list(items: list[str], *, max_items: int = 20) -> str:
+    cleaned = [_clean_authoring_repair_prompt_atom(item) for item in items[:max_items]]
+    return ", ".join(item for item in cleaned if item) or "(none)"
+
+
+def _render_selector_repair_alternatives(alternatives: list[dict[str, str]], *, max_items: int = 8) -> list[str]:
+    lines: list[str] = []
+    for alternative in alternatives[:max_items]:
+        tool_name = _clean_authoring_repair_prompt_atom(str(alternative.get("tool_name") or ""), max_chars=60)
+        role = _clean_authoring_repair_prompt_atom(str(alternative.get("role") or ""), max_chars=80)
+        selector = _clean_authoring_repair_prompt_atom(str(alternative.get("selector") or ""), max_chars=180)
+        if not selector:
+            continue
+        parts = [f"tool_name={tool_name or '(unknown)'}"]
+        if role:
+            parts.append(f"role={role}")
+        parts.append(f"selector={selector}")
+        lines.append("- " + ", ".join(parts))
+    return lines
+
+
+def _render_unresolved_name_binding_actions(
+    unresolved_names: list[str], available_parameter_keys: list[str], *, max_items: int = 20
+) -> list[str]:
+    available_keys = {
+        key
+        for raw_key in available_parameter_keys
+        for key in [_clean_authoring_repair_prompt_atom(raw_key, max_chars=80)]
+        if key
+    }
+    lines: list[str] = []
+    for raw_name in unresolved_names[:max_items]:
+        name = _clean_authoring_repair_prompt_atom(raw_name, max_chars=80)
+        if not name:
+            continue
+        if name in available_keys:
+            lines.append(
+                f"- {name} -> existing workflow parameter key {name} -> parameter_keys -> bare variable {name}"
+            )
+            continue
+        lines.append(
+            f"- {name} -> create workflow string parameter key {name} -> parameter_keys -> bare variable {name}"
+        )
+    return lines
+
+
+def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
+    if ctx is None:
+        return ""
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return ""
+    repair_context = ctx.last_code_authoring_repair_context
+    if not isinstance(repair_context, CodeAuthoringRepairContext):
+        return ""
+    LOG.info(
+        "copilot code authoring repair context rendered",
+        reason_code=repair_context.reason_code,
+        block_label=repair_context.block_label,
+        unresolved_names=repair_context.unresolved_names,
+    )
+    available_parameter_keys = repair_context.available_parameter_keys
+    binding_candidates = repair_context.binding_candidates or repair_context.unresolved_names
+
+    lines = [
+        "CODE AUTHORING REPAIR CONTEXT:",
+        f"block_label: {_clean_authoring_repair_prompt_atom(repair_context.block_label)}",
+        f"reason_code: {_clean_authoring_repair_prompt_atom(repair_context.reason_code)}",
+        f"unresolved_names: {_render_authoring_repair_prompt_list(repair_context.unresolved_names)}",
+        f"declared_parameter_keys: {_render_authoring_repair_prompt_list(repair_context.parameter_keys)}",
+        f"available_parameter_keys: {_render_authoring_repair_prompt_list(available_parameter_keys)}",
+        f"binding_candidates: {_render_authoring_repair_prompt_list(binding_candidates)}",
+        f"allowed_global_names: {_render_authoring_repair_prompt_list(repair_context.allowed_global_names)}",
+    ]
+    if repair_context.selector:
+        lines.append(f"selector: {_clean_authoring_repair_prompt_atom(repair_context.selector)}")
+    if repair_context.source_url:
+        lines.append(f"source_url: {_clean_authoring_repair_prompt_atom(repair_context.source_url)}")
+    if repair_context.refiner_selector:
+        lines.append(f"refiner_selector: {_clean_authoring_repair_prompt_atom(repair_context.refiner_selector)}")
+    selector_alternative_lines = _render_selector_repair_alternatives(repair_context.selector_alternatives)
+    if selector_alternative_lines:
+        lines.append("same_page_selector_alternatives:")
+        lines.extend(selector_alternative_lines)
+    if repair_context.allowed_helper_surface:
+        lines.append("allowed_helper_surface:")
+        for helper_name, attributes in sorted(repair_context.allowed_helper_surface.items()):
+            helper = _clean_authoring_repair_prompt_atom(helper_name)
+            rendered_attributes = _render_authoring_repair_prompt_list(attributes, max_items=40)
+            if helper:
+                lines.append(f"{helper}: {rendered_attributes}")
+    if repair_context.reason_code == SANDBOX_UNRESOLVED_NAME_REASON_CODE:
+        binding_action_lines = _render_unresolved_name_binding_actions(
+            repair_context.unresolved_names, available_parameter_keys
+        )
+        if binding_action_lines:
+            lines.append("binding_actions:")
+            lines.extend(binding_action_lines)
+        lines.append(
+            "For workflow-input-like unresolved names, ensure a workflow string parameter exists, "
+            "list the exact key in the code block's parameter_keys, reference the exact key as a bare Python "
+            "variable in code, do not hardcode the eval value, and rerun via update_and_run_blocks."
+        )
+    if repair_context.reason_code == "ambiguous_bare_selector":
+        lines.append(
+            "For ambiguous selectors, do not re-emit the bare selector or a positional nth selector. "
+            "Use the same-page alternatives when they are stable, or re-scout the same page and choose a "
+            "stable role/name/data attribute."
+        )
+    lines.append(_clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=260))
+    return "\n\n" + "\n".join(line for line in lines if line)
+
+
 def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     """Pre-authoring offer of the synthesized code block.
 
@@ -610,6 +731,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         return (
             prompt
             + _runtime_verification_evidence_prompt(ctx)
+            + _code_authoring_repair_context_prompt(ctx)
             + _synthesized_block_offer_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )

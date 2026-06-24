@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    _AUTHORING_REPAIR_CATEGORY,
     DiagnosisRepairContract,
     RepairLoopState,
     RepairNextAction,
@@ -2349,12 +2350,13 @@ async def _verify_and_record_run_blocks_result(
 
 
 def _repair_non_convergence_signature(contract: DiagnosisRepairContract) -> str | None:
-    """A constant streak token for any REPAIR verdict, ``None`` otherwise. The trigger
-    is non-convergence (REPAIR with no verified progress), so the only thing the signature
-    must do is tell a contiguous repair streak from a reset on a non-REPAIR verdict."""
     if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
         return None
-    # Constant by design: the streak only distinguishes a REPAIR run from a reset, so the failure specifics are ignored.
+    identity = contract.diagnosis_result.root_cause_identity
+    if identity.primary_category == _AUTHORING_REPAIR_CATEGORY and identity.root_cause_signature:
+        return identity.root_cause_signature
+    if _AUTHORING_REPAIR_CATEGORY in identity.failure_categories and identity.root_cause_signature:
+        return identity.root_cause_signature
     return "repair_no_verified_progress"
 
 
