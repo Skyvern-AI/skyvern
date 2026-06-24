@@ -28,7 +28,6 @@ import aiohttp
 import docx
 import filetype
 import pandas as pd
-import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
@@ -94,7 +93,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
@@ -4045,7 +4044,7 @@ async def wrapper({default_args}):
                         totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
                         totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
                         if totp_secret:
-                            secret_value = pyotp.TOTP(totp_secret).now()
+                            secret_value = generate_totp_code(totp_secret)
                             # The pre-minted .totp string is exposed to user code (legacy path),
                             # so register it for masking like any other resolved secret.
                             _register_code_block_secret(workflow_run_context, secret_value)

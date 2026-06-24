@@ -800,6 +800,11 @@ export type PasswordCredentialApiResponse = {
   totp_identifier?: string | null;
 };
 
+export type CredentialTotpCodeResponse = {
+  code: string;
+  seconds_remaining: number;
+};
+
 export type CreditCardCredentialApiResponse = {
   last_four: string;
   brand: string;

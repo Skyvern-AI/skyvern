@@ -5,19 +5,24 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/util/utils";
 import {
+  CheckIcon,
   EnvelopeClosedIcon,
   EyeNoneIcon,
   EyeOpenIcon,
   MobileIcon,
   Pencil1Icon,
+  ReloadIcon,
+  UploadIcon,
 } from "@radix-ui/react-icons";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { decodeQrCodeImage } from "./decodeQrCodeImage";
 
 type Props = {
   values: {
@@ -51,6 +56,7 @@ type Props = {
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
   onEnableEditValues?: () => void;
+  totpError?: string | null;
 };
 
 function PasswordCredentialContent({
@@ -66,6 +72,7 @@ function PasswordCredentialContent({
   editingGroups,
   onEnableEditName,
   onEnableEditValues,
+  totpError,
 }: Props) {
   const { name, username, password, totp, totp_type, totp_identifier } = values;
   const nameReadOnly = editMode && !editingGroups?.name;
@@ -78,6 +85,9 @@ function PasswordCredentialContent({
   );
   const [totpAccordionValue, setTotpAccordionValue] = useState<string>("");
   const [showPassword, setShowPassword] = useState(false);
+  const [qrCodeScanError, setQrCodeScanError] = useState<string | null>(null);
+  const [isScanningQrCode, setIsScanningQrCode] = useState(false);
+  const qrCodeInputRef = useRef<HTMLInputElement>(null);
 
   // Sync totpMethod and auto-expand accordion when totp_type prop changes
   // (e.g. edit data arriving after mount)
@@ -147,6 +157,7 @@ function PasswordCredentialContent({
     onEnableEditValues?.();
     const prevMethod = totpMethod;
     setTotpMethod(method);
+    setQrCodeScanError(null);
 
     const updates: Partial<Props["values"]> = {
       totp: method === "authenticator" ? totp : "",
@@ -168,6 +179,51 @@ function PasswordCredentialContent({
     }
 
     updateValues(updates);
+  };
+
+  const handleTotpAccordionValueChange = (value: string) => {
+    setTotpAccordionValue(value);
+    if (
+      value === "two-factor-authentication" &&
+      totp_type === "none" &&
+      !valuesReadOnly
+    ) {
+      handleTotpMethodChange(totpMethod);
+    }
+  };
+
+  const handleAuthenticatorTotpChange = (value: string) => {
+    onEnableEditValues?.();
+    setQrCodeScanError(null);
+    setTotpMethod("authenticator");
+    updateValues({ totp: value, totp_type: "authenticator" });
+  };
+
+  const handleQrCodeFileChange = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+
+    onEnableEditValues?.();
+    setIsScanningQrCode(true);
+    setQrCodeScanError(null);
+    try {
+      const qrCodeValue = await decodeQrCodeImage(file);
+      setTotpMethod("authenticator");
+      updateValues({ totp: qrCodeValue, totp_type: "authenticator" });
+    } catch (caught) {
+      setQrCodeScanError(
+        caught instanceof Error
+          ? caught.message
+          : "Unable to scan that QR code. Paste the setup key instead.",
+      );
+    } finally {
+      setIsScanningQrCode(false);
+    }
   };
 
   return (
@@ -287,7 +343,7 @@ function PasswordCredentialContent({
         type="single"
         collapsible
         value={totpAccordionValue}
-        onValueChange={setTotpAccordionValue}
+        onValueChange={handleTotpAccordionValueChange}
       >
         <AccordionItem value="two-factor-authentication" className="border-b-0">
           <AccordionTrigger className="py-2">
@@ -302,39 +358,61 @@ function PasswordCredentialContent({
               <div className="grid h-36 grid-cols-3 gap-4">
                 <div
                   className={cn(
-                    "flex cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-elevation1 hover:bg-slate-elevation3",
+                    "relative flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
                     {
-                      "bg-slate-elevation3": totpMethod === "authenticator",
+                      "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60":
+                        totpMethod === "authenticator",
                     },
                   )}
                   onClick={() => handleTotpMethodChange("authenticator")}
                 >
+                  {totpMethod === "authenticator" && (
+                    <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
+                      <CheckIcon className="size-3" />
+                    </span>
+                  )}
                   <QRCodeIcon className="h-6 w-6" />
-                  <Label>Authenticator App</Label>
+                  <Label className="cursor-pointer text-center">
+                    Authenticator App
+                  </Label>
                 </div>
                 <div
                   className={cn(
-                    "flex cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-elevation1 hover:bg-slate-elevation3",
+                    "relative flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
                     {
-                      "bg-slate-elevation3": totpMethod === "email",
+                      "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60":
+                        totpMethod === "email",
                     },
                   )}
                   onClick={() => handleTotpMethodChange("email")}
                 >
+                  {totpMethod === "email" && (
+                    <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
+                      <CheckIcon className="size-3" />
+                    </span>
+                  )}
                   <EnvelopeClosedIcon className="h-6 w-6" />
-                  <Label>Email</Label>
+                  <Label className="cursor-pointer text-center">Email</Label>
                 </div>
                 <div
                   className={cn(
-                    "flex cursor-pointer items-center justify-center gap-2 rounded-lg bg-slate-elevation1 hover:bg-slate-elevation3",
+                    "relative flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
                     {
-                      "bg-slate-elevation3": totpMethod === "text",
+                      "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60":
+                        totpMethod === "text",
                     },
                   )}
                   onClick={() => handleTotpMethodChange("text")}
                 >
+                  {totpMethod === "text" && (
+                    <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
+                      <CheckIcon className="size-3" />
+                    </span>
+                  )}
                   <MobileIcon className="h-6 w-6" />
-                  <Label>Text Message</Label>
+                  <Label className="cursor-pointer text-center">
+                    Text Message
+                  </Label>
                 </div>
               </div>
               {(totpMethod === "text" || totpMethod === "email") && (
@@ -399,6 +477,7 @@ function PasswordCredentialContent({
                     <div className="w-40 shrink-0">
                       <Label className="whitespace-nowrap">
                         Authenticator Key
+                        <span className="text-destructive"> *</span>
                       </Label>
                     </div>
                     {valuesReadOnly ? (
@@ -418,17 +497,56 @@ function PasswordCredentialContent({
                         </button>
                       </div>
                     ) : (
-                      <Input
-                        value={totp}
-                        onChange={(e) => updateValues({ totp: e.target.value })}
-                        placeholder={editMode ? "••••••••" : undefined}
-                      />
+                      <div className="flex w-full gap-2">
+                        <Input
+                          value={totp}
+                          onChange={(e) =>
+                            handleAuthenticatorTotpChange(e.target.value)
+                          }
+                          placeholder="e.g. JBSWY3DPEHPK3PXP"
+                          aria-invalid={Boolean(totpError)}
+                          className={cn(
+                            totpError &&
+                              "border-destructive bg-destructive/10 focus-visible:ring-destructive/30",
+                          )}
+                        />
+                        <input
+                          ref={qrCodeInputRef}
+                          type="file"
+                          accept="image/*"
+                          className="sr-only"
+                          aria-label="Upload QR code image"
+                          onChange={(event) =>
+                            void handleQrCodeFileChange(event)
+                          }
+                        />
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          className="shrink-0"
+                          disabled={isScanningQrCode}
+                          onClick={() => qrCodeInputRef.current?.click()}
+                        >
+                          {isScanningQrCode ? (
+                            <ReloadIcon className="mr-2 size-4 animate-spin" />
+                          ) : (
+                            <UploadIcon className="mr-2 size-4" />
+                          )}
+                          Scan QR
+                        </Button>
+                      </div>
                     )}
                   </div>
+                  {(totpError || qrCodeScanError) && (
+                    <div className="space-y-1 text-xs text-destructive">
+                      {totpError && <p>{totpError}</p>}
+                      {qrCodeScanError && <p>{qrCodeScanError}</p>}
+                    </div>
+                  )}
                   <p className="text-sm text-slate-400">
-                    You need to find the authenticator secret from the website
+                    You need to find the authenticator key from the website
                     where you are using the credential. Here are some guides
-                    from popular authenticator apps:{"  "}
+                    from popular password managers:{"  "}
                     <Link
                       to="https://bitwarden.com/help/integrated-authenticator/#manually-enter-a-secret"
                       target="_blank"
