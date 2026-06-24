@@ -21,7 +21,7 @@ export type ContextualHint = {
   };
 };
 
-const EDITOR_ROUTE = /^\/workflows\/[^/]+\/build$/;
+const EDITOR_ROUTE = /^\/workflows\/[^/]+\/(?:build|edit|studio)$/;
 
 export const HINT_REGISTRY: readonly ContextualHint[] = [
   {

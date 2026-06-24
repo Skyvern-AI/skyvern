@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -25,22 +26,53 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useToast } from "@/components/ui/use-toast";
 import { Pencil1Icon } from "@radix-ui/react-icons";
 
-import { CopyAndExplainCode } from "../editor/Workspace";
-import { ScriptFixInput } from "./ScriptFixInput";
+import { CopyAndExplainCode, CopyText } from "../editor/Workspace";
+import { ScriptFixInput, ScriptFixTriggerButton } from "./ScriptFixInput";
 
 const enableCodeBlock =
   import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
 
+const CODE_SKELETON_WIDTHS = [
+  "w-1/3",
+  "w-2/3",
+  "w-1/2",
+  "w-3/4",
+  "w-1/4",
+  "w-2/3",
+  "w-1/2",
+  "w-5/6",
+  "w-1/3",
+  "w-3/5",
+  "w-1/2",
+  "w-2/3",
+];
+
+function CodeLoadingSkeleton() {
+  return (
+    <div className="flex h-full w-full flex-col gap-2.5 overflow-hidden bg-slate-elevation3 p-4">
+      {CODE_SKELETON_WIDTHS.map((width, i) => (
+        <Skeleton key={i} className={cn("h-3", width)} />
+      ))}
+    </div>
+  );
+}
+
 interface Props {
   showCacheKeyValueSelector?: boolean;
+  workflowRunId?: string;
 }
 
 function WorkflowRunCode(props?: Props) {
   const showCacheKeyValueSelector = props?.showCacheKeyValueSelector ?? false;
+  // The studio passes an explicit workflowRunId; legacy call sites don't. Gate
+  // the redesigned toolbar/skeleton on it so legacy renders origin/main parity.
+  const studioLayout = Boolean(props?.workflowRunId);
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const { toast } = useToast();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    props?.workflowRunId ? { workflowRunId: props.workflowRunId } : undefined,
+  );
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
@@ -60,16 +92,20 @@ function WorkflowRunCode(props?: Props) {
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
 
-  const { data: blockScriptsPending } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    workflowPermanentId,
-    pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
-    status: "pending",
-    workflowRunId: workflowRun?.workflow_run_id,
-  });
+  const { data: blockScriptsPending, isLoading: blockScriptsPendingLoading } =
+    useBlockScriptsQuery({
+      cacheKey,
+      cacheKeyValue,
+      workflowPermanentId,
+      pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
+      status: "pending",
+      workflowRunId: workflowRun?.workflow_run_id,
+    });
 
-  const { data: blockScriptsPublished } = useBlockScriptsQuery({
+  const {
+    data: blockScriptsPublished,
+    isLoading: blockScriptsPublishedLoading,
+  } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
     workflowPermanentId,
@@ -100,6 +136,7 @@ function WorkflowRunCode(props?: Props) {
     setSelectedVersion(null);
     setIsEditing(false);
     setEditedCode("");
+    setFixOpen(false);
   }, [scriptId, currentVersion]);
 
   // Fetch available versions for this script
@@ -141,6 +178,7 @@ function WorkflowRunCode(props?: Props) {
 
   // --- Edit mode state ---
   const [isEditing, setIsEditing] = useState(false);
+  const [fixOpen, setFixOpen] = useState(false);
   const [editedCode, setEditedCode] = useState("");
   const originalCodeRef = useRef("");
 
@@ -271,6 +309,23 @@ function WorkflowRunCode(props?: Props) {
     [setSelectedVersion],
   );
 
+  if (studioLayout && code.length === 0) {
+    // Still generating (run in flight) or the code query hasn't resolved yet —
+    // show a skeleton rather than a premature "no code" message.
+    if (
+      isGeneratingCode ||
+      blockScriptsPendingLoading ||
+      blockScriptsPublishedLoading
+    ) {
+      return <CodeLoadingSkeleton />;
+    }
+    return (
+      <div className="flex items-center justify-center bg-slate-elevation3 p-8 text-sm text-muted-foreground">
+        No code has been generated yet.
+      </div>
+    );
+  }
+
   if (code.length === 0 && !isGeneratingCode) {
     return (
       <div className="flex items-center justify-center bg-slate-elevation3 p-8">
@@ -338,6 +393,19 @@ function WorkflowRunCode(props?: Props) {
       </div>
     ) : null;
 
+  // Fix-with-AI trigger lives in the studio toolbar; the expand panel renders
+  // below. Legacy keeps ScriptFixInput's own inline trigger.
+  const fixTrigger =
+    studioLayout &&
+    enableCodeBlock &&
+    code.length > 0 &&
+    isFinalized &&
+    workflowPermanentId &&
+    !isEditing &&
+    !fixOpen ? (
+      <ScriptFixTriggerButton onClick={() => setFixOpen(true)} />
+    ) : null;
+
   // Version selector — "Used → Generated" chips instead of dropdown
   const activeChipVersion = selectedVersion ?? generatedVersion ?? usedVersion;
 
@@ -388,6 +456,7 @@ function WorkflowRunCode(props?: Props) {
         <div className="flex items-center justify-end gap-2">
           {editButton}
           {editActions}
+          {fixTrigger}
           {versionSelector}
           {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
         </div>
@@ -399,6 +468,8 @@ function WorkflowRunCode(props?: Props) {
               workflowPermanentId={workflowPermanentId}
               workflowRunId={workflowRun?.workflow_run_id}
               onScriptUpdated={handleScriptUpdated}
+              open={studioLayout ? fixOpen : undefined}
+              onOpenChange={studioLayout ? setFixOpen : undefined}
             />
           )}
         <CodeEditor
@@ -428,55 +499,97 @@ function WorkflowRunCode(props?: Props) {
     cacheKeyValueSet.add(cacheKeyValueForWorkflowRun);
   }
 
+  const cacheKeyVariantSelector =
+    cacheKeyValueSet.size > 0 ? (
+      <div className="flex items-center gap-1.5">
+        <HelpTooltip
+          content={
+            !isFinalized
+              ? "The cached variant the generated code is stored under."
+              : "Which cached code variant to view."
+          }
+        />
+        <Select
+          disabled={!isFinalized || isEditing}
+          value={cacheKeyValue}
+          onValueChange={(v: string) => setCacheKeyValue(v)}
+        >
+          <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs [&>span]:text-ellipsis">
+            <SelectValue placeholder="Variant" />
+          </SelectTrigger>
+          <SelectContent>
+            {Array.from(cacheKeyValueSet)
+              .sort()
+              .map((value, i) => {
+                const v = value
+                  ? value.length === 0
+                    ? "default"
+                    : value
+                  : "default";
+
+                return (
+                  <SelectItem key={`${v}-${i}`} value={v}>
+                    {value === cacheKeyValueForWorkflowRun &&
+                    isFinalized === true ? (
+                      <span className="underline">{v}</span>
+                    ) : (
+                      v
+                    )}
+                  </SelectItem>
+                );
+              })}
+          </SelectContent>
+        </Select>
+      </div>
+    ) : null;
+
+  if (!studioLayout) {
+    return (
+      <div className="flex h-full w-full flex-col items-end justify-center gap-2">
+        <div className="flex w-full items-center justify-end gap-2">
+          {editButton}
+          {editActions}
+          {versionSelector}
+          {cacheKeyVariantSelector}
+          {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
+        </div>
+        {enableCodeBlock &&
+          code.length > 0 &&
+          isFinalized &&
+          workflowPermanentId && (
+            <ScriptFixInput
+              workflowPermanentId={workflowPermanentId}
+              workflowRunId={workflowRun?.workflow_run_id}
+              onScriptUpdated={handleScriptUpdated}
+            />
+          )}
+        <CodeEditor
+          className={cn("h-full w-full overflow-y-scroll", {
+            "animate-pulse": isGeneratingCode || isLoadingVersion,
+          })}
+          language="python"
+          value={isEditing ? editedCode : code}
+          onChange={isEditing ? setEditedCode : undefined}
+          lineWrap={false}
+          readOnly={!isEditing}
+          fontSize={10}
+        />
+      </div>
+    );
+  }
+
   return (
-    <div className="flex h-full w-full flex-col items-end justify-center gap-2">
-      <div className="flex w-full items-center justify-end gap-2">
+    <div className="flex h-full w-full flex-col gap-2">
+      <div className="flex w-full items-center gap-2">
+        {versionSelector}
+        {cacheKeyVariantSelector}
+        <div className="flex-1" />
+        {!isEditing && code.length > 0 && (
+          <CopyAndExplainCode code={code} showCopy={false} />
+        )}
         {editButton}
         {editActions}
-        {versionSelector}
-        {cacheKeyValueSet.size > 0 ? (
-          <div className="flex items-center gap-1.5">
-            <HelpTooltip
-              content={
-                !isFinalized
-                  ? "The cached variant the generated code is stored under."
-                  : "Which cached code variant to view."
-              }
-            />
-            <Select
-              disabled={!isFinalized || isEditing}
-              value={cacheKeyValue}
-              onValueChange={(v: string) => setCacheKeyValue(v)}
-            >
-              <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs [&>span]:text-ellipsis">
-                <SelectValue placeholder="Variant" />
-              </SelectTrigger>
-              <SelectContent>
-                {Array.from(cacheKeyValueSet)
-                  .sort()
-                  .map((value, i) => {
-                    const v = value
-                      ? value.length === 0
-                        ? "default"
-                        : value
-                      : "default";
-
-                    return (
-                      <SelectItem key={`${v}-${i}`} value={v}>
-                        {value === cacheKeyValueForWorkflowRun &&
-                        isFinalized === true ? (
-                          <span className="underline">{v}</span>
-                        ) : (
-                          v
-                        )}
-                      </SelectItem>
-                    );
-                  })}
-              </SelectContent>
-            </Select>
-          </div>
-        ) : null}
-        {!isEditing && code.length > 0 && <CopyAndExplainCode code={code} />}
+        {fixTrigger}
       </div>
       {enableCodeBlock &&
         code.length > 0 &&
@@ -486,19 +599,28 @@ function WorkflowRunCode(props?: Props) {
             workflowPermanentId={workflowPermanentId}
             workflowRunId={workflowRun?.workflow_run_id}
             onScriptUpdated={handleScriptUpdated}
+            open={fixOpen}
+            onOpenChange={setFixOpen}
           />
         )}
-      <CodeEditor
-        className={cn("h-full w-full overflow-y-scroll", {
-          "animate-pulse": isGeneratingCode || isLoadingVersion,
-        })}
-        language="python"
-        value={isEditing ? editedCode : code}
-        onChange={isEditing ? setEditedCode : undefined}
-        lineWrap={false}
-        readOnly={!isEditing}
-        fontSize={10}
-      />
+      <div className="relative min-h-0 w-full flex-1">
+        <CodeEditor
+          className={cn("h-full w-full overflow-y-scroll", {
+            "animate-pulse": isGeneratingCode || isLoadingVersion,
+          })}
+          language="python"
+          value={isEditing ? editedCode : code}
+          onChange={isEditing ? setEditedCode : undefined}
+          lineWrap={false}
+          readOnly={!isEditing}
+          fontSize={10}
+        />
+        {!isEditing && code.length > 0 ? (
+          <div className="absolute right-3 top-3 z-10 rounded bg-slate-elevation2/80 backdrop-blur-sm">
+            <CopyText text={code} />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

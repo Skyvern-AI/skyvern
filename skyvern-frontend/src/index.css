@@ -54,6 +54,11 @@
 
     --radius: 0.5rem;
 
+    /* studio editor brand accent (#6d6cf6) — opt-in via `studio-accent` utilities, scoped to the workflow studio */
+    --studio-accent: 244.8 84.4% 60%;
+    --studio-accent-foreground: 0 0% 100%;
+    --studio-accent-2: 244.5 100% 71.4%;
+
     --slate-elevation-1: 0 0% 98%;
     --slate-elevation-2: 0 0% 96%;
     --slate-elevation-3: 0 0% 93%;

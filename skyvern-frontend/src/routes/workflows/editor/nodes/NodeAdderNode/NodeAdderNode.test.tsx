@@ -61,7 +61,9 @@ const initialWorkflowSettings = useWorkflowSettingsStore.getState();
 
 function renderNodeAdder(props: Partial<NodeProps<NodeAdderNodeType>>) {
   return render(
-    <DebugStoreContext.Provider value={{ isDebugMode: false }}>
+    <DebugStoreContext.Provider
+      value={{ isDebugMode: false, blockRunsEnabled: false }}
+    >
       <NodeAdderNode
         {...({
           id: "adder",

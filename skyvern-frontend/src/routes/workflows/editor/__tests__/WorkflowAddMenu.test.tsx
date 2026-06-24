@@ -32,7 +32,9 @@ const initialRecording = useRecordingStore.getState();
 
 function renderInDebugMode() {
   return render(
-    <DebugStoreContext.Provider value={{ isDebugMode: true }}>
+    <DebugStoreContext.Provider
+      value={{ isDebugMode: true, blockRunsEnabled: false }}
+    >
       <WorkflowAddMenu
         onAdd={() => {}}
         onRecord={() => {}}
