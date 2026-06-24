@@ -8,8 +8,10 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+import structlog
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+LOG = structlog.get_logger()
 
 _OTP_QUERY_TERMS = "(verification OR verify OR code OR passcode OR otp OR 2fa OR one-time OR password)"
 _SAFE_EMAIL_QUERY_IDENTIFIER = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$")
@@ -169,8 +171,14 @@ async def search_recent_otp_messages(
                 params={"format": "full"},
             )
             candidate = _candidate(message)
-            if candidate and candidate.internal_date and (not cutoff or candidate.internal_date >= cutoff):
-                candidates_.append(candidate)
+            if not candidate:
+                continue
+            if not candidate.internal_date:
+                LOG.debug("Skipping Gmail OTP candidate without internalDate", message_id=candidate.message_id)
+                continue
+            if cutoff and candidate.internal_date < cutoff:
+                continue
+            candidates_.append(candidate)
         return candidates_
 
     if client is None:

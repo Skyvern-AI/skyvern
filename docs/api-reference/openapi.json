@@ -12027,7 +12027,7 @@
           "continue_on_empty": {
             "type": "boolean",
             "title": "Continue On Empty",
-            "description": "When the run download directory has no files, fail the block (False, default) instead of reporting success. Set True to allow an empty upload (success with no files uploaded).",
+            "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
             "default": false
           }
         },

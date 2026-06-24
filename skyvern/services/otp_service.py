@@ -465,6 +465,8 @@ async def poll_otp_value(
             # intentional backstops only when the webhook has no code yet.
             if totp_verification_url:
                 if org_token is None:
+                    # The org token is only needed for webhook polling. Gmail
+                    # and DB-only polling should not fail on missing webhook auth.
                     org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
                         organization_id, OrganizationAuthTokenType.api.value
                     )
