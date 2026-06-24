@@ -58,6 +58,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     foldersMap,
     workflowTagsMap,
     tagDescriptions,
+    tagColors,
     tagKeys,
     labelSuggestions,
     valueSuggestionsByKey,
@@ -186,7 +187,11 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
               )}
             </div>
             {workflowTags && workflowTags.length > 0 ? (
-              <TagChipList tags={workflowTags} descriptions={tagDescriptions} />
+              <TagChipList
+                tags={workflowTags}
+                descriptions={tagDescriptions}
+                colors={tagColors}
+              />
             ) : null}
           </div>
         </TableCell>
@@ -252,6 +257,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                   tagKeys={tagKeys}
                   labelSuggestions={labelSuggestions}
                   valueSuggestionsByKey={valueSuggestionsByKey}
+                  colorMap={tagColors}
                 />
               </>
             )}

@@ -12,6 +12,7 @@ import {
   tagElementKey,
   type Tag,
 } from "../../types/tagTypes";
+import { tagColorFor, type TagColorMap } from "../../types/tagColors";
 import { TagChip } from "./TagChip";
 
 type Props = {
@@ -19,13 +20,21 @@ type Props = {
   // Group (key) -> description. A Map (not a plain object) so user-controlled keys
   // can't hit Object prototype members (e.g. a key named "constructor").
   descriptions?: Map<string, string | null>;
+  // (key, value) -> palette color for grouped tags. Standalone labels stay neutral.
+  colors?: TagColorMap;
   maxVisible?: number;
   className?: string;
 };
 
 // Generic list of tag chips with a "+N" overflow affordance. Standalone labels
 // sort first, then grouped by key, for stable ordering across renders.
-function TagChipList({ tags, descriptions, maxVisible = 3, className }: Props) {
+function TagChipList({
+  tags,
+  descriptions,
+  colors,
+  maxVisible = 3,
+  className,
+}: Props) {
   // Re-validate at render time: callers feed this straight from API payloads,
   // and a shape skew here previously killed the whole route via React #31.
   const safeTags = normalizeWorkflowTags(tags);
@@ -46,6 +55,7 @@ function TagChipList({ tags, descriptions, maxVisible = 3, className }: Props) {
           description={
             tag.key !== null ? descriptions?.get(tag.key) : undefined
           }
+          color={tagColorFor(colors, tag.key, tag.value)}
         />
       ))}
       {hidden.length > 0 ? (

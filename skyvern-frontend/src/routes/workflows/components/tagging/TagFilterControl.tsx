@@ -31,6 +31,11 @@ import {
   type TagFilterTerm,
   type TagKey,
 } from "../../types/tagTypes";
+import {
+  paletteDotClass,
+  tagColorFor,
+  type TagColorMap,
+} from "../../types/tagColors";
 
 type Props = {
   tagKeys: Array<TagKey>;
@@ -51,6 +56,9 @@ type Props = {
   // literally (the analytics summary endpoint), where those broader forms
   // would silently return unfiltered/empty data.
   exactValuesOnly?: boolean;
+  // (key, value) -> palette color; only exact group:value chips are colored.
+  // Omit on surfaces that don't load colors (chips stay neutral).
+  colors?: TagColorMap;
 };
 
 // Group identity used for display + dedupe: exact terms sharing a key OR
@@ -81,6 +89,7 @@ function TagFilterControl({
   triggerLabel = "Tags",
   onDeleteKey,
   exactValuesOnly = false,
+  colors,
 }: Props) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
@@ -245,6 +254,13 @@ function TagFilterControl({
                   termGroupId(previous) !== termGroupId(term);
                 const unknownKey =
                   term.key !== null && !knownKeys.has(term.key);
+                // Only exact group:value terms carry a color, shown as a leading
+                // dot; the chip surface stays neutral. A warning border (unknown
+                // group) is independent of the color dot.
+                const dotClass =
+                  !unknownKey && term.value !== null
+                    ? paletteDotClass(tagColorFor(colors, term.key, term.value))
+                    : "";
                 return (
                   <React.Fragment key={termDedupeKey(term)}>
                     {startsNewConjunct ? (
@@ -264,6 +280,15 @@ function TagFilterControl({
                           : undefined
                       }
                     >
+                      {dotClass ? (
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            "inline-block h-2 w-2 shrink-0 rounded-full",
+                            dotClass,
+                          )}
+                        />
+                      ) : null}
                       <span className="truncate">{termLabel(term)}</span>
                       <button
                         type="button"

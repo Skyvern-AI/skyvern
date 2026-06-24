@@ -2,6 +2,7 @@ import { createContext, useContext, type MouseEvent } from "react";
 import type { ParameterDisplayItem } from "../ParameterDisplayInline";
 import type { Folder } from "../../types/folderTypes";
 import type { Tag, TagKey } from "../../types/tagTypes";
+import type { TagColorMap } from "../../types/tagColors";
 
 // Shared, read-only state and handlers consumed by every workflow row, whether
 // the row is rendered flat (search results) or nested under a folder node. Lives
@@ -16,6 +17,8 @@ export interface WorkflowsListContextValue {
   foldersMap: ReadonlyMap<string, Folder>;
   workflowTagsMap: Record<string, Array<Tag>>;
   tagDescriptions: Map<string, string | null>;
+  // (key, value) -> palette color for grouped tag chips; undefined until loaded.
+  tagColors: TagColorMap | undefined;
   tagKeys: Array<TagKey>;
   labelSuggestions: Array<string>;
   valueSuggestionsByKey: Map<string, Array<string>>;
