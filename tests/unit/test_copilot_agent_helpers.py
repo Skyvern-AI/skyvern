@@ -5519,7 +5519,8 @@ class TestClassifierFallbackCompletionFloor:
         assert policy.completion_contract_status == "unknown"
 
         trace = policy.to_trace_data()
-        assert trace["completion_criteria_count"] > 0
+        assert trace["completion_criteria_count"] == 0
+        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria)
         assert trace["has_completion_contract"] is False
 
     def test_floor_is_excluded_from_judge_satisfaction_set(self) -> None:
@@ -5603,3 +5604,32 @@ class TestClassifierFallbackCompletionFloor:
         ]
 
         assert not any(is_fallback_floor_criterion(c) for c in criteria)
+
+
+class TestDeclaredEqualsGradedCompletionCriteria:
+    @staticmethod
+    def _policy(total: int, method_mandated: int) -> RequestPolicy:
+        criteria = [
+            CompletionCriterion(id=f"c{i}", outcome=f"outcome {i}", method_mandated=i < method_mandated)
+            for i in range(total)
+        ]
+        return RequestPolicy(completion_criteria=criteria)
+
+    @pytest.mark.parametrize("total, method_mandated", [(6, 2), (8, 1), (5, 0)])
+    def test_declared_count_equals_graded_set_across_shapes(self, total: int, method_mandated: int) -> None:
+        policy = self._policy(total, method_mandated)
+        ctx = SimpleNamespace(request_policy=policy)
+        graded = total - method_mandated
+
+        declared = policy.to_trace_data()["completion_criteria_count"]
+        assert declared == len(policy.graded_completion_criteria())
+        assert declared == len(_completion_verification_criteria(ctx))
+        assert declared == graded
+        assert policy.to_trace_data()["completion_criteria_method_mandated_count"] == method_mandated
+
+    def test_graded_set_excludes_only_method_mandated_criteria(self) -> None:
+        policy = self._policy(6, 2)
+
+        graded = policy.graded_completion_criteria()
+        assert all(not criterion.method_mandated for criterion in graded)
+        assert {criterion.id for criterion in graded} == {"c2", "c3", "c4", "c5"}
