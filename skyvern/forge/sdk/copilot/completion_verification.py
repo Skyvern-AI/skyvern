@@ -79,8 +79,19 @@ class CompletionVerificationResult:
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
             return False
-        satisfied = {verdict.criterion_id for verdict in self.verdicts if verdict.satisfied}
-        return all(criterion_id in satisfied for criterion_id in self.criterion_ids)
+        verdict_by_id = {verdict.criterion_id: verdict for verdict in self.verdicts}
+        satisfied_count = 0
+        for criterion_id in self.criterion_ids:
+            verdict = verdict_by_id.get(criterion_id)
+            if verdict is not None and verdict.satisfied:
+                satisfied_count += 1
+                continue
+            # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
+            # so it must not veto a run whose observable outcome evidence is fully confirmed.
+            if verdict is not None and _is_definition_plane_abstention(verdict):
+                continue
+            return False
+        return satisfied_count > 0
 
     def to_trace_data(self) -> dict[str, Any]:
         unmet = [verdict for verdict in self.verdicts if not verdict.satisfied]
@@ -389,12 +400,12 @@ def grade_definition_criteria(criteria: list[CompletionCriterion], workflow_yaml
             )
             continue
         defined, referenced = reference_state
+        named = _named_definition_inputs(criterion.outcome)
         if defined and referenced:
             # When the criterion names specific inputs, each must match a defined
             # parameter key; one stray parameter must not satisfy a multi-input ask.
             # An unmatchable name degrades to unknown, not unsatisfied — extraction
             # is heuristic and a false negative would drive repair of correct YAML.
-            named = _named_definition_inputs(criterion.outcome)
             normalized_keys = [_normalize_input_phrase(key) for key in defined]
             if named and not all(_input_matches_any_key(candidate, normalized_keys) for candidate in named):
                 verdicts.append(
@@ -410,6 +421,13 @@ def grade_definition_criteria(criteria: list[CompletionCriterion], workflow_yaml
                     reason_code="definition_parameters_referenced",
                     evidence_ref="workflow_yaml:" + ",".join(referenced[:8]),
                 )
+            )
+        elif not named:
+            # A reusable-inputs hint with no specific named inputs cannot be proven
+            # false: a read-only/validation workflow legitimately defines none, so a
+            # missing/unreferenced parameter set abstains rather than sinking the run.
+            verdicts.append(
+                CriterionVerdict(criterion_id=criterion.id, state="unknown", reason_code="definition_parameters_absent")
             )
         elif defined:
             verdicts.append(
@@ -434,18 +452,25 @@ _ISO_DATE_LITERAL_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 # A bare digit run qualifies as an identifier only at >=5 digits: a 4-digit run is
 # usually a year and too low-specificity to credit on a coincidental output match.
 _LONG_DIGIT_LITERAL_RE = re.compile(r"\b\d{5,}\b")
+# A mixed alphanumeric code (e.g. WTR-1842-DEMO, ABC12345) credits only via the
+# letter+digit, >=6 alnum filter below, which excludes bare words and bare years.
+_STRUCTURED_ID_LITERAL_RE = re.compile(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\b")
 
 
 def _normalize_present_value(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
+def _is_structured_identifier(token: str) -> bool:
+    alnum = [ch for ch in token if ch.isalnum()]
+    return len(alnum) >= 6 and any(ch.isalpha() for ch in alnum) and any(ch.isdigit() for ch in alnum)
+
+
 def _extract_present_value_literals(outcome: str) -> list[str]:
-    literals: list[str] = []
-    for match in _QUOTED_LITERAL_RE.finditer(outcome):
-        literals.append(match.group(1))
+    literals: list[str] = [match.group(1) for match in _QUOTED_LITERAL_RE.finditer(outcome)]
     for pattern in (_CURRENCY_LITERAL_RE, _ISO_DATE_LITERAL_RE, _LONG_DIGIT_LITERAL_RE):
         literals.extend(pattern.findall(outcome))
+    literals.extend(token for token in _STRUCTURED_ID_LITERAL_RE.findall(outcome) if _is_structured_identifier(token))
     normalized: list[str] = []
     seen: set[str] = set()
     for literal in literals:
@@ -891,6 +916,10 @@ def _is_meaningful_record_value(value: Any) -> bool:
 
 
 _DEFINITION_REASON_PREFIX = "definition_"
+
+
+def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
+    return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
 
 
 def run_plane_all_no_evidence(result: CompletionVerificationResult) -> bool:

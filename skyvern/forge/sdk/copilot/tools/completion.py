@@ -267,19 +267,18 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
     """A clean ok=True run worth judging on its whole-workflow outcome.
 
     Recognition is governed by the outcome evidence the user can observe, not by
-    whether every block was verified as an end-to-end prefix (SKY-10576). The judge
-    requires positive evidence for every criterion, and ``empty_data_blocks`` rejects
-    a run whose outcome block produced nothing, so an incomplete run never passes --
-    this only lets an already-reached goal be recognized without a redundant
-    full-prefix re-run.
+    whether the run produced any data. The judge requires positive evidence for
+    every criterion, so a genuinely-empty run still grades unsatisfied; only a
+    terminal anti-bot blocker keeps a completed run out of the judge, because that
+    evidence makes the apparent success unusable.
     """
     if not bool(result.get("ok", False)):
         return False
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
-    anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
+    anti_bot, _empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
     if structured_blocker and (anti_bot or _looks_like_anti_bot_blocker(structured_blocker)):
         return False
-    return not empty_data_blocks
+    return True
 
 
 def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str, Any]) -> bool:

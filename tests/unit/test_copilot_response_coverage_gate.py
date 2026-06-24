@@ -58,7 +58,6 @@ class _Ctx:
         self.last_test_anti_bot = None
         self.failed_test_nudge_count = 0
         self.explore_without_workflow_nudge_count = 0
-        self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
         self.last_artifact_health_blocker_reason = None
