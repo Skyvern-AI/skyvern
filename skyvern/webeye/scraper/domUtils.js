@@ -1469,29 +1469,28 @@ function getElementText(element) {
     return element.data.trim();
   }
 
-  const childNodes = element.childNodes;
-  const childNodesLength = childNodes.length;
-
-  // If no child nodes, return empty string directly
-  if (childNodesLength === 0) {
-    return "";
-  }
+  // Web components can render values as bare text nodes directly in an open
+  // shadow root; the Element walker only recurses shadow Element children, so
+  // fold those text nodes here. Direct children only — no <slot>, since
+  // slotted content lives in light DOM.
+  const sources = element.shadowRoot
+    ? [element.childNodes, element.shadowRoot.childNodes]
+    : [element.childNodes];
 
   const visibleText = [];
-  let hasText = false;
-
-  for (let i = 0; i < childNodesLength; i++) {
-    const node = childNodes[i];
-    if (node.nodeType === Node.TEXT_NODE) {
-      const nodeText = node.data.trim();
-      if (nodeText.length > 0) {
-        visibleText.push(nodeText);
-        hasText = true;
+  for (const childNodes of sources) {
+    for (let i = 0; i < childNodes.length; i++) {
+      const node = childNodes[i];
+      if (node.nodeType === Node.TEXT_NODE) {
+        const nodeText = node.data.trim();
+        if (nodeText.length > 0) {
+          visibleText.push(nodeText);
+        }
       }
     }
   }
 
-  return hasText ? visibleText.join(";") : "";
+  return visibleText.length > 0 ? visibleText.join(";") : "";
 }
 
 function getSelectOptions(element) {
