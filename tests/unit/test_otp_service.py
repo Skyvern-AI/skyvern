@@ -70,6 +70,9 @@ class TestIsMfaLikeParameterKey:
 class TestExtractTotpFromNavigationInputs:
     """extract_totp_from_navigation_inputs should only return actual OTP codes."""
 
+    def test_untyped_short_numeric_value_defaults_to_totp(self) -> None:
+        assert OTPValue(value="123456").get_otp_type() == OTPType.TOTP
+
     def test_returns_none_for_none_payload(self) -> None:
         assert extract_totp_from_navigation_inputs(None) is None
 
@@ -81,6 +84,14 @@ class TestExtractTotpFromNavigationInputs:
         result = extract_totp_from_navigation_inputs(payload)
         assert result is not None
         assert result.value == "123456"
+        assert result.get_otp_type() == OTPType.TOTP
+
+    def test_extracts_magic_link_from_payload(self) -> None:
+        payload = {"verification_code": "https://example.com/login/magic?token=abc123"}
+        result = extract_totp_from_navigation_inputs(payload)
+        assert result is not None
+        assert result.value == "https://example.com/login/magic?token=abc123"
+        assert result.get_otp_type() == OTPType.MAGIC_LINK
 
     def test_ignores_totp_identifier_key(self) -> None:
         """The core bug: totp_identifier value must NOT be returned as OTP code."""
@@ -914,6 +925,29 @@ class TestTryGenerateTotpFromCredential:
 
         assert result is not None
         assert result.value == "424242"
+
+    def test_active_credential_with_otpauth_uri_uses_uri_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        totp_uri = (
+            "otpauth://totp/Example:user@example.com"
+            "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+        )
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u_b", "password": "p_b", "totp": "tot_b"}},
+            secrets={"tot_b_value": totp_uri},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        generate_totp_code_mock = MagicMock(return_value="12345678")
+        monkeypatch.setattr(otp_service, "generate_totp_code", generate_totp_code_mock)
+
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is not None
+        assert result.value == "12345678"
+        assert len(result.value) == 8
+        generate_totp_code_mock.assert_called_once_with(totp_uri)
 
     def test_no_active_credential_with_multiple_totps_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Avoid the original bug: walking all credentials when which is active is unknown."""
