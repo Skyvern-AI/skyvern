@@ -81,6 +81,19 @@ async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) ->
         return
 
 
+async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None:
+    # Best-effort readiness guard before capturing. 'domcontentloaded' fires far
+    # earlier than 'load'; pages with streaming/long-polling/SSE/websockets or a
+    # persistent spinner may never fire 'load', so a timeout here must be
+    # non-fatal — the capture has its own (separate) timeout budget.
+    if timeout_ms <= 0:
+        return
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except (PlaywrightError, TimeoutError):
+        LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
+
+
 def _load_cursor_overlay_js() -> str:
     path = f"{SKYVERN_DIR}/webeye/scraper/cursorOverlay.js"
     with open(path, encoding="utf-8") as f:
@@ -151,8 +164,9 @@ async def _current_viewpoint_screenshot_helper(
 
     try:
         if mode == ScreenshotMode.DETAILED:
-            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
-            LOG.debug("Page is fully loaded, agent is about to take screenshots")
+            await _wait_for_screenshot_load_state(
+                page, timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS
+            )
         start_time = time.time()
         screenshot: bytes = b""
         if file_path:
