@@ -129,6 +129,7 @@ from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
     CUA_ENGINES,
+    MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
     BlockRunResponse,
     BulkCancelRunsRequest,
@@ -3349,6 +3350,11 @@ async def get_runs_v2(
     ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
+    if search_key and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"Search pagination is limited to the first {MAX_SEARCH_FETCH_LIMIT} matches. Use a narrower search.",
+        )
 
     rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
         current_org.organization_id,

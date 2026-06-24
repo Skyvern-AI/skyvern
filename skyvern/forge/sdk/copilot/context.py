@@ -432,11 +432,6 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
-    # Consecutive test runs whose data-producing blocks completed with no
-    # meaningful output (missing, empty, or all-null fields). Resets when a
-    # run produces real data. Used to escalate when the agent is stuck
-    # retrying extraction against a page that doesn't contain the data.
-    null_data_streak_count: int = 0
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
