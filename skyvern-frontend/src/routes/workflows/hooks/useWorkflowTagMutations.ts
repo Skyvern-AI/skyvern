@@ -38,6 +38,9 @@ function useApplyWorkflowTagsMutation() {
       queryClient.invalidateQueries({ queryKey: ["workflow-tags"] });
       // A first-time key registers a new tag-key row, so refresh the registry.
       queryClient.invalidateQueries({ queryKey: ["tag-keys"] });
+      // The apply request can set/change a grouped tag's color, so refresh the
+      // color registry or new colors won't render until a hard refetch.
+      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
       // The workflows list is filterable by tags, so a changed tag can change
       // which rows match the active ?tags= filter.
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
