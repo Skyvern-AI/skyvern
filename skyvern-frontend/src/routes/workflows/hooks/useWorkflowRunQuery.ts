@@ -15,8 +15,9 @@ import {
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-function useWorkflowRunQuery() {
-  const workflowRunId = useFirstParam("workflowRunId", "runId");
+function useWorkflowRunQuery(options?: { workflowRunId?: string }) {
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();

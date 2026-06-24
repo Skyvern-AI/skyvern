@@ -7,6 +7,8 @@ import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
+import { BlockStatusBar } from "@/routes/workflows/studio/BlockStatusBar";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { cn } from "@/util/utils";
 
 import { useCollapseContext } from "../../collapse/CollapseContext";
@@ -18,6 +20,7 @@ import type { TaskNode } from "./types";
 
 function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");
+  const studioEnabled = useWorkflowStudioEnabled();
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
@@ -70,6 +73,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             totpUrl={data.totpVerificationUrl}
             type={type}
           />
+          {studioEnabled && <BlockStatusBar blockLabel={label} />}
           <NodeBody>
             <BuildModeOnly>
               <TaskEditor blockId={id} />

@@ -96,6 +96,7 @@ interface Props {
   interactive?: boolean;
   showControlButtons?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onUrlChange?: (url: string) => void;
 }
 
 function BrowserSessionStream({
@@ -103,6 +104,7 @@ function BrowserSessionStream({
   interactive = false,
   showControlButtons = false,
   onReadyChange,
+  onUrlChange,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
@@ -277,6 +279,10 @@ function BrowserSessionStream({
   }, [credentialGetter, browserSessionId]);
 
   const isReady = streamImgSrc.length > 0;
+
+  useEffect(() => {
+    onUrlChange?.(currentUrl);
+  }, [currentUrl, onUrlChange]);
 
   useEffect(() => {
     // browserSessionId intentionally not a dep: re-firing on prop change

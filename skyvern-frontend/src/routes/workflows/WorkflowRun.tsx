@@ -34,7 +34,13 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  Navigate,
+  Outlet,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import {
   statusIsAFailureType,
   statusIsCancellable,
@@ -68,6 +74,8 @@ import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCar
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecoveryGuidance";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
@@ -147,6 +155,7 @@ function WorkflowRun() {
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const onboarding = useOnboardingStateOptional();
 
   const {
@@ -520,6 +529,25 @@ function WorkflowRun() {
     return <Status404 />;
   }
 
+  // With the preview on, route legacy run links into the studio Run tab
+  // (preserving the selected item); flag-off keeps this legacy run view.
+  if (studioEnabled && !isEmbedded && workflowRunId && workflowPermanentId) {
+    const studioParams = new URLSearchParams();
+    studioParams.set("wr", workflowRunId);
+    if (active) {
+      studioParams.set("active", active);
+    }
+    if (iterationParam) {
+      studioParams.set("iteration", iterationParam);
+    }
+    return (
+      <Navigate
+        to={`/workflows/${workflowPermanentId}/studio?${studioParams.toString()}`}
+        replace
+      />
+    );
+  }
+
   return (
     <div className="space-y-8">
       {!isEmbedded && (
@@ -626,7 +654,10 @@ function WorkflowRun() {
                 />
                 <Button asChild variant="secondary">
                   <Link
-                    to={`/workflows/${workflowPermanentId}/build`}
+                    to={workflowEditorPath(
+                      workflowPermanentId ?? "",
+                      studioEnabled,
+                    )}
                     data-testid="workflow-open-editor-link"
                   >
                     <Pencil2Icon className="mr-2 h-4 w-4" />

@@ -19,17 +19,19 @@ type ApiWebhookActionsMenuProps = {
   runId?: string;
   webhookDisabled?: boolean;
   onTestWebhook: () => void;
+  size?: "default" | "sm";
 };
 
 export function ApiWebhookActionsMenu({
   getOptions,
   webhookDisabled = false,
   onTestWebhook,
+  size = "default",
 }: ApiWebhookActionsMenuProps) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button type="button" variant="secondary">
+        <Button type="button" variant="secondary" size={size}>
           API & Webhooks
         </Button>
       </DropdownMenuTrigger>

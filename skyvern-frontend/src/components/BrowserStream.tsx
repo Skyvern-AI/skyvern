@@ -562,18 +562,23 @@ function BrowserStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interactive, isMessageConnected, userIsControlling]);
 
-  // Effect to handle window resize trigger for NoVNC canvas
+  // noVNC (1.5.0) only rescales via its own observer, which gets swallowed on
+  // re-parent; re-asserting scaleViewport on resize forces a recompute (skip 0×0).
   useEffect(() => {
-    if (!resizeTrigger || !canvasContainer || !rfbRef.current) {
+    if (!canvasContainer || typeof ResizeObserver === "undefined") {
       return;
     }
-
-    // const originalDisplay = canvasContainer.style.display;
-    // canvasContainer.style.display = "none";
-    // canvasContainer.offsetHeight;
-    // canvasContainer.style.display = originalDisplay;
-    // window.dispatchEvent(new Event("resize"));
-  }, [resizeTrigger, canvasContainer]);
+    const rescale = () => {
+      const rect = canvasContainer.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0 && rfbRef.current) {
+        rfbRef.current.scaleViewport = true;
+      }
+    };
+    rescale();
+    const observer = new ResizeObserver(rescale);
+    observer.observe(canvasContainer);
+    return () => observer.disconnect();
+  }, [canvasContainer, resizeTrigger]);
 
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {

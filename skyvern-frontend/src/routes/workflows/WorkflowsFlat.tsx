@@ -70,6 +70,9 @@ import React, {
   useState,
 } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "./studioNavigation";
 import { useDebounce } from "use-debounce";
 import {
   DropdownMenu,
@@ -156,6 +159,7 @@ function WorkflowsFlat() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
@@ -1129,7 +1133,10 @@ function WorkflowsFlat() {
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
-                                          `/workflows/${workflow.workflow_permanent_id}/build`,
+                                          workflowEditorPath(
+                                            workflow.workflow_permanent_id,
+                                            studioEnabled,
+                                          ),
                                         );
                                       }}
                                     >

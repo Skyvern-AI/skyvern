@@ -48,7 +48,14 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { nanoid } from "nanoid";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useDebouncedCallback } from "use-debounce";
 import { useBlocker, useParams } from "react-router-dom";
 import {
@@ -381,6 +388,9 @@ type Props = {
   onLayoutPhaseChange?: (
     phase: "pre-layout" | "initial-load" | "ready",
   ) => void;
+  // Width of a left-side panel (the studio Copilot column) the canvas sits right
+  // of; the chain shifts left by half of it to read as page-centered, not pane.
+  centerOffsetX?: number;
 };
 
 function FlowRenderer({
@@ -404,6 +414,7 @@ function FlowRenderer({
   captureHistoryImmediately,
   onAddNode,
   onLayoutPhaseChange,
+  centerOffsetX = 0,
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
@@ -459,13 +470,25 @@ function FlowRenderer({
         maxZoom: options?.maxZoom ?? 1,
         duration,
       });
+      // fitView centers on the editor pane (right of the Copilot panel); once it
+      // settles, nudge left by half the panel so it reads as page-centered.
+      if (centerOffsetX > 0) {
+        window.setTimeout(() => {
+          const vp = reactFlowInstance.getViewport();
+          reactFlowInstance.setViewport({
+            x: vp.x - centerOffsetX / 2,
+            y: vp.y,
+            zoom: vp.zoom,
+          });
+        }, duration + 10);
+      }
       // Small safety buffer so a frame near the tail of the animation cannot
       // re-enter `constrainPan` before the final viewport lands.
       window.setTimeout(() => {
         fitViewInProgressRef.current = false;
       }, duration + 50);
     },
-    [reactFlowInstance],
+    [reactFlowInstance, centerOffsetX],
   );
 
   // Keep a ref so the keyboard handler can pick up the latest closure without
@@ -473,6 +496,23 @@ function FlowRenderer({
   // listener on every reactFlowInstance identity change).
   const runFitViewRef = useRef(runFitView);
   runFitViewRef.current = runFitView;
+
+  // React Flow's viewport is in canvas coords, so a Copilot collapse/expand would
+  // jump the chain by the width delta — counter-translate to keep blocks put.
+  const prevCenterOffsetRef = useRef(centerOffsetX);
+  useLayoutEffect(() => {
+    const delta = centerOffsetX - prevCenterOffsetRef.current;
+    prevCenterOffsetRef.current = centerOffsetX;
+    if (delta === 0) {
+      return;
+    }
+    const viewport = reactFlowInstance.getViewport();
+    reactFlowInstance.setViewport({
+      x: viewport.x - delta,
+      y: viewport.y,
+      zoom: viewport.zoom,
+    });
+  }, [centerOffsetX, reactFlowInstance]);
 
   // Canvas zoom + fit-view keyboard shortcuts. Gated to non-read-only
   // canvases for the same reason as the Escape handler above. Skip when
@@ -1488,6 +1528,42 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyApplyTrigger]);
 
+  // Fit once, when first visible (non-zero) and measured — a hidden mount fits at
+  // zero size; once-only so returning to the editor preserves the user's pan/zoom.
+  const hasInitialFitRef = useRef(false);
+  useEffect(() => {
+    // Studio-only: the legacy canvas keeps React Flow's own mount fit and must
+    // not be auto-fit here. centerOffsetX is > 0 only in the studio shell.
+    if (centerOffsetX <= 0) {
+      return;
+    }
+    if (hasInitialFitRef.current) {
+      return;
+    }
+    const el = editorElementRef.current;
+    if (!el) {
+      return;
+    }
+    let observer: ResizeObserver | null = null;
+    const tryFit = () => {
+      if (hasInitialFitRef.current) {
+        return;
+      }
+      const visible =
+        (editorElementRef.current?.getBoundingClientRect().width ?? 0) > 0;
+      if (!visible || !nodesInitialized) {
+        return;
+      }
+      hasInitialFitRef.current = true;
+      runFitView({ duration: 0 });
+      observer?.disconnect();
+    };
+    observer = new ResizeObserver(tryFit);
+    observer.observe(el);
+    tryFit();
+    return () => observer?.disconnect();
+  }, [runFitView, nodesInitialized, centerOffsetX]);
+
   const zoomLock = 1 as const;
   const yLockMax = 140 as const;
 
@@ -1513,7 +1589,9 @@ function FlowRenderer({
     const idealWidth = hasHttpBlock ? 580 : hasLoopBlock ? 498 : 475;
     const split = (width - idealWidth) / 2;
 
-    return Math.max(24, split);
+    // Shift left by half the left panel so the locked position matches the
+    // page-centered fit (see runFitView).
+    return Math.max(24, split - centerOffsetX / 2);
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {

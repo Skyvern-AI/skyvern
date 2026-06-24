@@ -17,10 +17,10 @@ describe("HINT_REGISTRY", () => {
     expect(keys.size).toBe(HINT_REGISTRY.length);
   });
 
-  it("matches the editor route only for the build editor path", () => {
+  it("matches both the build and edit editor paths", () => {
     const block = HINT_REGISTRY.find((h) => h.id === "add-another-block")!;
     expect(block.matchRoute("/workflows/wpid_123/build")).toBe(true);
-    expect(block.matchRoute("/workflows/wpid_123/edit")).toBe(false);
+    expect(block.matchRoute("/workflows/wpid_123/edit")).toBe(true);
     expect(block.matchRoute("/workflows")).toBe(false);
     expect(block.matchRoute("/workflows/wpid_123/runs")).toBe(false);
   });

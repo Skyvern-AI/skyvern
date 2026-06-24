@@ -21,6 +21,7 @@ interface InteractiveStreamViewProps {
     handleKeyUp: (e: React.KeyboardEvent) => void;
   };
   currentUrl?: string;
+  centered?: boolean;
 }
 
 function UrlBar({ url }: { url: string }) {
@@ -43,6 +44,7 @@ function InteractiveStreamView({
   showControlButtons,
   handlers,
   currentUrl,
+  centered,
 }: InteractiveStreamViewProps) {
   const imgDataUrl = `data:image/${streamFormat};base64,${streamImgSrc}`;
 
@@ -83,6 +85,23 @@ function InteractiveStreamView({
           onMouseMove={handlers.handleMouseMove}
           onContextMenu={(e) => e.preventDefault()}
           draggable={false}
+        />
+      </div>
+    );
+  }
+
+  // Plain img (not ZoomableImage) so h-full resolves here; ZoomableImage's bare
+  // auto-height wrapper collapses the height and pins the frame to the top.
+  if (centered) {
+    return (
+      <div className="flex h-full w-full flex-col">
+        {currentUrl && <UrlBar url={currentUrl} />}
+        <img
+          src={imgDataUrl}
+          className={cn(
+            "min-h-0 w-full flex-1 object-contain",
+            currentUrl ? "rounded-b-md" : "rounded-md",
+          )}
         />
       </div>
     );

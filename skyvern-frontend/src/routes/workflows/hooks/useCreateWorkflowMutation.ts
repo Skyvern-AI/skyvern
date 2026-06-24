@@ -7,6 +7,8 @@ import { stringify as convertToYAML } from "yaml";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "../studioNavigation";
 import axios from "axios";
 
 type CreateWorkflowInput = WorkflowCreateYAMLRequest & { _via?: string };
@@ -31,6 +33,7 @@ function useCreateWorkflowMutation() {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   return useMutation({
     mutationFn: async (input: CreateWorkflowInput) => {
       const { _via: _, ...workflow } = input;
@@ -66,7 +69,11 @@ function useCreateWorkflowMutation() {
       }
       const search = via ? `?via=${encodeURIComponent(via)}` : "";
       navigate(
-        `/workflows/${response.data.workflow_permanent_id}/build${search}`,
+        workflowEditorPath(
+          response.data.workflow_permanent_id,
+          studioEnabled,
+          search,
+        ),
       );
     },
     onError: (error) => {

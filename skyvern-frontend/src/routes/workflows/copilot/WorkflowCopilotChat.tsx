@@ -14,8 +14,10 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
+  ChevronRightIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
+import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -55,6 +57,8 @@ import {
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
+import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
+import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import {
   EMPTY_NARRATIVE,
   NarrativeEvent,
@@ -336,6 +340,13 @@ interface WorkflowCopilotChatProps {
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
   onInitialMessageConsumed?: () => void;
+  // Render as a docked panel (no float/drag/resize) instead of a floating window.
+  docked?: boolean;
+  // Collapse the docked panel to a rail. Only used when `docked`.
+  onCollapse?: () => void;
+  // When docked, render into this element via a portal (keeps the component in
+  // its parent's React tree so canvas callbacks stay wired) instead of inline.
+  portalTarget?: HTMLElement | null;
 }
 
 // Snap-back state keyed by turn_id so rapid resubmits don't clobber a prior
@@ -404,6 +415,9 @@ export function WorkflowCopilotChat({
   isLiveBrowserReady = false,
   initialMessage,
   onInitialMessageConsumed,
+  docked = false,
+  onCollapse,
+  portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
@@ -1970,24 +1984,42 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
 
-  return (
+  const content = (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
-      style={{
-        left: `${position.x}px`,
-        top: `${position.y}px`,
-        width: `${size.width}px`,
-        height: `${size.height}px`,
-      }}
+      className={
+        docked
+          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
+      }
+      style={
+        docked
+          ? undefined
+          : {
+              left: `${position.x}px`,
+              top: `${position.y}px`,
+              width: `${size.width}px`,
+              height: `${size.height}px`,
+            }
+      }
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-border px-4 py-2"
-        onMouseDown={handleMouseDown}
+        className={
+          "flex items-center justify-between border-b border-border px-4" +
+          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+        }
+        onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-foreground">
-          Agent Copilot (Beta)
-        </h3>
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-foreground">
+            {docked ? "Copilot" : "Agent Copilot (Beta)"}
+          </h3>
+          {docked ? (
+            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+              Beta
+            </span>
+          ) : null}
+        </div>
         <div className="flex items-center gap-2">
           <WorkflowCopilotHistory
             workflowPermanentId={workflowPermanentId}
@@ -2005,15 +2037,28 @@ export function WorkflowCopilotChat({
           </button>
           <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
           <span className="text-xs text-muted-foreground">Active</span>
-          <button
-            type="button"
-            onClick={() => onClose?.()}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            title="Close"
-          >
-            <Cross2Icon className="h-4 w-4" />
-          </button>
+          {docked ? (
+            onCollapse ? (
+              <button
+                type="button"
+                onClick={onCollapse}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Collapse Copilot"
+              >
+                <ChevronRightIcon className="h-4 w-4" />
+              </button>
+            ) : null
+          ) : (
+            <button
+              type="button"
+              onClick={() => onClose?.()}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              title="Close"
+            >
+              <Cross2Icon className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -2099,6 +2144,21 @@ export function WorkflowCopilotChat({
                           Reject
                         </button>
                       </div>
+                    ) : null}
+                    {docked && shouldShowDiffCard(message.narrative) ? (
+                      <DiffCard turn={message.narrative} />
+                    ) : null}
+                    {docked &&
+                    isLastMessage &&
+                    shouldShowFixCard(message.narrative) ? (
+                      <FixCard
+                        turn={message.narrative}
+                        onFix={() =>
+                          handleSend(
+                            "The last run failed — diagnose the failure and fix it, then re-run.",
+                          )
+                        }
+                      />
                     ) : null}
                   </div>
                 );
@@ -2397,48 +2457,57 @@ export function WorkflowCopilotChat({
       </div>
 
       {/* Resize Handles */}
-      {/* Corners */}
-      <div
-        className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "se")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
-        title="Resize"
-      />
-      <div
-        className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
-        title="Resize"
-      />
-      <div
-        className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
-        title="Resize"
-      />
-      {/* Edges */}
-      <div
-        className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "n")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "s")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "w")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "e")}
-        title="Resize"
-      />
+      {!docked && (
+        <>
+          {/* Corners */}
+          <div
+            className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "se")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
+            title="Resize"
+          />
+          <div
+            className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
+            title="Resize"
+          />
+          <div
+            className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
+            title="Resize"
+          />
+          {/* Edges */}
+          <div
+            className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "n")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "s")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "w")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "e")}
+            title="Resize"
+          />
+        </>
+      )}
     </div>
   );
+
+  if (docked) {
+    return portalTarget ? createPortal(content, portalTarget) : null;
+  }
+  return content;
 }
