@@ -1567,6 +1567,136 @@
         "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
+    "/v1/tag-values": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List tag values",
+        "description": "List the palette color assigned to each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value).",
+        "operationId": "list_tag_values_v1_tag_values_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TagValue"
+                  },
+                  "title": "Response List Tag Values V1 Tag Values Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_tag_values"
+      }
+    },
+    "/v1/tag-values/{key}": {
+      "patch": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Update tag value color",
+        "description": "Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.",
+        "operationId": "update_tag_value_v1_tag_values__key__patch",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully recolored tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValue"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "422": {
+            "description": "Invalid palette color"
+          }
+        },
+        "x-fern-sdk-method-name": "update_tag_value"
+      }
+    },
     "/v1/workflow-tags": {
       "get": {
         "tags": [
@@ -18355,6 +18485,21 @@
             "type": "array",
             "title": "Tags To Delete",
             "description": "Tags to soft-delete. List of {key?, value?} targets."
+          },
+          "colors": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Colors",
+            "description": "Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color."
           }
         },
         "type": "object",
@@ -18644,6 +18789,51 @@
         ],
         "title": "TagResponse",
         "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row).\n``key`` is null for a standalone label."
+      },
+      "TagValue": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "color": {
+            "type": "string",
+            "title": "Color"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "color"
+        ],
+        "title": "TagValue",
+        "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
+      },
+      "TagValueUpdate": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) under the key to recolor."
+          },
+          "color": {
+            "type": "string",
+            "title": "Color",
+            "description": "Palette color name to assign to this (key, value)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "color"
+        ],
+        "title": "TagValueUpdate",
+        "description": "Body for ``PATCH /v1/tag-values/{key}``. The value rides in the body, not the\npath, so values containing ``/`` stay addressable."
       },
       "TagsResponse": {
         "properties": {

@@ -154,6 +154,8 @@ from skyvern.schemas.tags import (
     TagKeyUpdate,
     TagResponse,
     TagsResponse,
+    TagValue,
+    TagValueUpdate,
     WorkflowTagsBatchRequest,
     WorkflowTagsBatchResponse,
     _assert_user_key_writable,
@@ -1566,6 +1568,7 @@ async def _apply_tag_changes_with_retry(
     context: TagWriteContext,
     label_sets: list[str] | None = None,
     label_deletes: list[str] | None = None,
+    colors: dict[str, str] | None = None,
 ) -> None:
     """Wrap ``apply_tag_changes`` with one IntegrityError retry: concurrent
     same-identity SETs race the partial UNIQUE; last-write-wins, else 409."""
@@ -1579,6 +1582,7 @@ async def _apply_tag_changes_with_retry(
                 context=context,
                 label_sets=label_sets,
                 label_deletes=label_deletes,
+                colors=colors,
             )
             return
         except IntegrityError:
@@ -1655,6 +1659,7 @@ async def apply_workflow_tags(
             context=write_ctx,
             label_sets=label_sets,
             label_deletes=label_deletes,
+            colors=data.colors,
         )
     except ValueError as e:
         # Cap-breach is the only ValueError surfaced; treat as 422 (user input).
@@ -1901,6 +1906,67 @@ async def delete_tag_key(
     if removed_count is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
     return TagKeyDeleteResponse(key=key, removed_from_workflow_count=removed_count)
+
+
+@legacy_base_router.get("/tag-values", response_model=list[TagValue], tags=["agent"], include_in_schema=False)
+@legacy_base_router.get("/tag-values/", response_model=list[TagValue], include_in_schema=False)
+@base_router.get(
+    "/tag-values",
+    response_model=list[TagValue],
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "list_tag_values"},
+    description="List the palette color assigned to each grouped tag (key, value) for the organization. "
+    "The frontend joins these onto tags by (key, value).",
+    summary="List tag values",
+    responses={200: {"description": "Successfully retrieved tag values"}},
+)
+@base_router.get("/tag-values/", response_model=list[TagValue], include_in_schema=False)
+async def list_tag_values(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> list[TagValue]:
+    organization_id = current_org.organization_id
+    rows = await app.DATABASE.tags.list_tag_values(organization_id=organization_id)
+    return [TagValue(key=row.key, value=row.value, color=row.color) for row in rows]
+
+
+@legacy_base_router.patch("/tag-values/{key}", response_model=TagValue, tags=["agent"], include_in_schema=False)
+@legacy_base_router.patch("/tag-values/{key}/", response_model=TagValue, include_in_schema=False)
+@base_router.patch(
+    "/tag-values/{key}",
+    response_model=TagValue,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "update_tag_value"},
+    description="Recolor a grouped tag (key, value). The value is supplied in the body so values "
+    "containing '/' stay addressable. The new color must be a palette name.",
+    summary="Update tag value color",
+    responses={
+        200: {"description": "Successfully recolored tag value"},
+        404: {"description": "Tag value not found"},
+        422: {"description": "Invalid palette color"},
+    },
+)
+@base_router.patch("/tag-values/{key}/", response_model=TagValue, include_in_schema=False)
+async def update_tag_value(
+    key: str = Path(..., description="Tag key (group)", examples=["env"]),
+    data: TagValueUpdate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValue:
+    _validate_path_key(key)
+    organization_id = current_org.organization_id
+    row = await app.DATABASE.tags.recolor_tag_value(
+        organization_id=organization_id,
+        key=key,
+        value=data.value,
+        color=data.color,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Tag value '{key}:{data.value}' not found",
+        )
+    return TagValue(key=row.key, value=row.value, color=row.color)
 
 
 # Keep in sync with BATCH_TAGS_MAX_WPIDS in the frontend

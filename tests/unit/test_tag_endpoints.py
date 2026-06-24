@@ -665,3 +665,106 @@ def test_post_succeeds_when_first_integrity_error_then_succeeds(app_with_routes:
     resp = client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
     assert resp.status_code == 200
     assert attempts["n"] == 2
+
+
+# ----------------------------- GET /tag-values -------------------------------------
+
+
+def test_get_tag_values_reflects_applied_colors(client: TestClient) -> None:
+    resp = client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={
+            "tags": [{"key": "env", "value": "prod"}, {"key": "team", "value": "growth"}],
+            "colors": {"env": "blue", "team": "purple"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    values = client.get("/v1/tag-values").json()
+    by_pair = {(row["key"], row["value"]): row["color"] for row in values}
+    assert by_pair == {("env", "prod"): "blue", ("team", "growth"): "purple"}
+
+
+def test_get_tag_values_assigns_random_palette_color_when_unset(client: TestClient) -> None:
+    from skyvern.forge.sdk.workflow.models.validators import TAG_COLOR_PALETTE
+
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+
+    values = client.get("/v1/tag-values").json()
+    assert len(values) == 1
+    assert values[0]["color"] in TAG_COLOR_PALETTE
+
+
+def test_get_tag_values_excludes_standalone_labels(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"value": "urgent"}]})
+    assert client.get("/v1/tag-values").json() == []
+
+
+def test_get_tag_values_legacy_route_works(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "green"}},
+    )
+    resp = client.get("/api/v1/tag-values")
+    assert resp.status_code == 200
+    assert resp.json()[0]["color"] == "green"
+
+
+def test_post_tags_invalid_color_returns_422(client: TestClient) -> None:
+    resp = client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "#ff0000"}},
+    )
+    assert resp.status_code == 422
+
+
+def test_post_tags_color_is_case_insensitive(client: TestClient) -> None:
+    resp = client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "BLUE"}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert client.get("/v1/tag-values").json()[0]["color"] == "blue"
+
+
+# ----------------------------- PATCH /tag-values/{key} -----------------------------
+
+
+def test_patch_tag_value_recolors(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/env", json={"value": "prod", "color": "pink"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"key": "env", "value": "prod", "color": "pink"}
+    assert client.get("/v1/tag-values").json()[0]["color"] == "pink"
+
+
+def test_patch_tag_value_recolors_value_containing_slash(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "region", "value": "us/west"}], "colors": {"region": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/region", json={"value": "us/west", "color": "pink"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"key": "region", "value": "us/west", "color": "pink"}
+
+
+def test_patch_tag_value_404_when_absent(client: TestClient) -> None:
+    resp = client.patch("/v1/tag-values/env", json={"value": "prod", "color": "pink"})
+    assert resp.status_code == 404
+
+
+def test_patch_tag_value_invalid_color_returns_422(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/env", json={"value": "prod", "color": "chartreuse"})
+    assert resp.status_code == 422
+
+
+def test_patch_tag_value_reserved_prefix_returns_400(client: TestClient) -> None:
+    resp = client.patch("/v1/tag-values/skyvern.system", json={"value": "prod", "color": "blue"})
+    assert resp.status_code == 400

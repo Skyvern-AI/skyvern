@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import Select, exists, func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -27,14 +27,13 @@ from skyvern.forge.sdk.db.models import (
     WorkflowParameterModel,
     WorkflowRunModel,
     WorkflowScheduleModel,
-    WorkflowTagEventModel,
     WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.db.tag_filters import workflow_tag_wpid_subqueries
 from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
-from skyvern.forge.sdk.workflow.models.tags import TagEventType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
@@ -486,47 +485,8 @@ class WorkflowsRepository(BaseRepository):
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
             if workflow_tags:
-                exact_values_by_key: dict[str, list[str]] = {}
-                key_only_terms: list[str] = []
-                value_only_terms: list[str] = []
-                for key, value in workflow_tags:
-                    if key is not None and value is not None:
-                        exact_values_by_key.setdefault(key, []).append(value)
-                    elif key is not None:
-                        key_only_terms.append(key)
-                    elif value is not None:
-                        value_only_terms.append(value)
-
-                def _active_set_subquery() -> Select:
-                    return (
-                        select(WorkflowTagEventModel.workflow_permanent_id)
-                        .where(WorkflowTagEventModel.organization_id == organization_id)
-                        .where(WorkflowTagEventModel.deleted_at.is_(None))
-                        .where(WorkflowTagEventModel.superseded_at.is_(None))
-                        .where(WorkflowTagEventModel.event_type == TagEventType.SET.value)
-                    )
-
-                # AND across distinct terms; OR within a key for exact terms.
-                for key, values in exact_values_by_key.items():
-                    main_query = main_query.where(
-                        WorkflowModel.workflow_permanent_id.in_(
-                            _active_set_subquery()
-                            .where(WorkflowTagEventModel.key == key)
-                            .where(WorkflowTagEventModel.value.in_(values))
-                        )
-                    )
-                for key in key_only_terms:
-                    main_query = main_query.where(
-                        WorkflowModel.workflow_permanent_id.in_(
-                            _active_set_subquery().where(WorkflowTagEventModel.key == key)
-                        )
-                    )
-                for value in value_only_terms:
-                    main_query = main_query.where(
-                        WorkflowModel.workflow_permanent_id.in_(
-                            _active_set_subquery().where(WorkflowTagEventModel.value == value)
-                        )
-                    )
+                for subquery in workflow_tag_wpid_subqueries(workflow_tags, organization_id):
+                    main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(subquery))
             if search_key:
                 search_like = f"%{search_key}%"
                 title_like = WorkflowModel.title.ilike(search_like)
