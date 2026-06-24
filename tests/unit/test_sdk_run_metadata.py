@@ -1,11 +1,14 @@
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from skyvern.client import AsyncSkyvern, Skyvern
 from skyvern.client.types.workflow_run_request_output import WorkflowRunRequestOutput as WorkflowRunRequest
+from skyvern.library.skyvern import Skyvern as LibrarySkyvern
 
 
 def test_workflow_run_request_accepts_run_metadata() -> None:
@@ -18,6 +21,29 @@ def test_workflow_run_request_accepts_max_elapsed_time() -> None:
     request = WorkflowRunRequest(workflow_id="wpid_123", max_elapsed_time_minutes=10)
 
     assert request.max_elapsed_time_minutes == 10
+
+
+@pytest.mark.asyncio
+async def test_launch_cloud_browser_sends_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LibrarySkyvern(base_url="https://api.example.test", api_key="test-key")
+    browser_session = SimpleNamespace(browser_session_id="pbs_123", app_url=None)
+    browser = object()
+    create_browser_session = AsyncMock(return_value=browser_session)
+    connect_to_session = AsyncMock(return_value=browser)
+
+    monkeypatch.setattr(client, "_ensure_cloud_environment", lambda: None)
+    monkeypatch.setattr(client, "create_browser_session", create_browser_session)
+    monkeypatch.setattr(client, "_connect_to_cloud_browser_session", connect_to_session)
+
+    result = await client.launch_cloud_browser(timeout=30, browser_profile_id="bp_123")
+
+    assert result is browser
+    create_browser_session.assert_awaited_once_with(
+        timeout=30,
+        proxy_location=None,
+        browser_profile_id="bp_123",
+    )
+    connect_to_session.assert_awaited_once_with(browser_session)
 
 
 def test_run_workflow_sends_run_metadata() -> None:
