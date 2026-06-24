@@ -573,7 +573,6 @@ def _prior_repair_attempts(ctx: Any) -> dict[str, int]:
     keys = (
         "repeated_failure_streak_count",
         "failed_test_nudge_count",
-        "null_data_streak_count",
         "probable_site_block_streak_count",
         "per_tool_budget_nudge_count",
         "repeated_action_fingerprint_streak_count",

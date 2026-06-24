@@ -184,7 +184,6 @@ class AgentContext:
     copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
-    null_data_streak_count: int = 0
     last_test_ok: bool | None = None
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None

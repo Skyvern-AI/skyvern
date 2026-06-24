@@ -82,6 +82,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ensure_browser_session,
 )
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
@@ -2110,6 +2111,9 @@ def _record_run_blocks_result(
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
+        completion_verification_evaluated = (
+            completion_verification is not None and completion_verification.status == "evaluated"
+        )
         completion_fully_satisfied = (
             completion_verification is not None
             and completion_verification.status == "evaluated"
@@ -2146,12 +2150,10 @@ def _record_run_blocks_result(
             copilot_ctx.verified_terminal_proposal_ready = True
             copilot_ctx.last_test_suspicious_success = False
             copilot_ctx.last_test_failure_reason = None
-            copilot_ctx.null_data_streak_count = 0
             copilot_ctx.suspicious_success_nudge_count = 0
-        if empty_data_blocks and not completion_fully_satisfied:
+        if empty_data_blocks and not completion_verification_evaluated:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
-            copilot_ctx.null_data_streak_count = getattr(copilot_ctx, "null_data_streak_count", 0) + 1
             copilot_ctx.last_test_failure_reason = (
                 "All blocks completed but data-producing blocks "
                 "produced no meaningful output "
@@ -2189,7 +2191,6 @@ def _record_run_blocks_result(
                     data.setdefault("failure_reason", outcome_unverified_reason)
         else:
             copilot_ctx.failed_test_nudge_count = 0
-            copilot_ctx.null_data_streak_count = 0
             copilot_ctx.probable_site_block_streak_count = 0
             copilot_ctx.last_failed_workflow_yaml = None
             # Real success: clear the signature latch so a subsequent bad URL in
@@ -2211,6 +2212,21 @@ def _record_run_blocks_result(
                 "The last run verified only the current browser frontier; unverified workflow blocks remain: "
                 + ", ".join(unverified[:8])
             )
+        update_repeated_failure_state(copilot_ctx, result)
+        _update_verification_evidence_from_run_result(copilot_ctx, result)
+        return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
+
+    if outcome_fully_verified(copilot_ctx):
+        copilot_ctx.last_test_suspicious_success = False
+        copilot_ctx.last_test_failure_reason = None
+        copilot_ctx.suspicious_success_nudge_count = 0
+        copilot_ctx.failed_test_nudge_count = 0
+        copilot_ctx.probable_site_block_streak_count = 0
+        copilot_ctx.last_failed_workflow_yaml = None
+        copilot_ctx.last_full_workflow_test_ok = True
+        copilot_ctx.last_unverified_block_labels = []
+        copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+        copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
         return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
