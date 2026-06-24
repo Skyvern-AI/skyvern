@@ -91,6 +91,11 @@ export default {
           cta: "hsl(var(--brand-cta))",
           "cta-foreground": "hsl(var(--brand-cta-foreground))",
         },
+        studio: {
+          accent: "hsl(var(--studio-accent))",
+          "accent-foreground": "hsl(var(--studio-accent-foreground))",
+          "accent-2": "hsl(var(--studio-accent-2))",
+        },
       },
       borderRadius: {
         lg: "var(--radius)",
