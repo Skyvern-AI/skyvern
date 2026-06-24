@@ -151,6 +151,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
+from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
@@ -1844,12 +1845,15 @@ class ForgeAgent:
                 # Tell the handler to skip the auto-completion Tab hack when the
                 # next batched action would be broken by a focus change — e.g. a
                 # KEYPRESS Enter or another action on the same element.
-                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
-                    next_action = action_linked_list[action_idx + 1].action
+                if action.action_type == ActionType.INPUT_TEXT:
+                    next_action = (
+                        action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
+                    )
                     if isinstance(next_action, KeypressAction) or (
                         isinstance(next_action, WebAction) and next_action.element_id == action.element_id
                     ):
                         action.skip_auto_complete_tab = True
+                    action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
 
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,

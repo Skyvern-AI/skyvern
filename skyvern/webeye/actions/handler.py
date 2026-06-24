@@ -2259,6 +2259,10 @@ async def handle_input_text_action(
                     )
                     if select_result and select_result.action_result and select_result.action_result.success:
                         auto_complete_hacky_flag = False
+                        # A matching option was committed during this INPUT_TEXT. Stop the batch only when
+                        # the next queued action would clobber it (a trailing Enter/Return); next step re-scrapes.
+                        if action.stop_batch_after_dropdown_select:
+                            select_result.action_result.skip_remaining_actions = True
                         return [select_result.action_result]
         except PlaywrightError as inc_error:
             # Handle Playwright-specific errors during incremental element processing
