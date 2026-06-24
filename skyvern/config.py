@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
+    # Pre-screenshot readiness guard; kept short so a page that never settles
+    # degrades fast instead of burning the full loading-timeout budget.
+    BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS: int = 5000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
     CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
     # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
