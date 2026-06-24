@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
@@ -30,6 +31,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -632,6 +634,145 @@ workflow_definition:
         assert "current_url_may_encode_runtime_state: true" in prompt
         assert "per_tool_budget_on_block:" in prompt
         assert "run only missing block labels" in prompt
+
+    def test_unresolved_symbol_repair_context_prompt_is_policy_gated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
+
+        def capture_info(event: str, **kwargs: str | list[str]) -> None:
+            info_calls.append((event, kwargs))
+
+        monkeypatch.setattr(agent_module.LOG, "info", capture_info)
+        repair_context = CodeAuthoringRepairContext(
+            block_label="search_registry",
+            reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+            unresolved_names=["confirmation_number"],
+            parameter_keys=[],
+            available_parameter_keys=["confirmation_number"],
+            binding_candidates=["confirmation_number"],
+            allowed_global_names=["Exception", "json", "page"],
+            allowed_helper_surface={"json": ["dumps", "loads"]},
+        )
+        enabled_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        standard_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            last_code_authoring_repair_context=repair_context,
+        )
+        wrong_reason_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context.model_copy(
+                update={"reason_code": "SANDBOX_SAFETY_CHECK"}
+            ),
+        )
+
+        enabled_prompt = agent_module._code_authoring_repair_context_prompt(enabled_ctx)
+
+        assert "CODE AUTHORING REPAIR CONTEXT" in enabled_prompt
+        assert "block_label: search_registry" in enabled_prompt
+        assert "unresolved_names: confirmation_number" in enabled_prompt
+        assert "declared_parameter_keys: (none)" in enabled_prompt
+        assert "available_parameter_keys: confirmation_number" in enabled_prompt
+        assert "binding_candidates: confirmation_number" in enabled_prompt
+        assert (
+            "confirmation_number -> existing workflow parameter key confirmation_number -> parameter_keys -> "
+            "bare variable confirmation_number"
+        ) in enabled_prompt
+        assert "ensure a workflow string parameter exists" in enabled_prompt
+        assert "list the exact key in the code block's parameter_keys" in enabled_prompt
+        assert "do not hardcode the eval value" in enabled_prompt
+        assert "rerun via update_and_run_blocks" in enabled_prompt
+        assert "json: dumps, loads" in enabled_prompt
+        assert "create a workflow string parameter" not in enabled_prompt
+        assert agent_module._code_authoring_repair_context_prompt(standard_ctx) == ""
+        wrong_reason_prompt = agent_module._code_authoring_repair_context_prompt(wrong_reason_ctx)
+        assert "CODE AUTHORING REPAIR CONTEXT" in wrong_reason_prompt
+        assert "reason_code: SANDBOX_SAFETY_CHECK" in wrong_reason_prompt
+        assert (
+            "copilot code authoring repair context rendered",
+            {
+                "reason_code": SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+                "block_label": "search_registry",
+                "unresolved_names": ["confirmation_number"],
+            },
+        ) in info_calls
+
+    def test_unresolved_symbol_repair_context_prompt_creates_exact_parameter_when_missing(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+            unresolved_names=["confirmation_number"],
+            parameter_keys=[],
+            available_parameter_keys=[],
+            binding_candidates=["confirmation_number"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "available_parameter_keys: (none)" in prompt
+        assert "binding_candidates: confirmation_number" in prompt
+        assert (
+            "confirmation_number -> create workflow string parameter key confirmation_number -> parameter_keys -> "
+            "bare variable confirmation_number"
+        ) in prompt
+        assert "do not hardcode the eval value" in prompt
+        assert "rerun via update_and_run_blocks" in prompt
+
+    def test_ambiguous_selector_repair_context_prompt_includes_selector_details(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com/orders",
+            refiner_selector='button[data-action="status"]',
+            repair_instruction="Use a unique selector from the same page before saving the code block.",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "CODE AUTHORING REPAIR CONTEXT" in prompt
+        assert "reason_code: ambiguous_bare_selector" in prompt
+        assert "selector: button" in prompt
+        assert "source_url: https://example.com/orders" in prompt
+        assert 'refiner_selector: button[data-action="status"]' in prompt
+        assert "Use a unique selector from the same page" in prompt
+
+    def test_ambiguous_selector_repair_context_prompt_includes_same_page_alternatives(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+            refiner_selector=None,
+            selector_alternatives=[
+                {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"},
+                {"tool_name": "click", "role": "button", "selector": 'role=button[name="Order status"]'},
+            ],
+            repair_instruction="Replace the ambiguous bare selector with a stable same-page control.",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "same_page_selector_alternatives:" in prompt
+        assert "tool_name=type_text, role=textbox, selector=#order-id" in prompt
+        assert 'tool_name=click, role=button, selector=role=button[name="Order status"]' in prompt
+        assert "re-scout the same page" in prompt
+        assert "stable role/name/data attribute" in prompt
+        assert "button:nth-of-type" not in prompt
+        assert "secret-token" not in prompt
 
 
 class TestVerifiedWorkflowOrNone:

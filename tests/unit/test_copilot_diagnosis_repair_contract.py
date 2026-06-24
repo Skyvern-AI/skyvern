@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,8 +8,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     RepairNextAction,
@@ -18,6 +20,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
 )
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
@@ -54,6 +57,17 @@ def _clean_completed_result() -> dict[str, object]:
             "overall_status": "completed",
             "frontier_start_label": "extract",
             "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+        },
+    }
+
+
+def _authoring_repair_result(repair_context: CodeAuthoringRepairContext) -> dict[str, object]:
+    return {
+        "ok": False,
+        "error": "Workflow authoring repair needed.",
+        "data": {
+            "workflow_updated": False,
+            "authoring_repair_context": repair_context.model_dump(mode="json"),
         },
     }
 
@@ -111,6 +125,113 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
         missing.repair_decision.next_action,
         missing.repair_decision.required_authority,
     ) == (DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT, RepairNextAction.ASK, ["may_answer_without_mutation"])
+
+
+def test_authoring_repair_contexts_have_distinct_structural_root_cause_signatures() -> None:
+    ambiguous = CodeAuthoringRepairContext(
+        block_label="retrieve_resale_demand_document_link",
+        reason_code="ambiguous_bare_selector",
+        selector="button",
+        refiner_selector="xpath=//button[normalize-space()='View / Download']",
+    )
+    sandbox = CodeAuthoringRepairContext(
+        block_label="retrieve_resale_demand_document_link",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["row_text", "confirmation_number"],
+    )
+    sandbox_reordered = CodeAuthoringRepairContext(
+        block_label="retrieve_resale_demand_document_link",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["confirmation_number", "row_text"],
+    )
+
+    ambiguous_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(ambiguous),
+        ctx=_ctx(),
+    )
+    sandbox_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(sandbox),
+        ctx=_ctx(),
+    )
+    sandbox_reordered_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(sandbox_reordered),
+        ctx=_ctx(),
+    )
+
+    ambiguous_signature = ambiguous_contract.to_trace_data()["root_cause_signature"]
+    sandbox_signature = sandbox_contract.to_trace_data()["root_cause_signature"]
+    assert ambiguous_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert ambiguous_signature is not None
+    assert sandbox_signature is not None
+    assert ambiguous_signature != sandbox_signature
+    assert sandbox_reordered_contract.to_trace_data()["root_cause_signature"] == sandbox_signature
+
+
+def test_missing_required_output_key_repair_identity_uses_structural_context_only() -> None:
+    repair_context = CodeAuthoringRepairContext(
+        block_label="search_registry",
+        reason_code="missing_required_output_key",
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(repair_context),
+        ctx=_ctx(),
+    )
+
+    expected_payload = {
+        "version": "authoring_repair_context:v1",
+        "reason_code": "missing_required_output_key",
+        "block_label": "search_registry",
+    }
+    expected_signature = hashlib.sha256(
+        json.dumps(expected_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.to_trace_data()["root_cause_signature"] == expected_signature
+    assert contract.diagnosis_result.root_cause_identity.error_class == "code_authoring_missing_required_output_key"
+
+
+def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes() -> None:
+    ctx = _ctx()
+    ambiguous = CodeAuthoringRepairContext(
+        block_label="retrieve_resale_demand_document_link",
+        reason_code="ambiguous_bare_selector",
+        selector="button",
+        refiner_selector="xpath=//button[normalize-space()='View / Download']",
+    )
+    sandbox = CodeAuthoringRepairContext(
+        block_label="retrieve_resale_demand_document_link",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["confirmation_number", "row_text"],
+    )
+
+    for expected_count in (1, 2):
+        contract = build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result=_authoring_repair_result(ambiguous),
+            ctx=ctx,
+        )
+        run_execution_module._update_repair_loop_state(ctx, contract)
+        assert contract.repair_loop_state.consecutive_identical_repair_count == expected_count
+        assert contract.repair_loop_state.ceiling_reached is False
+
+    sandbox_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(sandbox),
+        ctx=ctx,
+    )
+    run_execution_module._update_repair_loop_state(ctx, sandbox_contract)
+
+    assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 1
+    assert sandbox_contract.repair_loop_state.ceiling_reached is False
+    assert getattr(ctx, "blocker_signal", None) is None
 
 
 def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
@@ -556,6 +677,149 @@ def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> Non
     )
 
 
+def test_result_unresolved_symbol_context_prefers_repair_over_credential_ask() -> None:
+    ctx = _ctx()
+    repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["business_name"],
+        parameter_keys=[],
+    )
+    data = {
+        "failure_type": "missing_credential_or_init",
+        "diagnostic_code_safety_errors": ["Code block references names that are unavailable."],
+    }
+    data["authoring_repair_context"] = repair_context.model_dump(mode="json")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Saved credential needs verification before running.",
+            "data": data,
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert "may_update_workflow" in contract.repair_decision.required_authority
+    assert contract.repair_decision.target_blocks == ["create_request"]
+    assert contract.to_trace_data()["next_action"] == "repair"
+
+
+def test_stale_stored_unresolved_symbol_context_does_not_override_credential_ask() -> None:
+    ctx = _ctx()
+    ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["business_name"],
+        parameter_keys=[],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Saved credential needs verification before running.",
+            "data": {
+                "failure_type": "missing_credential_or_init",
+                "diagnostic_code_safety_errors": ["Code block reads saved credential fields before live scouting."],
+            },
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action == RepairNextAction.ASK
+    assert contract.repair_decision.required_authority == ["may_answer_without_mutation"]
+
+
+def test_non_credential_unresolved_name_result_repairs_instead_of_credential_ask() -> None:
+    ctx = _ctx()
+    repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["business_name"],
+        parameter_keys=[],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Code block `create_request` references names that are unavailable: business_name.",
+            "data": {"authoring_repair_context": repair_context.model_dump(mode="json")},
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["create_request"]
+
+
+def test_missing_credential_without_unresolved_symbol_context_still_asks() -> None:
+    ctx = _ctx()
+    ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code="SANDBOX_SAFETY_CHECK",
+        unresolved_names=[],
+        parameter_keys=[],
+    )
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Saved credential needs verification before running.",
+            "data": {"failure_type": "missing_credential_or_init"},
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action == RepairNextAction.ASK
+    assert contract.repair_decision.required_authority == ["may_answer_without_mutation"]
+
+
+def test_unresolved_symbol_context_does_not_preempt_terminal_challenge_stop() -> None:
+    ctx = _ctx()
+    ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["business_name"],
+        parameter_keys=[],
+    )
+    ctx.last_test_anti_bot = "Typed run analysis reported an anti-bot challenge."
+    ctx.last_test_failure_reason = "Run output reported a blocker: Verify you are human."
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_blocked",
+                "overall_status": "completed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "completed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.to_trace_data()["next_action"] == "stop"
+
+
 def test_active_run_terminal_evidence_contract_stops_without_marking_workflow_success() -> None:
     contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
@@ -777,6 +1041,12 @@ def test_pre_run_challenge_observation_does_not_force_stop_on_repairable_failure
 
 def test_post_run_gated_challenge_observation_forces_stop_on_repairable_failure() -> None:
     ctx = _ctx()
+    ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["business_name"],
+        parameter_keys=[],
+    )
     ctx.last_test_anti_bot = (
         "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
     )
@@ -847,6 +1117,12 @@ def test_suspicious_success_flag_does_not_override_failed_run() -> None:
 
 def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() -> None:
     stop_ctx = _ctx()
+    stop_ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="create_request",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["business_name"],
+        parameter_keys=[],
+    )
     stop_ctx.last_test_non_retriable_nav_error = "net::ERR_NAME_NOT_RESOLVED"
     stop_contract = build_diagnosis_repair_contract(
         source_tool="run_blocks_and_collect_debug",
