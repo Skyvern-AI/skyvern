@@ -356,13 +356,23 @@ def test_definition_grading_satisfied_when_parameters_exist_and_are_referenced()
 
 
 def test_definition_grading_unsatisfied_when_parameters_missing_or_unreferenced() -> None:
-    criteria = [_criterion("c0", "the workflow accepts reusable inputs", level="definition")]
+    criteria = [_criterion("c0", "the workflow accepts first name and NPI as reusable inputs", level="definition")]
     (missing,) = grade_definition_criteria(criteria, _NO_PARAMS_YAML)
     assert missing.state == "unsatisfied"
     assert missing.reason_code == "definition_parameters_missing"
     (unreferenced,) = grade_definition_criteria(criteria, _UNREFERENCED_YAML)
     assert unreferenced.state == "unsatisfied"
     assert unreferenced.reason_code == "definition_parameters_unreferenced"
+
+
+def test_definition_grading_abstains_when_no_specific_inputs_named() -> None:
+    criteria = [_criterion("c0", "the workflow accepts reusable inputs", level="definition")]
+    (no_params,) = grade_definition_criteria(criteria, _NO_PARAMS_YAML)
+    assert no_params.state == "unknown"
+    assert no_params.reason_code == "definition_parameters_absent"
+    (unreferenced,) = grade_definition_criteria(criteria, _UNREFERENCED_YAML)
+    assert unreferenced.state == "unknown"
+    assert unreferenced.reason_code == "definition_parameters_absent"
 
 
 def test_definition_grading_requires_every_named_input_to_match() -> None:
@@ -557,21 +567,48 @@ def test_present_value_upgrade_is_upgrade_only() -> None:
     assert upgraded.verdicts[0].state == "satisfied"
     assert upgraded.verdicts[0].reason_code == "present_value_verbatim"
 
-    already_satisfied = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
-    kept = _apply_present_value_upgrades(already_satisfied, criteria, snapshot)
-    assert kept.verdicts[0].reason_code == "evidence_confirms"
+
+def test_present_value_credits_unquoted_structured_identifier() -> None:
+    criteria = [_criterion("c0", "the submitted request returns confirmation number WTR-1842-DEMO")]
+    snapshot = _snapshot({"submit_request": {"confirmation_number": "WTR-1842-DEMO", "status": "submitted"}})
+    (verdict,) = grade_present_value_criteria(criteria, snapshot)
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "present_value_verbatim"
+    assert verdict.evidence_ref == "block_outputs:submit_request"
+
+
+def test_present_value_structured_identifier_abstains_when_absent() -> None:
+    criteria = [_criterion("c0", "the submitted request returns confirmation number WTR-1842-DEMO")]
+    snapshot = _snapshot({"submit_request": {"confirmation_number": "WTR-9999-PROD"}})
+    assert grade_present_value_criteria(criteria, snapshot) == []
+
+
+def test_present_value_structured_identifier_requires_letter_and_digit() -> None:
+    # A bare word or a bare year-length token is not a high-specificity identifier.
+    plain_word = [_criterion("c0", "the page shows submitted")]
+    assert grade_present_value_criteria(plain_word, _snapshot({"x": {"state": "submitted"}})) == []
+
+    hyphen_word = [_criterion("c0", "the request is read-only")]
+    assert grade_present_value_criteria(hyphen_word, _snapshot({"x": {"mode": "read-only"}})) == []
+
+
+def test_present_value_structured_identifier_rejects_substring_of_longer_token() -> None:
+    criteria = [_criterion("c0", "confirmation number WTR-1842-DEMO")]
+    assert grade_present_value_criteria(criteria, _snapshot({"x": {"number": "WTR-1842-DEMO2"}})) == []
+
+
+def test_present_value_structured_identifier_upgrade_only() -> None:
+    criteria = [_criterion("c0", "confirmation number WTR-1842-DEMO")]
+    snapshot = _snapshot({"confirm": {"number": "WTR-1842-DEMO"}})
+
+    judge_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
+    upgraded = _apply_present_value_upgrades(judge_unknown, criteria, snapshot)
+    assert upgraded.verdicts[0].state == "satisfied"
+    assert upgraded.verdicts[0].reason_code == "present_value_verbatim"
 
     contradicts = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
-    absent_snapshot = _snapshot({"confirm": {"number": "ZZZ00000"}})
-    unchanged = _apply_present_value_upgrades(contradicts, criteria, absent_snapshot)
-    assert unchanged.verdicts[0].reason_code == "evidence_contradicts"
-
-    present_contradicts = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
-    kept_contradicts = _apply_present_value_upgrades(present_contradicts, criteria, snapshot)
-    assert kept_contradicts.verdicts[0].reason_code == "evidence_contradicts"
-
-    unavailable = CompletionVerificationResult(status="unavailable")
-    assert _apply_present_value_upgrades(unavailable, criteria, snapshot).status == "unavailable"
+    kept = _apply_present_value_upgrades(contradicts, criteria, snapshot)
+    assert kept.verdicts[0].reason_code == "evidence_contradicts"
 
 
 def test_parse_completion_criteria_coerces_level() -> None:

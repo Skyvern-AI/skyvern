@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 
 
 def _make_workflow_parameter(
@@ -60,6 +61,10 @@ class _EmptyExecuteResult:
 
 def _where_clause_sql(query: Any) -> str:
     return str(query.whereclause.compile(compile_kwargs={"literal_binds": True}))
+
+
+def _query_sql(query: Any) -> str:
+    return str(query.compile(compile_kwargs={"literal_binds": True}))
 
 
 def _assert_not_filtering_copilot_authored_workflows(where_clause: str) -> None:
@@ -187,10 +192,10 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
     """Regression test for SKY-8795: searching by run_id (wr_*/tsk_*) or wpid_*
     on the global runs page must match the underlying ID columns, not only
     `searchable_text` (which contains only title + url)."""
-    captured: dict[str, Any] = {}
+    captured_queries: list[Any] = []
 
     async def _execute(query):
-        captured["query"] = query
+        captured_queries.append(query)
         return _EmptyExecuteResult()
 
     session = MagicMock()
@@ -198,17 +203,29 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
 
     repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
 
-    await repo.get_all_runs_v2(organization_id="o_test", search_key="wr_abc123")
+    await repo.get_all_runs_v2(organization_id="o_test", page=10, page_size=100, search_key="wr_abc123")
 
-    # Inspect the WHERE clause specifically — both columns are also in the SELECT
-    # list, so a substring check on the full SQL would be a false positive.
-    where_clause = _where_clause_sql(captured["query"])
+    assert len(captured_queries) == 2
+
+    # Inspect WHERE clauses specifically — these columns are also in SELECT lists,
+    # so substring checks on full SQL would be false positives.
+    where_clause = _where_clause_sql(captured_queries[0])
     assert "task_runs.run_id" in where_clause
     # WPID search must match across both task_runs and the joined workflow_runs
     # so legacy rows with task_runs.workflow_permanent_id=NULL still hit.
     assert "coalesce(task_runs.workflow_permanent_id, workflow_runs.workflow_permanent_id)" in where_clause
     # autoescape rewrites '_' to e.g. '/_' so check the distinctive suffix.
     assert "abc123" in where_clause
+    assert ".".join(("workflows", "title")) not in where_clause
+
+    fallback_where_clause = _where_clause_sql(captured_queries[1])
+    assert "workflow_runs.workflow_run_id" in fallback_where_clause
+    assert ".".join(("workflows", "title")) in fallback_where_clause
+    assert "workflow_runs.workflow_permanent_id" in fallback_where_clause
+    assert "task_runs.run_id = workflow_runs.workflow_run_id" in fallback_where_clause
+
+    for query in captured_queries:
+        assert f"LIMIT {MAX_SEARCH_FETCH_LIMIT}" in _query_sql(query)
 
 
 @pytest.mark.asyncio
