@@ -213,7 +213,7 @@ async def capture_block_download_baseline(
         async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
             baseline_files = await app.STORAGE.get_downloaded_files(
                 organization_id=organization_id,
-                run_id=context.run_id or workflow_run_id,
+                run_id=resolve_run_download_id(context, fallback_run_id=workflow_run_id),
             )
             context.loop_internal_state = {
                 DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(fi) for fi in baseline_files],
@@ -493,6 +493,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        download_run_id_override: str | None = None,
     ) -> BrowserState | None:
         """
         Acquire or create browser state for block execution.
@@ -507,27 +508,28 @@ class Block(BaseModel, abc.ABC):
         if browser_session_id and organization_id:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
             if browser_state is not None:
-                adopted_context = browser_state.browser_context
-                adopted_browser = adopted_context.browser if adopted_context else None
-                if adopted_browser is not None:
-                    try:
-                        rebind_run_id = resolve_run_download_id(
-                            skyvern_context.current(), fallback_run_id=workflow_run_id
-                        )
-                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
+                rebind_run_id = download_run_id_override or resolve_run_download_id(
+                    skyvern_context.current(), fallback_run_id=workflow_run_id
+                )
+                try:
+                    adopted_context = browser_state.browser_context
+                    adopted_browser = adopted_context.browser if adopted_context else None
+                    rebind_page = None if adopted_browser is not None else await browser_state.get_working_page()
+                    if adopted_browser is not None or rebind_page is not None:
+                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id, page=rebind_page)
                         LOG.info(
                             "Rebound download dir on adopted persistent session",
                             browser_session_id=browser_session_id,
                             workflow_run_id=workflow_run_id,
                             run_id=rebind_run_id,
                         )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to rebind download dir on adopted persistent session",
-                            browser_session_id=browser_session_id,
-                            workflow_run_id=workflow_run_id,
-                            exc_info=True,
-                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to rebind download dir on adopted persistent session",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
@@ -611,6 +613,28 @@ class Block(BaseModel, abc.ABC):
                     workflow_run_id=workflow_run_id,
                 )
                 return None
+
+        if not (browser_session_id and organization_id) and browser_state is not None:
+            rebind_run_id = download_run_id_override or resolve_run_download_id(
+                skyvern_context.current(), fallback_run_id=workflow_run_id
+            )
+            try:
+                owning_browser = browser_state.browser_context.browser if browser_state.browser_context else None
+                rebind_page = None if owning_browser is not None else await browser_state.get_working_page()
+                if owning_browser is not None or rebind_page is not None:
+                    await rebind_download_dir(owning_browser, run_id=rebind_run_id, page=rebind_page)
+                    LOG.info(
+                        "Rebound download dir on workflow-run browser",
+                        workflow_run_id=workflow_run_id,
+                        run_id=rebind_run_id,
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to rebind download dir on workflow-run browser",
+                    workflow_run_id=workflow_run_id,
+                    run_id=rebind_run_id,
+                    exc_info=True,
+                )
 
         return browser_state
 
@@ -2389,7 +2413,7 @@ class ForLoopBlock(Block):
                             to_downloaded_file_signature(fi)
                             for fi in await app.STORAGE.get_downloaded_files(
                                 organization_id=organization_id or "",
-                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                                run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
                         ]
                 except asyncio.TimeoutError:
@@ -3119,7 +3143,7 @@ class WhileLoopBlock(Block):
                             to_downloaded_file_signature(fi)
                             for fi in await app.STORAGE.get_downloaded_files(
                                 organization_id=organization_id or "",
-                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                                run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
                         ]
                 except asyncio.TimeoutError:
@@ -3860,16 +3884,18 @@ async def wrapper({default_args}):
         organization_id: str | None,
         workflow_run_id: str,
         workflow_run_block_id: str,
+        download_run_id: str | None = None,
     ) -> list[FileInfo]:
         # Register up front so the block output carries downloaded_file_urls for
         # downstream blocks in the same run; workflow finalization re-runs the save safely.
         if not organization_id:
             return []
+        storage_run_id = download_run_id or workflow_run_id
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -3890,7 +3916,7 @@ async def wrapper({default_args}):
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 return await app.STORAGE.get_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -3962,10 +3988,12 @@ async def wrapper({default_args}):
                 self.label,
             )
 
+        resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            download_run_id_override=resolved_download_id,
         )
         if not browser_state:
             return await self.build_block_result(
@@ -4267,6 +4295,7 @@ async def wrapper({default_args}):
             organization_id=organization_id or workflow_run_context.organization_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
+            download_run_id=resolved_download_id,
         )
         current_context = skyvern_context.current()
         downloaded_files = filter_downloaded_files_for_current_iteration(
@@ -7602,17 +7631,19 @@ class PrintPageBlock(Block):
         organization_id: str | None,
         workflow_run_id: str,
         workflow_run_block_id: str,
+        download_run_id: str | None = None,
     ) -> list[FileInfo]:
         # Workflow finalization eventually runs save_downloaded_files, but the block
         # output snapshot is recorded now and the UI keys off downloaded_file_urls
         # on the block — so we register up front and let finalization re-run safely.
         if not organization_id:
             return []
+        storage_run_id = download_run_id or workflow_run_id
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -7633,7 +7664,7 @@ class PrintPageBlock(Block):
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 return await app.STORAGE.get_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -7658,10 +7689,12 @@ class PrintPageBlock(Block):
         if block_context:
             await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
+        resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            download_run_id_override=resolved_download_id,
         )
         if not browser_state:
             return await self.build_block_result(
@@ -7711,7 +7744,7 @@ class PrintPageBlock(Block):
             filename = f"page_{timestamp_str}.pdf"
 
         # Save PDF to download directory so it appears in runs UI
-        download_dir = get_download_dir(workflow_run_id)
+        download_dir = get_download_dir(resolved_download_id)
         file_path = os.path.join(download_dir, filename)
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(pdf_bytes)
@@ -7730,6 +7763,7 @@ class PrintPageBlock(Block):
             organization_id=artifact_org_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
+            download_run_id=resolved_download_id,
         )
 
         current_context = skyvern_context.current()
