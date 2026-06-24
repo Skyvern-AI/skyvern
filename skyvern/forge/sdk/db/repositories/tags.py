@@ -6,15 +6,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.models import TagKeyModel, WorkflowTagEventModel
+from skyvern.forge.sdk.db.models import TagKeyModel, TagValueModel, WorkflowTagEventModel
 from skyvern.forge.sdk.workflow.models.tags import TagEventType, TagWriteContext
-from skyvern.forge.sdk.workflow.models.validators import RUN_METADATA_MAX_KEYS
+from skyvern.forge.sdk.workflow.models.validators import RUN_METADATA_MAX_KEYS, random_tag_color
 
 LOG = structlog.get_logger()
 
@@ -54,11 +54,15 @@ class TagsRepository(BaseRepository):
         context: TagWriteContext,
         label_sets: list[str] | None = None,
         label_deletes: list[str] | None = None,
+        colors: dict[str, str] | None = None,
     ) -> list[TagChange]:
         """Atomically apply SET/DELETE tag events. Grouped tags via ``sets``/``deletes``
-        (keys), standalone labels via ``label_sets``/``label_deletes``; set wins over delete."""
+        (keys), standalone labels via ``label_sets``/``label_deletes``; set wins over delete.
+        ``colors`` maps a grouped tag's key to a palette color for the value being set;
+        a SET key absent from ``colors`` keeps its existing color or gets a random one."""
         label_sets = label_sets or []
         label_deletes = label_deletes or []
+        colors = colors or {}
         label_set_values = set(label_sets)
         effective_deletes = {k for k in deletes if k not in sets}
         effective_label_deletes = {v for v in label_deletes if v not in label_set_values}
@@ -186,8 +190,67 @@ class TagsRepository(BaseRepository):
                 )
                 await session.execute(insert_stmt)
 
+            await self._register_tag_value_colors(
+                session,
+                organization_id=organization_id,
+                sets=sets,
+                colors=colors,
+                now=now,
+            )
+
             await session.commit()
             return changes
+
+    async def _register_tag_value_colors(
+        self,
+        session: AsyncSession,
+        *,
+        organization_id: str,
+        sets: dict[str, str],
+        colors: dict[str, str],
+        now: datetime,
+    ) -> None:
+        """Upsert a color for every grouped (key, value) in this SET request, even when the
+        tag event is idempotent: an explicit color overrides (DO UPDATE), an unspecified one
+        registers only on first use (DO NOTHING keeps the existing). Standalone labels are skipped."""
+        if not sets:
+            return
+
+        dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+        insert = sqlite.insert if dialect_name == "sqlite" else postgresql.insert
+
+        explicit_rows: list[dict[str, str]] = []
+        random_rows: list[dict[str, str]] = []
+        for key, value in sets.items():
+            provided = colors.get(key)
+            if provided is not None:
+                explicit_rows.append(
+                    {"organization_id": organization_id, "key": key, "value": value, "color": provided}
+                )
+            else:
+                random_rows.append(
+                    {"organization_id": organization_id, "key": key, "value": value, "color": random_tag_color()}
+                )
+
+        if explicit_rows:
+            stmt = insert(TagValueModel.__table__).values(explicit_rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["organization_id", "key", "value"],
+                index_where=text("deleted_at IS NULL"),
+                set_={"color": stmt.excluded.color, "modified_at": now},
+            )
+            await session.execute(stmt)
+
+        if random_rows:
+            stmt = (
+                insert(TagValueModel.__table__)
+                .values(random_rows)
+                .on_conflict_do_nothing(
+                    index_elements=["organization_id", "key", "value"],
+                    index_where=text("deleted_at IS NULL"),
+                )
+            )
+            await session.execute(stmt)
 
     async def _get_active_set_rows(
         self,
@@ -335,6 +398,47 @@ class TagsRepository(BaseRepository):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @db_operation("list_tag_values")
+    async def list_tag_values(self, organization_id: str) -> list[TagValueModel]:
+        """Active (key, value, color) registry entries for the org, ordered by key
+        then value. The frontend joins these onto tags by (key, value) the same way
+        it joins descriptions onto keys."""
+        async with self.Session() as session:
+            stmt = (
+                select(TagValueModel)
+                .where(TagValueModel.organization_id == organization_id)
+                .where(TagValueModel.deleted_at.is_(None))
+                .order_by(TagValueModel.key.asc(), TagValueModel.value.asc())
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    @db_operation("recolor_tag_value")
+    async def recolor_tag_value(
+        self,
+        organization_id: str,
+        key: str,
+        value: str,
+        color: str,
+    ) -> TagValueModel | None:
+        """Recolor an existing (key, value) registry row. Returns None when the pair
+        is not registered for the org (caller should 404)."""
+        async with self.Session() as session:
+            stmt = (
+                select(TagValueModel)
+                .where(TagValueModel.organization_id == organization_id)
+                .where(TagValueModel.key == key)
+                .where(TagValueModel.value == value)
+                .where(TagValueModel.deleted_at.is_(None))
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            row.color = color
+            await session.commit()
+            await session.refresh(row)
+            return row
+
     @db_operation("get_tag_key")
     async def get_tag_key(self, organization_id: str, key: str) -> TagKeyModel | None:
         async with self.Session() as session:
@@ -399,7 +503,8 @@ class TagsRepository(BaseRepository):
         context: TagWriteContext,
     ) -> int | None:
         """Cascade-delete a tag key: write a DELETE event for every workflow that
-        currently has it, then soft-delete the registry row. Returns the number
+        currently has it, then soft-delete the key registry row and its value color
+        rows (so GET /tag-values stops returning colors for the removed key). Returns the number
         of workflows the tag was removed from, or None when the key is not
         registered (caller should 404). Idempotent: a second call returns None.
 
@@ -472,5 +577,14 @@ class TagsRepository(BaseRepository):
                 )
 
             key_row.deleted_at = now
+            await session.execute(
+                update(TagValueModel)
+                .where(
+                    TagValueModel.organization_id == organization_id,
+                    TagValueModel.key == key,
+                    TagValueModel.deleted_at.is_(None),
+                )
+                .values(deleted_at=now)
+            )
             await session.commit()
             return len(active_sets)
