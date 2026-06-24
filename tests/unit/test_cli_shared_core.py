@@ -197,6 +197,19 @@ async def test_do_session_create_local() -> None:
 
 
 @pytest.mark.asyncio
+async def test_do_session_create_local_rejects_browser_profile_options() -> None:
+    skyvern = MagicMock()
+    skyvern.launch_local_browser = AsyncMock(return_value=MagicMock())
+
+    with pytest.raises(ValueError, match="only supported for cloud sessions"):
+        await do_session_create(skyvern, local=True, browser_profile_id="bp_123")
+    with pytest.raises(ValueError, match="only supported for cloud sessions"):
+        await do_session_create(skyvern, local=True, generate_browser_profile=True)
+
+    skyvern.launch_local_browser.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_do_session_create_cloud() -> None:
     skyvern = MagicMock()
     browser_mock = MagicMock()
@@ -228,6 +241,101 @@ async def test_do_session_create_cloud_forwards_extensions() -> None:
         proxy_location=None,
         extensions=[CAPTCHA_SOLVER_EXTENSION],
     )
+
+
+@pytest.mark.asyncio
+async def test_do_session_create_cloud_forwards_browser_profile_id() -> None:
+    skyvern = MagicMock()
+    browser_mock = MagicMock()
+    browser_mock.browser_session_id = "pbs_profile"
+    skyvern.launch_cloud_browser = AsyncMock(return_value=browser_mock)
+
+    browser, result = await do_session_create(
+        skyvern,
+        timeout=30,
+        browser_profile_id="bp_123",
+    )
+
+    assert browser is browser_mock
+    assert result.session_id == "pbs_profile"
+    skyvern.launch_cloud_browser.assert_awaited_once_with(
+        timeout=30,
+        proxy_location=None,
+        browser_profile_id="bp_123",
+    )
+
+
+@pytest.mark.asyncio
+async def test_do_session_create_cloud_enables_browser_profile_export() -> None:
+    skyvern = MagicMock()
+    browser_mock = MagicMock()
+    browser_mock.browser_session_id = "pbs_profile"
+    skyvern.launch_cloud_browser = AsyncMock(return_value=browser_mock)
+    skyvern._client_wrapper.httpx_client.request = AsyncMock(
+        return_value=MagicMock(status_code=200, text="", json=lambda: {})
+    )
+
+    browser, result = await do_session_create(
+        skyvern,
+        timeout=30,
+        generate_browser_profile=True,
+    )
+
+    assert browser is browser_mock
+    assert result.session_id == "pbs_profile"
+    skyvern._client_wrapper.httpx_client.request.assert_awaited_once_with(
+        "v1/browser_sessions/pbs_profile",
+        method="PATCH",
+        json={"generate_browser_profile": True},
+        headers={"content-type": "application/json"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_do_session_create_cloud_rolls_back_when_browser_profile_export_patch_fails() -> None:
+    skyvern = MagicMock()
+    browser_mock = MagicMock()
+    browser_mock.browser_session_id = "pbs_profile"
+    browser_mock.close = AsyncMock()
+    skyvern.launch_cloud_browser = AsyncMock(return_value=browser_mock)
+    skyvern.close_browser_session = AsyncMock()
+    skyvern._client_wrapper.httpx_client.request = AsyncMock(
+        return_value=MagicMock(status_code=500, text="patch failed", json=lambda: {"detail": "patch failed"})
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to update browser session pbs_profile"):
+        await do_session_create(
+            skyvern,
+            timeout=30,
+            generate_browser_profile=True,
+        )
+
+    skyvern.close_browser_session.assert_awaited_once_with("pbs_profile")
+    browser_mock.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_do_session_create_preserves_patch_failure_when_rollback_fails() -> None:
+    skyvern = MagicMock()
+    browser_mock = MagicMock()
+    browser_mock.browser_session_id = "pbs_profile"
+    browser_mock.close = AsyncMock()
+    skyvern.launch_cloud_browser = AsyncMock(return_value=browser_mock)
+    skyvern.close_browser_session = AsyncMock(side_effect=RuntimeError("close failed"))
+    skyvern._client_wrapper.httpx_client.request = AsyncMock(
+        return_value=MagicMock(status_code=500, text="patch failed", json=lambda: {"detail": "patch failed"})
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await do_session_create(
+            skyvern,
+            timeout=30,
+            generate_browser_profile=True,
+        )
+
+    assert "Failed to update browser session pbs_profile" in str(exc_info.value)
+    assert "close failed" in str(exc_info.value)
+    skyvern.close_browser_session.assert_awaited_once_with("pbs_profile")
 
 
 @pytest.mark.asyncio
