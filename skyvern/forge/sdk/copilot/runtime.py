@@ -36,6 +36,7 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
@@ -202,6 +203,7 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None

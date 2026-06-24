@@ -133,6 +133,22 @@ class ObservedPage(BaseModel):
     reached_via: str = ""
 
 
+class CodeAuthoringRepairContext(BaseModel):
+    block_label: str
+    reason_code: str
+    unresolved_names: list[str] = Field(default_factory=list)
+    parameter_keys: list[str] = Field(default_factory=list)
+    available_parameter_keys: list[str] = Field(default_factory=list)
+    binding_candidates: list[str] = Field(default_factory=list)
+    selector: str | None = None
+    source_url: str | None = None
+    refiner_selector: str | None = None
+    selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
+    allowed_global_names: list[str] = Field(default_factory=list)
+    allowed_helper_surface: dict[str, list[str]] = Field(default_factory=dict)
+    repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
+
+
 class StructuredContext(BaseModel):
     user_goal: str = ""
     urls_visited: list[UrlVisit] = Field(default_factory=list)
@@ -480,6 +496,7 @@ class CopilotContext(AgentContext):
     # True when the most-recent such rejection deferred to the credential-scout
     # gate, so the churn backstop yields to that message instead of pre-empting it.
     last_code_authoring_reject_was_credential_priority: bool = False
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the
     # high-water length of the verified block prefix. A repair that grows either
