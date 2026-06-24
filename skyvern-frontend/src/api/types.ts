@@ -314,8 +314,12 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
-  scopes: string | null;
-  valid: boolean;
+  provider?: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
   created_at: string;
   modified_at: string;
 }
@@ -332,6 +336,7 @@ export interface GoogleOAuthCredentialListResponse {
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
+  scope_profile?: string;
   app_origin?: string;
 }
 
