@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List
 
-import pyotp
 import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
@@ -84,7 +83,12 @@ from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_te
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import (
+    AzureVaultConstants,
+    OnePasswordConstants,
+    generate_totp_code,
+    parse_totp_config,
+)
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
@@ -1696,7 +1700,6 @@ async def handle_click_to_download_file_action(
 
 
 # TOTP timing constants
-TOTP_TIME_STEP_SECONDS = 30
 TOTP_EXPIRY_THRESHOLD_SECONDS = 20
 
 
@@ -1717,11 +1720,13 @@ async def _handle_multi_field_totp_sequence(
     if action_index == 0:
         # First digit: generate TOTP and cache it
         totp_secret = timing_info["totp_secret"]
-        totp = pyotp.TOTP(totp_secret)
+        totp = parse_totp_config(totp_secret)
+        if not totp:
+            raise ValueError("Invalid TOTP secret or otpauth URI")
 
         # Check current TOTP expiry time
         current_time = int(time.time())
-        current_totp_valid_until = ((current_time // TOTP_TIME_STEP_SECONDS) + 1) * TOTP_TIME_STEP_SECONDS
+        current_totp_valid_until = ((current_time // totp.interval) + 1) * totp.interval
         seconds_until_expiry = current_totp_valid_until - current_time
 
         # If less than threshold seconds until expiry, use the next TOTP
@@ -1758,11 +1763,13 @@ async def _handle_multi_field_totp_sequence(
 
         # Check if cached TOTP has expired
         totp_secret = timing_info["totp_secret"]
-        totp = pyotp.TOTP(totp_secret)
+        totp = parse_totp_config(totp_secret)
+        if not totp:
+            raise ValueError("Invalid TOTP secret or otpauth URI")
 
         # Get current time and calculate TOTP expiry
         current_time = int(time.time())
-        totp_valid_until = ((current_time // TOTP_TIME_STEP_SECONDS) + 1) * TOTP_TIME_STEP_SECONDS
+        totp_valid_until = ((current_time // totp.interval) + 1) * totp.interval
 
         if current_time >= totp_valid_until:
             LOG.error(
@@ -1786,7 +1793,7 @@ async def _handle_multi_field_totp_sequence(
     if action_index == 5:
         # Calculate when this TOTP becomes valid (valid_from time)
         # If we used the next TOTP window, valid_from is the start of that window
-        totp_valid_from = totp_valid_until - TOTP_TIME_STEP_SECONDS
+        totp_valid_from = totp_valid_until - totp.interval
 
         if current_time < totp_valid_from:
             # TOTP is not yet valid, wait until it becomes valid
@@ -3459,7 +3466,7 @@ def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
     if not totp_secret:
         LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
         return parameter
-    return pyotp.TOTP(totp_secret).now()
+    return generate_totp_code(totp_secret)
 
 
 def generate_totp_value_with_task(task: Task, parameter: str) -> str:

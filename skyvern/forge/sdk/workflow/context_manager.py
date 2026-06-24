@@ -32,7 +32,7 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordC
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_secret
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, normalize_totp_config
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -660,7 +660,7 @@ class WorkflowRunContext:
             totp_secret_id = f"{random_secret_id}_totp"
             self.secrets[totp_secret_id] = BitwardenConstants.TOTP
             totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-            self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
+            self.secrets[totp_secret_value] = normalize_totp_config(credential.totp)
             self.values[parameter.key]["totp"] = totp_secret_id
 
     def get_credential_totp_identifier(self, parameter_key: str) -> str | None:
@@ -808,7 +808,7 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = parse_totp_secret(field.value)
+                self.secrets[totp_secret_value] = normalize_totp_config(field.value)
                 self.values[parameter.key]["totp"] = totp_secret_id
             elif field.title and field.title.lower() in ["expire date", "expiry date", "expiration date"]:
                 parts = [part.strip() for part in field.value.strip().split("/")]
@@ -1040,7 +1040,7 @@ class WorkflowRunContext:
                     totp_secret_id = f"{random_secret_id}_totp"
                     self.secrets[totp_secret_id] = BitwardenConstants.TOTP
                     totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                    self.secrets[totp_secret_value] = secret_credentials[BitwardenConstants.TOTP]
+                    self.secrets[totp_secret_value] = normalize_totp_config(secret_credentials[BitwardenConstants.TOTP])
                     self.values[parameter.key]["totp"] = totp_secret_id
 
         except BitwardenBaseError as e:
@@ -1094,7 +1094,7 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = AzureVaultConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = parse_totp_secret(totp_secret)
+                self.secrets[totp_secret_value] = normalize_totp_config(totp_secret)
                 self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_bitwarden_sensitive_information_parameter_value(
