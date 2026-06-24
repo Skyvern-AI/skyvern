@@ -228,6 +228,19 @@ environment:
 
 To use an external database, update this connection string and remove the `postgres` service.
 
+### Base URL and artifact signing
+
+Required when self-hosting behind a custom domain or reverse proxy:
+
+```bash
+# The public URL of your Skyvern API (used to generate asset links)
+SKYVERN_BASE_URL=https://your-api-domain.com
+
+# HMAC keyring for signing artifact URLs — generate your own secret
+ARTIFACT_CONTENT_HMAC_KEYRING={"current_kid": "2026-06-01-v1","keys": {"2026-06-01-v1": {"secret": "your-secret-here","created_at": "2026-06-01"}}}
+```
+
+Both go in the root `.env` file, not `skyvern-frontend/.env`.
 ---
 
 ## Common operations

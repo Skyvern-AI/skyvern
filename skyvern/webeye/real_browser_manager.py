@@ -242,12 +242,28 @@ class RealBrowserManager(BrowserManager):
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             proxy_location = workflow_run.proxy_location
+            session = None
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
                     browser_session_id, workflow_run.organization_id
                 )
                 if session and session.proxy_location is not None:
                     proxy_location = session.proxy_location
+
+            browser_address = workflow_run.browser_address
+            if browser_session_id and not browser_address and workflow_run.organization_id:
+                if session is None:
+                    session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                        browser_session_id, workflow_run.organization_id
+                    )
+                if session and session.browser_address:
+                    browser_address = session.browser_address
+            LOG.info(
+                "Retrieved browser_address from persistent session DB",
+                browser_session_id=browser_session_id,
+                browser_address=browser_address,
+            )
+
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=url,
@@ -256,15 +272,9 @@ class RealBrowserManager(BrowserManager):
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
-                browser_address=workflow_run.browser_address,
+                browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
-
-            if browser_session_id:
-                await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
-                    browser_session_id,
-                    browser_state,
-                )
 
         self.pages[workflow_run_id] = browser_state
         # Only sync the parent's entry when the child is sharing the parent's

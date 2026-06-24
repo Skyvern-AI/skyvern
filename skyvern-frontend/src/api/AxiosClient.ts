@@ -62,11 +62,25 @@ function getResponseDetail(data: unknown): string | undefined {
 
 clients.forEach((instance) => {
   instance.interceptors.response.use(
-    (response) => response,
-    (error) => {
+    (response: any) => response,
+    (error: any) => {
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);
+
+        // Suppress misleading error for internal auth endpoint —
+        // remote self-hosted setups get 403 by design (localhost-only).
+        const isInternalAuth = error.config?.url?.includes(
+          "/internal/auth/status",
+        );
+        if (isInternalAuth && (statusCode === 403 || statusCode === 404)) {
+          return Promise.resolve({
+            ...error.response,
+            status: 200,
+            data: { status: "ok" },
+          });
+        }
+
         const isAuthFailure =
           statusCode === 401 ||
           statusCode === 403 ||
