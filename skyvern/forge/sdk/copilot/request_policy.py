@@ -197,6 +197,9 @@ class RequestPolicy:
     classifier_retry_count: int = 0
     completion_contract_status: str = "absent"
 
+    def graded_completion_criteria(self) -> list[CompletionCriterion]:
+        return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
+
     def to_trace_data(self) -> dict[str, Any]:
         return {
             "testing_intent": self.testing_intent,
@@ -207,7 +210,7 @@ class RequestPolicy:
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "resolved_credential_count": len(self.resolved_credentials),
             "has_completion_contract": bool(self.completion_contract),
-            "completion_criteria_count": len(self.completion_criteria),
+            "completion_criteria_count": len(self.graded_completion_criteria()),
             "completion_criteria_implicit_count": sum(
                 1 for criterion in self.completion_criteria if criterion.implicit
             ),

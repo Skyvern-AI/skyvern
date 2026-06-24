@@ -102,7 +102,7 @@ def test_outcome_verification_turn_fields_composes_all_sources() -> None:
     assert fields["gate_satisfied"] is True
     assert fields["completion_verification_status"] == "evaluated"
     assert fields["verification_evidence_full_workflow_verified"] is True
-    assert fields["request_policy_completion_criteria_count"] == 2
+    assert fields["request_policy_completion_criteria_count"] == 1
     assert fields["request_policy_completion_criteria_implicit_count"] == 1
     assert fields["request_policy_completion_criteria_method_mandated_count"] == 1
 
