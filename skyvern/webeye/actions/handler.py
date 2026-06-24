@@ -3265,7 +3265,11 @@ async def handle_goto_url_action(
     step: Step,
 ) -> list[ActionResult]:
     await page.goto(action.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-    return [ActionSuccess()]
+    # Navigation invalidates the current scraped page's element ids; stop the batch so the
+    # next step re-scrapes before any later actions run against the new DOM.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
 
 
 async def handle_go_back_action(
@@ -3298,7 +3302,11 @@ async def handle_reload_page_action(
     step: Step,
 ) -> list[ActionResult]:
     await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-    return [ActionSuccess()]
+    # Reloading re-renders the DOM and invalidates the scraped page's element ids; stop the
+    # batch so the next step re-scrapes before any later actions run.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
 
 
 @traced(name="skyvern.agent.action.close_page")

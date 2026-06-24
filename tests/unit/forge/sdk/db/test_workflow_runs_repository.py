@@ -229,6 +229,38 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
 
 
 @pytest.mark.asyncio
+async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
+    """Regression test for SKY-11217: Run History search must match agent input values
+    (workflow_run_parameters key/description/value + extra_http_headers) on the primary
+    task_runs query — not only searchable_text/run_id/wpid. The SKY-7600 unified task_runs
+    migration repointed the runs list to the v2 path and dropped parameter-value search for
+    runs that have a task_runs row (the common case); the fallback query only covers orphan
+    workflow_runs, so param search must live on the primary query too."""
+    captured_queries: list[Any] = []
+
+    async def _execute(query):
+        captured_queries.append(query)
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="Paris")
+
+    primary_where = _where_clause_sql(captured_queries[0])
+    # Parameter EXISTS subqueries correlate on the run_id of the primary task_runs row.
+    assert "workflow_run_parameters.workflow_run_id = task_runs.run_id" in primary_where
+    assert "workflow_run_parameters.value" in primary_where
+    assert "workflow_parameters.key" in primary_where
+    assert "workflow_parameters.description" in primary_where
+    assert "extra_http_headers" in primary_where
+    # Param search must not drag workflows.title into the primary query (no implicit FROM workflows).
+    assert ".".join(("workflows", "title")) not in primary_where
+
+
+@pytest.mark.asyncio
 async def test_get_all_runs_v2_selects_workflow_deleted_flag() -> None:
     captured: dict[str, Any] = {}
 

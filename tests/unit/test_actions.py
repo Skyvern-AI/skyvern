@@ -20,10 +20,13 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ClickAction,
+    ExtractAction,
+    GotoUrlAction,
     InputTextAction,
     KeypressAction,
     NewTabAction,
     NullAction,
+    ReloadPageAction,
     SelectOptionAction,
     SwitchTabAction,
     WebAction,
@@ -486,6 +489,115 @@ def test_parse_click_download_field(download_value: bool | None) -> None:
     assert isinstance(action, ClickAction)
     expected = download_value if download_value is not None else False
     assert action.download is expected
+
+
+@pytest.mark.parametrize("action_type", ["EXTRACT_INFORMATION", "EXTRACT", "extract_information"])
+def test_parse_extract_information_with_extraction_goal(action_type: str) -> None:
+    schema = {"type": "object", "properties": {"price": {"type": "string"}}}
+    action = parse_action(
+        action={"action_type": action_type, "id": None, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+        data_extraction_goal="extract the price",
+        extracted_information_schema=schema,
+    )
+    assert isinstance(action, ExtractAction)
+    assert action.data_extraction_goal == "extract the price"
+    assert action.data_extraction_schema == schema
+    assert action.element_id is None
+    assert action.skyvern_element_hash is None
+    assert action.skyvern_element_data is None
+
+
+def test_parse_extract_information_clears_hallucinated_element_id() -> None:
+    action = parse_action(
+        action={"action_type": "EXTRACT_INFORMATION", "id": "42", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+        data_extraction_goal="extract the price",
+    )
+    assert isinstance(action, ExtractAction)
+    assert action.element_id is None
+
+
+def test_parse_extract_information_without_extraction_goal_returns_null_action() -> None:
+    action = parse_action(
+        action={"action_type": "EXTRACT_INFORMATION", "id": None, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_parse_goto_url_valid_url() -> None:
+    action = parse_action(
+        action={"action_type": "GOTO_URL", "id": None, "url": "https://example.com/a", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, GotoUrlAction)
+    assert action.url == "https://example.com/a"
+    assert action.element_id is None
+    assert action.skyvern_element_hash is None
+    assert action.skyvern_element_data is None
+    assert action.is_magic_link is False
+
+
+def test_parse_goto_url_prepends_https_scheme() -> None:
+    action = parse_action(
+        action={"action_type": "GOTO_URL", "id": None, "url": "example.com/a", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, GotoUrlAction)
+    assert action.url == "https://example.com/a"
+
+
+def test_parse_goto_url_clears_hallucinated_element_id() -> None:
+    action = parse_action(
+        action={"action_type": "GOTO_URL", "id": "7", "url": "https://example.com", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, GotoUrlAction)
+    assert action.element_id is None
+
+
+@pytest.mark.parametrize("url", [None, "", "ftp://example.com", "not a url"])
+def test_parse_goto_url_invalid_or_missing_url_returns_null_action(url: str | None) -> None:
+    action = parse_action(
+        action={"action_type": "GOTO_URL", "id": None, "url": url, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_parse_goto_url_without_url_key_returns_null_action() -> None:
+    action = parse_action(
+        action={"action_type": "GOTO_URL", "id": None, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000/admin",
+        "http://127.0.0.1/latest",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.5/internal",
+    ],
+)
+def test_parse_goto_url_blocked_host_returns_null_action(url: str) -> None:
+    action = parse_action(
+        action={"action_type": "GOTO_URL", "id": None, "url": url, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_parse_reload_page() -> None:
+    action = parse_action(
+        action={"action_type": "RELOAD_PAGE", "id": None, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ReloadPageAction)
+    assert action.element_id is None
 
 
 def test_parse_new_tab_action_with_url() -> None:

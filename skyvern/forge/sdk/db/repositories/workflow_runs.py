@@ -624,6 +624,13 @@ class WorkflowRunsRepository(BaseRepository):
                         TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
                         TaskRunModel.run_id.icontains(search_key, autoescape=True),
                         effective_wpid.icontains(search_key, autoescape=True),
+                        # task_runs.searchable_text is only title+url, so agent inputs are matched via
+                        # workflow_run_parameters / extra_http_headers correlated on this run's run_id.
+                        *self._run_input_search_clauses(
+                            search_key,
+                            TaskRunModel.run_id,
+                            WorkflowRunModel.extra_http_headers,
+                        ),
                     )
                 )
 
@@ -903,20 +910,17 @@ class WorkflowRunsRepository(BaseRepository):
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
     @staticmethod
-    def _apply_workflow_run_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
-        if not search_key:
-            return query
-        # Call only on WorkflowRunModel queries that already join WorkflowModel. The TaskRunModel query in
-        # get_all_runs_v2 uses its own filter so workflow-title search cannot add an implicit workflows FROM.
-        # Match workflow_run_id directly
-        id_matches = WorkflowRunModel.workflow_run_id.icontains(search_key, autoescape=True)
-        workflow_title_matches = WorkflowModel.title.icontains(search_key, autoescape=True)
-        workflow_permanent_id_matches = WorkflowRunModel.workflow_permanent_id.icontains(
-            search_key,
-            autoescape=True,
-        )
-        # Match parameter key or description (only for non-deleted parameter definitions)
-        # Use EXISTS to avoid duplicate rows and to keep pagination correct
+    def _run_input_search_clauses(
+        search_key: str,
+        workflow_run_id_col: ColumnElement[Any],
+        extra_http_headers_col: ColumnElement[Any],
+    ) -> list[ColumnElement[bool]]:
+        """Clauses matching a run's agent inputs: workflow_run_parameters (key/description/value)
+        and extra_http_headers, correlated on the given workflow_run_id column. Self-contained
+        subqueries, so they OR into either the task_runs or workflow_runs search without adding an
+        implicit FROM."""
+        # Match parameter key or description (only for non-deleted parameter definitions).
+        # Use EXISTS to avoid duplicate rows and to keep pagination correct.
         param_key_desc_exists = exists(
             select(1)
             .select_from(WorkflowRunParameterModel)
@@ -924,7 +928,7 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowParameterModel,
                 WorkflowParameterModel.workflow_parameter_id == WorkflowRunParameterModel.workflow_parameter_id,
             )
-            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(WorkflowRunParameterModel.workflow_run_id == workflow_run_id_col)
             .where(WorkflowParameterModel.deleted_at.is_(None))
             .where(
                 or_(
@@ -933,26 +937,42 @@ class WorkflowRunsRepository(BaseRepository):
                 )
             )
         )
-        # Match run parameter value directly (searches all values regardless of parameter definition status)
+        # Match run parameter value directly (searches all values regardless of parameter definition status).
         param_value_exists = exists(
             select(1)
             .select_from(WorkflowRunParameterModel)
-            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(WorkflowRunParameterModel.workflow_run_id == workflow_run_id_col)
             .where(WorkflowRunParameterModel.value.icontains(search_key, autoescape=True))
         )
-        # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+        # Match extra HTTP headers (cast JSON to text for search, skip NULLs).
         extra_headers_match = and_(
-            WorkflowRunModel.extra_http_headers.isnot(None),
-            func.cast(WorkflowRunModel.extra_http_headers, Text()).icontains(search_key, autoescape=True),
+            extra_http_headers_col.isnot(None),
+            func.cast(extra_http_headers_col, Text()).icontains(search_key, autoescape=True),
+        )
+        return [param_key_desc_exists, param_value_exists, extra_headers_match]
+
+    @staticmethod
+    def _apply_workflow_run_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
+        if not search_key:
+            return query
+        # Call only on WorkflowRunModel queries that already join WorkflowModel. The TaskRunModel query in
+        # get_all_runs_v2 uses its own filter so workflow-title search cannot add an implicit workflows FROM.
+        id_matches = WorkflowRunModel.workflow_run_id.icontains(search_key, autoescape=True)
+        workflow_title_matches = WorkflowModel.title.icontains(search_key, autoescape=True)
+        workflow_permanent_id_matches = WorkflowRunModel.workflow_permanent_id.icontains(
+            search_key,
+            autoescape=True,
         )
         return query.where(
             or_(
                 id_matches,
                 workflow_title_matches,
                 workflow_permanent_id_matches,
-                param_key_desc_exists,
-                param_value_exists,
-                extra_headers_match,
+                *WorkflowRunsRepository._run_input_search_clauses(
+                    search_key,
+                    WorkflowRunModel.workflow_run_id,
+                    WorkflowRunModel.extra_http_headers,
+                ),
             )
         )
 

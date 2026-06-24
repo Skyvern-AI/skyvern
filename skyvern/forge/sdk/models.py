@@ -111,7 +111,7 @@ class Step(BaseModel):
         if is_last is False:
             raise ValueError(f"cant_set_is_last_to_false({self.step_id})")
 
-    def is_goal_achieved(self) -> bool:
+    def is_goal_achieved(self, has_navigation_goal: bool = False) -> bool:
         # TODO: now we also consider a step has achieved the goal if the task doesn't have a navigation goal
         # and the data extraction is successful
 
@@ -128,6 +128,17 @@ class Step(BaseModel):
         last_action, last_action_results = self.output.actions_and_results[-1]
         if last_action.action_type not in [ActionType.COMPLETE, ActionType.EXTRACT]:
             return False
+
+        if last_action.action_type == ActionType.EXTRACT and has_navigation_goal:
+            # A planner-emitted mid-task EXTRACT must not complete a task that still has a
+            # navigation goal; only accept it when a successful COMPLETE exists in the step
+            # (the agent appends its own EXTRACT right after a verified COMPLETE).
+            step_has_successful_complete = any(
+                action.action_type == ActionType.COMPLETE and any(result.success for result in results)
+                for action, results in self.output.actions_and_results
+            )
+            if not step_has_successful_complete:
+                return False
 
         return any(action_result.success for action_result in last_action_results)
 
