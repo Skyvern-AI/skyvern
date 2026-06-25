@@ -1309,6 +1309,7 @@ function Workspace({
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+    useWorkflowPanelStore.getState().setSelectedBlockId(id);
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
