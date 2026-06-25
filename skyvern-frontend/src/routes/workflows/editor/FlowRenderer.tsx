@@ -391,6 +391,9 @@ type Props = {
   // Width of a left-side panel (the studio Copilot column) the canvas sits right
   // of; the chain shifts left by half of it to read as page-centered, not pane.
   centerOffsetX?: number;
+  // Embedded in the studio shell: aligns the block-config sidebar's top/bottom
+  // edges with the Copilot column instead of the legacy header offsets.
+  embedded?: boolean;
 };
 
 function FlowRenderer({
@@ -415,6 +418,7 @@ function FlowRenderer({
   onAddNode,
   onLayoutPhaseChange,
   centerOffsetX = 0,
+  embedded = false,
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
@@ -1940,7 +1944,9 @@ function FlowRenderer({
             entirely in read-only mode so comparison canvases never
             expose the editable block form.
           */}
-            {!readOnly && <BlockConfigSidebar onAddNode={onAddNode} />}
+            {!readOnly && (
+              <BlockConfigSidebar onAddNode={onAddNode} embedded={embedded} />
+            )}
             {!readOnly && (
               <div
                 data-tour="sidebar-region"

@@ -1309,6 +1309,7 @@ function Workspace({
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+    useWorkflowPanelStore.getState().setSelectedBlockId(id);
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -1704,6 +1705,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 centerOffsetX={studioCanvasCenterOffset}
+                embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
