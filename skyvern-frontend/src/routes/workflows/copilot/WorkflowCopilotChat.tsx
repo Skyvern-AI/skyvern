@@ -1293,6 +1293,7 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
             max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
             max_elapsed_time_minutes:
@@ -1326,6 +1327,12 @@ export function WorkflowCopilotChat({
           pendingSubmitSnapshot.current = {
             ...saveData.workflow,
             title: saveData.title,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
+            model: saveData.settings.model,
             workflow_definition: {
               ...saveData.workflow.workflow_definition,
               parameters: saveData.parameters,

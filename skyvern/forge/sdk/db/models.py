@@ -514,6 +514,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     browser_profile_id = Column(String, nullable=True)
+    browser_profile_key = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)

@@ -3771,6 +3771,7 @@ async def _update_workflow(
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
                 browser_profile_id=workflow.browser_profile_id,
+                browser_profile_key=workflow.browser_profile_key,
                 model=workflow.model,
                 max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
                 extra_http_headers=workflow.extra_http_headers,
