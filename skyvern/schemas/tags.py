@@ -237,6 +237,10 @@ class TagValue(BaseModel):
     key: str
     value: str
     color: str
+    workflow_count: int = Field(
+        default=0,
+        description="Number of non-deleted workflows currently carrying this (key, value) label.",
+    )
 
 
 class TagValueUpdate(BaseModel):
@@ -255,6 +259,58 @@ class TagValueUpdate(BaseModel):
     @classmethod
     def _normalize_color(cls, v: object) -> str:
         return normalize_tag_color(v)
+
+
+class TagValueRename(BaseModel):
+    """Body for ``PATCH /v1/tag-values/{key}/rename``. Both the current and the new
+    value ride in the body so values containing ``/`` stay addressable."""
+
+    value: str = Field(description="Current tag value (label) under the key to rename.")
+    new_value: str = Field(description="New tag value (label) to rename it to.")
+
+    @field_validator("value", "new_value", mode="before")
+    @classmethod
+    def _normalize_value(cls, v: object) -> str:
+        return normalize_tag_value(v)
+
+    @model_validator(mode="after")
+    def _new_value_is_distinct_and_addressable(self) -> TagValueRename:
+        if self.new_value == self.value:
+            raise ValueError("new_value must differ from the current value")
+        # Grouped values reserve '*' as the group filter wildcard (mirrors TagInput).
+        if self.new_value == "*":
+            raise ValueError("grouped tag values must not be exactly '*' (reserved as the group filter wildcard)")
+        return self
+
+
+class TagValueRenameResponse(BaseModel):
+    """Response for ``PATCH /v1/tag-values/{key}/rename``: the renamed label with its
+    carried-over color and the number of workflows re-tagged."""
+
+    key: str
+    value: str
+    color: str
+    renamed_workflow_count: int
+
+
+class TagValueDelete(BaseModel):
+    """Body for ``DELETE /v1/tag-values/{key}``. The value rides in the body, not the
+    path, so values containing ``/`` stay addressable."""
+
+    value: str = Field(description="Tag value (label) under the key to soft-delete.")
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _normalize_value(cls, v: object) -> str:
+        return normalize_tag_value(v)
+
+
+class TagValueDeleteResponse(BaseModel):
+    """Response for ``DELETE /v1/tag-values/{key}``."""
+
+    key: str
+    value: str
+    removed_from_workflow_count: int
 
 
 class WorkflowTagsBatchRequest(BaseModel):
