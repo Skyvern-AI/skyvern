@@ -1292,3 +1292,11 @@ class ImaginarySecretValue(SkyvernException):
         super().__init__(
             f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )
+
+
+class CodeBlockRunnerSelectionError(SkyvernException):
+    """Raised when the secure CodeBlock runner selection policy cannot be evaluated safely.
+
+    The block-execution call site catches this and fails the block closed instead of
+    silently falling back to in-process execution.
+    """
