@@ -1249,6 +1249,7 @@ class TestRequestPolicyInputGuardrail:
             organization_id="org-1",
             handler=policy_inputs.handler,
             active_criteria=None,
+            config=None,
         )
 
     @pytest.mark.asyncio

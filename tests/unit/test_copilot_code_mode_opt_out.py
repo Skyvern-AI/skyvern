@@ -262,4 +262,5 @@ def test_derive_copilot_code_mode_diagnostics_uses_context_state() -> None:
         "copilot_last_code_build_failed": True,
         "copilot_repair_ceiling_hit": True,
         "copilot_pending_capability": "credential-typed code synthesis",
+        "copilot_schema_incompatibility": None,
     }
