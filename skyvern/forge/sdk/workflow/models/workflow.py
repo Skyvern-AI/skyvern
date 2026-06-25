@@ -138,6 +138,7 @@ class Workflow(BaseModel):
     totp_identifier: str | None = None
     persist_browser_session: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None

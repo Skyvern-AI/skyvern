@@ -555,6 +555,7 @@ def convert_to_workflow(
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
         browser_profile_id=workflow_model.browser_profile_id,
+        browser_profile_key=workflow_model.browser_profile_key,
         model=workflow_model.model,
         proxy_location=deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
