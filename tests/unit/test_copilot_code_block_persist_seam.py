@@ -739,6 +739,64 @@ class TestCodeSafetySeam:
         assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
+    async def test_code_only_exact_declared_string_parameters_are_adopted_for_unresolved_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Registry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_query, default_value: Sample}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location, default_value: City}
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  await page.locator("#query").fill(str(provider_query))
+                  await page.locator("#location").fill(str(search_location))
+            """
+        )
+
+        accepted = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert accepted["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["provider_query", "search_location"]
+
+    @pytest.mark.asyncio
+    async def test_code_only_partial_declared_parameter_name_still_rejects(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Registry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_query, default_value: Sample}
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  await page.locator("#query").fill(str(provider_name))
+            """
+        )
+
+        rejected = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert rejected["ok"] is False
+        result_context = rejected["data"]["authoring_repair_context"]
+        assert result_context["unresolved_names"] == ["provider_name"]
+        assert result_context["available_parameter_keys"] == ["provider_query"]
+        assert result_context["binding_candidates"] == ["provider_query", "provider_name"]
+
+    @pytest.mark.asyncio
     async def test_unresolved_name_repair_context_includes_existing_workflow_binding_candidates(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
