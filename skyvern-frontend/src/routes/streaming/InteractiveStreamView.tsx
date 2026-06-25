@@ -1,5 +1,5 @@
 import type { RefObject } from "react";
-import { GlobeIcon } from "@radix-ui/react-icons";
+import { ExitIcon, GlobeIcon, HandIcon } from "@radix-ui/react-icons";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
@@ -60,16 +60,23 @@ function InteractiveStreamView({
         {currentUrl && <UrlBar url={currentUrl} />}
         {showControlButtons && !userIsControlling && inputReady && (
           <div className="absolute inset-0 z-10 flex items-center justify-center">
-            <Button onClick={() => setUserIsControlling(true)}>
+            <Button
+              size="sm"
+              className="border"
+              onClick={() => setUserIsControlling(true)}
+            >
+              <HandIcon className="mr-2 h-4 w-4" />
               take control
             </Button>
           </div>
         )}
         {showControlButtons && userIsControlling && (
           <Button
-            className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2"
+            size="sm"
+            className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2 border"
             onClick={() => setUserIsControlling(false)}
           >
+            <ExitIcon className="mr-2 h-4 w-4" />
             stop controlling
           </Button>
         )}
