@@ -104,6 +104,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
     browserProfileId: version.browser_profile_id ?? null,
+    browserProfileKey: version.browser_profile_key ?? null,
     model: version.model,
     maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
     maxElapsedTimeMinutes: version.max_elapsed_time_minutes ?? null,

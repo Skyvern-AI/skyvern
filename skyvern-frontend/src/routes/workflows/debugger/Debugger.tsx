@@ -69,6 +69,7 @@ function Debugger() {
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
     browserProfileId: workflow.browser_profile_id ?? null,
+    browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
