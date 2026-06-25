@@ -1704,6 +1704,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 centerOffsetX={studioCanvasCenterOffset}
+                embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
