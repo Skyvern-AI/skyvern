@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_FAILURE_TYPE
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
@@ -50,6 +51,7 @@ class DiagnosisFailureType(StrEnum):
     REPAIRABLE_BLOCK_FAILURE = "repairable_block_failure"
     ACTIVE_RUN_TERMINAL_EVIDENCE = "active_run_terminal_evidence"
     UNRECOVERABLE_TOOL_ERROR = "unrecoverable_tool_error"
+    SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
     UNKNOWN = "unknown"
 
 
@@ -234,6 +236,11 @@ def build_diagnosis_repair_contract(
         decision_summary = (
             "Stop the current retry loop: the active run reached the requested browser state, "
             "but the reusable workflow is not verified end-to-end."
+        )
+    elif failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY:
+        decision_summary = (
+            "Stop re-authoring: the edited extraction schema declares fields that map to no output the "
+            "workflow produces, so the mismatch is not repairable without user input."
         )
     completion_check = {
         RepairNextAction.NO_CHANGE: "Current run already satisfies the goal.",
@@ -482,6 +489,8 @@ def _failure_type(
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     if _safe_str(data.get("failure_type")) == "missing_credential_or_init":
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    if _safe_str(data.get("failure_type")) == SCHEMA_INCOMPATIBILITY_FAILURE_TYPE:
+        return DiagnosisFailureType.SCHEMA_INCOMPATIBILITY
     if repair_context is not None:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if outcome_verified:
@@ -510,6 +519,8 @@ def _next_action(
     if failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
         return RepairNextAction.STOP
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
+        return RepairNextAction.STOP
+    if failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY:
         return RepairNextAction.STOP
     if ctx.last_test_non_retriable_nav_error:
         return RepairNextAction.STOP
