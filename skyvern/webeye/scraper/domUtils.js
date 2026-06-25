@@ -2757,6 +2757,10 @@ if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
 
+if (window.globalParsedElementCounter === undefined) {
+  window.globalParsedElementCounter = new SafeCounter();
+}
+
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
   return (
@@ -2999,8 +3003,10 @@ async function stopGlobalIncrementalObserver() {
 async function getIncrementElements(wait_until_finished = true) {
   if (wait_until_finished) {
     while (
+      window.globalParsedElementCounter &&
+      window.globalOneTimeIncrementElements &&
       (await window.globalParsedElementCounter.get()) <
-      window.globalOneTimeIncrementElements.length
+        window.globalOneTimeIncrementElements.length
     ) {
       await asyncSleepFor(100);
     }
