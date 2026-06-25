@@ -43,6 +43,7 @@ import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
+import { handleVncClipboardPasteShortcut } from "@/components/browserStreamClipboard";
 
 import "./browser-stream.css";
 
@@ -216,6 +217,7 @@ function BrowserStream({
     setCanvasContainer(node);
   }, []);
   const rfbRef = useRef<RFB | null>(null);
+  const userCanSendVncInputRef = useRef(false);
   const observerRef = useRef<MutationObserver | null>(null);
   const clientId = useClientIdStore((state) => state.clientId);
   const recordingStore = useRecordingStore();
@@ -633,6 +635,32 @@ function BrowserStream({
     }
   }, [interactive]);
 
+  const theUserIsControlling =
+    userIsControlling || (interactive && !showControlButtons);
+
+  useEffect(() => {
+    userCanSendVncInputRef.current = theUserIsControlling;
+  }, [theUserIsControlling]);
+
+  useEffect(() => {
+    if (!canvasContainer) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!userCanSendVncInputRef.current) {
+        return;
+      }
+
+      void handleVncClipboardPasteShortcut(event, rfbRef.current);
+    };
+
+    canvasContainer.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      canvasContainer.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [canvasContainer]);
+
   // effect to ensure the recordingStore is reset when the component unmounts
   useEffect(() => {
     return () => {
@@ -767,7 +795,7 @@ function BrowserStream({
             toast({
               title: "Pasting Into Browser",
               description:
-                "Pasting your current clipboard text into the web page. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+                "Pasting your current clipboard text into the browser.",
             });
 
             const response: MessageOutAskForClipboardResponse = {
@@ -791,8 +819,7 @@ function BrowserStream({
             if (success) {
               toast({
                 title: "Copied to Clipboard",
-                description:
-                  "The text has been copied to your clipboard. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+                description: "The text has been copied to your clipboard.",
               });
             } else {
               toast({
@@ -825,8 +852,6 @@ function BrowserStream({
     }
   };
 
-  const theUserIsControlling =
-    userIsControlling || (interactive && !showControlButtons);
   const streamDiagnostic: StreamDiagnostic =
     !showStream || !runId
       ? {
