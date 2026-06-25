@@ -51,6 +51,11 @@ type Props = {
   // to this callback. Omit it for read-only surfaces (e.g. the analytics
   // dashboard filter) that must not expose destructive tag-key management.
   onDeleteKey?: (tagKey: TagKey) => void;
+  // Restrict filtering to exact `group:value` terms only — no bare labels and
+  // no group-any (`key:*`). Use on surfaces whose backend matches values
+  // literally (the analytics summary endpoint), where those broader forms
+  // would silently return unfiltered/empty data.
+  exactValuesOnly?: boolean;
   // (key, value) -> palette color; only exact group:value chips are colored.
   // Omit on surfaces that don't load colors (chips stay neutral).
   colors?: TagColorMap;
@@ -83,6 +88,7 @@ function TagFilterControl({
   valueSuggestionsByKey,
   triggerLabel = "Tags",
   onDeleteKey,
+  exactValuesOnly = false,
   colors,
 }: Props) {
   const [open, setOpen] = React.useState(false);
@@ -137,7 +143,12 @@ function TagFilterControl({
   const trimmedQuery = query.trim();
   const normalizedQuery = trimmedQuery.toLowerCase();
   const candidate = parseTagFilterTerm(query);
-  const candidateAddable = candidate !== null;
+  // In exact mode only fully-specified group:value terms are addable; bare
+  // labels and group-any (key:null) are rejected because the backend can't
+  // honor them.
+  const candidateAddable =
+    candidate !== null &&
+    (!exactValuesOnly || (candidate.key !== null && candidate.value !== null));
   const candidateExists =
     candidate !== null && value.some((term) => sameTerm(term, candidate));
   const showAdd = candidateAddable && !candidateExists;
@@ -155,7 +166,7 @@ function TagFilterControl({
           .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
       : [];
   const labelMatches =
-    typedKey === null
+    typedKey === null && !exactValuesOnly
       ? labelSuggestions
           .filter((label) => label.toLowerCase().includes(normalizedQuery))
           .filter(
@@ -296,7 +307,11 @@ function TagFilterControl({
         ) : null}
         <Command shouldFilter={false}>
           <CommandInput
-            placeholder="Filter by label, group:*, or group:label…"
+            placeholder={
+              exactValuesOnly
+                ? "Filter by group:value…"
+                : "Filter by label or group:label…"
+            }
             value={query}
             onValueChange={setQuery}
             onKeyDown={(event) => {
@@ -307,7 +322,11 @@ function TagFilterControl({
             }}
           />
           <CommandList>
-            <CommandEmpty>Type a label, group:*, or group:label.</CommandEmpty>
+            <CommandEmpty>
+              {exactValuesOnly
+                ? "Type group:value to filter."
+                : "Type a label, group:*, or group:label."}
+            </CommandEmpty>
             {showAdd && candidate ? (
               <CommandGroup>
                 <CommandItem
@@ -326,13 +345,21 @@ function TagFilterControl({
                     key={tagKey.key}
                     value={`__group__,${tagKey.key}`}
                     className="justify-between gap-2"
-                    // Filter by group (any value in it).
-                    onSelect={() => addTerm({ key: tagKey.key, value: null })}
+                    // Default: filter by group (any value in it). In exact mode
+                    // group-any isn't supported, so prefill `key:` and make the
+                    // user pick a concrete value instead.
+                    onSelect={() =>
+                      exactValuesOnly
+                        ? setQuery(`${tagKey.key}:`)
+                        : addTerm({ key: tagKey.key, value: null })
+                    }
                   >
                     <div className="flex min-w-0 flex-col">
                       <span className="truncate">
                         <span className="font-medium">{tagKey.key}</span>
-                        <span className="text-muted-foreground">: any</span>
+                        <span className="text-muted-foreground">
+                          {exactValuesOnly ? ": …" : ": any"}
+                        </span>
                       </span>
                       {tagKey.description ? (
                         <span className="truncate text-xs text-muted-foreground">

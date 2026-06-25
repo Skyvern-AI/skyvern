@@ -639,6 +639,209 @@ def grade_structured_record_criteria(
     return best_verdicts
 
 
+_TERMINAL_ACTION_KEY_TOKENS = (
+    (("submitted",), "submission"),
+    (("request", "submitted"), "request"),
+    (("application", "submitted"), "application"),
+    (("form", "submitted"), "form"),
+    (("order", "placed"), "order"),
+)
+_TERMINAL_ARTIFACT_KEY_TOKENS = (
+    (("confirmation", "number"), "confirmation"),
+    (("confirmation", "id"), "confirmation"),
+    (("request", "number"), "request"),
+    (("request", "id"), "request"),
+    (("submission", "id"), "submission"),
+    (("submission", "number"), "submission"),
+    (("application", "number"), "application"),
+    (("application", "id"), "application"),
+    (("order", "number"), "order"),
+    (("order", "id"), "order"),
+    (("receipt", "number"), "receipt"),
+    (("receipt", "id"), "receipt"),
+    (("reference", "number"), "reference"),
+    (("reference", "id"), "reference"),
+)
+_TERMINAL_CRITERION_VERBS = frozenset({"submit", "submitted", "submission", "place", "placed"})
+_TERMINAL_CRITERION_ABSTAIN_TOKENS = frozenset(
+    {
+        "lookup",
+        "looked",
+        "retrieve",
+        "retrieved",
+        "retrieval",
+        "return",
+        "returned",
+        "status",
+    }
+)
+_NEGATIVE_GUARD_TOKENS = frozenset({"blocker", "error", "failure", "failed", "challenge"})
+_NEGATIVE_TERMINAL_STATUS_VALUES = frozenset(
+    {
+        "blocked",
+        "cancelled",
+        "canceled",
+        "captcha required",
+        "denied",
+        "error",
+        "failed",
+        "failure",
+        "incomplete",
+        "not submitted",
+        "timeout",
+        "unable",
+    }
+)
+_TERMINAL_RECORD_FAMILY_ARTIFACTS = {
+    "request": frozenset({"confirmation", "reference", "request", "submission"}),
+    "application": frozenset({"application", "confirmation", "reference", "submission"}),
+    "form": frozenset({"confirmation", "reference", "submission"}),
+    "order": frozenset({"order", "receipt"}),
+}
+_TERMINAL_RECORD_FAMILY_ACTIONS = {
+    "request": frozenset({"request", "submission"}),
+    "application": frozenset({"application", "submission"}),
+    "form": frozenset({"form", "submission"}),
+    "order": frozenset({"order"}),
+}
+
+
+def grade_terminal_goal_record_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    verdicts: list[CriterionVerdict] = []
+    eligible_criteria = [
+        (criterion, family)
+        for criterion in criteria
+        if (family := _terminal_goal_criterion_family(criterion.outcome)) is not None
+    ]
+    if not eligible_criteria:
+        return []
+    for label, payload in snapshot.block_outputs.items():
+        record = _structured_record_payload(payload)
+        if record is None:
+            continue
+        for criterion, family in eligible_criteria:
+            if _terminal_goal_record_confirmed(record, family):
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="satisfied",
+                        reason_code="evidence_confirms",
+                        evidence_ref=f"block_outputs:{label}",
+                    )
+                )
+        if verdicts:
+            return verdicts
+    return []
+
+
+def _terminal_goal_criterion_family(outcome: str) -> str | None:
+    if _extract_present_value_literals(outcome):
+        return None
+    tokens = set(_status_word_tokens(outcome))
+    if tokens & _TERMINAL_CRITERION_ABSTAIN_TOKENS:
+        return None
+    if not tokens & _TERMINAL_CRITERION_VERBS:
+        return None
+    families = [family for family in ("request", "application", "form", "order") if family in tokens]
+    if len(families) != 1:
+        return None
+    family = families[0]
+    if family == "order" and "placed" not in tokens:
+        return None
+    return family
+
+
+def _terminal_goal_record_confirmed(record: dict[str, Any], family: str) -> bool:
+    if _terminal_goal_record_has_negative_guard(record):
+        return False
+    if _structured_record_contradiction(record):
+        return False
+    action_families = [
+        action_family
+        for key, value in _walk_record_scalars(record)
+        if (action_family := _terminal_action_family_for_key(key)) is not None and value is True
+    ]
+    if any(
+        value is False
+        for key, value in _walk_record_scalars(record)
+        if _terminal_action_family_for_key(key) is not None
+    ):
+        return False
+    has_family_artifact = _terminal_goal_record_has_artifact_for_family(record, family)
+    if not action_families:
+        return has_family_artifact and not _terminal_goal_record_has_generic_success_claim(record)
+    if family not in _TERMINAL_RECORD_FAMILY_ACTIONS:
+        return False
+    if not any(action_family in _TERMINAL_RECORD_FAMILY_ACTIONS[family] for action_family in action_families):
+        return False
+    return has_family_artifact
+
+
+def _terminal_action_family_for_key(key: str) -> str | None:
+    leaf_tokens = _record_key_leaf_tokens(key)
+    for key_tokens, family in _TERMINAL_ACTION_KEY_TOKENS:
+        if leaf_tokens == key_tokens:
+            return family
+    return None
+
+
+def _terminal_goal_record_has_generic_success_claim(record: dict[str, Any]) -> bool:
+    generic_success_keys = {
+        ("completed",),
+        ("succeeded",),
+        ("success",),
+    }
+    for key, value in _walk_record_scalars(record):
+        leaf_tokens = _record_key_leaf_tokens(key)
+        if value is True and _terminal_action_family_for_key(key) is None and leaf_tokens:
+            if leaf_tokens[-1] in _TERMINAL_CRITERION_VERBS:
+                return True
+        if leaf_tokens in generic_success_keys and value is True:
+            return True
+        if "status" in _key_word_tokens(key) and isinstance(value, str):
+            polarity = _status_polarity(value)
+            if polarity is not None and not polarity[0]:
+                return True
+    return False
+
+
+def _terminal_goal_record_has_negative_guard(record: dict[str, Any]) -> bool:
+    for key, value in _walk_record_scalars(record):
+        tokens = _key_word_tokens(key)
+        if tokens & _NEGATIVE_GUARD_TOKENS and _is_meaningful_record_value(value) and value is not False:
+            return True
+        if "status" in tokens and isinstance(value, str):
+            normalized_status = _normalize_present_value(value)
+            if normalized_status in _NEGATIVE_TERMINAL_STATUS_VALUES or any(
+                phrase in normalized_status for phrase in ("captcha required", "not submitted", "unable")
+            ):
+                return True
+            polarity = _status_polarity(value)
+            if polarity is not None and polarity[0]:
+                return True
+    return False
+
+
+def _terminal_goal_record_has_artifact_for_family(record: dict[str, Any], family: str) -> bool:
+    allowed_artifacts = _TERMINAL_RECORD_FAMILY_ARTIFACTS[family]
+    for key, value in _walk_record_scalars(record):
+        if isinstance(value, bool) or not _is_meaningful_record_value(value):
+            continue
+        leaf_tokens = _record_key_leaf_tokens(key)
+        for key_tokens, artifact_family in _TERMINAL_ARTIFACT_KEY_TOKENS:
+            if leaf_tokens == key_tokens and artifact_family in allowed_artifacts:
+                return True
+    return False
+
+
+def _record_key_leaf_tokens(key: str) -> tuple[str, ...]:
+    leaf = re.sub(r"\[\d+\]$", "", key.rsplit(".", 1)[-1])
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", leaf).casefold()
+    return tuple(re.findall(r"[a-z0-9]+", spaced))
+
+
 def _structured_record_satisfied(criterion_id: str, label: str) -> CriterionVerdict:
     return CriterionVerdict(
         criterion_id=criterion_id,

@@ -965,6 +965,51 @@ def _code_block_authoring_repair_context(
     return None
 
 
+def _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml: str) -> str:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml
+    declared_string_keys = _declared_string_workflow_parameter_keys(parsed)
+    if not declared_string_keys:
+        return workflow_yaml
+    available_binding_keys_by_label = _code_block_available_binding_keys_by_label(workflow_yaml)
+    adopted_by_label: dict[str, list[str]] = {}
+    for block in _workflow_code_blocks(parsed):
+        label = str(block.get("label") or "").strip()
+        if not label:
+            continue
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        parameter_keys = _code_block_parameter_keys(block)
+        available_declared_keys = set(available_binding_keys_by_label.get(label, [])) & declared_string_keys
+        if not available_declared_keys:
+            continue
+        diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+        if diagnostic is None or not diagnostic.unresolved_names:
+            continue
+        adopted_keys = [
+            name
+            for name in diagnostic.unresolved_names
+            if name in available_declared_keys and name not in parameter_keys
+        ]
+        if not adopted_keys:
+            continue
+        raw_keys = block.get("parameter_keys")
+        merged_keys = (
+            [str(key) for key in raw_keys if isinstance(key, str) and key] if isinstance(raw_keys, list) else []
+        )
+        for key in adopted_keys:
+            if key not in merged_keys:
+                merged_keys.append(key)
+        block["parameter_keys"] = merged_keys
+        adopted_by_label[label] = adopted_keys
+    if not adopted_by_label:
+        return workflow_yaml
+    LOG.info("copilot adopted exact declared parameter keys for unresolved names", adopted_by_label=adopted_by_label)
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
 def _repair_context_log_values(values: list[str], *, max_items: int = 20) -> list[str]:
     cleaned: list[str] = []
     for raw_value in values[:max_items]:
@@ -3523,6 +3568,8 @@ async def _update_workflow(
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
         )
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        workflow_yaml = _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml)
     params["workflow_yaml"] = workflow_yaml
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
     if parameter_contract_error is not None:
