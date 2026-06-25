@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
+    # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
+    # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
+    # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
+    # instead of surfacing an opaque ECONNREFUSED.
+    CDP_CONNECT_RETRY_ATTEMPTS: int = 6
+    CDP_CONNECT_RETRY_BACKOFF_SECONDS: list[float] = [1, 2, 3, 4, 5]
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
