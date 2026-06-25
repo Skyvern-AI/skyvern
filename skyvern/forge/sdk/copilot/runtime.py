@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -308,6 +309,10 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
+    # Latest edited-schema-incompatibility terminal outcome, set when an edited
+    # extraction_schema declares fields that map to no output the block produces.
+    # Surfaced into the persisted TurnOutcome so a later turn can report it.
+    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
