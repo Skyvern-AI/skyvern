@@ -7,7 +7,7 @@ import keyword
 import re
 import textwrap
 import tokenize
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Annotated, Any, Literal, NamedTuple
@@ -78,9 +78,19 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
+from skyvern.forge.sdk.copilot.schema_incompatibility import (
+    SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
+    SchemaIncompatibility,
+    build_schema_incompatibility_blocker_signal,
+    merge_schema_incompatibilities,
+    render_schema_incompatibility_agent_steer,
+)
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import blocker_signal_is_genuinely_terminal
+from skyvern.forge.sdk.copilot.turn_halt import (
+    blocker_signal_is_genuinely_terminal,
+    stash_turn_halt_from_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
@@ -360,6 +370,7 @@ class CodeArtifactNormalization(NamedTuple):
     error: str | None
     violations: list[str]
     offending_labels: list[str]
+    schema_incompatibilities: list[SchemaIncompatibility] = []
 
 
 def _normalize_code_artifact_metadata(
@@ -399,6 +410,7 @@ def _normalize_code_artifact_metadata_detailed(
     trajectory: list[ScoutedInteraction] = scout_trajectory or []
     violations: list[str] = []
     offending_labels: list[str] = []
+    schema_incompatibilities: list[SchemaIncompatibility] = []
     anchored: list[dict[str, Any]] = []
     unanchored: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
@@ -494,6 +506,10 @@ def _normalize_code_artifact_metadata_detailed(
         schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
         if schema_conformance_error is not None:
             item_violations.append(schema_conformance_error)
+        schema_incompatibility = _extraction_schema_incompatibility(label, dumped, block_code)
+        if schema_incompatibility is not None:
+            schema_incompatibilities.append(schema_incompatibility)
+            item_violations.append(render_schema_incompatibility_agent_steer(schema_incompatibility))
         download_shape_error = _download_return_shape_error(label, dumped, block_code)
         if download_shape_error is not None:
             item_violations.append(download_shape_error)
@@ -507,9 +523,13 @@ def _normalize_code_artifact_metadata_detailed(
             normalized[label] = _imposed_artifact_skeleton(label, code_blocks[label], trajectory)
     if violations:
         return CodeArtifactNormalization(
-            normalized, _format_code_artifact_violations(violations), violations, offending_labels
+            normalized,
+            _format_code_artifact_violations(violations),
+            violations,
+            offending_labels,
+            schema_incompatibilities,
         )
-    return CodeArtifactNormalization(normalized, None, [], [])
+    return CodeArtifactNormalization(normalized, None, [], [], [])
 
 
 def _artifact_label_fragment(label: str) -> str:
@@ -3107,6 +3127,81 @@ def _extraction_schema_conformance_error(label: str, artifact: Mapping[str, Any]
     return None
 
 
+def _top_level_path_segment(path: str) -> str:
+    head = path.strip()
+    for separator in (".", "[", "/"):
+        index = head.find(separator)
+        if index > 0:
+            head = head[:index]
+    return head.strip()
+
+
+def _known_output_contract_paths(artifact: Mapping[str, Any], code: str) -> set[str]:
+    """Top-level field names the block is known to produce: the snippet's return-dict
+    keys plus the confirmed `goal_value_paths`' top-level segments. Empty when neither
+    is statically determinable, so the incompatibility check stays tolerant."""
+    paths: set[str] = set()
+    return_keys = _top_level_return_dict_keys(code)
+    if return_keys:
+        paths |= return_keys
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(artifact.get(field_name)):
+            for path in _artifact_goal_value_paths(row.get("goal_value_paths")):
+                segment = _top_level_path_segment(path)
+                if segment:
+                    paths.add(segment)
+    return paths
+
+
+def _schema_property_summary(schema: Mapping[str, Any]) -> str:
+    names = _schema_object_property_names(schema)
+    if names is None:
+        return ""
+    property_names, _required = names
+    return ", ".join(sorted(property_names))
+
+
+def _extraction_schema_incompatibility(
+    label: str, artifact: Mapping[str, Any], code: str
+) -> SchemaIncompatibility | None:
+    """Detect an edited `extraction_schema` whose object property names overlap NONE of
+    the block's known output contract. Unlike `_extraction_schema_conformance_error`,
+    this fires even when `required` is empty: an optional-only field that maps to nothing
+    the block produces is a non-repairable mismatch, not a tolerated gap. Stays tolerant
+    when the contract or property names are not statically determinable."""
+    if _is_download_intent(artifact, code) or not code.strip():
+        return None
+    known_paths = _known_output_contract_paths(artifact, code)
+    if not known_paths:
+        return None
+    incompatible: set[str] = set()
+    summaries: list[str] = []
+    for value in _artifact_extraction_schema_values(artifact):
+        if isinstance(value, str) and _is_unfilled_artifact_placeholder(value.strip()):
+            continue
+        parsed = _parse_extraction_schema(value)
+        if parsed is None or not validate_schema(parsed):
+            continue
+        names = _schema_object_property_names(parsed)
+        if names is None:
+            continue
+        property_names, _required = names
+        if not property_names or property_names & known_paths:
+            continue
+        incompatible |= property_names
+        summary = _schema_property_summary(parsed)
+        if summary and summary not in summaries:
+            summaries.append(summary)
+    if not incompatible:
+        return None
+    return SchemaIncompatibility(
+        block_label=label,
+        incompatible_paths=tuple(sorted(incompatible)),
+        known_output_paths=tuple(sorted(known_paths)),
+        edited_schema_summary="; ".join(summaries),
+    )
+
+
 _EXPECT_DOWNLOAD_ATTR = "expect_download"
 
 
@@ -3507,6 +3602,29 @@ def _credentialed_code_block_scout_gate_errors(
     return errors
 
 
+def _reject_schema_incompatibility(
+    ctx: AgentContext,
+    incompatibility: SchemaIncompatibility,
+    reject: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    """Emit the typed, non-repairable schema-incompatibility outcome: stash the terminal
+    blocker + turn halt so enforcement renders a product-language reply (instead of
+    falling through to repair churn), record it on the context, and reject without
+    persisting the incompatible draft."""
+    signal = build_schema_incompatibility_blocker_signal(incompatibility)
+    stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
+    ctx.latest_schema_incompatibility = incompatibility
+    return reject(
+        error=render_schema_incompatibility_agent_steer(incompatibility),
+        user_facing_summary=signal.user_facing_reason,
+        data={
+            "failure_type": SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
+            "schema_incompatibility": incompatibility.to_summary_dict(),
+        },
+    )
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -3600,6 +3718,10 @@ async def _update_workflow(
     code_artifact_metadata_error = normalization.error
     if code_artifact_metadata_error is not None:
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
+    if normalization.schema_incompatibilities:
+        incompatibility = merge_schema_incompatibilities(normalization.schema_incompatibilities)
+        if incompatibility is not None:
+            return _reject_schema_incompatibility(ctx, incompatibility, reject)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
     code_authoring_repair_context = (

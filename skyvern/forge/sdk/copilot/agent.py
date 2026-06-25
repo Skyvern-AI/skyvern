@@ -404,10 +404,14 @@ def _reconcile_completion_criteria_on_context(
     snapshot = policy_inputs.stored_completion_criteria
     if snapshot is None:
         return
+    requested_output_path_aliases = (
+        ctx.copilot_config.requested_output_path_aliases if ctx.copilot_config is not None else None
+    )
     decision = reconcile_completion_criteria(
         snapshot,
         list(policy.completion_criteria),
         actionable=policy.user_response_policy != "ask_clarification",
+        requested_output_path_aliases=requested_output_path_aliases,
     )
     if decision.action == "adopt_stored":
         policy.completion_criteria = list(decision.criteria)
@@ -3105,6 +3109,7 @@ def _build_copilot_input_guardrails(
                 organization_id=policy_inputs.organization_id,
                 handler=policy_inputs.handler,
                 active_criteria=_stored_active_completion_criteria(policy_inputs),
+                config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
             )
             if isinstance(ctx, CopilotContext):
                 turn_intent_classifier_result = None
@@ -3551,6 +3556,7 @@ async def _run_copilot_turn_impl(
         prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         block_authoring_policy=copilot_config.block_authoring_policy,
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
+        copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from

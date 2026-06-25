@@ -252,7 +252,8 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
             flags += " (implicit)"
         if criterion.method_mandated:
             flags += " (method_mandated)"
-        parts.append(f"- {criterion.id}: {criterion.outcome}{flags}")
+        output_path = f" [required_output_path={criterion.output_path}]" if criterion.output_path else ""
+        parts.append(f"- {criterion.id}: {criterion.outcome}{output_path}{flags}")
     return "\n".join(parts)
 
 
