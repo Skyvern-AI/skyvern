@@ -22,6 +22,7 @@ const tagKeys: Array<TagKey> = [
 ];
 
 function renderControl(props: {
+  exactValuesOnly?: boolean;
   value?: Array<TagFilterTerm>;
   onChange?: (terms: Array<TagFilterTerm>) => void;
 }) {
@@ -32,6 +33,7 @@ function renderControl(props: {
         value={props.value ?? []}
         onChange={props.onChange ?? (() => {})}
         labelSuggestions={["adhoc"]}
+        exactValuesOnly={props.exactValuesOnly}
       />
     </MemoryRouter>,
   );
@@ -43,37 +45,32 @@ function openAndType(query: string) {
   fireEvent.change(input, { target: { value: query } });
 }
 
-// All surfaces (workflows list + analytics dashboard) accept the same three
-// term shapes: bare label, group:* (group-any), and exact group:value.
-describe("TagFilterControl", () => {
-  it("offers a bare label as an addable filter", () => {
-    renderControl({});
+describe("TagFilterControl exactValuesOnly", () => {
+  it("does not offer a bare label as an addable filter", () => {
+    renderControl({ exactValuesOnly: true });
     openAndType("prod");
-    expect(screen.getByText(/Filter by label/)).toBeTruthy();
+    expect(screen.queryByText(/^Filter by/)).toBeNull();
   });
 
-  it("adds a bare label on selection", () => {
-    const onChange = vi.fn();
-    renderControl({ onChange });
-    openAndType("prod");
-    fireEvent.click(screen.getByText(/Filter by/));
-    expect(onChange).toHaveBeenCalledWith([{ key: null, value: "prod" }]);
-  });
-
-  it("offers and adds an exact group:value", () => {
-    const onChange = vi.fn();
-    renderControl({ onChange });
+  it("offers an exact group:value as an addable filter", () => {
+    renderControl({ exactValuesOnly: true });
     openAndType("env:prod");
     expect(screen.getByText(/env: prod/)).toBeTruthy();
+  });
+
+  it("adds an exact term on selection", () => {
+    const onChange = vi.fn();
+    renderControl({ exactValuesOnly: true, onChange });
+    openAndType("env:prod");
     fireEvent.click(screen.getByText(/Filter by/));
     expect(onChange).toHaveBeenCalledWith([{ key: "env", value: "prod" }]);
   });
+});
 
-  it("adds a group-any term from a group suggestion", () => {
-    const onChange = vi.fn();
-    renderControl({ onChange });
-    openAndType("env");
-    fireEvent.click(screen.getByText(/: any/));
-    expect(onChange).toHaveBeenCalledWith([{ key: "env", value: null }]);
+describe("TagFilterControl default mode", () => {
+  it("still offers a bare label as an addable filter (workflows list parity)", () => {
+    renderControl({ exactValuesOnly: false });
+    openAndType("prod");
+    expect(screen.getByText(/Filter by label/)).toBeTruthy();
   });
 });
