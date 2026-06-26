@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -387,6 +387,7 @@ class CopilotContext(AgentContext):
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     impose_synthesized_code_block: bool = False
     target_block_label: str | None = None
