@@ -536,14 +536,15 @@ def test_wait_suppressed_when_page_idle() -> None:
     assert [action.kind for action in actions] == [ActionKind.CLICK]
 
 
-def test_wait_emitted_when_page_showed_network_activity() -> None:
+def test_wait_emitted_and_sized_to_page_busy_span() -> None:
     target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
 
     events = [
         make_click_event(target=target, timestamp=1000.0),
-        # page was loading during the idle gap (cdp timestamps are seconds)
+        # page busy until ~7s after the click (cdp timestamps are seconds)
         make_cdp_event("net:activity", timestamp_seconds=4.0, params={"count": 12}),
-        make_focus_event(target=target, timestamp=8000.0),
+        make_cdp_event("net:activity", timestamp_seconds=7.0, params={"count": 3}),
+        make_focus_event(target=target, timestamp=9000.0),
     ]
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
@@ -552,7 +553,60 @@ def test_wait_emitted_when_page_showed_network_activity() -> None:
     assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
     wait_action = actions[1]
     assert isinstance(wait_action, ActionWait)
-    assert wait_action.duration_ms == 7000
+    # busy span = last activity (7000) - click (1000); the 2s idle tail is excluded.
+    assert wait_action.duration_ms == 6000
+
+
+def test_wait_suppressed_when_page_settles_before_threshold() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        make_click_event(target=target, timestamp=1000.0),
+        # page settles ~1.5s in, then a long idle tail — below the wait threshold
+        make_cdp_event("net:activity", timestamp_seconds=2.5, params={"count": 4}),
+        make_focus_event(target=target, timestamp=12000.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK]
+
+
+def _two_consecutive_wait_events() -> list[t.Any]:
+    # Two busy stretches (focus events produce no action) yield two adjacent waits;
+    # a wait resets the timer, so each stretch needs its own pair of focus events.
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+    return [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_cdp_event("net:activity", timestamp_seconds=6.5, params={"count": 9}),
+        make_focus_event(target=target, timestamp=7000.0),
+        make_focus_event(target=target, timestamp=13000.0),
+        make_cdp_event("net:activity", timestamp_seconds=18.5, params={"count": 9}),
+        make_focus_event(target=target, timestamp=19000.0),
+    ]
+
+
+def test_events_to_actions_keeps_waits_separate_for_live_path() -> None:
+    # events_to_actions feeds the incremental live interpreter, which tracks
+    # actions by index, so it must stay append-only (no collapsing here).
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(_two_consecutive_wait_events())
+
+    assert [action.kind for action in actions] == [ActionKind.WAIT, ActionKind.WAIT]
+
+
+def test_collapse_consecutive_waits_merges_durations() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(_two_consecutive_wait_events())
+
+    collapsed = Processor._collapse_consecutive_waits(actions)
+
+    assert [action.kind for action in collapsed] == [ActionKind.WAIT]
+    wait_action = collapsed[0]
+    assert isinstance(wait_action, ActionWait)
+    # 5500ms + 5500ms busy spans summed into a single wait.
+    assert wait_action.duration_ms == 11000
 
 
 def test_wait_ignores_activity_outside_the_idle_gap() -> None:
