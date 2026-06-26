@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
+    grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
     grade_record_semantic_consistency,
     grade_structured_record_criteria,
@@ -509,6 +510,12 @@ def _apply_present_value_upgrades(
     )
     if include_terminal_goal_records:
         upgrades.update(
+            {
+                verdict.criterion_id: verdict
+                for verdict in grade_fallback_floor_reached_end_state_criteria(run_criteria, snapshot)
+            }
+        )
+        upgrades.update(
             {verdict.criterion_id: verdict for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot)}
         )
     semantic_verdicts = {
@@ -595,6 +602,8 @@ def _deterministic_run_verification_result(
     for verdict in grade_present_value_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_structured_record_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_fallback_floor_reached_end_state_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict

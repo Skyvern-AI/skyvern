@@ -916,13 +916,17 @@ def is_fallback_floor_criterion(criterion: CompletionCriterion) -> bool:
     return criterion.id.startswith(FALLBACK_FLOOR_CRITERION_ID_PREFIX)
 
 
+def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id == _FALLBACK_FLOOR_BASE_ID
+
+
 def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
     floor = [
         CompletionCriterion(
             id=_FALLBACK_FLOOR_BASE_ID,
             outcome=_FALLBACK_FLOOR_BASE_OUTCOME,
             implicit=True,
-            method_mandated=True,
+            method_mandated=False,
             level="run",
         )
     ]
