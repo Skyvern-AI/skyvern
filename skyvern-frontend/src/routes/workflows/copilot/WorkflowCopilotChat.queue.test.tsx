@@ -112,6 +112,7 @@ const saveData = {
     webhookCallbackUrl: null,
     persistBrowserSession: false,
     browserProfileId: null,
+    browserProfileKey: null,
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,

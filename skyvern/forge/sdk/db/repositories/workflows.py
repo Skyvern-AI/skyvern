@@ -103,6 +103,7 @@ class WorkflowsRepository(BaseRepository):
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         browser_profile_id: str | None = None,
+        browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -136,6 +137,7 @@ class WorkflowsRepository(BaseRepository):
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
@@ -653,6 +655,7 @@ class WorkflowsRepository(BaseRepository):
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
@@ -702,6 +705,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.persist_browser_session = persist_browser_session
                 if browser_profile_id is not _UNSET:
                     workflow.browser_profile_id = cast(str | None, browser_profile_id)
+                if browser_profile_key is not _UNSET:
+                    workflow.browser_profile_key = cast(str | None, browser_profile_key)
                 if model is not _UNSET:
                     workflow.model = model
                 if max_screenshot_scrolling_times is not _UNSET:
@@ -963,6 +968,7 @@ class WorkflowsRepository(BaseRepository):
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
@@ -1048,6 +1054,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.persist_browser_session = persist_browser_session
             if browser_profile_id is not _UNSET:
                 workflow.browser_profile_id = cast(str | None, browser_profile_id)
+            if browser_profile_key is not _UNSET:
+                workflow.browser_profile_key = cast(str | None, browser_profile_key)
             if model is not _UNSET:
                 workflow.model = model
             if max_screenshot_scrolling_times is not _UNSET:

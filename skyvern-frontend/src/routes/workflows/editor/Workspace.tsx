@@ -1309,6 +1309,7 @@ function Workspace({
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+    useWorkflowPanelStore.getState().setSelectedBlockId(id);
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -1344,6 +1345,7 @@ function Workspace({
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
       browserProfileId: workflowData.browser_profile_id ?? null,
+      browserProfileKey: workflowData.browser_profile_key ?? null,
       model: workflowData.model ?? null,
       maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
       maxElapsedTimeMinutes: workflowData.max_elapsed_time_minutes ?? null,
@@ -1419,6 +1421,7 @@ function Workspace({
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
       browserProfileId: selectedVersion.browser_profile_id ?? null,
+      browserProfileKey: selectedVersion.browser_profile_key ?? null,
       model: selectedVersion.model,
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
       maxElapsedTimeMinutes: selectedVersion.max_elapsed_time_minutes ?? null,
@@ -1702,6 +1705,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 centerOffsetX={studioCanvasCenterOffset}
+                embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
@@ -2365,6 +2369,8 @@ function Workspace({
               extra_http_headers: extraHttpHeaders,
               cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
+              browser_profile_id: saveData.settings.browserProfileId,
+              browser_profile_key: saveData.settings.browserProfileKey,
               model: saveData.settings.model,
               totp_verification_url: saveData.workflow.totp_verification_url,
               totp_identifier: null,

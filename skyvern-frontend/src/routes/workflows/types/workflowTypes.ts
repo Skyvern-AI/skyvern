@@ -659,6 +659,7 @@ export type WorkflowApiResponse = {
   cdp_connect_headers: Record<string, string> | null;
   persist_browser_session: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
@@ -684,6 +685,7 @@ export type WorkflowSettings = {
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
   browserProfileId: string | null;
+  browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   maxElapsedTimeMinutes: number | null;

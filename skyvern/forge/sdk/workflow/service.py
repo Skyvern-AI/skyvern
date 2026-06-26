@@ -71,6 +71,10 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.browser_profile_key import (
+    build_workflow_browser_session_storage_key,
+    render_browser_profile_key,
+)
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     WorkflowVersionConflict,
@@ -1233,6 +1237,14 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
 
+                browser_profile_key = getattr(workflow, "browser_profile_key", None)
+                if getattr(workflow, "persist_browser_session", False) and browser_profile_key:
+                    await self.get_workflow_browser_session_storage_key(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        parameter_values={param.key: value for param, value in workflow_parameter_values},
+                    )
+
                 await self._validate_credential_ids(
                     [
                         value
@@ -1300,6 +1312,51 @@ class WorkflowService:
         if isinstance(error, IntegrityError):
             return "value cannot be null"
         return "database error while saving parameter value"
+
+    async def get_workflow_browser_session_storage_key(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any] | None = None,
+    ) -> str:
+        if not workflow.browser_profile_key:
+            return workflow.workflow_permanent_id
+
+        if parameter_values is None:
+            try:
+                parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                parameter_values = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+            except Exception as exc:
+                raise SkyvernHTTPException(
+                    message=("Failed to read workflow run parameters while resolving the browser profile segment key")
+                ) from exc
+
+        try:
+            rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
+        except Exception as exc:
+            raise SkyvernHTTPException(
+                message=f"Failed to render browser profile segment key: {get_user_facing_exception_message(exc)}"
+            ) from exc
+
+        if not rendered_key:
+            raise MissingValueForParameter(
+                parameter_key=workflow.browser_profile_key,
+                workflow_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
+        storage_key = build_workflow_browser_session_storage_key(workflow.workflow_permanent_id, rendered_key)
+        LOG.info(
+            "Resolved workflow browser session storage key",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_profile_key=workflow.browser_profile_key,
+            storage_key=storage_key,
+        )
+        return storage_key
 
     @staticmethod
     def _is_schedule_input_parameter(workflow_parameter: Any) -> bool:
@@ -3924,6 +3981,7 @@ class WorkflowService:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         browser_profile_id: str | None = None,
+        browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -3957,6 +4015,7 @@ class WorkflowService:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 workflow_permanent_id=workflow_permanent_id,
                 version=version,
@@ -4348,6 +4407,7 @@ class WorkflowService:
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
@@ -4376,6 +4436,7 @@ class WorkflowService:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -4404,6 +4465,7 @@ class WorkflowService:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -5870,6 +5932,10 @@ class WorkflowService:
                 and not workflow_run.browser_profile_id
             ):
                 if workflow_run.status == WorkflowRunStatus.completed:
+                    browser_session_storage_key = await self.get_workflow_browser_session_storage_key(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                     if not close_browser_on_completion:
                         # Browser stays alive here, so close()'s cookie snapshot never ran; capture
                         # session cookies now or they're missing from the archived profile on reuse.
@@ -5879,12 +5945,13 @@ class WorkflowService:
                         )
                     await app.STORAGE.store_browser_session(
                         workflow_run.organization_id,
-                        workflow.workflow_permanent_id,
+                        browser_session_storage_key,
                         browser_state.browser_artifacts.browser_session_dir,
                     )
                     LOG.info(
                         "Persisted browser session for workflow run",
                         workflow_run_id=workflow_run.workflow_run_id,
+                        browser_session_storage_key=browser_session_storage_key,
                     )
                 else:
                     LOG.info(
@@ -6391,6 +6458,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     browser_profile_id=request.browser_profile_id,
+                    browser_profile_key=request.browser_profile_key,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
@@ -6431,6 +6499,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     browser_profile_id=request.browser_profile_id,
+                    browser_profile_key=request.browser_profile_key,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=request.max_elapsed_time_minutes,

@@ -49,6 +49,7 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
@@ -4038,6 +4039,7 @@ async def wrapper({default_args}):
 
         # get all parameters into a dictionary
         parameter_values = {}
+        credential_parameter_keys: set[str] = set()
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
             if not parameter.parameter_type.is_secret_or_credential() and not (
@@ -4057,6 +4059,7 @@ async def wrapper({default_args}):
                     )
                 parameter_values[parameter.key] = value
                 continue
+            credential_parameter_keys.add(parameter.key)
             if isinstance(value, dict):
                 real_secret_values = {}
                 for credential_field, credential_place_holder in value.items():
@@ -4091,6 +4094,38 @@ async def wrapper({default_args}):
             else:
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
+
+        try:
+            use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_context=workflow_run_context,
+                organization_id=organization_id,
+                block_label=self.label,
+                browser_session_id=browser_session_id,
+            )
+        except CodeBlockRunnerSelectionError as selection_error:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(selection_error),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        if use_codeblock_runner:
+            secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                workflow_run_context=workflow_run_context,
+                parameter_values=parameter_values,
+                credential_parameter_keys=credential_parameter_keys,
+            )
+            if secure_code_block_result is not None:
+                return secure_code_block_result
 
         workflow_run_block = None
 

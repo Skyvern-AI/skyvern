@@ -12,6 +12,7 @@ export type WorkflowCreateYAMLRequest = {
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model?: WorkflowModel | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;

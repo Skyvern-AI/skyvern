@@ -234,6 +234,34 @@ def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes
     assert getattr(ctx, "blocker_signal", None) is None
 
 
+def test_schema_incompatibility_failure_type_stops_without_repair() -> None:
+    # SKY-11380: the typed schema-incompatibility reject must route to STOP, never repair,
+    # so the agent reports the mismatch instead of churning toward repair_ceiling_reached.
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "STOP: the edited extraction_schema declares field(s) [shoebox] that map to no output.",
+            "data": {
+                "failure_type": "schema_incompatibility",
+                "workflow_updated": False,
+                "schema_incompatibility": {
+                    "block_label": "capture_row",
+                    "incompatible_paths": ["shoebox"],
+                    "known_output_paths": ["order_date", "order_total"],
+                },
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=False,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.repair_decision.next_action != RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == []
+
+
 def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
     ctx = _ctx()
     ctx.last_test_suspicious_success = True

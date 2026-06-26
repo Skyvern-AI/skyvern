@@ -27,6 +27,15 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.schema_incompatibility import (
+    SchemaIncompatibility,
+    render_schema_incompatibility_user_reason,
+)
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_outcome import (
+    build_minimal_turn_outcome,
+    with_copilot_code_mode_diagnostics,
+)
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
@@ -34,7 +43,9 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_chat_audio,
     workflow_copilot_chat_post,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamErrorUpdate,
@@ -1374,3 +1385,74 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
     persisted = calls[0].kwargs["proposed_workflow"]
     assert persisted is not None
     assert persisted.get("_copilot_unvalidated") is not True
+
+
+def _schema_incompatibility_ctx() -> SimpleNamespace:
+    incompat = SchemaIncompatibility(
+        block_label="capture_row",
+        incompatible_paths=("shoebox",),
+        known_output_paths=("order_date", "order_total"),
+    )
+    return SimpleNamespace(
+        latest_schema_incompatibility=incompat,
+        turn_halt=SimpleNamespace(kind=TurnHaltKind.SCHEMA_INCOMPATIBILITY),
+        code_native_pending_capability=None,
+        last_test_ok=None,
+        last_failed_workflow_yaml=None,
+    )
+
+
+def test_schema_incompatibility_turn_outcome_is_not_repair_ceiling() -> None:
+    # SKY-11380: the schema-incompatibility halt is a distinct typed outcome; it must
+    # not masquerade as the repair-ceiling diagnostic on the persisted turn.
+    ctx = _schema_incompatibility_ctx()
+    reply = render_schema_incompatibility_user_reason(ctx.latest_schema_incompatibility)
+    outcome = with_copilot_code_mode_diagnostics(
+        build_minimal_turn_outcome(reply, ResponseKind.DIAGNOSE, terminal_reason="turn_halt:schema_incompatibility"),
+        ctx,
+    )
+
+    assert outcome.copilot_repair_ceiling_hit is False
+    assert outcome.copilot_schema_incompatibility is not None
+    assert outcome.copilot_schema_incompatibility["incompatible_paths"] == ["shoebox"]
+    assert outcome.copilot_schema_incompatibility["known_output_paths"] == ["order_date", "order_total"]
+
+
+def test_schema_incompatibility_persists_and_recalls_for_followup_turn() -> None:
+    # The follow-up "what was the problem?" turn reads the prior assistant outcome from
+    # chat history; the structured incompatibility survives the round-trip so it can be reported.
+    ctx = _schema_incompatibility_ctx()
+    reply = render_schema_incompatibility_user_reason(ctx.latest_schema_incompatibility)
+    outcome = with_copilot_code_mode_diagnostics(
+        build_minimal_turn_outcome(reply, ResponseKind.DIAGNOSE, terminal_reason="turn_halt:schema_incompatibility"),
+        ctx,
+    )
+    now = datetime.now(timezone.utc)
+    messages = [
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="m1",
+            workflow_copilot_chat_id="c1",
+            sender=WorkflowCopilotChatSender.USER,
+            content="add a shoebox field to the extraction",
+            created_at=now,
+            modified_at=now,
+        ),
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="m2",
+            workflow_copilot_chat_id="c1",
+            sender=WorkflowCopilotChatSender.AI,
+            content=reply,
+            turn_outcome=outcome,
+            created_at=now,
+            modified_at=now,
+        ),
+    ]
+
+    recalled = workflow_copilot_route._latest_assistant_turn_outcome(messages)
+
+    assert recalled is not None
+    assert recalled.terminal_reason == "turn_halt:schema_incompatibility"
+    assert recalled.copilot_schema_incompatibility is not None
+    assert recalled.copilot_schema_incompatibility["incompatible_paths"] == ["shoebox"]
+    # The persisted reply reports the problem in product language.
+    assert "shoebox" in messages[1].content

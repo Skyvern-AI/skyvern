@@ -27,12 +27,14 @@ export function StreamPresenter({
   const useCdp = browserStreamingMode === "cdp" && !isRecording;
 
   if (useCdp) {
+    // CDP frames must be explicitly centered; VNC handles this in its own CSS.
     return (
       <BrowserSessionStream
         browserSessionId={browserSessionId}
         interactive={interactive}
         showControlButtons={showControlButtons}
         onUrlChange={onUrlChange}
+        centered
       />
     );
   }

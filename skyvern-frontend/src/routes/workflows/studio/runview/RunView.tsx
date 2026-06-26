@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Share1Icon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 import { useSearchParams } from "react-router-dom";
 
@@ -11,6 +12,7 @@ import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
+import { cn } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
@@ -235,7 +237,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   );
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col px-3 pt-3">
+    <div className="flex h-full min-h-0 w-full flex-col p-3">
       <div className="flex min-h-0 flex-1 items-stretch gap-3 overflow-hidden">
         <div className="flex min-w-0 flex-1 flex-col gap-3 overflow-hidden">
           <WorkflowRunVerificationCodeForm
@@ -286,7 +288,19 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
             actions={
               <>
                 <ApiWebhookActionsMenu
-                  size="sm"
+                  trigger={
+                    <button
+                      type="button"
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium",
+                        "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
+                        "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                      )}
+                    >
+                      <Share1Icon className="h-4 w-4" />
+                      API & Webhooks
+                    </button>
+                  }
                   getOptions={() => {
                     const headers: Record<string, string> = {
                       "Content-Type": "application/json",

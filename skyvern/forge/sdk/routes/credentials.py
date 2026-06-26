@@ -1349,12 +1349,28 @@ async def _create_browser_profile_after_workflow(
 
             # Session persistence lags the run reaching completed (see clean_up_workflow),
             # so retrieval retries on a budget sized to that lag.
+            workflow = await app.DATABASE.workflows.get_workflow(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+            )
+            if not workflow:
+                LOG.warning(
+                    "Workflow not found during browser profile creation",
+                    credential_id=credential_id,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
+                return
+            browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
+                workflow=workflow,
+                workflow_run=workflow_run,
+            )
             session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
                 session_dir = await app.STORAGE.retrieve_browser_session(
                     organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_permanent_id=browser_session_storage_key,
                 )
                 if session_dir:
                     break

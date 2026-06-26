@@ -21,6 +21,11 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION.validate_block_execution = AsyncMock()
     fake_app_module.AGENT_FUNCTION.validate_code_block = AsyncMock()
+    # Secure CodeBlock runner gating — _LazyNamespace would auto-mock these as
+    # truthy AsyncMocks and hijack CodeBlock.execute into the runner path. Match
+    # the real OSS base no-op so unit tests exercise the legacy in-process path.
+    fake_app_module.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     # Sync method — _LazyNamespace would auto-mock it as AsyncMock and break
     # callers that unpack the return value. Match the real OSS default (None).
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)

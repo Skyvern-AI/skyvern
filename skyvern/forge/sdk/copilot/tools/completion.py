@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_present_value_criteria,
     grade_record_semantic_consistency,
     grade_structured_record_criteria,
+    grade_terminal_goal_record_criteria,
     summarize_unsatisfied_outcomes,
     verdict_missing_evidence,
 )
@@ -437,6 +438,8 @@ def _apply_present_value_upgrades(
     run_result: CompletionVerificationResult,
     run_criteria: list[CompletionCriterion],
     snapshot: RunEvidenceSnapshot,
+    *,
+    include_terminal_goal_records: bool = False,
 ) -> CompletionVerificationResult:
     """Upgrade a ``no_evidence``/``unknown`` run verdict to a deterministic present-value
     ``satisfied``. An ``evidence_contradicts`` verdict is left to the judge, a judge
@@ -448,6 +451,10 @@ def _apply_present_value_upgrades(
     upgrades.update(
         {verdict.criterion_id: verdict for verdict in grade_structured_record_criteria(run_criteria, snapshot)}
     )
+    if include_terminal_goal_records:
+        upgrades.update(
+            {verdict.criterion_id: verdict for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot)}
+        )
     semantic_verdicts = {
         verdict.criterion_id: verdict for verdict in grade_record_semantic_consistency(run_criteria, snapshot)
     }
@@ -496,6 +503,8 @@ def _deterministic_run_verification_result(
     for verdict in grade_present_value_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_structured_record_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in semantic_verdicts:
         deterministic_by_id[verdict.criterion_id] = verdict
@@ -581,21 +590,21 @@ async def _maybe_run_completion_verification(
             ],
         )
     else:
-        handler = await _completion_verification_handler(copilot_ctx)
-        if handler is None:
-            return CompletionVerificationResult(status="unavailable")
-        # Too little budget to verify a candidate run: fail closed (unavailable)
-        # rather than let the run-status proxy claim an unverified outcome as success.
-        remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
-        if (
-            remaining
-            <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
-        ):
-            return CompletionVerificationResult(status="unavailable")
         deterministic_result, remaining_criteria = _deterministic_run_verification_result(run_criteria, snapshot)
         if deterministic_result is not None and not remaining_criteria:
             run_result = deterministic_result
         else:
+            handler = await _completion_verification_handler(copilot_ctx)
+            if handler is None:
+                return CompletionVerificationResult(status="unavailable")
+            # Too little budget to verify a candidate run: fail closed (unavailable)
+            # rather than let the run-status proxy claim an unverified outcome as success.
+            remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
+            if (
+                remaining
+                <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+            ):
+                return CompletionVerificationResult(status="unavailable")
             judged_result = await evaluate_completion_criteria(remaining_criteria, snapshot, handler)
             if judged_result.status != "evaluated":
                 run_result = judged_result
@@ -609,7 +618,12 @@ async def _maybe_run_completion_verification(
                     criterion_ids=[criterion.id for criterion in run_criteria],
                     verdicts=verdicts,
                 )
-                run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
+                run_result = _apply_present_value_upgrades(
+                    run_result,
+                    run_criteria,
+                    snapshot,
+                    include_terminal_goal_records=True,
+                )
     return combine_verification_results(criterion_ids, run_result, definition_verdicts)
 
 
