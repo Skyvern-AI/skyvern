@@ -4102,6 +4102,7 @@ async def wrapper({default_args}):
                 workflow_run_context=workflow_run_context,
                 organization_id=organization_id,
                 block_label=self.label,
+                browser_session_id=browser_session_id,
             )
         except CodeBlockRunnerSelectionError as selection_error:
             return await self.build_block_result(
