@@ -3,8 +3,8 @@
 Computes two normalized keys per run:
 
 - **failure signature**: "is this the same failure as last time?" —
-  frontier_start_label + normalized failure reason + top failure category +
-  suspicious-success flag.
+  structural root-cause identity when available, otherwise normalized failure
+  reason + top failure category + suspicious-success flag.
 - **frontier fingerprint**: SHA256 of the executed blocks' canonical config.
   Changes whenever the agent edits any block in the executed suffix.
 
@@ -22,24 +22,98 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 
 _FAILURE_REASON_MAX_CHARS = 200
+_ROOT_CAUSE_SIGNATURE_VERSION = "repair_root_cause:v1"
 
 # Stable identifier for the per-tool budget failure category written into
 # ``failure_categories`` by the watchdog. Used by enforcement, reconciliation,
 # and signature normalization as a single source of truth.
 PER_TOOL_BUDGET_FAILURE_CATEGORY = "PER_TOOL_BUDGET"
+ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY = "ANTI_BOT_CHALLENGE"
 
 # Stable active-run terminal evidence identifiers. The category is stored in
 # tool result ``failure_categories``; the reason code is stored on blocker
 # signals that convert that tool result into product-safe final copy.
 ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY = "ACTIVE_RUN_TERMINAL_EVIDENCE"
 ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE = "tool_error_active_run_terminal_evidence"
+
+_ROOT_CAUSE_CATEGORY_ALIASES = {
+    "ANTI_BOT_DETECTION": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+    "CHALLENGE_DETECTION": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+    "HUMAN_VERIFICATION_CHALLENGE": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+    # Self-mappings document categories whose noisy failure prose must not
+    # affect repeat identity.
+    "PARAMETER_BINDING_ERROR": "PARAMETER_BINDING_ERROR",
+    PER_TOOL_BUDGET_FAILURE_CATEGORY: PER_TOOL_BUDGET_FAILURE_CATEGORY,
+}
+ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES = frozenset(
+    {
+        ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+        *(
+            category
+            for category, normalized in _ROOT_CAUSE_CATEGORY_ALIASES.items()
+            if normalized == ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY
+        ),
+    }
+)
+_CATEGORY_ONLY_ROOT_CAUSES = frozenset(
+    {
+        ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+        "PARAMETER_BINDING_ERROR",
+        PER_TOOL_BUDGET_FAILURE_CATEGORY,
+    }
+)
+_LOCATOR_RE = re.compile(r"""(?:page\.)?locator\(\s*(["'])(?P<selector>.+?)\1""")
+_SELECTOR_QUOTED_RE = re.compile(
+    r"""(?:selector|css selector|target selector|resolved selector)\s*[:=]\s*(["'])(?P<selector>.+?)\1""",
+    re.IGNORECASE,
+)
+_SELECTOR_UNQUOTED_RE = re.compile(
+    r"""(?:selector|css selector|target selector|resolved selector)\s*[:=]\s*(?P<selector>[#.\[\]:=\w\-/]+)""",
+    re.IGNORECASE,
+)
+_ROLE_RE = re.compile(
+    r"""get_by_role\(\s*(["'])(?P<role>.+?)\1(?:\s*,\s*name\s*=\s*(["'])(?P<name>.*?)\3)?""",
+    re.IGNORECASE,
+)
+_EXCEPTION_CLASS_RE = re.compile(r"""\b(?P<class>[A-Za-z_][\w.]*?(?:Error|Exception))\s*:""")
+# ``browser_context.mode=none`` is the stable enum-backed value surfaced by
+# local browser-state failures, unlike surrounding natural-language prose.
+_BROWSER_SESSION_ERROR_RE = re.compile(
+    r"\b(browser session not found|no browser context|no active browser|browser_context\.mode=none|"
+    r"no_active_browser|browser_not_found)\b",
+    re.IGNORECASE,
+)
+_TIMEOUT_ERROR_RE = re.compile(r"\b(timeout(?:error)?|timed out)\b", re.IGNORECASE)
+_CODE_BLOCK_IMPOSITION_DROPPED_RE = re.compile(
+    r"unable to impose synthesized code block:\s*dropped scout interaction\s+\d+\s+"
+    r"from\s+`?(?P<tool>[A-Za-z0-9_]+)`?\s+\((?P<reason>[A-Za-z0-9_]+)\)",
+    re.IGNORECASE,
+)
+_CODE_BLOCK_IMPOSITION_RE = re.compile(
+    r"unable to impose synthesized code block:\s*(?P<reason>[^\n.]+)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class RepairRootCauseIdentity:
+    root_cause_signature: str | None = None
+    primary_category: str = ""
+    failure_categories: tuple[str, ...] = ()
+    error_class: str = ""
+    selector_kind: str = ""
+    selector: str = ""
 
 
 def normalize_failure_reason(raw: str | None) -> str:
@@ -51,6 +125,138 @@ def normalize_failure_reason(raw: str | None) -> str:
     return collapsed.lower()
 
 
+def _category_name(value: Mapping[str, Any] | str) -> str:
+    raw = value.get("category") if isinstance(value, Mapping) else value
+    return str(raw or "").strip().upper()
+
+
+def _normalized_root_cause_categories(
+    failure_categories: Sequence[Mapping[str, Any] | str] | None,
+    detected_challenge: bool,
+) -> tuple[str, ...]:
+    categories: set[str] = set()
+    for entry in failure_categories or ():
+        category = _category_name(entry)
+        if not category:
+            continue
+        categories.add(_ROOT_CAUSE_CATEGORY_ALIASES.get(category, category))
+    if detected_challenge:
+        categories.add(ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY)
+    return tuple(sorted(categories))
+
+
+def _normalize_signature_text(value: str) -> str:
+    return " ".join(value.strip().split()).rstrip(".,;")
+
+
+def _selector_from_text(text: str) -> tuple[str, str]:
+    for pattern, kind in (
+        (_LOCATOR_RE, "locator"),
+        (_SELECTOR_QUOTED_RE, "selector"),
+        (_SELECTOR_UNQUOTED_RE, "selector"),
+    ):
+        match = pattern.search(text)
+        if match:
+            return kind, _normalize_signature_text(match.group("selector"))
+    role_match = _ROLE_RE.search(text)
+    if role_match:
+        role = _normalize_signature_text(role_match.group("role"))
+        name = _normalize_signature_text(role_match.group("name") or "")
+        return "role", f"{role}:{name}" if name else role
+    return "", ""
+
+
+def _error_class_from_text(text: str) -> str:
+    code_block_imposition = _code_block_imposition_error_class(text)
+    if code_block_imposition:
+        return code_block_imposition
+    if _BROWSER_SESSION_ERROR_RE.search(text):
+        return "browser_session_not_found"
+    match = _EXCEPTION_CLASS_RE.search(text)
+    if match:
+        return re.sub(r"(?<!^)(?=[A-Z])", "_", match.group("class").split(".")[-1]).lower()
+    if _TIMEOUT_ERROR_RE.search(text):
+        return "timeout_error"
+    return ""
+
+
+def _code_block_imposition_error_class(text: str) -> str:
+    dropped_match = _CODE_BLOCK_IMPOSITION_DROPPED_RE.search(text)
+    if dropped_match:
+        return f"code_block_synthesis_{_snake_token(dropped_match.group('reason'))}"
+    match = _CODE_BLOCK_IMPOSITION_RE.search(text)
+    if match:
+        return f"code_block_synthesis_{_snake_token(match.group('reason'))}"
+    return ""
+
+
+def _snake_token(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
+    return normalized or "unknown"
+
+
+def _root_cause_texts(
+    failure_reason: str | None,
+    error_texts: Sequence[str | None] | None,
+    blocks: Sequence[Mapping[str, Any]] | None,
+) -> list[str]:
+    texts = [text for text in ([failure_reason] + list(error_texts or ())) if isinstance(text, str) and text.strip()]
+    for block in blocks or ():
+        for key in ("failure_reason", "error", "message"):
+            value = block.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+    return texts
+
+
+def compute_repair_root_cause_signature(
+    *,
+    failure_categories: Sequence[Mapping[str, Any] | str] | None = None,
+    failure_reason: str | None = None,
+    error_texts: Sequence[str | None] | None = None,
+    blocks: Sequence[Mapping[str, Any]] | None = None,
+    detected_challenge: bool = False,
+) -> RepairRootCauseIdentity:
+    categories = _normalized_root_cause_categories(failure_categories, detected_challenge)
+    primary_category = categories[0] if categories else ""
+    texts = _root_cause_texts(failure_reason, error_texts, blocks)
+    error_class = ""
+    selector_kind = ""
+    selector = ""
+    for text in texts:
+        if not error_class:
+            error_class = _error_class_from_text(text)
+        if not selector:
+            selector_kind, selector = _selector_from_text(text)
+        if error_class and selector:
+            break
+
+    if set(categories) & _CATEGORY_ONLY_ROOT_CAUSES:
+        error_class = ""
+        selector_kind = ""
+        selector = ""
+    if not categories and not error_class and not selector:
+        return RepairRootCauseIdentity()
+
+    payload = {
+        "version": _ROOT_CAUSE_SIGNATURE_VERSION,
+        "failure_categories": categories,
+        "error_class": error_class,
+        "selector_kind": selector_kind,
+        "selector": selector,
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    signature = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return RepairRootCauseIdentity(
+        root_cause_signature=signature,
+        primary_category=primary_category,
+        failure_categories=categories,
+        error_class=error_class,
+        selector_kind=selector_kind,
+        selector=selector,
+    )
+
+
 def _top_failure_category(failure_categories: list[dict] | None) -> str:
     if not failure_categories:
         return ""
@@ -60,38 +266,75 @@ def _top_failure_category(failure_categories: list[dict] | None) -> str:
     return ""
 
 
+def _failure_identity_terms(
+    failure_reason: str | None,
+    failure_categories: list[dict] | None,
+    suspicious_success: bool,
+    detected_challenge: bool = False,
+) -> list[str] | None:
+    """Category-stable failure half shared by both signatures, or ``None`` on a
+    real success. Per-call-data categories collapse to a constant so consecutive
+    trips hash identically."""
+    normalized = normalize_failure_reason(failure_reason)
+    has_signal = bool(normalized) or bool(failure_categories) or suspicious_success or detected_challenge
+    if not has_signal:
+        return None
+    structural_identity = compute_repair_root_cause_signature(
+        failure_categories=failure_categories,
+        failure_reason=failure_reason,
+        detected_challenge=detected_challenge,
+    )
+    terminal_state = "suspicious" if suspicious_success else "failed"
+    if structural_identity.root_cause_signature:
+        return [structural_identity.root_cause_signature]
+    top_category = _top_failure_category(failure_categories)
+    if top_category == "PARAMETER_BINDING_ERROR":
+        normalized = "parameter_binding_error"
+    elif top_category == PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        normalized = "per_tool_budget"
+    return [normalized, top_category, terminal_state]
+
+
 def compute_failure_signature(
     frontier_start_label: str | None,
     failure_reason: str | None,
     failure_categories: list[dict] | None,
     suspicious_success: bool,
+    detected_challenge: bool = False,
 ) -> str | None:
     """Return a normalized signature for the current failure, or ``None`` on success.
 
     ``None`` means "no signature — this was a real success". A suspicious-success
     run (status=completed but data-producing blocks produced no output) still
     generates a signature so repeated no-data runs can be counted as repeats.
+
+    ``frontier_start_label`` is kept for call-site compatibility. Labels are
+    intentionally excluded from the signature because block renames are not a
+    new root cause.
     """
-    normalized = normalize_failure_reason(failure_reason)
-    has_signal = bool(normalized) or suspicious_success
-    if not has_signal:
+    terms = _failure_identity_terms(failure_reason, failure_categories, suspicious_success, detected_challenge)
+    if terms is None:
         return None
-    safe_label = frontier_start_label if isinstance(frontier_start_label, str) else ""
-    top_category = _top_failure_category(failure_categories)
-    # Categories whose failure_reason embeds per-call data (key name, run id):
-    # collapse to a stable constant so consecutive trips hash to the same
-    # signature instead of each one looking unique.
-    if top_category == "PARAMETER_BINDING_ERROR":
-        normalized = "parameter_binding_error"
-    elif top_category == PER_TOOL_BUDGET_FAILURE_CATEGORY:
-        normalized = "per_tool_budget"
-    parts = [
-        safe_label,
-        normalized,
-        top_category,
-        "suspicious" if suspicious_success else "failed",
-    ]
-    return "|".join(parts)
+    return "|".join(terms)
+
+
+def satisfied_criterion_ids(result: CompletionVerificationResult | None) -> frozenset[str]:
+    """Criterion ids the outcome-verification judge confirmed satisfied (evidence_confirms),
+    or empty when no judge result is available for this run."""
+    if result is None or result.status != "evaluated":
+        return frozenset()
+    return frozenset(verdict.criterion_id for verdict in result.verdicts if verdict.reason_code == "evidence_confirms")
+
+
+def made_newly_verified_progress(
+    current_satisfied: frozenset[str],
+    high_water: frozenset[str],
+    full_workflow_verified_this_run: bool,
+    verified_prefix_grew: bool,
+) -> bool:
+    """Whether this run advanced verified progress past the turn high-water: a newly
+    confirmed criterion, a clean end-to-end run, or a grown verified block prefix."""
+    return bool(current_satisfied - high_water) or full_workflow_verified_this_run or verified_prefix_grew
 
 
 def _canonical_block_config(block: Any) -> dict[str, Any]:
@@ -194,6 +437,7 @@ def update_repeated_failure_state(
 
     suspicious_success_raw = getattr(ctx, "last_test_suspicious_success", False)
     suspicious_success = bool(suspicious_success_raw) if isinstance(suspicious_success_raw, (bool, int)) else False
+    detected_challenge = bool(getattr(ctx, "last_test_anti_bot", None))
     failure_reason_raw = getattr(ctx, "last_test_failure_reason", None)
     failure_reason = failure_reason_raw if isinstance(failure_reason_raw, str) else None
     frontier_start_raw = getattr(ctx, "last_frontier_start_label", None)
@@ -233,6 +477,7 @@ def update_repeated_failure_state(
         failure_reason=failure_reason,
         failure_categories=failure_categories,
         suspicious_success=suspicious_success,
+        detected_challenge=detected_challenge,
     )
     fingerprint = compute_frontier_fingerprint(executed_labels, workflow_definition)
 

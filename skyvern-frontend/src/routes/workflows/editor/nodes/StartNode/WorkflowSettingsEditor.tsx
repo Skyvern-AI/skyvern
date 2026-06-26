@@ -51,6 +51,12 @@ const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
 const SEQUENTIAL_KEY_TOOLTIP =
   "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent inputs, for example {{ account_id }} to serialize per account.";
 
+const BROWSER_PROFILE_KEY_TOOLTIP =
+  "Template for separating saved browser profiles. Use + to insert an agent input, or type a static key. Runs with the same rendered value reuse the same saved profile.";
+
+const WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES = 4 * 60;
+const WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES = 8 * 60;
+
 function WorkflowSettingsEditor({ blockId }: { blockId: string }) {
   // Subscribe to the start node's data slice. The sidebar mount lives
   // outside the per-node renderer, and the body also subscribes to
@@ -111,7 +117,6 @@ function WorkflowSettingsEditorBody({
     () => new Set(terminalBlockLabels),
     [terminalBlockLabels],
   );
-
   useEffect(() => {
     if (
       data.finallyBlockLabel &&
@@ -289,10 +294,53 @@ function WorkflowSettingsEditorBody({
             className="ml-auto"
             checked={data.persistBrowserSession}
             onCheckedChange={(value) =>
-              update({ persistBrowserSession: value })
+              update({
+                persistBrowserSession: value,
+                browserProfileKey: value ? data.browserProfileKey : null,
+              })
             }
           />
         </div>
+        {data.persistBrowserSession && (
+          <div className="flex flex-col gap-3 rounded-md bg-slate-elevation4 p-4 pl-4">
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label>Browser Profile Key (optional)</Label>
+                <HelpTooltip content={BROWSER_PROFILE_KEY_TOOLTIP} />
+              </div>
+              <div className="flex flex-col gap-2">
+                <WorkflowBlockInputTextarea
+                  nodeId={blockId}
+                  onChange={(value) => {
+                    update({
+                      browserProfileKey: value.length ? value : null,
+                    });
+                  }}
+                  value={data.browserProfileKey ?? ""}
+                  placeholder="{{ credential_id }}"
+                  className="nopan text-xs"
+                  data-testid="browser-profile-key-template"
+                />
+                <p className="text-xs text-slate-400">
+                  Use + to insert an input like {"{{ credential_id }}"}. Leave
+                  empty to use one saved profile for this agent.
+                </p>
+                {!data.runSequentially && data.browserProfileKey && (
+                  <p className="text-xs text-amber-300">
+                    Overlapping runs with the same rendered key can overwrite
+                    the same saved profile.
+                  </p>
+                )}
+                {data.browserProfileId && (
+                  <p className="text-xs text-amber-300">
+                    Starting Browser Profile bypasses saved-session loading and
+                    write-back. Leave it empty when separating saved profiles.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
         {data.persistBrowserSession && workflowPermanentId && (
           <Dialog
             open={isResetProfileDialogOpen}
@@ -306,16 +354,16 @@ function WorkflowSettingsEditorBody({
                 className="nopan"
               >
                 <ReloadIcon className="mr-2 h-3 w-3" />
-                Reset Profile
+                Reset Saved Profile
               </Button>
             </DialogTrigger>
             <DialogContent>
               <DialogHeader>
                 <DialogTitle>Reset saved profile?</DialogTitle>
                 <DialogDescription>
-                  Clears the saved browser profile for this agent. The next run
-                  will start from a fresh browser state. Use this if the saved
-                  profile is stuck or producing errors.
+                  Clears the default saved browser profile for this agent. The
+                  next unsegmented run starts from a fresh browser state.
+                  Segmented saved profiles are kept.
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
@@ -330,7 +378,7 @@ function WorkflowSettingsEditorBody({
                   {resetProfileMutation.isPending && (
                     <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                   )}
-                  Reset Profile
+                  Reset Saved Profile
                 </Button>
               </DialogFooter>
             </DialogContent>
@@ -339,8 +387,8 @@ function WorkflowSettingsEditorBody({
       </div>
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <Label>Default Browser Profile</Label>
-          <HelpTooltip content="The default browser profile used when running this agent. Can be overridden per run." />
+          <Label>Starting Browser Profile</Label>
+          <HelpTooltip content="Optional browser profile to load at run start. Leave this empty when you want saved-session persistence to decide the browser state." />
         </div>
         <BrowserProfileSelector
           value={data.browserProfileId}
@@ -396,14 +444,14 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Label>Max Run Time (minutes)</Label>
-          <HelpTooltip content="Times out this workflow after the configured elapsed runtime. Maximum runtime is 4 hours (240 minutes)." />
+          <HelpTooltip content="Times out this workflow after the configured elapsed runtime. Leave blank to use the platform default of 4 hours. Maximum is 8 hours." />
         </div>
         <Input
           value={data.maxElapsedTimeMinutes ?? ""}
-          placeholder="Default: 4 hours"
+          placeholder={`Default: ${WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES} minutes`}
           type="number"
           min={1}
-          max={240}
+          max={WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES}
           step={1}
           onChange={(event) => {
             const rawValue = event.target.value;
@@ -411,7 +459,10 @@ function WorkflowSettingsEditorBody({
             const value =
               rawValue === "" || !Number.isFinite(parsedValue)
                 ? null
-                : Math.min(240, Math.max(1, Math.trunc(parsedValue)));
+                : Math.min(
+                    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+                    Math.max(1, Math.trunc(parsedValue)),
+                  );
             update({ maxElapsedTimeMinutes: value });
           }}
         />

@@ -26,8 +26,15 @@ def _evaluated_result() -> CompletionVerificationResult:
         status="evaluated",
         criterion_ids=["c0", "c1"],
         verdicts=[
-            CriterionVerdict(criterion_id="c0", satisfied=True, reason_code="evidence_confirms", evidence_ref="cart"),
-            CriterionVerdict(criterion_id="c1", satisfied=False, reason_code="no_evidence"),
+            CriterionVerdict(
+                criterion_id="c0", state="satisfied", reason_code="evidence_confirms", evidence_ref="cart"
+            ),
+            CriterionVerdict(
+                criterion_id="c1",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="block output containing the requested paragraph",
+            ),
         ],
     )
 
@@ -41,6 +48,16 @@ def test_record_completion_verification_populates_evaluated_block() -> None:
     assert snapshot["completion_verification_criterion_count"] == 2
     assert snapshot["completion_verification_satisfied_count"] == 1
     assert snapshot["completion_verification_fully_satisfied"] is False
+    assert snapshot["completion_verification_unmet_criterion_ids"] == ["c1"]
+    assert snapshot["completion_verification_missing_evidence"] == [
+        "c1: block output containing the requested paragraph"
+    ]
+    assert snapshot["completion_verification_verdict_1_criterion_id"] == "c1"
+    assert snapshot["completion_verification_verdict_1_reason_code"] == "no_evidence"
+    assert (
+        snapshot["completion_verification_verdict_1_missing_evidence"]
+        == "block output containing the requested paragraph"
+    )
     assert snapshot["completion_verification_evaluated_on_final_run"] is True
 
 
@@ -85,7 +102,7 @@ def test_outcome_verification_turn_fields_composes_all_sources() -> None:
     assert fields["gate_satisfied"] is True
     assert fields["completion_verification_status"] == "evaluated"
     assert fields["verification_evidence_full_workflow_verified"] is True
-    assert fields["request_policy_completion_criteria_count"] == 2
+    assert fields["request_policy_completion_criteria_count"] == 1
     assert fields["request_policy_completion_criteria_implicit_count"] == 1
     assert fields["request_policy_completion_criteria_method_mandated_count"] == 1
 

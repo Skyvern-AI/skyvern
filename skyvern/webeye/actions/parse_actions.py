@@ -41,6 +41,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    ExtractAction,
     GotoUrlAction,
     HoverAction,
     InputOrSelectContext,
@@ -50,6 +51,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     NewTabAction,
     NullAction,
+    ReloadPageAction,
     ScrollAction,
     SelectOption,
     SelectOptionAction,
@@ -69,6 +71,7 @@ def parse_action(
     action: Dict[str, Any],
     scraped_page: ScrapedPage,
     data_extraction_goal: str | None = None,
+    extracted_information_schema: dict[str, Any] | list | str | None = None,
     totp_code_required: bool = False,
 ) -> Action:
     if "id" in action:
@@ -114,6 +117,9 @@ def parse_action(
     # Backward compat: map PRESS_ENTER to KEYPRESS (old prompt used PRESS_ENTER)
     if action_type_str == "PRESS_ENTER":
         action_type_str = "KEYPRESS"
+    # The prompt exposes EXTRACT as EXTRACT_INFORMATION; map it back to the internal enum name
+    if action_type_str == "EXTRACT_INFORMATION":
+        action_type_str = "EXTRACT"
     action_type = ActionType[action_type_str]
 
     if not action_type.is_web_action() and action_type != ActionType.SCROLL:
@@ -254,7 +260,57 @@ def parse_action(
         return ScrollAction(**base_action_dict, scroll_x=scroll_x, scroll_y=scroll_y)
 
     if action_type == ActionType.CLOSE_PAGE:
-        return ClosePageAction(**base_action_dict)
+        raw_index = action.get("tab_index")
+        if raw_index is None:
+            return ClosePageAction(**base_action_dict)
+        try:
+            tab_index = int(raw_index)
+        except (TypeError, ValueError):
+            LOG.warning(
+                "CLOSE_PAGE action returned with a non-integer tab_index, closing the current tab instead",
+                raw_action=action,
+            )
+            return ClosePageAction(**base_action_dict)
+        return ClosePageAction(**base_action_dict, tab_index=tab_index)
+
+    if action_type == ActionType.EXTRACT:
+        # EXTRACT is a global page action, not element-targeted
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        if not data_extraction_goal:
+            LOG.warning("EXTRACT action returned without a data extraction goal, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        return ExtractAction(
+            **base_action_dict,
+            data_extraction_goal=data_extraction_goal,
+            data_extraction_schema=extracted_information_schema,
+        )
+
+    if action_type == ActionType.GOTO_URL:
+        # GOTO_URL is a global navigation action, not element-targeted
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        url = action.get("url")
+        if not url or not isinstance(url, str):
+            LOG.warning("GOTO_URL action returned without a url, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        try:
+            validated_url = prepend_scheme_and_validate_url(url.strip())
+        except InvalidUrl:
+            LOG.warning("GOTO_URL action returned with an invalid url, skipping action", url=url)
+            return NullAction(**base_action_dict)
+        # LLM-generated navigation targets can be steered by page content, so block
+        # private/loopback/link-local hosts the same way the task URL boundary does.
+        host = urlparse(validated_url).hostname
+        if not host or is_blocked_host(host):
+            LOG.warning("GOTO_URL action targets a blocked host, skipping action", url=validated_url)
+            return NullAction(**base_action_dict)
+        return GotoUrlAction(**base_action_dict, url=validated_url)
+
+    if action_type == ActionType.RELOAD_PAGE:
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        return ReloadPageAction(**base_action_dict)
 
     if action_type == ActionType.NEW_TAB:
         url = action.get("url")
@@ -303,6 +359,7 @@ def parse_actions(
                 action=action,
                 scraped_page=scraped_page,
                 data_extraction_goal=task.data_extraction_goal,
+                extracted_information_schema=task.extracted_information_schema,
                 totp_code_required=totp_code_required,
             )
             action_instance.organization_id = task.organization_id

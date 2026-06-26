@@ -68,11 +68,17 @@ def _make_channel(on_event: MagicMock | None = None) -> tuple[ExfiltrationChanne
 def restore_exfiltration_channel_class_state() -> t.Iterator[None]:
     active_binding_channels = weakref.WeakKeyDictionary(ExfiltrationChannel._active_binding_channels)
     binding_registered_pages = weakref.WeakSet(ExfiltrationChannel._binding_registered_pages)
+    adorn_init_script_pages = weakref.WeakSet(ExfiltrationChannel._adorn_init_script_pages)
+    rearm_in_flight_pages = weakref.WeakKeyDictionary(ExfiltrationChannel._rearm_in_flight_pages)
+    rearm_pending_full_nav_pages = weakref.WeakSet(ExfiltrationChannel._rearm_pending_full_nav_pages)
 
     yield
 
     ExfiltrationChannel._active_binding_channels = active_binding_channels
     ExfiltrationChannel._binding_registered_pages = binding_registered_pages
+    ExfiltrationChannel._adorn_init_script_pages = adorn_init_script_pages
+    ExfiltrationChannel._rearm_in_flight_pages = rearm_in_flight_pages
+    ExfiltrationChannel._rearm_pending_full_nav_pages = rearm_pending_full_nav_pages
 
 
 class TestExfiltrationChannelEvents:
@@ -286,3 +292,101 @@ class TestExfiltrationChannelEvents:
         page.on.assert_not_called()
         page.add_init_script.assert_not_awaited()
         assert page.evaluate.await_count == 2
+
+
+class TestNavigationReExfiltration:
+    @pytest.mark.asyncio
+    async def test_frame_navigated_waits_for_load_before_rearm(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page("https://example.com/next")
+        page.wait_for_load_state = AsyncMock()
+        channel.page = page
+
+        channel._ensure_binding = AsyncMock()
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+
+        channel._handle_cdp_event("nav:frame_navigated", {"frame": {"url": "https://example.com/next"}})
+
+        on_event.assert_called_once()
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=10_000)
+        channel._ensure_binding.assert_awaited_once_with(page)
+        channel.exfiltrate.assert_awaited_once_with(page)
+        channel.adorn.assert_awaited_once_with(page)
+
+    @pytest.mark.asyncio
+    async def test_navigated_within_document_rearms_without_load_wait(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page("https://example.com/app#section")
+        page.wait_for_load_state = AsyncMock()
+        channel.page = page
+        channel._ensure_binding = AsyncMock()
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+
+        channel._handle_cdp_event("nav:navigated_within_document", {"url": "https://example.com/app#section"})
+
+        on_event.assert_called_once()
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.wait_for_load_state.assert_not_awaited()
+        channel._ensure_binding.assert_awaited_once_with(page)
+        channel.exfiltrate.assert_awaited_once_with(page)
+        channel.adorn.assert_awaited_once_with(page)
+
+    @pytest.mark.asyncio
+    async def test_frame_navigated_queues_full_rearm_when_same_document_rearm_in_flight(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page("https://example.com/app")
+        channel.page = page
+        channel._rearm_in_flight_pages[page] = False
+
+        channel._handle_cdp_event("nav:frame_navigated", {"frame": {"url": "https://example.com/next"}})
+
+        on_event.assert_called_once()
+        assert page in channel._rearm_pending_full_nav_pages
+        assert not channel._pending_event_tasks
+
+    @pytest.mark.asyncio
+    async def test_pending_full_nav_rearm_runs_after_same_document_rearm_finishes(self) -> None:
+        channel, _on_event = _make_channel()
+        page = _make_page("https://example.com/next")
+        page.wait_for_load_state = AsyncMock()
+        channel._ensure_binding = AsyncMock()
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+        channel._rearm_pending_full_nav_pages.add(page)
+
+        await channel._rearm_page_after_navigation(
+            page,
+            event_name="nav:navigated_within_document",
+            wait_for_load=False,
+        )
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=10_000)
+        channel._ensure_binding.assert_awaited()
+        assert channel._ensure_binding.await_count == 2
+        assert channel.exfiltrate.await_count == 2
+        assert channel.adorn.await_count == 2
+
+    def test_non_navigation_cdp_event_does_not_rearm(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        browser_context = MagicMock()
+        browser_context.pages = [page]
+        channel.browser_context = browser_context
+
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+
+        channel._handle_cdp_event("nav:frame_started_navigating", {"url": "https://example.com/next"})
+
+        on_event.assert_called_once()
+        channel.exfiltrate.assert_not_called()
+        channel.adorn.assert_not_called()

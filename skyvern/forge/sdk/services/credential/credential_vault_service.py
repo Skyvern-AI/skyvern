@@ -7,6 +7,8 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
     CredentialVaultType,
+    CreditCardBillingAddress,
+    CreditCardCredential,
 )
 
 
@@ -38,6 +40,64 @@ class CredentialVaultService(ABC):
     @abstractmethod
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         """Retrieve the full credential data from the vault."""
+
+    async def _preserve_omitted_credit_card_fields(
+        self,
+        credential: Credential,
+        updated_credential: CreditCardCredential,
+    ) -> CreditCardCredential:
+        updated_fields = updated_credential.model_fields_set
+        if {
+            "billing_address",
+            "billing_email",
+            "billing_phone",
+            "metadata",
+        }.issubset(updated_fields):
+            return updated_credential
+
+        existing_item = await self.get_credential_item(credential)
+        if not isinstance(existing_item.credential, CreditCardCredential):
+            return updated_credential
+
+        preserved_fields: dict[str, object] = {}
+        existing_credential = existing_item.credential
+        if "billing_address" not in updated_fields:
+            preserved_fields["billing_address"] = existing_credential.billing_address
+        elif updated_credential.billing_address and existing_credential.billing_address:
+            preserved_fields["billing_address"] = self._preserve_omitted_billing_address_fields(
+                existing_address=existing_credential.billing_address,
+                updated_address=updated_credential.billing_address,
+            )
+
+        for field_name in ("billing_email", "billing_phone", "metadata"):
+            if field_name not in updated_fields:
+                preserved_fields[field_name] = getattr(existing_credential, field_name)
+
+        return updated_credential.model_copy(update=preserved_fields)
+
+    @staticmethod
+    def _preserve_omitted_billing_address_fields(
+        existing_address: CreditCardBillingAddress,
+        updated_address: CreditCardBillingAddress,
+    ) -> CreditCardBillingAddress:
+        preserved_fields = {}
+        updated_fields = updated_address.model_fields_set
+        for field_name in (
+            "line1",
+            "line2",
+            "city",
+            "state",
+            "state_code",
+            "postal_code",
+            "country",
+            "country_code",
+        ):
+            preserved_fields[field_name] = (
+                getattr(updated_address, field_name)
+                if field_name in updated_fields
+                else getattr(existing_address, field_name)
+            )
+        return updated_address.model_copy(update=preserved_fields)
 
     @staticmethod
     async def _create_db_credential(

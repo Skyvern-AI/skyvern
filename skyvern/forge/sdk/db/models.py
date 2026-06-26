@@ -54,6 +54,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
+    generate_tag_value_id,
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
@@ -62,6 +63,7 @@ from skyvern.forge.sdk.db.id import (
     generate_totp_code_id,
     generate_workflow_copilot_chat_id,
     generate_workflow_copilot_chat_message_id,
+    generate_workflow_copilot_completion_criteria_set_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -446,6 +448,40 @@ class TagKeyModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class TagValueModel(Base):
+    """Org-scoped registry of the color for each grouped tag ``(key, value)``, auto-registered
+    on first SET (random palette unless supplied). Partial-UNIQUE on (org, key, value)
+    WHERE deleted_at IS NULL mirrors TagKeyModel; standalone labels (no key) are not colored."""
+
+    __tablename__ = "tag_values"
+    __table_args__ = (
+        Index(
+            "ix_tag_values_org_key_value_active",
+            "organization_id",
+            "key",
+            "value",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    tag_value_id = Column(String, primary_key=True, default=generate_tag_value_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(String, nullable=False)
+    color = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 # TODO: ~22 other models with manual deleted_at columns could inherit SoftDeleteMixin.
 # WorkflowModel is the proof of concept; remaining models will be migrated in a follow-up PR.
 class WorkflowModel(SoftDeleteMixin, Base):
@@ -478,6 +514,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     browser_profile_id = Column(String, nullable=True)
+    browser_profile_key = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
@@ -572,6 +609,13 @@ class WorkflowRunModel(Base):
             "modified_at",
             "created_at",
             postgresql_where=text("status IN ('created', 'queued', 'running', 'paused')"),
+        ),
+        Index(
+            "ix_workflow_runs_sequential_key_lookup",
+            "workflow_permanent_id",
+            "sequential_key",
+            "queued_at",
+            postgresql_where=text("status IN ('queued', 'running', 'paused') AND browser_session_id IS NULL"),
         ),
     )
 
@@ -1029,6 +1073,10 @@ class WorkflowRunBlockModel(Base):
     # column on `WorkflowRunModel` but at block granularity.
     script_run = Column(JSON, nullable=True)
 
+    # Scalar mirror of output["downloaded_files"] length: the JSON output column is
+    # not CDC-mirrored, so download success would not otherwise be queryable.
+    downloaded_file_count = Column(Integer, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -1144,6 +1192,7 @@ class PersistentBrowserSessionModel(Base):
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
@@ -1462,6 +1511,7 @@ class ScriptBlockModel(Base):
 
 class WorkflowCopilotChatModel(Base):
     __tablename__ = "workflow_copilot_chats"
+    __table_args__ = (Index("wcc_org_created_at_index", "organization_id", "created_at"),)
 
     workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
     organization_id = Column(String, nullable=False)
@@ -1480,6 +1530,7 @@ class WorkflowCopilotChatModel(Base):
 
 class WorkflowCopilotChatMessageModel(Base):
     __tablename__ = "workflow_copilot_chat_messages"
+    __table_args__ = (Index("wccm_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
     workflow_copilot_chat_message_id = Column(
         String, primary_key=True, default=generate_workflow_copilot_chat_message_id
@@ -1492,6 +1543,36 @@ class WorkflowCopilotChatMessageModel(Base):
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class WorkflowCopilotCompletionCriteriaSetModel(Base):
+    __tablename__ = "workflow_copilot_completion_criteria_sets"
+    __table_args__ = (Index("wcccs_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
+
+    completion_criteria_set_id = Column(
+        String, primary_key=True, default=generate_workflow_copilot_completion_criteria_set_id
+    )
+    organization_id = Column(String, nullable=False)
+    workflow_copilot_chat_id = Column(String, nullable=False)
+    goal_epoch = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    criteria = Column(JSON, nullable=False)
+    source_turn_id = Column(String, nullable=True)
+    source_goal_text = Column(UnicodeText, nullable=True)
+    consecutive_all_no_evidence = Column(Integer, nullable=False, default=0)
+    tripwire_fired = Column(Boolean, nullable=False, default=False)
+    last_fully_satisfied_workflow_yaml = Column(UnicodeText, nullable=True)
+    superseded_by_set_id = Column(String, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+    supersede_reason = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

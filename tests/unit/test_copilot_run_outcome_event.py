@@ -7,6 +7,7 @@ result rows; domains and person names are generic placeholders.
 from __future__ import annotations
 
 import inspect
+import re
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -92,6 +93,29 @@ def _blocked_run_result() -> dict[str, Any]:
     )
 
 
+def _challenge_failure_result() -> dict[str, Any]:
+    result = _run_result([], ok=False)
+    result["error"] = "The run stopped on a terminal site challenge."
+    result["data"]["workflow_run_id"] = "wr_challenge"
+    result["data"]["failure_reason"] = "Human verification challenge blocked the search."
+    result["data"]["failure_categories"] = [
+        {
+            "category": "ANTI_BOT_DETECTION",
+            "confidence_float": 0.95,
+            "reasoning": "Typed run analysis reported an anti-bot challenge.",
+        }
+    ]
+    result["data"]["blocks"] = [
+        {
+            "label": "search_registry_person",
+            "block_type": "CODE",
+            "status": "failed",
+            "failure_reason": "Human verification challenge blocked the search.",
+        }
+    ]
+    return result
+
+
 def _clean_run_result() -> dict[str, Any]:
     return _run_result(
         [
@@ -105,7 +129,9 @@ def _clean_run_result() -> dict[str, Any]:
 
 def _evaluated(satisfied: bool) -> CompletionVerificationResult:
     verdict = CriterionVerdict(
-        criterion_id="c0", satisfied=satisfied, reason_code="evidence_confirms" if satisfied else "no_evidence"
+        criterion_id="c0",
+        state="satisfied" if satisfied else "unsatisfied",
+        reason_code="evidence_confirms" if satisfied else "no_evidence",
     )
     return CompletionVerificationResult(status="evaluated", criterion_ids=["c0"], verdicts=[verdict])
 
@@ -124,16 +150,66 @@ async def test_blocker_run_emits_hold_then_not_demonstrated() -> None:
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
     final = frames[-1]
-    assert final.reason_code == "blocker_reported"
+    assert final.reason_code == "terminal_challenge_blocker"
     assert final.workflow_run_id == "wr_test"
     assert final.workflow_run_block_ids == ["wrb_open_registry_search", "wrb_search_registry_person"]
     assert final.block_labels == ["open_registry_search", "search_registry_person"]
     assert final.display_reason is not None and "human verification challenge" in final.display_reason
-    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_suspicious_success is False
     assert ctx.last_run_outcome == RecordedRunOutcome(
-        verdict=final.verdict, reason_code=final.reason_code, display_reason=final.display_reason
+        verdict=final.verdict,
+        reason_code=final.reason_code,
+        display_reason=final.display_reason,
+        workflow_run_id="wr_test",
     )
     assert ctx.last_run_outcome_block_labels == final.block_labels
+
+
+def test_challenge_failure_records_terminal_blocker_outcome() -> None:
+    result = _challenge_failure_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    outcome = _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert outcome == RecordedRunOutcome(
+        verdict="not_demonstrated",
+        reason_code="terminal_challenge_blocker",
+        display_reason=run_outcome_display_reason(
+            "Run output reported a blocker: Human verification challenge blocked the search."
+        ),
+        workflow_run_id="wr_challenge",
+    )
+    assert ctx.last_run_outcome == outcome
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_anti_bot is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
+    assert ctx.blocker_signal.extra["run_outcome_reason_code"] == "terminal_challenge_blocker"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.extra["evidence_source"] == "structured_blocker"
+
+
+def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
+    result = _challenge_failure_result()
+    raw_reason = (
+        "Human verification challenge blocked https://user:secret@example.com/path?token=abc "
+        "after password=topsecret was submitted."
+    )
+    result["data"]["failure_reason"] = raw_reason
+    result["data"]["blocks"][0]["failure_reason"] = raw_reason
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.turn_halt is not None
+    evidence_reason = ctx.turn_halt.extra["evidence_reason"]
+    assert re.search(r"https://example\.com", evidence_reason) is not None
+    assert "[REDACTED_SECRET]" in evidence_reason
+    assert "user:secret" not in evidence_reason
+    assert "password=" not in evidence_reason
+    assert "topsecret" not in evidence_reason
+    assert "token=abc" not in evidence_reason
 
 
 @pytest.mark.asyncio
@@ -226,6 +302,36 @@ async def test_satisfied_adjudication_emits_demonstrated(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_satisfied_adjudication_emits_demonstrated_with_unverified_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _clean_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(block_type="code", label="search_registry_person"),
+                SimpleNamespace(block_type="code", label="review_results"),
+            ]
+        )
+    )
+
+    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
+        return _evaluated(satisfied=True)
+
+    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
+    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
+    assert frames[-1].reason_code is None
+    # A fully-verified completion promotes the full-workflow test result; this is the
+    # deterministic terminal path that lets a verified run finalize success.
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_run_outcome == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+
+
+@pytest.mark.asyncio
 async def test_verification_skipped_emits_not_evaluated(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -286,6 +392,20 @@ def test_failed_rerun_clears_prior_recorded_outcome() -> None:
     assert ctx.last_run_outcome_block_labels == []
 
 
+def test_recorded_run_outcome_carries_producing_workflow_run_id() -> None:
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+    outcome = _record_run_blocks_result(
+        ctx,
+        _run_result([_code_block("search_registry_person", {"records": []})]),
+        completion_verification=_evaluated(satisfied=False),
+    )
+
+    assert outcome is not None
+    assert outcome.workflow_run_id == "wr_test"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.workflow_run_id == "wr_test"
+
+
 def test_both_consumers_route_through_single_producer() -> None:
     source = inspect.getsource(copilot_tools)
     assert source.count("await _verify_and_record_run_blocks_result(") == 2
@@ -301,6 +421,20 @@ def test_display_reason_collapses_whitespace_and_caps_length() -> None:
     assert capped is not None and len(capped) == 160
     assert run_outcome_display_reason("   ") is None
     assert run_outcome_display_reason(None) is None
+
+
+def test_display_reason_redacts_secrets_and_url_credentials() -> None:
+    reason = run_outcome_display_reason(
+        "Blocked at https://user:secret@example.com/path?token=abc after password=topsecret was submitted."
+    )
+
+    assert reason is not None
+    assert re.search(r"https://example\.com", reason) is not None
+    assert "[REDACTED_SECRET]" in reason
+    assert "user:secret" not in reason
+    assert "password=" not in reason
+    assert "topsecret" not in reason
+    assert "token=abc" not in reason
 
 
 def _payload_ctx() -> CopilotContext:

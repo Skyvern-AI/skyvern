@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -7,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _docs_answer_turn_directive,
@@ -22,6 +24,8 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentAuthority,
     TurnIntentClassification,
+    TurnIntentClassifierFailureKind,
+    TurnIntentClassifierResult,
     TurnIntentExpectedOutput,
     TurnIntentMode,
     TurnIntentReasonCode,
@@ -61,8 +65,8 @@ def _classification(
     target_entities: dict[str, list[str]] | None = None,
     missing_context_question: str | None = None,
     reason_codes: list[TurnIntentReasonCode] | None = None,
-) -> TurnIntentClassification:
-    return TurnIntentClassification(
+) -> TurnIntentClassifierResult:
+    classification = TurnIntentClassification(
         mode=mode,
         expected_output=expected_output,
         required_context=required_context or [],
@@ -71,6 +75,11 @@ def _classification(
         missing_context_question=missing_context_question,
         reason_codes=reason_codes or [],
     )
+    return TurnIntentClassifierResult.success(classification)
+
+
+def _classifier_failure(failure_kind: TurnIntentClassifierFailureKind) -> TurnIntentClassifierResult:
+    return TurnIntentClassifierResult.failure(failure_kind)
 
 
 def test_turn_intent_defaults_to_unknown_shadow_contract() -> None:
@@ -141,7 +150,7 @@ def test_build_turn_intent_applies_llm_build_classification() -> None:
         global_llm_context="",
         request_policy=RequestPolicy(),
         browser_session_id="pbs_123",
-        classification=_classification(
+        classifier_result=_classification(
             TurnIntentMode.BUILD,
             required_context=[RequiredContextKey.BROWSER_STATE],
             confidence=0.84,
@@ -164,7 +173,7 @@ def test_build_turn_intent_applies_docs_classification_without_mutation() -> Non
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(),
-        classification=_classification(TurnIntentMode.DOCS_ANSWER),
+        classifier_result=_classification(TurnIntentMode.DOCS_ANSWER),
     )
 
     assert intent.mode == TurnIntentMode.DOCS_ANSWER
@@ -182,7 +191,7 @@ def test_build_turn_intent_applies_diagnose_classification_and_read_authority() 
         global_llm_context="",
         request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
         workflow_run_id="wr_123",
-        classification=_classification(TurnIntentMode.DIAGNOSE),
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
     )
 
     assert intent.mode == TurnIntentMode.DIAGNOSE
@@ -201,7 +210,7 @@ def test_build_turn_intent_applies_draft_only_classification_without_run_authori
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
-        classification=_classification(TurnIntentMode.DRAFT_ONLY),
+        classifier_result=_classification(TurnIntentMode.DRAFT_ONLY),
     )
 
     assert intent.mode == TurnIntentMode.DRAFT_ONLY
@@ -231,13 +240,50 @@ def test_build_turn_intent_llm_diagnose_outranks_skip_test_policy() -> None:
         global_llm_context="",
         request_policy=RequestPolicy(testing_intent="skip_test", allow_update_workflow=True, allow_run_blocks=False),
         workflow_run_id="wr_123",
-        classification=_classification(TurnIntentMode.DIAGNOSE),
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
     )
 
     assert intent.mode == TurnIntentMode.DIAGNOSE
     assert intent.authority.may_read_run_context is True
     assert intent.authority.may_update_workflow is False
     assert TurnIntentReasonCode.TESTING_INTENT_SKIP_TEST not in intent.reason_codes
+
+
+def test_build_turn_intent_diagnose_with_require_test_keeps_run_authority() -> None:
+    intent = build_turn_intent(
+        user_message="Test it again and confirm what it extracted.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(testing_intent="require_test", allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_run_blocks is True
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_read_run_context is True
+    assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
+    assert TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE in intent.reason_codes
+
+
+def test_build_turn_intent_diagnose_without_require_test_stays_answer_only() -> None:
+    intent = build_turn_intent(
+        user_message="What did the last run extract?",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_read_run_context is True
+    assert TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE not in intent.reason_codes
 
 
 def test_build_turn_intent_uses_request_policy_clarification_over_llm_classification() -> None:
@@ -255,7 +301,7 @@ def test_build_turn_intent_uses_request_policy_clarification_over_llm_classifica
         chat_history=[_user_message("Build a workflow")],
         global_llm_context="",
         request_policy=policy,
-        classification=_classification(TurnIntentMode.EDIT),
+        classifier_result=_classification(TurnIntentMode.EDIT),
     )
 
     assert intent.mode == TurnIntentMode.CLARIFY
@@ -284,7 +330,7 @@ def test_build_turn_intent_routes_raw_secret_to_refuse_over_llm_classification()
         chat_history=[],
         global_llm_context="",
         request_policy=policy,
-        classification=_classification(TurnIntentMode.BUILD),
+        classifier_result=_classification(TurnIntentMode.BUILD),
     )
 
     assert intent.mode == TurnIntentMode.REFUSE
@@ -303,7 +349,7 @@ def test_build_turn_intent_redacts_user_goal() -> None:
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(),
-        classification=_classification(TurnIntentMode.BUILD),
+        classifier_result=_classification(TurnIntentMode.BUILD),
     )
 
     assert "hunter2" not in intent.user_goal
@@ -318,7 +364,7 @@ def test_build_turn_intent_low_confidence_mutating_classification_clarifies(mode
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(),
-        classification=_classification(mode, confidence=0.35, target_entities={"workflow_change": ["update_it"]}),
+        classifier_result=_classification(mode, confidence=0.35, target_entities={"workflow_change": ["update_it"]}),
     )
 
     assert intent.mode == TurnIntentMode.CLARIFY
@@ -334,7 +380,7 @@ def test_build_turn_intent_targetless_edit_classification_clarifies() -> None:
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(),
-        classification=_classification(TurnIntentMode.EDIT, confidence=0.82),
+        classifier_result=_classification(TurnIntentMode.EDIT, confidence=0.82),
     )
 
     assert intent.mode == TurnIntentMode.CLARIFY
@@ -351,7 +397,7 @@ def test_build_turn_intent_allows_clear_workflow_change_edit_classification() ->
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(allow_run_blocks=False),
-        classification=_classification(
+        classifier_result=_classification(
             TurnIntentMode.EDIT,
             confidence=0.82,
             target_entities={"workflow_change": ["add_invoice_download_step"]},
@@ -386,7 +432,7 @@ def test_build_turn_intent_resolves_classifier_block_targets(block_ref: str, exp
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(allow_run_blocks=False),
-        classification=_classification(
+        classifier_result=_classification(
             TurnIntentMode.EDIT,
             confidence=0.65,
             target_entities={"block": [block_ref]},
@@ -412,7 +458,7 @@ def test_build_turn_intent_preserves_classifier_unresolved_block_targets() -> No
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(allow_run_blocks=False),
-        classification=_classification(
+        classifier_result=_classification(
             TurnIntentMode.CLARIFY,
             confidence=0.35,
             target_entities={"block": ["login block"]},
@@ -464,6 +510,144 @@ def test_build_turn_intent_unknown_with_persisted_prior_run_signal_upgrades_to_d
     assert intent.mode == TurnIntentMode.DIAGNOSE
     assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
     assert intent.authority.may_read_run_context is True
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [TurnIntentClassifierFailureKind.TIMEOUT, TurnIntentClassifierFailureKind.PROVIDER_ERROR],
+)
+def test_build_turn_intent_transient_classifier_failure_suppresses_prior_run_recovery(
+    failure_kind: TurnIntentClassifierFailureKind,
+) -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(testing_intent="require_test", allow_update_workflow=True, allow_run_blocks=True),
+        classifier_result=_classifier_failure(failure_kind),
+    )
+
+    assert intent.mode == TurnIntentMode.BUILD
+    assert intent.expected_output == TurnIntentExpectedOutput.WORKFLOW_UPDATE
+    assert intent.confidence == 0.6
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+    assert intent.authority.may_read_run_context is False
+    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK in intent.reason_codes
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT not in intent.reason_codes
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        TurnIntentClassifierFailureKind.MISSING_HANDLER,
+        TurnIntentClassifierFailureKind.EMPTY_MESSAGE,
+        TurnIntentClassifierFailureKind.PROMPT_RENDER_ERROR,
+        TurnIntentClassifierFailureKind.MALFORMED_OUTPUT,
+    ],
+)
+def test_build_turn_intent_structural_classifier_failure_uses_prior_run_recovery(
+    failure_kind: TurnIntentClassifierFailureKind,
+) -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(testing_intent="require_test", allow_update_workflow=True, allow_run_blocks=True),
+        classifier_result=_classifier_failure(failure_kind),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.may_read_run_context is True
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
+    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
+
+
+def test_build_turn_intent_genuine_unknown_classification_uses_prior_run_recovery() -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(testing_intent="require_test", allow_update_workflow=True, allow_run_blocks=True),
+        classifier_result=_classification(TurnIntentMode.UNKNOWN, confidence=0.34),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert TurnIntentReasonCode.LLM_CLASSIFIER in intent.reason_codes
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
+    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
+
+
+def test_build_turn_intent_transient_classifier_failure_without_authority_uses_prior_run_recovery() -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+        classifier_result=_classifier_failure(TurnIntentClassifierFailureKind.TIMEOUT),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
+    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
+
+
+def test_build_turn_intent_raw_secret_refusal_wins_over_transient_classifier_failure() -> None:
+    intent = build_turn_intent(
+        user_message="Use password: hunter2 to sign in.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(
+            credential_input_kind="raw_secret",
+            raw_secret_detected=True,
+            raw_secret_handling="block",
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+        ),
+        classifier_result=_classifier_failure(TurnIntentClassifierFailureKind.TIMEOUT),
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+    assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
+    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
+
+
+def test_build_turn_intent_policy_clarification_wins_over_transient_classifier_failure() -> None:
+    intent = build_turn_intent(
+        user_message="Build and test it.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(
+            user_response_policy="ask_clarification",
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+            clarification_question="Which page should I target?",
+        ),
+        classifier_result=_classifier_failure(TurnIntentClassifierFailureKind.TIMEOUT),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+    assert intent.missing_context_question == "Which page should I target?"
+    assert TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION in intent.reason_codes
+    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
 
 
 def test_has_structured_prior_run_signal_ignores_workflow_state_only() -> None:
@@ -531,7 +715,7 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
         ctx,
         policy,
         inputs,
-        turn_intent_classification=_classification(TurnIntentMode.DIAGNOSE),
+        turn_intent_classifier_result=_classification(TurnIntentMode.DIAGNOSE),
     )
 
     assert ctx.turn_intent is not None
@@ -590,6 +774,20 @@ def test_turn_intent_classification_parser_rejects_malformed_payload() -> None:
     assert _turn_intent_classification_from_raw("not json") is None
 
 
+def test_turn_intent_classification_parser_ignores_deterministic_fallback_reason_code() -> None:
+    classification = _turn_intent_classification_from_raw(
+        {
+            "mode": "build",
+            "expected_output": "workflow_draft",
+            "confidence": 0.8,
+            "reason_codes": ["transient_classifier_fallback", "target_entity_resolved"],
+        }
+    )
+
+    assert classification is not None
+    assert classification.reason_codes == [TurnIntentReasonCode.TARGET_ENTITY_RESOLVED]
+
+
 @pytest.mark.asyncio
 async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> None:
     calls: list[dict[str, str]] = []
@@ -606,7 +804,7 @@ async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> 
             "reason_codes": [],
         }
 
-    classification = await classify_turn_intent(
+    classifier_result = await classify_turn_intent(
         user_message="Create a workflow from the page I have open.",
         workflow_yaml="",
         chat_history=[],
@@ -615,9 +813,349 @@ async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> 
         handler=handler,
     )
 
+    assert classifier_result.is_success
+    classification = classifier_result.classification
     assert classification is not None
     assert classification.mode == TurnIntentMode.BUILD
     assert classification.required_context == [RequiredContextKey.BROWSER_STATE]
     assert calls[0]["prompt_name"] == PROMPT_NAME
     assert "Create a workflow from the page I have open." in calls[0]["prompt"]
     assert "Allowed modes" in calls[0]["prompt"]
+    assert "transient_classifier_fallback" not in calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_escapes_code_fences_in_untrusted_inputs() -> None:
+    prompts: list[str] = []
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"mode": "build", "expected_output": "workflow_draft", "reason_codes": []}
+
+    await classify_turn_intent(
+        user_message="build ```INJECT_VIA_USER``` now",
+        workflow_yaml="```INJECT_VIA_YAML```",
+        chat_history=[],
+        global_llm_context="```INJECT_VIA_CONTEXT```",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    prompt = prompts[0]
+    for sentinel in ("INJECT_VIA_USER", "INJECT_VIA_YAML", "INJECT_VIA_CONTEXT"):
+        assert sentinel in prompt
+        assert f"```{sentinel}" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_reports_missing_handler_and_empty_message() -> None:
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        raise AssertionError("handler should not be called")
+
+    empty_result = await classify_turn_intent(
+        user_message="",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+    missing_handler_result = await classify_turn_intent(
+        user_message="Build it",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=None,
+    )
+
+    assert empty_result.failure_kind == TurnIntentClassifierFailureKind.EMPTY_MESSAGE
+    assert missing_handler_result.failure_kind == TurnIntentClassifierFailureKind.MISSING_HANDLER
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_uses_turn_intent_timeout_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS", 0.001)
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        await asyncio.sleep(0.05)
+        return {"mode": "build"}
+
+    result = await classify_turn_intent(
+        user_message="Build it",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    assert result.failure_kind == TurnIntentClassifierFailureKind.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_reports_converted_cancellation_as_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS", 0.001)
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError as exc:
+            raise RuntimeError("LLM request got cancelled") from exc
+        return {"mode": "build"}
+
+    result = await classify_turn_intent(
+        user_message="Build it",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    assert result.failure_kind == TurnIntentClassifierFailureKind.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_reports_provider_error() -> None:
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        raise RuntimeError("provider unavailable")
+
+    result = await classify_turn_intent(
+        user_message="Build it",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    assert result.failure_kind == TurnIntentClassifierFailureKind.PROVIDER_ERROR
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_reports_malformed_output() -> None:
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        return {"mode": "not_a_mode"}
+
+    result = await classify_turn_intent(
+        user_message="Build it",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    assert result.failure_kind == TurnIntentClassifierFailureKind.MALFORMED_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_reports_prompt_render_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_prompt_error(**_: object) -> str:
+        raise RuntimeError("template missing")
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        raise AssertionError("handler should not be called")
+
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.turn_intent.prompt_engine.load_prompt", raise_prompt_error)
+
+    result = await classify_turn_intent(
+        user_message="Build it",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    assert result.failure_kind == TurnIntentClassifierFailureKind.PROMPT_RENDER_ERROR
+
+
+def test_structurally_infeasible_with_question_clarifies_and_carries_reason() -> None:
+    intent = build_turn_intent(
+        user_message="download regulatory filings from videostream.example",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classification(
+            TurnIntentMode.CLARIFY,
+            missing_context_question="A video-streaming site has no filings — which source should I use?",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.missing_context_question == "A video-streaming site has no filings — which source should I use?"
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in intent.reason_codes
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+
+
+@pytest.mark.parametrize("classified_mode", [TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DIAGNOSE])
+def test_structurally_infeasible_with_question_but_non_clarify_mode_forces_clarify(
+    classified_mode: TurnIntentMode,
+) -> None:
+    # Routed to CLARIFY so the mode==CLARIFY pre-loop bail can fire instead of entering the loop.
+    intent = build_turn_intent(
+        user_message="download regulatory filings from videostream.example",
+        workflow_yaml="workflow:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classification(
+            classified_mode,
+            confidence=0.9,
+            target_entities={"workflow": ["existing"]},
+            missing_context_question="A video-streaming site has no filings — which source should I use?",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.expected_output == TurnIntentExpectedOutput.CLARIFICATION
+    assert intent.missing_context_question == "A video-streaming site has no filings — which source should I use?"
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in intent.reason_codes
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+    assert intent.target_entities == {"workflow": ["current_workflow"]}
+
+
+def test_structurally_infeasible_without_question_fails_open_to_request_policy_baseline() -> None:
+    baseline = build_turn_intent(
+        user_message="build a workflow",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    intent = build_turn_intent(
+        user_message="build a workflow",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classification(
+            TurnIntentMode.CLARIFY,
+            missing_context_question="   ",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode != TurnIntentMode.CLARIFY
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+    assert intent.missing_context_question is None
+    assert intent.authority.model_dump() == baseline.authority.model_dump()
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+
+
+def test_request_policy_clarification_precedes_structural_infeasibility() -> None:
+    policy = RequestPolicy()
+    policy.user_response_policy = "ask_clarification"
+    policy.clarification_question = "Which saved credential should I use?"
+    intent = build_turn_intent(
+        user_message="log into the portal",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        classifier_result=_classification(
+            TurnIntentMode.CLARIFY,
+            missing_context_question="A different infeasibility question",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.missing_context_question == "Which saved credential should I use?"
+    assert TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION in intent.reason_codes
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+
+
+def test_classifier_failure_does_not_emit_infeasibility_clarify() -> None:
+    intent = build_turn_intent(
+        user_message="build a workflow on example.test",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classifier_failure(TurnIntentClassifierFailureKind.PROVIDER_ERROR),
+    )
+
+    assert intent.mode != TurnIntentMode.CLARIFY
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+
+
+def test_skip_test_bare_value_continuation_classifies_identically_after_fold() -> None:
+    chat_history = [
+        _user_message("Draft a workflow that downloads the monthly invoice PDF — don't run it yet."),
+        _ai_message("Here's a draft workflow with a download block. Want me to adjust anything before you run it?"),
+    ]
+    intent = build_turn_intent(
+        user_message="the second one",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=chat_history,
+        global_llm_context="",
+        request_policy=RequestPolicy(testing_intent="skip_test", allow_update_workflow=True, allow_run_blocks=False),
+        classifier_result=_classification(
+            TurnIntentMode.DRAFT_ONLY,
+            confidence=0.82,
+            target_entities={"workflow_change": ["select_second_proposal"]},
+        ),
+    )
+
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+    assert intent.mode == TurnIntentMode.DRAFT_ONLY
+    assert intent.mode != TurnIntentMode.CLARIFY
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is False
+    assert RequiredContextKey.LATEST_ASSISTANT_PROPOSAL in intent.required_context
+    assert intent.target_entities["workflow_change"] == ["select_second_proposal"]
+
+
+def _render_turn_intent_prompt() -> str:
+    from skyvern.forge.prompts import prompt_engine
+
+    return prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        mode_values="build, clarify",
+        expected_output_values="workflow_draft, clarification",
+        required_context_values="current_workflow",
+        reason_code_values="structurally_infeasible, llm_classifier",
+        user_message="do this on a video streaming site",
+        request_policy_summary="",
+        workflow_yaml="",
+        earliest_user_turn="download filings",
+        latest_prior_user_turn="download filings",
+        latest_assistant_turn="(none)",
+        retained_history="(none)",
+        global_llm_context="",
+    )
+
+
+def test_turn_intent_prompt_carries_structural_feasibility_contract() -> None:
+    prompt = _render_turn_intent_prompt()
+
+    assert "Structural feasibility:" in prompt
+    assert "structurally_infeasible" in prompt
+    assert "mid-session pivot" in prompt
+    assert "On the fence" in prompt
+
+
+def test_turn_intent_prompt_carries_over_asking_guardrails() -> None:
+    prompt = _render_turn_intent_prompt()
+
+    assert "resolves the target even without a URL" in prompt
+    assert "never ask which website/URL to use" in prompt
+    assert "refinements, corrections, and bare-value replies" in prompt
+    assert "When a concrete URL is present" in prompt
+    assert "default harder away from structurally_infeasible" in prompt
+    assert "On the fence: do not use structurally_infeasible" in prompt

@@ -7,17 +7,28 @@ import {
 } from "@/routes/tasks/types";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import {
+  getActiveOrgQueryKeyScope,
+  getOrgScopedQueryKey,
+  useActiveOrgId,
+} from "@/store/ActiveOrgContext";
 
-function useWorkflowRunWithWorkflowQuery() {
-  const workflowRunId = useFirstParam("workflowRunId", "runId");
+function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
 
   return useQuery<WorkflowRunStatusApiResponseWithWorkflow>({
-    queryKey: ["workflowRun", workflowRunId],
-    queryFn: async () => {
+    queryKey: getOrgScopedQueryKey(
+      ["workflowRun", workflowRunId],
+      activeOrgQueryKeyScope,
+    ),
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client
-        .get(`/workflows/runs/${workflowRunId}`)
+        .get(`/workflows/runs/${workflowRunId}`, { signal })
         .then((response) => response.data);
     },
     refetchInterval: (query) => {

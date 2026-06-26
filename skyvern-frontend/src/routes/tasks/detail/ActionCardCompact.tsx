@@ -3,8 +3,9 @@ import {
   type ActionType,
   ActionTypes,
   ReadableActionTypes,
-  Status,
 } from "@/api/types";
+import { getActionDisplayKind } from "@/routes/workflows/components/actionStatus";
+import { terminatedDot } from "@/components/terminatedVisual";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import {
   Tooltip,
@@ -59,11 +60,7 @@ function ActionCardCompact({
   onToggleExpanded,
   cardClassName,
 }: Props) {
-  // wait actions return ActionFailure despite succeeding
-  const success =
-    action.action_type === ActionTypes.wait ||
-    action.status === Status.Completed ||
-    action.status === Status.Skipped;
+  const kind = getActionDisplayKind(action);
 
   const reasoningPreview = action.reasoning?.trim() ?? "";
   const fromScript = action.created_by === "script";
@@ -88,7 +85,7 @@ function ActionCardCompact({
       <div
         data-slot="action-card-compact"
         data-active={active ? "true" : "false"}
-        data-status={success ? "success" : "failure"}
+        data-status={kind}
         className={cn(
           "group relative rounded-md bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
           {
@@ -111,9 +108,10 @@ function ActionCardCompact({
           <div className="flex min-h-[24px] items-center gap-2">
             <span
               aria-hidden="true"
-              className={cn("h-2 w-2 shrink-0 rounded-full", {
-                "bg-success": success,
-                "bg-destructive": !success,
+              className={cn("h-2 w-2 shrink-0", {
+                "rounded-full bg-success": kind === "success",
+                "rounded-full bg-destructive": kind === "failure",
+                [`rounded-[2px] ${terminatedDot}`]: kind === "terminated",
               })}
             />
             <span className="shrink-0 text-xs tabular-nums text-slate-500">

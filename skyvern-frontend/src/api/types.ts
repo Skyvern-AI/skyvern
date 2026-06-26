@@ -164,8 +164,6 @@ export type FailureCategory = {
   reasoning: string;
 };
 
-export type WebhookDeliveryStatus = "pending" | "failed";
-
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -249,6 +247,33 @@ export type OnePasswordTokenApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordItemApiResponse = {
+  item_id: string;
+  title: string;
+  vault_id: string;
+  vault_name: string;
+  category: string;
+  url?: string | null;
+};
+
+export type OnePasswordItemsApiResponse = {
+  configured: boolean;
+  items: Array<OnePasswordItemApiResponse>;
+};
+
+export type BitwardenItemApiResponse = {
+  item_id: string;
+  title: string;
+  collection_id?: string | null;
+  credential_type: "password" | "credit_card" | "secret";
+  url?: string | null;
+};
+
+export type BitwardenItemsApiResponse = {
+  configured: boolean;
+  items: Array<BitwardenItemApiResponse>;
+};
+
 export type CreateOnePasswordTokenRequest = {
   token: string;
 };
@@ -289,8 +314,12 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
-  scopes: string | null;
-  valid: boolean;
+  provider?: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
   created_at: string;
   modified_at: string;
 }
@@ -307,6 +336,7 @@ export interface GoogleOAuthCredentialListResponse {
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
+  scope_profile?: string;
   app_origin?: string;
 }
 
@@ -447,6 +477,7 @@ export const ActionTypes = {
   LeftMouse: "left_mouse",
   GotoUrl: "goto_url",
   ClosePage: "close_page",
+  ExecuteJs: "execute_js",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -475,7 +506,36 @@ export const ReadableActionTypes: {
   left_mouse: "Left Mouse",
   goto_url: "Goto URL",
   close_page: "Close Page",
+  execute_js: "Execute JS",
 };
+
+type GetReadableActionTypeOptions = {
+  nullActionLabel?: string;
+};
+
+// Recorded code-block actions can carry an action_type the readable map doesn't
+// list yet (the runtime recorder maps more Playwright calls than the UI enumerates).
+// Humanize unknown types instead of rendering a blank badge.
+export function getReadableActionType(
+  actionType: string,
+  options: GetReadableActionTypeOptions = {},
+): string {
+  if (actionType === ActionTypes.NullAction && options.nullActionLabel) {
+    return options.nullActionLabel;
+  }
+  const known = ReadableActionTypes[actionType as ActionType];
+  if (known) {
+    return known;
+  }
+  if (!actionType) {
+    return "Step";
+  }
+  return actionType
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
 
 export type Option = {
   label: string;
@@ -537,6 +597,12 @@ export type DebugSessionApiResponse = {
   created_at: string;
   modified_at: string;
   vnc_streaming_supported: boolean | null;
+  pbs_browser_profile_id: string | null;
+};
+
+export type DebugLoginBlockCompatibilityResponse = {
+  compatible: boolean;
+  reason: "pbs_no_profile" | "pbs_different_profile" | null;
 };
 
 export type WorkflowRunApiResponse = {
@@ -607,7 +673,6 @@ export type WorkflowRunStatusApiResponse = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -645,7 +710,6 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -690,6 +754,11 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  // Code block recorded actions carry code_line and duration_ms here.
+  output?:
+    | { code_line?: number | null; duration_ms?: number | null }
+    | Record<string, unknown>
+    | null;
 };
 
 export type TaskV2 = {
@@ -734,6 +803,11 @@ export type PasswordCredentialApiResponse = {
   username: string;
   totp_type: "authenticator" | "email" | "text" | "none";
   totp_identifier?: string | null;
+};
+
+export type CredentialTotpCodeResponse = {
+  code: string;
+  seconds_remaining: number;
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -809,6 +883,21 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+  billing_address?: CreditCardBillingAddress | null;
+  billing_email?: string | null;
+  billing_phone?: string | null;
+  metadata?: Record<string, string> | null;
+};
+
+export type CreditCardBillingAddress = {
+  line1?: string | null;
+  line2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  state_code?: string | null;
+  postal_code?: string | null;
+  country?: string | null;
+  country_code?: string | null;
 };
 
 export type SecretCredential = {

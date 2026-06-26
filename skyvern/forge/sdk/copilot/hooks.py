@@ -48,6 +48,14 @@ _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
 )
 
 
+def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
+    return {
+        "workflow_permanent_id": getattr(ctx, "workflow_permanent_id", None),
+        "turn_id": getattr(ctx, "turn_id", None),
+        "workflow_copilot_chat_id": getattr(ctx, "workflow_copilot_chat_id", None),
+    }
+
+
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
     if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
         return False
@@ -90,6 +98,7 @@ class CopilotRunHooks(RunHooksBase):
                 ok=parsed.get("ok"),
                 summary=summary,
                 total_tokens=getattr(self._ctx, "total_tokens_used", None),
+                **_copilot_log_fields(self._ctx),
             )
 
             if tool_name == "list_credentials" and parsed.get("ok"):
@@ -124,6 +133,7 @@ class CopilotRunHooks(RunHooksBase):
             LOG.warning(
                 "CopilotRunHooks.on_tool_end recording failed, skipping entry",
                 tool=getattr(tool, "name", None),
+                **_copilot_log_fields(self._ctx),
                 exc_info=True,
             )
             return
@@ -133,7 +143,7 @@ class CopilotRunHooks(RunHooksBase):
             getattr(self._ctx, "latest_tool_blocker_signal", None) or getattr(self._ctx, "blocker_signal", None),
             source="hook",
         )
-        raise_if_turn_halt(self._ctx)
+        raise_if_turn_halt(self._ctx, verified=outcome_fully_verified(self._ctx))
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
             LOG.info(
@@ -142,5 +152,8 @@ class CopilotRunHooks(RunHooksBase):
                 workflow_run_id=(parsed.get("data") or {}).get("workflow_run_id")
                 if isinstance(parsed.get("data"), dict)
                 else None,
+                **_copilot_log_fields(self._ctx),
             )
+            self._ctx.goal_satisfied_tool_name = tool_name
+            self._ctx.goal_satisfied_tool_output = dict(parsed)
             raise CopilotGoalSatisfied()

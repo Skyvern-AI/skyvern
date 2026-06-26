@@ -431,7 +431,7 @@ class Skyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
@@ -1623,7 +1623,7 @@ class Skyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -1634,10 +1634,10 @@ class Skyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3177,7 +3177,7 @@ class AsyncSkyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
@@ -4571,7 +4571,7 @@ class AsyncSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -4582,10 +4582,10 @@ class AsyncSkyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.

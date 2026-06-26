@@ -56,6 +56,8 @@ import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
 import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
 import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
 import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
+import { PdfFillNode } from "./PdfFillNode/types";
+import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
@@ -88,7 +90,8 @@ export type WorkflowBlockNode =
   | PrintPageNode
   | WorkflowTriggerNode
   | GoogleSheetsReadNode
-  | GoogleSheetsWriteNode;
+  | GoogleSheetsWriteNode
+  | PdfFillNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -150,4 +153,5 @@ export const nodeTypes = {
   workflowTrigger: wrapBlock(WorkflowTriggerNodeComponent),
   googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
   googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
+  pdfFill: wrapBlock(PdfFillNodeComponent),
 } as const;

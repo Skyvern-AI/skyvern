@@ -7,7 +7,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import BrowserContext, Page, Playwright
+from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_PAGE_CLOSE_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
@@ -362,6 +362,69 @@ class RealBrowserState(BrowserState):
             page = await self.__assert_page()
         return page
 
+    def is_connected(self) -> bool:
+        # A reused browser state (e.g. a persistent debug session) can have a stopped driver
+        # after a prior owner's cleanup; page.goto then raises "Connection closed while reading
+        # from the driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
+        # _close_was_called, so also inspect the shared driver Connection's closed-error.
+        context = self.browser_context
+        if context is None:
+            return False
+        impl = getattr(context, "_impl_obj", None)
+        if getattr(impl, "_close_was_called", False) is True or getattr(impl, "_closed", False) is True:
+            return False
+        connection = getattr(impl, "_connection", None)
+        if getattr(connection, "_closed_error", None) is not None:
+            return False
+        browser = getattr(context, "browser", None)
+        if browser is None:
+            return True
+        try:
+            return browser.is_connected()
+        except Exception:
+            return False
+
+    async def reconnect(
+        self,
+        proxy_location: ProxyLocationInput = None,
+        workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
+        browser_profile_id: str | None = None,
+    ) -> None:
+        # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
+        # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
+        stale_pw = self.pw
+        self.browser_context = None
+        await self.set_working_page(None)
+        self.pw = await async_playwright().start()
+        try:
+            await self.check_and_fix_state(
+                proxy_location=proxy_location,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
+            )
+        except Exception:
+            # The caller abandons this state on failure, so stop the just-started driver too or it leaks.
+            try:
+                await self.pw.stop()
+            except Exception:
+                LOG.debug("Failed to stop the new Playwright driver after a failed reconnect", exc_info=True)
+            raise
+        finally:
+            try:
+                await stale_pw.stop()
+            except Exception:
+                LOG.debug("Failed to stop the stale Playwright driver during reconnect", exc_info=True)
+
     async def close_current_open_page(self) -> bool:
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
@@ -441,7 +504,10 @@ class RealBrowserState(BrowserState):
         max_retries: int = settings.MAX_SCRAPING_RETRIES,
         scrape_exclude: ScrapeExcludeFunc | None = None,
         take_screenshots: bool = True,
-        draw_boxes: bool = True,
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # The parameter is retained for backwards compatibility and is scheduled for removal.
+        # New call sites must not pass ``draw_boxes=True``.
+        draw_boxes: bool = False,
         max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
         support_empty_page: bool = False,
@@ -469,7 +535,7 @@ class RealBrowserState(BrowserState):
         )
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
-        LOG.info("Closing browser state")
+        LOG.info("Closing browser state", sampling=True)
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:

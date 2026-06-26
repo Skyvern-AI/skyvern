@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import structlog
-from sqlalchemy import asc, case, or_, select
+from sqlalchemy import case, desc, or_, select
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
@@ -97,7 +97,13 @@ class BrowserSessionsRepository(BaseRepository):
                         BrowserProfileModel.description.ilike(search_like),
                     )
                 )
-            query = query.order_by(asc(BrowserProfileModel.created_at)).limit(page_size).offset(db_page * page_size)
+            # The id tie-break only needs to be deterministic so pagination stays
+            # stable when created_at collides; it isn't meant to encode recency.
+            query = (
+                query.order_by(desc(BrowserProfileModel.created_at), desc(BrowserProfileModel.browser_profile_id))
+                .limit(page_size)
+                .offset(db_page * page_size)
+            )
             browser_profiles = await session.scalars(query)
             return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
 
@@ -118,6 +124,24 @@ class BrowserSessionsRepository(BaseRepository):
             if not browser_profile:
                 raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
             browser_profile.deleted_at = naive_utc_now()
+            await session.commit()
+
+    @db_operation("hard_delete_browser_profile")
+    async def hard_delete_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            await session.delete(browser_profile)
             await session.commit()
 
     @db_operation("update_browser_profile")
@@ -301,6 +325,7 @@ class BrowserSessionsRepository(BaseRepository):
         completed_at: datetime | None = None,
         started_at: datetime | None = None,
         generate_browser_profile: bool | None = None,
+        browser_profile_loaded: bool | None = None,
     ) -> PersistentBrowserSession:
         async with self.Session() as session:
             persistent_browser_session = (
@@ -324,6 +349,8 @@ class BrowserSessionsRepository(BaseRepository):
                 persistent_browser_session.started_at = to_naive_utc(started_at)
             if generate_browser_profile is not None:
                 persistent_browser_session.generate_browser_profile = generate_browser_profile
+            if browser_profile_loaded is not None:
+                persistent_browser_session.browser_profile_loaded = browser_profile_loaded
 
             await session.commit()
             await session.refresh(persistent_browser_session)

@@ -176,6 +176,15 @@ def _render_block_policy_detail(block_type: str, policy: CopilotBlockPolicy) -> 
     return f"`{block_type}` is {policy.status.value} and requires {policy.required_capability}. {policy.guidance}"
 
 
+def _record_code_native_pending_capability(ctx: AgentContext | None, policy: CopilotBlockPolicy) -> None:
+    if (
+        ctx is not None
+        and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
+        and ctx.code_native_pending_capability is None
+    ):
+        ctx.code_native_pending_capability = policy.required_capability
+
+
 def _code_only_browser_unavailable_types() -> list[str]:
     return sorted(
         block_type
@@ -216,7 +225,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
-        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username, <key>.password, and <key>.totp (a fresh one-time code generated when the block starts). Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
     ]
 
 
@@ -239,14 +248,26 @@ Code-native capabilities still pending plumbing:
 
 Runtime facts:
 - `code` is async Python with a Playwright `page` object and workflow parameters by key.
+- The runtime pre-injects its helper namespaces; do not write `import` statements and do
+  not access dunder (`__name__`) names or attributes.
 - Valid Python identifier parameter keys are local variables; normalize before page inputs.
 - Use deterministic, bounded Playwright calls: `goto`, `click`, `fill`, `press`,
-  `wait_for_load_state`, and `evaluate`.
+  `wait_for_load_state`, `locator`, `get_by_role`, and locator text/count APIs.
+- For browser reads, prefer visible anchors, locator text, block outputs, and
+  MCP/scout evidence gathered before authoring.
 - A `credential_id` workflow parameter resolves to a credential object with
-  `<key>.username`, `<key>.password`, and fresh `<key>.totp`; scout fields with
+  `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
   `fill_credential_field`, never embed literal secrets.
+- Credentialed login code must be idempotent. After `goto`, wait for either the
+  login form or an already-authenticated page anchor; only fill username/password
+  when the login fields are visible, and after submit wait for a logged-in page
+  anchor instead of relying only on `networkidle`.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
+- For an extraction-intent `code` block, propose a typed `extraction_schema` (named
+  fields with types) from the goal and the scouted page, ASK_QUESTION to confirm or
+  adjust which fields to grab, then carry the confirmed JSON Schema as
+  `extraction_schema` on `code_artifact_metadata` and conform the block's `return` to it.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 
@@ -273,6 +294,7 @@ def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext
         if policy_entry is None:
             continue
         _normalized, policy = policy_entry
+        _record_code_native_pending_capability(ctx, policy)
         type_labels = ", ".join(sorted(grouped[block_type]))
         details.append(f"{block_type} [{type_labels}]: {_render_block_policy_detail(block_type, policy)}")
     details_part = " ".join(details)

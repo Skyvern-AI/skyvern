@@ -7,23 +7,46 @@ import { toast } from "@/components/ui/use-toast";
 import { useReviewScriptMutation } from "../hooks/useReviewScriptMutation";
 import type { ReviewScriptResponse } from "../types/scriptTypes";
 
+function ScriptFixTriggerButton({ onClick }: { onClick: () => void }) {
+  return (
+    <Button variant="outline" size="sm" className="gap-1.5" onClick={onClick}>
+      <MagicWandIcon className="h-3.5 w-3.5" />
+      Fix with AI
+    </Button>
+  );
+}
+
 interface Props {
   workflowPermanentId: string;
   workflowRunId?: string;
   onScriptUpdated?: (data: ReviewScriptResponse) => void;
+  // Controlled open state: when provided, the internal trigger is hidden so the
+  // parent can place it elsewhere. Self-managed when omitted.
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
 function ScriptFixInput({
   workflowPermanentId,
   workflowRunId,
   onScriptUpdated,
+  open: openProp,
+  onOpenChange,
 }: Props) {
-  const [isOpen, setIsOpen] = useState(false);
+  const isControlled = openProp !== undefined;
+  const [openState, setOpenState] = useState(false);
+  const isOpen = isControlled ? Boolean(openProp) : openState;
+  const setIsOpen = (next: boolean) => {
+    if (!isControlled) {
+      setOpenState(next);
+    }
+    onOpenChange?.(next);
+  };
   const [instructions, setInstructions] = useState("");
 
   // Reset state when navigating between runs or workflows
   useEffect(() => {
-    setIsOpen(false);
+    setOpenState(false);
     setInstructions("");
   }, [workflowRunId, workflowPermanentId]);
 
@@ -57,20 +80,17 @@ function ScriptFixInput({
     });
   };
 
+  // Controlled mode: the parent owns the trigger, so render only the panel.
+  if (isControlled && !isOpen) {
+    return null;
+  }
+
   return (
     <div className="flex w-full flex-col gap-2">
-      {/* Trigger button — always visible in collapsed state */}
-      {!isOpen && (
+      {/* Trigger button — only when self-managed (uncontrolled). */}
+      {!isControlled && !isOpen && (
         <div className="flex justify-end">
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1.5"
-            onClick={() => setIsOpen(true)}
-          >
-            <MagicWandIcon className="h-3.5 w-3.5" />
-            Fix with AI
-          </Button>
+          <ScriptFixTriggerButton onClick={() => setIsOpen(true)} />
         </div>
       )}
       {/* Expanded input panel */}
@@ -128,4 +148,4 @@ function ScriptFixInput({
   );
 }
 
-export { ScriptFixInput };
+export { ScriptFixInput, ScriptFixTriggerButton };

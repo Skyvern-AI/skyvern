@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Mapping
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -100,6 +101,7 @@ class TurnIntentReasonCode(StrEnum):
     REQUEST_POLICY_DERIVED = "request_policy_derived"
     REQUEST_POLICY_CLARIFICATION = "request_policy_clarification"
     TESTING_INTENT_SKIP_TEST = "testing_intent_skip_test"
+    TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE = "testing_intent_run_overrides_diagnose"
     WORKFLOW_CONTEXT_PRESENT = "workflow_context_present"
     CHAT_HISTORY_PRESENT = "chat_history_present"
     RUN_CONTEXT_PRESENT = "run_context_present"
@@ -112,6 +114,22 @@ class TurnIntentReasonCode(StrEnum):
     LOW_CONFIDENCE_CLARIFICATION = "low_confidence_clarification"
     TARGET_ENTITY_RESOLVED = "target_entity_resolved"
     MISSING_EDIT_TARGET = "missing_edit_target"
+    STRUCTURALLY_INFEASIBLE = "structurally_infeasible"
+    TRANSIENT_CLASSIFIER_FALLBACK = "transient_classifier_fallback"
+
+
+class TurnIntentClassifierFailureKind(StrEnum):
+    TIMEOUT = "timeout"
+    PROVIDER_ERROR = "provider_error"
+    MISSING_HANDLER = "missing_handler"
+    EMPTY_MESSAGE = "empty_message"
+    PROMPT_RENDER_ERROR = "prompt_render_error"
+    MALFORMED_OUTPUT = "malformed_output"
+
+
+_CLASSIFIER_REASON_CODES = tuple(
+    reason for reason in TurnIntentReasonCode if reason != TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK
+)
 
 
 _DEFAULT_EXPECTED_OUTPUT_BY_MODE: dict[TurnIntentMode, TurnIntentExpectedOutput] = {
@@ -249,6 +267,38 @@ class TurnIntentClassification(BaseModel):
         if self.missing_context_question:
             data["has_missing_context_question"] = True
         return data
+
+
+class TurnIntentClassifierResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    classification: TurnIntentClassification | None = None
+    failure_kind: TurnIntentClassifierFailureKind | None = None
+
+    @model_validator(mode="after")
+    def _validate_result_shape(self) -> TurnIntentClassifierResult:
+        if (self.classification is None) == (self.failure_kind is None):
+            raise ValueError("classifier result must contain exactly one of classification or failure_kind")
+        return self
+
+    @classmethod
+    def success(cls, classification: TurnIntentClassification) -> TurnIntentClassifierResult:
+        return cls(classification=classification)
+
+    @classmethod
+    def failure(cls, failure_kind: TurnIntentClassifierFailureKind) -> TurnIntentClassifierResult:
+        return cls(failure_kind=failure_kind)
+
+    @property
+    def is_success(self) -> bool:
+        return self.classification is not None
+
+    @property
+    def is_transient_failure(self) -> bool:
+        return self.failure_kind in (
+            TurnIntentClassifierFailureKind.TIMEOUT,
+            TurnIntentClassifierFailureKind.PROVIDER_ERROR,
+        )
 
 
 _GOAL_MAX_CHARS = 240
@@ -404,9 +454,11 @@ def _coerce_reason_codes(raw: object) -> list[TurnIntentReasonCode]:
     reason_codes: list[TurnIntentReasonCode] = []
     for value in values:
         try:
-            reason_codes.append(TurnIntentReasonCode(value))
+            reason_code = TurnIntentReasonCode(value)
         except ValueError:
             continue
+        if reason_code in _CLASSIFIER_REASON_CODES:
+            reason_codes.append(reason_code)
     return list(dict.fromkeys(reason_codes))
 
 
@@ -518,12 +570,13 @@ async def classify_turn_intent(
     global_llm_context: str,
     request_policy: RequestPolicy,
     handler: LLMAPIHandler | None,
-) -> TurnIntentClassification | None:
+) -> TurnIntentClassifierResult:
     if not isinstance(user_message, str) or not user_message.strip():
-        return None
+        LOG.info("turn-intent classifier skipped empty user message")
+        return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.EMPTY_MESSAGE)
     if handler is None:
         LOG.info("turn-intent classifier has no LLM handler available")
-        return None
+        return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.MISSING_HANDLER)
 
     safe_user_message = redact_raw_secrets_for_prompt(user_message)
     transcript = build_transcript_context(chat_history, safe_user_message)
@@ -533,7 +586,7 @@ async def classify_turn_intent(
             mode_values=", ".join(mode.value for mode in TurnIntentMode),
             expected_output_values=", ".join(output.value for output in TurnIntentExpectedOutput),
             required_context_values=", ".join(key.value for key in RequiredContextKey),
-            reason_code_values=", ".join(reason.value for reason in TurnIntentReasonCode),
+            reason_code_values=", ".join(reason.value for reason in _CLASSIFIER_REASON_CODES),
             user_message=escape_code_fences(safe_user_message),
             request_policy_summary=escape_code_fences(request_policy.prompt_summary()),
             workflow_yaml=escape_code_fences(
@@ -549,31 +602,53 @@ async def classify_turn_intent(
         )
     except Exception as exc:
         LOG.warning("turn-intent classifier prompt render failed", error=str(exc))
-        return None
+        return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.PROMPT_RENDER_ERROR)
 
+    timeout = settings.COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS
+    started_at = time.monotonic()
     try:
         raw = await asyncio.wait_for(
             handler(prompt=prompt, prompt_name=PROMPT_NAME),
-            timeout=settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except asyncio.TimeoutError:
         LOG.warning(
             "turn-intent classifier timed out",
-            timeout=settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS,
+            failure_kind=TurnIntentClassifierFailureKind.TIMEOUT.value,
+            timeout=timeout,
         )
-        return None
+        return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.TIMEOUT)
     except Exception as exc:
-        LOG.warning("turn-intent classifier failed", error=str(exc))
-        return None
+        elapsed_seconds = time.monotonic() - started_at
+        timeout_margin = min(0.25, max(0.001, timeout * 0.05))
+        if elapsed_seconds + timeout_margin >= timeout:
+            LOG.warning(
+                "turn-intent classifier timed out",
+                failure_kind=TurnIntentClassifierFailureKind.TIMEOUT.value,
+                timeout=timeout,
+                elapsed_seconds=elapsed_seconds,
+                converted_error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.TIMEOUT)
+        LOG.warning(
+            "turn-intent classifier provider failed",
+            failure_kind=TurnIntentClassifierFailureKind.PROVIDER_ERROR.value,
+            error=str(exc),
+        )
+        return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.PROVIDER_ERROR)
 
     classification = _turn_intent_classification_from_raw(raw)
     if classification is None:
-        LOG.warning("turn-intent classifier returned malformed output")
-        return None
+        LOG.warning(
+            "turn-intent classifier returned malformed output",
+            failure_kind=TurnIntentClassifierFailureKind.MALFORMED_OUTPUT.value,
+        )
+        return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.MALFORMED_OUTPUT)
 
     with copilot_span("turn_intent_classifier", data=classification.to_trace_data()):
         LOG.info("turn-intent classifier decision", **classification.to_trace_data())
-    return classification
+    return TurnIntentClassifierResult.success(classification)
 
 
 _PRIOR_RUN_OUTPUT_PREFIX = "  output:"
@@ -677,7 +752,7 @@ def build_turn_intent(
     workflow_permanent_id: str | None = None,
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
-    classification: TurnIntentClassification | None = None,
+    classifier_result: TurnIntentClassifierResult | None = None,
 ) -> TurnIntent:
     has_workflow = bool((workflow_yaml or "").strip())
     has_prior_context = bool((global_llm_context or "").strip())
@@ -719,7 +794,35 @@ def build_turn_intent(
     confidence = 0.2 if (has_workflow or has_prior_context or chat_history) else 0.0
     missing_context_question = None
 
+    classification = classifier_result.classification if classifier_result and classifier_result.is_success else None
     has_prior_run_signal = workflow_run_id is not None or _has_structured_prior_run_signal(global_llm_context)
+
+    if classification is not None and TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in classification.reason_codes:
+        infeasibility_question = (classification.missing_context_question or "").strip()
+        if not infeasibility_question:
+            # Questionless infeasibility fails open: drop the verdict and proceed at request-policy
+            # authority rather than stranding the turn in an answerless CLARIFY.
+            LOG.warning("turn-intent dropped questionless structural-infeasibility verdict, proceeding")
+            classification = classification.model_copy(
+                update={
+                    "mode": TurnIntentMode.UNKNOWN,
+                    "reason_codes": [
+                        code
+                        for code in classification.reason_codes
+                        if code != TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE
+                    ],
+                }
+            )
+        elif classification.mode != TurnIntentMode.CLARIFY:
+            # Force CLARIFY so the pre-loop bail fires; otherwise the turn enters the agent loop with
+            # mutation authority on a blocked request. Clear edit targets that don't belong on a CLARIFY.
+            classification = classification.model_copy(
+                update={
+                    "mode": TurnIntentMode.CLARIFY,
+                    "expected_output": TurnIntentExpectedOutput.CLARIFICATION,
+                    "target_entities": {},
+                }
+            )
 
     if request_policy.raw_secret_detected and request_policy.raw_secret_handling != "redacted_draft":
         mode = TurnIntentMode.REFUSE
@@ -781,7 +884,24 @@ def build_turn_intent(
     if _user_signals_non_progress(user_message, chat_history):
         reason_codes.append(TurnIntentReasonCode.USER_NON_PROGRESS)
 
-    if mode == TurnIntentMode.UNKNOWN and has_prior_run_signal:
+    has_request_policy_update_or_run_authority = authority.may_update_workflow or authority.may_run_blocks
+    suppress_prior_run_recovery = (
+        mode == TurnIntentMode.UNKNOWN
+        and has_prior_run_signal
+        and classifier_result is not None
+        and classifier_result.is_transient_failure
+        and has_request_policy_update_or_run_authority
+    )
+    if suppress_prior_run_recovery:
+        mode = TurnIntentMode.BUILD
+        expected_output = (
+            TurnIntentExpectedOutput.WORKFLOW_UPDATE
+            if has_workflow or has_prior_context or workflow_id or workflow_permanent_id
+            else TurnIntentExpectedOutput.WORKFLOW_DRAFT
+        )
+        confidence = max(confidence, 0.6)
+        reason_codes.append(TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK)
+    elif mode == TurnIntentMode.UNKNOWN and has_prior_run_signal:
         mode = TurnIntentMode.DIAGNOSE
         expected_output = TurnIntentExpectedOutput.RUN_RESULT
         reason_codes.append(TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT)
@@ -800,13 +920,23 @@ def build_turn_intent(
         authority.may_update_workflow = False
         authority.may_run_blocks = False
         authority.requires_user_input = True
-    elif mode == TurnIntentMode.DIAGNOSE and RequiredContextKey.LATEST_RUN_RESULT not in required_context:
-        authority.may_update_workflow = False
-        authority.may_run_blocks = False
-        required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
     elif mode == TurnIntentMode.DIAGNOSE:
         authority.may_update_workflow = False
-        authority.may_run_blocks = False
+        retest_mandated = (
+            request_policy.testing_intent == "require_test"
+            and request_policy.allow_run_blocks
+            and classification is not None
+            and classification.mode == TurnIntentMode.DIAGNOSE
+        )
+        if retest_mandated:
+            # RequestPolicy owns testing policy; an explicit require_test re-run must not be inverted
+            # by the diagnose classification.
+            authority.may_run_blocks = True
+            reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE)
+        else:
+            authority.may_run_blocks = False
+        if RequiredContextKey.LATEST_RUN_RESULT not in required_context:
+            required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
 
     authority.may_read_run_context = mode == TurnIntentMode.DIAGNOSE
 

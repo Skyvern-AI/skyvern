@@ -31,7 +31,7 @@ import {
   useReactFlow,
   Edge,
 } from "@xyflow/react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
@@ -47,11 +47,19 @@ import {
   StreamModeBadge,
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
+import { type BrowserSession as BrowserSessionData } from "@/routes/workflows/types/browserSessionTypes";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
+import {
+  DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
+  DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS,
+  formatBrowserSessionRemainingTime,
+  getBrowserSessionRemainingMs,
+} from "../hooks/debugSessionLease";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
@@ -141,7 +149,14 @@ import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
+import { useStudioShellContext } from "../studio/StudioShellContext";
+import {
+  STUDIO_COPILOT_RAIL_WIDTH,
+  STUDIO_COPILOT_WIDTH,
+} from "../studio/constants";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
+import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
 
 import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
@@ -187,6 +202,9 @@ type Props = Pick<FlowRendererProps, "initialTitle" | "workflow"> & {
   initialNodes: Array<AppNode>;
   initialEdges: Array<Edge>;
   showBrowser?: boolean;
+  // When embedded in the Spine+Stage StudioShell, the shell provides the top
+  // bar, so Workspace suppresses its own floating WorkflowHeader.
+  embedded?: boolean;
 };
 
 export type AddNodeProps = {
@@ -213,7 +231,13 @@ function bash(text: string, alternateText?: string) {
   );
 }
 
-function CopyAndExplainCode({ code }: { code: string }) {
+function CopyAndExplainCode({
+  code,
+  showCopy = true,
+}: {
+  code: string;
+  showCopy?: boolean;
+}) {
   const [isOpen, setIsOpen] = useState(false);
   const numCodeLines = code.split("\n").length;
 
@@ -258,7 +282,7 @@ function CopyAndExplainCode({ code }: { code: string }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <CopyText text={code} />
+      {showCopy ? <CopyText text={code} /> : null}
     </div>
   );
 }
@@ -292,9 +316,23 @@ function Workspace({
   initialEdges,
   initialTitle,
   showBrowser = false,
+  embedded = false,
   workflow,
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
+  const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
+  const studioCopilotCollapsed = useStudioShellStore((s) => s.copilotCollapsed);
+  const studioSetCopilotCollapsed = useStudioShellStore(
+    (s) => s.setCopilotCollapsed,
+  );
+  const studioSetTab = useStudioShellStore((s) => s.setTab);
+  // The studio canvas sits right of the Copilot column; offset the fit by the
+  // column width so the chain centers on the whole page, not just the pane.
+  const studioCanvasCenterOffset = embedded
+    ? studioCopilotCollapsed
+      ? STUDIO_COPILOT_RAIL_WIDTH
+      : STUDIO_COPILOT_WIDTH
+    : 0;
   const location = useLocation();
   const navigate = useNavigate();
   const locationState = location.state as { copilotMessage?: unknown } | null;
@@ -311,6 +349,9 @@ function Workspace({
   }, [initialCopilotMessage, location.pathname, location.search, navigate]);
   const [searchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
+  const headlessTurnDrainEnabled = ["1", "true"].includes(
+    (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
+  );
   const [timelineMode, setTimelineMode] = useState("wide");
   const [page, setPage] = useState(1);
   const [nudge, setNudge] = useState(false);
@@ -349,7 +390,9 @@ function Workspace({
         ? frozenSidebarOpenRef.current
         : blockSidebarOpen
       : false;
-  const blockSidebarWidth = useBlockSidebarWidthStore((s) => s.width);
+  const renderedBlockSidebarWidth = useBlockSidebarWidthStore(
+    (s) => s.renderedWidth,
+  );
   const handleOnSave = useSaveWorkflow();
   const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -408,6 +451,16 @@ function Workspace({
   const [isCopilotOpen, setIsCopilotOpen] = useState(
     () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
   );
+  // Open the copilot panel when a code block requests a goal-driven (re)build,
+  // so the user can watch the scout and the generated block apply.
+  const copilotPendingBuild = useCopilotActionStore(
+    (state) => state.pendingBuild,
+  );
+  useEffect(() => {
+    if (copilotPendingBuild) {
+      setIsCopilotOpen(true);
+    }
+  }, [copilotPendingBuild]);
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
@@ -618,6 +671,7 @@ function Workspace({
     workflowPermanentId,
     enabled: shouldFetchDebugSession && !!workflowPermanentId,
     isRateLimited,
+    keepAliveBrowserSession: true,
   });
 
   const activeDebugSession = debugSession ?? null;
@@ -634,14 +688,42 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
+  // Embedded: the shell owns the stream, so bind the copilot once the backend
+  // session exists — else it gets a null id and the backend spins a separate browser.
   const copilotRequiresLiveBrowser =
-    showBrowser && shouldFetchDebugSession && !isRateLimited;
+    (showBrowser || embedded) && shouldFetchDebugSession && !isRateLimited;
   // readyBrowserSessionId is keyed to the browser session id rather than a
   // bare boolean: when activeDebugSession's id changes, stale ready state
   // from the previous session cannot leak into the next render.
-  const copilotLiveBrowserReady = Boolean(
-    readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
-  );
+  const copilotLiveBrowserReady = resolveCopilotLiveBrowserReady({
+    displayReady: Boolean(
+      readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
+    ),
+    hasBackendSession: Boolean(liveBrowserSessionId),
+    headlessTurnDrainEnabled: headlessTurnDrainEnabled || embedded,
+  });
+  const debugSessionExpiryWarningKeyRef = useRef<string | null>(null);
+
+  const { data: liveBrowserSession, dataUpdatedAt: liveBrowserSessionNowMs } =
+    useQuery<BrowserSessionData>({
+      queryKey: ["browserSession", liveBrowserSessionId],
+      queryFn: async () => {
+        if (!liveBrowserSessionId) {
+          throw new Error("Cannot fetch browser session without an ID");
+        }
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<BrowserSessionData>(
+          `/browser_sessions/${liveBrowserSessionId}`,
+        );
+        return response.data;
+      },
+      enabled:
+        Boolean(liveBrowserSessionId) &&
+        shouldFetchDebugSession &&
+        !isRateLimited,
+      refetchInterval: DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
+      refetchOnWindowFocus: true,
+    });
 
   const handleLiveBrowserReadyChange = useCallback(
     (ready: boolean, sessionId: string | null) => {
@@ -651,6 +733,50 @@ function Workspace({
   );
 
   useBrowserLoadingFlag(shouldFetchDebugSession, readyBrowserSessionId);
+
+  useEffect(() => {
+    if (!liveBrowserSession || liveBrowserSession.completed_at) {
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    const remainingMs = getBrowserSessionRemainingMs(
+      liveBrowserSession,
+      liveBrowserSessionNowMs,
+    );
+    if (remainingMs !== null && remainingMs <= 0) {
+      if (debugSessionExpiryWarningKeyRef.current) {
+        toast({
+          variant: "destructive",
+          title: "Browser session expired",
+          description: "Start a new debug browser to continue.",
+        });
+      }
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    if (
+      remainingMs === null ||
+      remainingMs > DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS
+    ) {
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    const warningKey = `${liveBrowserSession.browser_session_id}:${liveBrowserSession.started_at}:${liveBrowserSession.timeout}`;
+    if (debugSessionExpiryWarningKeyRef.current === warningKey) {
+      return;
+    }
+
+    debugSessionExpiryWarningKeyRef.current = warningKey;
+    const remainingTime = formatBrowserSessionRemainingTime(remainingMs);
+    toast({
+      variant: "warning",
+      title: "Browser session expiring soon",
+      description: `This debug browser expires in ${remainingTime}. Skyvern renews it automatically while this view is open, but may open a replacement browser if this lease can no longer be renewed.`,
+    });
+  }, [liveBrowserSession, liveBrowserSessionNowMs]);
 
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
@@ -712,7 +838,12 @@ function Workspace({
   // payload resolves.
   const cacheKeyInitWpidRef = useRef<string | null>(null);
   useEffect(() => {
-    useWorkflowPanelStore.getState().setSelectedBlockId(null);
+    // Studio defaults the selection to the start node on open (legacy keeps it
+    // empty); fires only on workflow change, so tab-switch selection persists.
+    const startNodeId = embedded
+      ? (initialNodes.find((node) => node.type === "start")?.id ?? null)
+      : null;
+    useWorkflowPanelStore.getState().setSelectedBlockId(startNodeId);
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     cacheKeyInitWpidRef.current = null;
@@ -725,6 +856,9 @@ function Workspace({
     } else {
       setShouldFetchDebugSession(false);
     }
+    // initialNodes/embedded read from the mount closure on purpose; as deps they
+    // would re-fire this reset on every workflow refetch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workflowPermanentId, queryClient]);
 
   useEffect(() => {
@@ -1249,6 +1383,7 @@ function Workspace({
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+    useWorkflowPanelStore.getState().setSelectedBlockId(id);
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -1284,6 +1419,7 @@ function Workspace({
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
       browserProfileId: workflowData.browser_profile_id ?? null,
+      browserProfileKey: workflowData.browser_profile_key ?? null,
       model: workflowData.model ?? null,
       maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
       maxElapsedTimeMinutes: workflowData.max_elapsed_time_minutes ?? null,
@@ -1359,6 +1495,7 @@ function Workspace({
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
       browserProfileId: selectedVersion.browser_profile_id ?? null,
+      browserProfileKey: selectedVersion.browser_profile_key ?? null,
       model: selectedVersion.model,
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
       maxElapsedTimeMinutes: selectedVersion.max_elapsed_time_minutes ?? null,
@@ -1399,7 +1536,7 @@ function Workspace({
       className="relative h-full w-full"
       style={
         {
-          [BLOCK_SIDEBAR_WIDTH_VAR]: `${blockSidebarWidth}px`,
+          [BLOCK_SIDEBAR_WIDTH_VAR]: `${renderedBlockSidebarWidth}px`,
         } as React.CSSProperties
       }
     >
@@ -1486,26 +1623,57 @@ function Workspace({
       </Dialog>
 
       {/* header panel */}
-      <div
-        className={cn(
-          "absolute left-6 top-8 z-40 h-20 transition-all duration-300 ease-out",
-          headerEffectiveSidebarOpen
-            ? HEADER_RIGHT_INSET_OPEN
-            : HEADER_RIGHT_INSET_CLOSED,
-        )}
-        style={{
-          transform: headerCollapsed
-            ? "translateY(calc(-100% - 2rem))"
-            : "translateY(0)",
-        }}
-      >
-        <WorkflowHeader />
-      </div>
+      {!embedded && (
+        <div
+          className={cn(
+            "absolute left-6 top-8 z-40 h-20 transition-all duration-300 ease-out",
+            headerEffectiveSidebarOpen
+              ? HEADER_RIGHT_INSET_OPEN
+              : HEADER_RIGHT_INSET_CLOSED,
+          )}
+          style={{
+            transform: headerCollapsed
+              ? "translateY(calc(-100% - 2rem))"
+              : "translateY(0)",
+          }}
+        >
+          <WorkflowHeader />
+        </div>
+      )}
 
       {/* comparison view (takes precedence over both browser and non-browser modes) */}
       {workflowPanelState.data?.showComparison &&
       workflowPanelState.data?.version1 &&
-      workflowPanelState.data?.version2 ? (
+      workflowPanelState.data?.version2 &&
+      embedded ? (
+        // Studio: a flex row so Agent History docks beside the comparison; the
+        // legacy absolute layout below assumes the old full-width editor.
+        <div className="flex h-full w-full gap-3 overflow-hidden p-3">
+          <div className="min-w-0 flex-1">
+            <WorkflowComparisonPanel
+              key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
+              version1={workflowPanelState.data.version1}
+              version2={workflowPanelState.data.version2}
+              onSelectState={handleSelectState}
+              mode={workflowPanelState.data.mode}
+              onCopilotReviewClose={
+                workflowPanelState.data.onCopilotReviewClose
+              }
+            />
+          </div>
+          {workflowPanelState.active &&
+            workflowPanelState.content === "history" && (
+              <div className="shrink-0">
+                <WorkflowHistoryPanel
+                  workflowPermanentId={workflowPermanentId!}
+                  onCompare={handleCompareVersions}
+                />
+              </div>
+            )}
+        </div>
+      ) : workflowPanelState.data?.showComparison &&
+        workflowPanelState.data?.version1 &&
+        workflowPanelState.data?.version2 ? (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           {/* comparison view */}
           <div
@@ -1533,7 +1701,8 @@ function Workspace({
           {workflowPanelState.active && (
             <div
               className={cn(
-                "absolute top-[8.5rem] z-30 transition-all duration-300 ease-out",
+                "absolute z-30 transition-all duration-300 ease-out",
+                embedded ? "top-3" : "top-[8.5rem]",
                 blockSidebarOpen
                   ? HEADER_RIGHT_INSET_OPEN
                   : HEADER_RIGHT_INSET_CLOSED,
@@ -1543,10 +1712,11 @@ function Workspace({
                   workflowPanelState.content === "nodeLibrary"
                     ? "calc(100vh - 14rem)"
                     : "unset",
-                transform: headerCollapsed
-                  ? "translateY(calc(-100% - 8.5rem))"
-                  : "translateY(0)",
-                opacity: headerCollapsed ? 0 : 1,
+                transform:
+                  !embedded && headerCollapsed
+                    ? "translateY(calc(-100% - 8.5rem))"
+                    : "translateY(0)",
+                opacity: !embedded && headerCollapsed ? 0 : 1,
               }}
             >
               {workflowPanelState.content === "cacheKeyValues" && (
@@ -1608,6 +1778,8 @@ function Workspace({
                 onEdgesChange={onEdgesChange}
                 initialTitle={initialTitle}
                 workflow={workflow}
+                centerOffsetX={studioCanvasCenterOffset}
+                embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
@@ -1617,7 +1789,7 @@ function Workspace({
               {/* sub panels */}
               {workflowPanelState.active && (
                 <>
-                  {workflowPanelState.content === "schedules" && (
+                  {!embedded && workflowPanelState.content === "schedules" && (
                     <div
                       className="absolute inset-0 z-20"
                       onClick={closeWorkflowPanel}
@@ -1625,7 +1797,10 @@ function Workspace({
                   )}
                   <div
                     className={cn(
-                      "absolute top-[8.5rem] z-30 transition-all duration-300 ease-out",
+                      "absolute z-30 transition-all duration-300 ease-out",
+                      // Studio's top bar is above the canvas, so the panel drops
+                      // from the canvas top; legacy's header is inside it.
+                      embedded ? "top-3" : "top-[8.5rem]",
                       blockSidebarOpen
                         ? HEADER_RIGHT_INSET_OPEN
                         : HEADER_RIGHT_INSET_CLOSED,
@@ -1635,10 +1810,11 @@ function Workspace({
                         workflowPanelState.content === "nodeLibrary"
                           ? "calc(100vh - 14rem)"
                           : "unset",
-                      transform: headerCollapsed
-                        ? "translateY(calc(-100% - 8.5rem))"
-                        : "translateY(0)",
-                      opacity: headerCollapsed ? 0 : 1,
+                      transform:
+                        !embedded && headerCollapsed
+                          ? "translateY(calc(-100% - 8.5rem))"
+                          : "translateY(0)",
+                      opacity: !embedded && headerCollapsed ? 0 : 1,
                     }}
                   >
                     {workflowPanelState.content === "cacheKeyValues" && (
@@ -1664,16 +1840,18 @@ function Workspace({
                         }}
                       />
                     )}
-                    {workflowPanelState.content === "parameters" && (
-                      <div className="z-30">
-                        <WorkflowParametersPanel />
-                      </div>
-                    )}
-                    {workflowPanelState.content === "schedules" && (
-                      <div className="z-30">
-                        <WorkflowSchedulePanel onClose={closeWorkflowPanel} />
-                      </div>
-                    )}
+                    {!embedded &&
+                      workflowPanelState.content === "parameters" && (
+                        <div className="z-30">
+                          <WorkflowParametersPanel />
+                        </div>
+                      )}
+                    {!embedded &&
+                      workflowPanelState.content === "schedules" && (
+                        <div className="z-30">
+                          <WorkflowSchedulePanel onClose={closeWorkflowPanel} />
+                        </div>
+                      )}
                     {workflowPanelState.content === "history" && (
                       <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
                         <WorkflowHistoryPanel
@@ -2154,7 +2332,14 @@ function Workspace({
       )}
 
       <WorkflowCopilotChat
-        isOpen={showBrowser && isCopilotOpen}
+        isOpen={
+          embedded ? !studioCopilotCollapsed : showBrowser && isCopilotOpen
+        }
+        docked={embedded}
+        portalTarget={embedded ? studioCopilotPortalEl : undefined}
+        onCollapse={
+          embedded ? () => studioSetCopilotCollapsed(true) : undefined
+        }
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
@@ -2258,6 +2443,8 @@ function Workspace({
               extra_http_headers: extraHttpHeaders,
               cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
+              browser_profile_id: saveData.settings.browserProfileId,
+              browser_profile_key: saveData.settings.browserProfileKey,
               model: saveData.settings.model,
               totp_verification_url: saveData.workflow.totp_verification_url,
               totp_identifier: null,
@@ -2326,8 +2513,12 @@ function Workspace({
               }
             };
 
-            // Hide chat and show comparison
+            // Hide chat and show comparison. The comparison renders on the
+            // editor canvas, so surface the editor tab when docked in the studio.
             setIsCopilotOpen(false);
+            if (embedded) {
+              studioSetTab("editor");
+            }
             setWorkflowPanelState({
               active: false,
               content: "history",

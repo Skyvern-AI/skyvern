@@ -89,10 +89,30 @@ def test_backfill_writes_both_fields_together() -> None:
     assert result.narrative_payload["verifiedSuccess"] is False
 
 
-def test_backfill_verified_success_true_when_gate_passes() -> None:
+def test_backfill_verified_success_requires_adjudicated_evidence() -> None:
+    # The legacy run-status conjunction still ends the turn but no longer backs
+    # a verified-success claim: without judge-confirmed outcome evidence the
+    # claim tier renders built-but-unverified.
     result = _result(_verified_goal_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert result.narrative_payload["responseKind"] == "build"
+    assert result.narrative_payload["verifiedSuccess"] is False
+
+
+def test_backfill_verified_success_true_when_outcome_fully_verified() -> None:
+    from skyvern.forge.sdk.copilot.completion_verification import (
+        CompletionVerificationResult,
+        CriterionVerdict,
+    )
+
+    ctx = _verified_goal_ctx()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    assert result.narrative_payload is not None
     assert result.narrative_payload["verifiedSuccess"] is True
 
 

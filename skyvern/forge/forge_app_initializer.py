@@ -31,7 +31,7 @@ def start_forge_app() -> ForgeApp:
 
     if settings.ADDITIONAL_MODULES:
         for module in settings.ADDITIONAL_MODULES:
-            LOG.info("Loading additional module to set up api app", module=module)
+            LOG.debug("Loading additional module to set up api app", module=module)
             app_module = __import__(module)
             configure_app_fn = getattr(app_module, "configure_app", None)
             if not configure_app_fn:

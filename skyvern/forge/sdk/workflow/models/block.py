@@ -11,6 +11,7 @@ import json
 import keyword
 import os
 import re
+import shutil
 import smtplib
 import textwrap
 import uuid
@@ -27,7 +28,6 @@ import aiohttp
 import docx
 import filetype
 import pandas as pd
-import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
@@ -42,18 +42,23 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
+    MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
+    PDF_OCR_PAGE_CONCURRENCY,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
+    FailedToGetTOTPVerificationCode,
     MalformedBranchEvaluationError,
     MissingBrowserState,
     MissingBrowserStatePage,
     MissingStarterUrl,
+    NoTOTPVerificationCodeFound,
     PDFParsingError,
     SkyvernException,
     TaskNotFound,
@@ -72,6 +77,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     is_remote_url,
     parse_uri_to_path,
+    resolve_run_download_id,
     validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -83,12 +89,12 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
@@ -117,6 +123,12 @@ from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
     jinja_json_finalize_strict_env,
+    render_templates_in_json_value,
+)
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    CODE_BLOCK_FILENAME,
+    RecordingPage,
+    user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -125,8 +137,10 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     ParameterType,
     WorkflowParameter,
+    WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -136,11 +150,15 @@ from skyvern.schemas.workflows import (
     FileType,
     FileUploadDestination,
 )
+from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -196,7 +214,7 @@ async def capture_block_download_baseline(
         async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
             baseline_files = await app.STORAGE.get_downloaded_files(
                 organization_id=organization_id,
-                run_id=context.run_id or workflow_run_id,
+                run_id=resolve_run_download_id(context, fallback_run_id=workflow_run_id),
             )
             context.loop_internal_state = {
                 DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(fi) for fi in baseline_files],
@@ -250,6 +268,41 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
+
+
+def extract_file_url_from_block_output(value: Any) -> str | None:
+    """Extract a file URL from block output values that wrap downloaded files."""
+    if isinstance(value, dict):
+        downloaded_files = value.get("downloaded_files")
+        if isinstance(downloaded_files, list) and downloaded_files:
+            first_file = downloaded_files[0]
+            if isinstance(first_file, dict):
+                return first_file.get("url") or first_file.get("file_path") or None
+
+        for key in ("artifact_url", "file_url", "file_path"):
+            extracted = value.get(key)
+            if isinstance(extracted, str) and extracted:
+                return extracted
+        return None
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return extract_file_url_from_block_output(parsed)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, dict):
+                return extract_file_url_from_block_output(parsed)
+        except (ValueError, SyntaxError):
+            pass
+    return None
+
+
+def sanitize_filename(filename: str, default: str = "document") -> str:
+    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
+    return sanitized[:200] if sanitized else default
 
 
 def _format_payload_path_segment(key: str) -> str:
@@ -387,6 +440,7 @@ class Block(BaseModel, abc.ABC):
         )
         LOG.info(
             "Registered output parameter value",
+            sampling=True,
             output_parameter_id=self.output_parameter.output_parameter_id,
             workflow_run_id=workflow_run_id,
             output_parameter_value=value,
@@ -440,6 +494,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        download_run_id_override: str | None = None,
     ) -> BrowserState | None:
         """
         Acquire or create browser state for block execution.
@@ -453,8 +508,83 @@ class Block(BaseModel, abc.ABC):
 
         if browser_session_id and organization_id:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+            if browser_state is not None:
+                rebind_run_id = download_run_id_override or resolve_run_download_id(
+                    skyvern_context.current(), fallback_run_id=workflow_run_id
+                )
+                try:
+                    adopted_context = browser_state.browser_context
+                    adopted_browser = adopted_context.browser if adopted_context else None
+                    rebind_page = None if adopted_browser is not None else await browser_state.get_working_page()
+                    if adopted_browser is not None or rebind_page is not None:
+                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id, page=rebind_page)
+                        LOG.info(
+                            "Rebound download dir on adopted persistent session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run_id,
+                            run_id=rebind_run_id,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to rebind download dir on adopted persistent session",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        # A reused browser state (a persistent debug session shared with the copilot, or a
+        # cached workflow-run browser) can have a dead Playwright driver after a prior owner
+        # stopped it — reusing it makes the block's first page.goto raise "Connection closed
+        # while reading from the driver". Rebuild a fresh connection to the same browser first.
+        if browser_state is not None and not browser_state.is_connected():
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            # Reconnect to the session's own remote browser, never the run's (possibly pooled)
+            # browser_address. get_browser_address_if_ready resolves a dead session to None
+            # instead of blocking on the workflow query, so a missing address aborts fast.
+            if browser_session_id and organization_id:
+                try:
+                    browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address_if_ready(
+                        session_id=browser_session_id, organization_id=organization_id
+                    )
+                except Exception:
+                    browser_address = None
+                if not browser_address:
+                    LOG.warning(
+                        "No session browser address available to reconnect; aborting browser setup",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+                    return None
+            else:
+                browser_address = workflow_run.browser_address
+            try:
+                await browser_state.reconnect(
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    cdp_connect_headers=workflow_run.cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+                LOG.info(
+                    "Rebuilt a disconnected browser state before block execution",
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to rebuild disconnected browser state",
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+                return None
 
         if not browser_state:
             workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
@@ -484,6 +614,28 @@ class Block(BaseModel, abc.ABC):
                     workflow_run_id=workflow_run_id,
                 )
                 return None
+
+        if not (browser_session_id and organization_id) and browser_state is not None:
+            rebind_run_id = download_run_id_override or resolve_run_download_id(
+                skyvern_context.current(), fallback_run_id=workflow_run_id
+            )
+            try:
+                owning_browser = browser_state.browser_context.browser if browser_state.browser_context else None
+                rebind_page = None if owning_browser is not None else await browser_state.get_working_page()
+                if owning_browser is not None or rebind_page is not None:
+                    await rebind_download_dir(owning_browser, run_id=rebind_run_id, page=rebind_page)
+                    LOG.info(
+                        "Rebound download dir on workflow-run browser",
+                        workflow_run_id=workflow_run_id,
+                        run_id=rebind_run_id,
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to rebind download dir on workflow-run browser",
+                    workflow_run_id=workflow_run_id,
+                    run_id=rebind_run_id,
+                    exc_info=True,
+                )
 
         return browser_state
 
@@ -711,6 +863,7 @@ class Block(BaseModel, abc.ABC):
             description = json_response.get("summary")
             LOG.info(
                 "Generated description for the workflow run block",
+                sampling=True,
                 description=description,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -799,7 +952,11 @@ class Block(BaseModel, abc.ABC):
                     )
 
             LOG.info(
-                "Executing block", workflow_run_id=workflow_run_id, block_label=self.label, block_type=self.block_type
+                "Executing block",
+                sampling=True,
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                block_type=self.block_type,
             )
             return await self.execute(
                 workflow_run_id,
@@ -1348,6 +1505,7 @@ class BaseTaskBlock(Block):
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     "Task completed",
+                    sampling=True,
                     task_id=updated_task.task_id,
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
@@ -2077,6 +2235,9 @@ class ForLoopBlock(Block):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
 
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
 
@@ -2253,7 +2414,7 @@ class ForLoopBlock(Block):
                             to_downloaded_file_signature(fi)
                             for fi in await app.STORAGE.get_downloaded_files(
                                 organization_id=organization_id or "",
-                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                                run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
                         ]
                 except asyncio.TimeoutError:
@@ -2717,6 +2878,9 @@ class WhileLoopBlock(Block):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
 
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
 
@@ -2980,7 +3144,7 @@ class WhileLoopBlock(Block):
                             to_downloaded_file_signature(fi)
                             for fi in await app.STORAGE.get_downloaded_files(
                                 organization_id=organization_id or "",
-                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                                run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
                         ]
                 except asyncio.TimeoutError:
@@ -3346,6 +3510,114 @@ class Credential(SimpleNamespace):
     pass
 
 
+class CodeBlockStep(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    action_type: ActionType = ActionType.NULL_ACTION
+    line_start: int | None = None
+    line_end: int | None = None
+
+
+class CodeBlockOTPError(Exception):
+    """Sanitized OTP-primitive error: never includes the identifier, URL, code, or seed."""
+
+
+def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
+    fresh_key = workflow_run_context.generate_random_secret_id()
+    workflow_run_context.secrets[fresh_key] = value
+
+
+async def _resolve_code_block_otp(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> str:
+    """Resolve a fresh OTP at call time for one credential: re-mint its TOTP (the staleness
+    fix) or poll its email/SMS/magic-link, registering the value as a secret before return.
+    The run context is re-resolved from workflow_run_id, never captured in the bound method's
+    closure, so user code cannot reach the seed through the method's cells."""
+    if not workflow_run_id:
+        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if workflow_run_context is None:
+        raise CodeBlockOTPError("OTP is unavailable: the workflow run context could not be resolved.")
+
+    otp_value = otp_service.try_generate_totp_for_credential(
+        workflow_run_context, credential_parameter_key, workflow_run_id
+    )
+    if otp_value is not None:
+        _register_code_block_secret(workflow_run_context, otp_value.value)
+        return otp_value.value
+
+    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
+    if not totp_identifier:
+        raise CodeBlockOTPError(
+            "No OTP source is configured for this credential. "
+            "Add a TOTP secret or an email/SMS identifier to the credential."
+        )
+
+    if not organization_id:
+        raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
+
+    # Run-start anchor disqualifies codes that predate this run (identifiers are shared across runs).
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
+    if workflow_run is None:
+        raise CodeBlockOTPError("OTP is unavailable: the workflow run could not be loaded.")
+
+    try:
+        polled = await asyncio.wait_for(
+            otp_service.poll_otp_value(
+                organization_id=organization_id,
+                workflow_id=workflow_run.workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                totp_identifier=totp_identifier,
+                created_after=workflow_run.started_at,
+            ),
+            timeout=budget_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
+    except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
+        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+
+    if polled is None:
+        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+
+    _register_code_block_secret(workflow_run_context, polled.value)
+    return polled.value
+
+
+def _bind_code_block_otp(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+) -> Callable[[], Awaitable[str]]:
+    """Build the awaitable ``otp`` method bound onto a code block's Credential, closing over
+    only opaque ids so the seed stays unreachable from the method's cells."""
+
+    async def otp() -> str:
+        return await _resolve_code_block_otp(
+            credential_parameter_key,
+            organization_id,
+            workflow_run_id,
+            budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+        )
+
+    return otp
+
+
+async def _code_block_otp_builtin(credential: object) -> str:
+    """Top-level ``await otp(credential)`` sugar that forwards to the credential's bound otp()."""
+    bound = getattr(credential, "otp", None)
+    if not callable(bound):
+        raise CodeBlockOTPError("otp() expects a credential with an OTP source.")
+    return await bound()
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -3353,6 +3625,8 @@ class CodeBlock(Block):
 
     code: str
     parameters: list[PARAMETER_TYPE] = []
+    prompt: str | None = None
+    steps: list[CodeBlockStep] | None = None
 
     # Dangerous attribute names that must never be accessed in user code.
     # This blocks subprocess creation, OS access, and sandbox-escape primitives.
@@ -3489,10 +3763,11 @@ class CodeBlock(Block):
             "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
             "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
+            "otp": _code_block_otp_builtin,
         }
 
     def generate_async_user_function(
-        self, code: str, page: Page, parameters: dict[str, Any] | None = None
+        self, code: str, page: Page | RecordingPage, parameters: dict[str, Any] | None = None
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -3516,7 +3791,9 @@ async def wrapper({default_args}):
         safe_vars["page"] = page
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
-        exec(full_code, safe_vars, runtime_variables)
+        # Compile under a recognizable filename so tracebacks map back to user code lines.
+        compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
         if not parameter_defaults:
             return user_function
@@ -3543,6 +3820,52 @@ async def wrapper({default_args}):
             return await user_function()
         return await asyncio.wait_for(user_function(), timeout=timeout_seconds)
 
+    async def _ensure_run_recording_artifact(
+        self,
+        browser_state: BrowserState,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None = None,
+    ) -> None:
+        """Register the run-scoped RECORDING row a fresh-browser code block otherwise lacks; no-op when the
+        browser stays open on completion (persistent session or pinned browser_address)."""
+        if browser_session_id:
+            return
+        # get_video_artifacts returns the same VideoArtifact objects held on browser_state, so the id
+        # written below is observed by the early-return guard on later blocks sharing the browser.
+        # Idempotency assumes those blocks run sequentially (no concurrent first-time registration).
+        browser_artifacts = browser_state.browser_artifacts
+        if not browser_artifacts or all(va.video_artifact_id for va in browser_artifacts.video_artifacts):
+            return
+        try:
+            # A pinned browser_address run also keeps its browser open, so its per-run webm never
+            # finalizes — skip it like a session run and let the clip path serve the recording.
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id)
+            if workflow_run is not None and workflow_run.browser_address:
+                return
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                workflow_run_id=workflow_run_id, browser_state=browser_state, finalize=False
+            )
+            pending_indexes = [idx for idx, va in enumerate(video_artifacts) if not va.video_artifact_id]
+            if not pending_indexes:
+                return
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
+            )
+            for idx in pending_indexes:
+                video_artifacts[idx].video_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                    workflow_run_block=workflow_run_block,
+                    artifact_type=ArtifactType.RECORDING,
+                    data=video_artifacts[idx].video_data,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to register run-scoped recording artifact for code block",
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -3551,6 +3874,100 @@ async def wrapper({default_args}):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
+        if self.prompt:
+            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
+                self.prompt, workflow_run_context
+            )
+
+    async def _register_downloaded_files(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        download_run_id: str | None = None,
+    ) -> list[FileInfo]:
+        # Register up front so the block output carries downloaded_file_urls for
+        # downstream blocks in the same run; workflow finalization re-runs the save safely.
+        if not organization_id:
+            return []
+        storage_run_id = download_run_id or workflow_run_id
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=storage_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "CodeBlock failed to register downloaded files; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=storage_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout getting downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "CodeBlock failed to read back downloaded files; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _materialize_file_parameter_path(
+        self,
+        value: str | dict[str, Any] | None,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+    ) -> str | dict[str, Any] | None:
+        uri: str | None = None
+        if isinstance(value, str):
+            uri = value
+        elif isinstance(value, dict):
+            uri = value.get("s3uri")
+        if not uri or not str(uri).strip():
+            return value
+        try:
+            output_dir = get_download_dir(workflow_run_id)
+            local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
+            # download_file routes managed storage (s3/azure) to a temp file outside the run
+            # dir; copy it under the run dir so it passes validate_local_file_path containment.
+            resolved = os.path.realpath(local_path)
+            allowed_dir = os.path.realpath(output_dir)
+            if not resolved.startswith(allowed_dir + os.sep):
+                contained = os.path.join(output_dir, os.path.basename(local_path))
+                shutil.copyfile(local_path, contained)
+                local_path = contained
+            return validate_local_file_path(local_path, workflow_run_id)
+        except Exception:
+            LOG.warning(
+                "Failed to materialize file parameter to a local path; leaving the original value",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            return value
 
     async def execute(
         self,
@@ -3562,10 +3979,22 @@ async def wrapper({default_args}):
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
 
+        block_context = skyvern_context.current()
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if block_context:
+            await capture_block_download_baseline(
+                block_context,
+                organization_id or workflow_run_context.organization_id or "",
+                workflow_run_id,
+                self.label,
+            )
+
+        resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            download_run_id_override=resolved_download_id,
         )
         if not browser_state:
             return await self.build_block_result(
@@ -3588,8 +4017,14 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
 
-        # get workflow run context
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        await self._ensure_run_recording_artifact(
+            browser_state=browser_state,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
@@ -3604,6 +4039,7 @@ async def wrapper({default_args}):
 
         # get all parameters into a dictionary
         parameter_values = {}
+        credential_parameter_keys: set[str] = set()
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
             if not parameter.parameter_type.is_secret_or_credential() and not (
@@ -3612,8 +4048,18 @@ async def wrapper({default_args}):
                 and parameter.workflow_parameter_type is not None
                 and parameter.workflow_parameter_type.is_credential_type()
             ):
+                if (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+                ):
+                    value = await self._materialize_file_parameter_path(
+                        value,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
                 parameter_values[parameter.key] = value
                 continue
+            credential_parameter_keys.add(parameter.key)
             if isinstance(value, dict):
                 real_secret_values = {}
                 for credential_field, credential_place_holder in value.items():
@@ -3629,7 +4075,10 @@ async def wrapper({default_args}):
                         totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
                         totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
                         if totp_secret:
-                            secret_value = pyotp.TOTP(totp_secret).now()
+                            secret_value = generate_totp_code(totp_secret)
+                            # The pre-minted .totp string is exposed to user code (legacy path),
+                            # so register it for masking like any other resolved secret.
+                            _register_code_block_secret(workflow_run_context, secret_value)
                         else:
                             LOG.warning(
                                 "No TOTP secret found, returning the parameter value as is",
@@ -3639,18 +4088,177 @@ async def wrapper({default_args}):
                     real_secret_value = secret_value if secret_value is not None else credential_place_holder
                     parameter_values[credential_field] = real_secret_value
                     real_secret_values[credential_field] = real_secret_value
-                parameter_values[parameter.key] = Credential(**real_secret_values)
+                credential_namespace = Credential(**real_secret_values)
+                credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
+                parameter_values[parameter.key] = credential_namespace
             else:
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         try:
-            user_function = self.generate_async_user_function(self.code, page, parameter_values)
+            use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_context=workflow_run_context,
+                organization_id=organization_id,
+                block_label=self.label,
+                browser_session_id=browser_session_id,
+            )
+        except CodeBlockRunnerSelectionError as selection_error:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(selection_error),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        if use_codeblock_runner:
+            secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                workflow_run_context=workflow_run_context,
+                parameter_values=parameter_values,
+                credential_parameter_keys=credential_parameter_keys,
+            )
+            if secure_code_block_result is not None:
+                return secure_code_block_result
+
+        workflow_run_block = None
+
+        # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
+        # the standard action/artifact timeline and the agent can later take over on failure.
+        # Promptless blocks have no task and persist neither actions nor screenshots.
+        task: Task | None = None
+        step: Step | None = None
+        if self.prompt:
+            task, step = await app.agent.create_task_and_step_from_code_block(
+                code_block=self,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                task_url=page.url,
+            )
+
+        screenshot_tasks: list[asyncio.Task[None]] = []
+
+        async def _screenshot_sink(action: Action) -> None:
+            # No task means no action row will reference the screenshot, so skip it rather than orphan an artifact.
+            nonlocal workflow_run_block
+            if task is None:
+                return
+            # Every action that reaches this sink is one the recorder chose to surface on the timeline
+            # (goto, click, input, page.evaluate, select, hover, ...), so each one earns a screenshot.
+            # Re-listing eligible types here only drifts from the recorder's maps — which is exactly how
+            # page.evaluate (EXECUTE_JS) ended up with no screenshot.
+            # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
+            # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
+            # only the page-free S3 upload is deferred off the critical path.
+            try:
+                if workflow_run_block is None:
+                    workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                        workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
+                    )
+                run_block = workflow_run_block
+                screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            except Exception:
+                LOG.warning(
+                    "Code block screenshot capture failed",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+                return
+
+            async def _upload() -> None:
+                try:
+                    action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                        workflow_run_block=run_block,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        data=screenshot,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Code block screenshot upload failed",
+                        workflow_run_block_id=workflow_run_block_id,
+                        exc_info=True,
+                    )
+
+            screenshot_tasks.append(asyncio.create_task(_upload()))
+
+        async def _drain_screenshots() -> None:
+            if screenshot_tasks:
+                await asyncio.gather(*screenshot_tasks, return_exceptions=True)
+
+        recording_page = RecordingPage(page, on_action=_screenshot_sink)
+
+        async def _persist_recorded_actions(recorded: list[Action]) -> None:
+            # Best-effort like the screenshot sink: recording must never change block outcome.
+            await _drain_screenshots()
+            if not recorded or task is None or step is None:
+                return
+            try:
+                masked = workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
+                for raw in masked:
+                    action = Action.model_validate(raw)
+                    action.task_id = task.task_id
+                    action.step_id = step.step_id
+                    action.step_order = step.order
+                    action.organization_id = organization_id
+                    await app.DATABASE.workflow_params.create_action(action)
+            except Exception:
+                LOG.warning(
+                    "Failed to persist recorded code block actions",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+
+        finalized = False
+
+        async def _finalize_code_block_task(success: bool) -> None:
+            # Finalize both task and step on every exit path (incl. CancelledError via the finally); idempotent.
+            nonlocal finalized
+            if task is None or finalized:
+                return
+            finalized = True
+            try:
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.completed if success else TaskStatus.failed,
+                )
+                if step is not None:
+                    await app.DATABASE.tasks.update_step(
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        status=StepStatus.completed if success else StepStatus.failed,
+                        output=AgentStepOutput(action_results=[]) if success else None,
+                        is_last=True,
+                        organization_id=organization_id,
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to finalize code block task status",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+
+        try:
+            if task is not None:
+                await app.DATABASE.observer.update_workflow_run_block(
+                    workflow_run_block_id=workflow_run_block_id,
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                )
+            user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
             )
         except InsecureCodeDetected as e:
+            await _drain_screenshots()
+            await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
@@ -3660,6 +4268,8 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         except asyncio.TimeoutError:
+            await _persist_recorded_actions(recording_page.recorded_actions())
+            await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=(
@@ -3673,18 +4283,66 @@ async def wrapper({default_args}):
             )
         except Exception as e:
             exc = CustomizedCodeException(e)
+            failing_line = user_code_line_from_exception(e)
+            # User code can raise an exception carrying a resolved secret (e.g.
+            # `raise Exception(await cred.otp())`); mask before it reaches the persisted reason.
+            failure_reason = workflow_run_context.mask_secrets_in_data(exc.message)
+            recorded = recording_page.recorded_actions()
+            if recording_page.last_recorded_exception() is not e:
+                # The exception did not come from a recorded page call; add a synthetic failure row.
+                recorded.append(
+                    Action(
+                        action_type=ActionType.NULL_ACTION,
+                        status=ActionStatus.failed,
+                        action_order=len(recorded),
+                        description=f"code error at line {failing_line}" if failing_line else "code error",
+                        response=(failure_reason or "")[:500],
+                        output={"code_line": failing_line},
+                    )
+                )
+            await _persist_recorded_actions(recorded)
+            await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
-                failure_reason=exc.message,
+                failure_reason=failure_reason,
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
 
+        else:
+            await _persist_recorded_actions(recording_page.recorded_actions())
+            await _finalize_code_block_task(success=True)
+        finally:
+            # Safety net for paths the except arms miss (CancelledError, update_workflow_run_block failure).
+            await _finalize_code_block_task(success=False)
+
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
         )
+        # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
+        # reach captured locals, the persisted output, or the logged value. Mirrors
+        # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
+        result = workflow_run_context.mask_secrets_in_data(result)
+
+        downloaded_files = await self._register_downloaded_files(
+            organization_id=organization_id or workflow_run_context.organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            download_run_id=resolved_download_id,
+        )
+        current_context = skyvern_context.current()
+        downloaded_files = filter_downloaded_files_for_current_iteration(
+            downloaded_files,
+            current_context.loop_internal_state if current_context else None,
+        )
+        if downloaded_files and not isinstance(result, dict):
+            result = {"value": result} if result is not None else {}
+        if downloaded_files and isinstance(result, dict):
+            result["downloaded_files"] = [fi.model_dump() for fi in downloaded_files]
+            result["downloaded_file_urls"] = [fi.url for fi in downloaded_files]
+            result["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in downloaded_files if fi.artifact_id]
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(
@@ -4065,7 +4723,7 @@ class UploadToS3Block(Block):
             context = skyvern_context.current()
             self.path = str(
                 get_path_for_workflow_download_directory(
-                    context.run_id if context and context.run_id else workflow_run_id
+                    resolve_run_download_id(context, fallback_run_id=workflow_run_id)
                 ).absolute()
             )
 
@@ -4143,6 +4801,14 @@ class FileUploadBlock(Block):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     path: str | None = None
+    continue_on_empty: bool = Field(
+        default=False,
+        description=(
+            "When the run download directory has no files, allow the empty upload only after confirming no registered, "
+            "browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an "
+            "empty upload."
+        ),
+    )
 
     def get_all_parameters(
         self,
@@ -4267,6 +4933,194 @@ class FileUploadBlock(Block):
             azure_blob_name=blob_name,
         )
 
+    @staticmethod
+    def _candidate_download_signal_run_ids(
+        *,
+        context: SkyvernContext | None,
+        workflow_run_id: str,
+        run_download_id: str | None,
+    ) -> list[str]:
+        candidate_run_ids: list[str] = []
+        for candidate in (
+            run_download_id,
+            workflow_run_id,
+            context.run_id if context else None,
+            context.workflow_run_id if context else None,
+        ):
+            if candidate and candidate not in candidate_run_ids:
+                candidate_run_ids.append(candidate)
+        if not candidate_run_ids and context and context.task_id:
+            candidate_run_ids.append(context.task_id)
+        return candidate_run_ids
+
+    def _get_files_to_upload_from_download_dir(
+        self,
+        *,
+        download_files_path: str,
+        max_file_count: int,
+    ) -> list[str]:
+        files_to_upload = []
+        if os.path.isdir(download_files_path):
+            files = os.listdir(download_files_path)
+            if len(files) > max_file_count:
+                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
+            for file in files:
+                if os.path.isdir(os.path.join(download_files_path, file)):
+                    LOG.warning("FileUploadBlock Skipping directory", file=file)
+                    continue
+                files_to_upload.append(os.path.join(download_files_path, file))
+        return files_to_upload
+
+    def _get_files_in_alternate_candidate_download_dirs(
+        self,
+        *,
+        context: SkyvernContext | None,
+        workflow_run_id: str,
+        run_download_id: str | None,
+        download_files_path: str,
+        max_file_count: int,
+    ) -> tuple[list[str] | None, str]:
+        """Return alternate local files plus a failure-reason count label.
+
+        None means the local evidence could not be trusted, so execute() fails closed rather than no-oping.
+        """
+        for candidate_run_id in self._candidate_download_signal_run_ids(
+            context=context,
+            workflow_run_id=workflow_run_id,
+            run_download_id=run_download_id,
+        ):
+            candidate_download_files_path = str(get_path_for_workflow_download_directory(candidate_run_id).absolute())
+            if candidate_download_files_path == download_files_path:
+                continue
+            try:
+                alternate_files = self._get_files_to_upload_from_download_dir(
+                    download_files_path=candidate_download_files_path,
+                    max_file_count=max_file_count,
+                )
+            except ValueError:
+                LOG.warning(
+                    "FileUploadBlock found too many files in an alternate candidate download directory",
+                    workflow_run_id=workflow_run_id,
+                    candidate_run_id=candidate_run_id,
+                    download_files_path=download_files_path,
+                    candidate_download_files_path=candidate_download_files_path,
+                    exc_info=True,
+                )
+                return None, "too_many"
+            if alternate_files:
+                LOG.warning(
+                    "FileUploadBlock found files in an alternate candidate download directory",
+                    workflow_run_id=workflow_run_id,
+                    candidate_run_id=candidate_run_id,
+                    download_files_path=download_files_path,
+                    candidate_download_files_path=candidate_download_files_path,
+                    file_count=len(alternate_files),
+                )
+                return alternate_files, str(len(alternate_files))
+        return [], "0"
+
+    async def _get_browser_session_downloaded_files_for_empty_scan(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        browser_session_id: str | None,
+    ) -> list[str] | None:
+        if not browser_session_id:
+            # No persistent-session namespace exists to inspect, so this signal cannot contain downloads.
+            return []
+        if not organization_id:
+            LOG.warning(
+                "FileUploadBlock cannot check browser-session downloads without organization_id",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+            )
+            return None
+
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout checking browser-session downloads for empty FileUploadBlock scan",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+            )
+            return None
+        except Exception:
+            LOG.warning(
+                "Failed to check browser-session downloads for empty FileUploadBlock scan",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _get_registered_downloaded_files_for_empty_scan(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        run_download_id: str | None,
+        context: SkyvernContext | None,
+    ) -> list[FileInfo] | None:
+        """Return registered downloads, or None when the signal is unknown.
+
+        A timeout on any candidate stays unknown even if later candidates might be empty; an empty later lookup cannot
+        prove that the timed-out candidate had no downloads, so the caller fails closed.
+        """
+        if not organization_id:
+            LOG.warning(
+                "FileUploadBlock cannot check registered downloads without organization_id",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+        registered_downloaded_files: list[FileInfo] = []
+        for candidate_run_id in self._candidate_download_signal_run_ids(
+            context=context,
+            workflow_run_id=workflow_run_id,
+            run_download_id=run_download_id,
+        ):
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    registered_downloaded_files.extend(
+                        await app.STORAGE.get_downloaded_files(
+                            organization_id=organization_id,
+                            run_id=candidate_run_id,
+                        )
+                    )
+                    if registered_downloaded_files:
+                        return registered_downloaded_files
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout checking registered downloads for empty FileUploadBlock scan",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    candidate_run_id=candidate_run_id,
+                )
+                return None
+            except Exception:
+                LOG.warning(
+                    "Failed to check registered downloads for empty FileUploadBlock scan",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    candidate_run_id=candidate_run_id,
+                    exc_info=True,
+                )
+                return None
+
+        return registered_downloaded_files
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4327,32 +5181,95 @@ class FileUploadBlock(Block):
             )
 
         context = skyvern_context.current()
-        download_files_path = str(
-            get_path_for_workflow_download_directory(
-                context.run_id if context and context.run_id else workflow_run_id
-            ).absolute()
-        )
+        run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+        download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
 
-        uploaded_uris = []
+        uploaded_uris: list[str] = []
         try:
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             files_to_upload = []
-            if os.path.isdir(download_files_path):
-                files = os.listdir(download_files_path)
-                max_file_count = (
-                    MAX_UPLOAD_FILE_COUNT
-                    if self.storage_type == FileStorageType.S3
-                    else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            max_file_count = (
+                MAX_UPLOAD_FILE_COUNT
+                if self.storage_type == FileStorageType.S3
+                else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            )
+            files_to_upload = self._get_files_to_upload_from_download_dir(
+                download_files_path=download_files_path,
+                max_file_count=max_file_count,
+            )
+
+            if not files_to_upload and not self.continue_on_empty:
+                (
+                    (alternate_files, alternate_file_count),
+                    browser_session_downloaded_files,
+                    registered_downloaded_files,
+                ) = await asyncio.gather(
+                    asyncio.to_thread(
+                        self._get_files_in_alternate_candidate_download_dirs,
+                        context=context,
+                        workflow_run_id=workflow_run_id,
+                        run_download_id=run_download_id,
+                        download_files_path=download_files_path,
+                        max_file_count=max_file_count,
+                    ),
+                    self._get_browser_session_downloaded_files_for_empty_scan(
+                        organization_id=organization_id or workflow_run_context.organization_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        browser_session_id=browser_session_id or (context.browser_session_id if context else None),
+                    ),
+                    self._get_registered_downloaded_files_for_empty_scan(
+                        organization_id=organization_id or workflow_run_context.organization_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        run_download_id=run_download_id,
+                        context=context,
+                    ),
                 )
-                if len(files) > max_file_count:
-                    raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
-                for file in files:
-                    if os.path.isdir(os.path.join(download_files_path, file)):
-                        LOG.warning("FileUploadBlock Skipping directory", file=file)
-                        continue
-                    files_to_upload.append(os.path.join(download_files_path, file))
-            else:
-                files_to_upload.append(download_files_path)
+                if (
+                    registered_downloaded_files == []
+                    and alternate_files == []
+                    and browser_session_downloaded_files == []
+                ):
+                    LOG.info(
+                        "FileUploadBlock empty scan has no registered downloads; treating as no-op",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        download_files_path=download_files_path,
+                        storage_type=self.storage_type,
+                    )
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
+                    return await self.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value=uploaded_uris,
+                        status=BlockStatus.completed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
+                registered_download_count = (
+                    str(len(registered_downloaded_files)) if registered_downloaded_files is not None else "unknown"
+                )
+                browser_session_download_count = (
+                    str(len(browser_session_downloaded_files))
+                    if browser_session_downloaded_files is not None
+                    else "unknown"
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        f"No files found to upload in the run download directory ({download_files_path}); "
+                        f"registered_download_count={registered_download_count}; "
+                        f"alternate_file_count={alternate_file_count}; "
+                        f"browser_session_download_count={browser_session_download_count}; "
+                        f"nothing was sent to {self.storage_type}."
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
             if self.storage_type == FileStorageType.S3:
                 actual_aws_access_key_id = (
@@ -4618,7 +5535,7 @@ class SendEmailBlock(Block):
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
         for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
-            if filename.startswith(("s3://", "azure://", "http://", "https://")):
+            if filename.startswith(("s3://", "gs://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
                 LOG.info("SendEmailBlock Looking for file locally", filename=filename)
@@ -5020,37 +5937,107 @@ class FileParserBlock(Block):
         if extracted_text.strip():
             return extracted_text
 
-        # Scanned / image-based PDF — render pages as images and use vision LLM
+        # Scanned / image-based PDF — render pages as images and OCR each page in
+        # its own vision-LLM call. A single call covering every page collapses a
+        # multi-page document down to the first page or two.
         LOG.info(
             "PDF text extraction returned empty content, falling back to vision LLM OCR",
             file_url=self.file_url,
         )
         try:
-            page_images = render_pdf_pages_as_images(file_path, file_identifier=self.file_url)
+            page_images = await asyncio.to_thread(
+                render_pdf_pages_as_images,
+                file_path,
+                file_identifier=self.file_url,
+                max_pages=MAX_PDF_OCR_PAGES,
+            )
             if not page_images:
                 return extracted_text
-
-            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                self.override_llm_key, default=app.LLM_API_HANDLER
-            )
-            # OCR transcription intentionally skips system_prompt
-            # It still applies to the downstream extract-information-from-file-text call.
-            llm_response = await llm_api_handler(
-                prompt=llm_prompt,
-                prompt_name="extract-text-from-image",
-                screenshots=page_images,
-                force_dict=True,
+            return await self._ocr_pdf_pages(
+                page_images,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-            return llm_response.get("extracted_text", "")
         except Exception:
             LOG.exception(
                 "Failed to extract text from PDF via vision LLM fallback",
                 file_url=self.file_url,
             )
             raise
+
+    async def _ocr_pdf_pages(
+        self,
+        page_images: list[bytes],
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
+        """OCR each rendered PDF page in its own vision-LLM call and concatenate.
+
+        Per-page transcription avoids the single-call collapse where a multi-page
+        document is summarized down to its first page(s). Pages are transcribed with
+        bounded concurrency, reassembled in page order with page markers, and
+        truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
+        """
+        llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            self.override_llm_key, default=app.LLM_API_HANDLER
+        )
+        semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
+
+        async def _ocr_page(page_image: bytes) -> str:
+            async with semaphore:
+                # OCR transcription intentionally skips system_prompt; it still applies
+                # to the downstream extract-information-from-file-text call.
+                llm_response = await llm_api_handler(
+                    prompt=llm_prompt,
+                    prompt_name="extract-text-from-image",
+                    screenshots=[page_image],
+                    force_dict=True,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                return llm_response.get("extracted_text", "") or ""
+
+        page_results = await asyncio.gather(
+            *(_ocr_page(page_image) for page_image in page_images),
+            return_exceptions=True,
+        )
+
+        # A total OCR outage must fail the block, not record an empty success — match the
+        # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
+        errors = [r for r in page_results if isinstance(r, BaseException)]
+        if errors and len(errors) == len(page_results):
+            raise errors[0]
+
+        page_chunks: list[str] = []
+        current_tokens = 0
+        for page_number, result in enumerate(page_results, start=1):
+            if isinstance(result, BaseException):
+                LOG.warning(
+                    "Failed to OCR a PDF page via vision LLM, skipping it",
+                    file_url=self.file_url,
+                    page_number=page_number,
+                    error=str(result),
+                )
+                continue
+            page_text = result.strip()
+            if not page_text:
+                continue
+            chunk = f"--- Page {page_number} ---\n{page_text}"
+            chunk_tokens = count_tokens(chunk)
+            if current_tokens + chunk_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
+                LOG.warning(
+                    "PDF OCR text exceeds token limit, truncating at page boundary",
+                    file_url=self.file_url,
+                    pages_included=page_number - 1,
+                    total_pages=len(page_results),
+                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                )
+                break
+            current_tokens += chunk_tokens
+            page_chunks.append(chunk)
+
+        return "\n\n".join(page_chunks)
 
     async def _parse_image_file(
         self,
@@ -5237,26 +6224,7 @@ class FileParserBlock(Block):
         - JSON string encoding such a dict
         - Python dict-repr string produced by Jinja's default ``str()`` rendering
         """
-        if isinstance(value, dict):
-            downloaded_files = value.get("downloaded_files")
-            if isinstance(downloaded_files, list) and downloaded_files:
-                first_file = downloaded_files[0]
-                if isinstance(first_file, dict):
-                    return first_file.get("url") or None
-            return None
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                return FileParserBlock._extract_file_url_from_block_output(parsed)
-            except (json.JSONDecodeError, ValueError):
-                pass
-            try:
-                parsed = ast.literal_eval(value)
-                if isinstance(parsed, dict):
-                    return FileParserBlock._extract_file_url_from_block_output(parsed)
-            except (ValueError, SyntaxError):
-                pass
-        return None
+        return extract_file_url_from_block_output(value)
 
     async def execute(
         self,
@@ -5343,31 +6311,40 @@ class FileParserBlock(Block):
 
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
-        if self.file_type == FileType.CSV:
-            parsed_data = await self._parse_csv_file(file_path)
-        elif self.file_type == FileType.EXCEL:
-            parsed_data = await self._parse_excel_file(file_path)
-        elif self.file_type == FileType.PDF:
-            parsed_data = await self._parse_pdf_file(
-                file_path,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-        elif self.file_type == FileType.IMAGE:
-            parsed_data = await self._parse_image_file(
-                file_path,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-        elif self.file_type == FileType.DOCX:
-            parsed_data = await self._parse_docx_file(file_path)
-        else:
+        try:
+            if self.file_type == FileType.CSV:
+                parsed_data = await self._parse_csv_file(file_path)
+            elif self.file_type == FileType.EXCEL:
+                parsed_data = await self._parse_excel_file(file_path)
+            elif self.file_type == FileType.PDF:
+                parsed_data = await self._parse_pdf_file(
+                    file_path,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            elif self.file_type == FileType.IMAGE:
+                parsed_data = await self._parse_image_file(
+                    file_path,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            elif self.file_type == FileType.DOCX:
+                parsed_data = await self._parse_docx_file(file_path)
+            else:
+                return await self._record_failure(
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    f"Unsupported file type: {self.file_type}",
+                )
+        except Exception as e:
             return await self._record_failure(
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
-                f"Unsupported file type: {self.file_type}",
+                f"Failed to parse {self.file_type} file: {str(e)}",
             )
 
         # If json_schema is provided, use AI to extract structured data
@@ -6022,6 +6999,12 @@ class TaskV2Block(Block):
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
                 workflow_system_prompt=self.workflow_system_prompt,
                 trigger_type=inherited_v2_trigger_type,
+                # Pin the child to the parent's remote browser (CDP address + the
+                # headers its handshake authenticates with) so a cloud-browser run
+                # doesn't fall back to a fresh local Chrome.
+                browser_address=workflow_run.browser_address,
+                extra_http_headers=workflow_run.extra_http_headers,
+                cdp_connect_headers=workflow_run.cdp_connect_headers,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -6188,58 +7171,22 @@ class HttpRequestBlock(Block):
         """Format template parameters in the block fields"""
         template_kwargs = {"force_include_secrets": True}
 
-        def _render_templates_in_json(value: object) -> object:
-            """
-            Recursively render Jinja templates in nested JSON-like structures.
-
-            This is required because HTTP request bodies are often deeply nested
-            dict/list structures, and templates may appear at any depth.
-
-            Supports {{ expr | json }} filter for type-preserving JSON injection.
-            """
-            if isinstance(value, str):
-                rendered = self.format_block_parameter_template_from_workflow_run_context(
-                    value, workflow_run_context, **template_kwargs
-                )
-
-                if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
-                    json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
-                    try:
-                        return json.loads(json_str)
-                    except json.JSONDecodeError:
-                        raise FailedToFormatJinjaStyleParameter(
-                            value, f"Raw JSON filter produced invalid JSON: {json_str}"
-                        )
-                elif _JSON_TYPE_MARKER in rendered:
-                    raise FailedToFormatJinjaStyleParameter(
-                        value,
-                        "The '| json' filter can only be used for complete value replacement. "
-                        "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
-                        "Remove the surrounding text or remove the '| json' filter.",
-                    )
-                return rendered
-            if isinstance(value, list):
-                return [_render_templates_in_json(item) for item in value]
-            if isinstance(value, dict):
-                return {
-                    cast(str, _render_templates_in_json(key)): _render_templates_in_json(val)
-                    for key, val in value.items()
-                }
-            return value
-
-        if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(
-                self.url, workflow_run_context, **template_kwargs
+        def _render_string(value: str) -> str:
+            return self.format_block_parameter_template_from_workflow_run_context(
+                value, workflow_run_context, **template_kwargs
             )
 
+        if self.url:
+            self.url = _render_string(self.url)
+
         if self.body:
-            self.body = cast(dict[str, Any], _render_templates_in_json(self.body))
+            self.body = cast(dict[str, Any], render_templates_in_json_value(self.body, _render_string))
 
         if self.files:
-            self.files = cast(dict[str, str], _render_templates_in_json(self.files))
+            self.files = cast(dict[str, str], render_templates_in_json_value(self.files, _render_string))
 
         if self.headers:
-            self.headers = cast(dict[str, str], _render_templates_in_json(self.headers))
+            self.headers = cast(dict[str, str], render_templates_in_json_value(self.headers, _render_string))
 
         if self.download_filename:
             self.download_filename = self.format_block_parameter_template_from_workflow_run_context(
@@ -6424,7 +7371,9 @@ class HttpRequestBlock(Block):
                 is_url = (
                     file_path.startswith("http://") or file_path.startswith("https://") or file_path.startswith("www.")
                 )
-                is_managed_storage_uri = file_path.startswith("s3://") or file_path.startswith("azure://")
+                is_managed_storage_uri = (
+                    file_path.startswith("s3://") or file_path.startswith("gs://") or file_path.startswith("azure://")
+                )
 
                 # Check if file is in allowed directories
                 is_allowed_local_file = False
@@ -6624,9 +7573,7 @@ class PrintPageBlock(Block):
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
-        sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
-        sanitized = sanitized.strip(". ")
-        return sanitized[:200] if sanitized else "document"
+        return sanitize_filename(filename)
 
     def _build_pdf_options(self) -> dict[str, Any]:
         pdf_format = self.format if self.format in self.VALID_FORMATS else "A4"
@@ -6719,17 +7666,19 @@ class PrintPageBlock(Block):
         organization_id: str | None,
         workflow_run_id: str,
         workflow_run_block_id: str,
+        download_run_id: str | None = None,
     ) -> list[FileInfo]:
         # Workflow finalization eventually runs save_downloaded_files, but the block
         # output snapshot is recorded now and the UI keys off downloaded_file_urls
         # on the block — so we register up front and let finalization re-run safely.
         if not organization_id:
             return []
+        storage_run_id = download_run_id or workflow_run_id
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -6750,7 +7699,7 @@ class PrintPageBlock(Block):
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 return await app.STORAGE.get_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -6775,10 +7724,12 @@ class PrintPageBlock(Block):
         if block_context:
             await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
+        resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            download_run_id_override=resolved_download_id,
         )
         if not browser_state:
             return await self.build_block_result(
@@ -6828,7 +7779,7 @@ class PrintPageBlock(Block):
             filename = f"page_{timestamp_str}.pdf"
 
         # Save PDF to download directory so it appears in runs UI
-        download_dir = get_download_dir(workflow_run_id)
+        download_dir = get_download_dir(resolved_download_id)
         file_path = os.path.join(download_dir, filename)
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(pdf_bytes)
@@ -6847,6 +7798,7 @@ class PrintPageBlock(Block):
             organization_id=artifact_org_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
+            download_run_id=resolved_download_id,
         )
 
         current_context = skyvern_context.current()
@@ -8637,6 +9589,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
+from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -8666,9 +9619,47 @@ BlockSubclasses = Union[
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
+    PdfFillBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 
 
 BranchCriteriaSubclasses = Union[JinjaBranchCriteria, PromptBranchCriteria]
 BranchCriteriaTypeVar = Annotated[BranchCriteriaSubclasses, Field(discriminator="criteria_type")]
+
+
+def resolve_conditional_merge_edges(
+    blocks: list[BlockTypeVar],
+    label_to_block: dict[str, BlockTypeVar],
+    default_next_map: dict[str, str | None],
+) -> None:
+    """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
+
+    SKY-8571: iterates to convergence so an outer conditional patched on one pass can let an inner
+    conditional's branch terminals be patched on the next. Mutates default_next_map in place.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for block in blocks:
+            if not isinstance(block, ConditionalBlock):
+                continue
+            successor = default_next_map.get(block.label)
+            if not successor:
+                continue
+            for branch in block.ordered_branches:
+                target = branch.next_block_label
+                if not target or target == successor:
+                    continue
+                cur: str | None = target
+                visited: set[str] = set()
+                while cur and cur in label_to_block and cur not in visited:
+                    if cur == successor:
+                        break
+                    visited.add(cur)
+                    nxt = default_next_map.get(cur)
+                    if nxt is None:
+                        default_next_map[cur] = successor
+                        changed = True
+                        break
+                    cur = nxt

@@ -216,7 +216,8 @@ export type WorkflowBlock =
   | PrintPageBlock
   | WorkflowTriggerBlock
   | GoogleSheetsReadBlock
-  | GoogleSheetsWriteBlock;
+  | GoogleSheetsWriteBlock
+  | PdfFillBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -246,6 +247,7 @@ export const WorkflowBlockTypes = {
   WorkflowTrigger: "workflow_trigger",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
+  PDFFill: "pdf_fill",
 } as const;
 
 // all of them
@@ -377,10 +379,20 @@ export type WhileLoopBlock = WorkflowBlockBase & {
   condition: BranchCriteria;
 };
 
+export type CodeBlockStep = {
+  title?: string | null;
+  description?: string | null;
+  action_type: string;
+  line_start?: number | null;
+  line_end?: number | null;
+};
+
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
   parameters: Array<WorkflowParameter>;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -614,6 +626,15 @@ export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type PdfFillBlock = WorkflowBlockBase & {
+  block_type: "pdf_fill";
+  file_url: string;
+  prompt: string;
+  payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
@@ -638,6 +659,7 @@ export type WorkflowApiResponse = {
   cdp_connect_headers: Record<string, string> | null;
   persist_browser_session: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
@@ -663,6 +685,7 @@ export type WorkflowSettings = {
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
   browserProfileId: string | null;
+  browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   maxElapsedTimeMinutes: number | null;

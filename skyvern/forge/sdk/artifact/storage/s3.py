@@ -330,6 +330,21 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a browser profile from S3."""
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        LOG.info(
+            "Deleting browser profile",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            profile_uri=profile_uri,
+        )
+        # DeleteObject is idempotent: deleting a missing key is a no-op. Best-effort — log and
+        # swallow so a reap failure never breaks the promote or the soft-delete that triggered it.
+        await self.async_client.delete_file(profile_uri, log_exception=True)
+
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:

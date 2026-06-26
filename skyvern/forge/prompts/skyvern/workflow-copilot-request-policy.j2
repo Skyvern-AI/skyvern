@@ -1,5 +1,5 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; {% if outcome_verification_enabled %}completion_criteria; {% endif %}raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
@@ -24,14 +24,17 @@ completion_contract:
 - The value must be an exact span copied from the latest user message. Do not paraphrase, summarize, or infer a completion condition.
 - Set to null when the user does not provide an explicit completion condition.
 
-{% if outcome_verification_enabled %}completion_criteria:
-- An array of the END-STATE OUTCOMES that must be true for the user's goal to be done. Each item is {outcome, implicit, method_mandated}.
+completion_criteria:
+- An array of the END-STATE OUTCOMES that must be true for the user's goal to be done. Each item is {outcome, implicit, method_mandated, level}.
 - outcome: a short statement of an end state the workflow must achieve (an END, not a step). Extract the goal as outcomes the user wants to be true, not the recipe they describe.
 - Capture ALL distinct outcomes the goal requires, including implicit constraints the user did not state as a step (for example "added exactly once / not duplicated", "the item is present in the cart"). Mark such items implicit=true.
 - A prescribed HOW step is NOT a criterion. "search for X", "open the result lightbox", "click add to cart", "go to the cart page" are methods/navigation, not outcomes — do not list them. A different or shorter path that reaches the same end state must still satisfy the goal.
+- Telling/showing/reporting results to the user is NOT a criterion. "tell me what it extracted", "show me the data", "confirm to me it worked" describe the chat reply, which no workflow definition or run can evidence — capture only the underlying workflow outcome (the data is extracted into the run output, the form is submitted) and list nothing for the reporting itself.
 - method_mandated=true ONLY when the user explicitly makes a specific method the point of the request (for example "verify it works by submitting the real form", "specifically use the search bar"). Otherwise method_mandated=false.
+- level=definition when the outcome is a property of the workflow definition itself, checkable without running it (for example "the workflow accepts first name, last name, and NPI as reusable inputs", "X is a configurable parameter"). level=run when the outcome is an end state only a run can show (data extracted, item in cart, form submitted). Default to run when unsure.
+- Do not emit a criterion that restates or negates another criterion in the list (for example a "values are not hardcoded" duplicate of a reusable-inputs criterion); one outcome, one criterion. State a definition-level outcome as the positive checkable property of the named inputs, never as a negation.
+- When ACTIVE COMPLETION CRITERIA are provided below, they are the canonical phrasing of the chat's current goal. If the latest request keeps that goal — including repeat, retest, fix, and follow-up turns — emit each still-required outcome COPIED VERBATIM from that list, character for character, punctuation included; never rephrase or reword a covered outcome. Write new phrasing only for an outcome the list does not cover, and drop an item only when the latest request abandons or replaces it.
 - Set to [] when the user gives no goal with a checkable outcome (for example a pure draft-only or sketch request).
-{% endif %}
 
 raw_secret_evidence:
 - When credential_input_kind=raw_secret, set this to the verbatim substring of the LATEST user message that is the pasted secret value (e.g. the password string, JWT, API key, OTP digits, or PEM body). Do not paraphrase. Do not cite a token that appears only in prior turns or in the workflow_yaml — the substring must occur in the latest user message.
@@ -81,4 +84,6 @@ Retained recent history:
 ```{{ retained_history }}```
 Current workflow YAML:
 ```{{ workflow_yaml }}```
-Global context: ```{{ global_llm_context }}```
+{% if active_completion_criteria %}ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):
+```{{ active_completion_criteria }}```
+{% endif %}Global context: ```{{ global_llm_context }}```

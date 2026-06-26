@@ -7,19 +7,30 @@ import {
 } from "@/components/ui/tooltip";
 import { badgeVariants } from "@/components/ui/badge-variants";
 import { cn } from "@/util/utils";
+import { paletteDotClass } from "../../types/tagColors";
 
 type Props = {
   // null = a standalone label (no group); rendered as just the value.
   tagKey: string | null;
   value: string;
   description?: string | null;
+  // Palette color name for grouped tags. Ignored for standalone labels (which
+  // stay neutral) and for names outside the curated palette.
+  color?: string | null;
   onRemove?: () => void;
   className?: string;
 };
 
 // Generic single-tag chip: a styled span (not Badge div) so it can be a Radix
 // TooltipTrigger `asChild` target. Grouped shows `key: value`, standalone the value.
-function TagChip({ tagKey, value, description, onRemove, className }: Props) {
+function TagChip({
+  tagKey,
+  value,
+  description,
+  color,
+  onRemove,
+  className,
+}: Props) {
   // Last line of defense against payload shape skew: a non-string child here
   // is React error #31, which unmounts the route through the error boundary.
   if (
@@ -30,6 +41,9 @@ function TagChip({ tagKey, value, description, onRemove, className }: Props) {
     return null;
   }
   const label = tagKey === null ? value : `${tagKey}: ${value}`;
+  // Only grouped tags with a curated palette color get a leading dot; standalone
+  // labels and out-of-palette colors render no dot. The chip surface stays neutral.
+  const dotClass = tagKey !== null ? paletteDotClass(color) : "";
   const chip = (
     <span
       className={cn(
@@ -38,6 +52,12 @@ function TagChip({ tagKey, value, description, onRemove, className }: Props) {
         className,
       )}
     >
+      {dotClass ? (
+        <span
+          aria-hidden="true"
+          className={cn("inline-block h-2 w-2 shrink-0 rounded-full", dotClass)}
+        />
+      ) : null}
       <span className="truncate">
         {tagKey !== null ? (
           <>

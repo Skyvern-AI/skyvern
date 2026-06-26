@@ -3,9 +3,11 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
+from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
+from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -20,6 +22,7 @@ from skyvern.forge.sdk.db.id import (
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
+    InvalidCodeBlockStep,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateBlockLabels,
@@ -33,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     BranchCondition,
     CodeBlock,
+    CodeBlockStep,
     ConditionalBlock,
     DownloadToS3Block,
     ExtractionBlock,
@@ -80,6 +84,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -197,7 +202,11 @@ def convert_workflow_definition(
                     workflow_parameter_key=parameter.key,
                     required_value="bitwarden_collection_id or bitwarden_item_id",
                 )
-            if parameter.bitwarden_collection_id and not parameter.url_parameter_key:
+            if (
+                parameter.bitwarden_collection_id
+                and not parameter.bitwarden_item_id
+                and not parameter.url_parameter_key
+            ):
                 raise WorkflowParameterMissingRequiredValue(
                     workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
                     workflow_parameter_key=parameter.key,
@@ -318,10 +327,8 @@ def convert_workflow_definition(
         blocks.append(block)
         block_label_mapping[block.label] = block
 
-    # Set the blocks for the workflow definition and derive DAG version metadata
-    dag_version = workflow_definition_yaml.version
-    if dag_version is None:
-        dag_version = 2 if _has_dag_metadata(workflow_definition_yaml.blocks) else 1
+    # version is populated by the WorkflowDefinitionYAML after-validator; `or 1` only narrows int | None.
+    dag_version = workflow_definition_yaml.version or 1
 
     workflow_definition = WorkflowDefinition(
         parameters=parameters.values(),
@@ -388,6 +395,64 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
+
+
+def _code_block_step_span_issue(step: CodeBlockStep, code_line_count: int) -> str | None:
+    """Return why a step's line span is malformed, or None when it is well-formed: a well-formed span
+    is empty, a lone 1-based line_start, or a 1-based line_start <= line_end with both bounds within
+    the code's line count (a lone line_end has no anchor for the editor to render from)."""
+    line_start = step.line_start
+    line_end = step.line_end
+    if line_end is not None and line_start is None:
+        return "line_end is set without line_start"
+    for bound_name, bound in (("line_start", line_start), ("line_end", line_end)):
+        if bound is None:
+            continue
+        if bound < 1:
+            return f"{bound_name} must be >= 1, got {bound}"
+        if bound > code_line_count:
+            return f"{bound_name} ({bound}) exceeds the code length ({code_line_count} line(s))"
+    if line_start is not None and line_end is not None and line_start > line_end:
+        return f"line_start ({line_start}) must be <= line_end ({line_end})"
+    return None
+
+
+def _reconcile_code_block_step_spans(
+    *,
+    block_label: str,
+    steps: list[CodeBlockStep],
+    code: str,
+) -> list[CodeBlockStep]:
+    """Repair malformed step spans against the code-derived spans instead of rejecting the save.
+
+    Step spans are display-only line references the editor and run timeline render. A non-copilot
+    save path (the copilot re-derives) can persist a stale or model-mangled span, e.g. a code edit
+    that shortens the block below a step's line_end. Snap an invalid span to the synthesized span at
+    the same position, or drop it to null when the code yields no step there; well-formed spans and
+    all other fields are kept untouched."""
+    code_line_count = len(code.splitlines())
+    issues = [_code_block_step_span_issue(step, code_line_count) for step in steps]
+    if not any(issues):
+        return steps
+    derived = derive_code_block_steps(code)
+    reconciled: list[CodeBlockStep] = []
+    for step_index, (step, issue) in enumerate(zip(steps, issues)):
+        if issue is None:
+            reconciled.append(step)
+            continue
+        derived_step = derived[step_index] if step_index < len(derived) else None
+        repaired_start = derived_step["line_start"] if derived_step else None
+        repaired_end = derived_step["line_end"] if derived_step else None
+        LOG.info(
+            "Reconciled malformed code-block step span",
+            block_label=block_label,
+            step_index=step_index,
+            issue=issue,
+            line_start=repaired_start,
+            line_end=repaired_end,
+        )
+        reconciled.append(step.model_copy(update={"line_start": repaired_start, "line_end": repaired_end}))
+    return reconciled
 
 
 def block_yaml_to_block(
@@ -510,10 +575,32 @@ def block_yaml_to_block(
             branch_conditions=branch_conditions,
         )
     elif block_yaml.block_type == BlockType.CODE:
+        code_block_steps: list[CodeBlockStep] | None = None
+        if block_yaml.steps:
+            code_block_steps = []
+            for step_index, step_yaml in enumerate(block_yaml.steps):
+                try:
+                    step = CodeBlockStep(**step_yaml.model_dump())
+                except ValidationError as exc:
+                    first_error = exc.errors()[0]
+                    field = ".".join(str(part) for part in first_error["loc"])
+                    raise InvalidCodeBlockStep(
+                        block_label=block_yaml.label,
+                        step_index=step_index,
+                        detail=f"{field}: {first_error['msg']}",
+                    ) from exc
+                code_block_steps.append(step)
+            code_block_steps = _reconcile_code_block_step_spans(
+                block_label=block_yaml.label,
+                steps=code_block_steps,
+                code=block_yaml.code,
+            )
         return CodeBlock(
             **base_kwargs,
             code=block_yaml.code,
             parameters=_resolve_block_parameters(block_yaml, parameters),
+            prompt=block_yaml.prompt,
+            steps=code_block_steps,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(
@@ -773,6 +860,17 @@ def block_yaml_to_block(
             parameters=print_page_block_parameters,
         )
 
+    elif block_yaml.block_type == BlockType.PDF_FILL:
+        pdf_fill_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return PdfFillBlock(
+            **base_kwargs,
+            file_url=block_yaml.file_url,
+            prompt=block_yaml.prompt,
+            payload=block_yaml.payload,
+            llm_key=block_yaml.llm_key,
+            parameters=pdf_fill_block_parameters,
+        )
+
     elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:
         workflow_trigger_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return WorkflowTriggerBlock(
@@ -843,12 +941,3 @@ def _resolve_block_parameters(
 ) -> list[PARAMETER_TYPE]:
     parameter_keys = getattr(block_yaml, "parameter_keys", None)
     return [parameters[parameter_key] for parameter_key in parameter_keys] if parameter_keys else []
-
-
-def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
-    for block_yaml in block_yamls:
-        if block_yaml.next_block_label:
-            return True
-        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and _has_dag_metadata(block_yaml.loop_blocks):
-            return True
-    return False

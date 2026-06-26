@@ -3,6 +3,25 @@ type BrowserReadinessInput = {
   isLiveBrowserReady?: boolean;
 };
 
+type CopilotLiveBrowserReadyInput = {
+  displayReady: boolean;
+  hasBackendSession: boolean;
+  headlessTurnDrainEnabled: boolean;
+};
+
+// The headless drain path posts a turn on the backend session id alone,
+// decoupling turn-readiness from the VNC/canvas paint signal.
+export function resolveCopilotLiveBrowserReady({
+  displayReady,
+  hasBackendSession,
+  headlessTurnDrainEnabled,
+}: CopilotLiveBrowserReadyInput): boolean {
+  if (!headlessTurnDrainEnabled) {
+    return displayReady;
+  }
+  return displayReady || hasBackendSession;
+}
+
 type BrowserPromptQueueInput = BrowserReadinessInput & {
   message?: string;
 };

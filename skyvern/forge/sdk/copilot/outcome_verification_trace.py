@@ -45,6 +45,17 @@ def record_gate_decision(ctx: Any, fields: dict[str, Any]) -> None:
         LOG.warning("failed to record copilot gate decision telemetry", exc_info=True)
 
 
+def record_criteria_lifecycle(ctx: Any, fields: dict[str, Any]) -> None:
+    """Attach criteria-lifecycle fields (epoch, decision reason, tripwire counters,
+    claim tier) to the per-turn snapshot so they ride the copilot.turn span."""
+    try:
+        snapshot = _snapshot(ctx)
+        if snapshot is not None:
+            snapshot.update(fields)
+    except Exception:
+        LOG.warning("failed to record copilot criteria lifecycle telemetry", exc_info=True)
+
+
 def record_code_artifact_violations(ctx: Any, violations: list[str], offending_labels: list[str]) -> None:
     """Persist the code-artifact-metadata violation batch onto the turn snapshot.
 

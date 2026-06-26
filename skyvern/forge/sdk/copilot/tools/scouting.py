@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -18,7 +19,19 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_bounded_page_schema,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    ReachedDownloadTarget,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
+from skyvern.forge.sdk.copilot.result_evidence import (
+    loaded_result_composition_evidence_from_page,
+    loaded_result_composition_target_summary,
+)
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
@@ -32,6 +45,7 @@ from ._shared import (
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
+from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
 
@@ -113,13 +127,17 @@ def _consume_scout_source_url(ctx: AgentContext) -> str | None:
 _ROLE_NAME_SELECTOR_RE = re.compile(r'^role=([a-zA-Z]+)(?:\[name="((?:[^"\\]|\\.)*)"\])?(.*)$')
 
 
-def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
+def _selector_text(selector: Any) -> str:
+    return selector.strip() if isinstance(selector, str) else ""
+
+
+def _role_name_from_selector(selector: str | None) -> tuple[str, str] | None:
     """Parse the ``role=<role>[name="<name>"]`` form (ref_to_selector) — TIER 1, no browser read.
 
     Returns (role, accessible_name) when the selector is a plain role/name locator;
     None for bare CSS/xpath or when an engine chain (`>> nth=`) trails the role/name.
     """
-    selector = selector.strip()
+    selector = _selector_text(selector)
     match = _ROLE_NAME_SELECTOR_RE.match(selector)
     if not match:
         return None
@@ -130,13 +148,15 @@ def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
     return role, name
 
 
-async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tuple[str, str] | None:
+async def _capture_accessible_role_name(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> tuple[str, str] | None:
     """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
 
     A failed read degrades gracefully to None so the selector-only auto-credit
     path (SKY-10712) stays intact.
     """
-    selector = selector.strip()
+    selector = _selector_text(selector)
     if not selector:
         return None
     server = getattr(ctx, "discovery_mcp_server", None)
@@ -148,7 +168,7 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tup
                 "skyvern_evaluate",
                 {"expression": _scout_accessible_role_name_expression(selector)},
             ),
-            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except Exception:
         return None
@@ -164,8 +184,49 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tup
     return role, name
 
 
+# A click pre-hook runs inline before the click dispatch, so the read is bounded well under the
+# discovery timeout to avoid delaying the action when the element resists a fast a11y read.
+_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS = 2.0
+
+
+async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
+    """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
+
+    A navigating click leaves only the landing page, so the post-action read returns the wrong
+    element; this captures the source-page anchor so a bare-selector navigating click still carries a
+    role/name into the trajectory."""
+    ctx.pending_scout_role_name = None
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    parsed = _role_name_from_selector(selector)
+    if parsed is not None:
+        role, name = parsed
+    else:
+        captured = await _capture_accessible_role_name(
+            ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+        )
+        if captured is None:
+            return
+        role, name = captured
+    if not role or not name:
+        return
+    ctx.pending_scout_role_name = (selector, role, name)
+
+
+def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
+    """Return the pre-navigation (role, accessible_name) only when the recorded selector matches the
+    stashed one, so a navigating click's anchor is never applied to a different element."""
+    if pending is None:
+        return "", ""
+    stashed_selector, role, name = pending
+    if stashed_selector != _selector_text(selector):
+        return "", ""
+    return role, name
+
+
 async def _resolve_scout_role_name(
-    ctx: AgentContext, selector: str, *, allow_browser_read: bool = True
+    ctx: AgentContext, selector: str | None, *, allow_browser_read: bool = True
 ) -> tuple[str, str]:
     """Resolve (role, accessible_name) for a scouted selector. TIER 1 parse first;
     TIER 2 browser read only for bare CSS/xpath. Always degrades to ("", "").
@@ -173,7 +234,7 @@ async def _resolve_scout_role_name(
     ``allow_browser_read=False`` skips TIER 2 when the action navigated: a post-action
     read against the landing page would capture the wrong element's name, so the bare
     selector is kept verbatim (the synthesizer prefers it anyway)."""
-    selector = selector.strip()
+    selector = _selector_text(selector)
     if not selector:
         return "", ""
     parsed = _role_name_from_selector(selector)
@@ -191,9 +252,10 @@ def _record_scouted_interaction(
     ctx: AgentContext,
     *,
     tool_name: str,
-    selector: str = "",
+    selector: str | None = None,
     source_url: str | None = None,
     value: str = "",
+    typed_value: str = "",
     key: str = "",
     typed_length: int = 0,
     role: str = "",
@@ -202,10 +264,11 @@ def _record_scouted_interaction(
     credential_field: str = "",
     credential_name: str = "",
 ) -> None:
-    selector = selector.strip()
+    selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
     if tool_name != "press_key" and not selector:
         return
+    _reset_evaluate_tracker(ctx)
     artifact: ScoutedInteraction = {"tool_name": tool_name}
     if selector:
         artifact["selector"] = selector
@@ -213,6 +276,8 @@ def _record_scouted_interaction(
         artifact["source_url"] = source_url.strip()
     if value:
         artifact["value"] = value
+    if typed_value:
+        artifact["typed_value"] = typed_value
     if key:
         artifact["key"] = key
     if typed_length:
@@ -294,12 +359,12 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
 
 
 async def _register_scout_interaction_observation(
-    ctx: AgentContext, *, tool_name: str, selector: str, source_url: str | None, url: str
+    ctx: AgentContext, *, tool_name: str, selector: str | None, source_url: str | None, url: str
 ) -> tuple[int | None, dict[str, Any] | None]:
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
-    selector = selector.strip()
+    selector = _selector_text(selector)
     if not selector or not url:
         return None, None
     evidence: dict[str, Any] = {
@@ -312,7 +377,7 @@ async def _register_scout_interaction_observation(
     if source_url and source_url.strip():
         evidence["interaction_source_url"] = source_url.strip()
     page_evidence: dict[str, Any] | None = None
-    if settings.COPILOT_SCOUT_ACT_OBSERVE_ENABLED and tool_name in _ACT_OBSERVE_TOOLS:
+    if tool_name in _ACT_OBSERVE_TOOLS:
         parsed = await _scout_act_observe_page_evidence(ctx, url=url)
         if parsed is not None:
             # Identity keys overwrite the parsed packet so the entry stays a
@@ -447,6 +512,476 @@ def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, 
     except Exception:
         data.pop("page", None)
         LOG.warning("copilot_scout_act_observe_summary_failed", exc_info=True)
+
+
+_EVALUATE_ACTIONABLE_MAX_TARGETS = 4
+
+_EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
+    "This page already exposes actionable targets; click the intended one rather than re-evaluating."
+)
+_EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
+    "Loaded results are already visible on the current page; inspect this page for composition or author an "
+    "extraction/validation block from the loaded results instead of re-reading it."
+)
+
+
+def _reset_evaluate_tracker(ctx: AgentContext) -> None:
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    ctx.latest_evaluate_result_composition_steer = None
+
+
+def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
+    identities: list[tuple[str, str]] = []
+
+    def add(control: Any) -> None:
+        if not isinstance(control, dict):
+            return
+        selector = _summary_text(control.get("selector"))
+        text = _summary_text(control.get("text") or control.get("value") or control.get("aria_label"))
+        if selector or text:
+            identities.append((selector, text))
+
+    for form in evidence.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        for field_entry in form.get("fields") or []:
+            add(field_entry)
+        for control in form.get("submit_controls") or []:
+            add(control)
+    for target in evidence.get("navigation_targets") or []:
+        add(target)
+    for container in evidence.get("result_containers") or []:
+        add(container)
+    for overlay in evidence.get("modal_overlays") or []:
+        if not isinstance(overlay, dict):
+            continue
+        for control in overlay.get("dismiss_controls") or []:
+            add(control)
+    return identities
+
+
+def _actionable_target_signature(identities: list[tuple[str, str]]) -> str:
+    canonical = json.dumps(sorted(identities), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _actionable_targets_for_result(identities: list[tuple[str, str]]) -> list[dict[str, str]]:
+    targets: list[dict[str, str]] = []
+    for selector, text in identities[:_EVALUATE_ACTIONABLE_MAX_TARGETS]:
+        entry = {key: value for key, value in {"selector": selector, "text": text}.items() if value}
+        if entry:
+            targets.append(entry)
+    return targets
+
+
+# Verbs that imply an irreversible or money-moving side effect — never auto-clicked.
+_AUTO_ACT_HIGH_TIER_VERBS = frozenset(
+    {
+        "pay",
+        "payment",
+        "purchase",
+        "buy",
+        "order",
+        "place order",
+        "checkout",
+        "delete",
+        "remove",
+        "transfer",
+        "send",
+        "submit payment",
+        "confirm payment",
+        "wire",
+        "withdraw",
+        "cancel",
+    }
+)
+
+
+def _auto_act_is_high_tier_label(*labels: Any) -> bool:
+    for label in labels:
+        if not isinstance(label, str):
+            continue
+        normalized = label.strip().lower()
+        if not normalized:
+            continue
+        if any(verb in normalized for verb in _AUTO_ACT_HIGH_TIER_VERBS):
+            return True
+    return False
+
+
+def _auto_act_href_is_navigation(href: Any) -> bool:
+    if not isinstance(href, str):
+        return False
+    candidate = href.strip()
+    if not candidate or candidate.startswith("#"):
+        return False
+    lowered = candidate.lower()
+    if lowered.startswith(("javascript:", "mailto:", "tel:")):
+        return False
+    if lowered.startswith(("http://", "https://")):
+        return True
+    return not lowered.startswith(("data:", "blob:"))
+
+
+def _auto_act_candidate(parsed: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the single unambiguous, low-tier nav link to auto-click, or None.
+
+    Eligible only from navigation_targets (`<a href>` with a real http/https/relative
+    href and non-empty text); form submit_controls, form fields, result containers, and
+    modal dismiss controls are excluded. Form submits are never candidates because the
+    structured-evidence producer cannot reliably distinguish a writing submit from a
+    bare default-submit button, so the whole form-submit class is dropped for safety.
+    Money-moving / destructive verbs are dropped. Exactly one survivor ⇒ act; zero or
+    more than one ⇒ None."""
+    candidates: list[dict[str, Any]] = []
+
+    for target in parsed.get("navigation_targets") or []:
+        if not isinstance(target, dict):
+            continue
+        selector = _summary_text(target.get("selector"))
+        if not selector or target.get("disabled") is True:
+            continue
+        if not _auto_act_href_is_navigation(target.get("href")):
+            continue
+        text = _summary_text(target.get("text"))
+        if not text:
+            continue
+        if _auto_act_is_high_tier_label(text, target.get("name"), target.get("id")):
+            continue
+        candidates.append({"selector": selector, "text": text})
+
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+_EVALUATE_STEER_SHED_MARKER = "[omitted on repeat — act on the named target instead of re-reading]"
+
+# Keys the steer must never shed: navigation/identity context plus the steer's own output.
+_EVALUATE_STEER_ESSENTIAL_KEYS = frozenset(
+    {
+        "url",
+        "title",
+        "observation_step",
+        "actionable_targets",
+        "composition_targets",
+        "next_action",
+        "next_action_reason",
+    }
+)
+
+# Nested bulky subfields inside an evaluate `result` dict (the raw page payload).
+_EVALUATE_STEER_NESTED_BULKY_KEYS = ("html", "outerHTML", "innerHTML", "body", "bodyText", "text", "buttons")
+
+
+def _serialized_len(value: Any) -> int:
+    try:
+        return len(json.dumps(value, default=str))
+    except Exception:
+        return len(str(value))
+
+
+def _largest_non_essential_data_key(data: dict[str, Any]) -> str | None:
+    candidates = [
+        (key, _serialized_len(value))
+        for key, value in data.items()
+        if key not in _EVALUATE_STEER_ESSENTIAL_KEYS and value != _EVALUATE_STEER_SHED_MARKER
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates[0][0]
+
+
+def _fit_evaluate_steer_under_cap(
+    result: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    keep_raw_page_payload: bool,
+) -> None:
+    """Keep the serialized result under the recent-output cap without ever head-slicing it.
+
+    Reconnaissance output needs the raw page payload available to the model; imperative steers have
+    enough structured evidence to shed bulky non-essential payload while always preserving the action."""
+
+    def over_cap() -> bool:
+        return len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+
+    if not over_cap():
+        return
+    if keep_raw_page_payload:
+        data.pop("actionable_targets", None)
+        return
+    nested = data.get("result")
+    if isinstance(nested, dict):
+        for key in _EVALUATE_STEER_NESTED_BULKY_KEYS:
+            if key in nested and nested[key] != _EVALUATE_STEER_SHED_MARKER:
+                nested[key] = _EVALUATE_STEER_SHED_MARKER
+                if not over_cap():
+                    return
+    while over_cap():
+        largest_key = _largest_non_essential_data_key(data)
+        if largest_key is None:
+            break
+        data[largest_key] = _EVALUATE_STEER_SHED_MARKER
+        if not over_cap():
+            return
+    targets = data.get("actionable_targets")
+    while isinstance(targets, list) and len(targets) > 1 and over_cap():
+        targets.pop()
+
+
+def _auto_act_essential_keys() -> frozenset[str]:
+    return _EVALUATE_STEER_ESSENTIAL_KEYS | {"auto_acted", "page"}
+
+
+async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url: str, target: dict[str, Any]) -> bool:
+    """Issue the in-process click for the single unambiguous target and reshape the result.
+
+    Returns True when the click landed and the result was reshaped to report it; False
+    degrades the caller to the advisory steer (next_action/actionable_targets left intact)."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return False
+    selector = target["selector"]
+    pre_url = await _live_working_page_url(ctx) or url
+    try:
+        click_result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_click", {"selector": selector, "selector_mode": "direct"}),
+            timeout=settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.warning("copilot_evaluate_auto_act_failed", url=pre_url, selector=selector, exc_info=True)
+        return False
+    if not isinstance(click_result, dict) or not click_result.get("ok"):
+        LOG.warning(
+            "copilot_evaluate_auto_act_failed",
+            url=pre_url,
+            selector=selector,
+            error=(click_result or {}).get("error") if isinstance(click_result, dict) else None,
+        )
+        return False
+
+    post_url = await _live_working_page_url(ctx) or url
+    post_evidence = await _scout_act_observe_page_evidence(ctx, url=post_url)
+    navigated = bool(pre_url) and bool(post_url) and pre_url != post_url
+    role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+    _record_scouted_interaction(
+        ctx,
+        tool_name="click",
+        selector=selector,
+        source_url=pre_url,
+        role=role,
+        accessible_name=accessible_name,
+    )
+
+    for key in ("next_action", "next_action_reason", "actionable_targets"):
+        data.pop(key, None)
+    data["auto_acted"] = {"tool": "click", "selector": selector, "text": target.get("text", "")}
+    if post_evidence is None:
+        data["auto_acted"]["note"] = "clicked; post-click page evidence unavailable"
+    else:
+        data["page"] = _build_scout_page_summary(post_evidence)
+    essential = _auto_act_essential_keys()
+    while len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        largest = max(
+            (
+                (key, _serialized_len(value))
+                for key, value in data.items()
+                if key not in essential and value != _EVALUATE_STEER_SHED_MARKER
+            ),
+            key=lambda item: item[1],
+            default=None,
+        )
+        if largest is None:
+            page = data.get("page")
+            if not isinstance(page, dict) or not _shed_scout_page_summary_section(page):
+                break
+            continue
+        data[largest[0]] = _EVALUATE_STEER_SHED_MARKER
+    LOG.info("copilot_evaluate_auto_acted", url=post_url, selector=selector)
+    return True
+
+
+class _UnsetEvidence:
+    pass
+
+
+_EVIDENCE_UNSET = _UnsetEvidence()
+
+
+async def _maybe_steer_evaluate_to_action(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    url: str,
+    page_evidence: dict[str, Any] | None | _UnsetEvidence = _EVIDENCE_UNSET,
+) -> bool:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    try:
+        parsed = (
+            await _scout_act_observe_page_evidence(ctx, url=url)
+            if isinstance(page_evidence, _UnsetEvidence)
+            else page_evidence
+        )
+        if parsed is None or not has_bounded_page_schema(parsed):
+            _reset_evaluate_tracker(ctx)
+            return False
+        loaded_results = loaded_result_composition_evidence_from_page(parsed)
+        if loaded_results is not None:
+            _reset_evaluate_tracker(ctx)
+            ctx.latest_evaluate_result_composition_steer = loaded_results
+            data.pop("actionable_targets", None)
+            data["composition_targets"] = loaded_result_composition_target_summary(loaded_results)
+            data["next_action"] = "compose_extraction"
+            data["next_action_reason"] = _EVALUATE_RESULT_COMPOSITION_INSTRUCTION
+            # The steer is structured enough to keep under cap without preserving raw page payload.
+            _fit_evaluate_steer_under_cap(result, data, keep_raw_page_payload=False)
+            LOG.info(
+                "copilot_evaluate_result_composition_steer",
+                url=url,
+                result_container_count=loaded_results.result_container_count,
+                table_result_container_count=loaded_results.table_result_container_count,
+            )
+            # The result is patched in-place; returning False keeps the normal tool-loop guard active.
+            return False
+        ctx.latest_evaluate_result_composition_steer = None
+        identities = _actionable_target_identities(parsed)
+        if not identities:
+            _reset_evaluate_tracker(ctx)
+            return False
+        signature = _actionable_target_signature(identities)
+        # Strict full-URL match (fragment included): on an SPA a hash-route change
+        # is a navigation, so a differing fragment must read as a different page.
+        is_repeat = ctx.last_evaluate_actionable_signature == signature and ctx.last_evaluate_actionable_url == url
+        ctx.last_evaluate_actionable_signature = signature
+        ctx.last_evaluate_actionable_url = url
+        if signature != ctx.last_auto_acted_signature and ctx.last_auto_acted_signature is not None:
+            ctx.last_auto_acted_signature = None
+        targets = _actionable_targets_for_result(identities)
+        # Generic evaluate-loop breaker: intentionally fires for all v2 policies, not only code-first.
+        if is_repeat and ctx.last_auto_acted_signature != signature:
+            candidate = _auto_act_candidate(parsed)
+            if candidate is not None:
+                ctx.last_auto_acted_signature = signature
+                if await _auto_act_on_repeat(ctx, result, url=url, target=candidate):
+                    LOG.info("copilot_evaluate_actionable_target_steer", url=url, is_repeat=True, steered=True)
+                    return True
+        if targets:
+            data["actionable_targets"] = targets
+            if is_repeat:
+                data["next_action"] = "click"
+                data["next_action_reason"] = _EVALUATE_ACTIONABLE_ACT_INSTRUCTION
+            _fit_evaluate_steer_under_cap(result, data, keep_raw_page_payload=not is_repeat)
+        LOG.info(
+            "copilot_evaluate_actionable_target_steer",
+            url=url,
+            actionable_target_count=len(identities),
+            is_repeat=is_repeat,
+            steered=is_repeat and bool(targets),
+        )
+    except Exception:
+        data.pop("actionable_targets", None)
+        data.pop("composition_targets", None)
+        data.pop("next_action", None)
+        data.pop("next_action_reason", None)
+        _reset_evaluate_tracker(ctx)
+        LOG.warning("copilot_evaluate_actionable_target_steer_failed", exc_info=True)
+    return False
+
+
+def _register_reached_download_scout_interaction(ctx: AgentContext, target: ReachedDownloadTarget, *, url: str) -> None:
+    """Record the evaluate-resolved download affordance as a scout_interaction observation.
+
+    The scout-act download gate is cleared by a scout_interaction this turn, but the reached-download
+    target is resolved on the evaluate post-hook (source_tool="evaluate"). Registering the affordance
+    here unifies the two: the same evaluate call that feeds the synthesizer also clears the gate, so
+    obeying the scout-act steering is sufficient and the gate cannot loop on a scouted download.
+    """
+    selector = target.selector.strip()
+    if not selector or not url.strip():
+        return
+    _append_flow_evidence(
+        ctx,
+        {
+            "inspected_url": url,
+            "current_url": url,
+            "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
+            "interaction_tool": "evaluate",
+            "interaction_selector": selector,
+            "download_kind": target.download_kind,
+        },
+        reached_via="interaction",
+    )
+
+
+async def _maybe_attach_reached_download_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    url: str,
+    page_evidence: dict[str, Any] | None | _UnsetEvidence = _EVIDENCE_UNSET,
+) -> None:
+    """Attach a typed reached-download target + guidance when the page exposes exactly one same-host
+    download affordance, matched on the captured selector (never URL — a download does not change the SPA URL)."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return
+    # Code-first only: the guidance steers toward an expect_download code block (ADR 0010), which
+    # standard-mode v2 does not author.
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return
+    try:
+        parsed = (
+            await _scout_act_observe_page_evidence(ctx, url=url)
+            if isinstance(page_evidence, _UnsetEvidence)
+            else page_evidence
+        )
+        if parsed is None:
+            return
+        target = _derive_reached_download_from_nav_targets(parsed.get("navigation_targets"))
+        if target is None:
+            return
+        data["reached_download_target"] = target.to_dict()
+        data["reached_download_guidance"] = _reached_download_guidance_for(target)
+        if not target.already_registered:
+            # The pure synthesizer compiles the terminal expect_download step from this typed object.
+            ctx.reached_download_target = target
+            if ctx.synthesized_block_offered and not ctx.update_workflow_called:
+                # The prompt-side offer latched before this download target resolved, so it rendered the
+                # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
+                ctx.synthesized_block_offered = False
+                LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
+        if not target.already_registered:
+            _register_reached_download_scout_interaction(ctx, target, url=url)
+        LOG.info(
+            "copilot_reached_download_target_steer",
+            url=url,
+            download_kind=target.download_kind,
+            already_registered=target.already_registered,
+        )
+    except Exception:
+        data.pop("reached_download_target", None)
+        data.pop("reached_download_guidance", None)
+        LOG.warning("copilot_reached_download_target_steer_failed", exc_info=True)
+
+
+async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+    # Observe the bounded page evidence once and feed both evaluate steers; re-observe for the
+    # download steer only when the actionable steer auto-acted and may have changed the page.
+    if not isinstance(result.get("data"), dict):
+        return
+    page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+    acted = await _maybe_steer_evaluate_to_action(ctx, result, url=url, page_evidence=page_evidence)
+    await _maybe_attach_reached_download_target(
+        ctx, result, url=url, page_evidence=_EVIDENCE_UNSET if acted else page_evidence
+    )
 
 
 def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:

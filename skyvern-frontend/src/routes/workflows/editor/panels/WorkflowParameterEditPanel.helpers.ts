@@ -4,8 +4,8 @@ import {
 } from "../../types/workflowTypes";
 import {
   ParametersState,
-  parameterIsAzureVaultCredential,
   parameterIsBitwardenCredential,
+  parameterIsAzureVaultCredential,
   parameterIsSkyvernCredential,
 } from "../types";
 
@@ -62,6 +62,35 @@ export function detectInitialCredentialSource(
   }
 
   return isCloud ? "skyvern" : "bitwarden";
+}
+
+export function detectInitialBitwardenManualEntry(
+  initialValues: ParametersState[number] | undefined,
+): boolean {
+  if (!initialValues) return false;
+
+  if (
+    initialValues.parameterType === "credential" &&
+    parameterIsBitwardenCredential(initialValues)
+  ) {
+    const itemId = initialValues.itemId ?? "";
+    const collectionId = initialValues.collectionId ?? "";
+    return (
+      !itemId ||
+      Boolean(initialValues.urlParameterKey) ||
+      itemId.includes("{{") ||
+      collectionId.includes("{{")
+    );
+  }
+
+  if (initialValues.parameterType === "creditCardData") {
+    return (
+      initialValues.collectionId.includes("{{") ||
+      initialValues.itemId.includes("{{")
+    );
+  }
+
+  return false;
 }
 
 export function header(type: WorkflowEditorParameterType, isEdit: boolean) {

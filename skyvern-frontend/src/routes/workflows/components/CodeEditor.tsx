@@ -8,6 +8,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { useDebouncedCallback } from "use-debounce";
 
+import { isOversizedDocument } from "./oversizedDocument";
 import "./code-mirror-overrides.css";
 
 function getLanguageExtension(language: "python" | "json" | "html") {
@@ -144,17 +145,24 @@ function CodeEditorImpl({
     if (!viewRef.current) viewRef.current = viewUpdate.view;
   }, []);
 
+  const oversized = useMemo(
+    () => isOversizedDocument(internalValue),
+    [internalValue],
+  );
+  const effectiveLineWrap = lineWrap && !oversized;
+
   // Memoize the extension tuple so React hands CodeMirror a stable
   // reference across renders. Without this, a parent re-render would
   // rebuild the array (and anything spread in) every cycle and trigger
   // unnecessary editor state reconfiguration.
   const extensions = useMemo<Extension[]>(() => {
-    const exts: Extension[] = language
-      ? [
-          getLanguageExtension(language),
-          lineWrap ? EditorView.lineWrapping : [],
-        ]
-      : [lineWrap ? EditorView.lineWrapping : []];
+    const exts: Extension[] = [];
+    if (language && !oversized) {
+      exts.push(getLanguageExtension(language));
+    }
+    if (effectiveLineWrap) {
+      exts.push(EditorView.lineWrapping);
+    }
     if (extraExtensions) {
       exts.push(...extraExtensions);
     }
@@ -162,7 +170,7 @@ function CodeEditorImpl({
       exts.push(fullHeightExtension);
     }
     return exts;
-  }, [language, lineWrap, extraExtensions, fullHeight]);
+  }, [language, oversized, effectiveLineWrap, extraExtensions, fullHeight]);
 
   const style: React.CSSProperties = { fontSize };
   if (fullHeight) {

@@ -41,6 +41,8 @@ type Props = {
   onClearSelection: () => void;
   onDeleteRequest: () => void;
   onMoveToFolder: (folderId: string | null) => Promise<void>;
+  // Defaults to shown; only an explicit false (cloud flag off) hides tagging.
+  taggingEnabled?: boolean;
   tagKeys: Array<TagKey>;
   labelSuggestions: Array<string>;
   valueSuggestionsByKey?: Map<string, Array<string>>;
@@ -68,6 +70,7 @@ function BulkActionBar({
   onClearSelection,
   onDeleteRequest,
   onMoveToFolder,
+  taggingEnabled = true,
   tagKeys,
   labelSuggestions,
   valueSuggestionsByKey,
@@ -253,14 +256,16 @@ function BulkActionBar({
           </Button>
         }
       />
-      <BulkTagPicker
-        bulkCount={count}
-        tagKeys={tagKeys}
-        labelSuggestions={labelSuggestions}
-        valueSuggestionsByKey={valueSuggestionsByKey}
-        disabled={isOperating}
-        onApplyTag={handleBulkTagApply}
-      />
+      {taggingEnabled && (
+        <BulkTagPicker
+          bulkCount={count}
+          tagKeys={tagKeys}
+          labelSuggestions={labelSuggestions}
+          valueSuggestionsByKey={valueSuggestionsByKey}
+          disabled={isOperating}
+          onApplyTag={handleBulkTagApply}
+        />
+      )}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button size="sm" variant="ghost" disabled={isOperating}>

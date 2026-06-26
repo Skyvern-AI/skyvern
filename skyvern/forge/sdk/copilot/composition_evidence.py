@@ -15,6 +15,10 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    NAV_TARGET_DOWNLOAD_KIND_KEY,
+    classify_download_affordance,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -701,6 +705,13 @@ def _turn_evidence_sources(ctx: Any) -> list[dict[str, Any]]:
     if isinstance(single, dict):
         sources.append(single)
     return sources
+
+
+def turn_has_scout_interaction(ctx: Any) -> bool:
+    """True when this turn's evidence trajectory carries a scout_interaction observation that
+    resolved a concrete selector — proof the model scout-ACTED an affordance (clicked it) rather
+    than only inspecting the page passively."""
+    return any(_is_scout_interaction_evidence(evidence) for evidence in _turn_evidence_sources(ctx))
 
 
 def _prior_observed_pages(ctx: Any) -> list[dict[str, Any]]:
@@ -1680,13 +1691,18 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         if not _same_origin(resolved_href, current_url or inspected_url):
             continue
         text = _node_text(link)
-        navigation_targets.append(
-            {
-                "text": _schema_text(text, 160),
-                "href": resolved_href[:300],
-                "selector": _selector_for(link)[:160],
-            }
+        nav_entry: dict[str, Any] = {
+            "text": _schema_text(text, 160),
+            "href": resolved_href[:300],
+            "selector": _selector_for(link)[:160],
+        }
+        download_kind = classify_download_affordance(
+            href=resolved_href,
+            has_download_attr=link.has_attr("download"),
         )
+        if download_kind is not None:
+            nav_entry[NAV_TARGET_DOWNLOAD_KIND_KEY] = download_kind
+        navigation_targets.append(nav_entry)
 
     result_containers: list[dict[str, Any]] = []
     for node in all_nodes:
@@ -1828,13 +1844,18 @@ def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[st
             continue
         if not _same_origin(href, base_url):
             continue
-        targets.append(
-            {
-                "text": _schema_text(_structured_str(link.get("text")), 160),
-                "href": href[:300],
-                "selector": _structured_str(link.get("selector"))[:160],
-            }
+        entry: dict[str, Any] = {
+            "text": _schema_text(_structured_str(link.get("text")), 160),
+            "href": href[:300],
+            "selector": _structured_str(link.get("selector"))[:160],
+        }
+        download_kind = classify_download_affordance(
+            href=href,
+            has_download_attr=link.get("has_download_attr") is True,
         )
+        if download_kind is not None:
+            entry[NAV_TARGET_DOWNLOAD_KIND_KEY] = download_kind
+        targets.append(entry)
     return targets
 
 

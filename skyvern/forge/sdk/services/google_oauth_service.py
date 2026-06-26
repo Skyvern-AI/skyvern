@@ -56,6 +56,14 @@ GOOGLE_SHEETS_SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 )
+GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_GMAIL_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_READONLY_SCOPE,)
+GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS = "google_sheets"
+GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL = "gmail"
+GOOGLE_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
+    GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS: GOOGLE_SHEETS_SCOPES,
+    GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL: GOOGLE_GMAIL_SCOPES,
+}
 
 CONSENT_TTL_SECONDS = 600
 
@@ -78,6 +86,10 @@ class InvalidRedirectURIError(ValueError):
 
 class InvalidAppOriginError(ValueError):
     """Raised when the supplied app_origin is not on the GOOGLE_OAUTH_APP_ORIGINS allowlist."""
+
+
+class UnsupportedScopeProfileError(ValueError):
+    """Raised when a caller asks for an unsupported Google OAuth scope profile."""
 
 
 @dataclass(frozen=True)
@@ -114,6 +126,22 @@ def _coerce_scopes(scopes: str | list[str] | tuple[str, ...] | None) -> list[str
     else:
         parts = [p for p in (str(s).strip() for s in scopes) if p]
     return parts or list(GOOGLE_SHEETS_SCOPES)
+
+
+def scopes_for_profile(scope_profile: str | None) -> list[str]:
+    if scope_profile is None:
+        scope_profile = GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS
+    if scope_profile not in GOOGLE_OAUTH_SCOPE_PROFILES:
+        raise UnsupportedScopeProfileError(f"Unsupported Google OAuth scope profile: {scope_profile}")
+    return list(GOOGLE_OAUTH_SCOPE_PROFILES[scope_profile])
+
+
+def has_required_scopes(
+    granted_scopes: list[str] | tuple[str, ...] | None,
+    required_scopes: list[str] | tuple[str, ...],
+) -> bool:
+    granted = set(granted_scopes or [])
+    return all(scope in granted for scope in required_scopes)
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -266,6 +294,7 @@ async def start_authorization(
     redirect_uri: str,
     credential_name: str = "Default",
     scopes_requested: str | list[str] | tuple[str, ...] | None = None,
+    scope_profile: str | None = None,
     app_origin: str | None = None,
 ) -> GoogleAuthorizationStart:
     """Insert a pending consent row, build the authorize URL, persist the PKCE verifier."""
@@ -281,12 +310,15 @@ async def start_authorization(
     # pending row that the callback would see as missing the verifier.
     code_verifier = secrets.token_urlsafe(64)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    requested_scopes = (
+        scopes_for_profile(scope_profile) if scopes_requested is None else _coerce_scopes(scopes_requested)
+    )
 
     await app.DATABASE.google_oauth.insert_pending_credential(
         credential_id=credential_id,
         organization_id=organization_id,
         credential_name=credential_name,
-        scopes_requested=_coerce_scopes(scopes_requested),
+        scopes_requested=requested_scopes,
         consent_nonce=nonce,
         consent_redirect_uri=redirect_uri,
         consent_expires_at=now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS),
@@ -297,7 +329,7 @@ async def start_authorization(
     authorize_url, _ = build_authorize_url(
         redirect_uri=redirect_uri,
         state=nonce,
-        scopes=scopes_requested,
+        scopes=requested_scopes,
         code_verifier=code_verifier,
     )
 

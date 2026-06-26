@@ -2,13 +2,18 @@ import asyncio
 import copy
 import hashlib
 import os
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List
 
 import aiohttp
 import httpx
 import structlog
+from cachetools import TTLCache
+from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
@@ -26,6 +31,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
 from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -36,6 +42,7 @@ from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
+from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -44,7 +51,9 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.services.otp_service import OTPValue
 
 LOG = structlog.get_logger()
 
@@ -53,6 +62,23 @@ USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
 INVALID_SHAPE = "N/A"
+DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG = "DISABLE_SVG_CONVERT_CACHE_RESILIENCE"
+SVG_LOCAL_CACHE_MAX_ITEMS = 4096
+SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME = timedelta(hours=1)
+SVGLocalCacheValue = tuple[str, float | None]
+
+# TTLCache has one global TTL, so each value also carries an optional shorter
+# expiry timestamp for negative cache entries.
+_SVG_LOCAL_SHAPE_CACHE: TTLCache[str, SVGLocalCacheValue] = TTLCache(
+    maxsize=SVG_LOCAL_CACHE_MAX_ITEMS,
+    ttl=CACHE_EXPIRE_TIME.total_seconds(),
+)
+# Best-effort single-flight cache: eviction under extreme distinct-key pressure can
+# allow duplicate conversions, but does not affect conversion correctness.
+_SVG_CONVERSION_LOCKS: TTLCache[str, asyncio.Lock] = TTLCache(
+    maxsize=SVG_LOCAL_CACHE_MAX_ITEMS,
+    ttl=CACHE_EXPIRE_TIME.total_seconds(),
+)
 
 
 @dataclass
@@ -113,6 +139,158 @@ def _get_svg_cache_key(hash: str) -> str:
 
 def _get_shape_cache_key(hash: str) -> str:
     return f"skyvern:shape:{hash}"
+
+
+def _get_svg_conversion_lock(svg_key: str) -> asyncio.Lock:
+    lock = _SVG_CONVERSION_LOCKS.get(svg_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SVG_CONVERSION_LOCKS[svg_key] = lock
+    return lock
+
+
+@asynccontextmanager
+async def _svg_conversion_lock_scope(svg_key: str, *, use_lock: bool) -> AsyncIterator[None]:
+    if not use_lock:
+        yield
+        return
+
+    async with _get_svg_conversion_lock(svg_key):
+        yield
+
+
+async def _is_svg_convert_cache_resilience_disabled() -> bool:
+    context = skyvern_context.current()
+    if context is None:
+        return False
+
+    distinct_id = context.run_id or context.workflow_run_id or context.task_id
+    organization_id = context.organization_id
+    if not distinct_id or not organization_id:
+        return False
+
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+
+    try:
+        flag_enabled = await experimentation_provider.is_feature_enabled_cached(
+            DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG,
+            distinct_id,
+            properties={"organization_id": organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate SVG convert cache resilience flag; defaulting to enabled",
+            exc_info=True,
+            distinct_id=distinct_id,
+            organization_id=organization_id,
+        )
+        return False
+
+    return bool(flag_enabled)
+
+
+def _get_local_cache_ttl_seconds(svg_shape: str, ex: int | timedelta | None) -> float | None:
+    if ex is None:
+        ttl_seconds = None
+    else:
+        ttl_seconds = ex.total_seconds() if isinstance(ex, timedelta) else float(ex)
+
+    if svg_shape == INVALID_SHAPE:
+        negative_ttl_seconds = SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME.total_seconds()
+        if ttl_seconds is None:
+            return negative_ttl_seconds
+        return min(ttl_seconds, negative_ttl_seconds)
+    return ttl_seconds
+
+
+def _get_local_cache_expires_at(svg_shape: str, ex: int | timedelta | None) -> float | None:
+    ttl_seconds = _get_local_cache_ttl_seconds(svg_shape, ex)
+    if ttl_seconds is None:
+        return None
+    return time.monotonic() + max(ttl_seconds, 0.0)
+
+
+def _get_svg_shape_from_local_cache(svg_key: str) -> str | None:
+    cached_value = _SVG_LOCAL_SHAPE_CACHE.get(svg_key)
+    if cached_value is None:
+        return None
+
+    svg_shape, expires_at = cached_value
+    if expires_at is not None and expires_at <= time.monotonic():
+        _SVG_LOCAL_SHAPE_CACHE.pop(svg_key, None)
+        return None
+    return svg_shape
+
+
+def _cache_svg_shape_locally(
+    svg_key: str,
+    svg_shape: str | None,
+    *,
+    ex: int | timedelta | None = CACHE_EXPIRE_TIME,
+) -> None:
+    if svg_shape:
+        _SVG_LOCAL_SHAPE_CACHE[svg_key] = (svg_shape, _get_local_cache_expires_at(svg_shape, ex))
+
+
+async def _get_cached_svg_shape(svg_key: str, *, use_local_cache: bool = True) -> str | None:
+    if use_local_cache:
+        local_shape = _get_svg_shape_from_local_cache(svg_key)
+        if local_shape:
+            return local_shape
+
+    try:
+        cached_svg_shape = await app.CACHE.get(svg_key)
+    except Exception:
+        LOG.warning(
+            "Failed to loaded SVG cache",
+            exc_info=True,
+            key=svg_key,
+        )
+        if use_local_cache:
+            return _get_svg_shape_from_local_cache(svg_key)
+        return None
+
+    svg_shape = cached_svg_shape if isinstance(cached_svg_shape, str) else None
+    if use_local_cache:
+        _cache_svg_shape_locally(svg_key, svg_shape)
+    return svg_shape
+
+
+async def _set_svg_cache(
+    svg_key: str,
+    svg_shape: str,
+    *,
+    ex: int | timedelta | None = CACHE_EXPIRE_TIME,
+    cache_locally: bool = True,
+) -> None:
+    if cache_locally:
+        _cache_svg_shape_locally(svg_key, svg_shape, ex=ex)
+    try:
+        await app.CACHE.set(svg_key, svg_shape, ex=ex)
+    except Exception:
+        LOG.warning(
+            "Failed to store SVG cache",
+            exc_info=True,
+            key=svg_key,
+        )
+
+
+async def _set_css_shape_cache(
+    shape_key: str,
+    css_shape: str,
+    *,
+    ex: int | timedelta | None = CACHE_EXPIRE_TIME,
+) -> None:
+    try:
+        await app.CACHE.set(shape_key, css_shape, ex=ex)
+    except Exception:
+        LOG.warning(
+            "Failed to store CSS shape cache",
+            exc_info=True,
+            key=shape_key,
+        )
 
 
 def _remove_skyvern_attributes(element: Dict) -> Dict:
@@ -223,99 +401,107 @@ async def _convert_svg_to_string(
     svg_key = _get_svg_cache_key(svg_hash)
 
     svg_shape: str | None = None
-    try:
-        svg_shape = await app.CACHE.get(svg_key)
-    except Exception:
-        LOG.warning(
-            "Failed to loaded SVG cache",
-            exc_info=True,
-            key=svg_key,
-        )
+    refresh_svg_cache = False
+    use_cache_resilience = not await _is_svg_convert_cache_resilience_disabled()
+    async with _svg_conversion_lock_scope(svg_key, use_lock=use_cache_resilience):
+        svg_shape = await _get_cached_svg_shape(svg_key, use_local_cache=use_cache_resilience)
 
-    if svg_shape:
-        LOG.debug("SVG loaded from cache", element_id=element_id, key=svg_key, shape=svg_shape)
-    else:
-        if _is_element_already_dropped(svg_key):
-            LOG.debug("SVG is already dropped, going to abort conversion", element_id=element_id, key=svg_key)
-            _mark_element_as_dropped(element, hashed_key=svg_key)
-            return
+        if svg_shape:
+            LOG.debug("SVG loaded from cache", element_id=element_id, key=svg_key, shape=svg_shape)
+            refresh_svg_cache = True
+        else:
+            if _is_element_already_dropped(svg_key):
+                LOG.debug("SVG is already dropped, going to abort conversion", element_id=element_id, key=svg_key)
+                _mark_element_as_dropped(element, hashed_key=svg_key)
+                return
 
-        if len(svg_html) > settings.SVG_MAX_LENGTH:
-            # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
-            LOG.warning(
-                "SVG element is too large to convert, going to drop the svg element.",
-                element_id=element_id,
-                length=len(svg_html),
-                key=svg_key,
-            )
-            _mark_element_as_dropped(element, hashed_key=svg_key)
-            return
-
-        LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
-        svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
-
-        for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
-            try:
-                async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                    if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
-                        raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
-                    json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
-                        prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
-                    )
-                svg_shape = json_response.get("shape", "")
-                recognized = json_response.get("recognized", False)
-                if not svg_shape or not recognized:
-                    raise Exception("Empty or unrecognized SVG shape replied by secondary llm")
-                LOG.info("SVG converted by LLM", element_id=element_id, key=svg_key, shape=svg_shape)
-                await app.CACHE.set(svg_key, svg_shape)
-                break
-            except LLMProviderError:
-                LOG.info(
-                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt.",
-                    exc_info=True,
-                    element_id=element_id,
-                    key=svg_key,
-                    retry=retry,
-                )
-                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
-                    # set the invalid css shape to cache to avoid retry in the near future
-                    await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(hours=1))
-                else:
-                    await asyncio.sleep(0.5 * (2**retry))
-            except asyncio.TimeoutError:
+            if len(svg_html) > settings.SVG_MAX_LENGTH:
+                # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
                 LOG.warning(
-                    "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
+                    "SVG element is too large to convert, going to drop the svg element.",
                     element_id=element_id,
+                    length=len(svg_html),
                     key=svg_key,
                 )
                 _mark_element_as_dropped(element, hashed_key=svg_key)
                 return
-            except Exception:
-                LOG.info(
-                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt.",
-                    exc_info=True,
+
+            LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
+            svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
+
+            for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
+                try:
+                    async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                            raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
+                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
+                            prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
+                        )
+                    svg_shape = json_response.get("shape", "")
+                    recognized = json_response.get("recognized", False)
+                    if not svg_shape or not recognized:
+                        raise Exception("Empty or unrecognized SVG shape replied by secondary llm")
+                    LOG.info("SVG converted by LLM", element_id=element_id, key=svg_key, shape=svg_shape)
+                    await _set_svg_cache(svg_key, svg_shape, cache_locally=use_cache_resilience)
+                    break
+                except LLMProviderError:
+                    LOG.info(
+                        "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt.",
+                        exc_info=True,
+                        element_id=element_id,
+                        key=svg_key,
+                        retry=retry,
+                    )
+                    if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
+                        # set the invalid css shape to cache to avoid retry in the near future
+                        await _set_svg_cache(
+                            svg_key,
+                            INVALID_SHAPE,
+                            ex=timedelta(hours=1),
+                            cache_locally=use_cache_resilience,
+                        )
+                    else:
+                        await asyncio.sleep(0.5 * (2**retry))
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
+                        element_id=element_id,
+                        key=svg_key,
+                    )
+                    _mark_element_as_dropped(element, hashed_key=svg_key)
+                    return
+                except Exception:
+                    LOG.info(
+                        "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt.",
+                        exc_info=True,
+                        element_id=element_id,
+                        retry=retry,
+                    )
+                    if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
+                        # set the invalid css shape to cache to avoid retry in the near future
+                        await _set_svg_cache(
+                            svg_key,
+                            INVALID_SHAPE,
+                            ex=timedelta(weeks=1),
+                            cache_locally=use_cache_resilience,
+                        )
+                    else:
+                        await asyncio.sleep(0.5 * (2**retry))
+            else:
+                LOG.warning(
+                    "Reaching the max try to convert svg element, going to drop the svg element.",
                     element_id=element_id,
-                    retry=retry,
+                    key=svg_key,
+                    length=len(svg_html),
                 )
-                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
-                    # set the invalid css shape to cache to avoid retry in the near future
-                    await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(weeks=1))
-                else:
-                    await asyncio.sleep(0.5 * (2**retry))
-        else:
-            LOG.warning(
-                "Reaching the max try to convert svg element, going to drop the svg element.",
-                element_id=element_id,
-                key=svg_key,
-                length=len(svg_html),
-            )
-            _mark_element_as_dropped(element, hashed_key=svg_key)
-            return
+                _mark_element_as_dropped(element, hashed_key=svg_key)
+                return
 
     element["attributes"] = dict()
     if svg_shape != INVALID_SHAPE:
         # refresh the cache expiration
-        await app.CACHE.set(svg_key, svg_shape)
+        if refresh_svg_cache:
+            await _set_svg_cache(svg_key, svg_shape, cache_locally=use_cache_resilience)
         element["attributes"]["alt"] = svg_shape
     if "children" in element:
         del element["children"]
@@ -404,7 +590,7 @@ async def _convert_css_shape_to_string(
                     if not css_shape or not recognized:
                         raise Exception("Empty or unrecognized css shape replied by secondary llm")
                     LOG.info("CSS Shape converted by LLM", element_id=element_id, key=shape_key, shape=css_shape)
-                    await app.CACHE.set(shape_key, css_shape)
+                    await _set_css_shape_cache(shape_key, css_shape)
                     break
                 except LLMProviderError:
                     LOG.info(
@@ -416,7 +602,7 @@ async def _convert_css_shape_to_string(
                     )
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
-                        await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
+                        await _set_css_shape_cache(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
@@ -435,7 +621,7 @@ async def _convert_css_shape_to_string(
                     )
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
-                        await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
+                        await _set_css_shape_cache(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
             else:
                 LOG.info(
                     "Max css shape convertion retry, going to abort the convertion.",
@@ -458,7 +644,7 @@ async def _convert_css_shape_to_string(
         element["attributes"] = dict()
     if css_shape != INVALID_SHAPE:
         # refresh the cache expiration
-        await app.CACHE.set(shape_key, css_shape)
+        await _set_css_shape_cache(shape_key, css_shape)
         element["attributes"]["shape-description"] = css_shape
     return None
 
@@ -512,6 +698,49 @@ class AgentFunction:
         workflow: "Workflow",
         workflow_run: "WorkflowRun",
     ) -> bool:
+        return True
+
+    async def should_use_codeblock_runner(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: "WorkflowRunContext",
+        organization_id: str | None,
+        block_label: str | None,
+        browser_session_id: str | None,
+    ) -> bool:
+        """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
+
+        Gating lives here, at the block-execution call site, rather than inside
+        execute_code_block_override so the override only runs the runner. OSS has no
+        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
+        only routes runs that have a browser session for the runner to broker against.
+        """
+        return False
+
+    async def execute_code_block_override(
+        self,
+        *,
+        block: Any,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        workflow_run_context: "WorkflowRunContext",
+        parameter_values: dict[str, Any],
+        credential_parameter_keys: set[str],
+    ) -> Any | None:
+        """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
+
+        OSS no-op returns None so callers fall through to in-process execution. Cloud
+        overrides to dispatch to the runner. Callers must gate on
+        should_use_codeblock_runner first.
+        """
+        return None
+
+    async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
+        """OSS always-on; cloud overrides to gate per-org for staged rollout."""
         return True
 
     async def get_analytics_warmable_organization_ids(self, statement_timeout_seconds: int = 10) -> list[str]:
@@ -742,11 +971,7 @@ class AgentFunction:
         return
 
     async def wait_for_challenge_solver(self, page: Page) -> None:
-        """Wait for a cloud-managed challenge solver if one is attached to the page.
-
-        OSS no-op. Cloud overrides this so OSS-synced browser/action code can
-        wait at navigation/action boundaries without importing cloud modules.
-        """
+        """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None
 
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
@@ -758,14 +983,7 @@ class AgentFunction:
         workflow_permanent_id: str | None,
         cache_key: str,
     ) -> Any | None:
-        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op.
-
-        Cloud overrides this to consult the Redis tier (SKY-8873). Returns the
-        cached extraction value on a hit or None on a miss / error / disabled
-        flag. Implementations MUST swallow backend errors and return None so
-        the extract path always falls through to a fresh LLM call rather than
-        failing loud.
-        """
+        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op."""
         return None
 
     async def store_cross_run_extraction_cache(
@@ -774,14 +992,7 @@ class AgentFunction:
         cache_key: str,
         value: Any,
     ) -> None:
-        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op.
-
-        Cloud overrides this to write to the Redis tier (SKY-8873) with a
-        long TTL. Called after a fresh LLM extraction so subsequent runs of
-        the same workflow against the same page content skip the LLM call.
-        Implementations MUST swallow backend errors — write-path failures
-        must never fail the user-visible request.
-        """
+        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op."""
         return None
 
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
@@ -802,6 +1013,7 @@ class AgentFunction:
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
+        max_elapsed_time_minutes: int | None = None,
     ) -> None:
         """Upsert a recurring schedule with the execution backend (e.g. Temporal).
 
@@ -816,11 +1028,16 @@ class AgentFunction:
         return None
 
     async def delete_workflow_schedule(self, backend_schedule_id: str) -> None:
-        """Delete a schedule from the execution backend. OSS no-op.
+        """Delete a schedule from the execution backend. OSS no-op."""
+        return None
 
-        Implementations must be idempotent — deleting an already-absent schedule
-        should succeed silently rather than raising.
-        """
+    async def calculate_workflow_run_total_cost(
+        self,
+        organization_id: str | None,
+        credits_used: int,
+        cached_credits_used: int,
+    ) -> float | None:
+        """Compute the user-facing ``total_cost`` for a workflow run. OSS returns None."""
         return None
 
     async def auto_solve_captchas(self, page: Page) -> bool:
@@ -866,26 +1083,25 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
         required_scopes: list[str] | None = None,
-    ) -> object | None:
+    ) -> Credentials | None:
         """Return a refreshed ``google.oauth2.credentials.Credentials``, or None on failure.
 
-        ``required_scopes`` is accepted for forward-compat with cloud overrides
-        that may enforce scope checks; the OSS path does not yet use it.
+        ``required_scopes`` gates use of a credential whose grant does not cover
+        the API the caller is about to use.
         """
-        if required_scopes:
-            # Debug-level so OSS operators don't see this on every call; scope
-            # enforcement lives on the cloud override and a future caller can
-            # grep for this message if they need to audit usage.
-            LOG.debug(
-                "required_scopes ignored by OSS get_google_workspace_credentials; cloud override gates this",
-                required_scopes=required_scopes,
-                credential_id=credential_id,
-            )
         try:
             secrets = await google_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
                 credential_id=credential_id,
             )
+            if required_scopes and not google_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+                LOG.info(
+                    "Google OAuth credential missing required scopes",
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    required_scopes=required_scopes,
+                )
+                return None
             return await google_oauth_service.credentials_from_secrets(secrets)
         except google_oauth_service.EncryptionNotConfiguredError:
             LOG.error(
@@ -901,6 +1117,19 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+
+    async def get_otp_value_from_gmail(
+        self,
+        *,
+        organization_id: str,
+        totp_identifier: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        created_after: datetime | None = None,
+        context: GmailOTPVerificationContext | None = None,
+    ) -> "OTPValue | None":
+        """Cloud-only Gmail OTP lookup hook. OSS builds do not read inboxes."""
+        return None
 
     async def ensure_sheet_tab(
         self,
@@ -1205,7 +1434,7 @@ class AgentFunction:
         resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
         return CopilotConfig(
             block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
-            impose_synthesized_code_block=settings.WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS,
+            impose_synthesized_code_block=True,
         )
 
     async def get_copilot_config_for_request(

@@ -259,16 +259,16 @@ def test_signature_parameter_binding_ignores_key_name() -> None:
     assert sig_a == sig_b
 
 
-def test_signature_non_parameter_binding_preserves_text() -> None:
+def test_signature_non_category_only_failure_preserves_selector_shape() -> None:
     sig_a = compute_failure_signature(
         frontier_start_label="extract",
-        failure_reason="Element not found for selector #foo",
+        failure_reason="Element not found for selector: #foo",
         failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}],
         suspicious_success=False,
     )
     sig_b = compute_failure_signature(
         frontier_start_label="extract",
-        failure_reason="Element not found for selector #bar",
+        failure_reason="Element not found for selector: #bar",
         failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}],
         suspicious_success=False,
     )

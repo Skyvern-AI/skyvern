@@ -1,3 +1,4 @@
+import { MicIcon } from "@/components/icons/MicIcon";
 import {
   Tooltip,
   TooltipContent,
@@ -5,24 +6,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
-
-function MicIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 15 15"
-      fill="currentColor"
-      className={className}
-      aria-hidden="true"
-    >
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M7.5 1.25a2.25 2.25 0 0 0-2.25 2.25v3.5a2.25 2.25 0 0 0 4.5 0V3.5A2.25 2.25 0 0 0 7.5 1.25Zm-3.75 5.25a3.75 3.75 0 0 0 7.5 0H10a4.75 4.75 0 0 1-9.5 0H3.75ZM7.5 10.25a.75.75 0 0 1 .75.75v1.5h1.25a.75.75 0 0 1 0 1.5H5.5a.75.75 0 0 1 0-1.5h1.25v-1.5A.75.75 0 0 1 7.5 10.25Z"
-      />
-    </svg>
-  );
-}
 
 type SpeechInputButtonProps = {
   isSupported: boolean;

@@ -14,10 +14,13 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
+  ChevronRightIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
+import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -40,10 +43,12 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
+  WorkflowCopilotChatSummary,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
   WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
+import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
   QueuedPromptReason,
@@ -52,6 +57,8 @@ import {
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
+import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
+import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import {
   EMPTY_NARRATIVE,
   NarrativeEvent,
@@ -70,12 +77,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
@@ -103,6 +104,23 @@ function normalizeComposerDefaultVariant(
   return "build";
 }
 
+function defaultVariantUsesCode(variant: ComposerDefaultVariant): boolean {
+  return variant === "build_code" || variant === "ask_code";
+}
+
+function defaultCodeBlockRequestOverride(
+  variant: string | undefined,
+): boolean | null {
+  if (variant === "build_code") {
+    return true;
+  }
+  if (variant === "build" || variant === "build_no_code") {
+    return false;
+  }
+  // Ask-only variants, including ask_code, do not send a build request override.
+  return null;
+}
+
 function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(seconds / 60);
@@ -126,9 +144,11 @@ function isPictographic(glyph: string): boolean {
 function ModeGlyph({
   mode,
   tone = "light",
+  glow = false,
 }: {
   mode: "ask" | "build";
   tone?: "light" | "dark";
+  glow?: boolean;
 }) {
   const glyph = mode === "build" ? BUILD_GLYPH : ASK_GLYPH;
   const filter = isPictographic(glyph)
@@ -137,9 +157,22 @@ function ModeGlyph({
       : "grayscale(1) brightness(0) invert(1)"
     : undefined;
   return (
-    <span className="inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+    <span className="relative inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+      {glow ? (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-[-5px] rounded-full"
+          style={{
+            background:
+              "radial-gradient(circle, rgba(96,165,250,0.55) 0%, rgba(59,130,246,0.18) 45%, rgba(59,130,246,0) 72%)",
+          }}
+        />
+      ) : null}
       <span
-        className={cn(mode === "build" ? "text-[16px]" : "text-[15px]")}
+        className={cn(
+          "relative",
+          mode === "build" ? "text-[16px]" : "text-[15px]",
+        )}
         style={{ lineHeight: 1, filter }}
       >
         {glyph}
@@ -307,6 +340,13 @@ interface WorkflowCopilotChatProps {
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
   onInitialMessageConsumed?: () => void;
+  // Render as a docked panel (no float/drag/resize) instead of a floating window.
+  docked?: boolean;
+  // Collapse the docked panel to a rail. Only used when `docked`.
+  onCollapse?: () => void;
+  // When docked, render into this element via a portal (keeps the component in
+  // its parent's React tree so canvas callbacks stay wired) instead of inline.
+  portalTarget?: HTMLElement | null;
 }
 
 // Snap-back state keyed by turn_id so rapid resubmits don't clobber a prior
@@ -375,6 +415,9 @@ export function WorkflowCopilotChat({
   isLiveBrowserReady = false,
   initialMessage,
   onInitialMessageConsumed,
+  docked = false,
+  onCollapse,
+  portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
@@ -395,11 +438,12 @@ export function WorkflowCopilotChat({
       ? "ask"
       : "build",
   );
-  const [codeWorkflow, setCodeWorkflow] = useState(
-    () =>
-      effectiveDefaultVariant === "build_code" ||
-      effectiveDefaultVariant === "ask_code",
+  const [codeWorkflow, setCodeWorkflow] = useState(() =>
+    defaultVariantUsesCode(effectiveDefaultVariant),
   );
+  const [codeBlockRequestOverride, setCodeBlockRequestOverride] = useState<
+    boolean | null
+  >(() => defaultCodeBlockRequestOverride(defaultModeVariant));
   // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
   const composerSeededRef = useRef(false);
   const flagsResolved =
@@ -417,15 +461,19 @@ export function WorkflowCopilotChat({
         ? "ask"
         : "build",
     );
-    setCodeWorkflow(
-      effectiveDefaultVariant === "build_code" ||
-        effectiveDefaultVariant === "ask_code",
+    setCodeWorkflow(defaultVariantUsesCode(effectiveDefaultVariant));
+    setCodeBlockRequestOverride(
+      defaultCodeBlockRequestOverride(defaultModeVariant),
     );
-  }, [flagsResolved, effectiveDefaultVariant]);
+  }, [flagsResolved, effectiveDefaultVariant, defaultModeVariant]);
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
   const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
-  const showCodeToggle = isBuild && codeBlockModeEnabled && codeToggleAllowed;
+  // "Build with code" is offered as a third mode in the dropdown rather than a
+  // separate toggle; the code state only renders on the button while in Build.
+  const codeOptionAvailable =
+    copilotV2Enabled && codeBlockModeEnabled && codeToggleAllowed;
+  const codeStateActive = isBuild && codeWorkflow && codeOptionAvailable;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -633,6 +681,91 @@ export function WorkflowCopilotChat({
     latestTurnId.current = null;
     repin();
   };
+
+  const applyHistoryResponse = useCallback(
+    (data: WorkflowCopilotChatHistoryResponse) => {
+      const historyMessages = data.chat_history.map((message, index) => ({
+        id: `${index}-${Date.now()}`,
+        sender: message.sender,
+        content: message.content,
+        timestamp: message.created_at,
+        narrative: (() => {
+          const hydrated = hydrateHistoryNarrative(
+            message.narrative_payload,
+            message.turn_outcome,
+          );
+          if (!hydrated) return undefined;
+          // Fall back to the legacy message body when the persisted payload
+          // predates terminal-text capture.
+          if (!hydrated.terminalMessage && message.content) {
+            return {
+              ...hydrated,
+              terminalMessage: message.content,
+              narrativeSummary: hydrated.narrativeSummary ?? message.content,
+            };
+          }
+          return hydrated;
+        })(),
+      }));
+      setMessages(historyMessages);
+      setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
+      setProposedWorkflow(data.proposed_workflow ?? null);
+      setAutoAccept(data.auto_accept ?? false);
+    },
+    // Only stable state setters are referenced, so the callback never needs to change.
+    [],
+  );
+
+  const loadChatInPlace = useCallback(
+    async (chatId: string) => {
+      if (!workflowPermanentId) return;
+      setIsLoadingHistory(true);
+      updateQueuedPrompt(null);
+      setNarrative(EMPTY_NARRATIVE);
+      turnSnapshots.current.clear();
+      pendingSubmitSnapshot.current = null;
+      latestTurnId.current = null;
+      repin();
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+          "/workflow/copilot/chat-history",
+          {
+            params: {
+              workflow_permanent_id: workflowPermanentId,
+              workflow_copilot_chat_id: chatId,
+            },
+          },
+        );
+        applyHistoryResponse(response.data);
+        // Mark history loaded for this workflow so the mount effect won't reload
+        // the latest chat over the one the user just selected.
+        historyLoadedForRef.current = workflowPermanentId;
+      } catch (error) {
+        console.error("Failed to load chat:", error);
+        toast({ title: "Failed to load chat", variant: "destructive" });
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    },
+    [
+      credentialGetter,
+      workflowPermanentId,
+      applyHistoryResponse,
+      updateQueuedPrompt,
+      repin,
+    ],
+  );
+
+  const handleSelectHistoryChat = useCallback(
+    (chat: WorkflowCopilotChatSummary) => {
+      if (chat.workflow_copilot_chat_id === workflowCopilotChatIdRef.current) {
+        return;
+      }
+      void loadChatInPlace(chat.workflow_copilot_chat_id);
+    },
+    [loadChatInPlace],
+  );
 
   const applyWorkflowUpdate = useCallback(
     (
@@ -891,36 +1024,7 @@ export function WorkflowCopilotChat({
 
         if (!isMounted) return;
 
-        const historyMessages = response.data.chat_history.map(
-          (message, index) => ({
-            id: `${index}-${Date.now()}`,
-            sender: message.sender,
-            content: message.content,
-            timestamp: message.created_at,
-            narrative: (() => {
-              const hydrated = hydrateHistoryNarrative(
-                message.narrative_payload,
-                message.turn_outcome,
-              );
-              if (!hydrated) return undefined;
-              // Fall back to the legacy message body when the persisted
-              // payload predates terminal-text capture.
-              if (!hydrated.terminalMessage && message.content) {
-                return {
-                  ...hydrated,
-                  terminalMessage: message.content,
-                  narrativeSummary:
-                    hydrated.narrativeSummary ?? message.content,
-                };
-              }
-              return hydrated;
-            })(),
-          }),
-        );
-        setMessages(historyMessages);
-        setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
-        setProposedWorkflow(response.data.proposed_workflow ?? null);
-        setAutoAccept(response.data.auto_accept ?? false);
+        applyHistoryResponse(response.data);
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
@@ -936,7 +1040,13 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, repin, updateQueuedPrompt, workflowPermanentId]);
+  }, [
+    credentialGetter,
+    repin,
+    updateQueuedPrompt,
+    workflowPermanentId,
+    applyHistoryResponse,
+  ]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -995,6 +1105,8 @@ export function WorkflowCopilotChat({
     }
 
     updateQueuedPrompt(null);
+    // Discard the queued block-build's target so it can't leak into the next normal message.
+    blockBuildTargetLabelRef.current = null;
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -1024,6 +1136,11 @@ export function WorkflowCopilotChat({
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
+
+  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
+  const blockBuildTargetLabelRef = useRef<string | null>(null);
+  // True only while a block-build turn is actually in flight (not a turn it queued behind).
+  const blockGenInFlightRef = useRef(false);
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
@@ -1176,6 +1293,7 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
             max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
             max_elapsed_time_minutes:
@@ -1209,6 +1327,12 @@ export function WorkflowCopilotChat({
           pendingSubmitSnapshot.current = {
             ...saveData.workflow,
             title: saveData.title,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
+            model: saveData.settings.model,
             workflow_definition: {
               ...saveData.workflow.workflow_definition,
               parameters: saveData.parameters,
@@ -1347,6 +1471,11 @@ export function WorkflowCopilotChat({
         };
 
         const client = await getSseClient(credentialGetter);
+        const targetBlockLabel = blockBuildTargetLabelRef.current;
+        blockBuildTargetLabelRef.current = null;
+        if (targetBlockLabel != null) {
+          blockGenInFlightRef.current = true;
+        }
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
@@ -1359,8 +1488,10 @@ export function WorkflowCopilotChat({
             audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
             mode: copilotV2Enabled ? composerMode : null,
-            code_block: isBuild && codeBlockModeEnabled ? codeWorkflow : null,
+            code_block:
+              isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
             cancel_token: cancelToken,
+            target_block_label: targetBlockLabel,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -1469,7 +1600,7 @@ export function WorkflowCopilotChat({
       applyWorkflowUpdate,
       autoAccept,
       codeBlockModeEnabled,
-      codeWorkflow,
+      codeBlockRequestOverride,
       composerMode,
       copilotV2Enabled,
       credentialGetter,
@@ -1489,6 +1620,94 @@ export function WorkflowCopilotChat({
       workflowRunId,
     ],
   );
+
+  // A code block's "Generate" button asks the copilot to (re)build that one block
+  // from its goal. Force build + code mode, then fire the send on the next tick.
+  const pendingBlockBuild = useCopilotActionStore(
+    (state) => state.pendingBuild,
+  );
+  const clearPendingBlockBuild = useCopilotActionStore(
+    (state) => state.clearPendingBuild,
+  );
+  const finishBlockGenerating = useCopilotActionStore(
+    (state) => state.finishGenerating,
+  );
+  const blockCancelNonce = useCopilotActionStore((state) => state.cancelNonce);
+  const blockBuildMessageRef = useRef<string | null>(null);
+  const [blockBuildArmNonce, setBlockBuildArmNonce] = useState(0);
+
+  useEffect(() => {
+    if (!pendingBlockBuild) {
+      return;
+    }
+    blockBuildMessageRef.current =
+      `Rebuild the "${pendingBlockBuild.blockLabel}" code block so it accomplishes ` +
+      `this goal, and update its code and steps accordingly: ${pendingBlockBuild.prompt}`;
+    blockBuildTargetLabelRef.current = pendingBlockBuild.blockLabel;
+    setComposerMode("build");
+    setCodeWorkflow(true);
+    setCodeBlockRequestOverride(true);
+    setBlockBuildArmNonce((nonce) => nonce + 1);
+    clearPendingBlockBuild();
+  }, [pendingBlockBuild, clearPendingBlockBuild]);
+
+  useEffect(() => {
+    if (blockBuildArmNonce === 0 || blockBuildMessageRef.current === null) {
+      return;
+    }
+    if (composerMode !== "build" || !codeWorkflow) {
+      return;
+    }
+    const message = blockBuildMessageRef.current;
+    blockBuildMessageRef.current = null;
+    // A prompt is already queued, so this send no-ops. Disarm the block target
+    // (else the queued drain inherits it) and clear the stuck generating state.
+    if (queuedPromptRef.current) {
+      blockBuildTargetLabelRef.current = null;
+      finishBlockGenerating();
+      return;
+    }
+    void handleSend(message);
+  }, [
+    blockBuildArmNonce,
+    composerMode,
+    codeWorkflow,
+    handleSend,
+    finishBlockGenerating,
+  ]);
+
+  const blockGenLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    if (
+      blockGenLoadingRef.current &&
+      !isLoading &&
+      blockGenInFlightRef.current
+    ) {
+      blockGenInFlightRef.current = false;
+      finishBlockGenerating();
+    }
+    blockGenLoadingRef.current = isLoading;
+  }, [isLoading, finishBlockGenerating]);
+
+  const blockCancelNonceRef = useRef(blockCancelNonce);
+  useEffect(() => {
+    if (blockCancelNonce !== blockCancelNonceRef.current) {
+      blockCancelNonceRef.current = blockCancelNonce;
+      const queued = queuedPromptRef.current;
+      // A queued block build hasn't streamed yet, so cancelSend would no-op and
+      // let it drain later. Drop it (and its bubble), leaving any unrelated
+      // in-flight turn untouched.
+      if (queued && blockBuildTargetLabelRef.current != null) {
+        blockBuildTargetLabelRef.current = null;
+        updateQueuedPrompt(null);
+        setMessages((prev) =>
+          prev.filter((message) => message.id !== queued.id),
+        );
+        return;
+      }
+      void cancelSend();
+    }
+  }, [blockCancelNonce, cancelSend, updateQueuedPrompt]);
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1772,25 +1991,49 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
 
-  return (
+  const content = (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
-      style={{
-        left: `${position.x}px`,
-        top: `${position.y}px`,
-        width: `${size.width}px`,
-        height: `${size.height}px`,
-      }}
+      className={
+        docked
+          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
+      }
+      style={
+        docked
+          ? undefined
+          : {
+              left: `${position.x}px`,
+              top: `${position.y}px`,
+              width: `${size.width}px`,
+              height: `${size.height}px`,
+            }
+      }
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-border px-4 py-2"
-        onMouseDown={handleMouseDown}
+        className={
+          "flex items-center justify-between border-b border-border px-4" +
+          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+        }
+        onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-foreground">
-          Agent Copilot (Beta)
-        </h3>
         <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-foreground">
+            {docked ? "Copilot" : "Agent Copilot (Beta)"}
+          </h3>
+          {docked ? (
+            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+              Beta
+            </span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <WorkflowCopilotHistory
+            workflowPermanentId={workflowPermanentId}
+            currentChatId={workflowCopilotChatId}
+            onSelect={handleSelectHistoryChat}
+            disabled={isLoading || isLoadingHistory}
+          />
           <button
             type="button"
             onClick={handleNewChat}
@@ -1801,15 +2044,28 @@ export function WorkflowCopilotChat({
           </button>
           <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
           <span className="text-xs text-muted-foreground">Active</span>
-          <button
-            type="button"
-            onClick={() => onClose?.()}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            title="Close"
-          >
-            <Cross2Icon className="h-4 w-4" />
-          </button>
+          {docked ? (
+            onCollapse ? (
+              <button
+                type="button"
+                onClick={onCollapse}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Collapse Copilot"
+              >
+                <ChevronRightIcon className="h-4 w-4" />
+              </button>
+            ) : null
+          ) : (
+            <button
+              type="button"
+              onClick={() => onClose?.()}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              title="Close"
+            >
+              <Cross2Icon className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -1895,6 +2151,21 @@ export function WorkflowCopilotChat({
                           Reject
                         </button>
                       </div>
+                    ) : null}
+                    {docked && shouldShowDiffCard(message.narrative) ? (
+                      <DiffCard turn={message.narrative} />
+                    ) : null}
+                    {docked &&
+                    isLastMessage &&
+                    shouldShowFixCard(message.narrative) ? (
+                      <FixCard
+                        turn={message.narrative}
+                        onFix={() =>
+                          handleSend(
+                            "The last run failed — diagnose the failure and fix it, then re-run.",
+                          )
+                        }
+                      />
                     ) : null}
                   </div>
                 );
@@ -2068,143 +2339,182 @@ export function WorkflowCopilotChat({
               Send
             </button>
           ) : (
-            <div className="flex items-end gap-2">
-              {showCodeToggle ? (
-                <TooltipProvider>
-                  <Tooltip delayDuration={300}>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        aria-pressed={codeWorkflow}
-                        onClick={() => setCodeWorkflow((v) => !v)}
-                        className={cn(
-                          "flex h-10 w-10 items-center justify-center rounded-lg border transition-colors hover:brightness-[1.18] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                          codeWorkflow
-                            ? "border-sky-300 bg-sky-300/15 text-sky-300"
-                            : "border-slate-600 bg-transparent text-slate-400",
-                        )}
-                      >
-                        <span
-                          className="text-[13px] font-semibold"
-                          style={{ lineHeight: 1 }}
-                        >
-                          {"</>"}
-                        </span>
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-[260px]">
-                      Build the workflow as code. Faster and more flexible, but
-                      may need extra detail to handle every edge case.
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              ) : null}
-              <div className="flex items-stretch">
-                <button
-                  onClick={() => handleSend()}
-                  className="flex h-10 items-center gap-1.5 rounded-l-lg bg-cta px-3 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <ModeGlyph mode={isBuild ? "build" : "ask"} tone="dark" />
-                  {isBuild ? "Build" : "Ask"}
-                </button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      title="Switch mode"
-                      aria-label="Switch mode"
-                      className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      <ChevronDownIcon className="h-3.5 w-3.5" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    side="top"
-                    align="end"
-                    className="w-[272px] p-1.5"
+            <div className="flex items-stretch">
+              <button
+                onClick={() => handleSend()}
+                className="flex h-10 items-center gap-2 rounded-l-lg bg-cta px-3 py-1.5 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <ModeGlyph
+                  mode={isBuild ? "build" : "ask"}
+                  tone="dark"
+                  glow={codeStateActive}
+                />
+                {codeStateActive ? (
+                  <span className="flex flex-col items-start">
+                    <span className="text-sm font-medium leading-tight">
+                      Build
+                    </span>
+                    <span className="text-[10px] font-medium leading-tight text-cta-foreground/70">
+                      with code
+                    </span>
+                  </span>
+                ) : (
+                  <span>{isBuild ? "Build" : "Ask"}</span>
+                )}
+              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="Switch mode"
+                    aria-label="Switch mode"
+                    className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
+                    <ChevronDownIcon className="h-3.5 w-3.5" />
+                  </button>
+                </DropdownMenuTrigger>
+                {/* onCloseAutoFocus: don't return focus to the caret on close,
+                    so its focus ring doesn't linger after a click. */}
+                <DropdownMenuContent
+                  side="top"
+                  align="end"
+                  className="w-[272px] p-1.5"
+                  onCloseAutoFocus={(event) => event.preventDefault()}
+                >
+                  <DropdownMenuItem
+                    aria-label="Ask"
+                    onSelect={() => {
+                      setComposerMode("ask");
+                      setCodeWorkflow(false);
+                      setCodeBlockRequestOverride(null);
+                    }}
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      !isBuild && "bg-accent",
+                    )}
+                  >
+                    <ModeGlyph mode="ask" />
+                    <span className="flex flex-1 flex-col">
+                      <span className="text-sm font-medium">Ask</span>
+                      <span className="text-xs leading-snug text-muted-foreground">
+                        Answer questions and make quick workflow edits.
+                      </span>
+                    </span>
+                    {!isBuild ? (
+                      <CheckIcon className="h-4 w-4 text-sky-400" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    aria-label="Build"
+                    onSelect={() => {
+                      setComposerMode("build");
+                      setCodeWorkflow(false);
+                      setCodeBlockRequestOverride(false);
+                    }}
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      isBuild && !codeWorkflow && "bg-accent",
+                    )}
+                  >
+                    <ModeGlyph mode="build" />
+                    <span className="flex flex-1 flex-col">
+                      <span className="text-sm font-medium">Build</span>
+                      <span className="text-xs leading-snug text-muted-foreground">
+                        Navigates the site to design your workflow, then tests
+                        that it works.
+                      </span>
+                    </span>
+                    {isBuild && !codeWorkflow ? (
+                      <CheckIcon className="h-4 w-4 text-sky-400" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  {codeOptionAvailable ? (
                     <DropdownMenuItem
-                      onSelect={() => setComposerMode("ask")}
-                      className="flex items-start gap-2.5"
+                      aria-label="Build workflow as code"
+                      onSelect={() => {
+                        setComposerMode("build");
+                        setCodeWorkflow(true);
+                        setCodeBlockRequestOverride(true);
+                      }}
+                      className={cn(
+                        "flex items-start gap-2.5",
+                        isBuild && codeWorkflow && "bg-accent",
+                      )}
                     >
-                      <ModeGlyph mode="ask" />
+                      <ModeGlyph mode="build" glow />
                       <span className="flex flex-1 flex-col">
-                        <span className="text-sm font-medium">Ask</span>
+                        <span className="text-sm font-medium">
+                          Build workflow as code
+                        </span>
                         <span className="text-xs leading-snug text-muted-foreground">
-                          Answer questions and make quick workflow edits.
+                          Build the workflow as code. Faster and more flexible,
+                          but may need extra detail to handle every edge case.
                         </span>
                       </span>
-                      {!isBuild ? (
+                      {isBuild && codeWorkflow ? (
                         <CheckIcon className="h-4 w-4 text-sky-400" />
                       ) : null}
                     </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => setComposerMode("build")}
-                      className="flex items-start gap-2.5"
-                    >
-                      <ModeGlyph mode="build" />
-                      <span className="flex flex-1 flex-col">
-                        <span className="text-sm font-medium">Build</span>
-                        <span className="text-xs leading-snug text-muted-foreground">
-                          Navigates the site to design your workflow, then tests
-                          that it works.
-                        </span>
-                      </span>
-                      {isBuild ? (
-                        <CheckIcon className="h-4 w-4 text-sky-400" />
-                      ) : null}
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
+                  ) : null}
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           )}
         </div>
       </div>
 
       {/* Resize Handles */}
-      {/* Corners */}
-      <div
-        className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "se")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
-        title="Resize"
-      />
-      <div
-        className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
-        title="Resize"
-      />
-      <div
-        className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
-        title="Resize"
-      />
-      {/* Edges */}
-      <div
-        className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "n")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "s")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "w")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "e")}
-        title="Resize"
-      />
+      {!docked && (
+        <>
+          {/* Corners */}
+          <div
+            className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "se")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
+            title="Resize"
+          />
+          <div
+            className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
+            title="Resize"
+          />
+          <div
+            className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
+            title="Resize"
+          />
+          {/* Edges */}
+          <div
+            className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "n")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "s")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "w")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "e")}
+            title="Resize"
+          />
+        </>
+      )}
     </div>
   );
+
+  if (docked) {
+    return portalTarget ? createPortal(content, portalTarget) : null;
+  }
+  return content;
 }

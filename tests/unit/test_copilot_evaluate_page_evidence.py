@@ -7,11 +7,13 @@ import pytest
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
     _inspect_page_for_composition_impl,
     _mark_pending_browser_interaction_observation,
 )
+from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
@@ -30,6 +32,33 @@ def _ctx() -> CopilotContext:
             authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
         ),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"ok": False, "error": "evaluate failed"},
+        {"ok": True},
+        {"ok": True, "data": {}},
+        {"ok": True, "data": []},
+    ],
+)
+async def test_evaluate_post_hook_resets_steer_on_unusable_result(result: dict[str, object]) -> None:
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = "stale-signature"
+    ctx.last_evaluate_actionable_url = "https://example.test/old"
+    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+        result_container_count=1,
+        table_result_container_count=1,
+    )
+
+    updated = await _evaluate_post_hook(result, raw={}, ctx=ctx)
+
+    assert updated is result
+    assert ctx.last_evaluate_actionable_signature is None
+    assert ctx.last_evaluate_actionable_url is None
+    assert ctx.latest_evaluate_result_composition_steer is None
 
 
 @pytest.mark.asyncio
@@ -105,10 +134,72 @@ async def test_evaluate_turnstile_key_records_challenge_observation_step() -> No
     assert evidence["source_tool"] == "evaluate"
     assert evidence["challenge_state"]["detected"] is True
     assert evidence["challenge_state"]["kind"] == "captcha"
+    assert evidence["challenge_state"]["requires_human_verification"] is True
     assert evidence["challenge_state"]["gates_submit_controls"] is True
     assert evidence["challenge_state"]["gated_submit_controls"][0]["disabled"] is True
     assert "turnstile" in evidence["anti_bot_indicators"]
     assert ctx.composition_page_evidence is evidence
+
+
+@pytest.mark.asyncio
+async def test_evaluate_nested_challenge_payload_does_not_block_before_attempt() -> None:
+    ctx = _ctx()
+
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.test/certificant-search",
+            "title": "Certificant Search",
+            "buttons": [{"text": "Search", "disabled": True, "selector": "#search-button"}],
+            "fields": [
+                {
+                    "label": "Verification code",
+                    "name": "captcha_response",
+                    "placeholder": "Enter verification code",
+                }
+            ],
+        },
+    }
+
+    await _evaluate_post_hook(result, raw={}, ctx=ctx)
+
+    evidence = ctx.composition_page_evidence
+    assert evidence is not None
+    assert evidence["source_tool"] == "evaluate"
+    assert evidence["challenge_state"]["detected"] is True
+    assert evidence["challenge_state"]["requires_human_verification"] is True
+    assert evidence["challenge_state"]["gates_submit_controls"] is True
+    assert evidence["challenge_state"]["gated_submit_controls"][0]["disabled"] is True
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_lookup"]})
+
+    assert msg is None
+    assert ctx.turn_halt is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_text_only_challenge_payload_stays_diagnostic() -> None:
+    ctx = _ctx()
+
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.test/certificant-search",
+            "title": "Certificant Search",
+            "text": "Verify you are human before searching.",
+            "turnstile": True,
+        },
+    }
+
+    await _evaluate_post_hook(result, raw={}, ctx=ctx)
+
+    evidence = ctx.composition_page_evidence
+    assert evidence is not None
+    assert evidence["source_tool"] == "evaluate"
+    assert evidence["challenge_state"]["detected"] is True
+    assert evidence["challenge_state"]["requires_human_verification"] is False
+    assert evidence["challenge_state"]["gates_submit_controls"] is False
+    assert evidence["challenge_state"]["gated_submit_controls"] == []
 
 
 @pytest.mark.asyncio

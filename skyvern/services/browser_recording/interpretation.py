@@ -3,6 +3,7 @@ import dataclasses
 import enum
 import time
 import typing as t
+import uuid
 
 import structlog
 
@@ -245,6 +246,7 @@ class RecordingInterpretationSession:
         self.organization_id = organization_id
         self.workflow_permanent_id = workflow_permanent_id
         self.on_update = on_update
+        self.interpretation_session_id = str(uuid.uuid4())
         self.debounce_seconds = debounce_seconds
         self.max_wait_seconds = max_wait_seconds
         self.events: list[ExfiltratedEvent] = []
@@ -266,8 +268,24 @@ class RecordingInterpretationSession:
         ]
         self._all_actions: list[Action] = []
         self._processed_event_count = 0
+        self._capture_paused = False
+
+    def reset_wait_capture(self) -> None:
+        for machine in self._action_machines:
+            if isinstance(machine, sm.Wait):
+                machine.reset()
+
+    def pause_capture(self) -> None:
+        self._capture_paused = True
+        self.reset_wait_capture()
+
+    def resume_capture(self) -> None:
+        self._capture_paused = False
+        self.reset_wait_capture()
 
     def ingest_events(self, events: list[streaming_exfiltration.ExfiltratedEvent]) -> None:
+        if self._capture_paused:
+            return
         reified_events = streaming_events_to_recording_events(events)
         if not reified_events:
             return
@@ -465,9 +483,31 @@ class RecordingInterpretationSession:
             suffix += 1
         return f"{label}_{suffix}"
 
+    def emit_snapshot(self) -> None:
+        if self.session_revision == 0:
+            return
+
+        update = RecordingInterpretationUpdate(
+            interpretation_session_id=self.interpretation_session_id,
+            session_revision=self.session_revision,
+            steps=self.steps,
+            pending=self.pending,
+            finalized=self.finalized,
+        )
+
+        try:
+            self.on_update(update)
+        except Exception:
+            LOG.exception(
+                "Failed to emit recording interpretation snapshot",
+                browser_session_id=self.browser_session_id,
+                organization_id=self.organization_id,
+            )
+
     def _emit_update(self) -> None:
         self.session_revision += 1
         update = RecordingInterpretationUpdate(
+            interpretation_session_id=self.interpretation_session_id,
             session_revision=self.session_revision,
             steps=self.steps,
             pending=self.pending,

@@ -22,7 +22,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
-from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential, TotpType
 
 _FAKE_PASSWORD = "fake-test-password-7x9"
 _FAKE_USERNAME = "qa.user@example.test"
@@ -174,6 +174,44 @@ class TestResolveCredentialFillValue:
         assert value is None
         assert error is not None
         assert "TOTP" in error
+
+    @pytest.mark.asyncio
+    async def test_email_otp_credential_returns_runtime_otp_steer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(
+            monkeypatch,
+            PasswordCredential(
+                username=_FAKE_USERNAME,
+                password=_FAKE_PASSWORD,
+                totp=None,
+                totp_type=TotpType.EMAIL,
+                totp_identifier="otp@example.test",
+            ),
+        )
+        value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "totp")
+        assert value is None
+        assert error is not None
+        assert "await <credential_parameter>.otp()" in error
+        assert "workflow run" in error
+        assert "otp@example.test" not in error
+
+    @pytest.mark.asyncio
+    async def test_text_otp_credential_returns_runtime_otp_steer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(
+            monkeypatch,
+            PasswordCredential(
+                username=_FAKE_USERNAME,
+                password=_FAKE_PASSWORD,
+                totp=None,
+                totp_type=TotpType.TEXT,
+                totp_identifier="+15550101111",
+            ),
+        )
+        value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "totp")
+        assert value is None
+        assert error is not None
+        assert "await <credential_parameter>.otp()" in error
+        assert "workflow run" in error
+        assert "+15550101111" not in error
 
     @pytest.mark.asyncio
     async def test_missing_credential_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:

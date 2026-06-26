@@ -35,7 +35,7 @@ User details:
 ```
 
 {% if open_tabs_context %}
-Open browser tabs ({% if show_switch_tab_action %}use SWITCH_TAB with the tab's number to make a different tab active, and CLOSE_PAGE closes the tab marked [current]{% else %}CLOSE_PAGE always closes the tab marked [current] — other tabs are shown for context only{% endif %}):
+Open browser tabs ({% if show_switch_tab_action %}use SWITCH_TAB with the tab's number to make a different tab active; CLOSE_PAGE closes the tab marked [current], or set its "tab_index" to close a specific tab{% else %}CLOSE_PAGE closes the tab marked [current] by default, or set its "tab_index" to the number of a specific tab to close that one{% endif %}):
 ```
 {{ open_tabs_context }}
 ```

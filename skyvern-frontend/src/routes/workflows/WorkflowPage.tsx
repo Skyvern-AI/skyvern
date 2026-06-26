@@ -54,6 +54,7 @@ import {
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowActions } from "./WorkflowActions";
@@ -65,11 +66,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
-import * as env from "@/util/env";
 import { getClient } from "@/api/AxiosClient";
 import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { legacyRunDetailPath, workflowEditorPath } from "./studioNavigation";
 import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
@@ -81,7 +83,11 @@ import {
   useFeatureFlagVariantKey,
 } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import { ANALYTICS_DASHBOARD_FLAG } from "@/util/featureFlags";
+import {
+  ANALYTICS_DASHBOARD_FLAG,
+  WORKFLOW_TAGGING_FLAG,
+} from "@/util/featureFlags";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 
@@ -98,19 +104,16 @@ function WorkflowPage() {
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const PAGE_SIZE_OPTIONS = ["10", "25", "50"];
   const pageSize = Number(searchParams.get("page_size") || "10");
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const [openRunParams, setOpenRunParams] = useState<string | null>(null);
-  const { matchesParameter, isSearchActive } =
-    useKeywordSearch(debouncedSearch);
-  const {
-    expandedRows,
-    toggleExpanded: toggleParametersExpanded,
-    setAutoExpandedRows,
-  } = useParameterExpansion();
+  const { matchesParameter } = useKeywordSearch(debouncedSearch);
+  const { expandedRows, toggleExpanded: toggleParametersExpanded } =
+    useParameterExpansion();
 
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
@@ -133,13 +136,16 @@ function WorkflowPage() {
     workflowPermanentId,
   });
 
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
+    { enabled: taggingEnabled },
   );
   const workflowTags = workflowPermanentId
     ? workflowTagsMap[workflowPermanentId]
     : undefined;
-  const { data: tagKeys = [] } = useTagKeysQuery();
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
   const tagDescriptions = useMemo(
     () =>
       new Map(
@@ -150,20 +156,7 @@ function WorkflowPage() {
       ),
     [tagKeys],
   );
-
-  useEffect(() => {
-    if (!isSearchActive) {
-      setAutoExpandedRows([]);
-      return;
-    }
-
-    const runIds =
-      workflowRuns
-        ?.map((run) => run.workflow_run_id)
-        .filter((id): id is string => Boolean(id)) ?? [];
-
-    setAutoExpandedRows(runIds);
-  }, [isSearchActive, workflowRuns, setAutoExpandedRows]);
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   if (!workflowPermanentId) {
     return null; // this should never happen
@@ -186,10 +179,14 @@ function WorkflowPage() {
               </>
             )}
           </div>
-          {!workflowIsLoading && workflowTags && workflowTags.length > 0 ? (
+          {taggingEnabled &&
+          !workflowIsLoading &&
+          workflowTags &&
+          workflowTags.length > 0 ? (
             <TagChipList
               tags={workflowTags}
               descriptions={tagDescriptions}
+              colors={tagColors}
               maxVisible={6}
             />
           ) : null}
@@ -217,7 +214,7 @@ function WorkflowPage() {
           </Button>
           <Button asChild variant="secondary">
             <Link
-              to={`/workflows/${workflowPermanentId}/build`}
+              to={workflowEditorPath(workflowPermanentId, studioEnabled)}
               data-testid="workflow-open-editor-link"
             >
               <Pencil2Icon className="mr-2 size-4" />
@@ -327,9 +324,12 @@ function WorkflowPage() {
                           {/* Main run row */}
                           <TableRow
                             onClick={(event) => {
-                              const url = env.useNewRunsUrl
-                                ? `/runs/${workflowRun.workflow_run_id}`
-                                : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
+                              const url = studioEnabled
+                                ? `/workflows/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
+                                : legacyRunDetailPath(
+                                    workflowPermanentId,
+                                    workflowRun.workflow_run_id,
+                                  );
 
                               if (event.ctrlKey || event.metaKey) {
                                 window.open(

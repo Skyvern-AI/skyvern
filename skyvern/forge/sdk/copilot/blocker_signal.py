@@ -12,6 +12,8 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 
 BlockerKind = Literal[
     "authority_denied",
@@ -159,18 +161,30 @@ def to_trace_data(signal: CopilotToolBlockerSignal) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
-class LoopBlockerEvidence:
+class TerminalEvidence:
     outcome_gate_reason: str | None = None
+    outcome_gate_workflow_run_id: str | None = None
+    recorded_run_outcome: RecordedRunOutcome | None = None
+    latest_workflow_run_id: str | None = None
     anti_bot_blocked: bool = False
     has_draft: bool = False
 
 
+@dataclass(frozen=True)
+class LoopBlockerEvidence(TerminalEvidence):
+    latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+
+
 class _LoopEvidenceCtx(Protocol):
     last_outcome_gate_reason: str | None
+    last_outcome_gate_workflow_run_id: str | None
+    last_run_outcome: RecordedRunOutcome | None
+    last_run_blocks_workflow_run_id: str | None
     last_test_anti_bot: str | None
     staged_workflow: Any | None
     staged_workflow_yaml: str | None
     has_staged_proposal: bool
+    latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None
 
 
 class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
@@ -179,13 +193,64 @@ class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
     tool_blocker_signals: list[CopilotToolBlockerSignal]
 
 
+class _TerminalEvidenceResetCtx(Protocol):
+    last_run_blocks_workflow_run_id: str | None
+    last_successful_run_blocks_workflow_run_id: str | None
+    last_run_blocks_block_ids: list[str]
+    last_run_blocks_block_labels: list[str]
+    last_run_outcome: RecordedRunOutcome | None
+    last_run_outcome_block_labels: list[str]
+    last_outcome_gate_reason: str | None
+    last_outcome_gate_workflow_run_id: str | None
+    last_test_anti_bot: str | None
+    completion_verification_result: Any | None
+    outcome_verification_trace_snapshot: dict[str, Any]
+
+
+def terminal_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> TerminalEvidence:
+    recorded = getattr(ctx, "last_run_outcome", None)
+    return TerminalEvidence(
+        outcome_gate_reason=getattr(ctx, "last_outcome_gate_reason", None),
+        outcome_gate_workflow_run_id=getattr(ctx, "last_outcome_gate_workflow_run_id", None),
+        recorded_run_outcome=recorded if isinstance(recorded, RecordedRunOutcome) else None,
+        latest_workflow_run_id=getattr(ctx, "last_run_blocks_workflow_run_id", None),
+        anti_bot_blocked=bool(getattr(ctx, "last_test_anti_bot", None)),
+        has_draft=(
+            getattr(ctx, "staged_workflow", None) is not None
+            or getattr(ctx, "staged_workflow_yaml", None) is not None
+            or bool(getattr(ctx, "has_staged_proposal", False))
+            or getattr(ctx, "last_workflow", None) is not None
+            or getattr(ctx, "last_workflow_yaml", None) is not None
+        ),
+    )
+
+
+def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> None:
+    ctx.last_run_blocks_workflow_run_id = None
+    ctx.last_successful_run_blocks_workflow_run_id = None
+    ctx.last_run_blocks_block_ids = []
+    ctx.last_run_blocks_block_labels = []
+    ctx.last_run_outcome = None
+    ctx.last_run_outcome_block_labels = []
+    ctx.last_outcome_gate_reason = None
+    ctx.last_outcome_gate_workflow_run_id = None
+    ctx.last_test_anti_bot = None
+    ctx.completion_verification_result = None
+    ctx.outcome_verification_trace_snapshot = {}
+
+
 def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence:
+    evidence = terminal_evidence_from_ctx(ctx)
+    # Older context snapshots may not carry fields added after the snapshot was created.
+    result_steer = getattr(ctx, "latest_evaluate_result_composition_steer", None)
     return LoopBlockerEvidence(
-        outcome_gate_reason=ctx.last_outcome_gate_reason,
-        anti_bot_blocked=bool(ctx.last_test_anti_bot),
-        has_draft=ctx.staged_workflow is not None
-        or ctx.staged_workflow_yaml is not None
-        or bool(ctx.has_staged_proposal),
+        outcome_gate_reason=evidence.outcome_gate_reason,
+        outcome_gate_workflow_run_id=evidence.outcome_gate_workflow_run_id,
+        recorded_run_outcome=evidence.recorded_run_outcome,
+        latest_workflow_run_id=evidence.latest_workflow_run_id,
+        anti_bot_blocked=evidence.anti_bot_blocked,
+        has_draft=evidence.has_draft,
+        latest_evaluate_result_composition_steer=result_steer,
     )
 
 
@@ -254,6 +319,22 @@ def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reaso
         ctx.blocker_signal = None
 
 
+def clear_tool_blocker_signals_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
+    clear_blocker_signal_for_reason_codes(ctx, internal_reason_codes)
+    # getattr matches stash_blocker_signal's defensive read: real contexts type
+    # both fields, but partial test shims may omit them.
+    latest = getattr(ctx, "latest_tool_blocker_signal", None)
+    if isinstance(latest, CopilotToolBlockerSignal) and latest.internal_reason_code in internal_reason_codes:
+        ctx.latest_tool_blocker_signal = None
+    history = getattr(ctx, "tool_blocker_signals", None)
+    if isinstance(history, list):
+        history[:] = [
+            entry
+            for entry in history
+            if not (isinstance(entry, CopilotToolBlockerSignal) and entry.internal_reason_code in internal_reason_codes)
+        ]
+
+
 def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSignal) -> str:
     """Mostly first-wins stash + observability log; returns the LLM-visible payload."""
     ctx.latest_tool_blocker_signal = signal
@@ -286,6 +367,9 @@ def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSigna
 _LOOP_CREDENTIAL_TEMPLATE = (
     "I couldn't run this with the current credential or parameter setup. Update them and ask me to try again."
 )
+CREDENTIAL_SCOUT_VERIFY_REPLY = (
+    "I need to verify the saved-credential login in the browser before I can save or run this code."
+)
 _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     "loop_detected_repeated_failed_step": (
         "I retried without making progress.",
@@ -299,8 +383,19 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
         "I couldn't keep going on this turn.",
         "Tell me what to change and I'll try again.",
     ),
+    "repair_ceiling_reached": (
+        "I couldn't get past the same problem after several attempts.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
+    "code_authoring_guardrail_churn": (
+        "I kept rewriting the generated code, but the safety checks rejected each version.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
 }
 _LOOP_ANTI_BOT_BLOCKER_COPY = "The site's verification challenge was still keeping the submit/search control disabled."
+_LOOP_RESULT_COMPOSITION_BLOCKER_COPY = (
+    "I found loaded results on the page, but I got stuck before extracting the requested information."
+)
 _LOOP_VERDICT_MAX_CHARS = 240
 _LOOP_VERDICT_FAILED_PREFIX = "failed:"
 # Fixed agent-advice tails appended by the recorded-reason producers; repair
@@ -315,6 +410,37 @@ _LOOP_VERDICT_RAW_ERROR_RE = re.compile(
     r"|(?i:\bfailed to execute\b)"
     r"|(?i:\btimeout \d+\s*ms\b)"
 )
+
+
+def _fresh_recorded_run_outcome(evidence: TerminalEvidence) -> RecordedRunOutcome | None:
+    recorded = evidence.recorded_run_outcome
+    if recorded is None or not recorded.workflow_run_id or not evidence.latest_workflow_run_id:
+        return None
+    if recorded.workflow_run_id != evidence.latest_workflow_run_id:
+        return None
+    return recorded
+
+
+def _recorded_run_outcome_tier(recorded: RecordedRunOutcome | None) -> str | None:
+    if recorded is None:
+        return None
+    if recorded.verdict == "demonstrated":
+        return "The latest run recorded a verified outcome."
+    if recorded.verdict == "not_demonstrated":
+        if recorded.reason_code == "blocker_reported":
+            return "The latest run recorded a blocker instead of a verified result."
+        if recorded.reason_code == "no_meaningful_output":
+            return "The latest run completed without meaningful output to return."
+        return "The latest run recorded workflow output, but it did not verify the requested outcome."
+    return "The latest run recorded workflow output, but it has not been verified end-to-end."
+
+
+def _fresh_outcome_gate_reason(evidence: TerminalEvidence) -> str | None:
+    if not evidence.latest_workflow_run_id or not evidence.outcome_gate_workflow_run_id:
+        return None
+    if evidence.latest_workflow_run_id != evidence.outcome_gate_workflow_run_id:
+        return None
+    return evidence.outcome_gate_reason
 
 
 def _sanitize_loop_verdict_reason(reason: str | None) -> str | None:
@@ -338,6 +464,51 @@ def _sanitize_loop_verdict_reason(reason: str | None) -> str | None:
     return text
 
 
+def terminal_evidence_has_recorded_state(evidence: TerminalEvidence | None) -> bool:
+    if evidence is None:
+        return False
+    return bool(
+        _fresh_outcome_gate_reason(evidence)
+        or _fresh_recorded_run_outcome(evidence) is not None
+        or evidence.anti_bot_blocked
+    )
+
+
+def compose_terminal_evidence_user_facing_reason(
+    framing: str,
+    ask: str,
+    evidence: TerminalEvidence | None,
+    *,
+    blocked_tool: str | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    template = f"{framing} {ask}"
+    draft_tier = ("draft",) if evidence is not None and evidence.has_draft else ()
+    if evidence is None:
+        return template, draft_tier
+
+    tier_candidates = (
+        ("recorded_run_outcome", _recorded_run_outcome_tier(_fresh_recorded_run_outcome(evidence))),
+        ("verdict", _sanitize_loop_verdict_reason(_fresh_outcome_gate_reason(evidence))),
+        ("anti_bot", _LOOP_ANTI_BOT_BLOCKER_COPY if evidence.anti_bot_blocked else None),
+    )
+    parts = [framing]
+    tiers: list[str] = []
+    for tier, text in tier_candidates:
+        if text is None:
+            continue
+        candidate = " ".join([*parts, text, ask])
+        try:
+            assert_clean_user_facing_text(candidate, blocked_tool=blocked_tool)
+        except ValueError:
+            continue
+        parts.append(text)
+        tiers.append(tier)
+    candidate = " ".join([*parts, ask])
+    if candidate == template:
+        return template, draft_tier
+    return candidate, (*tiers, *draft_tier)
+
+
 def compose_loop_blocker_user_facing_reason(
     internal_reason_code: str | None,
     evidence: LoopBlockerEvidence | None,
@@ -349,31 +520,24 @@ def compose_loop_blocker_user_facing_reason(
     draft_tier = ("draft",) if evidence is not None and evidence.has_draft else ()
     if internal_reason_code == "loop_detected_credential_or_parameter_misconfig":
         return _LOOP_CREDENTIAL_TEMPLATE, draft_tier
+    if internal_reason_code == "credential_priority_authoring_churn":
+        return CREDENTIAL_SCOUT_VERIFY_REPLY, draft_tier
     framing, ask = _LOOP_BRANCH_COPY.get(internal_reason_code or "", _LOOP_BRANCH_COPY["loop_detected_generic"])
-    template = f"{framing} {ask}"
-    if evidence is None:
-        return template, draft_tier
-    verdict = _sanitize_loop_verdict_reason(evidence.outcome_gate_reason)
-    blocker = _LOOP_ANTI_BOT_BLOCKER_COPY if evidence.anti_bot_blocked else None
-    for include_verdict in (True, False):
-        parts = [framing]
-        tiers: list[str] = []
-        if include_verdict and verdict is not None:
-            parts.append(verdict)
-            tiers.append("verdict")
-        if blocker is not None:
-            parts.append(blocker)
-            tiers.append("anti_bot")
-        parts.append(ask)
-        candidate = " ".join(parts)
-        if candidate == template:
-            return template, draft_tier
-        try:
-            assert_clean_user_facing_text(candidate, blocked_tool=blocked_tool)
-        except ValueError:
-            continue
-        return candidate, (*tiers, *draft_tier)
-    return template, draft_tier
+    result_steer = evidence.latest_evaluate_result_composition_steer if evidence is not None else None
+    if (
+        internal_reason_code == "loop_detected_consecutive_same_tool"
+        and blocked_tool == "evaluate"
+        and result_steer is not None
+    ):
+        # Loaded-result loops use their own framing while preserving the branch-specific ask.
+        user_facing, tiers = compose_terminal_evidence_user_facing_reason(
+            _LOOP_RESULT_COMPOSITION_BLOCKER_COPY,
+            ask,
+            evidence,
+            blocked_tool=blocked_tool,
+        )
+        return user_facing, ("loaded_results", *tiers)
+    return compose_terminal_evidence_user_facing_reason(framing, ask, evidence, blocked_tool=blocked_tool)
 
 
 def build_loop_blocker_signal(
@@ -416,14 +580,14 @@ def refresh_held_loop_blocker_evidence(ctx: _BlockerSignalCtx) -> None:
     if not isinstance(held, CopilotToolBlockerSignal) or held.blocker_kind != "loop_detected":
         return
     evidence = loop_blocker_evidence_from_ctx(ctx)
-    user_facing, tiers = compose_loop_blocker_user_facing_reason(
-        held.internal_reason_code, evidence, blocked_tool=held.blocked_tool
-    )
-    if not tiers:
-        return
-    if user_facing == held.user_facing_reason and evidence.has_draft == held.preserves_workflow_draft:
-        return
     try:
+        user_facing, tiers = compose_loop_blocker_user_facing_reason(
+            held.internal_reason_code, evidence, blocked_tool=held.blocked_tool
+        )
+        if not tiers:
+            return
+        if user_facing == held.user_facing_reason and evidence.has_draft == held.preserves_workflow_draft:
+            return
         refreshed = CopilotToolBlockerSignal(
             blocker_kind=held.blocker_kind,
             agent_steering_text=held.agent_steering_text,

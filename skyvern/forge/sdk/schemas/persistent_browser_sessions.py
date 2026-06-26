@@ -28,6 +28,19 @@ def is_final_status(status: str | None) -> bool:
     return status in FINAL_STATUSES
 
 
+def export_profile_storage_id(
+    *,
+    session_id: str,
+    browser_profile_id: str | None,
+    generate_browser_profile: bool,
+) -> str:
+    """Pure (cloud-dep-free) routing helper mapping a session to the storage id its profile archive is exported
+    to and read from (pass the loaded profile id, or None when no profile loaded)."""
+    if generate_browser_profile:
+        return session_id
+    return browser_profile_id or session_id
+
+
 class PersistentBrowserType(StrEnum):
     MSEdge = "msedge"
     Chrome = "chrome"
@@ -72,6 +85,9 @@ class PersistentBrowserSession(BaseModel):
     browser_type: PersistentBrowserType | None = None
     browser_profile_id: str | None = None
     generate_browser_profile: bool = False
+    # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
+    # so teardown exported under the session id rather than the bp_ id.
+    browser_profile_loaded: bool = True
 
     @field_validator("proxy_location", mode="before")
     @classmethod

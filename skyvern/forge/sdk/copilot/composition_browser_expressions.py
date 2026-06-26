@@ -325,7 +325,9 @@ for (const link of document.querySelectorAll('a[href]')) {
   let resolved; try { resolved = new URL(rawHref, location.href).href; } catch (e) { continue; }
   let host; try { host = new URL(resolved).host.toLowerCase(); } catch (e) { continue; }
   if (!host || host !== baseHost) continue;
-  navTargets.push({ text: nodeText(link), href: resolved, selector: selectorFor(link) });
+  const entry = { text: nodeText(link), href: resolved, selector: selectorFor(link) };
+  if (link.hasAttribute('download')) entry.has_download_attr = true;
+  navTargets.push(entry);
 }
 
 const resultContainers = [];

@@ -15,7 +15,8 @@ from pydantic import (
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -59,6 +60,8 @@ from skyvern.schemas.run_enums import (  # noqa: F401
 )
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
+
+MAX_SEARCH_FETCH_LIMIT = 1000
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
@@ -263,8 +266,12 @@ class WorkflowRunRequest(BaseModel):
     max_elapsed_time_minutes: int | None = Field(
         default=None,
         ge=1,
-        le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
-        description="Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.",
+        le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+        description=(
+            "Timeout this workflow run after the configured elapsed runtime in minutes. "
+            f"When omitted, the platform default is {WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES} minutes. "
+            f"The maximum configurable value is {WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES} minutes."
+        ),
     )
     extra_http_headers: dict[str, str] | None = Field(
         default=None,

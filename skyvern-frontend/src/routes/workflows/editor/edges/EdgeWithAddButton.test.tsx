@@ -61,7 +61,9 @@ const initialRecording = useRecordingStore.getState();
 
 function renderEdge(props: Partial<EdgeProps> = {}) {
   return render(
-    <DebugStoreContext.Provider value={{ isDebugMode: false }}>
+    <DebugStoreContext.Provider
+      value={{ isDebugMode: false, blockRunsEnabled: false }}
+    >
       <EdgeWithAddButton
         {...({
           id: "edge",

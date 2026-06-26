@@ -12,10 +12,14 @@ from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
     advance_to_composing,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import (
+    BlockAuthoringPolicy,
+    download_scout_act_required_for_policy,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from .banned_blocks import (
@@ -27,6 +31,7 @@ from .banned_blocks import (
     _copilot_banned_block_types,
     _copilot_block_authoring_policy,
     _copilot_block_policy,
+    _record_code_native_pending_capability,
     _render_block_policy_detail,
 )
 from .completion import _maybe_run_completion_verification_from_page_observation
@@ -36,17 +41,39 @@ from .page_observation import (
 )
 from .scouting import (
     _attach_scout_page_summary,
+    _capture_scout_role_name,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
+    _maybe_attach_reached_download_target,
+    _prenav_role_name_for_selector,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
+    _reset_evaluate_tracker,
     _resolve_scout_role_name,
+    _steer_evaluate_result,
 )
 
 LOG = structlog.get_logger()
+
+
+def _selector_from_tool_data(data: dict[str, Any], *, prefer_resolved_when_empty: bool = False) -> str:
+    raw_selector = data.get("selector")
+    selector = raw_selector if isinstance(raw_selector, str) else ""
+    if prefer_resolved_when_empty and not selector.strip():
+        resolved_selector = data.get("resolved_selector")
+        selector = resolved_selector if isinstance(resolved_selector, str) else ""
+    return selector.strip()
+
+
+def _effective_target_text(selector: str, role: str = "", accessible_name: str = "") -> str:
+    label = accessible_name.strip() if isinstance(accessible_name, str) else ""
+    role_text = role.strip() if isinstance(role, str) else ""
+    if label and role_text:
+        return f"{role_text} {label}"
+    return label or selector
 
 
 async def _get_block_schema_pre_hook(
@@ -67,6 +94,7 @@ async def _get_block_schema_pre_hook(
     if policy_entry is None:
         return None
     normalized, policy = policy_entry
+    _record_code_native_pending_capability(ctx, policy)
     return {
         "ok": False,
         "error": (
@@ -76,10 +104,38 @@ async def _get_block_schema_pre_hook(
     }
 
 
+_BLOCK_JSON_ALIASES = ("block", "block_definition", "definition", "block_yaml")
+
+
+def _normalize_block_json_alias(params: dict[str, Any]) -> None:
+    """Promote a misnamed block payload (e.g. ``block``) to ``block_json`` in place.
+
+    The model sometimes passes the block under a shorter key than the schema's
+    ``block_json``; without this, FastMCP rejects the whole call at signature
+    validation before the tool runs. Stray alias keys are always dropped so they
+    cannot trip the "unexpected keyword argument" check.
+    """
+    has_block_json = isinstance(params.get("block_json"), str) and bool(params["block_json"].strip())
+    promoted: str | None = None
+    for alias in _BLOCK_JSON_ALIASES:
+        if alias not in params:
+            continue
+        value = params.pop(alias)
+        if has_block_json or promoted is not None:
+            continue
+        if isinstance(value, str):
+            promoted = value
+        elif isinstance(value, (dict, list)):
+            promoted = json.dumps(value)
+    if promoted is not None:
+        params["block_json"] = promoted
+
+
 async def _validate_block_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    _normalize_block_json_alias(params)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     block_json = params.get("block_json")
@@ -108,6 +164,7 @@ async def _validate_block_pre_hook(
     if policy_entry is None:
         return None
     normalized, policy = policy_entry
+    _record_code_native_pending_capability(ctx, policy)
     return {
         "ok": False,
         "error": (
@@ -232,6 +289,9 @@ async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    # Cleared up front so an early return below (deterministic result, jQuery reject, no selector)
+    # cannot leave a prior click's stash for this click's post-hook to consume.
+    ctx.pending_scout_role_name = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -253,6 +313,7 @@ async def _click_pre_hook(
                 "b => {{ if (b.textContent.includes('Download')) b.click() }})"
             ),
         }
+    await _capture_scout_role_name(ctx, selector)
     return None
 
 
@@ -261,7 +322,27 @@ async def _type_text_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
+    ctx.pending_scout_typed_value = None
+    text = params.get("text")
+    selector = str(params.get("selector") or "")
+    intent = str(params.get("intent") or "")
+    if should_reject_type_text_value(value=text, selector=selector, intent=intent):
+        return {
+            "ok": False,
+            "error": (
+                "type_text cannot type raw credentials, secrets, OTP/TOTP codes, API keys, tokens, or "
+                "password-like values. Use the saved credential flow instead of inline secret text."
+            ),
+        }
+    if isinstance(text, str) and text:
+        ctx.pending_scout_typed_value = text
+    result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
+    if result is not None:
+        # Non-None means the deterministic targeting guard is rejecting the
+        # tool call before browser execution; there will be no post-hook to
+        # consume this value.
+        ctx.pending_scout_typed_value = None
+    return result
 
 
 async def _select_option_pre_hook(
@@ -328,35 +409,41 @@ async def _click_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_role_name = ctx.pending_scout_role_name
+    ctx.pending_scout_role_name = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = _selector_from_tool_data(data, prefer_resolved_when_empty=True)
         url, title = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
         result["data"] = {
-            "selector": data.get("selector", ""),
+            "selector": selector,
             "url": url,
             "title": title,
         }
         navigated = bool(source_url) and bool(url) and source_url != url
-        role, accessible_name = await _resolve_scout_role_name(
-            ctx, data.get("selector", ""), allow_browser_read=not navigated
-        )
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+        if navigated and not (role and accessible_name):
+            role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
         _record_scouted_interaction(
             ctx,
             tool_name="click",
-            selector=data.get("selector", ""),
+            selector=selector,
             source_url=source_url,
             role=role,
             accessible_name=accessible_name,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
-            ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
+            ctx, tool_name="click", selector=selector, source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+            if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+                await _maybe_attach_reached_download_target(ctx, result, url=url, page_evidence=page_evidence)
     return result
 
 
@@ -426,9 +513,11 @@ async def _type_text_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_typed_value = ctx.pending_scout_typed_value
+    ctx.pending_scout_typed_value = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
-        selector = data.get("selector", "")
+        selector = _selector_from_tool_data(data)
         typed_length = data.get("text_length", 0)
         url, _ = await _resolve_url_title(raw, ctx)
         result["data"] = {
@@ -441,12 +530,26 @@ async def _type_text_post_hook(
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        typed_value = (
+            safe_typed_default_value(
+                pending_typed_value,
+                selector=selector,
+                role=role,
+                accessible_name=accessible_name,
+            )
+            if isinstance(typed_length, int)
+            and typed_length > 0
+            and isinstance(pending_typed_value, str)
+            and len(pending_typed_value) == typed_length
+            else None
+        )
         _record_scouted_interaction(
             ctx,
             tool_name="type_text",
             selector=selector,
             source_url=source_url,
             typed_length=typed_length,
+            typed_value=typed_value or "",
             role=role,
             accessible_name=accessible_name,
         )
@@ -466,39 +569,43 @@ async def _evaluate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    if result.get("ok") and result.get("data"):
-        _mark_page_inspected(ctx)
-        result["data"].pop("sdk_equivalent", None)
-        if "url" not in result["data"]:
-            url, _ = await _resolve_url_title(raw, ctx)
-            if url:
-                result["data"]["url"] = url
-        url = str(result["data"].get("url") or "")
-        title = str(result["data"].get("title") or "")
-        if not title:
-            _, title = await _resolve_url_title(raw, ctx)
-        observation_step = _record_composition_page_observation(
-            ctx,
-            source_tool="evaluate",
-            url=url,
-            title=title,
-            observed_data=result["data"],
-            append_to_flow=True,
-            reached_via="auto",
-        )
-        if observation_step is not None:
-            result["observation_step"] = observation_step
-            result["data"]["observation_step"] = observation_step
-        if _copilot_block_authoring_policy(
-            ctx
-        ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(result["data"]):
-            ctx.code_only_target_page_evidence_seen = True
-        await _maybe_run_completion_verification_from_page_observation(
-            ctx,
-            url=url,
-            title=title,
-            observed_data=result["data"],
-        )
+    data = result.get("data")
+    if not result.get("ok") or not isinstance(data, dict) or not data:
+        _reset_evaluate_tracker(ctx)
+        return result
+    _mark_page_inspected(ctx)
+    data.pop("sdk_equivalent", None)
+    if "url" not in data:
+        url, _ = await _resolve_url_title(raw, ctx)
+        if url:
+            data["url"] = url
+    url = str(data.get("url") or "")
+    title = str(data.get("title") or "")
+    if not title:
+        _, title = await _resolve_url_title(raw, ctx)
+    observation_step = _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url=url,
+        title=title,
+        observed_data=data,
+        append_to_flow=True,
+        reached_via="auto",
+    )
+    if observation_step is not None:
+        result["observation_step"] = observation_step
+        data["observation_step"] = observation_step
+    if _copilot_block_authoring_policy(
+        ctx
+    ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
+        ctx.code_only_target_page_evidence_seen = True
+    await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url=url,
+        title=title,
+        observed_data=data,
+    )
+    await _steer_evaluate_result(ctx, result, url=url)
     return result
 
 
@@ -527,25 +634,26 @@ async def _select_option_post_hook(
     source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = _selector_from_tool_data(data)
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="select_option", url=url)
         result["data"] = {
-            "selector": data.get("selector", ""),
+            "selector": selector,
             "value": data.get("value", ""),
             "url": url,
         }
-        role, accessible_name = await _resolve_scout_role_name(ctx, data.get("selector", ""))
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector)
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
-            selector=data.get("selector", ""),
+            selector=selector,
             source_url=source_url,
             value=data.get("value", ""),
             role=role,
             accessible_name=accessible_name,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
-            ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url
+            ctx, tool_name="select_option", selector=selector, source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
@@ -564,17 +672,18 @@ async def _press_key_post_hook(
     source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = _selector_from_tool_data(data)
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="press_key", url=url)
         result["data"] = {
             "key": data.get("key", ""),
-            "selector": data.get("selector", ""),
+            "selector": selector,
             "url": url,
         }
         _record_scouted_interaction(
             ctx,
             tool_name="press_key",
-            selector=data.get("selector", ""),
+            selector=selector,
             source_url=source_url,
             key=data.get("key", ""),
         )
@@ -597,7 +706,35 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
     }
 
 
-def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
+_EVALUATE_BASE_DESCRIPTION = (
+    "Execute JavaScript in the browser and return the result. "
+    "Use this to inspect DOM state, read values, or run arbitrary JS."
+)
+# Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
+# target only once its page is reached. The model reaches that page with navigate/click and
+# observes it here — evaluate cannot click — so the copilot can derive the target and compile
+# the terminal download step.
+_EVALUATE_SCOUT_ACT_DESCRIPTION = (
+    _EVALUATE_BASE_DESCRIPTION
+    + " Some affordances (a download, a row-expand, a post-login area) only expose their target "
+    "once the page holding them is reached. Use this tool to OBSERVE that page — it cannot click; "
+    "reach the page with the navigate/click tools first. For a download, observe the page that "
+    "exposes the download control rather than authoring the download yourself; the copilot then "
+    "compiles the terminal download step for you."
+)
+
+
+def _evaluate_overlay_description(
+    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+) -> str:
+    if download_scout_act_required_for_policy(block_authoring_policy):
+        return _EVALUATE_SCOUT_ACT_DESCRIPTION
+    return _EVALUATE_BASE_DESCRIPTION
+
+
+def _build_skyvern_mcp_overlays(
+    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+) -> dict[str, SchemaOverlay]:
     return {
         "get_block_schema": SchemaOverlay(
             pre_hook=_get_block_schema_pre_hook,
@@ -625,10 +762,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
-            description=(
-                "Execute JavaScript in the browser and return the result. "
-                "Use this to inspect DOM state, read values, or run arbitrary JS."
-            ),
+            description=_evaluate_overlay_description(block_authoring_policy),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
             timeout=30,

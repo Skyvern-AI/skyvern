@@ -8,7 +8,9 @@ export const BLOCK_SIDEBAR_WIDTH_STORAGE_KEY = "skyvern.blockSidebarWidth";
 
 type BlockSidebarWidthStore = {
   width: number;
+  renderedWidth: number;
   setWidth: (next: number) => void;
+  setRenderedWidth: (next: number) => void;
   reset: () => void;
 };
 
@@ -20,12 +22,24 @@ function clamp(n: number): number {
   );
 }
 
+function normalizeRenderedWidth(n: number): number {
+  if (!Number.isFinite(n)) return BLOCK_SIDEBAR_WIDTH_DEFAULT;
+  return Math.max(0, n);
+}
+
 const useBlockSidebarWidthStore = create<BlockSidebarWidthStore>()(
   persist(
     (set) => ({
       width: BLOCK_SIDEBAR_WIDTH_DEFAULT,
+      renderedWidth: BLOCK_SIDEBAR_WIDTH_DEFAULT,
       setWidth: (next) => set({ width: clamp(next) }),
-      reset: () => set({ width: BLOCK_SIDEBAR_WIDTH_DEFAULT }),
+      setRenderedWidth: (next) =>
+        set({ renderedWidth: normalizeRenderedWidth(next) }),
+      reset: () =>
+        set({
+          width: BLOCK_SIDEBAR_WIDTH_DEFAULT,
+          renderedWidth: BLOCK_SIDEBAR_WIDTH_DEFAULT,
+        }),
     }),
     {
       name: BLOCK_SIDEBAR_WIDTH_STORAGE_KEY,

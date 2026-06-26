@@ -348,6 +348,43 @@ class TestSanctionedSecretReferenceIdiom:
 
         assert verdict.allowed
 
+    def test_allows_awaited_credential_otp_assignment_in_workflow_yaml(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            workflow_yaml=(
+                'code: |\n  passcode = await login_credentials.otp()\n  await page.locator("#code").fill(passcode)\n'
+            ),
+        )
+
+        assert verdict.allowed
+
+    def test_allows_keyword_secret_reference_to_awaited_credential_otp_in_tool_arguments(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  token = await login_credential.otp()"},
+        )
+
+        assert verdict.allowed
+
+    def test_allows_secret_keyword_match_when_full_line_is_sanctioned_otp_reference(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  passcode = await login_credential.otp()"},
+        )
+
+        assert verdict.allowed
+
+    def test_rejects_literal_secret_even_when_same_line_has_credential_reference(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={
+                "workflow_yaml": "code: |\n  password = 'hunter2'; password_ref = login_credential.password"
+            },
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
     def test_allows_str_wrapped_parameter_reference(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
@@ -369,6 +406,15 @@ class TestSanctionedSecretReferenceIdiom:
 
             assert not verdict.allowed, rhs
             assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_awaited_non_credential_secret_source(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  passcode = await page.locator('#code').inner_text()"},
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
     def test_allows_keyword_argument_reference_with_closing_paren(self) -> None:
         verdict = evaluate_output_policy(
@@ -499,6 +545,65 @@ def test_rejects_reply_when_request_policy_required_clarification() -> None:
 
     assert not verdict.allowed
     assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
+
+
+def test_avoidable_output_field_confirmation_is_hard_blocked() -> None:
+    policy = _policy(
+        user_response_policy="proceed",
+        completion_contract_status="present",
+        completion_criteria=[
+            SimpleNamespace(id="record_identity", outcome="The returned record identifies the target record."),
+        ],
+    )
+
+    verdict = evaluate_output_policy(
+        request_policy=policy,
+        response_type="ASK_QUESTION",
+        user_response="Please confirm the output fields before I build this record status workflow.",
+        has_workflow_proposal=False,
+        workflow_attempted=False,
+    )
+    hard = hard_block_output_policy_verdict(verdict)
+
+    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION in verdict.reason_codes
+    assert hard.reason_codes == [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION]
+
+
+def test_output_field_confirmation_allowed_when_request_policy_requires_clarification() -> None:
+    policy = _policy(
+        user_response_policy="ask_clarification",
+        clarification_question="Which saved credential should I use?",
+        clarification_reason="credential_name_unresolved",
+        completion_contract_status="present",
+        completion_criteria=[
+            SimpleNamespace(id="record_identity", outcome="The returned record identifies the target record."),
+        ],
+    )
+
+    verdict = evaluate_output_policy(
+        request_policy=policy,
+        response_type="ASK_QUESTION",
+        user_response="Which saved credential should I use?",
+        has_workflow_proposal=False,
+        workflow_attempted=False,
+    )
+
+    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
+    assert verdict.allowed is True
+
+
+def test_url_clarification_does_not_trigger_output_field_confirmation_guard() -> None:
+    policy = _policy(user_response_policy="proceed", completion_contract_status="present")
+
+    verdict = evaluate_output_policy(
+        request_policy=policy,
+        response_type="ASK_QUESTION",
+        user_response="Which URL should I use for this workflow?",
+        has_workflow_proposal=False,
+        workflow_attempted=False,
+    )
+
+    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
 
 
 def test_classifies_unbacked_workflow_delivery_claim() -> None:
@@ -1732,7 +1837,6 @@ workflow_definition:
     monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
     monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-    monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
     monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["open_results"], {}, "open_results"))
     monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
@@ -1799,6 +1903,8 @@ workflow_definition:
 
     assert result["ok"] is False
     assert "raw_secret_leak" in result["error"]
+    assert "<key>.password" in result["error"]
+    assert "do not split, concatenate, or obfuscate" in result["error"]
     process_mock.assert_not_called()
 
 

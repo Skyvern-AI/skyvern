@@ -27,6 +27,15 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.schema_incompatibility import (
+    SchemaIncompatibility,
+    render_schema_incompatibility_user_reason,
+)
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_outcome import (
+    build_minimal_turn_outcome,
+    with_copilot_code_mode_diagnostics,
+)
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
@@ -34,8 +43,11 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_chat_audio,
     workflow_copilot_chat_post,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
@@ -690,6 +702,19 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     assert "The workflow was not modified" in assistant_contents[0]
     assert "reference cpe_" in assistant_contents[0]
 
+    assistant_messages = [
+        call.kwargs
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    ]
+    assert len(assistant_messages) == 1
+    turn_outcome = assistant_messages[0]["turn_outcome"]
+    assert turn_outcome is not None
+    assert turn_outcome.response_kind == "recover"
+    assert turn_outcome.terminal_reason == workflow_copilot_route.COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    assert turn_outcome.copilot_effective_mode == "build"
+    assert turn_outcome.copilot_turn_id is not None
+
     frames = [call.args[0] for call in stream.send.await_args_list if call.args]
     response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
     assert response_frames
@@ -890,6 +915,105 @@ async def test_proposed_workflow_cleared_on_restore(
     assert len(response_frames) == 1, f"expected exactly one RESPONSE frame, got {response_frames!r}"
     expected_payload_workflow = proposal.model_dump.return_value if has_valid_proposal else None
     assert response_frames[0].updated_workflow == expected_payload_workflow
+    if not auto_accept:
+        assert response_frames[0].workflow_applied is False
+
+
+@pytest.mark.asyncio
+async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    proposal = MagicMock()
+    proposal.model_dump.return_value = {"workflow_id": "wf-applied"}
+    proposal.title = "Applied"
+    proposal.description = "Applied description"
+    proposal.workflow_definition = SimpleNamespace(blocks=[])
+    proposal.proxy_location = None
+    proposal.webhook_callback_url = None
+    proposal.totp_verification_url = None
+    proposal.totp_identifier = None
+    proposal.persist_browser_session = False
+    proposal.browser_profile_id = None
+    proposal.model = None
+    proposal.max_screenshot_scrolls = None
+    proposal.extra_http_headers = None
+    proposal.cdp_connect_headers = None
+    proposal.run_with = "agent"
+    proposal.ai_fallback = None
+    proposal.cache_key = None
+    proposal.adaptive_caching = False
+    proposal.code_version = 2
+    proposal.run_sequentially = False
+    proposal.sequential_key = None
+    agent_result = SimpleNamespace(
+        user_response="done",
+        updated_workflow=proposal,
+        global_llm_context=None,
+        workflow_yaml="title: Applied",
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        proposal_disposition="auto_applicable",
+        apply_without_review=True,
+        has_staged_proposal=True,
+        staged_workflow=proposal,
+        turn_outcome=None,
+    )
+
+    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_service = SimpleNamespace(update_workflow_definition=AsyncMock())
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "resolve_copilot_created_by_stamp",
+        AsyncMock(return_value="copilot"),
+    )
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_not_awaited()
+    workflow_service.update_workflow_definition.assert_awaited_once()
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None] == []
+    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].workflow_applied is True
+    assert response_frames[0].updated_workflow == {"workflow_id": "wf-applied"}
 
 
 @pytest.mark.asyncio
@@ -913,13 +1037,15 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         description="Original description",
         workflow_definition=None,
     )
+    terminal_message = "I could not safely return that chat reply."
     agent_result = SimpleNamespace(
-        user_response="I could not safely return that chat reply.",
+        user_response=terminal_message,
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        response_type="ASK_QUESTION",
         unvalidated=False,
         output_policy_diagnostics={
             "final_output_policy_allowed": False,
@@ -948,6 +1074,23 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert not clear_calls, f"did not expect a clear call, got {update_calls!r}"
+
+    assistant_call = next(
+        call
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    )
+    assert assistant_call.kwargs["content"] == terminal_message
+
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1
+    frame = response_frames[0]
+    assert frame.message == terminal_message
+    assert frame.response_type == "ASK_QUESTION"
 
 
 @pytest.mark.asyncio
@@ -1209,3 +1352,107 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest
         "legacy V1 path must stash the LLM-emitted YAML on the proposal so "
         "/apply-proposed-workflow can re-create the workflow version"
     )
+
+
+@pytest.mark.asyncio
+async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = SimpleNamespace(
+        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "built"}),
+        workflow_yaml="title: built\n",
+        clear_proposed_workflow=False,
+        proposal_disposition="review_tested",
+        cancelled=False,
+        apply_without_review=False,
+        output_policy_diagnostics=None,
+        canonical_was_persisted_due_to_param_change=False,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    persisted = calls[0].kwargs["proposed_workflow"]
+    assert persisted is not None
+    assert persisted.get("_copilot_unvalidated") is not True
+
+
+def _schema_incompatibility_ctx() -> SimpleNamespace:
+    incompat = SchemaIncompatibility(
+        block_label="capture_row",
+        incompatible_paths=("shoebox",),
+        known_output_paths=("order_date", "order_total"),
+    )
+    return SimpleNamespace(
+        latest_schema_incompatibility=incompat,
+        turn_halt=SimpleNamespace(kind=TurnHaltKind.SCHEMA_INCOMPATIBILITY),
+        code_native_pending_capability=None,
+        last_test_ok=None,
+        last_failed_workflow_yaml=None,
+    )
+
+
+def test_schema_incompatibility_turn_outcome_is_not_repair_ceiling() -> None:
+    # SKY-11380: the schema-incompatibility halt is a distinct typed outcome; it must
+    # not masquerade as the repair-ceiling diagnostic on the persisted turn.
+    ctx = _schema_incompatibility_ctx()
+    reply = render_schema_incompatibility_user_reason(ctx.latest_schema_incompatibility)
+    outcome = with_copilot_code_mode_diagnostics(
+        build_minimal_turn_outcome(reply, ResponseKind.DIAGNOSE, terminal_reason="turn_halt:schema_incompatibility"),
+        ctx,
+    )
+
+    assert outcome.copilot_repair_ceiling_hit is False
+    assert outcome.copilot_schema_incompatibility is not None
+    assert outcome.copilot_schema_incompatibility["incompatible_paths"] == ["shoebox"]
+    assert outcome.copilot_schema_incompatibility["known_output_paths"] == ["order_date", "order_total"]
+
+
+def test_schema_incompatibility_persists_and_recalls_for_followup_turn() -> None:
+    # The follow-up "what was the problem?" turn reads the prior assistant outcome from
+    # chat history; the structured incompatibility survives the round-trip so it can be reported.
+    ctx = _schema_incompatibility_ctx()
+    reply = render_schema_incompatibility_user_reason(ctx.latest_schema_incompatibility)
+    outcome = with_copilot_code_mode_diagnostics(
+        build_minimal_turn_outcome(reply, ResponseKind.DIAGNOSE, terminal_reason="turn_halt:schema_incompatibility"),
+        ctx,
+    )
+    now = datetime.now(timezone.utc)
+    messages = [
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="m1",
+            workflow_copilot_chat_id="c1",
+            sender=WorkflowCopilotChatSender.USER,
+            content="add a shoebox field to the extraction",
+            created_at=now,
+            modified_at=now,
+        ),
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="m2",
+            workflow_copilot_chat_id="c1",
+            sender=WorkflowCopilotChatSender.AI,
+            content=reply,
+            turn_outcome=outcome,
+            created_at=now,
+            modified_at=now,
+        ),
+    ]
+
+    recalled = workflow_copilot_route._latest_assistant_turn_outcome(messages)
+
+    assert recalled is not None
+    assert recalled.terminal_reason == "turn_halt:schema_incompatibility"
+    assert recalled.copilot_schema_incompatibility is not None
+    assert recalled.copilot_schema_incompatibility["incompatible_paths"] == ["shoebox"]
+    # The persisted reply reports the problem in product language.
+    assert "shoebox" in messages[1].content

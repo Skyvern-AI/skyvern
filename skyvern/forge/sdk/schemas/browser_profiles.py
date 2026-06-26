@@ -22,16 +22,20 @@ class CreateBrowserProfileRequest(BaseModel):
     name: str = Field(..., min_length=1, description="Name for the browser profile")
     description: str | None = Field(None, description="Optional profile description")
     browser_session_id: str | None = Field(
-        default=None, description="Persistent browser session to convert into a profile"
+        default=None,
+        min_length=1,
+        description="Persistent browser session to convert into a profile. Omit for a blank profile.",
     )
     workflow_run_id: str | None = Field(
-        default=None, description="Workflow run whose persisted session should be captured"
+        default=None,
+        min_length=1,
+        description="Workflow run whose persisted session should be captured. Omit for a blank profile.",
     )
 
     @model_validator(mode="after")
     def _validate_source(self) -> "CreateBrowserProfileRequest":
-        if bool(self.browser_session_id) == bool(self.workflow_run_id):
-            raise ValueError("Provide either browser_session_id or workflow_run_id")
+        if self.browser_session_id is not None and self.workflow_run_id is not None:
+            raise ValueError("Provide only one of browser_session_id or workflow_run_id")
         return self
 
 

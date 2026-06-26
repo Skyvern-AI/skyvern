@@ -440,3 +440,60 @@ class TestModelResolver:
 
         joined = " ".join(str(record.get("event", "")) for record in logs)
         assert "unrouted" not in joined
+
+    def test_github_copilot_endpoint_restores_openai_compatible_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GitHub Copilot via OPENAI_COMPATIBLE exposes the handler's .llm_key as the bare
+        model name ("gpt-4o"), which is not a registry key. The resolver must restore the
+        OPENAI_COMPATIBLE key so the githubcopilot api_base/api_key thread through instead of
+        resolving to a credential-less OpenAI model that 401s."""
+        from skyvern.config import settings
+        from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+        openai_compatible_config = LLMConfig(
+            model_name="openai/gpt-4o",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_key="gho_test",
+                api_base="https://api.githubcopilot.com",
+                api_version=None,
+                model_info={"model_name": "openai/gpt-4o"},
+            ),
+        )
+
+        seen_keys: list[str] = []
+
+        def fake_get_config(key: str) -> LLMConfig:
+            seen_keys.append(key)
+            return openai_compatible_config
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
+            fake_get_config,
+        )
+        # The rewritten label "gpt-4o" is not a registered registry key.
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.is_registered",
+            lambda key: False,
+        )
+        # Force the GitHub Copilot endpoint branch on.
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMAPIHandlerFactory.is_github_copilot_endpoint",
+            lambda: True,
+        )
+        monkeypatch.setattr(settings, "OPENAI_COMPATIBLE_MODEL_KEY", "OPENAI_COMPATIBLE")
+        monkeypatch.setattr(settings, "OPENAI_COMPATIBLE_MODEL_NAME", "gpt-4o")
+
+        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+
+        handler = MagicMock()
+        handler.llm_key = "gpt-4o"  # the rewritten observability label
+
+        model_name, run_config, llm_key, _ = resolve_model_config(handler)
+
+        assert llm_key == "OPENAI_COMPATIBLE"
+        assert seen_keys == ["OPENAI_COMPATIBLE"]
+        assert model_name == "openai/gpt-4o"
+        assert run_config.model_provider._base_url == "https://api.githubcopilot.com"
+        assert run_config.model_provider._api_key == "gho_test"

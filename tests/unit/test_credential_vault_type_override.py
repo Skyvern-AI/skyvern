@@ -178,6 +178,37 @@ class TestGetCredentialVaultServiceRouting:
             assert result is mock_azure
 
     @pytest.mark.asyncio
+    async def test_override_gcp_ignores_global(self) -> None:
+        mock_bw = MagicMock(spec=CredentialVaultService)
+        mock_gcp = MagicMock(spec=CredentialVaultService)
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.CREDENTIAL_VAULT_TYPE = CredentialVaultType.BITWARDEN
+            mock_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_bw
+            mock_app.GCP_CREDENTIAL_VAULT_SERVICE = mock_gcp
+            result = await _get_credential_vault_service(
+                vault_type_override=CredentialVaultType.GCP,
+            )
+            assert result is mock_gcp
+
+    @pytest.mark.asyncio
+    async def test_override_gcp_raises_when_not_configured(self) -> None:
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.CREDENTIAL_VAULT_TYPE = CredentialVaultType.BITWARDEN
+            mock_app.GCP_CREDENTIAL_VAULT_SERVICE = None
+            with pytest.raises(HTTPException) as exc_info:
+                await _get_credential_vault_service(
+                    vault_type_override=CredentialVaultType.GCP,
+                )
+            assert exc_info.value.status_code == 400
+            assert "GCP credential vault" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
     async def test_override_custom_raises_when_not_configured(self) -> None:
         with (
             patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,

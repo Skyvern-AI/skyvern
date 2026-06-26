@@ -22,6 +22,7 @@ from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageInGoBack,
     MessageInGoForward,
     MessageInNavigate,
+    MessageInRecordingRearmCapture,
     MessageInReload,
     MessageInTakeScreenshot,
     MessageKind,
@@ -103,10 +104,17 @@ class TestReifyChannelMessage:
         assert msg.workflow_permanent_id == "wpid_123"
         assert msg.live_interpretation_enabled is True
 
+    def test_recording_rearm_capture(self) -> None:
+        assert isinstance(
+            reify_channel_message({"kind": "recording-rearm-capture"}),
+            MessageInRecordingRearmCapture,
+        )
+
 
 class TestMessageSerialization:
     def test_recording_interpretation_update_serializes_pydantic_steps(self) -> None:
         message = MessageOutRecordingInterpretationUpdate(
+            interpretation_session_id="session-abc",
             session_revision=2,
             pending=False,
             finalized=True,
@@ -125,6 +133,7 @@ class TestMessageSerialization:
         serialized = message_to_dict(message)
 
         assert serialized["kind"] == "recording-interpretation-update"
+        assert serialized["interpretation_session_id"] == "session-abc"
         assert serialized["session_revision"] == 2
         assert serialized["finalized"] is True
         assert serialized["steps"][0]["action_kind"] == "click"
@@ -232,7 +241,7 @@ class TestLocalExecutionChannel:
         result = await channel.evaluate_js("() => 'hello'")
 
         assert result == "hello"
-        page.evaluate.assert_awaited_once_with("() => 'hello'", None)
+        page.evaluate.assert_awaited_once_with("() => 'hello'")
 
     @pytest.mark.asyncio
     async def test_evaluate_js_forwards_arg(self) -> None:

@@ -175,6 +175,7 @@ from .guardrails import (
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
+from .mcp_hooks import _click_pre_hook as _click_pre_hook
 from .mcp_hooks import (
     _code_only_pre_run_results_error,
 )
@@ -223,6 +224,7 @@ from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
+from .scouting import _capture_scout_role_name as _capture_scout_role_name
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
 from .scouting import (
@@ -232,6 +234,7 @@ from .scouting import _consume_scout_source_url as _consume_scout_source_url
 from .scouting import _mark_page_inspected as _mark_page_inspected
 from .scouting import _mark_pending_browser_interaction_observation as _mark_pending_browser_interaction_observation
 from .scouting import _mark_post_run_page_observed as _mark_post_run_page_observed
+from .scouting import _prenav_role_name_for_selector as _prenav_role_name_for_selector
 from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
@@ -241,7 +244,6 @@ from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
 from .workflow_update import _code_block_safety_errors as _code_block_safety_errors
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
-from .workflow_update import _pre_run_workflow_coverage_error as _pre_run_workflow_coverage_error
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
 from .workflow_update import _update_workflow as _update_workflow
@@ -352,6 +354,12 @@ async def update_workflow_tool(
         )
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+        if result.get("ok") is False:
+            _record_diagnosis_repair_contract(
+                copilot_ctx,
+                source_tool="update_workflow",
+                result=result,
+            )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -659,34 +667,6 @@ async def update_and_run_blocks_tool(
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
-    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
-    if coverage_error:
-        user_facing_summary = (
-            "Workflow draft saved; I still need to add the remaining requested actions before testing it."
-        )
-        result = {
-            "ok": False,
-            "error": coverage_error,
-            "data": {
-                "block_count": copilot_ctx.last_update_block_count,
-                "workflow_updated": True,
-                "workflow_run_skipped": True,
-                "control_signal": {
-                    "kind": "intermediate_success",
-                    "user_facing_summary": user_facing_summary,
-                },
-                "user_facing_summary": user_facing_summary,
-            },
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=result,
-            workflow_updated=True,
-        )
-        return json.dumps(result)
-
     if skip_run_after_update:
         skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
@@ -848,20 +828,23 @@ async def fill_credential_field_tool(
     The secret value is resolved server-side from the stored credential and never
     enters the conversation; the result reports only `typed_length`. Use this
     instead of `type_text` whenever a login form field should receive a saved
-    credential's username, password, or one-time TOTP code — `type_text` cannot
-    type secrets and you never have the values.
+    credential's username, password, or authenticator-app one-time code. Email/SMS
+    OTP credentials are not filled during scouting because scouting has no
+    workflow run/task context for safe polling.
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id` must be a credential from the request policy's
-    `resolved_credentials`. `field` is one of `username`, `password`, `totp`
-    (`totp` generates a fresh code at call time).
+    `resolved_credentials`. `field` is one of `username`, `password`, `totp`.
 
     This tool only fills; it never clicks or submits. Each successful fill is
     recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind
-    the credential as a `credential_id` workflow parameter and reference it as
-    `<parameter_key>.username` / `.password` / `.totp` — keep that attribute
-    form when persisting code blocks.
+    the credential as a `credential_id` workflow parameter and reference
+    username/password as `<parameter_key>.username` / `.password`.
+
+    In synthesized code blocks, one-time codes must use
+    `await <parameter_key>.otp()` so authenticator, email, and SMS OTP sources
+    all resolve at runtime.
     """
     result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))

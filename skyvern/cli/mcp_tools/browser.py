@@ -450,8 +450,8 @@ async def skyvern_file_upload(
             ),
         )
 
-    has_urls = any(fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
-    has_local = any(not fp.startswith(("http://", "https://", "s3://", "azure://")) for fp in file_paths)
+    has_urls = any(fp.startswith(("http://", "https://", "s3://", "gs://", "azure://")) for fp in file_paths)
+    has_local = any(not fp.startswith(("http://", "https://", "s3://", "gs://", "azure://")) for fp in file_paths)
 
     if has_urls and has_local:
         return make_result(

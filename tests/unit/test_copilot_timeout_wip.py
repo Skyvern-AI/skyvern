@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_timeout_exit_result,
     _build_unexpected_error_exit_result,
 )
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -143,6 +144,66 @@ class TestBuildTimeoutExitResult:
             last_workflow_yaml="version: '1.0'",
             last_test_ok=None,
             last_test_suspicious_success=True,
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.workflow_yaml is None
+        assert result.proposal_disposition == "auto_applicable"
+        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+
+    def test_verified_terminal_state_preserves_tested_proposal_on_timeout(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="version: '1.0'",
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+        )
+        ctx.verified_terminal_proposal_ready = True
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "auto_applicable"
+        assert result.user_response == _TIMEOUT_REPLY_TESTED
+        assert result.clear_proposed_workflow is False
+
+    def test_stale_latch_without_judge_verdict_does_not_preserve_proposal(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="version: '1.0'",
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+        )
+        ctx.verified_terminal_proposal_ready = True
+        ctx.completion_verification_result = None
+        ctx.last_artifact_health_blocker_reason = None
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.workflow_yaml is None
+        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+
+    def test_suspicious_current_run_drops_last_good_workflow_without_verified_terminal_state(self) -> None:
+        wf = MagicMock(name="wf")
+        last_good = MagicMock(name="last_good")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="version: 'broken'",
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+            last_good_workflow=last_good,
+            last_good_workflow_yaml="version: 'tested'",
         )
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)

@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
+    # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
+    # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
+    # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
+    # instead of surfacing an opaque ECONNREFUSED.
+    CDP_CONNECT_RETRY_ATTEMPTS: int = 6
+    CDP_CONNECT_RETRY_BACKOFF_SECONDS: list[float] = [1, 2, 3, 4, 5]
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
@@ -111,12 +117,23 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
+    # Pre-screenshot readiness guard; kept short so a page that never settles
+    # degrades fast instead of burning the full loading-timeout budget.
+    BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS: int = 5000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
     CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
+    # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+    # so one fetch can't consume the whole block. TOTP re-mint is instant and unaffected.
+    CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS: int = 120
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
+    # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
+    MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
+    # Overall wall-clock budget for the completion screenshot loop.
+    COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS: float = 60.0
     MAX_NUM_SCREENSHOTS: int = 10
     # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
     # screenshot spend can be monitored independently of the provider's blended tokens.
@@ -125,6 +142,9 @@ class Settings(BaseSettings):
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
+    # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
+    # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
+    FAIL_FAST_SHADOW: bool = False
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
@@ -144,14 +164,23 @@ class Settings(BaseSettings):
     # log volume (health checks, polling) while carrying no mutation to audit.
     LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
-    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
-    # Gate copilot verified-success on per-criterion outcome evidence.
-    # Off restores the prior run-status/suspicious-success gate and classifier prompt.
-    COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
-    # Capture bounded page evidence synchronously in scout interaction post-hooks.
-    # Off restores schema-less interaction packets plus standalone page inspects.
-    COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
+    # Opt-in INFO-log sampling for high-volume orgs. A log call marked
+    # sampling=True is dropped from stdout/Datadog with probability
+    # (1 - LOG_SAMPLING_RATE) when its org is in LOG_SAMPLING_ORG_IDS. The full
+    # line is still captured in the per-run S3 log artifact. Both defaults make
+    # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
+    LOG_SAMPLING_RATE: float = 1.0
+    LOG_SAMPLING_ORG_IDS: list[str] = []
+    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
+    # Consecutive repair runs that make no newly-verified forward progress before the
+    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
+    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
+    # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
+    RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
@@ -160,9 +189,11 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    # Default-off companion to code-block mode. When enabled, Copilot can impose
-    # strict scout-trajectory synthesis at the persist seam for the narrow PR-1 envelope.
-    WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS: bool = False
+    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
+    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
+    # already-authenticated session (the first run and every login-replaying repair re-run alike).
+    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
+    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -679,6 +710,12 @@ class Settings(BaseSettings):
         }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
+
+        # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
+        # would offer models that resolve to unregistered configs and fail at runtime.
+        if self.ENABLE_OPENROUTER:
+            mapping["deepseek-v4-flash"] = {"llm_key": "OPENROUTER_DEEPSEEK_V4_FLASH", "label": "DeepSeek V4 Flash"}
+            mapping["mimo-v2.5"] = {"llm_key": "OPENROUTER_XIAOMI_MIMO_V2_5", "label": "Xiaomi MiMo V2.5"}
 
         # GPT models: prefer Azure when enabled, fall back to OpenAI
         gpt_models = [

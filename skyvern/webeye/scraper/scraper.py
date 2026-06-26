@@ -195,7 +195,10 @@ async def scrape_website(
     max_retries: int = settings.MAX_SCRAPING_RETRIES,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
-    draw_boxes: bool = True,
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # The parameter is retained for backwards compatibility and is scheduled for removal.
+    # New call sites must not pass ``draw_boxes=True``.
+    draw_boxes: bool = False,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
@@ -271,10 +274,13 @@ async def scrape_website(
         )
 
 
-async def get_frame_text(iframe: Frame) -> str:
+async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None = None) -> str:
     """
     Get all the visible text in the iframe.
     :param iframe: Frame instance to get the text from.
+    :param scrape_exclude: Optional ``filter_frames``-style predicate; True
+        means skip. The top-level caller must pass a starting frame the
+        predicate would not itself exclude.
     :return: All the visible text from the iframe.
     """
     js_script = "() => document.body.innerText"
@@ -294,6 +300,10 @@ async def get_frame_text(iframe: Frame) -> str:
         if child_frame.is_detached():
             continue
 
+        # Skip excluded frames before any CDP probe.
+        if scrape_exclude is not None and await scrape_exclude(child_frame.page, child_frame):
+            continue
+
         try:
             child_frame_element = await child_frame.frame_element()
         except Exception:
@@ -307,7 +317,7 @@ async def get_frame_text(iframe: Frame) -> str:
         if not await child_frame_element.is_visible():
             continue
 
-        text += await get_frame_text(child_frame)
+        text += await get_frame_text(child_frame, scrape_exclude)
 
     return text
 
@@ -379,7 +389,10 @@ async def scrape_web_unsafe(
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
-    draw_boxes: bool = True,
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # The parameter is retained for backwards compatibility and is scheduled for removal.
+    # New call sites must not pass ``draw_boxes=True``.
+    draw_boxes: bool = False,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
@@ -499,7 +512,7 @@ async def scrape_web_unsafe(
     if not elements and not support_empty_page:
         raise NoElementFound()
 
-    text_content = await get_frame_text(page.main_frame)
+    text_content = await get_frame_text(page.main_frame, scrape_exclude)
 
     html = ""
     window_dimension = None

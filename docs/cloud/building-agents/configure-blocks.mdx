@@ -58,8 +58,12 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 | **Max Steps Override** | Cap the number of AI reasoning steps |
 | **Disable Cache** | Skip cached script execution |
 | **TOTP Identifier** | Link TOTP credentials for 2FA handling |
-| **TOTP Verification URL** | Endpoint for fetching TOTP codes |
+| **TOTP Verification URL** | Endpoint this block polls when it needs a 2FA code |
 | **Error Code Mapping** | Map error conditions to custom error codes (JSON) |
+
+<Note>
+Set **TOTP Verification URL** on the block that may encounter 2FA. Top-level workflow run `totp_url` values do not automatically populate empty block fields.
+</Note>
 
 ---
 

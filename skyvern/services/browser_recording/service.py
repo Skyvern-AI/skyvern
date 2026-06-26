@@ -437,8 +437,23 @@ class Processor:
                             **self.identity,
                         )
                         continue
+                    fallback_label = deterministic_goto_url_label(url)
+                    title_candidate = (draft_step.title or "").strip()
+                    label_candidate = (draft_step.label or "").strip()
+                    if title_candidate:
+                        goto_label = normalize_recording_block_label(
+                            title_candidate,
+                            fallback=fallback_label,
+                        )
+                    elif label_candidate:
+                        goto_label = normalize_recording_block_label(
+                            label_candidate,
+                            fallback=fallback_label,
+                        )
+                    else:
+                        goto_label = fallback_label
                     block = WorkflowDefinitionYamlBlocksItem_GotoUrl(
-                        label=normalize_recording_block_label(draft_step.label, fallback="goto_url"),
+                        label=goto_label,
                         url=url,
                     )
                 case "wait":

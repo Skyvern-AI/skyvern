@@ -459,7 +459,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
-    async def refresh(self, draw_boxes: bool = True, scroll: bool = True, max_retries: int = 0) -> Self:
+    async def refresh(self, draw_boxes: bool = False, scroll: bool = True, max_retries: int = 0) -> Self:
         refreshed_page = await self._browser_state.scrape_website(
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
@@ -497,7 +497,10 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
     async def generate_scraped_page(
         self,
-        draw_boxes: bool = True,
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # The parameter is retained for backwards compatibility and is scheduled for removal.
+        # New call sites must not pass ``draw_boxes=True``.
+        draw_boxes: bool = False,
         scroll: bool = True,
         take_screenshots: bool = True,
         max_retries: int = 0,

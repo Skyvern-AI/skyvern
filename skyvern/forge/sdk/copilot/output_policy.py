@@ -12,10 +12,12 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_yaml_in_chat,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
-    RAW_SECRET_PATTERNS,
-    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     RequestPolicy,
     contains_email_password_pair,
+)
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
@@ -32,16 +34,22 @@ _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
 # RHS of a secret-keyword assignment that references a bound value instead of carrying one:
 # a `parameters`-rooted lookup (quoted-key subscript / .get / attribute), or an attribute
-# chain ending in a credential field (`cred.password`), optionally wrapped in str(...).
+# chain ending in a credential field (`cred.password` / `await cred.otp()`), optionally wrapped in str(...).
+# `totp` remains allowed for backward compatibility with old synthesized code;
+# new Code-block OTP flows should use `await cred.otp()`.
 # Fully anchored — only closing punctuation may follow, so a literal appended to a
 # reference (`cred.password+"hunter2"`) or a dotted literal (a JWT) never passes.
 _SANCTIONED_SECRET_REFERENCE_RE = re.compile(
     r"^(?:str\()?"
     r"(?:parameters(?:\[(?:'[^']*'|\"[^\"]*\")\]|\.get\((?:'[^']*'|\"[^\"]*\")\)|(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
-    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.(?:username|password|totp))"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.(?:username|password|totp)"
+    r"|(?:await\s+)?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.otp\(\))"
     r"[)\]\},;.'\"]*$"
 )
-_SECRET_ASSIGNMENT_RHS_RE = re.compile(r"[:=]\s*(\S+)\s*$")
+# The RHS can be a multi-token expression such as `await login_credentials.otp()`.
+# Callers pass the single line containing the match, so this is not expected to
+# consume across embedded newlines.
+_SECRET_ASSIGNMENT_RHS_RE = re.compile(r"[:=]\s*(.+)\s*$")
 _UNVALIDATED_PROPOSAL_AFFORDANCE_RE = re.compile(
     r"\baccept\b(?=[\s\S]{0,120}\bsav(?:e|ed|ing)\b)(?=[\s\S]{0,160}\b(?:reject|discard)\b)",
     re.IGNORECASE,
@@ -141,6 +149,15 @@ _SELF_PRESCRIPTIVE_CONTINUATION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_OUTPUT_FIELD_CONFIRMATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:confirm|verify|approve|check|tell me|let me know)\b"
+    r"(?=[\s\S]{0,180}\b(?:output|record|schema|field|fields)\b)"
+    r"(?=[\s\S]{0,220}\b(?:field|fields|schema|record)\b)"
+    r"|\b(?:which|what)\s+fields\s+should\b"
+    r")",
+    re.IGNORECASE,
+)
 
 # Response types whose `user_response` is rendered verbatim as the agent's final
 # message — REPLY and REPLACE_WORKFLOW. ASK_QUESTION is excluded because legitimate
@@ -179,6 +196,7 @@ class OutputPolicyReason(StrEnum):
     INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
     SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
     WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
+    AVOIDABLE_OUTPUT_FIELD_CONFIRMATION = "avoidable_output_field_confirmation"
 
 
 @dataclass
@@ -211,6 +229,7 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
+        OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION,
     }
 )
 
@@ -414,6 +433,15 @@ def evaluate_output_policy(
     if isinstance(request_policy, RequestPolicy):
         if request_policy.user_response_policy == "ask_clarification" and response_type != "ASK_QUESTION":
             verdict.add(OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS)
+        if (
+            response_type == "ASK_QUESTION"
+            and request_policy.user_response_policy != "ask_clarification"
+            and _request_policy_has_present_completion_contract(request_policy)
+            and not has_workflow_proposal
+            and not workflow_attempted
+            and _asks_to_confirm_output_fields(user_response)
+        ):
+            verdict.add(OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION)
         _apply_credential_policy(verdict, request_policy, values, workflow_yaml)
 
     if output_kind == CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL and not workflow_was_persisted:
@@ -424,9 +452,26 @@ def evaluate_output_policy(
     return verdict
 
 
+def _request_policy_has_present_completion_contract(request_policy: RequestPolicy) -> bool:
+    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def _asks_to_confirm_output_fields(user_response: str | None) -> bool:
+    if not isinstance(user_response, str) or not user_response.strip():
+        return False
+    return bool(_OUTPUT_FIELD_CONFIRMATION_RE.search(user_response[:500]))
+
+
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
-    return f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
+    message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
+    if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
+        message += (
+            " For saved credentials, bind a credential_id workflow parameter and reference fields as "
+            "`<key>.username`, `<key>.password`, or `await <key>.otp()` for one-time codes; do not split, "
+            "concatenate, or obfuscate literal secrets in workflow code or YAML."
+        )
+    return message
 
 
 def _contains_raw_secret(value: Any) -> bool:
@@ -438,10 +483,21 @@ def _contains_raw_secret(value: Any) -> bool:
                 matched = match.group(0)
                 if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
                     continue
-                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and _is_sanctioned_secret_reference(matched):
+                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and (
+                    _is_sanctioned_secret_reference(matched)
+                    or _is_sanctioned_secret_reference(_line_containing_match(text, match))
+                ):
                     continue
                 return True
     return False
+
+
+def _line_containing_match(text: str, match: re.Match[str]) -> str:
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(text)
+    return text[line_start:line_end]
 
 
 def _is_sanctioned_secret_reference(matched: str) -> bool:

@@ -50,7 +50,7 @@ console.log(result.output);
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
 | `title` | `str` | No | `None` | Display name for this run in the dashboard. |
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
-| `totp_url` | `str` | No | `None` | URL to receive TOTP codes. |
+| `totp_url` | `str` | No | `None` | Workflow-level TOTP endpoint metadata. For saved agents/workflows, set **TOTP Verification URL** on the block that may encounter 2FA, or template that block field from a workflow parameter. |
 | `template` | `bool` | No | `None` | Run a template workflow. |
 | `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |

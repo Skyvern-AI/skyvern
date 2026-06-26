@@ -1,7 +1,9 @@
 import { cn } from "@/util/utils";
 import { useEffect, useRef } from "react";
 
-type RunCardStatus = "success" | "failure";
+import { terminatedBorder } from "@/components/terminatedVisual";
+
+type RunCardStatus = "success" | "failure" | "terminated";
 
 type RunCardProps = {
   active?: boolean;
@@ -40,6 +42,7 @@ function RunCard({
             !!onClick,
           "border-l-destructive": status === "failure" && !active,
           "border-l-success": status === "success" && !active,
+          [terminatedBorder]: status === "terminated" && !active,
           "ring-2 ring-neutral-500/45 hover:ring-neutral-500/45 dark:ring-white/55 dark:hover:ring-white/55":
             active,
         },

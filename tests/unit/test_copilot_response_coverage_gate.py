@@ -58,9 +58,10 @@ class _Ctx:
         self.last_test_anti_bot = None
         self.failed_test_nudge_count = 0
         self.explore_without_workflow_nudge_count = 0
-        self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
+        self.last_artifact_health_blocker_reason = None
+        self.completion_verification_result = None
 
 
 @dataclass
@@ -111,6 +112,15 @@ def test_reply_with_coverage_gap_fires_nudge() -> None:
 def test_reply_after_success_with_request_policy_completion_contract_passes_through() -> None:
     ctx = _post_success_ctx("Go to https://example.com/contact. Fill out the contact form and submit it.")
     ctx.request_policy = SimpleNamespace(completion_contract="confirmation banner appears")
+    parsed = {"type": "REPLY", "user_response": "I created and tested the workflow."}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
+    assert ctx.coverage_nudge_count == 0
+
+
+def test_reply_after_success_with_unknown_fallback_contract_passes_through() -> None:
+    ctx = _post_success_ctx("Go to https://example.com/contact. Fill out the contact form and submit it.")
+    ctx.request_policy = SimpleNamespace(completion_contract_status="unknown")
     parsed = {"type": "REPLY", "user_response": "I created and tested the workflow."}
 
     assert _response_coverage_nudge(ctx, parsed) is None

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { resolveCopilotLiveBrowserReady } from "./browserReadiness";
 import { resolveDrainAction, resolveSendAction } from "./sendQueue";
 
 const sendInput = (
@@ -56,6 +57,19 @@ describe("resolveSendAction", () => {
     expect(
       resolveSendAction(
         sendInput({ requiresLiveBrowser: true, isLiveBrowserReady: true }),
+      ),
+    ).toBe("send");
+  });
+
+  it("sends when readiness is resolved from a headless backend session with no display paint", () => {
+    const isLiveBrowserReady = resolveCopilotLiveBrowserReady({
+      displayReady: false,
+      hasBackendSession: true,
+      headlessTurnDrainEnabled: true,
+    });
+    expect(
+      resolveSendAction(
+        sendInput({ requiresLiveBrowser: true, isLiveBrowserReady }),
       ),
     ).toBe("send");
   });
@@ -134,6 +148,19 @@ describe("resolveDrainAction", () => {
         drainInput({
           queuedReason: "live_browser",
           hasLiveBrowserSession: true,
+        }),
+      ),
+    ).toBe("drain_skip_queue");
+  });
+
+  it("drains a parked live_browser prompt once a backend session is present", () => {
+    expect(
+      resolveDrainAction(
+        drainInput({
+          queuedReason: "live_browser",
+          hasLiveBrowserSession: true,
+          inFlight: false,
+          hasWorkflowPermanentId: true,
         }),
       ),
     ).toBe("drain_skip_queue");

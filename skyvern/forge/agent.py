@@ -79,6 +79,7 @@ from skyvern.forge.sdk.api.files import (
     list_downloading_files_in_directory,
     list_files_in_directory,
     rename_file,
+    resolve_run_download_id,
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
@@ -88,6 +89,7 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
 from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_response_to_actions
+from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -95,10 +97,10 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
+from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -110,6 +112,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
+    CodeBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -148,6 +151,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
+from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
@@ -158,7 +162,7 @@ from skyvern.webeye.actions.parse_actions import (
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 
@@ -332,35 +336,6 @@ async def _cancel_pending_prefetch_task(task: asyncio.Task | None) -> None:
         await task
 
 
-async def _build_open_tabs_context(
-    browser_state: BrowserState,
-    working_page: Page | None,
-) -> str | None:
-    if working_page is None:
-        return None
-    pages = await browser_state.list_valid_pages()
-    if len(pages) <= 1:
-        return None
-    lines: list[str] = []
-    for i, p in enumerate(pages):
-        marker = " [current]" if p == working_page else ""
-        url = p.url
-        try:
-            title = await asyncio.wait_for(p.title(), timeout=1.0)
-        except Exception:
-            LOG.debug("tab_title_fetch_failed", url=url)
-            title = ""
-        if len(url) > 120:
-            url = url[:117] + "..."
-        if len(title) > 80:
-            title = title[:77] + "..."
-        entry = f"Tab {i}{marker}: {url}"
-        if title:
-            entry += f" ({title})"
-        lines.append(entry)
-    return "\n".join(lines)
-
-
 def _build_totp_timeout_reasoning(task: Task) -> str:
     # Mirror poll_otp_value's URL-then-identifier precedence so we only report the
     # source that was actually queried. URL goes through strip_query_params to keep
@@ -401,7 +376,7 @@ class ForgeAgent:
 
         context = skyvern_context.current()
         workflow_download_directory = get_path_for_workflow_download_directory(
-            context.run_id if context and context.run_id else task.workflow_run_id
+            resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
         )
         list_files_after = list_files_in_directory(workflow_download_directory)
         if task.browser_session_id:
@@ -416,8 +391,11 @@ class ForgeAgent:
             return []
         for file in files_to_rename:
             local_file_name = file
-            if file.startswith("s3://"):
-                file_data = await get_aws_client().download_file(file, log_exception=False)
+            if file.startswith(("s3://", "gs://")):
+                if file.startswith("s3://"):
+                    file_data = await get_aws_client().download_file(file, log_exception=False)
+                else:
+                    file_data = await get_gcs_client().download_file(file, log_exception=False)
                 if not file_data:
                     continue
                 local_file_name = file.split("/")[-1]
@@ -526,6 +504,7 @@ class ForgeAgent:
         )
         LOG.info(
             "Created a new task for workflow run",
+            sampling=True,
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             task_id=task.task_id,
@@ -550,10 +529,44 @@ class ForgeAgent:
         )
         LOG.info(
             "Created new step for workflow run",
+            sampling=True,
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             order=step.order,
             retry_index=step.retry_index,
+        )
+        return task, step
+
+    async def create_task_and_step_from_code_block(
+        self,
+        code_block: CodeBlock,
+        organization_id: str | None,
+        workflow_run_id: str,
+        task_url: str,
+    ) -> tuple[Task, Step]:
+        """Container task v1 for a code block's recorded actions, also the seat for future agent fallback."""
+        task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
+        task = await app.DATABASE.tasks.create_task(
+            url=task_url,
+            title=code_block.label,
+            navigation_goal=code_block.prompt,
+            data_extraction_goal=None,
+            navigation_payload=None,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            order=task_order,
+            retry=task_retry,
+        )
+        task = await app.DATABASE.tasks.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.running,
+        )
+        step = await app.DATABASE.tasks.create_step(
+            task.task_id,
+            order=0,
+            retry_index=0,
+            organization_id=organization_id,
         )
         return task, step
 
@@ -734,7 +747,7 @@ class ForgeAgent:
             if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(
-                        context.run_id if context and context.run_id else task.workflow_run_id
+                        resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
                     )
                 )
             if task.browser_session_id and download_baseline_files is None:
@@ -827,11 +840,18 @@ class ForgeAgent:
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
+            # Shadow-only loop-stall observability; never raises, never terminates (see shadow.py).
+            await record_fail_fast_shadow(
+                task=task,
+                step=step,
+                organization=organization,
+                scraped_page=detailed_output.scraped_page if detailed_output else None,
+            )
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
                 workflow_download_directory = get_path_for_workflow_download_directory(
-                    context.run_id if context and context.run_id else task.workflow_run_id
+                    resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
                 )
 
                 downloading_files = list_downloading_files_in_directory(workflow_download_directory)
@@ -1346,6 +1366,7 @@ class ForgeAgent:
         try:
             LOG.info(
                 "Starting agent step",
+                sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
@@ -1657,6 +1678,7 @@ class ForgeAgent:
             # Execute the actions
             LOG.info(
                 "Executing actions",
+                sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
                 actions=actions,
@@ -1794,12 +1816,15 @@ class ForgeAgent:
                 # Tell the handler to skip the auto-completion Tab hack when the
                 # next batched action would be broken by a focus change — e.g. a
                 # KEYPRESS Enter or another action on the same element.
-                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
-                    next_action = action_linked_list[action_idx + 1].action
+                if action.action_type == ActionType.INPUT_TEXT:
+                    next_action = (
+                        action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
+                    )
                     if isinstance(next_action, KeypressAction) or (
                         isinstance(next_action, WebAction) and next_action.element_id == action.element_id
                     ):
                         action.skip_auto_complete_tab = True
+                    action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
 
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,
@@ -1872,6 +1897,7 @@ class ForgeAgent:
                         pdf_auto_download_src = None
                     LOG.info(
                         "Action succeeded",
+                        sampling=True,
                         step_order=step.order,
                         step_retry=step.retry_index,
                         action_idx=action_idx,
@@ -1941,6 +1967,7 @@ class ForgeAgent:
 
             LOG.info(
                 "Actions executed successfully, marking step as completed",
+                sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
                 action_results=action_results,
@@ -2017,9 +2044,15 @@ class ForgeAgent:
 
             # if the last action is complete and is successful, check if there's a data extraction goal
             # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
+            # skip when the step already ran a successful planner-emitted EXTRACT action — re-extracting would be a duplicate
+            step_has_successful_extract = any(
+                executed_action.action_type == ActionType.EXTRACT and any(result.success for result in results)
+                for executed_action, results in detailed_agent_step_output.actions_and_results
+            )
             if (
                 task.navigation_goal
                 and task.data_extraction_goal
+                and not step_has_successful_extract
                 and self.step_has_completed_goal(detailed_agent_step_output)
             ):
                 working_page = await browser_state.must_get_working_page()
@@ -2044,18 +2077,25 @@ class ForgeAgent:
                 completed_step.speculative_original_status = StepStatus.completed
             return completed_step, detailed_agent_step_output.get_clean_detailed_output()
         except CancelledError:
-            LOG.exception(
-                "CancelledError in agent_step, marking step as failed",
+            # A cancellation here is a deliberate stop (elapsed-time timeout / user cancel). Persist
+            # the step as failed (shielded, so the write survives the cancel) for observability, then
+            # re-raise so the cancellation actually halts the run. Returning instead would let the step
+            # loop treat it as a retryable failure and keep executing past the timeout.
+            LOG.info(
+                "CancelledError in agent_step, marking step failed and re-raising",
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
             detailed_agent_step_output.step_exception = "CancelledError"
-            failed_step = await self.update_step(
-                step=step,
-                status=StepStatus.failed,
-                output=detailed_agent_step_output.to_agent_step_output(),
-            )
-            return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    self.update_step(
+                        step=step,
+                        status=StepStatus.failed,
+                        output=detailed_agent_step_output.to_agent_step_output(),
+                    )
+                )
+            raise
         except (
             UnsupportedActionType,
             UnsupportedTaskType,
@@ -2313,8 +2353,11 @@ class ForgeAgent:
         if output_config is not None:
             call_kwargs["output_config"] = output_config
         if not llm_caller.message_history:
+            # ExtractionBlock stores its prompt in data_extraction_goal rather than navigation_goal.
+            # Fall back so the first CUA turn still carries an instruction.
+            first_turn_prompt = task.navigation_goal or task.data_extraction_goal
             llm_response = await llm_caller.call(
-                prompt=task.navigation_goal,
+                prompt=first_turn_prompt,
                 **call_kwargs,
             )
         else:
@@ -2531,6 +2574,7 @@ class ForgeAgent:
 
             LOG.info(
                 "Speculative extract-actions completed",
+                sampling=True,
                 current_step_id=current_step.step_id,
                 synthetic_step_id=next_step.step_id,
             )
@@ -3196,11 +3240,13 @@ class ForgeAgent:
             await browser_state.reload_page(degradation=True)
 
         max_screenshot_number = settings.MAX_NUM_SCREENSHOTS
-        draw_boxes = True
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # ``draw_boxes`` is wired through the scrape pipeline as False; the overlay helpers
+        # are retained briefly for backwards compatibility and scheduled for removal.
+        draw_boxes = False
         scroll = True
         if engine in CUA_ENGINES:
             max_screenshot_number = 1
-            draw_boxes = False
             scroll = False
 
         return await browser_state.scrape_website(
@@ -3359,6 +3405,7 @@ class ForgeAgent:
             )
         LOG.info(
             "Scraped website",
+            sampling=True,
             step_order=step.order,
             step_retry=step.retry_index,
             num_elements=len(scraped_page.elements),
@@ -3480,11 +3527,13 @@ class ForgeAgent:
         enriched_tree_enabled: bool = False,
         llm_screenshots_enabled: bool = True,
         slim_output: str | None = None,
+        has_data_extraction_goal: bool = False,
+        enable_new_planner_actions: bool = False,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, close-page availability, complete criteria, slim output)
-        do not reuse the same Vertex cache object.
+        differ meaningfully (OTP, close-page availability, complete criteria, slim output,
+        data extraction goal availability, new planner actions) do not reuse the same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
@@ -3495,6 +3544,10 @@ class ForgeAgent:
             variant_parts.append("nt")
         if show_switch_tab_action:
             variant_parts.append("st")
+        if has_data_extraction_goal:
+            variant_parts.append("de")
+        if enable_new_planner_actions:
+            variant_parts.append("np")
         if enriched_tree_enabled:
             variant_parts.append("et")
         if enriched_tree_enabled and not llm_screenshots_enabled:
@@ -3767,7 +3820,7 @@ class ForgeAgent:
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
-        open_tabs_context = await _build_open_tabs_context(browser_state, page)
+        open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
         # NEW_TAB/SWITCH_TAB are gated behind a flag (default off) so single-tab tasks are
         # unaffected. SWITCH_TAB additionally requires >= 2 open tabs, like CLOSE_PAGE.
@@ -3776,6 +3829,14 @@ class ForgeAgent:
         show_switch_tab_action = multi_tab_enabled and open_tabs_context is not None
         llm_screenshots_enabled = context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
         enriched_tree_enabled = context.enriched_tree_enabled()
+
+        # Off keeps pre-PR behavior: the planner is never offered these actions, so the parser and
+        # is_goal_achieved branches stay dormant. Per-run randomization, like DISABLE_USER_GOAL_CHECK.
+        enable_new_planner_actions = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "ENABLE_NEW_PLANNER_ACTIONS",
+            task.workflow_run_id if task.workflow_run_id else task.task_id,
+            properties={"task_url": task.url, "organization_id": task.organization_id},
+        )
 
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
@@ -3792,6 +3853,7 @@ class ForgeAgent:
                     "starting_url": starting_url,
                     "current_url": current_url,
                     "data_extraction_goal": task.data_extraction_goal,
+                    "enable_new_planner_actions": enable_new_planner_actions,
                     "action_history": actions_and_results_str,
                     "error_code_mapping_str": (
                         json.dumps(task.error_code_mapping) if task.error_code_mapping else None
@@ -3818,6 +3880,8 @@ class ForgeAgent:
                     enriched_tree_enabled=enriched_tree_enabled,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     slim_output=slim_output,
+                    has_data_extraction_goal=bool(task.data_extraction_goal),
+                    enable_new_planner_actions=enable_new_planner_actions,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3872,6 +3936,7 @@ class ForgeAgent:
 
                 LOG.info(
                     "Using cached prompt",
+                    sampling=True,
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
                     cache_variant=cache_variant,
@@ -3896,6 +3961,7 @@ class ForgeAgent:
             starting_url=starting_url,
             current_url=current_url,
             data_extraction_goal=task.data_extraction_goal,
+            enable_new_planner_actions=enable_new_planner_actions,
             action_history=actions_and_results_str,
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             local_datetime=datetime.now(context.tz_info).isoformat(),
@@ -4338,7 +4404,7 @@ class ForgeAgent:
                             )
                         context = skyvern_context.current()
                         finalization_run_id = (
-                            context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+                            resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                         )
                         await app.STORAGE.save_downloaded_files(
                             organization_id=task.organization_id,
@@ -4391,6 +4457,7 @@ class ForgeAgent:
         if task.workflow_run_id:
             LOG.info(
                 "Task is part of a workflow run, not sending a webhook response",
+                sampling=True,
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
@@ -4479,6 +4546,7 @@ class ForgeAgent:
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
+                    sampling=True,
                     task_id=task.task_id,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
@@ -4587,7 +4655,7 @@ class ForgeAgent:
                     context = skyvern_context.current()
                     downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=task.organization_id,
-                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
+                        run_id=resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -4754,18 +4822,6 @@ class ForgeAgent:
                 organization_id=step.organization_id,
             )
 
-        # Flush event strategy metrics on any terminal status (including canceled)
-        if status in [StepStatus.completed, StepStatus.failed, StepStatus.canceled]:
-            try:
-                EventStrategyFactory.flush_metrics(
-                    step_id=step.step_id,
-                    task_id=step.task_id,
-                    step_status=status,
-                    organization_id=step.organization_id,
-                )
-            except Exception:
-                LOG.warning("Failed to flush event strategy metrics", exc_info=True)
-
         await save_step_logs(step.step_id)
 
         return await app.DATABASE.tasks.update_step(
@@ -4825,7 +4881,7 @@ class ForgeAgent:
             )
 
         await save_task_logs(task.task_id)
-        LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
+        LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
         return await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
@@ -5006,6 +5062,7 @@ class ForgeAgent:
 
         LOG.info(
             "Parallel verification: goal not achieved, awaiting speculative extract-actions",
+            sampling=True,
             step_id=step.step_id,
             task_id=task.task_id,
         )
@@ -5654,7 +5711,7 @@ class ForgeAgent:
         task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
         should_verify = (
             complete_verification
-            and not step.is_goal_achieved()
+            and not step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal))
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
             and not task_completes_on_download
@@ -5686,7 +5743,7 @@ class ForgeAgent:
                     task_block=task_block,
                 )
 
-        if step.is_goal_achieved():
+        if step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal)):
             LOG.info(
                 "Step completed and goal achieved, marking task as completed",
                 step_order=step.order,

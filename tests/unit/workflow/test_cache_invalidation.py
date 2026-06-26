@@ -7,10 +7,11 @@ do not trigger cache invalidation.
 
 from datetime import datetime, timezone
 
-from skyvern.forge.sdk.workflow.models.block import BlockType, TaskBlock
+from skyvern.forge.sdk.workflow.models.block import BlockType, CodeBlock, CodeBlockStep, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.forge.sdk.workflow.service import _get_workflow_definition_core_data
+from skyvern.webeye.actions.action_types import ActionType
 
 
 def make_output_parameter(key: str) -> OutputParameter:
@@ -36,6 +37,22 @@ def make_task_block(label: str, model: dict | None = None) -> TaskBlock:
         title="Test Task",
         navigation_goal="Complete the task",
         model=model,
+    )
+
+
+def make_code_block(
+    label: str,
+    goal: str | None = None,
+    steps: list[CodeBlockStep] | None = None,
+) -> CodeBlock:
+    """Create a test code block with optional code-first annotation fields."""
+    return CodeBlock(
+        label=label,
+        block_type=BlockType.CODE,
+        output_parameter=make_output_parameter(f"{label}_output"),
+        code="x = 1",
+        prompt=goal,
+        steps=steps,
     )
 
 
@@ -124,6 +141,54 @@ class TestCacheInvalidation:
             assert definitions[0] == definitions[i], (
                 f"Core data should be identical regardless of model. Definition 0 vs {i} differ."
             )
+
+    def test_code_block_annotation_edits_excluded_from_comparison(self) -> None:
+        """Editing display/derived code-block annotations must not invalidate the cached script."""
+        plain = make_code_block("code1")
+        annotated = make_code_block(
+            "code1",
+            steps=[CodeBlockStep(description="Open the page", action_type=ActionType.GOTO_URL)],
+        )
+
+        core_data_plain = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[plain]))
+        core_data_annotated = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[annotated]))
+
+        assert core_data_plain == core_data_annotated, (
+            "Code block steps are a display/derived annotation and should be excluded from comparison."
+        )
+
+    def test_code_block_annotation_fields_not_in_core_data(self) -> None:
+        block = make_code_block(
+            "code1",
+            steps=[CodeBlockStep(description="Click go", action_type=ActionType.CLICK)],
+        )
+        core_data = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[block]))
+
+        for block_data in core_data.get("blocks", []):
+            assert "steps" not in block_data
+
+    def test_code_block_goal_change_still_detected(self) -> None:
+        """A goal reprompt regenerates code and steps, so a goal edit must keep invalidating."""
+        definition1 = WorkflowDefinition(parameters=[], blocks=[make_code_block("code1", goal="Goal A")])
+        definition2 = WorkflowDefinition(parameters=[], blocks=[make_code_block("code1", goal="Goal B")])
+
+        core_data1 = _get_workflow_definition_core_data(definition1)
+        core_data2 = _get_workflow_definition_core_data(definition2)
+
+        assert core_data1 != core_data2, "Code block goal changes must still trigger cache invalidation"
+
+    def test_task_block_criteria_changes_still_detected(self) -> None:
+        """Criteria on task-family blocks are runtime-consumed; edits there must keep invalidating."""
+        block1 = make_task_block("task1")
+        block1.complete_criterion = "Criterion A"
+
+        block2 = make_task_block("task1")
+        block2.complete_criterion = "Criterion B"
+
+        core_data1 = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[block1]))
+        core_data2 = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[block2]))
+
+        assert core_data1 != core_data2, "Task block criteria changes must still trigger cache invalidation"
 
     def test_timestamps_excluded_from_comparison(self) -> None:
         """Verify that timestamps are properly excluded from comparison."""

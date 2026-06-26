@@ -13,13 +13,16 @@ const BATCH_TAGS_MAX_WPIDS = 200;
 
 // One batch fetch for all visible workflows (avoids per-row N+1). Ids are sorted so
 // the query key is order-independent and identical sets share a cache entry.
-function useWorkflowTagsBatchQuery(workflowPermanentIds: Array<string>) {
+function useWorkflowTagsBatchQuery(
+  workflowPermanentIds: Array<string>,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
   const credentialGetter = useCredentialGetter();
   const sortedIds = [...workflowPermanentIds].sort();
 
   return useQuery({
     queryKey: ["workflow-tags", "batch", sortedIds],
-    enabled: sortedIds.length > 0,
+    enabled: enabled && sortedIds.length > 0,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const chunks: Array<Array<string>> = [];

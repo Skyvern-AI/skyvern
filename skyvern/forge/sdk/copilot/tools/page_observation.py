@@ -36,6 +36,25 @@ def _bounded_observation_text(value: object, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+def _nested_observation_text(value: object, *, depth: int = 0) -> str:
+    if depth > 4:
+        return ""
+    if isinstance(value, str):
+        return _bounded_observation_text(value, 500)
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key, item in list(value.items())[:40]:
+            parts.append(_bounded_observation_text(key, 120))
+            parts.append(_nested_observation_text(item, depth=depth + 1))
+        return _bounded_observation_text(" ".join(part for part in parts if part), 2500)
+    if isinstance(value, list):
+        return _bounded_observation_text(
+            " ".join(part for item in value[:40] if (part := _nested_observation_text(item, depth=depth + 1))),
+            2500,
+        )
+    return ""
+
+
 @dataclass(frozen=True)
 class _ObservedFieldEvidence:
     name: str
@@ -192,7 +211,7 @@ def _normalize_evaluate_challenge_state(
     anti_bot_indicators: list[str],
 ) -> dict[str, Any]:
     detected = bool(anti_bot_indicators)
-    gated_controls: list[dict[str, Any]] = []
+    gated_controls = _disabled_submit_controls(observed_data)
     for key, value in observed_data.items():
         normalized_key = str(key).strip().lower().replace("_", " ").replace("-", " ")
         if "disabled" not in normalized_key or value is not True:
@@ -216,21 +235,74 @@ def _normalize_evaluate_challenge_state(
         kind = "human_verification"
     else:
         kind = "none"
+    gates_submit_controls = bool(detected and gated_controls)
     return {
         "detected": detected,
         "kind": kind,
         "source": "mcp_evaluate" if detected else "",
         "indicators": anti_bot_indicators[:8],
-        "requires_human_verification": detected,
+        "requires_human_verification": gates_submit_controls,
         "visual_location": "",
-        "gates_submit_controls": bool(detected and gated_controls),
+        "gates_submit_controls": gates_submit_controls,
         "gated_submit_controls": gated_controls[:5] if detected else [],
     }
 
 
+def _disabled_submit_controls(observed_data: object) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+
+    def visit(value: object, depth: int = 0) -> None:
+        if depth > 4 or len(controls) >= 5:
+            return
+        if isinstance(value, list):
+            for item in value[:40]:
+                visit(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+
+        disabled = value.get("disabled") is True or value.get("ariaDisabled") is True
+        text_parts: list[str] = []
+        for key in (
+            "text",
+            "label",
+            "name",
+            "id",
+            "selector",
+            "value",
+            "aria_label",
+            "aria-label",
+            "title",
+            "type",
+            "role",
+        ):
+            item = value.get(key)
+            if isinstance(item, str):
+                text_parts.append(item)
+        label = _bounded_observation_text(" ".join(text_parts), 160)
+        normalized = label.lower().replace("_", " ").replace("-", " ")
+        if disabled and any(token in normalized for token in ("submit", "search", "button", "btn")):
+            controls.append(
+                {
+                    "text": label,
+                    "id": _bounded_observation_text(value.get("id"), 120),
+                    "name": _bounded_observation_text(value.get("name"), 120),
+                    "selector": _bounded_observation_text(value.get("selector"), 160),
+                    "disabled": True,
+                }
+            )
+
+        for item in value.values():
+            visit(item, depth + 1)
+
+    visit(observed_data)
+    return controls[:5]
+
+
 def _evaluate_anti_bot_indicators(observed_data: dict[str, Any], text: str) -> list[str]:
     key_text = " ".join(str(key) for key in observed_data.keys()).lower()
-    combined = f"{text} {key_text}"
+    nested_text = _nested_observation_text(observed_data).lower()
+    combined = f"{text} {key_text} {nested_text}"[:5000]
     return [pattern for pattern in _DISCOVERY_ANTI_BOT_PATTERNS if pattern in combined]
 
 

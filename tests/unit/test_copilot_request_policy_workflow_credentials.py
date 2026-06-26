@@ -284,3 +284,55 @@ async def test_no_discovered_credentials_leaves_approved_set_empty() -> None:
 
     assert policy.discovered_credentials == []
     get_by_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fallback_code_block_credential_request_saves_draft_without_running() -> None:
+    credential = SimpleNamespace(
+        credential_id="cred_email_otp",
+        name="mock-portal-login-email-otp",
+        tested_url="http://localhost:8900/telco_billing/northwind/?mfa=email",
+    )
+    with patch(
+        "skyvern.forge.app.DATABASE.credentials.get_credentials",
+        new=AsyncMock(return_value=[credential]),
+    ):
+        policy = await build_request_policy(
+            user_message=(
+                "Build this as a Code block credential test using the saved credential named "
+                "mock-portal-login-email-otp. Do not create a Login block for sign-in or MFA, "
+                "and use await login_credentials.otp() for the email one-time-code."
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert policy.classifier_status == "fallback"
+    assert policy.credential_input_kind == "credential_name"
+    assert policy.credential_refs == ["mock-portal-login-email-otp"]
+    assert policy.resolved_credentials == [credential]
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is False
+    assert policy.allow_missing_credentials_in_draft is True
+    assert policy.testing_intent == "skip_test"
+    assert policy.requires_user_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_fallback_code_block_generic_one_time_code_does_not_skip_run() -> None:
+    policy = await build_request_policy(
+        user_message="Build a code block that handles a one time code after sign in.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="o_test",
+        handler=None,
+    )
+
+    assert policy.classifier_status == "fallback"
+    assert policy.allow_run_blocks is True
+    assert policy.allow_missing_credentials_in_draft is False
+    assert policy.testing_intent == "unspecified"

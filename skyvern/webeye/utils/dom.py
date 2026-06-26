@@ -36,6 +36,19 @@ LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
+def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
+    """A Playwright `TimeoutError` whose message references the post-click
+    auto-wait for scheduled navigations means the click was physically
+    dispatched (Playwright logs ``click action done`` immediately before this
+    wait) and only the post-action wait timed out — typical for clicks that
+    trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
+    chain would duplicate the already-applied side effect.
+    """
+    if not isinstance(exc, TimeoutError):
+        return False
+    return "scheduled navigation" in str(exc).lower()
+
+
 async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
@@ -843,16 +856,18 @@ class SkyvernElement:
         try:
             return await self.move_mouse_to(page, timeout=timeout)
         except NoElementBoudingBox:
-            LOG.warning(
+            LOG.info(
                 "Failed to move mouse to the element - NoElementBoudingBox",
+                sampling=True,
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,
                 exc_info=True,
             )
         except ElementOutOfCurrentViewport:
-            LOG.warning(
+            LOG.info(
                 "Failed to move mouse to the element - ElementOutOfCurrentViewport",
+                sampling=True,
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,
@@ -908,8 +923,14 @@ class SkyvernElement:
             # so Playwright actionability is preserved.
             await EventStrategyFactory.click_element(page, self.get_locator(), timeout=timeout)
             return
-        except Exception:
+        except Exception as exc:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
+            if is_post_dispatch_click_timeout(exc):
+                LOG.info(
+                    "Click side effect detected via navigation-wait timeout — skipping fallback chain",
+                    element_id=self.get_id(),
+                )
+                return
 
         if dom is not None:
             # try to click on the blocking element
@@ -1162,7 +1183,7 @@ class DomUtil:
                 # It can only represent the element position in the DOM tree with tag name, it's not 100% reliable.
                 # As long as the current position has the same element with the tag name, the locator can be found.
                 # (maybe) we should validate the element hash to make sure the element is the same?
-                LOG.warning("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id)
+                LOG.info("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id, sampling=True)
                 locator = frame_content.locator(f"xpath={xpath}")
                 num_elements = await locator.count()
                 if num_elements < 1:

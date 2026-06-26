@@ -21,6 +21,27 @@ class WorkflowCopilotChat(BaseModel):
     modified_at: datetime = Field(..., description="When the chat was last modified")
 
 
+class WorkflowCopilotCompletionCriteriaSet(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    completion_criteria_set_id: str
+    organization_id: str
+    workflow_copilot_chat_id: str
+    goal_epoch: int
+    status: str
+    criteria: list[dict]
+    source_turn_id: str | None = None
+    source_goal_text: str | None = None
+    consecutive_all_no_evidence: int = 0
+    tripwire_fired: bool = False
+    last_fully_satisfied_workflow_yaml: str | None = None
+    superseded_by_set_id: str | None = None
+    superseded_at: datetime | None = None
+    supersede_reason: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+
 class WorkflowCopilotChatSender(StrEnum):
     USER = "user"
     AI = "ai"
@@ -87,6 +108,13 @@ class WorkflowCopilotChatRequest(BaseModel):
             "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
         ),
     )
+    target_block_label: str | None = Field(
+        None,
+        description=(
+            "When set, the copilot regenerates only this code block from its goal and leaves every "
+            "other block unchanged. Used by the block-level Generate action."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
@@ -123,6 +151,17 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+
+
+class WorkflowCopilotChatSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID the chat belongs to")
+    workflow_title: str | None = Field(None, description="Title of the workflow the chat belongs to")
+    title: str = Field(..., description="Single-line preview derived from the chat's first message")
+    created_at: datetime = Field(..., description="When the chat was created")
+    modified_at: datetime = Field(..., description="When the chat was last modified")
 
 
 class WorkflowCopilotAudioUploadResponse(BaseModel):
@@ -170,6 +209,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
+    )
+    workflow_applied: bool = Field(
+        False,
+        description="True when the backend already committed this terminal workflow proposal.",
     )
     cancelled: bool = Field(
         False,

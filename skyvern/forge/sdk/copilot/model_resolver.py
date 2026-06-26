@@ -25,6 +25,7 @@ from agents.models.interface import Model
 from agents.run_config import RunConfig
 
 from skyvern.config import settings
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
@@ -162,6 +163,13 @@ def resolve_model_config(
     configure_litellm_transport()
 
     llm_key = llm_key_override or getattr(llm_api_handler, "llm_key", None) or settings.LLM_KEY
+    # GitHub Copilot's OPENAI_COMPATIBLE handler rewrites .llm_key to the bare model name; restore the registry key.
+    if (
+        llm_key == settings.OPENAI_COMPATIBLE_MODEL_NAME
+        and LLMAPIHandlerFactory.is_github_copilot_endpoint()
+        and not LLMConfigRegistry.is_registered(llm_key)
+    ):
+        llm_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
     config = LLMConfigRegistry.get_config(llm_key)
 
     if isinstance(config, LLMRouterConfig):

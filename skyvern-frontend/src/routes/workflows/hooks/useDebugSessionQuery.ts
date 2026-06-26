@@ -3,16 +3,43 @@ import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 
+const DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS = 5 * 60 * 1000;
+const DEBUG_SESSION_ERROR_REFETCH_INTERVAL_MS = 30 * 1000;
+
+type DebugSessionRefetchState = {
+  status: "pending" | "error" | "success";
+  data?: { browser_session_id?: string | null } | null;
+};
+
+function getDebugSessionRefetchInterval(
+  queryState: DebugSessionRefetchState,
+  isRateLimited = false,
+  keepAliveBrowserSession = false,
+): number | false {
+  if (isRateLimited) {
+    return false;
+  }
+  if (queryState.status === "error") {
+    return DEBUG_SESSION_ERROR_REFETCH_INTERVAL_MS;
+  }
+  if (keepAliveBrowserSession && queryState.data?.browser_session_id) {
+    return DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS;
+  }
+  return false;
+}
+
 interface Opts {
   workflowPermanentId?: string;
   enabled?: boolean;
   isRateLimited?: boolean;
+  keepAliveBrowserSession?: boolean;
 }
 
 function useDebugSessionQuery({
   workflowPermanentId,
   enabled,
   isRateLimited,
+  keepAliveBrowserSession,
 }: Opts) {
   const credentialGetter = useCredentialGetter();
 
@@ -35,16 +62,20 @@ function useDebugSessionQuery({
     retryDelay: 10000,
     refetchOnWindowFocus: false,
     // Don't keep retrying if in error state
-    refetchInterval: (query) => {
-      if (isRateLimited) return false;
-      // If query is in error state, poll much less frequently (30s)
-      // Otherwise don't auto-refetch
-      if (query.state.status === "error") {
-        return 30000;
-      }
-      return false;
-    },
+    refetchInterval: (query) =>
+      getDebugSessionRefetchInterval(
+        query.state,
+        isRateLimited,
+        keepAliveBrowserSession,
+      ),
+    // Keep lease renewal polling active even when the editor tab is backgrounded.
+    refetchIntervalInBackground: keepAliveBrowserSession,
   });
 }
 
-export { useDebugSessionQuery };
+export {
+  DEBUG_SESSION_ERROR_REFETCH_INTERVAL_MS,
+  DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS,
+  getDebugSessionRefetchInterval,
+  useDebugSessionQuery,
+};

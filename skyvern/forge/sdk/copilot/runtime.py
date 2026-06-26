@@ -36,8 +36,12 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -54,6 +58,7 @@ CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
+SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -118,6 +123,7 @@ class ScoutedInteraction(TypedDict):
     selector: NotRequired[str]
     source_url: NotRequired[str]
     value: NotRequired[str]
+    typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
     role: NotRequired[str]
@@ -138,6 +144,10 @@ class AgentContext:
     browser_session_id: str | None
     stream: EventSourceStream
     api_key: str | None = None
+    # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
+    sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
+        default_factory=dict
+    )
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -176,7 +186,6 @@ class AgentContext:
     copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
-    null_data_streak_count: int = 0
     last_test_ok: bool | None = None
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None
@@ -184,13 +193,18 @@ class AgentContext:
     # Latest evaluated outcome-gate verdict this turn. Deliberately not reset
     # per-run: a later run that fails before verification keeps the verdict.
     last_outcome_gate_reason: str | None = None
+    last_outcome_gate_workflow_run_id: str | None = None
     last_failure_category_top: str | None = None
     last_update_block_count: int | None = None
     last_failed_workflow_yaml: str | None = None
     code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
+    code_native_pending_capability: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    code_authoring_guardrail_reject_count: int = 0
+    last_code_authoring_reject_was_credential_priority: bool = False
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
@@ -200,6 +214,8 @@ class AgentContext:
     staged_workflow_yaml: str | None = None
     staged_workflow: Any | None = None
     has_staged_proposal: bool = False
+    # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
+    prior_copilot_workflow_yaml: str | None = None
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
@@ -212,11 +228,15 @@ class AgentContext:
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
     last_run_blocks_workflow_run_id: str | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
+    last_artifact_health_failure_classes: list[str] = field(default_factory=list)
     last_run_blocks_block_ids: list[str] = field(default_factory=list)
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     completion_verification_result: CompletionVerificationResult | None = None
+    verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
     # Ordered, bounded list of typed page-evidence packets — one per page observed
@@ -247,6 +267,10 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
+    last_evaluate_actionable_signature: str | None = None
+    last_evaluate_actionable_url: str | None = None
+    latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+    last_auto_acted_signature: str | None = None
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.
     scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
@@ -255,9 +279,20 @@ class AgentContext:
     # preserves repeats and ordering so code_block_synthesis can emit a faithful
     # linear Playwright trajectory.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
+    # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
+    reached_download_target: ReachedDownloadTarget | None = None
     synthesized_block_offered: bool = False
+    synthesized_block_offered_trajectory_len: int = 0
+    # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
+    # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
+    download_scout_required_rejections: int = 0
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
+    pending_scout_typed_value: str | None = None
+    # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
+    # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
+    pending_scout_role_name: tuple[str, str, str] | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.
@@ -274,6 +309,10 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
+    # Latest edited-schema-incompatibility terminal outcome, set when an edited
+    # extraction_schema declares fields that map to no output the block produces.
+    # Surfaced into the persisted TurnOutcome so a later turn can report it.
+    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
@@ -309,6 +348,8 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
     if not ctx.browser_session_id:
         raise RuntimeError("No browser_session_id set on agent context")
+    browser_session_id = ctx.browser_session_id
+    sdk_action_workflow_run_cache_key: SdkActionWorkflowRunCacheKey = (ctx.organization_id, browser_session_id)
     # Validate api_key at the boundary, before touching any backend.
     #
     # The copilot FastAPI route runs outside MCPAPIKeyMiddleware, so the CLI
@@ -321,13 +362,13 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     if not ctx.api_key:
         LOG.warning(
             "mcp_browser_context invoked without api_key",
-            session_id=ctx.browser_session_id,
+            session_id=browser_session_id,
             organization_id=ctx.organization_id,
         )
         raise RuntimeError("Copilot agent context missing api_key")
 
     browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-        session_id=ctx.browser_session_id,
+        session_id=browser_session_id,
         organization_id=ctx.organization_id,
     )
     if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
@@ -335,7 +376,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         # to LLM- or user-visible output -- but log it for operators.
         LOG.warning(
             "No browser context for copilot session",
-            session_id=ctx.browser_session_id,
+            session_id=browser_session_id,
             organization_id=ctx.organization_id,
         )
         raise RuntimeError("No browser context for copilot session")
@@ -346,11 +387,14 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         skyvern_browser = SkyvernBrowser(
             skyvern_client,
             browser_state.browser_context,
-            browser_session_id=ctx.browser_session_id,
+            browser_session_id=browser_session_id,
+        )
+        skyvern_browser.workflow_run_id = ctx.sdk_action_workflow_run_ids_by_browser_session.get(
+            sdk_action_workflow_run_cache_key
         )
         mcp_ctx = MCPBrowserContext(
             mode="cloud_session",
-            session_id=ctx.browser_session_id,
+            session_id=browser_session_id,
             can_access_localhost=_copilot_session_can_access_localhost(),
         )
         active_key = get_active_api_key()
@@ -359,12 +403,18 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
         )
-        register_copilot_session(ctx.browser_session_id, state)
+        register_copilot_session(browser_session_id, state)
         try:
             async with scoped_session(state):
                 yield
         finally:
-            unregister_copilot_session(ctx.browser_session_id)
+            if skyvern_browser.workflow_run_id:
+                ctx.sdk_action_workflow_run_ids_by_browser_session[sdk_action_workflow_run_cache_key] = (
+                    skyvern_browser.workflow_run_id
+                )
+            else:
+                ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
+            unregister_copilot_session(browser_session_id)
     finally:
         reset_api_key_override(override_token)
 

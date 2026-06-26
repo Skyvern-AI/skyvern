@@ -2,6 +2,11 @@ import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { Status, TaskRunListItem } from "@/api/types";
+import {
+  getActiveOrgQueryKeyScope,
+  getOrgScopedQueryKey,
+  useActiveOrgId,
+} from "@/store/ActiveOrgContext";
 
 type QueryReturnType = Array<TaskRunListItem>;
 type UseQueryOptions = Omit<
@@ -24,9 +29,14 @@ function useRunsQuery({
   ...queryOptions
 }: Props) {
   const credentialGetter = useCredentialGetter();
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   return useQuery<Array<TaskRunListItem>>({
-    queryKey: ["runs", { statusFilters }, page, pageSize, search],
-    queryFn: async () => {
+    queryKey: getOrgScopedQueryKey(
+      ["runs", { statusFilters }, page, pageSize, search],
+      activeOrgQueryKeyScope,
+    ),
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const params = new URLSearchParams();
       params.append("page", String(page));
@@ -39,7 +49,7 @@ function useRunsQuery({
       if (search) {
         params.append("search_key", search);
       }
-      return client.get("/runs", { params }).then((res) => res.data);
+      return client.get("/runs", { params, signal }).then((res) => res.data);
     },
     ...queryOptions,
   });

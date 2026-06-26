@@ -125,6 +125,7 @@ class RecordingDraftStep(BaseModel):
 
 
 class RecordingInterpretationUpdate(BaseModel):
+    interpretation_session_id: str
     session_revision: int
     steps: list[RecordingDraftStep] = Field(default_factory=list)
     pending: bool = False

@@ -23,6 +23,7 @@ import {
 import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
 import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
+import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
   classifyUnexecutedDefinedBlocks,
   flattenTimelineChronologically,
@@ -31,6 +32,10 @@ import {
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   activeIteration?: number | null;
+  // When set, read this run's timeline instead of the URL's (studio shell).
+  workflowRunId?: string;
+  // Studio owns live-status in its own header; let it hide this duplicate badge.
+  hideLiveBadge?: boolean;
   onLiveStreamSelected: () => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
@@ -80,6 +85,8 @@ function buildBlockOrderIndex(
 function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
+  workflowRunId,
+  hideLiveBadge = false,
   onLiveStreamSelected,
   onActionItemSelected,
   onBlockItemSelected,
@@ -87,10 +94,10 @@ function WorkflowRunTimeline({
   onIterationSelected,
 }: Props) {
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery();
+    useWorkflowRunWithWorkflowQuery({ workflowRunId });
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
-    useWorkflowRunTimelineQuery();
+    useWorkflowRunTimelineQuery({ workflowRunId });
   const displayTimeline = useMemo(
     () => flattenTimelineChronologically(workflowRunTimeline ?? []),
     [workflowRunTimeline],
@@ -98,6 +105,13 @@ function WorkflowRunTimeline({
   const blockOrder = useMemo(
     () => buildBlockOrderIndex(workflowRunTimeline ?? []),
     [workflowRunTimeline],
+  );
+  const codeStepsByLabel = useMemo(
+    () =>
+      buildCodeStepsByLabel(
+        workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+      ),
+    [workflowRun],
   );
 
   // Track known item IDs so we can animate only newly-arrived items
@@ -176,7 +190,7 @@ function WorkflowRunTimeline({
           ).toLocaleString()}{" "}
           credits
         </span>
-        {workflowRunIsNotFinalized && (
+        {workflowRunIsNotFinalized && !hideLiveBadge && (
           <button
             type="button"
             onClick={onLiveStreamSelected}
@@ -230,6 +244,7 @@ function WorkflowRunTimeline({
                       activeIteration={activeIteration}
                       block={timelineItem.block}
                       blockOrder={blockOrder}
+                      codeStepsByLabel={codeStepsByLabel}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
                       onIterationClick={onIterationSelected}

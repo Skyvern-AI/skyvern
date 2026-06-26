@@ -8,16 +8,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pyotp
 import pytest
+import structlog.testing
 
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import (
     OTPValue,
     _get_otp_value_from_db,
     _get_otp_value_from_url,
     _is_mfa_like_parameter_key,
     extract_totp_from_navigation_inputs,
+    parse_otp_login,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -67,6 +70,9 @@ class TestIsMfaLikeParameterKey:
 class TestExtractTotpFromNavigationInputs:
     """extract_totp_from_navigation_inputs should only return actual OTP codes."""
 
+    def test_untyped_short_numeric_value_defaults_to_totp(self) -> None:
+        assert OTPValue(value="123456").get_otp_type() == OTPType.TOTP
+
     def test_returns_none_for_none_payload(self) -> None:
         assert extract_totp_from_navigation_inputs(None) is None
 
@@ -78,6 +84,14 @@ class TestExtractTotpFromNavigationInputs:
         result = extract_totp_from_navigation_inputs(payload)
         assert result is not None
         assert result.value == "123456"
+        assert result.get_otp_type() == OTPType.TOTP
+
+    def test_extracts_magic_link_from_payload(self) -> None:
+        payload = {"verification_code": "https://example.com/login/magic?token=abc123"}
+        result = extract_totp_from_navigation_inputs(payload)
+        assert result is not None
+        assert result.value == "https://example.com/login/magic?token=abc123"
+        assert result.get_otp_type() == OTPType.MAGIC_LINK
 
     def test_ignores_totp_identifier_key(self) -> None:
         """The core bug: totp_identifier value must NOT be returned as OTP code."""
@@ -174,10 +188,13 @@ class TestGetOtpValueFromUrl:
             )
 
         reason = exc_info.value.reason or ""
-        assert "https://example.com/totp" in reason
-        assert "HTTP status=200" in reason
-        assert "content_type=text/plain; charset=utf-8" in reason
-        assert "body_preview='147258'" in reason
+        assert "https://example.com/totp" not in reason
+        assert "totp_webhook_non_json_response" in reason
+        assert "http_status=200" in reason
+        assert "content_type=text/plain" in reason
+        assert "charset" not in reason
+        assert "body_preview='[REDACTED_OTP_BODY](length=6,json_like=false)'" in reason
+        assert "147258" not in reason
         assert '{"verification_code":"123456"}' in reason
         assert "api-key" not in reason
 
@@ -201,7 +218,7 @@ class TestGetOtpValueFromUrl:
             )
 
         reason = exc_info.value.reason or ""
-        assert f"body_preview='{long_body[:200]}... (truncated)'" in reason
+        assert "body_preview='[REDACTED_OTP_BODY](length=250,json_like=false)'" in reason
         assert long_body not in reason
 
     @pytest.mark.asyncio
@@ -244,8 +261,9 @@ class TestGetOtpValueFromUrl:
             )
 
         reason = exc_info.value.reason or ""
-        assert "body_preview='line1\\nline2'" in reason
-        assert "body_preview='line1\\\\nline2'" not in reason
+        assert "body_preview='[REDACTED_OTP_BODY](length=11,json_like=false)'" in reason
+        assert "line1" not in reason
+        assert "line2" not in reason
 
     @pytest.mark.asyncio
     async def test_json_missing_verification_code_returns_none_and_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,7 +286,13 @@ class TestGetOtpValueFromUrl:
             )
 
         assert result is None
-        assert any("No verification_code found in TOTP webhook response" in log.get("event", "") for log in logs)
+        missing_code_log = next(
+            (log for log in logs if "No verification_code found in TOTP webhook response" in log.get("event", "")),
+            None,
+        )
+        assert missing_code_log is not None
+        assert "endpoint_url" not in missing_code_log
+        assert "https://example.com/totp" not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_json_non_object_response_returns_none_and_logs_distinct_event(
@@ -293,7 +317,13 @@ class TestGetOtpValueFromUrl:
             )
 
         assert result is None
-        assert any("TOTP webhook response body is not a JSON object" in log.get("event", "") for log in logs)
+        non_object_log = next(
+            (log for log in logs if "TOTP webhook response body is not a JSON object" in log.get("event", "")),
+            None,
+        )
+        assert non_object_log is not None
+        assert "endpoint_url" not in non_object_log
+        assert "https://example.com/totp" not in repr(logs)
         assert not any("No verification_code found in TOTP webhook response" in log.get("event", "") for log in logs)
 
     @pytest.mark.asyncio
@@ -317,7 +347,12 @@ class TestGetOtpValueFromUrl:
             )
 
         assert result is None
-        assert any("TOTP webhook returned non-200 response" in log.get("event", "") for log in logs)
+        non_200_log = next(
+            (log for log in logs if "TOTP webhook returned non-200 response" in log.get("event", "")), None
+        )
+        assert non_200_log is not None
+        assert "endpoint_url" not in non_200_log
+        assert "https://example.com/totp" not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_relayed_email_in_malformed_json_extracts_code_instead_of_raising(
@@ -357,6 +392,84 @@ class TestGetOtpValueFromUrl:
         )
 
         assert result == OTPValue(value="654321", type="totp")
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_warning_omits_raw_content_keeps_length(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        raw_content = "this-is-a-relayed-email-with-code-135790-inside"
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": raw_content},
+            is_json_response=True,
+        )
+
+        async def fake_parse_otp_login(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                task_id="tsk_test",
+            )
+
+        assert result is None
+
+        warning = next((r for r in logs if r.get("event") == "Failed to parse otp login from the totp url"), None)
+        assert warning is not None
+        assert "content_preview" not in warning
+        assert warning["content_length"] == len(raw_content)
+        for record in logs:
+            assert raw_content not in repr(record)
+            for value in record.values():
+                assert raw_content not in str(value)
+
+
+class TestParseOtpLogin:
+    @pytest.mark.asyncio
+    async def test_parser_log_omits_raw_code_and_reasoning_keeps_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.services import otp_service
+
+        raw = "135790"
+        resp = {
+            "reasoning": f"the code is {raw}",
+            "otp_type": "totp",
+            "otp_value_found": True,
+            "otp_value": raw,
+        }
+
+        async def fake_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return resp
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", fake_handler, raising=False)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await parse_otp_login(content="raw email body", organization_id="o_test")
+
+        assert result == OTPValue(value=raw, type="totp")
+
+        for record in logs:
+            assert raw not in repr(record)
+            for value in record.values():
+                assert raw not in str(value)
+
+        parser = next((r for r in logs if r.get("event") == "OTP Login Parser Response"), None)
+        assert parser is not None
+        assert "resp" not in parser
+        assert "reasoning" not in parser
+        assert "otp_value" not in parser
+        assert parser["otp_type"] == "totp"
+        assert parser["otp_value_found"] is True
+        assert parser["otp_length"] == len(raw)
 
 
 class TestPollOtpValueRetry:
@@ -421,6 +534,150 @@ class TestPollOtpValueRetry:
         assert mock_fetch.call_count == 3
 
     @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.settings")
+    async def test_falls_back_to_db_when_gmail_has_no_code(
+        self,
+        mock_settings: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_gmail.return_value = None
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_db.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+        )
+
+        assert result == otp
+        mock_gmail.assert_awaited_once()
+        mock_db.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_prefers_url_before_gmail_and_db_when_url_has_code(
+        self,
+        mock_settings: MagicMock,
+        mock_app: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_url: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_url.return_value = otp
+        mock_gmail.return_value = OTPValue(value="654321", type=OTPType.TOTP)
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_url.assert_awaited_once()
+        mock_gmail.assert_not_awaited()
+        mock_db.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_falls_back_to_gmail_before_db_when_url_has_no_code(
+        self,
+        mock_settings: MagicMock,
+        mock_app: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_url: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_url.return_value = None
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_gmail.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_url.assert_awaited_once()
+        mock_gmail.assert_awaited_once()
+        mock_db.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    @patch("skyvern.services.otp_service.datetime")
+    async def test_falls_back_to_db_after_url_and_gmail_preserves_db_cutoff_default(
+        self,
+        mock_datetime: MagicMock,
+        mock_settings: MagicMock,
+        mock_app: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_url: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        start = datetime(2026, 1, 1, 12, 0, 0)
+        mock_datetime.utcnow.return_value = start
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_url.return_value = None
+        mock_gmail.return_value = None
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_db.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_url.assert_awaited_once()
+        mock_gmail.assert_awaited_once()
+        mock_db.assert_awaited_once()
+        assert mock_gmail.await_args.kwargs["created_after"] == start
+        assert mock_db.await_args.kwargs["created_after"] is None
+
+    @pytest.mark.asyncio
     async def test_does_not_short_circuit_during_extended_outage(self) -> None:
         """Persistent webhook errors must not exit polling before the wall-clock timeout fires (SKY-9553)."""
         base = datetime(2026, 1, 1, 12, 0, 0)
@@ -453,7 +710,7 @@ class TestPollOtpValueRetry:
 
     @pytest.mark.asyncio
     async def test_raises_failed_with_reason_when_timeout_during_failure_streak(self) -> None:
-        """When the wall-clock timeout fires while the webhook is still failing, surface the underlying reason."""
+        """When timeout fires while webhook still fails, surface only sanitized failure context."""
         base = datetime(2026, 1, 1, 12, 0, 0)
         utcnow_returns = [
             base,  # start_datetime
@@ -472,15 +729,44 @@ class TestPollOtpValueRetry:
             mock_datetime.utcnow.side_effect = utcnow_returns
             mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
             mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
-            mock_fetch.side_effect = FailedToGetTOTPVerificationCode(reason="connection refused")
+            raw_identifier = "otp@example.com"
+            raw_url = "https://example.com/mfa?token=secret"
+            raw_code = "135790"
+            mock_fetch.side_effect = FailedToGetTOTPVerificationCode(
+                reason=f"connection refused for {raw_identifier} at {raw_url} after code {raw_code}"
+            )
 
-            with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
-                await poll_otp_value(
-                    organization_id="o_test",
-                    task_id="tsk_test",
-                    totp_verification_url="https://example.com/mfa",
-                )
-            assert exc_info.value.reason == "connection refused"
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+                    await poll_otp_value(
+                        organization_id="o_test",
+                        task_id="tsk_test",
+                        totp_identifier=raw_identifier,
+                        totp_verification_url=raw_url,
+                    )
+
+            assert exc_info.value.reason == "totp_webhook_request_failed"
+            assert raw_identifier not in str(exc_info.value)
+            assert raw_url not in str(exc_info.value)
+            assert raw_code not in str(exc_info.value)
+
+            retry_log = next(
+                (r for r in logs if r.get("event") == "OTP fetch failed, will retry until wall-clock timeout"), None
+            )
+            assert retry_log is not None
+            assert "totp_identifier" not in retry_log
+            assert "totp_verification_url" not in retry_log
+
+            timeout_log = next(
+                (r for r in logs if r.get("event") == "Polling otp value timed out while webhook was still failing"),
+                None,
+            )
+            assert timeout_log is not None
+            assert timeout_log["last_error_reason"] == exc_info.value.reason
+            for record in logs:
+                assert raw_identifier not in repr(record)
+                assert raw_url not in repr(record)
+                assert raw_code not in repr(record)
 
     @pytest.mark.asyncio
     async def test_raises_no_otp_at_timeout_when_polls_were_clean(self) -> None:
@@ -510,6 +796,67 @@ class TestPollOtpValueRetry:
                     task_id="tsk_test",
                     totp_verification_url="https://example.com/mfa",
                 )
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_success_log_omits_raw_otp_code_and_otp_locator_fields(
+        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
+    ) -> None:
+        """The success and polling logs must not emit OTP codes, identifiers, or verification URLs."""
+        import structlog.testing
+
+        raw = "135790"
+        raw_identifier = "otp@example.com"
+        raw_url = "https://example.com/mfa"
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_fetch.return_value = OTPValue(value=raw, type=OTPType.TOTP)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await poll_otp_value(
+                organization_id="o_test",
+                task_id="tsk_test",
+                workflow_run_id="wr_test",
+                workflow_permanent_id="wpid_test",
+                totp_identifier=raw_identifier,
+                totp_verification_url=raw_url,
+            )
+
+        assert result is not None
+        assert result.value == raw
+
+        for record in logs:
+            assert raw not in repr(record)
+            assert raw_identifier not in repr(record)
+            assert raw_url not in repr(record)
+            assert raw not in str(record.values())
+            for value in record.values():
+                assert raw not in str(value)
+                assert raw_identifier not in str(value)
+                assert raw_url not in str(value)
+            assert "otp_value" not in record
+            assert record.get("value") != raw
+
+        success = next((r for r in logs if r.get("event") == "Got otp value"), None)
+        assert success is not None
+        assert success["task_id"] == "tsk_test"
+        assert success["workflow_run_id"] == "wr_test"
+        assert success["workflow_permanent_id"] == "wpid_test"
+        assert "totp_identifier" not in success
+        assert "totp_verification_url" not in success
+        assert success["otp_type"] == "totp"
+        assert success["otp_length"] == 6
+        assert isinstance(success["otp_length"], int)
+        assert str(success["otp_length"]) != raw
+
+        polling = next((r for r in logs if r.get("event") == "Polling otp value"), None)
+        assert polling is not None
+        assert "totp_identifier" not in polling
+        assert "totp_verification_url" not in polling
+        assert raw not in str(polling.values())
 
 
 class _FakeWorkflowRunContext:
@@ -578,6 +925,29 @@ class TestTryGenerateTotpFromCredential:
 
         assert result is not None
         assert result.value == "424242"
+
+    def test_active_credential_with_otpauth_uri_uses_uri_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        totp_uri = (
+            "otpauth://totp/Example:user@example.com"
+            "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+        )
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u_b", "password": "p_b", "totp": "tot_b"}},
+            secrets={"tot_b_value": totp_uri},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        generate_totp_code_mock = MagicMock(return_value="12345678")
+        monkeypatch.setattr(otp_service, "generate_totp_code", generate_totp_code_mock)
+
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is not None
+        assert result.value == "12345678"
+        assert len(result.value) == 8
+        generate_totp_code_mock.assert_called_once_with(totp_uri)
 
     def test_no_active_credential_with_multiple_totps_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Avoid the original bug: walking all credentials when which is active is unknown."""
@@ -948,3 +1318,108 @@ async def test_get_otp_value_from_db_forwards_created_after(monkeypatch: pytest.
     assert result is None
     get_otp_codes.assert_awaited_once()
     assert get_otp_codes.await_args.kwargs["created_after"] == started_at
+    assert get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided() -> None:
+    """Run-scoped polling prefers exact rows but keeps unscoped email/SMS pushes eligible."""
+    unscoped = SimpleNamespace(
+        code="111111",
+        otp_type=OTPType.TOTP,
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    other_run = SimpleNamespace(
+        code="333333",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_other",
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    scoped = SimpleNamespace(
+        code="222222",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_test",
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+
+    async def get_otp_codes(**kwargs: object) -> list[SimpleNamespace]:
+        assert kwargs["workflow_run_id"] == "wr_test"
+        assert kwargs["include_unscoped_workflow_run"] is True
+        return [other_run, scoped, unscoped]
+
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(side_effect=get_otp_codes)
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.com",
+            workflow_run_id="wr_test",
+            created_after=datetime(2026, 6, 8, 20, 3, 0),
+        )
+
+    assert result == OTPValue(value="222222", type=OTPType.TOTP)
+    mock_app.DATABASE.otp.get_otp_codes.assert_awaited_once()
+    assert mock_app.DATABASE.otp.get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert mock_app.DATABASE.otp.get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() -> None:
+    unscoped = SimpleNamespace(
+        code="111111",
+        otp_type=OTPType.TOTP,
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    other_run = SimpleNamespace(
+        code="333333",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_other",
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    get_otp_codes = AsyncMock(return_value=[other_run, unscoped])
+
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = get_otp_codes
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.com",
+            workflow_run_id="wr_test",
+            created_after=datetime(2026, 6, 8, 20, 3, 0),
+        )
+
+    assert result == OTPValue(value="111111", type=OTPType.TOTP)
+    assert get_otp_codes.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_run() -> None:
+    unscoped = SimpleNamespace(
+        code="111111",
+        otp_type=OTPType.TOTP,
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+    get_otp_codes = AsyncMock(return_value=[unscoped])
+
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = get_otp_codes
+        result = await _get_otp_value_from_db("o_test", "otp@example.com")
+
+    assert result == OTPValue(value="111111", type=OTPType.TOTP)
+    assert get_otp_codes.await_args.kwargs["workflow_run_id"] is None
+    assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is False

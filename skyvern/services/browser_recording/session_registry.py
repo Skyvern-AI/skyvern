@@ -28,8 +28,20 @@ class RecordingInterpretationSessionRegistry:
         workflow_permanent_id: str,
         on_update: OnRecordingInterpretationUpdate,
     ) -> None:
-        self.discard_session(browser_session_id)
         self._prune_expired_sessions()
+        existing = self._sessions.get(browser_session_id)
+        if (
+            existing is not None
+            and existing.workflow_permanent_id == workflow_permanent_id
+            and existing.organization_id == organization_id
+            and not existing.finalized
+        ):
+            existing.on_update = on_update
+            self._last_seen[browser_session_id] = time.monotonic()
+            existing.emit_snapshot()
+            return
+
+        self.discard_session(browser_session_id)
         self._sessions[browser_session_id] = RecordingInterpretationSession(
             browser_session_id=browser_session_id,
             organization_id=organization_id,
@@ -46,6 +58,20 @@ class RecordingInterpretationSessionRegistry:
 
         self._last_seen[browser_session_id] = time.monotonic()
         session.ingest_events(events)
+
+    def pause_capture(self, browser_session_id: str) -> None:
+        session = self._sessions.get(browser_session_id)
+        if not session:
+            return
+
+        session.pause_capture()
+
+    def resume_capture(self, browser_session_id: str) -> None:
+        session = self._sessions.get(browser_session_id)
+        if not session:
+            return
+
+        session.resume_capture()
 
     async def stop_session(self, browser_session_id: str) -> list[RecordingDraftStep]:
         session = self._sessions.pop(browser_session_id, None)

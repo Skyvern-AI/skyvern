@@ -24,8 +24,9 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody
+from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.run_blocks import BaseRunBlockRequest, CredentialType, DownloadFilesRequest, LoginRequest
-from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.runs import RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.schemas.workflows import (
     AzureVaultCredentialParameterYAML,
     BitwardenLoginCredentialParameterYAML,
@@ -259,7 +260,7 @@ async def login(
     workflow_create_request = WorkflowCreateYAMLRequest(
         title=new_workflow.title,
         description=new_workflow.description,
-        proxy_location=login_request.proxy_location or ProxyLocation.RESIDENTIAL,
+        proxy_location=runtime_proxy_location(login_request.proxy_location),
         workflow_definition=workflow_definition_yaml,
         status=new_workflow.status,
         max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
@@ -352,7 +353,7 @@ async def download_files(
     workflow_create_request = WorkflowCreateYAMLRequest(
         title=new_workflow.title,
         description=new_workflow.description,
-        proxy_location=download_files_request.proxy_location or ProxyLocation.RESIDENTIAL,
+        proxy_location=runtime_proxy_location(download_files_request.proxy_location),
         workflow_definition=workflow_definition_yaml,
         status=new_workflow.status,
         max_screenshot_scrolls=download_files_request.max_screenshot_scrolling_times,
