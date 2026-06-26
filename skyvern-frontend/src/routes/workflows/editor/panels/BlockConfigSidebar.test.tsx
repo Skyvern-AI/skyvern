@@ -359,6 +359,32 @@ describe("BlockConfigSidebar block library layout (contained drawer)", () => {
     expect(title.parentElement?.className).toContain("min-w-0");
     expect(title.className).toContain("min-w-0");
   });
+
+  test("binds the search panel width to the drawer so it does not shrink to its content (SKY-11494)", () => {
+    // The search input + results column live in a flex *row* parent, so without
+    // w-full the panel sizes to its widest child — it shrinks as the query
+    // narrows (e.g. "No results found") and leaves dead space when the drawer
+    // widens. w-full ties it to the panel width instead.
+    act(() => {
+      useWorkflowPanelStore.getState().setWorkflowPanelState({
+        active: true,
+        content: "nodeLibrary",
+      });
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    const panel = screen
+      .getByPlaceholderText("Search blocks...")
+      .closest(".flex-col");
+
+    expect(panel).not.toBeNull();
+    expect(panel?.className).toContain("w-full");
+  });
 });
 
 describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
