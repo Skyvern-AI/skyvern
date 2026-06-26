@@ -625,6 +625,13 @@ class Settings(BaseSettings):
     Set to 10 minutes so that a 5-minute renewal loop gets 2+ attempts before expiry.
     """
 
+    PERSISTENT_SESSIONS_REAPER_INTERVAL_SECONDS: int = 60
+    """
+    How often the OSS in-process reaper scans for persistent browser sessions past their
+    timeout and closes them, freeing the leaked Chromium + record_video ffmpeg encoder.
+    Set to 0 to disable the reaper.
+    """
+
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None

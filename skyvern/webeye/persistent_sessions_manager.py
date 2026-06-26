@@ -20,6 +20,10 @@ class PersistentSessionsManager(Protocol):
         """Initialize monitoring of the session pool."""
         ...
 
+    def start_reaper(self) -> None:
+        """Start the periodic reaper that closes idle/expired sessions."""
+        ...
+
     def can_probe_registered_browser_state(self) -> bool: ...
 
     async def begin_session(
