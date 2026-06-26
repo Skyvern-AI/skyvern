@@ -148,4 +148,38 @@ describe("ModelSelector in a read-only comparison scope", () => {
 
     expect(await screen.findByText("GPT 5.2 (deprecated)")).toBeTruthy();
   });
+
+  test("hides deprecated Gemini 2.5 Pro/Flash unless selected", async () => {
+    getMock.mockResolvedValueOnce({
+      data: {
+        models: {
+          "gemini-2.5-pro-preview-05-06": "Gemini 2.5 Pro",
+          "gemini-2.5-flash": "Gemini 2.5 Flash",
+          "gemini-3.5-flash": "Gemini 3.5 Flash",
+        },
+      },
+    });
+
+    renderSelector(false, null);
+
+    expect(await screen.findByText("Gemini 3.5 Flash")).toBeTruthy();
+    expect(screen.queryByText("Gemini 2.5 Pro (deprecated)")).toBeNull();
+    expect(screen.queryByText("Gemini 2.5 Flash (deprecated)")).toBeNull();
+  });
+
+  test("surfaces the open-source OpenRouter models", async () => {
+    getMock.mockResolvedValueOnce({
+      data: {
+        models: {
+          "deepseek-v4-flash": "DeepSeek V4 Flash",
+          "mimo-v2.5": "Xiaomi MiMo V2.5",
+        },
+      },
+    });
+
+    renderSelector(false, null);
+
+    expect(await screen.findByText("DeepSeek V4 Flash")).toBeTruthy();
+    expect(screen.getByText("Xiaomi MiMo V2.5")).toBeTruthy();
+  });
 });

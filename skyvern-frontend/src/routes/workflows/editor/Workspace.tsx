@@ -31,7 +31,7 @@ import {
   useReactFlow,
   Edge,
 } from "@xyflow/react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
@@ -47,7 +47,14 @@ import {
   StreamModeBadge,
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
+import { type BrowserSession as BrowserSessionData } from "@/routes/workflows/types/browserSessionTypes";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
+import {
+  DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
+  DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS,
+  formatBrowserSessionRemainingTime,
+  getBrowserSessionRemainingMs,
+} from "../hooks/debugSessionLease";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
@@ -664,6 +671,7 @@ function Workspace({
     workflowPermanentId,
     enabled: shouldFetchDebugSession && !!workflowPermanentId,
     isRateLimited,
+    keepAliveBrowserSession: true,
   });
 
   const activeDebugSession = debugSession ?? null;
@@ -694,6 +702,28 @@ function Workspace({
     hasBackendSession: Boolean(liveBrowserSessionId),
     headlessTurnDrainEnabled: headlessTurnDrainEnabled || embedded,
   });
+  const debugSessionExpiryWarningKeyRef = useRef<string | null>(null);
+
+  const { data: liveBrowserSession, dataUpdatedAt: liveBrowserSessionNowMs } =
+    useQuery<BrowserSessionData>({
+      queryKey: ["browserSession", liveBrowserSessionId],
+      queryFn: async () => {
+        if (!liveBrowserSessionId) {
+          throw new Error("Cannot fetch browser session without an ID");
+        }
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<BrowserSessionData>(
+          `/browser_sessions/${liveBrowserSessionId}`,
+        );
+        return response.data;
+      },
+      enabled:
+        Boolean(liveBrowserSessionId) &&
+        shouldFetchDebugSession &&
+        !isRateLimited,
+      refetchInterval: DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
+      refetchOnWindowFocus: true,
+    });
 
   const handleLiveBrowserReadyChange = useCallback(
     (ready: boolean, sessionId: string | null) => {
@@ -703,6 +733,50 @@ function Workspace({
   );
 
   useBrowserLoadingFlag(shouldFetchDebugSession, readyBrowserSessionId);
+
+  useEffect(() => {
+    if (!liveBrowserSession || liveBrowserSession.completed_at) {
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    const remainingMs = getBrowserSessionRemainingMs(
+      liveBrowserSession,
+      liveBrowserSessionNowMs,
+    );
+    if (remainingMs !== null && remainingMs <= 0) {
+      if (debugSessionExpiryWarningKeyRef.current) {
+        toast({
+          variant: "destructive",
+          title: "Browser session expired",
+          description: "Start a new debug browser to continue.",
+        });
+      }
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    if (
+      remainingMs === null ||
+      remainingMs > DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS
+    ) {
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    const warningKey = `${liveBrowserSession.browser_session_id}:${liveBrowserSession.started_at}:${liveBrowserSession.timeout}`;
+    if (debugSessionExpiryWarningKeyRef.current === warningKey) {
+      return;
+    }
+
+    debugSessionExpiryWarningKeyRef.current = warningKey;
+    const remainingTime = formatBrowserSessionRemainingTime(remainingMs);
+    toast({
+      variant: "warning",
+      title: "Browser session expiring soon",
+      description: `This debug browser expires in ${remainingTime}. Skyvern renews it automatically while this view is open, but may open a replacement browser if this lease can no longer be renewed.`,
+    });
+  }, [liveBrowserSession, liveBrowserSessionNowMs]);
 
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
