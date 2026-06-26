@@ -107,14 +107,14 @@ function StudioTabs() {
     urlRunId ? urlRun?.status : latestRun?.status,
   );
 
+  // Live status lives in the Run view header (one source of truth); the tab keeps
+  // only the terminal outcome.
   const runBadge =
-    outcome === "running"
-      ? { label: "live", cls: "bg-studio-accent/20 text-studio-accent-2" }
-      : outcome === "failed"
-        ? { label: "failed", cls: "bg-destructive/20 text-destructive" }
-        : outcome === "success"
-          ? { label: "passed", cls: "bg-success/20 text-success" }
-          : null;
+    outcome === "failed"
+      ? { label: "failed", cls: "bg-destructive/20 text-destructive" }
+      : outcome === "success"
+        ? { label: "passed", cls: "bg-success/20 text-success" }
+        : null;
 
   const tabs: Array<{ id: StudioTab; label: string; disabled: boolean }> = [
     { id: "editor", label: "Editor", disabled: false },
