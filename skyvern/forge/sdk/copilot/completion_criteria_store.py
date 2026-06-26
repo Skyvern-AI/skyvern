@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    _normalize_contingent_antecedent_output_path,
     is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
@@ -110,6 +111,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
         {
             "id": criterion.id,
             "outcome": criterion.outcome,
+            "contingent_on": criterion.contingent_on,
+            "contingent_antecedent_output_path": criterion.contingent_antecedent_output_path,
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
@@ -132,10 +135,18 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             continue
         level = item.get("level")
         output_path = item.get("output_path")
+        contingent_on = item.get("contingent_on")
+        contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
+            item.get("contingent_antecedent_output_path")
+        )
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
                 outcome=outcome,
+                contingent_on=contingent_on.strip()
+                if isinstance(contingent_on, str) and contingent_on.strip()
+                else None,
+                contingent_antecedent_output_path=contingent_antecedent_output_path,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
@@ -146,9 +157,17 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
 
 
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
+    contingent_key = criterion.contingent_on or ""
+    contingent_path_key = criterion.contingent_antecedent_output_path or ""
     if criterion.output_path:
-        return f"output_path:{criterion.output_path}"
-    return f"outcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+        return (
+            f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1foutput_path:{criterion.output_path}"
+        )
+    return (
+        f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+        f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+    )
 
 
 def _outcome_key_set(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:

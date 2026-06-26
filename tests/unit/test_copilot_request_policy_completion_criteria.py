@@ -9,6 +9,7 @@ import pytest
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
+    criteria_from_json,
     criteria_to_json,
     reconcile_completion_criteria,
 )
@@ -18,6 +19,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _apply_requested_output_completion_criteria,
     _classify_request,
+    _parse_completion_criteria,
+    _render_active_criteria_for_prompt,
 )
 
 
@@ -56,6 +59,8 @@ def _criterion(
     level: str = "run",
     output_path: str | None = None,
     method_mandated: bool = False,
+    contingent_on: str | None = None,
+    contingent_antecedent_output_path: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -63,6 +68,8 @@ def _criterion(
         level=level,  # type: ignore[arg-type]
         output_path=output_path,
         method_mandated=method_mandated,
+        contingent_on=contingent_on,
+        contingent_antecedent_output_path=contingent_antecedent_output_path,
     )
 
 
@@ -323,6 +330,189 @@ def test_stored_complete_requested_output_survives_narrowed_generic_fresh_criter
 
     assert decision.action == "adopt_stored"
     assert decision.criteria == stored.criteria
+
+
+def test_requested_output_canonicalization_preserves_contingent_metadata() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "conditional_npi",
+                "The returned record includes NPI.",
+                output_path="output.npi",
+                contingent_on="the provider site allows online lookup",
+                contingent_antecedent_output_path="output.provider_lookup_available",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with NPI.")
+
+    criteria = _requested_output_subset(policy, {"output.npi"})
+    assert len(criteria) == 1
+    assert criteria[0].outcome == "The returned record includes NPI."
+    assert criteria[0].contingent_on == "the provider site allows online lookup"
+    assert criteria[0].contingent_antecedent_output_path == "output.provider_lookup_available"
+
+
+def test_classifier_parse_preserves_contingent_on_without_inference() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+            },
+            {"outcome": "The request is submitted unless the provider site blocks online submission."},
+            {"outcome": "Ignored empty contingent value.", "contingent_on": "   "},
+        ]
+    )
+
+    assert criteria[0].outcome == "A provider blocker is reported to the user."
+    assert criteria[0].contingent_on == "the provider site blocks online submission"
+    assert criteria[1].contingent_on is None
+    assert criteria[2].contingent_on is None
+
+
+def test_classifier_parse_preserves_contingent_antecedent_output_path_without_inference() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            {
+                "outcome": "Rejected transcript path.",
+                "contingent_on": "the transcript mentions a blocker",
+                "contingent_antecedent_output_path": "transcript.blocker",
+            },
+            {
+                "outcome": "Rejected nested path.",
+                "contingent_antecedent_output_path": "output.blocker.reason",
+            },
+            {"outcome": "No regex inference when prose mentions output.blocker."},
+        ]
+    )
+
+    assert criteria[0].contingent_antecedent_output_path == "output.blocker"
+    assert criteria[1].contingent_antecedent_output_path is None
+    assert criteria[2].contingent_antecedent_output_path is None
+    assert criteria[3].contingent_antecedent_output_path is None
+
+
+def test_active_criteria_rendering_includes_contingent_on() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "A provider blocker is reported to the user.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "contingent_on": "the provider site blocks online submission",
+        }
+    ]
+
+
+def test_active_criteria_rendering_includes_contingent_antecedent_output_path() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "A provider blocker is reported to the user.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "contingent_on": "the provider site blocks online submission",
+            "contingent_antecedent_output_path": "output.blocker",
+        }
+    ]
+
+
+def test_criteria_json_round_trips_contingent_on() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+
+
+def test_criteria_json_round_trips_contingent_antecedent_output_path() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+
+
+def test_reconcile_keeps_conditional_and_unconditional_same_outcome_distinct() -> None:
+    stored = _stored(_criterion("s0", "A provider blocker is reported to the user."))
+    fresh = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        fresh,
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == tuple(fresh)
+
+
+def test_reconcile_keeps_structural_conditional_and_unconditional_same_outcome_distinct() -> None:
+    stored = _stored(_criterion("s0", "A provider blocker is reported to the user."))
+    fresh = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        fresh,
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == tuple(fresh)
 
 
 @pytest.mark.asyncio

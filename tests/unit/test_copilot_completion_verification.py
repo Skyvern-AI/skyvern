@@ -21,12 +21,14 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
+    combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
     grade_present_value_criteria,
     grade_record_semantic_consistency,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    structural_unfired_contingent_criterion_ids,
     structured_record_has_goal_content,
     structured_record_has_identity,
     summarize_unsatisfied_outcomes,
@@ -75,8 +77,23 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools.completion import _artifact_health_blocker_from_result
 
 
-def _criterion(cid: str, outcome: str, *, method_mandated: bool = False) -> CompletionCriterion:
-    return CompletionCriterion(id=cid, outcome=outcome, method_mandated=method_mandated)
+def _criterion(
+    cid: str,
+    outcome: str,
+    *,
+    method_mandated: bool = False,
+    output_path: str | None = None,
+    contingent_on: str | None = None,
+    contingent_antecedent_output_path: str | None = None,
+) -> CompletionCriterion:
+    return CompletionCriterion(
+        id=cid,
+        outcome=outcome,
+        method_mandated=method_mandated,
+        output_path=output_path,
+        contingent_on=contingent_on,
+        contingent_antecedent_output_path=contingent_antecedent_output_path,
+    )
 
 
 _STRUCTURED_RECORD_CRITERIA = (
@@ -237,6 +254,283 @@ def test_definition_plane_unsatisfied_still_blocks() -> None:
     unreferenced = CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="definition_parameters_missing")
     confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
     assert _mixed(unreferenced, confirmed).is_fully_satisfied() is False
+
+
+def test_unfired_contingent_abstention_does_not_sink_evidence_confirmed_run() -> None:
+    contingent_unknown = CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")
+    confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_on_by_criterion_id={"c0": "the provider site blocks online submission"},
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[contingent_unknown, confirmed],
+    )
+
+    assert result.is_fully_satisfied() is True
+    trace = result.to_trace_data()
+    assert trace["contingent_criterion_ids"] == ["c0"]
+    assert trace["structural_unfired_criterion_ids"] == ["c0"]
+    assert trace["verdict_0_state"] == "unknown"
+    assert trace["verdict_0_contingent_on"] == "the provider site blocks online submission"
+    assert trace["verdict_0_contingent_antecedent_output_path"] == "output.blocker"
+    assert trace["verdict_0_structural_unfired"] is True
+    assert trace["unmet_criterion_ids"] == []
+    assert trace["missing_evidence"] == []
+    assert "verdict_0_missing_evidence" not in trace
+
+
+@pytest.mark.parametrize(
+    "reason_code,state",
+    [("unknown", "unknown"), ("no_evidence", "unsatisfied"), ("evidence_contradicts", "unsatisfied")],
+)
+def test_structural_unfired_contingent_abstention_accepts_non_satisfied_verdicts(reason_code: str, state: str) -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state=state, reason_code=reason_code),  # type: ignore[arg-type]
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_all_contingent_abstentions_do_not_vacuously_satisfy() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_contingent_reason_does_not_abstain_for_non_contingent_criterion() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+        structural_unfired_criterion_ids=["c0"],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_judge_contingent_reason_cannot_authorize_structural_abstention() -> None:
+    raw = {
+        "verdicts": [
+            {"criterion_id": "c0", "satisfied": False, "reason_code": "contingent_unfired"},
+            {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+        ]
+    }
+
+    result = _coerce_result(
+        raw,
+        ["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+    )
+
+    assert result.verdicts[0].reason_code == "unknown"
+    assert result.verdicts[0].state == "unknown"
+    assert result.is_fully_satisfied() is False
+
+
+def test_fired_contingent_criterion_without_blocker_evidence_fails() -> None:
+    raw = {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    result = _coerce_result(
+        raw,
+        ["c0"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_contingent_criterion_ids(
+            criteria,
+            RunEvidenceSnapshot(block_outputs={"terminal_result": {"blocker": "Provider requires a phone call."}}),
+        ),
+    )
+
+    assert result.verdicts[0].reason_code == "no_evidence"
+    assert result.structural_unfired_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_fired_contingent_criterion_with_blocker_evidence_can_satisfy() -> None:
+    raw = {
+        "verdicts": [
+            {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
+            {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+        ]
+    }
+    result = _coerce_result(
+        raw,
+        ["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_combine_verification_results_preserves_contingent_ids() -> None:
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c1"],
+        contingent_on_by_criterion_id={"c1": "the provider site blocks online submission"},
+        contingent_antecedent_output_path_by_criterion_id={"c1": "output.blocker"},
+        structural_unfired_criterion_ids=["c1"],
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms"),
+            CriterionVerdict(criterion_id="c1", state="unknown", reason_code="unknown"),
+        ],
+    )
+
+    result = combine_verification_results(["c0", "c1"], run_result, [])
+
+    assert result.contingent_criterion_ids == ["c1"]
+    assert result.contingent_on_by_criterion_id == {"c1": "the provider site blocks online submission"}
+    assert result.contingent_antecedent_output_path_by_criterion_id == {"c1": "output.blocker"}
+    assert result.structural_unfired_criterion_ids == ["c1"]
+    assert result.is_fully_satisfied() is True
+
+
+def test_structural_unfired_ids_derive_from_empty_output_path() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"blocker_output": None})
+
+    assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == ["c0"]
+
+
+@pytest.mark.parametrize("reason_code,state", [("evidence_contradicts", "unsatisfied"), ("unknown", "unknown")])
+def test_false_contingent_antecedent_output_abstains(reason_code: str, state: str) -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"terminal_result": {"blocker": False}}),
+    )
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_ids,
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state=state, reason_code=reason_code),  # type: ignore[arg-type]
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert structural_unfired_ids == ["c0"]
+    assert result.is_fully_satisfied() is True
+
+
+def test_true_contingent_antecedent_output_fires_and_requires_consequent_evidence() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"terminal_result": {"blocker": True}}),
+    )
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_ids,
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert structural_unfired_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_missing_contingent_antecedent_output_path_fails_closed() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"confirmation_output": "submitted"})
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_contingent_criterion_ids(criteria, snapshot),
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert result.structural_unfired_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_structural_fired_evidence_overrides_empty_output_path() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "blocker_output": None,
+            "blocker_detector": {"blocker": "Provider site requires a phone call."},
+        }
+    )
+
+    assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == []
 
 
 def test_empty_verdicts_with_criteria_is_not_vacuously_satisfied() -> None:
@@ -975,6 +1269,51 @@ def test_outcome_unverified_reason_uses_typed_missing_evidence_not_confirmation_
     assert known_good_reason is not None
     assert "previously tested revision" in known_good_reason
     assert "prefer restoring that revision" in known_good_reason
+
+
+def test_outcome_unverified_reason_excludes_structurally_abstained_contingent_missing_evidence() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c1", "The confirmation number is extracted."),
+        ]
+    )
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1", "c2"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                missing_evidence="blocker report",
+            ),
+            CriterionVerdict(
+                criterion_id="c1",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="confirmation output",
+            ),
+            CriterionVerdict(criterion_id="c2", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+    ctx = SimpleNamespace(request_policy=policy)
+
+    reason = _outcome_unverified_reason(ctx, verification)
+
+    assert reason is not None
+    assert "confirmation output" in reason
+    assert "confirmation number" in reason
+    assert "provider blocker" not in reason
+    assert "blocker report" not in reason
 
     missing_metadata = CompletionVerificationResult(
         status="evaluated",
@@ -2147,6 +2486,41 @@ async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monke
     assert result.is_fully_satisfied() is True
 
 
+@pytest.mark.parametrize("reason_code", ["evidence_contradicts", "no_evidence", "unknown"])
+@pytest.mark.asyncio
+async def test_mixed_completion_verification_preserves_structural_unfired_contingent_ids(
+    monkeypatch: pytest.MonkeyPatch, reason_code: str
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c1", "satisfied": False, "reason_code": reason_code}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion("c0", "a commercial water service request is submitted"),
+            _criterion(
+                "c1",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+
+    result = await _maybe_run_completion_verification(
+        ctx, _terminal_goal_output_result(blocker_output=None), time.monotonic()
+    )
+
+    assert result is not None
+    assert result.contingent_criterion_ids == ["c1"]
+    assert result.contingent_on_by_criterion_id == {"c1": "the provider site blocks online submission"}
+    assert result.contingent_antecedent_output_path_by_criterion_id == {"c1": "output.blocker"}
+    assert result.structural_unfired_criterion_ids == ["c1"]
+    assert result.is_fully_satisfied() is True
+
+
 def test_gate_recognizes_clean_run_despite_unverified_prefix() -> None:
     ctx = _ctx_unverified_prefix()
     # The full-workflow run-status latch is False (incremental run), yet the judge
@@ -2743,6 +3117,86 @@ async def test_requested_output_verdict_survives_unavailable_judge_result(
     assert verdicts["c_npi"].reason_code == "missing_exact_field"
     assert verdicts["c_npi"].satisfied is False
     assert verdicts["c_cart"].state == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["missing_exact_field", "unproducible"])
+async def test_unfired_contingent_requested_output_miss_does_not_veto_satisfied_run_criterion(
+    monkeypatch: pytest.MonkeyPatch,
+    reason_code: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("deterministic requested-output and present-value criteria should bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    if reason_code == "missing_exact_field":
+        ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+        output = {"status": "DONE", "blocker": False}
+    else:
+        output = {"status": "DONE", "blocker": False, "npi": "1234567890"}
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_npi",
+                "The NPI is returned.",
+                output_path="output.npi",
+                contingent_on="the provider lookup is available",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c_status", 'The output includes "DONE".'),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _requested_output_result(output), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == reason_code
+    assert verdicts["c_status"].satisfied is True
+    assert verification.structural_unfired_criterion_ids == ["c_npi"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["missing_exact_field", "unproducible"])
+async def test_fired_contingent_requested_output_miss_still_vetoes(
+    monkeypatch: pytest.MonkeyPatch,
+    reason_code: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("deterministic requested-output and present-value criteria should bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    if reason_code == "missing_exact_field":
+        ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+        output = {"status": "DONE", "blocker": True}
+    else:
+        output = {"status": "DONE", "blocker": True, "npi": "1234567890"}
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_npi",
+                "The NPI is returned.",
+                output_path="output.npi",
+                contingent_on="the provider lookup is available",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c_status", 'The output includes "DONE".'),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _requested_output_result(output), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == reason_code
+    assert verdicts["c_status"].satisfied is True
+    assert verification.structural_unfired_criterion_ids == []
 
 
 @pytest.mark.asyncio
