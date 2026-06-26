@@ -128,19 +128,21 @@ export function RunHero({
 
   const headerIcon =
     center === "recording" ? (
-      <PlayIcon className="h-3 w-3 shrink-0" />
+      <PlayIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
     ) : center === "code" ? (
-      <CodeIcon className="h-3 w-3 shrink-0" />
+      <CodeIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
     ) : (
-      <GlobeIcon className="h-3 w-3 shrink-0" />
+      <GlobeIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
     );
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-        <div className="flex min-w-0 flex-1 items-center gap-1.5 truncate rounded bg-slate-elevation3 px-2 py-1 text-xs text-muted-foreground">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
           {headerIcon}
-          <span className="truncate">{headerLabel}</span>
+          <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+            {headerLabel}
+          </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {running ? (

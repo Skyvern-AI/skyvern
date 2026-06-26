@@ -419,14 +419,16 @@ function WorkflowRunCode(props?: Props) {
               "rounded-full border px-2.5 py-1 text-xs transition-colors",
               activeChipVersion === usedVersion
                 ? "border-blue-500 bg-blue-500/20 text-blue-300"
-                : "border-slate-700 text-slate-400 hover:border-slate-500",
+                : "border-border text-muted-foreground hover:border-muted-foreground",
             )}
             onClick={() => setSelectedVersion(didGenerate ? usedVersion : null)}
             disabled={isEditing}
           >
             Used: #{usedVersion}
           </button>
-          {didGenerate && <span className="text-xs text-slate-600">→</span>}
+          {didGenerate && (
+            <span className="text-xs text-muted-foreground">→</span>
+          )}
         </>
       )}
       {generatedVersion != null && (
@@ -443,7 +445,9 @@ function WorkflowRunCode(props?: Props) {
         >
           Generated: #{generatedVersion}
           {usedVersion == null && (
-            <span className="ml-1 text-[10px] text-slate-500">(initial)</span>
+            <span className="ml-1 text-[10px] text-muted-foreground">
+              (initial)
+            </span>
           )}
         </button>
       )}
@@ -514,7 +518,7 @@ function WorkflowRunCode(props?: Props) {
           value={cacheKeyValue}
           onValueChange={(v: string) => setCacheKeyValue(v)}
         >
-          <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs [&>span]:text-ellipsis">
+          <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-border px-2.5 text-xs [&>span]:text-ellipsis">
             <SelectValue placeholder="Variant" />
           </SelectTrigger>
           <SelectContent>
