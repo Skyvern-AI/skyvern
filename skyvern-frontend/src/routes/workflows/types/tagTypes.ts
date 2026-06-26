@@ -30,10 +30,14 @@ export interface TagKey {
 
 // Palette color assigned to a grouped (key, value) pair (from GET /tag-values).
 // Standalone labels have no key and are not colored, so never appear here.
+// `workflow_count` (# workflows currently carrying this (key, value)) drives the
+// label-management usage column and delete blast-radius warning; it's optional so
+// color-only consumers and pre-field stubs stay valid.
 export interface TagValue {
   key: string;
   value: string;
   color: string;
+  workflow_count?: number;
 }
 
 // Batch endpoint returns a list of {key, value} per workflow (no per-tag

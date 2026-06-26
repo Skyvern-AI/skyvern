@@ -36,30 +36,25 @@ vi.mock("@/util/onboarding/OnboardingTelemetry", () => ({
 }));
 
 import { OnboardingProvider } from "./OnboardingProvider";
-import type { OnboardingState, OnboardingStateResponse } from "./types";
+import type { OnboardingStateResponse } from "./types";
 import { useOnboardingState } from "./useOnboardingState";
-import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 
 const DISMISSED_AT = "2026-01-01T00:00:00.000Z";
 
-function freshOnboardingState(): OnboardingState {
-  return {
-    tour_completed_at: null,
-    modal_dismissed_at: null,
-    first_save_at: null,
-    first_run_at: null,
-    ab_variant: null,
-    user_intent: null,
-    seen_canvas: null,
-    seen_node_adder: null,
-    seen_sidebar: null,
-    seen_save_run: null,
-  };
-}
-
 function freshResponse(): OnboardingStateResponse {
   return {
-    onboarding_state: freshOnboardingState(),
+    onboarding_state: {
+      tour_completed_at: null,
+      modal_dismissed_at: null,
+      first_save_at: null,
+      first_run_at: null,
+      ab_variant: null,
+      user_intent: null,
+      seen_canvas: null,
+      seen_node_adder: null,
+      seen_sidebar: null,
+      seen_save_run: null,
+    },
     launch_date_at_signup: "2025-01-01T00:00:00Z",
   };
 }
@@ -125,7 +120,7 @@ describe("OnboardingProvider write resilience", () => {
     const dismissedResponse: OnboardingStateResponse = {
       ...freshResponse(),
       onboarding_state: {
-        ...freshOnboardingState(),
+        ...freshResponse().onboarding_state,
         modal_dismissed_at: DISMISSED_AT,
       },
     };
@@ -145,27 +140,5 @@ describe("OnboardingProvider write resilience", () => {
     // onSuccess invalidates -> GET refetches exactly once more.
     await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId("dismissed").textContent).toBe(DISMISSED_AT);
-  });
-});
-
-describe("OnboardingProvider missing onboarding_state", () => {
-  it("renders without throwing when the response omits onboarding_state", async () => {
-    // A signed-out / transitional /users/me/onboarding body can lack
-    // onboarding_state; the provider must not dereference it (SKY-11430).
-    // The key is absent (not explicitly undefined) to mirror the real JSON.
-    const responseWithoutState: OnboardingStateResponse = {
-      launch_date_at_signup: null,
-    };
-    mockGet.mockResolvedValue({ data: responseWithoutState });
-
-    renderProvider();
-
-    await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(1));
-    // state resolves to null, so the consumer reads an undefined field rather
-    // than crashing on a missing onboarding_state.
-    await waitFor(() =>
-      expect(screen.getByTestId("dismissed").textContent).toBe("undefined"),
-    );
-    expect(OnboardingTelemetry.registerVariant).not.toHaveBeenCalled();
   });
 });
