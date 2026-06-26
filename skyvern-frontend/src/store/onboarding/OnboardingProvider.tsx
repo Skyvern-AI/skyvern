@@ -49,7 +49,7 @@ function OnboardingProvider({ children }: Readonly<Props>) {
       await queryClient.cancelQueries({ queryKey: QUERY_KEY });
       const previous =
         queryClient.getQueryData<OnboardingStateResponse>(QUERY_KEY);
-      if (previous) {
+      if (previous?.onboarding_state) {
         queryClient.setQueryData<OnboardingStateResponse>(QUERY_KEY, {
           ...previous,
           onboarding_state: { ...previous.onboarding_state, ...patch },
@@ -70,7 +70,7 @@ function OnboardingProvider({ children }: Readonly<Props>) {
     data?.launch_date_at_signup != null &&
     new Date(data.launch_date_at_signup) >= new Date(PRODUCT_LAUNCH_DATE);
 
-  const abVariant = data?.onboarding_state.ab_variant ?? null;
+  const abVariant = data?.onboarding_state?.ab_variant ?? null;
 
   useEffect(() => {
     if (abVariant) {
