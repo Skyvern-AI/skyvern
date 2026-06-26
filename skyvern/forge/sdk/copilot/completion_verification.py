@@ -75,23 +75,28 @@ class CompletionVerificationResult:
     status: VerificationStatus
     criterion_ids: list[str] = field(default_factory=list)
     verdicts: list[CriterionVerdict] = field(default_factory=list)
+    no_gradeable_run_plane: bool = False
 
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
             return False
         verdict_by_id = {verdict.criterion_id: verdict for verdict in self.verdicts}
-        satisfied_count = 0
+        satisfied_run_plane_count = 0
         for criterion_id in self.criterion_ids:
             verdict = verdict_by_id.get(criterion_id)
             if verdict is not None and verdict.satisfied:
-                satisfied_count += 1
+                # A definition-plane satisfied verdict proves the workflow is configurable,
+                # never that a run reached the outcome, so it cannot authorize verified success
+                # on its own — only a satisfied run-plane verdict can.
+                if not verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX):
+                    satisfied_run_plane_count += 1
                 continue
             # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
             if verdict is not None and _is_definition_plane_abstention(verdict):
                 continue
             return False
-        return satisfied_count > 0
+        return satisfied_run_plane_count > 0
 
     def to_trace_data(self) -> dict[str, Any]:
         unmet = [verdict for verdict in self.verdicts if not verdict.satisfied]
@@ -107,6 +112,7 @@ class CompletionVerificationResult:
             "unsatisfied_count": sum(1 for verdict in self.verdicts if verdict.state == "unsatisfied"),
             "unknown_count": sum(1 for verdict in self.verdicts if verdict.state == "unknown"),
             "fully_satisfied": self.is_fully_satisfied(),
+            "no_gradeable_run_plane": self.no_gradeable_run_plane,
             "reason_codes": [verdict.reason_code for verdict in self.verdicts],
             "unmet_criterion_ids": [verdict.criterion_id for verdict in unmet],
             "missing_evidence": missing_evidence,
@@ -1155,7 +1161,12 @@ def combine_verification_results(
         verdict_by_id.get(cid, CriterionVerdict(criterion_id=cid, state="unknown", reason_code="unknown"))
         for cid in criterion_ids
     ]
-    return CompletionVerificationResult(status="evaluated", criterion_ids=list(criterion_ids), verdicts=verdicts)
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=list(criterion_ids),
+        verdicts=verdicts,
+        no_gradeable_run_plane=run_result is None,
+    )
 
 
 async def evaluate_completion_criteria(
