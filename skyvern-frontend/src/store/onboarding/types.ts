@@ -15,7 +15,7 @@ export type OnboardingState = {
 };
 
 export type OnboardingStateResponse = {
-  onboarding_state?: OnboardingState;
+  onboarding_state: OnboardingState;
   launch_date_at_signup: string | null;
 };
 
