@@ -171,7 +171,7 @@ function StudioTabs() {
               "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
               selected
-                ? "bg-studio-accent/15 text-studio-accent-2 ring-1 ring-inset ring-studio-accent/40"
+                ? "bg-studio-accent/15 text-foreground ring-1 ring-inset ring-studio-accent/40"
                 : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
               t.disabled &&
                 "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
@@ -350,7 +350,6 @@ function RunStopButton() {
   return (
     <Button
       size="lg"
-      className="bg-studio-accent text-studio-accent-foreground hover:bg-studio-accent/90"
       disabled={isRecording}
       onClick={() => navigate(`/workflows/${workflowPermanentId}/run`)}
     >

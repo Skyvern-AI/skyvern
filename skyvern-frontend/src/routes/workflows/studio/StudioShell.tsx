@@ -11,7 +11,10 @@ import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
 import { StudioBrowserStream } from "./StudioBrowserStream";
 import {
+  STUDIO_COPILOT_COLLAPSE_EASE,
   STUDIO_COPILOT_RAIL_WIDTH,
+  STUDIO_COPILOT_TRANSITION_EASE,
+  STUDIO_COPILOT_TRANSITION_MS,
   STUDIO_COPILOT_WIDTH,
   studioPanelId,
   studioTabId,
@@ -19,7 +22,6 @@ import {
 import { StudioShellContext } from "./StudioShellContext";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
-import { usePresence } from "./usePresence";
 
 /**
  * Spine + Stage shell: a persistent Copilot column beside a Stage that swaps the
@@ -107,9 +109,6 @@ export function StudioShell(props: StudioWorkspaceProps) {
     ? STUDIO_COPILOT_RAIL_WIDTH
     : STUDIO_COPILOT_WIDTH;
 
-  // Keep the collapsed rail mounted briefly after expanding so it can fade out.
-  const railPresent = usePresence(copilotCollapsed, 150);
-
   return (
     <StudioShellContext.Provider value={shellContextValue}>
       <div className="flex h-full w-full flex-col">
@@ -119,30 +118,33 @@ export function StudioShell(props: StudioWorkspaceProps) {
           style={{
             gridTemplateColumns: `${copilotWidth}px minmax(0, 1fr)`,
             gridTemplateRows: "minmax(0, 1fr)",
+            transition: `grid-template-columns ${STUDIO_COPILOT_TRANSITION_MS}ms ${
+              copilotCollapsed
+                ? STUDIO_COPILOT_COLLAPSE_EASE
+                : STUDIO_COPILOT_TRANSITION_EASE
+            }`,
           }}
         >
           {/* Copilot portal target. Kept mounted (parked offscreen) when
               collapsed so an in-flight Copilot stream isn't torn down. */}
-          <div className="relative h-full min-w-0">
+          <div className="relative h-full min-w-0 overflow-hidden">
+            {/* Fixed width so the chat doesn't reflow; the widening column clip
+                reveals it left→right, so no opacity fade is needed. */}
             <div
               ref={setCopilotPortalEl}
-              className={
-                copilotCollapsed
-                  ? "h-0 w-0 overflow-hidden"
-                  : "h-full w-full py-3 pl-3 duration-150 animate-in fade-in slide-in-from-left-2"
-              }
+              style={{ width: STUDIO_COPILOT_WIDTH }}
+              className={cn(
+                "h-full py-3 pl-3",
+                copilotCollapsed && "pointer-events-none",
+              )}
             />
-            {railPresent ? (
+            {/* Rail renders only while collapsed and unmounts immediately on
+                expand, so the collapsed UI can't linger over the content the
+                widening column is revealing (the open-flicker). */}
+            {copilotCollapsed ? (
               <div
-                // Fixed rail width so it doesn't stretch to the expanded
-                // column while fading out on expand.
                 style={{ width: STUDIO_COPILOT_RAIL_WIDTH }}
-                className={cn(
-                  "absolute left-0 top-0 h-full py-3 pl-3 duration-150",
-                  copilotCollapsed
-                    ? "animate-in fade-in"
-                    : "animate-out fade-out",
-                )}
+                className="absolute left-0 top-0 h-full py-3 pl-3 duration-300 animate-in fade-in"
               >
                 <CopilotRail onExpand={() => setCopilotCollapsed(false)} />
               </div>

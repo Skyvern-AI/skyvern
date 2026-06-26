@@ -14,7 +14,7 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
-  ChevronRightIcon,
+  ChevronLeftIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
@@ -2052,7 +2052,7 @@ export function WorkflowCopilotChat({
                 className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                 title="Collapse Copilot"
               >
-                <ChevronRightIcon className="h-4 w-4" />
+                <ChevronLeftIcon className="h-4 w-4" />
               </button>
             ) : null
           ) : (

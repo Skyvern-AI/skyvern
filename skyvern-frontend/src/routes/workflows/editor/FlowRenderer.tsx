@@ -166,6 +166,7 @@ import { PoliteDndLiveRegionPolicy } from "./sortable/dragLiveRegionPolicy";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
+import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
 
 // Grace period after nodesInitialized before we start tracking changes.
 // Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
@@ -507,21 +508,84 @@ function FlowRenderer({
   const runFitViewRef = useRef(runFitView);
   runFitViewRef.current = runFitView;
 
-  // React Flow's viewport is in canvas coords, so a Copilot collapse/expand would
-  // jump the chain by the width delta — counter-translate to keep blocks put.
+  // React Flow's viewport is in canvas coords, so a Copilot collapse/expand
+  // would slide the chain by the column-width delta. The column animates over
+  // STUDIO_COPILOT_TRANSITION_MS, so a one-shot counter-translate jumps the
+  // canvas by the full delta and drifts back. Instead, track the editor pane's
+  // real left edge every frame for the transition's duration and counter the
+  // measured movement, keeping the chain screen-pinned while the column slides.
   const prevCenterOffsetRef = useRef(centerOffsetX);
+  const viewportCorrectionRafRef = useRef<number | null>(null);
   useLayoutEffect(() => {
     const delta = centerOffsetX - prevCenterOffsetRef.current;
     prevCenterOffsetRef.current = centerOffsetX;
     if (delta === 0) {
       return;
     }
-    const viewport = reactFlowInstance.getViewport();
-    reactFlowInstance.setViewport({
-      x: viewport.x - delta,
-      y: viewport.y,
-      zoom: viewport.zoom,
-    });
+    if (viewportCorrectionRafRef.current !== null) {
+      cancelAnimationFrame(viewportCorrectionRafRef.current);
+      viewportCorrectionRafRef.current = null;
+    }
+
+    const startX = reactFlowInstance.getViewport().x;
+    // Instant fallback (the prior behavior) when the canvas isn't painting,
+    // e.g. the editor tab is hidden — the slide isn't visible there, and this
+    // lands on the same final viewport the animated path converges to.
+    const applyFinalCorrection = () => {
+      const vp = reactFlowInstance.getViewport();
+      reactFlowInstance.setViewport({
+        x: startX - delta,
+        y: vp.y,
+        zoom: vp.zoom,
+      });
+    };
+
+    const el = editorElementRef.current;
+    const startRect = el?.getBoundingClientRect();
+    if (!el || !startRect || startRect.width === 0) {
+      applyFinalCorrection();
+      return;
+    }
+
+    const startLeft = startRect.left;
+    const startTime = performance.now();
+    // Suppress constrainPan (debug mode) for the animation so it can't clamp x
+    // back mid-flight, mirroring the runFitView guard.
+    fitViewInProgressRef.current = true;
+
+    const step = () => {
+      const rect = editorElementRef.current?.getBoundingClientRect();
+      if (!rect || rect.width === 0) {
+        applyFinalCorrection();
+        fitViewInProgressRef.current = false;
+        viewportCorrectionRafRef.current = null;
+        return;
+      }
+      const vp = reactFlowInstance.getViewport();
+      reactFlowInstance.setViewport({
+        x: startX - (rect.left - startLeft),
+        y: vp.y,
+        zoom: vp.zoom,
+      });
+      if (performance.now() - startTime >= STUDIO_COPILOT_TRANSITION_MS) {
+        // Snap to the exact final viewport so CSS/RAF cadence drift can't leave
+        // a sub-pixel gap from the measured per-frame correction.
+        applyFinalCorrection();
+        fitViewInProgressRef.current = false;
+        viewportCorrectionRafRef.current = null;
+        return;
+      }
+      viewportCorrectionRafRef.current = requestAnimationFrame(step);
+    };
+    viewportCorrectionRafRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (viewportCorrectionRafRef.current !== null) {
+        cancelAnimationFrame(viewportCorrectionRafRef.current);
+        viewportCorrectionRafRef.current = null;
+        fitViewInProgressRef.current = false;
+      }
+    };
   }, [centerOffsetX, reactFlowInstance]);
 
   // Canvas zoom + fit-view keyboard shortcuts. Gated to non-read-only

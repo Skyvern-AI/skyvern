@@ -59,7 +59,7 @@ function ViewToggle({
         "inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium",
         "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
         active
-          ? "bg-studio-accent/15 text-studio-accent-2"
+          ? "bg-studio-accent/15 text-foreground"
           : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
       )}
     >
@@ -284,7 +284,7 @@ export function RunHero({
               {onFix ? (
                 <Button
                   size="sm"
-                  className="bg-studio-accent text-studio-accent-foreground hover:bg-studio-accent/90"
+                  className="bg-studio-accent text-foreground hover:bg-studio-accent/90"
                   onClick={onFix}
                 >
                   Fix with Copilot
