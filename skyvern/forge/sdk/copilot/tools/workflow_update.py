@@ -379,12 +379,14 @@ def _normalize_code_artifact_metadata(
     *,
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
+    verified_runtime_output_paths_by_label: Mapping[str, set[str]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     result = _normalize_code_artifact_metadata_detailed(
         raw_metadata,
         workflow_yaml,
         impose_defaults=impose_defaults,
         scout_trajectory=scout_trajectory,
+        verified_runtime_output_paths_by_label=verified_runtime_output_paths_by_label,
     )
     return result.normalized, result.error
 
@@ -395,6 +397,7 @@ def _normalize_code_artifact_metadata_detailed(
     *,
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
+    verified_runtime_output_paths_by_label: Mapping[str, set[str]] | None = None,
 ) -> CodeArtifactNormalization:
     """Normalize submitted artifact metadata at the persist seam.
 
@@ -506,7 +509,14 @@ def _normalize_code_artifact_metadata_detailed(
         schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
         if schema_conformance_error is not None:
             item_violations.append(schema_conformance_error)
-        schema_incompatibility = _extraction_schema_incompatibility(label, dumped, block_code)
+        schema_incompatibility = _extraction_schema_incompatibility(
+            label,
+            dumped,
+            block_code,
+            verified_runtime_output_paths=(
+                verified_runtime_output_paths_by_label.get(label) if verified_runtime_output_paths_by_label else None
+            ),
+        )
         if schema_incompatibility is not None:
             schema_incompatibilities.append(schema_incompatibility)
             item_violations.append(render_schema_incompatibility_agent_steer(schema_incompatibility))
@@ -2405,6 +2415,33 @@ class _SynthesizedParameterReconciliation(NamedTuple):
     violations: list[str]
     aliases: dict[str, str]
     expressions: dict[str, str]
+    repair_context: CodeAuthoringRepairContext | None = None
+
+
+_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE = "synthesized_parameter_binding_ambiguous"
+
+
+def _synthesized_parameter_binding_repair_context(
+    *,
+    parsed: Mapping[str, Any],
+    code_block: Mapping[str, Any],
+    synthesized_key: str,
+    parameter_keys: list[str],
+) -> CodeAuthoringRepairContext:
+    available_parameter_keys = sorted(_declared_string_workflow_parameter_keys(parsed))
+    binding_candidates = [synthesized_key] + [key for key in available_parameter_keys if key != synthesized_key]
+    return CodeAuthoringRepairContext(
+        block_label=str(code_block.get("label") or ""),
+        reason_code=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+        unresolved_names=[synthesized_key],
+        parameter_keys=list(parameter_keys),
+        available_parameter_keys=available_parameter_keys,
+        binding_candidates=binding_candidates,
+        repair_instruction=(
+            f"Declare and use workflow string parameter `{synthesized_key}` exactly, include it in parameter_keys, "
+            "reference it as a bare Python variable in code, and rerun via update_and_run_blocks."
+        ),
+    )
 
 
 def _reconcile_synthesized_parameters(
@@ -2437,6 +2474,7 @@ def _reconcile_synthesized_parameters(
     violations: list[str] = []
     aliases: dict[str, str] = {}
     expressions: dict[str, str] = {}
+    repair_context: CodeAuthoringRepairContext | None = None
     non_credential_synthesized = [param for param in synthesized_parameters if not param.get("credential_id")]
     typed_lengths = [
         int(interaction.get("typed_length") or 0)
@@ -2573,6 +2611,13 @@ def _reconcile_synthesized_parameters(
             violations.append(
                 f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous."
             )
+            if repair_context is None:
+                repair_context = _synthesized_parameter_binding_repair_context(
+                    parsed=parsed,
+                    code_block=code_block,
+                    synthesized_key=key,
+                    parameter_keys=parameter_keys,
+                )
             continue
 
         typed_length = typed_lengths[0] if len(typed_lengths) == 1 else None
@@ -2618,7 +2663,7 @@ def _reconcile_synthesized_parameters(
     code_block["parameter_keys"] = parameter_keys
     # Submitted synthesized parameter rows are re-derived from scout evidence before persistence.
     code_block.pop("parameters", None)
-    return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, expressions)
+    return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, expressions, repair_context)
 
 
 def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
@@ -2702,6 +2747,8 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         scout_trajectory=scout_trajectory,
     )
     violations.extend(parameter_reconciliation.violations)
+    if repair_context is None:
+        repair_context = parameter_reconciliation.repair_context
     if violations:
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
@@ -3136,6 +3183,51 @@ def _top_level_path_segment(path: str) -> str:
     return head.strip()
 
 
+_STRUCTURAL_RUNTIME_OUTPUT_KEY_RE = re.compile(r"^[a-z]+(?:_[a-z]+)*(?:_[0-9])?$")
+_SENSITIVE_RUNTIME_OUTPUT_KEY_TERMS = frozenset(
+    {"api_key", "access_key", "password", "secret", "token", "credential", "email"}
+)
+
+
+def _is_structural_runtime_output_key(key: str) -> bool:
+    return (
+        _STRUCTURAL_RUNTIME_OUTPUT_KEY_RE.fullmatch(key) is not None
+        and not keyword.iskeyword(key)
+        and key not in _SENSITIVE_RUNTIME_OUTPUT_KEY_TERMS
+        and not any(part in _SENSITIVE_RUNTIME_OUTPUT_KEY_TERMS for part in key.split("_"))
+    )
+
+
+def _verified_runtime_output_contract_paths(value: object, *, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip()
+            if not _is_structural_runtime_output_key(key):
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            paths.add(path)
+            paths |= _verified_runtime_output_contract_paths(child, prefix=path)
+        return paths
+    if isinstance(value, list):
+        for item in value:
+            paths |= _verified_runtime_output_contract_paths(item, prefix=prefix)
+    return paths
+
+
+def _verified_runtime_output_contract_paths_by_label(ctx: AgentContext, workflow_yaml: str) -> dict[str, set[str]]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return {}
+    code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+    return {
+        label: paths
+        for label, output in ctx.verified_block_outputs.items()
+        if label in code_block_labels and (paths := _verified_runtime_output_contract_paths(output))
+    }
+
+
 def _known_output_contract_paths(artifact: Mapping[str, Any], code: str) -> set[str]:
     """Top-level field names the block is known to produce: the snippet's return-dict
     keys plus the confirmed `goal_value_paths`' top-level segments. Empty when neither
@@ -3162,7 +3254,11 @@ def _schema_property_summary(schema: Mapping[str, Any]) -> str:
 
 
 def _extraction_schema_incompatibility(
-    label: str, artifact: Mapping[str, Any], code: str
+    label: str,
+    artifact: Mapping[str, Any],
+    code: str,
+    *,
+    verified_runtime_output_paths: set[str] | None = None,
 ) -> SchemaIncompatibility | None:
     """Detect an edited `extraction_schema` whose object property names overlap NONE of
     the block's known output contract. Unlike `_extraction_schema_conformance_error`,
@@ -3172,6 +3268,8 @@ def _extraction_schema_incompatibility(
     if _is_download_intent(artifact, code) or not code.strip():
         return None
     known_paths = _known_output_contract_paths(artifact, code)
+    if verified_runtime_output_paths:
+        known_paths |= {_top_level_path_segment(path) for path in verified_runtime_output_paths}
     if not known_paths:
         return None
     incompatible: set[str] = set()
@@ -3713,6 +3811,7 @@ async def _update_workflow(
         workflow_yaml,
         impose_defaults=_copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         scout_trajectory=scout_trajectory if isinstance(scout_trajectory, list) else None,
+        verified_runtime_output_paths_by_label=_verified_runtime_output_contract_paths_by_label(ctx, workflow_yaml),
     )
     code_artifact_metadata = normalization.normalized
     code_artifact_metadata_error = normalization.error

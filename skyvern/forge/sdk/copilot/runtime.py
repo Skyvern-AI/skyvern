@@ -204,6 +204,7 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
