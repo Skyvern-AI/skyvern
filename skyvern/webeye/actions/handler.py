@@ -4357,8 +4357,9 @@ async def input_or_auto_complete_input(
             if fallback_result is not None:
                 return fallback_result
 
-        LOG.warning(
+        LOG.info(
             "Auto completion didn't finish, this might leave the input value to be empty.",
+            sampling=True,
             context=input_or_select_context,
         )
         return None
