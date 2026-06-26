@@ -5,7 +5,7 @@ import json
 import time
 from enum import StrEnum
 from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -21,7 +21,46 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_state import BrowserState
+
 LOG = structlog.get_logger()
+
+
+async def _safe_tab_title(page: Page) -> str:
+    try:
+        return await asyncio.wait_for(page.title(), timeout=1.0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("tab_title_fetch_failed", url=page.url)
+        return ""
+
+
+async def build_open_tabs_context(
+    browser_state: BrowserState,
+    working_page: Page | None,
+) -> str | None:
+    if working_page is None:
+        return None
+    pages = await browser_state.list_valid_pages()
+    if len(pages) <= 1:
+        return None
+    # Fetch titles concurrently so a few slow tabs don't add N×timeout latency to every iteration.
+    titles = await asyncio.gather(*(_safe_tab_title(p) for p in pages))
+    lines: list[str] = []
+    for i, (p, title) in enumerate(zip(pages, titles)):
+        marker = " [current]" if p == working_page else ""
+        url = p.url
+        if len(url) > 120:
+            url = url[:117] + "..."
+        if len(title) > 80:
+            title = title[:77] + "..."
+        entry = f"Tab {i}{marker}: {url}"
+        if title:
+            entry += f" ({title})"
+        lines.append(entry)
+    return "\n".join(lines)
 
 
 def load_js_script() -> str:
