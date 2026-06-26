@@ -23,7 +23,11 @@ import yaml
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    is_fallback_floor_base_criterion,
+    redact_raw_secrets_for_prompt,
+)
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -741,6 +745,36 @@ def grade_terminal_goal_record_criteria(
         if verdicts:
             return verdicts
     return []
+
+
+def grade_fallback_floor_reached_end_state_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    eligible_criteria = [criterion for criterion in criteria if is_fallback_floor_base_criterion(criterion)]
+    if not eligible_criteria:
+        return []
+    evidence_ref = _fallback_floor_reached_end_state_evidence_ref(snapshot)
+    if evidence_ref is None:
+        return []
+    return [
+        CriterionVerdict(
+            criterion_id=criterion.id,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref=evidence_ref,
+        )
+        for criterion in eligible_criteria
+    ]
+
+
+def _fallback_floor_reached_end_state_evidence_ref(snapshot: RunEvidenceSnapshot) -> str | None:
+    for label, payload in snapshot.block_outputs.items():
+        record = _structured_record_payload(payload)
+        if record is None:
+            continue
+        if any(_terminal_goal_record_confirmed(record, family) for family in _TERMINAL_RECORD_FAMILY_ARTIFACTS):
+            return f"block_outputs:{label}"
+    return None
 
 
 def _terminal_goal_criterion_family(outcome: str) -> str | None:

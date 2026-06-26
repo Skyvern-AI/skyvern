@@ -145,6 +145,8 @@ class SkyvernPage(Page):
             ) -> Any:
                 return await skyvern_page._decorate_call(fn, action, *args, **kwargs)
 
+            # Tag the wrapper so the recorder/deriver mirrors can be regression-tested against this set.
+            wrapper.__skyvern_action_type__ = action  # type: ignore[attr-defined]
             return wrapper
 
         return decorator
