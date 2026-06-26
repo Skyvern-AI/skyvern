@@ -42,6 +42,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
@@ -105,9 +106,17 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   return null;
 }
 
-function getRunNavigationPath(run: TaskRunListItem): string {
+function getRunNavigationPath(
+  run: TaskRunListItem,
+  studioEnabled: boolean,
+): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
+      // With the studio on, workflow runs open in its Run tab; otherwise they
+      // use the standalone run page (also the fallback when there is no wpid).
+      return studioEnabled && run.workflow_permanent_id
+        ? `/workflows/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
+        : `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV1:
@@ -147,6 +156,7 @@ function RunHistory() {
     search: effectiveSearch,
   });
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const { data: rawNextPageRuns } = useRunsQuery({
     page: page + 1,
@@ -239,7 +249,7 @@ function RunHistory() {
       );
       const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
-      const navPath = getRunNavigationPath(run);
+      const navPath = getRunNavigationPath(run, studioEnabled);
       const triggerType = inferTriggerType(run);
 
       const titleContent =
@@ -546,7 +556,7 @@ function WorkflowRunParametersInline({
       workflowRunId,
       "params-inline",
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -558,6 +568,7 @@ function WorkflowRunParametersInline({
       return client
         .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
           params,
+          signal,
         })
         .then((r) => r.data);
     },

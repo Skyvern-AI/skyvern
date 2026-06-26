@@ -69,6 +69,7 @@ import {
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useInfiniteFoldersQuery } from "./hooks/useInfiniteFoldersQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
@@ -373,6 +374,7 @@ function WorkflowsTree() {
       ),
     [tagKeys],
   );
+  const { data: tagColors } = useTagValuesQuery();
 
   // One batch fetch of current tags for every workflow on screen (no N+1) -
   // the main page list plus the contents of every expanded folder.
@@ -687,6 +689,7 @@ function WorkflowsTree() {
     foldersMap,
     workflowTagsMap,
     tagDescriptions,
+    tagColors,
     tagKeys,
     labelSuggestions,
     valueSuggestionsByKey,
@@ -923,6 +926,7 @@ function WorkflowsTree() {
               onChange={setTagFilters}
               labelSuggestions={labelSuggestions}
               valueSuggestionsByKey={valueSuggestionsByKey}
+              colors={tagColors}
             />
           </div>
           <div className="flex items-center gap-4">

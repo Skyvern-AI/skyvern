@@ -218,7 +218,6 @@ def test_suspicious_success_nudge_refires_on_subsequent_turn() -> None:
     ctx = _fresh_context()
     ctx.last_test_ok = None
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 1
 
     first = _check_enforcement(ctx)
     assert first == POST_SUSPICIOUS_SUCCESS_NUDGE

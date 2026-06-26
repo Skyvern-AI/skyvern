@@ -164,8 +164,6 @@ export type FailureCategory = {
   reasoning: string;
 };
 
-export type WebhookDeliveryStatus = "pending" | "failed";
-
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -316,8 +314,12 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
-  scopes: string | null;
-  valid: boolean;
+  provider?: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
   created_at: string;
   modified_at: string;
 }
@@ -334,6 +336,7 @@ export interface GoogleOAuthCredentialListResponse {
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
+  scope_profile?: string;
   app_origin?: string;
 }
 
@@ -506,10 +509,20 @@ export const ReadableActionTypes: {
   execute_js: "Execute JS",
 };
 
+type GetReadableActionTypeOptions = {
+  nullActionLabel?: string;
+};
+
 // Recorded code-block actions can carry an action_type the readable map doesn't
 // list yet (the runtime recorder maps more Playwright calls than the UI enumerates).
 // Humanize unknown types instead of rendering a blank badge.
-export function getReadableActionType(actionType: string): string {
+export function getReadableActionType(
+  actionType: string,
+  options: GetReadableActionTypeOptions = {},
+): string {
+  if (actionType === ActionTypes.NullAction && options.nullActionLabel) {
+    return options.nullActionLabel;
+  }
   const known = ReadableActionTypes[actionType as ActionType];
   if (known) {
     return known;
@@ -660,7 +673,6 @@ export type WorkflowRunStatusApiResponse = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -698,7 +710,6 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -792,6 +803,11 @@ export type PasswordCredentialApiResponse = {
   username: string;
   totp_type: "authenticator" | "email" | "text" | "none";
   totp_identifier?: string | null;
+};
+
+export type CredentialTotpCodeResponse = {
+  code: string;
+  seconds_remaining: number;
 };
 
 export type CreditCardCredentialApiResponse = {

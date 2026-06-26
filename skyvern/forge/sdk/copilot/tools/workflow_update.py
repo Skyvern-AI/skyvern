@@ -7,10 +7,11 @@ import keyword
 import re
 import textwrap
 import tokenize
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Annotated, Any, Literal, NamedTuple
+from urllib.parse import urlsplit
 
 import structlog
 import yaml
@@ -26,8 +27,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
+    SANDBOX_UNRESOLVED_NAME_REASON_CODE,
     author_time_code_block_diagnostics,
     sandbox_unresolved_name_diagnostics,
+    sandbox_unresolved_name_repair_diagnostic,
     strip_redundant_sandbox_imports,
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
@@ -49,14 +52,12 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
     workflow_target_url,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
-    POST_INTERMEDIATE_SUCCESS_NUDGE,
-    _completion_contract_unknown_due_to_policy_fallback,
-    _goal_likely_needs_more_blocks,
     code_authoring_churn_stop_signal,
     credential_priority_authoring_churn_stop_signal,
 )
@@ -69,6 +70,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
+    url_origin,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
@@ -76,9 +78,19 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
+from skyvern.forge.sdk.copilot.schema_incompatibility import (
+    SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
+    SchemaIncompatibility,
+    build_schema_incompatibility_blocker_signal,
+    merge_schema_incompatibilities,
+    render_schema_incompatibility_agent_steer,
+)
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import blocker_signal_is_genuinely_terminal
+from skyvern.forge.sdk.copilot.turn_halt import (
+    blocker_signal_is_genuinely_terminal,
+    stash_turn_halt_from_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
@@ -93,7 +105,6 @@ from ._shared import (
     _enum_or_string_name,
     _proxy_location_trace_value,
     _raw_yaml_proxy_location,
-    _workflow_definition_as_dict,
 )
 from .banned_blocks import (
     _banned_block_reject_message,
@@ -359,6 +370,7 @@ class CodeArtifactNormalization(NamedTuple):
     error: str | None
     violations: list[str]
     offending_labels: list[str]
+    schema_incompatibilities: list[SchemaIncompatibility] = []
 
 
 def _normalize_code_artifact_metadata(
@@ -398,6 +410,7 @@ def _normalize_code_artifact_metadata_detailed(
     trajectory: list[ScoutedInteraction] = scout_trajectory or []
     violations: list[str] = []
     offending_labels: list[str] = []
+    schema_incompatibilities: list[SchemaIncompatibility] = []
     anchored: list[dict[str, Any]] = []
     unanchored: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
@@ -493,6 +506,10 @@ def _normalize_code_artifact_metadata_detailed(
         schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
         if schema_conformance_error is not None:
             item_violations.append(schema_conformance_error)
+        schema_incompatibility = _extraction_schema_incompatibility(label, dumped, block_code)
+        if schema_incompatibility is not None:
+            schema_incompatibilities.append(schema_incompatibility)
+            item_violations.append(render_schema_incompatibility_agent_steer(schema_incompatibility))
         download_shape_error = _download_return_shape_error(label, dumped, block_code)
         if download_shape_error is not None:
             item_violations.append(download_shape_error)
@@ -506,9 +523,13 @@ def _normalize_code_artifact_metadata_detailed(
             normalized[label] = _imposed_artifact_skeleton(label, code_blocks[label], trajectory)
     if violations:
         return CodeArtifactNormalization(
-            normalized, _format_code_artifact_violations(violations), violations, offending_labels
+            normalized,
+            _format_code_artifact_violations(violations),
+            violations,
+            offending_labels,
+            schema_incompatibilities,
         )
-    return CodeArtifactNormalization(normalized, None, [], [])
+    return CodeArtifactNormalization(normalized, None, [], [], [])
 
 
 def _artifact_label_fragment(label: str) -> str:
@@ -806,6 +827,241 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
     return errors
 
 
+def _human_facing_code_safety_errors(errors: list[str | CodeBlockSecurityError]) -> list[str | CodeBlockSecurityError]:
+    preflight_reason_codes = {
+        reason_code for error in errors if (reason_code := _generated_code_preflight_reason_code(error)) is not None
+    }
+    if not preflight_reason_codes:
+        return errors
+    return [
+        error
+        for error in errors
+        if not isinstance(error, CodeBlockSecurityError) or error.reason_code not in preflight_reason_codes
+    ]
+
+
+def _generated_code_preflight_reason_code(error: str | CodeBlockSecurityError) -> str | None:
+    if isinstance(error, CodeBlockSecurityError):
+        return None
+    marker = "failed the generated-code preflight check: "
+    if marker not in error:
+        return None
+    detail = error.split(marker, 1)[1]
+    reason_code = detail.split(":", 1)[0]
+    if not reason_code.startswith("AUTHOR_PAGE_"):
+        return None
+    return reason_code
+
+
+def _unresolved_symbol_repair_context_enabled(ctx: AgentContext) -> bool:
+    return normalize_block_authoring_policy(ctx.block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+
+def _declared_string_workflow_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, Mapping):
+        return set()
+    parameters = workflow_definition.get("parameters")
+    if not isinstance(parameters, list):
+        return set()
+    keys: set[str] = set()
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if not key or _is_credential_parameter(parameter) or is_sensitive_workflow_parameter(dict(parameter)):
+            continue
+        parameter_type = str(parameter.get("parameter_type") or "").lower()
+        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+        if parameter_type and parameter_type != "workflow":
+            continue
+        if workflow_parameter_type and workflow_parameter_type != "string":
+            continue
+        keys.add(key)
+    return keys
+
+
+def _code_block_available_binding_keys_by_label(workflow_yaml: str | None) -> dict[str, list[str]]:
+    if workflow_yaml is None:
+        return {}
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, Mapping):
+        return {}
+    available_by_label: dict[str, set[str]] = {}
+
+    def block_output_key(block: Mapping[str, Any]) -> str | None:
+        label = str(block.get("label") or "").strip()
+        return f"{label}_output" if label else None
+
+    def visit_branch(branch: Mapping[str, Any], available_keys: set[str]) -> None:
+        for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
+            visit_blocks(branch.get(key), set(available_keys))
+        for branch_key in _ORDERED_BRANCH_LIST_KEYS:
+            branches = branch.get(branch_key)
+            if not isinstance(branches, list):
+                continue
+            for nested_branch in branches:
+                if isinstance(nested_branch, Mapping):
+                    visit_branch(nested_branch, set(available_keys))
+
+    def visit_blocks(blocks: Any, available_keys: set[str]) -> set[str]:
+        if not isinstance(blocks, list):
+            return available_keys
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            label = str(block.get("label") or "").strip()
+            if label and _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
+                available_by_label.setdefault(label, set()).update(available_keys)
+            for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
+                visit_blocks(block.get(key), set(available_keys))
+            for branch_key in _ORDERED_BRANCH_LIST_KEYS:
+                branches = block.get(branch_key)
+                if not isinstance(branches, list):
+                    continue
+                for branch in branches:
+                    if isinstance(branch, Mapping):
+                        visit_branch(branch, set(available_keys))
+            output_key = block_output_key(block)
+            if output_key:
+                available_keys.add(output_key)
+        return available_keys
+
+    workflow_definition = parsed.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, Mapping) else None
+    visit_blocks(blocks, _declared_string_workflow_parameter_keys(parsed))
+    return {label: sorted(keys) for label, keys in available_by_label.items()}
+
+
+def _code_block_authoring_repair_context(
+    workflow_yaml: str | None,
+    prior_yaml: str | None,
+) -> CodeAuthoringRepairContext | None:
+    prior_blocks = _workflow_yaml_code_blocks_by_label(prior_yaml)
+    available_binding_keys_by_label = _code_block_available_binding_keys_by_label(workflow_yaml)
+    for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items():
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        parameter_keys = _code_block_parameter_keys(block)
+        prior_block = prior_blocks.get(label)
+        if (
+            prior_block is not None
+            and str(prior_block.get("code") or "") == code
+            and _code_block_parameter_keys(prior_block) == parameter_keys
+        ):
+            continue
+        try:
+            CodeBlock.is_safe_code(code)
+        except (SyntaxError, InsecureCodeDetected):
+            continue
+        if author_time_code_security_errors(label=label, code=code):
+            continue
+        if author_time_code_block_diagnostics(code):
+            continue
+        diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+        if diagnostic is None or not diagnostic.unresolved_names:
+            continue
+        available_parameter_keys = available_binding_keys_by_label.get(label, [])
+        binding_candidates = list(dict.fromkeys([*available_parameter_keys, *diagnostic.unresolved_names]))
+        return CodeAuthoringRepairContext(
+            block_label=label,
+            reason_code=diagnostic.code,
+            unresolved_names=list(diagnostic.unresolved_names),
+            parameter_keys=list(diagnostic.parameter_keys),
+            available_parameter_keys=available_parameter_keys,
+            binding_candidates=binding_candidates,
+            allowed_global_names=list(diagnostic.allowed_global_names),
+            allowed_helper_surface={
+                helper: list(attributes) for helper, attributes in diagnostic.allowed_helper_surface.items()
+            },
+            repair_instruction=(
+                "For each workflow-input-like unresolved name, create a workflow string parameter with the exact "
+                "same key when no declared parameter exists, add that exact key to this code block's "
+                "parameter_keys, reference it as a bare Python variable in code, do not hardcode the eval value, "
+                "and rerun via update_and_run_blocks."
+            ),
+        )
+    return None
+
+
+def _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml: str) -> str:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml
+    declared_string_keys = _declared_string_workflow_parameter_keys(parsed)
+    if not declared_string_keys:
+        return workflow_yaml
+    available_binding_keys_by_label = _code_block_available_binding_keys_by_label(workflow_yaml)
+    adopted_by_label: dict[str, list[str]] = {}
+    for block in _workflow_code_blocks(parsed):
+        label = str(block.get("label") or "").strip()
+        if not label:
+            continue
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        parameter_keys = _code_block_parameter_keys(block)
+        available_declared_keys = set(available_binding_keys_by_label.get(label, [])) & declared_string_keys
+        if not available_declared_keys:
+            continue
+        diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+        if diagnostic is None or not diagnostic.unresolved_names:
+            continue
+        adopted_keys = [
+            name
+            for name in diagnostic.unresolved_names
+            if name in available_declared_keys and name not in parameter_keys
+        ]
+        if not adopted_keys:
+            continue
+        raw_keys = block.get("parameter_keys")
+        merged_keys = (
+            [str(key) for key in raw_keys if isinstance(key, str) and key] if isinstance(raw_keys, list) else []
+        )
+        for key in adopted_keys:
+            if key not in merged_keys:
+                merged_keys.append(key)
+        block["parameter_keys"] = merged_keys
+        adopted_by_label[label] = adopted_keys
+    if not adopted_by_label:
+        return workflow_yaml
+    LOG.info("copilot adopted exact declared parameter keys for unresolved names", adopted_by_label=adopted_by_label)
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
+def _repair_context_log_values(values: list[str], *, max_items: int = 20) -> list[str]:
+    cleaned: list[str] = []
+    for raw_value in values[:max_items]:
+        value = str(raw_value or "").replace("\r", " ").replace("\n", " ").strip()
+        if not value or _SECRET_LIKE_LITERAL_RE.search(value):
+            continue
+        cleaned.append(value[:80])
+    return cleaned
+
+
+def _set_code_authoring_repair_context(ctx: AgentContext, repair_context: CodeAuthoringRepairContext | None) -> None:
+    ctx.last_code_authoring_repair_context = repair_context
+    if repair_context is not None:
+        LOG.info(
+            "copilot code authoring repair context stored",
+            reason_code=repair_context.reason_code,
+            block_label=repair_context.block_label,
+            unresolved_names=_repair_context_log_values(repair_context.unresolved_names),
+            parameter_keys=_repair_context_log_values(repair_context.parameter_keys),
+            available_parameter_keys=_repair_context_log_values(repair_context.available_parameter_keys),
+            binding_candidates=_repair_context_log_values(repair_context.binding_candidates),
+        )
+
+
+def _clear_code_authoring_repair_context(ctx: AgentContext) -> None:
+    ctx.last_code_authoring_repair_context = None
+
+
+def _is_unresolved_symbol_repair_context(repair_context: CodeAuthoringRepairContext | None) -> bool:
+    return repair_context is not None and repair_context.reason_code == SANDBOX_UNRESOLVED_NAME_REASON_CODE
+
+
 _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
 
 
@@ -992,12 +1248,17 @@ def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
     return "\n".join(errors) if errors else None
 
 
-def _code_repair_progress_data() -> dict[str, str]:
+def _code_repair_progress_data(
+    repair_context: CodeAuthoringRepairContext | None = None,
+) -> dict[str, Any]:
     """Tag a code-authoring reject so the streaming adapter renders it as quiet de-duplicated progress."""
-    return {
+    data: dict[str, Any] = {
         "surface_kind": CODE_REPAIR_PROGRESS_SURFACE_KIND,
         "progress_text": CODE_REPAIR_PROGRESS_TEXT,
     }
+    if repair_context is not None:
+        data["authoring_repair_context"] = repair_context.model_dump(mode="json")
+    return data
 
 
 def _code_seam_rejection_user_summary(*, metadata_rejected: bool, code_rejected: bool) -> str:
@@ -1013,6 +1274,7 @@ class _SynthesizedCodeImpositionResult:
     workflow_yaml: str
     substitutions: dict[str, Any] | None = None
     violations: list[str] = dataclass_field(default_factory=list)
+    repair_context: CodeAuthoringRepairContext | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -1024,6 +1286,104 @@ _SECRET_LIKE_LITERAL_RE = re.compile(
 
 def _compiled_authoring_user_summary() -> str:
     return "I need to bind the compiled browser-step code safely before saving this workflow."
+
+
+def _ambiguous_bare_selector_repair_context(
+    *,
+    code_block: Mapping[str, Any],
+    dropped: Mapping[str, Any],
+    scout_trajectory: list[ScoutedInteraction],
+) -> CodeAuthoringRepairContext | None:
+    if dropped.get("reason_code") != "ambiguous_bare_selector":
+        return None
+    dropped_selector = str(dropped.get("selector") or "").strip()
+    if not dropped_selector:
+        return None
+    dropped_index = dropped.get("trajectory_index")
+    source_url = ""
+    refiner_selector: str | None = None
+    selector_alternatives: list[dict[str, str]] = []
+    if isinstance(dropped_index, int) and 0 <= dropped_index < len(scout_trajectory):
+        source_url = str(scout_trajectory[dropped_index].get("source_url") or "").strip()
+        for later in scout_trajectory[dropped_index + 1 :]:
+            if source_url and str(later.get("source_url") or "").strip() != source_url:
+                continue
+            later_selector = str(later.get("selector") or "").strip()
+            if later_selector and _selector_refines(dropped_selector, later_selector):
+                refiner_selector = later_selector
+                break
+        if refiner_selector is None:
+            selector_alternatives = _ambiguous_selector_same_page_alternatives(
+                dropped_selector=dropped_selector,
+                source_url=source_url,
+                scout_trajectory=scout_trajectory,
+                dropped_index=dropped_index,
+            )
+    safe_source_url = url_origin(source_url) if source_url else None
+    return CodeAuthoringRepairContext(
+        block_label=str(code_block.get("label") or ""),
+        reason_code="ambiguous_bare_selector",
+        selector=dropped_selector,
+        source_url=safe_source_url,
+        refiner_selector=refiner_selector,
+        selector_alternatives=selector_alternatives,
+        repair_instruction=(
+            "Replace the ambiguous bare selector with a unique selector or role/name locator from the same page."
+        ),
+    )
+
+
+def _same_page_url(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    left_parts = urlsplit(left)
+    right_parts = urlsplit(right)
+    return (
+        left_parts.scheme,
+        left_parts.netloc,
+        left_parts.path.rstrip("/"),
+    ) == (
+        right_parts.scheme,
+        right_parts.netloc,
+        right_parts.path.rstrip("/"),
+    )
+
+
+def _safe_selector_repair_atom(value: Any, *, max_chars: int = 160) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if not text or len(text) > max_chars:
+        return ""
+    if _SECRET_LIKE_LITERAL_RE.search(text):
+        return ""
+    return text
+
+
+def _ambiguous_selector_same_page_alternatives(
+    *,
+    dropped_selector: str,
+    source_url: str,
+    scout_trajectory: list[ScoutedInteraction],
+    dropped_index: int,
+) -> list[dict[str, str]]:
+    alternatives: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for index, interaction in enumerate(scout_trajectory):
+        if index == dropped_index:
+            continue
+        if not _same_page_url(source_url, str(interaction.get("source_url") or "").strip()):
+            continue
+        tool_name = _safe_selector_repair_atom(interaction.get("tool_name"), max_chars=40)
+        selector = _safe_selector_repair_atom(interaction.get("selector"))
+        if not selector or selector == dropped_selector or _is_positional_selector(selector):
+            continue
+        role = _safe_selector_repair_atom(interaction.get("role"), max_chars=60)
+        alternative = {"tool_name": tool_name, "role": role, "selector": selector}
+        key = (alternative["tool_name"], alternative["role"], alternative["selector"])
+        if key in seen:
+            continue
+        seen.add(key)
+        alternatives.append(alternative)
+    return alternatives
 
 
 def _prior_yaml_source(ctx: AgentContext) -> tuple[str, str | None]:
@@ -1200,6 +1560,9 @@ _FILTERING_PSEUDO_CLASSES = (
     ":text(",
     ":is(",
 )
+_EXACT_TEXT_XPATH_TAG_RE = re.compile(
+    r"""^(?:xpath=)?//(?P<tag>[a-zA-Z][a-zA-Z0-9-]*)\s*\[\s*normalize-space\(\s*(?:\.|text\(\))?\s*\)\s*=\s*(?P<quote>['"])[^'"]+(?P=quote)\s*\]\s*$"""
+)
 
 
 def _qualifier_narrows_to_identity(qualifier: str) -> bool:
@@ -1252,6 +1615,25 @@ def _selector_refines(bare: str, candidate: str) -> bool:
     return _qualifier_narrows_to_identity(candidate[len(bare) :])
 
 
+def _stable_same_kind_bare_click_refiner(bare: str, candidate: str) -> bool:
+    bare = bare.strip()
+    candidate = candidate.strip()
+    if not bare or not candidate or bare == candidate or _is_positional_selector(candidate):
+        return False
+    if _selector_refines(bare, candidate):
+        return True
+    if bare != "button":
+        return False
+
+    candidate_role = _parse_role_name(candidate)
+    if candidate_role is not None:
+        role_name, accessible_name, suffix = candidate_role
+        return role_name == "button" and bool(accessible_name) and not suffix
+
+    xpath_match = _EXACT_TEXT_XPATH_TAG_RE.match(candidate)
+    return xpath_match is not None and xpath_match.group("tag").casefold() == "button"
+
+
 def _bare_drop_superseded_on_screen(
     dropped: Mapping[str, Any],
     scout_trajectory: list[ScoutedInteraction],
@@ -1280,7 +1662,7 @@ def _bare_drop_superseded_on_screen(
         if str(later.get("source_url") or "").strip() != source_url:
             continue
         later_selector = str(later.get("selector") or "").strip()
-        if not _selector_refines(dropped_selector, later_selector):
+        if not _stable_same_kind_bare_click_refiner(dropped_selector, later_selector):
             continue
         claimed_refiner_indices.add(refiner_index)
         return True, {
@@ -2284,6 +2666,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         violations.append("Unable to impose synthesized code block: scout trajectory was truncated.")
     claimed_refiner_indices: set[int] = set()
     forgiven_superseded_bare_drops: list[dict[str, Any]] = []
+    repair_context: CodeAuthoringRepairContext | None = None
     for dropped in diagnostics.dropped_interactions:
         if _is_ignorable_entry_opener_drop(dropped, diagnostics):
             continue
@@ -2300,6 +2683,12 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         violations.append(
             f"Unable to impose synthesized code block: dropped scout interaction {index} from `{tool_name}` ({reason})."
         )
+        if repair_context is None:
+            repair_context = _ambiguous_bare_selector_repair_context(
+                code_block=code_block,
+                dropped=dropped,
+                scout_trajectory=scout_trajectory,
+            )
     for provenance in diagnostics.locator_provenance:
         if not _locator_provenance_is_self_validating(provenance):
             violations.append("Unable to impose synthesized code block: locator provenance was not byte-equal.")
@@ -2314,7 +2703,11 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     )
     violations.extend(parameter_reconciliation.violations)
     if violations:
-        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml, violations=violations)
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=violations,
+            repair_context=repair_context,
+        )
 
     extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
     raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
@@ -2734,6 +3127,81 @@ def _extraction_schema_conformance_error(label: str, artifact: Mapping[str, Any]
     return None
 
 
+def _top_level_path_segment(path: str) -> str:
+    head = path.strip()
+    for separator in (".", "[", "/"):
+        index = head.find(separator)
+        if index > 0:
+            head = head[:index]
+    return head.strip()
+
+
+def _known_output_contract_paths(artifact: Mapping[str, Any], code: str) -> set[str]:
+    """Top-level field names the block is known to produce: the snippet's return-dict
+    keys plus the confirmed `goal_value_paths`' top-level segments. Empty when neither
+    is statically determinable, so the incompatibility check stays tolerant."""
+    paths: set[str] = set()
+    return_keys = _top_level_return_dict_keys(code)
+    if return_keys:
+        paths |= return_keys
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(artifact.get(field_name)):
+            for path in _artifact_goal_value_paths(row.get("goal_value_paths")):
+                segment = _top_level_path_segment(path)
+                if segment:
+                    paths.add(segment)
+    return paths
+
+
+def _schema_property_summary(schema: Mapping[str, Any]) -> str:
+    names = _schema_object_property_names(schema)
+    if names is None:
+        return ""
+    property_names, _required = names
+    return ", ".join(sorted(property_names))
+
+
+def _extraction_schema_incompatibility(
+    label: str, artifact: Mapping[str, Any], code: str
+) -> SchemaIncompatibility | None:
+    """Detect an edited `extraction_schema` whose object property names overlap NONE of
+    the block's known output contract. Unlike `_extraction_schema_conformance_error`,
+    this fires even when `required` is empty: an optional-only field that maps to nothing
+    the block produces is a non-repairable mismatch, not a tolerated gap. Stays tolerant
+    when the contract or property names are not statically determinable."""
+    if _is_download_intent(artifact, code) or not code.strip():
+        return None
+    known_paths = _known_output_contract_paths(artifact, code)
+    if not known_paths:
+        return None
+    incompatible: set[str] = set()
+    summaries: list[str] = []
+    for value in _artifact_extraction_schema_values(artifact):
+        if isinstance(value, str) and _is_unfilled_artifact_placeholder(value.strip()):
+            continue
+        parsed = _parse_extraction_schema(value)
+        if parsed is None or not validate_schema(parsed):
+            continue
+        names = _schema_object_property_names(parsed)
+        if names is None:
+            continue
+        property_names, _required = names
+        if not property_names or property_names & known_paths:
+            continue
+        incompatible |= property_names
+        summary = _schema_property_summary(parsed)
+        if summary and summary not in summaries:
+            summaries.append(summary)
+    if not incompatible:
+        return None
+    return SchemaIncompatibility(
+        block_label=label,
+        incompatible_paths=tuple(sorted(incompatible)),
+        known_output_paths=tuple(sorted(known_paths)),
+        edited_schema_summary="; ".join(summaries),
+    )
+
+
 _EXPECT_DOWNLOAD_ATTR = "expect_download"
 
 
@@ -3134,25 +3602,65 @@ def _credentialed_code_block_scout_gate_errors(
     return errors
 
 
+def _reject_schema_incompatibility(
+    ctx: AgentContext,
+    incompatibility: SchemaIncompatibility,
+    reject: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    """Emit the typed, non-repairable schema-incompatibility outcome: stash the terminal
+    blocker + turn halt so enforcement renders a product-language reply (instead of
+    falling through to repair churn), record it on the context, and reject without
+    persisting the incompatible draft."""
+    signal = build_schema_incompatibility_blocker_signal(incompatibility)
+    stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
+    ctx.latest_schema_incompatibility = incompatibility
+    return reject(
+        error=render_schema_incompatibility_agent_steer(incompatibility),
+        user_facing_summary=signal.user_facing_reason,
+        data={
+            "failure_type": SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
+            "schema_incompatibility": incompatibility.to_summary_dict(),
+        },
+    )
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
     *,
     allow_missing_credentials: bool | None = None,
 ) -> dict[str, Any]:
+    def reject(
+        *,
+        error: str,
+        user_facing_summary: str | None = None,
+        data: dict[str, Any] | None = None,
+        repair_context: CodeAuthoringRepairContext | None = None,
+    ) -> dict[str, Any]:
+        if repair_context is None:
+            _clear_code_authoring_repair_context(ctx)
+        else:
+            _set_code_authoring_repair_context(ctx, repair_context)
+        result: dict[str, Any] = {"ok": False, "error": error}
+        if user_facing_summary is not None:
+            result["user_facing_summary"] = user_facing_summary
+        if data is not None:
+            result["data"] = data
+        return result
+
     authority_error = _authority_tool_error(ctx, "update_workflow")
     if authority_error is not None:
-        return {"ok": False, "error": authority_error}
+        return reject(error=authority_error)
 
     workflow_yaml = params["workflow_yaml"]
     raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
     if raw_conflict_marker_error is not None:
-        return {
-            "ok": False,
-            "error": raw_conflict_marker_error,
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(),
-        }
+        return reject(
+            error=raw_conflict_marker_error,
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
     # Tool wrappers run authority/loop guards before calling here. The composition
     # gate below consumes these refs, so they must be visible before validation.
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
@@ -3161,45 +3669,44 @@ async def _update_workflow(
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
     if imposition.violations:
-        return {
-            "ok": False,
-            "error": "\n".join(imposition.violations),
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(),
-        }
+        return reject(
+            error="\n".join(imposition.violations),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(imposition.repair_context),
+            repair_context=imposition.repair_context,
+        )
     workflow_yaml = imposition.workflow_yaml
     stripped_sandbox_imports: list[str] = []
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml, stripped_sandbox_imports = _strip_redundant_sandbox_imports_in_yaml(workflow_yaml)
     workflow_yaml, typed_default_violations = _apply_scouted_typed_default_promotions(workflow_yaml, ctx)
     if typed_default_violations:
-        return {
-            "ok": False,
-            "error": "\n".join(typed_default_violations),
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(),
-        }
+        return reject(
+            error="\n".join(typed_default_violations),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        workflow_yaml = _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml)
     params["workflow_yaml"] = workflow_yaml
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
     if parameter_contract_error is not None:
-        return {
-            "ok": False,
-            "error": parameter_contract_error,
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(),
-        }
+        return reject(
+            error=parameter_contract_error,
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
     missing_metadata_error = _missing_code_artifact_metadata_error(
         workflow_yaml,
         ctx,
         params.get("code_artifact_metadata"),
     )
     if missing_metadata_error is not None:
-        return {
-            "ok": False,
-            "error": missing_metadata_error,
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(),
-        }
+        return reject(
+            error=missing_metadata_error,
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     normalization = _normalize_code_artifact_metadata_detailed(
         params.get("code_artifact_metadata"),
@@ -3211,15 +3718,28 @@ async def _update_workflow(
     code_artifact_metadata_error = normalization.error
     if code_artifact_metadata_error is not None:
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
+    if normalization.schema_incompatibilities:
+        incompatibility = merge_schema_incompatibilities(normalization.schema_incompatibilities)
+        if incompatibility is not None:
+            return _reject_schema_incompatibility(ctx, incompatibility, reject)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
+    code_authoring_repair_context = (
+        _code_block_authoring_repair_context(workflow_yaml, prior_workflow_yaml)
+        if code_safety_errors and _unresolved_symbol_repair_context_enabled(ctx)
+        else None
+    )
     credential_scout_errors = (
         []
         if _request_policy_allows_untested_code_block_draft(ctx)
         else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
     )
-    credential_priority_reject = bool(credential_scout_errors) and code_artifact_metadata_error is None
+    unresolved_symbol_priority_reject = _is_unresolved_symbol_repair_context(code_authoring_repair_context)
+    credential_priority_reject = (
+        bool(credential_scout_errors) and code_artifact_metadata_error is None and not unresolved_symbol_priority_reject
+    )
     if code_safety_errors:
+        _set_code_authoring_repair_context(ctx, code_authoring_repair_context)
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=credential_priority_reject)
     # Per-label salvage keeps conforming metadata across a rejection; a
     # rejected code block keeps nothing, since its yaml never becomes the
@@ -3238,41 +3758,67 @@ async def _update_workflow(
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
         params["code_artifact_metadata"] = merged_metadata
+    if (
+        credential_scout_errors
+        and code_safety_errors
+        and code_artifact_metadata_error is None
+        and unresolved_symbol_priority_reject
+    ):
+        return reject(
+            error="\n".join(str(error) for error in code_safety_errors if error),
+            user_facing_summary=_code_seam_rejection_user_summary(
+                metadata_rejected=False,
+                code_rejected=True,
+            ),
+            data=_code_repair_progress_data(code_authoring_repair_context),
+            repair_context=code_authoring_repair_context,
+        )
     if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
-        return {
-            "ok": False,
-            "error": "\n".join(credential_scout_errors),
-            "user_facing_summary": CREDENTIAL_SCOUT_VERIFY_REPLY,
-            "data": {
+        return reject(
+            error="\n".join(credential_scout_errors),
+            user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
+            data={
                 "failure_type": "missing_credential_or_init",
                 "diagnostic_code_safety_errors": code_safety_errors,
+                **(
+                    {"authoring_repair_context": code_authoring_repair_context.model_dump(mode="json")}
+                    if code_authoring_repair_context is not None
+                    else {}
+                ),
             },
-        }
-    seam_errors = [error for error in (code_artifact_metadata_error, *code_safety_errors) if error]
+            repair_context=code_authoring_repair_context,
+        )
+    seam_errors = [
+        error
+        for error in (
+            code_artifact_metadata_error,
+            *_human_facing_code_safety_errors(code_safety_errors),
+        )
+        if error
+    ]
     if seam_errors:
-        return {
-            "ok": False,
-            "error": "\n".join(seam_errors),
-            "user_facing_summary": _code_seam_rejection_user_summary(
+        return reject(
+            error="\n".join(seam_errors),
+            user_facing_summary=_code_seam_rejection_user_summary(
                 metadata_rejected=code_artifact_metadata_error is not None,
                 code_rejected=bool(code_safety_errors),
             ),
-            "data": _code_repair_progress_data(),
-        }
+            data=_code_repair_progress_data(code_authoring_repair_context),
+            repair_context=code_authoring_repair_context,
+        )
     if credential_scout_errors:
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
-        return {
-            "ok": False,
-            "error": "\n".join(credential_scout_errors),
-            "user_facing_summary": CREDENTIAL_SCOUT_VERIFY_REPLY,
-            "data": {"failure_type": "missing_credential_or_init"},
-        }
+        return reject(
+            error="\n".join(credential_scout_errors),
+            user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
+            data={"failure_type": "missing_credential_or_init"},
+        )
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
     if not allow_missing_credentials:
         credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
         if credential_error is not None:
-            return {"ok": False, "error": credential_error}
+            return reject(error=credential_error)
 
     misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
     if misbinding_findings:
@@ -3282,7 +3828,7 @@ async def _update_workflow(
             workflow_id=ctx.workflow_id,
             findings=misbinding_findings,
         )
-        return {"ok": False, "error": _credential_id_misbinding_error_message(misbinding_findings)}
+        return reject(error=_credential_id_misbinding_error_message(misbinding_findings))
 
     output_policy_verdict = evaluate_output_policy(
         request_policy=getattr(ctx, "request_policy", None),
@@ -3299,7 +3845,7 @@ async def _update_workflow(
                 tool_name="update_workflow",
             ),
         )
-        return {"ok": False, "error": format_output_policy_tool_error(output_policy_verdict)}
+        return reject(error=format_output_policy_tool_error(output_policy_verdict))
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
@@ -3308,15 +3854,15 @@ async def _update_workflow(
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
     stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
     if stale_metadata:
-        return {"ok": False, "error": _stale_block_metadata_message(stale_metadata)}
+        return reject(error=_stale_block_metadata_message(stale_metadata))
 
     wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
     if wait_block_error:
-        return {"ok": False, "error": wait_block_error}
+        return reject(error=wait_block_error)
 
     challenge_http_error = _challenge_http_request_reject_message(ctx, workflow_yaml, ctx.workflow_yaml)
     if challenge_http_error:
-        return {"ok": False, "error": challenge_http_error}
+        return reject(error=challenge_http_error)
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -3329,15 +3875,15 @@ async def _update_workflow(
     )
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
-        return {"ok": False, "error": _banned_block_reject_message(banned_items, ctx)}
+        return reject(error=_banned_block_reject_message(banned_items, ctx))
 
     download_scout_error = _download_scout_required_error(ctx, workflow_yaml)
     if download_scout_error:
-        return {"ok": False, "error": download_scout_error}
+        return reject(error=download_scout_error)
 
     download_binding_error = _download_binding_required_error(ctx, workflow_yaml)
     if download_binding_error:
-        return {"ok": False, "error": download_binding_error}
+        return reject(error=download_binding_error)
 
     composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
     if composition_evidence_error:
@@ -3346,7 +3892,10 @@ async def _update_workflow(
             workflow_permanent_id=ctx.workflow_permanent_id,
             target_url=workflow_target_url(workflow_yaml),
         )
-        return {"ok": False, "error": composition_evidence_error}
+        return reject(error=composition_evidence_error)
+
+    # New data-write blocks default to surfacing failures rather than swallowing them.
+    workflow_yaml = default_data_write_continue_on_failure(workflow_yaml, ctx.workflow_yaml)
 
     try:
         # A code block renders code-first (goal + plain step timeline) only when it
@@ -3391,6 +3940,7 @@ async def _update_workflow(
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
                 browser_profile_id=workflow.browser_profile_id,
+                browser_profile_key=workflow.browser_profile_key,
                 model=workflow.model,
                 max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
                 extra_http_headers=workflow.extra_http_headers,
@@ -3412,6 +3962,7 @@ async def _update_workflow(
         ctx.workflow_yaml = workflow_yaml
         ctx.code_authoring_guardrail_reject_count = 0
         ctx.last_code_authoring_reject_was_credential_priority = False
+        _clear_code_authoring_repair_context(ctx)
         _clear_held_churn_signals(ctx)
         accepted_metadata = getattr(ctx, "code_artifact_metadata", None)
         if isinstance(accepted_metadata, dict) and accepted_metadata:
@@ -3444,17 +3995,19 @@ async def _update_workflow(
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
-        result: dict[str, Any] = {
-            "ok": False,
-            "error": f"Workflow validation failed: {e}",
-        }
+        repair_data = None
+        user_facing_summary = None
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-            result["data"] = _code_repair_progress_data()
-            result["user_facing_summary"] = _code_seam_rejection_user_summary(
+            repair_data = _code_repair_progress_data()
+            user_facing_summary = _code_seam_rejection_user_summary(
                 metadata_rejected=False,
                 code_rejected=True,
             )
-        return result
+        return reject(
+            error=f"Workflow validation failed: {e}",
+            user_facing_summary=user_facing_summary,
+            data=repair_data,
+        )
 
 
 def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:
@@ -3519,47 +4072,3 @@ def _record_workflow_update_result(
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
 
     _invalidate_verified_state_on_edit(copilot_ctx, prior_definition, getattr(wf, "workflow_definition", None))
-
-
-def _last_update_is_single_goto_bootstrap(copilot_ctx: CopilotContext) -> bool:
-    last_workflow = copilot_ctx.last_workflow
-    definition = _workflow_definition_as_dict(last_workflow.workflow_definition if last_workflow is not None else None)
-    blocks = definition.get("blocks")
-    if not isinstance(blocks, list) or len(blocks) != 1:
-        return False
-    block = blocks[0]
-    if not isinstance(block, dict):
-        return False
-    return str(block.get("block_type") or "").strip().lower() == "goto_url"
-
-
-def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
-    block_count = getattr(copilot_ctx, "last_update_block_count", None)
-    if not isinstance(block_count, int):
-        return None
-    if block_count == 1 and _last_update_is_single_goto_bootstrap(copilot_ctx):
-        return None
-
-    user_message = getattr(copilot_ctx, "user_message", "")
-    request_policy = getattr(copilot_ctx, "request_policy", None)
-    completion_contract = getattr(request_policy, "completion_contract", None)
-    if isinstance(completion_contract, str):
-        completion_contract = completion_contract.strip() or None
-    else:
-        completion_contract = None
-
-    if _completion_contract_unknown_due_to_policy_fallback(copilot_ctx):
-        return None
-
-    if not _goal_likely_needs_more_blocks(user_message, block_count, completion_contract):
-        return None
-
-    nudge_count = getattr(copilot_ctx, "coverage_nudge_count", 0)
-    if nudge_count >= 1:
-        return None
-    copilot_ctx.coverage_nudge_count = nudge_count + 1
-    return (
-        f"{POST_INTERMEDIATE_SUCCESS_NUDGE} The workflow was saved with {block_count} block"
-        f"{'' if block_count == 1 else 's'}, but it has not been run because the request-policy "
-        "completion contract still leaves distinct requested actions uncovered."
-    )

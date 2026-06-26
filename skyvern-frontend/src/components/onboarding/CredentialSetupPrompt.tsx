@@ -5,6 +5,8 @@ import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { CredentialSetupTelemetry } from "@/util/onboarding/credentialSetupTelemetry";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
 type CredentialSetupPromptProps = {
   workflowPermanentId: string;
@@ -23,6 +25,7 @@ function CredentialSetupPrompt({
   blocksMissingCredentials,
 }: Readonly<CredentialSetupPromptProps>) {
   const blockCount = blocksMissingCredentials.length;
+  const studioEnabled = useWorkflowStudioEnabled();
   const shownRef = useRef(false);
 
   useEffect(() => {
@@ -51,7 +54,7 @@ function CredentialSetupPrompt({
         </ul>
         <Button asChild size="sm" className="mt-3">
           <Link
-            to={`/workflows/${workflowPermanentId}/build`}
+            to={workflowEditorPath(workflowPermanentId, studioEnabled)}
             onClick={() =>
               CredentialSetupTelemetry.credentialSetupCtaClicked(
                 "run_parameters",

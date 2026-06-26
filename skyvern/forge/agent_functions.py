@@ -6,13 +6,14 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List
 
 import aiohttp
 import httpx
 import structlog
 from cachetools import TTLCache
+from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
+from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -49,7 +51,9 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.services.otp_service import OTPValue
 
 LOG = structlog.get_logger()
 
@@ -696,6 +700,45 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def should_use_codeblock_runner(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: "WorkflowRunContext",
+        organization_id: str | None,
+        block_label: str | None,
+        browser_session_id: str | None,
+    ) -> bool:
+        """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
+
+        Gating lives here, at the block-execution call site, rather than inside
+        execute_code_block_override so the override only runs the runner. OSS has no
+        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
+        only routes runs that have a browser session for the runner to broker against.
+        """
+        return False
+
+    async def execute_code_block_override(
+        self,
+        *,
+        block: Any,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        workflow_run_context: "WorkflowRunContext",
+        parameter_values: dict[str, Any],
+        credential_parameter_keys: set[str],
+    ) -> Any | None:
+        """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
+
+        OSS no-op returns None so callers fall through to in-process execution. Cloud
+        overrides to dispatch to the runner. Callers must gate on
+        should_use_codeblock_runner first.
+        """
+        return None
+
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
         return True
@@ -1040,26 +1083,25 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
         required_scopes: list[str] | None = None,
-    ) -> object | None:
+    ) -> Credentials | None:
         """Return a refreshed ``google.oauth2.credentials.Credentials``, or None on failure.
 
-        ``required_scopes`` is accepted for forward-compat with cloud overrides
-        that may enforce scope checks; the OSS path does not yet use it.
+        ``required_scopes`` gates use of a credential whose grant does not cover
+        the API the caller is about to use.
         """
-        if required_scopes:
-            # Debug-level so OSS operators don't see this on every call; scope
-            # enforcement lives on the cloud override and a future caller can
-            # grep for this message if they need to audit usage.
-            LOG.debug(
-                "required_scopes ignored by OSS get_google_workspace_credentials; cloud override gates this",
-                required_scopes=required_scopes,
-                credential_id=credential_id,
-            )
         try:
             secrets = await google_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
                 credential_id=credential_id,
             )
+            if required_scopes and not google_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+                LOG.info(
+                    "Google OAuth credential missing required scopes",
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    required_scopes=required_scopes,
+                )
+                return None
             return await google_oauth_service.credentials_from_secrets(secrets)
         except google_oauth_service.EncryptionNotConfiguredError:
             LOG.error(
@@ -1075,6 +1117,19 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+
+    async def get_otp_value_from_gmail(
+        self,
+        *,
+        organization_id: str,
+        totp_identifier: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        created_after: datetime | None = None,
+        context: GmailOTPVerificationContext | None = None,
+    ) -> "OTPValue | None":
+        """Cloud-only Gmail OTP lookup hook. OSS builds do not read inboxes."""
+        return None
 
     async def ensure_sheet_tab(
         self,

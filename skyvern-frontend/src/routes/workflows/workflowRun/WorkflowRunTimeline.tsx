@@ -32,6 +32,8 @@ import {
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   activeIteration?: number | null;
+  // When set, read this run's timeline instead of the URL's (studio shell).
+  workflowRunId?: string;
   onLiveStreamSelected: () => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
@@ -81,6 +83,7 @@ function buildBlockOrderIndex(
 function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
+  workflowRunId,
   onLiveStreamSelected,
   onActionItemSelected,
   onBlockItemSelected,
@@ -88,10 +91,10 @@ function WorkflowRunTimeline({
   onIterationSelected,
 }: Props) {
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery();
+    useWorkflowRunWithWorkflowQuery({ workflowRunId });
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
-    useWorkflowRunTimelineQuery();
+    useWorkflowRunTimelineQuery({ workflowRunId });
   const displayTimeline = useMemo(
     () => flattenTimelineChronologically(workflowRunTimeline ?? []),
     [workflowRunTimeline],

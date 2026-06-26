@@ -15,15 +15,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
-    NULL_DATA_STREAK_ESCALATE_AT,
-    POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     CopilotGoalSatisfied,
     _check_enforcement,
-    _needs_repeated_null_data_nudge,
     _needs_suspicious_success_nudge,
     _prune_input_list,
     _summarize_tool_output,
@@ -63,7 +61,6 @@ class _Ctx:
         self.last_failure_category_top = None
         self.failed_test_nudge_count = 0
         self.explore_without_workflow_nudge_count = 0
-        self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
         self.verified_terminal_proposal_ready = False
@@ -126,7 +123,7 @@ def test_unrecoverable_browser_session_error_stops_after_second_failure() -> Non
         _maybe_raise_unrecoverable_tool_error,
     )
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
     output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
 
     _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
@@ -334,7 +331,6 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_test_anti_bot=None,
         last_failure_category_top=None,
         last_test_non_retriable_nav_error=None,
-        null_data_streak_count=0,
         failed_test_nudge_count=0,
         last_failed_workflow_yaml=None,
         last_good_workflow=None,
@@ -546,6 +542,36 @@ def test_enforcement_stops_after_verified_terminal_proposal() -> None:
         _check_enforcement(ctx)
 
 
+def test_verified_outcome_out_orders_same_turn_involuntary_blocker() -> None:
+    ctx = _Ctx()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    involuntary = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="repeated failed step",
+        user_facing_reason="I'm stuck retrying the same step.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_and_run_blocks",
+        extra={},
+    )
+    ctx.turn_halt = None
+    ctx.blocker_signal = involuntary
+    ctx.latest_tool_blocker_signal = involuntary
+
+    with pytest.raises(CopilotGoalSatisfied):
+        _check_enforcement(ctx)
+
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+
+
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:
     """Stagnation/ceiling cancels mid-session must still set last_test_ok=False
     so the failed-test nudge can fire — only a coincident total timeout softens
@@ -579,47 +605,21 @@ def test_record_run_blocks_result_sets_last_test_ok_none_on_watchdog_cancel_at_t
 
 
 # ---------------------------------------------------------------------------
-# Repeated null-data escalation
+# Suspicious-success nudge
 # ---------------------------------------------------------------------------
 
 
 def test_suspicious_success_fires_when_flag_set() -> None:
     ctx = _Ctx()
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 1
     assert _needs_suspicious_success_nudge(ctx) is True
-    assert _needs_repeated_null_data_nudge(ctx) is False
 
 
-def test_repeated_null_data_fires_at_threshold() -> None:
+def test_check_enforcement_returns_suspicious_nudge_when_flag_set() -> None:
     ctx = _Ctx()
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = NULL_DATA_STREAK_ESCALATE_AT
-    assert _needs_repeated_null_data_nudge(ctx) is True
-
-
-def test_check_enforcement_returns_repeated_nudge_at_threshold() -> None:
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = NULL_DATA_STREAK_ESCALATE_AT
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_REPEATED_NULL_DATA_NUDGE
-
-
-def test_check_enforcement_returns_regular_suspicious_nudge_below_threshold() -> None:
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 1
     nudge = _check_enforcement(ctx)
     assert nudge == POST_SUSPICIOUS_SUCCESS_NUDGE
-
-
-def test_repeated_null_data_requires_suspicious_flag() -> None:
-    # If the current test wasn't a suspicious success, don't fire even with a high streak.
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = False
-    ctx.null_data_streak_count = 99
-    assert _needs_repeated_null_data_nudge(ctx) is False
 
 
 # ---------------------------------------------------------------------------

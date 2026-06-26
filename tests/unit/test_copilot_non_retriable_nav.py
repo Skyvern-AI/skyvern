@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _extract_url_from_nav_error,
     _maybe_raise_non_retriable_nav,
     _needs_failed_test_nudge,
-    _needs_repeated_null_data_nudge,
     _needs_suspicious_success_nudge,
     _non_retriable_nav_error_nudge,
     _repeated_frontier_failure_nudge,
@@ -387,14 +386,6 @@ def test_needs_suspicious_success_nudge_suppressed_when_flag_set() -> None:
     assert _needs_suspicious_success_nudge(ctx) is False
 
 
-def test_needs_repeated_null_data_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 5
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_repeated_null_data_nudge(ctx) is False
-
-
 def test_repeated_frontier_failure_nudge_suppressed_when_flag_set() -> None:
     ctx = _fresh_context()
     ctx.repeated_failure_streak_count = 5
@@ -492,18 +483,16 @@ def test_all_competing_branches_silent_after_latch() -> None:
     # Reproduce the full steady state after the one-shot stop nudge has
     # latched: ctx has a non-retriable error, last_test_ok=False,
     # test_after_update_done=True, and all counters are set such that the
-    # other branches would normally fire. Assert all four helpers are silent.
+    # other branches would normally fire. Assert each helper is silent.
     ctx = _fresh_context()
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 5
     ctx.repeated_failure_streak_count = 5
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
 
     assert _needs_failed_test_nudge(ctx) is False
     assert _needs_suspicious_success_nudge(ctx) is False
-    assert _needs_repeated_null_data_nudge(ctx) is False
     assert _repeated_frontier_failure_nudge(ctx) is None
 
 

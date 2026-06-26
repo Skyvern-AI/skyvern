@@ -34,7 +34,13 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  Navigate,
+  Outlet,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import {
   statusIsAFailureType,
   statusIsCancellable,
@@ -66,9 +72,10 @@ import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowR
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
-import { WebhookDeliveryStatus } from "@/routes/workflows/workflowRun/WebhookDeliveryStatus";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecoveryGuidance";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
@@ -148,6 +155,7 @@ function WorkflowRun() {
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const onboarding = useOnboardingStateOptional();
 
   const {
@@ -430,25 +438,18 @@ function WorkflowRun() {
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
-  const taskWebhookFailureReason =
-    workflowRun?.task_v2?.webhook_failure_reason ?? null;
-  const workflowWebhookFailureReason =
-    workflowRun?.webhook_failure_reason ?? null;
   const webhookFailureReasonData =
-    taskWebhookFailureReason ?? workflowWebhookFailureReason;
-  // TaskV2 webhook state is legacy failure-only data; workflow-level pending
-  // delivery status is surfaced separately by webhook_delivery_status.
-  const webhookDeliveryStatusData = taskWebhookFailureReason
-    ? "failed"
-    : (workflowRun?.webhook_delivery_status ??
-      (workflowWebhookFailureReason ? "failed" : null));
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
 
-  const webhookDeliveryStatus = (
-    <WebhookDeliveryStatus
-      webhookDeliveryStatus={webhookDeliveryStatusData}
-      webhookFailureReason={webhookFailureReasonData}
-    />
-  );
+  const webhookFailureReason = webhookFailureReasonData ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {webhookFailureReasonData}
+      </div>
+    </div>
+  ) : null;
 
   const outputs = workflowRun?.outputs;
   const extractedInformation =
@@ -526,6 +527,25 @@ function WorkflowRun() {
 
   if (status === 404) {
     return <Status404 />;
+  }
+
+  // With the preview on, route legacy run links into the studio Run tab
+  // (preserving the selected item); flag-off keeps this legacy run view.
+  if (studioEnabled && !isEmbedded && workflowRunId && workflowPermanentId) {
+    const studioParams = new URLSearchParams();
+    studioParams.set("wr", workflowRunId);
+    if (active) {
+      studioParams.set("active", active);
+    }
+    if (iterationParam) {
+      studioParams.set("iteration", iterationParam);
+    }
+    return (
+      <Navigate
+        to={`/workflows/${workflowPermanentId}/studio?${studioParams.toString()}`}
+        replace
+      />
+    );
   }
 
   return (
@@ -634,7 +654,10 @@ function WorkflowRun() {
                 />
                 <Button asChild variant="secondary">
                   <Link
-                    to={`/workflows/${workflowPermanentId}/build`}
+                    to={workflowEditorPath(
+                      workflowPermanentId ?? "",
+                      studioEnabled,
+                    )}
                     data-testid="workflow-open-editor-link"
                   >
                     <Pencil2Icon className="mr-2 h-4 w-4" />
@@ -751,9 +774,9 @@ function WorkflowRun() {
               </ScrollArea>
             </div>
           )}
+          {webhookFailureReason}
         </div>
       )}
-      {webhookDeliveryStatus}
       {workflowFailureReason}
       {fallbackEpisodes && fallbackEpisodes.episodes.length > 0 && (
         <ScriptUpdateCard

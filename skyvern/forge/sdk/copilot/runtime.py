@@ -36,10 +36,12 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -184,7 +186,6 @@ class AgentContext:
     copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
-    null_data_streak_count: int = 0
     last_test_ok: bool | None = None
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None
@@ -203,6 +204,7 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
@@ -307,6 +309,10 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
+    # Latest edited-schema-incompatibility terminal outcome, set when an edited
+    # extraction_schema declares fields that map to no output the block produces.
+    # Surfaced into the persisted TurnOutcome so a later turn can report it.
+    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:

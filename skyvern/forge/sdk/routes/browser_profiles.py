@@ -572,11 +572,15 @@ async def _create_profile_from_workflow_run(
     # Poll for a short grace period so that immediate profile-creation requests
     # succeed without forcing clients to implement retry loops.
     poll_attempts = 30  # ~30 s max wait
+    browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
+        workflow=workflow,
+        workflow_run=workflow_run,
+    )
     session_dir: str | None = None
     for attempt in range(poll_attempts):
         session_dir = await app.STORAGE.retrieve_browser_session(
             organization_id=organization_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_permanent_id=browser_session_storage_key,
         )
         if session_dir:
             break  # session found

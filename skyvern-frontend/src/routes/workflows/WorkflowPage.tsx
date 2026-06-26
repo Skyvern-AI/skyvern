@@ -54,6 +54,7 @@ import {
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowActions } from "./WorkflowActions";
@@ -65,11 +66,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
-import * as env from "@/util/env";
 import { getClient } from "@/api/AxiosClient";
 import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { legacyRunDetailPath, workflowEditorPath } from "./studioNavigation";
 import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
@@ -102,6 +104,7 @@ function WorkflowPage() {
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const PAGE_SIZE_OPTIONS = ["10", "25", "50"];
   const pageSize = Number(searchParams.get("page_size") || "10");
@@ -153,6 +156,7 @@ function WorkflowPage() {
       ),
     [tagKeys],
   );
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   if (!workflowPermanentId) {
     return null; // this should never happen
@@ -182,6 +186,7 @@ function WorkflowPage() {
             <TagChipList
               tags={workflowTags}
               descriptions={tagDescriptions}
+              colors={tagColors}
               maxVisible={6}
             />
           ) : null}
@@ -209,7 +214,7 @@ function WorkflowPage() {
           </Button>
           <Button asChild variant="secondary">
             <Link
-              to={`/workflows/${workflowPermanentId}/build`}
+              to={workflowEditorPath(workflowPermanentId, studioEnabled)}
               data-testid="workflow-open-editor-link"
             >
               <Pencil2Icon className="mr-2 size-4" />
@@ -319,9 +324,12 @@ function WorkflowPage() {
                           {/* Main run row */}
                           <TableRow
                             onClick={(event) => {
-                              const url = env.useNewRunsUrl
-                                ? `/runs/${workflowRun.workflow_run_id}`
-                                : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
+                              const url = studioEnabled
+                                ? `/workflows/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
+                                : legacyRunDetailPath(
+                                    workflowPermanentId,
+                                    workflowRun.workflow_run_id,
+                                  );
 
                               if (event.ctrlKey || event.metaKey) {
                                 window.open(

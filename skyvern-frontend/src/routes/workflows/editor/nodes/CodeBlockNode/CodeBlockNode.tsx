@@ -1,8 +1,6 @@
 import { Handle, NodeProps, Position } from "@xyflow/react";
-import { useState } from "react";
 import { useParams } from "react-router-dom";
 
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -12,8 +10,8 @@ import { useCollapseContext } from "../../collapse/CollapseContext";
 import { NodeBody } from "../../collapse/NodeBody";
 import { BuildModeOnly } from "../BuildModeOnly";
 import { CodeBlockEditor } from "./CodeBlockEditor";
-import { CodeBlockViewToggle, type CodeBlockView } from "./CodeBlockViewToggle";
 import { NodeHeader } from "../components/NodeHeader";
+import { getCodeBlockTitle } from "../types";
 import type { CodeBlockNode } from "./types";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
@@ -22,10 +20,10 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { data: workflowRun } = useWorkflowRunQuery();
   const recordingStore = useRecordingStore();
   const { open } = useCollapseContext();
-  const isCodeFirst = data.prompt != null;
-  const codeFirstAccess = useFeatureFlag("CODE_BLOCK_ACCESS") === true;
-  const showViewToggle = isCodeFirst && codeFirstAccess;
-  const [view, setView] = useState<CodeBlockView>("plain");
+  const blockTitle = getCodeBlockTitle({
+    prompt: data.prompt,
+    steps: data.steps,
+  });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const thisBlockIsTargetted =
@@ -70,18 +68,11 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
           totpIdentifier={null}
           totpUrl={null}
           type="code"
-          viewToggle={
-            showViewToggle ? (
-              <CodeBlockViewToggle value={view} onChange={setView} />
-            ) : undefined
-          }
+          blockTitle={blockTitle}
         />
         <NodeBody>
           <BuildModeOnly>
-            <CodeBlockEditor
-              blockId={id}
-              view={showViewToggle ? view : undefined}
-            />
+            <CodeBlockEditor blockId={id} />
           </BuildModeOnly>
         </NodeBody>
       </div>

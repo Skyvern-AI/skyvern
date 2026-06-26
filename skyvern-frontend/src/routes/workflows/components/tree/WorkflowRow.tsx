@@ -19,6 +19,8 @@ import {
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import { WorkflowApiResponse } from "../../types/workflowTypes";
 import { WorkflowActions } from "../../WorkflowActions";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
@@ -56,6 +58,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     foldersMap,
     workflowTagsMap,
     tagDescriptions,
+    tagColors,
     tagKeys,
     labelSuggestions,
     valueSuggestionsByKey,
@@ -68,6 +71,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     handleRowClick,
     handleIconClick,
   } = useWorkflowsListContext();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const parameterItems = (workflow.workflow_definition?.parameters ?? [])
     .filter((p) => p.parameter_type !== "output")
@@ -183,7 +187,11 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
               )}
             </div>
             {workflowTags && workflowTags.length > 0 ? (
-              <TagChipList tags={workflowTags} descriptions={tagDescriptions} />
+              <TagChipList
+                tags={workflowTags}
+                descriptions={tagDescriptions}
+                colors={tagColors}
+              />
             ) : null}
           </div>
         </TableCell>
@@ -249,6 +257,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                   tagKeys={tagKeys}
                   labelSuggestions={labelSuggestions}
                   valueSuggestionsByKey={valueSuggestionsByKey}
+                  colorMap={tagColors}
                 />
               </>
             )}
@@ -262,7 +271,10 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     onClick={(event) => {
                       handleIconClick(
                         event,
-                        `/workflows/${workflow.workflow_permanent_id}/build`,
+                        workflowEditorPath(
+                          workflow.workflow_permanent_id,
+                          studioEnabled,
+                        ),
                       );
                     }}
                   >

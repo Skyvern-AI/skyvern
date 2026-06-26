@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -27,6 +28,11 @@ class GoogleOAuthCredentialListResponse(BaseModel):
 class CreateGoogleOAuthAuthorizeRequest(BaseModel):
     redirect_uri: str = Field(..., description="Redirect URI the consent flow will return to")
     credential_name: str = Field(default="Default", description="Human-readable name for this credential")
+    scope_profile: Literal["google_sheets", "gmail"] | None = Field(
+        default=None,
+        description="Allowed Google OAuth scope profile to request. Defaults to google_sheets.",
+        examples=["google_sheets", "gmail"],
+    )
     app_origin: str | None = Field(
         default=None,
         description="Origin the callback should bounce back to (e.g. a Vercel preview URL). "

@@ -40,6 +40,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   webhookCallbackUrl: null,
   persistBrowserSession: false,
   browserProfileId: null,
+  browserProfileKey: null,
   model: null,
   maxScreenshotScrolls: null,
   maxElapsedTimeMinutes: null,

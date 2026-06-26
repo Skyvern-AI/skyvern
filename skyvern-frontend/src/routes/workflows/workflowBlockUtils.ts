@@ -1,3 +1,5 @@
+import { getReadableActionType } from "@/api/types";
+
 import {
   isNestedLoopWorkflowBlock,
   type CodeBlockStep,
@@ -55,4 +57,48 @@ export function buildCodeStepsByLabel(
   };
   visit(blocks);
   return stepsByLabel;
+}
+
+/**
+ * Plain-English text for a code-block step: prefer the generated title, then
+ * the description, and only humanize the raw action type when neither is
+ * present.
+ */
+export function getCodeStepPlainText(step: CodeBlockStep): string {
+  const title = step.title?.trim();
+  if (title) {
+    return title;
+  }
+  const description = step.description?.trim();
+  if (description) {
+    return description;
+  }
+  return getReadableActionType(step.action_type);
+}
+
+/**
+ * Resolve the definition step a recorded action belongs to by its source line.
+ * A fired action carries its `code_line`; match it to the step whose
+ * `line_start` equals that line, falling back to the step whose
+ * `[line_start, line_end]` range contains it.
+ */
+export function findCodeStepForLine(
+  steps: Array<CodeBlockStep>,
+  codeLine: number | null,
+): CodeBlockStep | null {
+  if (codeLine == null) {
+    return null;
+  }
+  const exact = steps.find((step) => step.line_start === codeLine);
+  if (exact) {
+    return exact;
+  }
+  return (
+    steps.find(
+      (step) =>
+        step.line_start != null &&
+        codeLine >= step.line_start &&
+        codeLine <= (step.line_end ?? step.line_start),
+    ) ?? null
+  );
 }

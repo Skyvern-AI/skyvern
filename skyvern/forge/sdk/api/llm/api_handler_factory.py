@@ -2293,11 +2293,13 @@ class LLMCaller:
 
         self.openai_client = None
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
-        if openrouter_model_name:
+        # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
+        if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
             self.llm_key = openrouter_model_name.replace("openrouter/", "")
+            litellm_params = self.llm_config.litellm_params or {}
             self.openai_client = AsyncOpenAI(
-                api_key=settings.OPENROUTER_API_KEY,
-                base_url=settings.OPENROUTER_API_BASE,
+                api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
+                base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
@@ -2765,6 +2767,10 @@ class LLMCaller:
                 openai_params["max_tokens"] = active_parameters["max_tokens"]
             if "temperature" in active_parameters:
                 openai_params["temperature"] = active_parameters["temperature"]
+            if active_parameters.get("service_tier"):
+                openai_params["service_tier"] = active_parameters["service_tier"]
+            if active_parameters.get("reasoning_effort"):
+                openai_params["reasoning_effort"] = active_parameters["reasoning_effort"]
 
             completion = await self.openai_client.chat.completions.create(
                 model=self.llm_key,

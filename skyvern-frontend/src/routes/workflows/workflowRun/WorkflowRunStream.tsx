@@ -22,6 +22,7 @@ type StreamMessage = {
   format?: string;
   viewport_width?: number;
   viewport_height?: number;
+  url?: string;
 };
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
@@ -77,6 +78,12 @@ interface Props {
   alwaysShowStream?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
+  // When set, stream this run instead of the URL's (studio shell).
+  workflowRunId?: string;
+  // Surfaces the live page URL each frame carries (studio header).
+  onUrlChange?: (url: string) => void;
+  // Studio centers the frame; legacy keeps the zoomable image.
+  centered?: boolean;
 }
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
@@ -85,9 +92,18 @@ function WorkflowRunStream({
   alwaysShowStream = false,
   interactive = false,
   showControlButtons = false,
+  workflowRunId: workflowRunIdProp,
+  onUrlChange,
+  centered,
 }: Props = {}) {
-  const workflowRunId = useFirstParam("workflowRunId", "runId");
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  // Held in a ref so a new callback identity doesn't reconnect the socket.
+  const onUrlChangeRef = useRef(onUrlChange);
+  onUrlChangeRef.current = onUrlChange;
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = workflowRunIdProp ?? urlWorkflowRunId;
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    workflowRunIdProp ? { workflowRunId: workflowRunIdProp } : undefined,
+  );
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
@@ -166,6 +182,9 @@ function WorkflowRunStream({
           }
           if (message.viewport_height) {
             setViewportHeight(message.viewport_height);
+          }
+          if (message.url) {
+            onUrlChangeRef.current?.(message.url);
           }
           if (!message.screenshot && message.status) {
             setDiagnostic(diagnosticForStatus(message.status));
@@ -291,6 +310,7 @@ function WorkflowRunStream({
         containerRef={containerRef}
         showControlButtons={showControlButtons}
         handlers={handlers}
+        centered={centered}
       />
     );
   }

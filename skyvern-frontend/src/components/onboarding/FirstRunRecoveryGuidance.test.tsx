@@ -12,6 +12,11 @@ vi.mock("react-router-dom", async (importOriginal) => {
 
 vi.mock("posthog-js", () => ({ default: { capture: vi.fn() } }));
 
+const { studioState } = vi.hoisted(() => ({ studioState: { enabled: true } }));
+vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
+  useWorkflowStudioEnabled: () => studioState.enabled,
+}));
+
 describe("getRecoveryPaths", () => {
   it("always returns at least two paths (AC1)", () => {
     for (const category of [
@@ -54,6 +59,7 @@ describe("getRecoveryPaths", () => {
 describe("FirstRunRecoveryGuidance", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    studioState.enabled = true;
   });
   afterEach(() => {
     cleanup();
@@ -110,6 +116,19 @@ describe("FirstRunRecoveryGuidance", () => {
   });
 
   it("navigates to the workflow editor with the permanent id (AC2 wiring)", () => {
+    const { getByTestId } = render(
+      <FirstRunRecoveryGuidance
+        surface="runs"
+        failureCategory="element_not_found"
+        workflowPermanentId="wpid_123"
+      />,
+    );
+    fireEvent.click(getByTestId("recovery-path-edit_workflow"));
+    expect(navigateMock).toHaveBeenCalledWith("/workflows/wpid_123/studio");
+  });
+
+  it("navigates to /build when the studio preview is off (AC2 wiring)", () => {
+    studioState.enabled = false;
     const { getByTestId } = render(
       <FirstRunRecoveryGuidance
         surface="runs"

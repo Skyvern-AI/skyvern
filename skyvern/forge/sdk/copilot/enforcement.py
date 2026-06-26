@@ -45,7 +45,6 @@ from skyvern.forge.sdk.copilot.config import (
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
-    POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     POST_UPDATE_NUDGE,
     PRE_DISCOVERY_URL_QUESTION_NUDGE,
@@ -76,6 +75,11 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     run_outcome_display_reason,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.terminal_predicates import (
+    artifact_health_blocked,
+    outcome_criteria_evaluated,
+    outcome_fully_verified,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
@@ -109,9 +113,6 @@ MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
 # longer willing to re-run extraction.
 MAX_SUSPICIOUS_SUCCESS_NUDGES = 2
-# Escalate after this many consecutive all-null extraction runs so the agent
-# inspects browser state instead of re-prompting the extractor.
-NULL_DATA_STREAK_ESCALATE_AT = 2
 # Streak levels for repeated-failure (same frontier + same failure signature).
 REPEATED_FRONTIER_STREAK_ESCALATE_AT = 2
 REPEATED_FRONTIER_STREAK_STOP_AT = 3
@@ -558,28 +559,7 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
 
 
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
-    result = ctx.completion_verification_result
-    return result is not None and result.status == "evaluated"
-
-
-def artifact_health_blocked(ctx: CopilotContext) -> bool:
-    reason = ctx.last_artifact_health_blocker_reason
-    return isinstance(reason, str) and bool(reason.strip())
-
-
-def outcome_fully_verified(ctx: CopilotContext) -> bool:
-    """The judge confirmed every outcome criterion from the evidence this run produced.
-
-    This evidence is authoritative over run status: a run that reached the goal is
-    recognized even when it was canceled or only partially completed. Run status must
-    never suppress recognition of an outcome the user can observe was achieved.
-    """
-    if artifact_health_blocked(ctx):
-        return False
-    if not _outcome_criteria_evaluated(ctx):
-        return False
-    result = ctx.completion_verification_result
-    return result is not None and result.is_fully_satisfied()
+    return outcome_criteria_evaluated(ctx)
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
@@ -1187,17 +1167,6 @@ def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
     return _get_int(ctx, "probable_site_block_stop_nudge_count") < MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
 
 
-def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
-    """Return True when suspicious-success has happened enough times to escalate."""
-    # Same as above: non-retriable nav state never belongs on this branch.
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return False
-    if not getattr(ctx, "last_test_suspicious_success", False):
-        return False
-    streak = getattr(ctx, "null_data_streak_count", 0)
-    return streak >= NULL_DATA_STREAK_ESCALATE_AT
-
-
 def _get_int(ctx: Any, name: str, default: int = 0) -> int:
     value = getattr(ctx, name, default)
     return value if isinstance(value, int) else default
@@ -1263,14 +1232,15 @@ def _check_enforcement(
     result: RunResultStreaming | None = None,
     config: CopilotConfig | None = None,
 ) -> str | None:
+    verified = outcome_fully_verified(ctx)
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
     terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
     if terminal_signal is not None:
         stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    if getattr(ctx, "verified_terminal_proposal_ready", False) is True and verified_goal_satisfied_context(ctx):
+    if verified:
         raise CopilotGoalSatisfied()
 
     if _needs_repair_ceiling_halt(ctx):
@@ -1284,7 +1254,7 @@ def _check_enforcement(
             signal,
             consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
         )
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
@@ -1314,7 +1284,7 @@ def _check_enforcement(
         return None
 
     _maybe_stash_terminal_challenge_halt(ctx)
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
 
     # If the last run had confirmed challenge evidence, do not misdiagnose a
     # challenge-solving loop as a long-chain budgeting problem.
@@ -1349,9 +1319,6 @@ def _check_enforcement(
     # Do NOT clear last_test_suspicious_success here. tools._record_run_blocks_result
     # resets it on every new run; if the agent ignores the nudge and answers
     # without rerunning, we want _check_enforcement to re-emit the nudge.
-    if _needs_repeated_null_data_nudge(ctx):
-        return _nudge(config, "post_repeated_null_data")
-
     if _needs_suspicious_success_nudge(ctx):
         ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
         return _nudge(config, "post_suspicious_success")
@@ -1364,7 +1331,7 @@ def _check_enforcement(
         signal = _probable_site_block_stop_signal(ctx, config)
         stash_blocker_signal(ctx, signal)
         stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
@@ -1672,7 +1639,6 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_NAVIGATE_NUDGE: "post_navigate",
     POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE: "explore_without_workflow",
     POST_SUSPICIOUS_SUCCESS_NUDGE: "suspicious_success",
-    POST_REPEATED_NULL_DATA_NUDGE: "repeated_null_data",
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE: "repeated_frontier_failure_warn",
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE: "repeated_frontier_failure_stop",
     POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE: "non_retriable_nav_error_stop",
@@ -1696,7 +1662,6 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_navigate": "post_navigate",
     "post_explore_without_workflow": "explore_without_workflow",
     "post_suspicious_success": "suspicious_success",
-    "post_repeated_null_data": "repeated_null_data",
     "post_repeated_frontier_failure_warn": "repeated_frontier_failure_warn",
     "post_repeated_frontier_failure_stop": "repeated_frontier_failure_stop",
     "post_non_retriable_nav_error_stop": "non_retriable_nav_error_stop",

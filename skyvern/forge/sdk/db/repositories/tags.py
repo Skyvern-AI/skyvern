@@ -6,15 +6,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import Exists, and_, exists, func, select, text, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.models import TagKeyModel, WorkflowTagEventModel
+from skyvern.forge.sdk.db.models import TagKeyModel, TagValueModel, WorkflowModel, WorkflowTagEventModel
 from skyvern.forge.sdk.workflow.models.tags import TagEventType, TagWriteContext
-from skyvern.forge.sdk.workflow.models.validators import RUN_METADATA_MAX_KEYS
+from skyvern.forge.sdk.workflow.models.validators import RUN_METADATA_MAX_KEYS, random_tag_color
 
 LOG = structlog.get_logger()
 
@@ -26,8 +26,26 @@ class TagCountLimitExceeded(ValueError):
     """Raised when an apply would push a workflow over MAX_TAGS_PER_WORKFLOW."""
 
 
-# Cap breaches are user input, not infra failures — log as BusinessLogicError (WARN).
+class TagValueRenameCollision(ValueError):
+    """Raised when renaming ``(key, old)`` to ``(key, new)`` and ``(key, new)``
+    already exists active org-wide. v1 rejects rather than merging."""
+
+
+# Cap breaches and rename collisions are user input, not infra failures — log as
+# BusinessLogicError (WARN), not UnexpectedError (ERROR).
 register_passthrough_exception(TagCountLimitExceeded)
+register_passthrough_exception(TagValueRenameCollision)
+
+
+@dataclass(frozen=True)
+class TagValueRenameResult:
+    """Outcome of a successful grouped-label rename: the new ``(key, value)``,
+    its carried-over color, and how many workflows were re-tagged."""
+
+    key: str
+    value: str
+    color: str
+    renamed_workflow_count: int
 
 
 @dataclass(frozen=True)
@@ -54,11 +72,15 @@ class TagsRepository(BaseRepository):
         context: TagWriteContext,
         label_sets: list[str] | None = None,
         label_deletes: list[str] | None = None,
+        colors: dict[str, str] | None = None,
     ) -> list[TagChange]:
         """Atomically apply SET/DELETE tag events. Grouped tags via ``sets``/``deletes``
-        (keys), standalone labels via ``label_sets``/``label_deletes``; set wins over delete."""
+        (keys), standalone labels via ``label_sets``/``label_deletes``; set wins over delete.
+        ``colors`` maps a grouped tag's key to a palette color for the value being set;
+        a SET key absent from ``colors`` keeps its existing color or gets a random one."""
         label_sets = label_sets or []
         label_deletes = label_deletes or []
+        colors = colors or {}
         label_set_values = set(label_sets)
         effective_deletes = {k for k in deletes if k not in sets}
         effective_label_deletes = {v for v in label_deletes if v not in label_set_values}
@@ -186,8 +208,67 @@ class TagsRepository(BaseRepository):
                 )
                 await session.execute(insert_stmt)
 
+            await self._register_tag_value_colors(
+                session,
+                organization_id=organization_id,
+                sets=sets,
+                colors=colors,
+                now=now,
+            )
+
             await session.commit()
             return changes
+
+    async def _register_tag_value_colors(
+        self,
+        session: AsyncSession,
+        *,
+        organization_id: str,
+        sets: dict[str, str],
+        colors: dict[str, str],
+        now: datetime,
+    ) -> None:
+        """Upsert a color for every grouped (key, value) in this SET request, even when the
+        tag event is idempotent: an explicit color overrides (DO UPDATE), an unspecified one
+        registers only on first use (DO NOTHING keeps the existing). Standalone labels are skipped."""
+        if not sets:
+            return
+
+        dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+        insert = sqlite.insert if dialect_name == "sqlite" else postgresql.insert
+
+        explicit_rows: list[dict[str, str]] = []
+        random_rows: list[dict[str, str]] = []
+        for key, value in sets.items():
+            provided = colors.get(key)
+            if provided is not None:
+                explicit_rows.append(
+                    {"organization_id": organization_id, "key": key, "value": value, "color": provided}
+                )
+            else:
+                random_rows.append(
+                    {"organization_id": organization_id, "key": key, "value": value, "color": random_tag_color()}
+                )
+
+        if explicit_rows:
+            stmt = insert(TagValueModel.__table__).values(explicit_rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["organization_id", "key", "value"],
+                index_where=text("deleted_at IS NULL"),
+                set_={"color": stmt.excluded.color, "modified_at": now},
+            )
+            await session.execute(stmt)
+
+        if random_rows:
+            stmt = (
+                insert(TagValueModel.__table__)
+                .values(random_rows)
+                .on_conflict_do_nothing(
+                    index_elements=["organization_id", "key", "value"],
+                    index_where=text("deleted_at IS NULL"),
+                )
+            )
+            await session.execute(stmt)
 
     async def _get_active_set_rows(
         self,
@@ -335,6 +416,47 @@ class TagsRepository(BaseRepository):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @db_operation("list_tag_values")
+    async def list_tag_values(self, organization_id: str) -> list[TagValueModel]:
+        """Active (key, value, color) registry entries for the org, ordered by key
+        then value. The frontend joins these onto tags by (key, value) the same way
+        it joins descriptions onto keys."""
+        async with self.Session() as session:
+            stmt = (
+                select(TagValueModel)
+                .where(TagValueModel.organization_id == organization_id)
+                .where(TagValueModel.deleted_at.is_(None))
+                .order_by(TagValueModel.key.asc(), TagValueModel.value.asc())
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    @db_operation("recolor_tag_value")
+    async def recolor_tag_value(
+        self,
+        organization_id: str,
+        key: str,
+        value: str,
+        color: str,
+    ) -> TagValueModel | None:
+        """Recolor an existing (key, value) registry row. Returns None when the pair
+        is not registered for the org (caller should 404)."""
+        async with self.Session() as session:
+            stmt = (
+                select(TagValueModel)
+                .where(TagValueModel.organization_id == organization_id)
+                .where(TagValueModel.key == key)
+                .where(TagValueModel.value == value)
+                .where(TagValueModel.deleted_at.is_(None))
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            row.color = color
+            await session.commit()
+            await session.refresh(row)
+            return row
+
     @db_operation("get_tag_key")
     async def get_tag_key(self, organization_id: str, key: str) -> TagKeyModel | None:
         async with self.Session() as session:
@@ -391,6 +513,89 @@ class TagsRepository(BaseRepository):
             rows = await session.execute(stmt)
             return {key: count for key, count in rows.all()}
 
+    @staticmethod
+    def _non_deleted_workflow_exists(organization_id: str) -> Exists:
+        """Correlated EXISTS: the tag event's workflow still has a live version.
+        Soft-deleting a workflow sets ``deleted_at`` on every version row, but its
+        tag events linger; without this filter a label attached only to deleted
+        workflows would inflate the workflow counts."""
+        return exists().where(
+            and_(
+                WorkflowModel.workflow_permanent_id == WorkflowTagEventModel.workflow_permanent_id,
+                WorkflowModel.organization_id == organization_id,
+                WorkflowModel.deleted_at.is_(None),
+            )
+        )
+
+    @db_operation("count_active_workflows_per_value")
+    async def count_active_workflows_per_value(self, organization_id: str) -> dict[tuple[str, str], int]:
+        """Map of grouped ``(key, value)`` -> number of non-deleted workflows carrying
+        it. Powers the per-label delete blast-radius warning. Standalone labels (no
+        key) are excluded; covered by the existing org/key/value active partial index."""
+        async with self.Session() as session:
+            stmt = (
+                select(
+                    WorkflowTagEventModel.key,
+                    WorkflowTagEventModel.value,
+                    func.count(func.distinct(WorkflowTagEventModel.workflow_permanent_id)),
+                )
+                .where(
+                    and_(
+                        WorkflowTagEventModel.organization_id == organization_id,
+                        WorkflowTagEventModel.superseded_at.is_(None),
+                        WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                        WorkflowTagEventModel.deleted_at.is_(None),
+                        WorkflowTagEventModel.key.isnot(None),
+                        self._non_deleted_workflow_exists(organization_id),
+                    )
+                )
+                .group_by(WorkflowTagEventModel.key, WorkflowTagEventModel.value)
+            )
+            rows = await session.execute(stmt)
+            return {(key, value): count for key, value, count in rows.all()}
+
+    @db_operation("count_active_workflows_for_value")
+    async def count_active_workflows_for_value(self, organization_id: str, key: str, value: str) -> int:
+        """Number of non-deleted workflows with an active SET on grouped ``(key, value)``.
+        Targeted single-pair count for the recolor/rename response, avoiding the full-org
+        GROUP BY that ``count_active_workflows_per_value`` runs for the list endpoint."""
+        async with self.Session() as session:
+            stmt = select(func.count(func.distinct(WorkflowTagEventModel.workflow_permanent_id))).where(
+                and_(
+                    WorkflowTagEventModel.organization_id == organization_id,
+                    WorkflowTagEventModel.key == key,
+                    WorkflowTagEventModel.value == value,
+                    WorkflowTagEventModel.superseded_at.is_(None),
+                    WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                    WorkflowTagEventModel.deleted_at.is_(None),
+                    self._non_deleted_workflow_exists(organization_id),
+                )
+            )
+            return (await session.execute(stmt)).scalar_one()
+
+    async def _soft_delete_tag_value_rows(
+        self,
+        session: AsyncSession,
+        *,
+        organization_id: str,
+        key: str,
+        now: datetime,
+        value: str | None = None,
+    ) -> None:
+        """Soft-delete the active ``tag_values`` color rows for a key (all values
+        when ``value`` is None, or a single ``(key, value)`` pair otherwise) so
+        GET /tag-values stops returning colors for removed labels. Shared by
+        ``delete_tag_key``, ``delete_tag_value``, and ``rename_tag_value`` (which
+        retires the old value's row) to keep the cascade consistent."""
+        stmt = update(TagValueModel).where(
+            TagValueModel.organization_id == organization_id,
+            TagValueModel.key == key,
+            TagValueModel.deleted_at.is_(None),
+        )
+        if value is not None:
+            stmt = stmt.where(TagValueModel.value == value)
+        await session.execute(stmt.values(deleted_at=now))
+
     @db_operation("delete_tag_key")
     async def delete_tag_key(
         self,
@@ -399,7 +604,8 @@ class TagsRepository(BaseRepository):
         context: TagWriteContext,
     ) -> int | None:
         """Cascade-delete a tag key: write a DELETE event for every workflow that
-        currently has it, then soft-delete the registry row. Returns the number
+        currently has it, then soft-delete the key registry row and its value color
+        rows (so GET /tag-values stops returning colors for the removed key). Returns the number
         of workflows the tag was removed from, or None when the key is not
         registered (caller should 404). Idempotent: a second call returns None.
 
@@ -472,5 +678,246 @@ class TagsRepository(BaseRepository):
                 )
 
             key_row.deleted_at = now
+            await self._soft_delete_tag_value_rows(session, organization_id=organization_id, key=key, now=now)
             await session.commit()
             return len(active_sets)
+
+    @db_operation("delete_tag_value")
+    async def delete_tag_value(
+        self,
+        organization_id: str,
+        key: str,
+        value: str,
+        context: TagWriteContext,
+    ) -> int | None:
+        """Cascade-delete a single grouped label ``(key, value)``, mirroring
+        ``delete_tag_key`` at value granularity: write a DELETE event (carrying the
+        value, so history records which label was removed) for every workflow with
+        an active SET on it, then soft-delete the ``(key, value)`` color row. Returns
+        the number of workflows the label was removed from, or None when neither a
+        registered color row nor an active SET exists (caller should 404). Idempotent:
+        a second call returns None; re-applying via a SET re-registers the label.
+
+        DELETE events don't match the SET-only partial UNIQUE, so superseding the SET
+        and inserting the DELETE in one transaction needs no flush ordering (same as
+        ``delete_tag_key``). The same accepted delete-vs-SET race applies."""
+        now = datetime.now(timezone.utc)
+        async with self.Session() as session:
+            value_row = (
+                await session.execute(
+                    select(TagValueModel).where(
+                        and_(
+                            TagValueModel.organization_id == organization_id,
+                            TagValueModel.key == key,
+                            TagValueModel.value == value,
+                            TagValueModel.deleted_at.is_(None),
+                        )
+                    )
+                )
+            ).scalar_one_or_none()
+
+            active_sets = (
+                (
+                    await session.execute(
+                        select(WorkflowTagEventModel).where(
+                            and_(
+                                WorkflowTagEventModel.organization_id == organization_id,
+                                WorkflowTagEventModel.key == key,
+                                WorkflowTagEventModel.value == value,
+                                WorkflowTagEventModel.superseded_at.is_(None),
+                                WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                                WorkflowTagEventModel.deleted_at.is_(None),
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            if value_row is None and not active_sets:
+                return None
+
+            for existing in active_sets:
+                existing.superseded_at = now
+                session.add(
+                    WorkflowTagEventModel(
+                        workflow_permanent_id=existing.workflow_permanent_id,
+                        organization_id=organization_id,
+                        key=key,
+                        value=value,
+                        event_type=TagEventType.DELETE.value,
+                        set_at=now,
+                        set_by=context.caller_id,
+                        source=context.source.value,
+                        caller_type=context.caller_type.value if context.caller_type else None,
+                    )
+                )
+
+            await self._soft_delete_tag_value_rows(
+                session, organization_id=organization_id, key=key, now=now, value=value
+            )
+            await session.commit()
+            return len(active_sets)
+
+    @db_operation("rename_tag_value")
+    async def rename_tag_value(
+        self,
+        organization_id: str,
+        key: str,
+        old_value: str,
+        new_value: str,
+        context: TagWriteContext,
+    ) -> TagValueRenameResult | None:
+        """Rename a grouped label ``(key, old_value)`` -> ``(key, new_value)`` by
+        cascading through the append-only event log (mirrors ``delete_tag_key`` but
+        inserts a SET, not a DELETE): for every workflow with an active SET on
+        ``(key, old_value)``, supersede it and insert a new SET on ``(key, new_value)``.
+        The new color row inherits the old row's color. Historical events keep their
+        point-in-time value (append-only invariant preserved). Returns the rename
+        result, or None when ``(key, old_value)`` is not present (caller should 404).
+
+        Raises ``TagValueRenameCollision`` when ``(key, new_value)`` already exists
+        active org-wide (registered or in use) — v1 rejects rather than merging.
+
+        The new SET shares the ``(org, wpid, key)`` active-SET partial UNIQUE with the
+        superseded row, so the supersede UPDATEs are flushed before the new SET INSERTs
+        (same ordering ``apply_tag_changes`` relies on).
+
+        Accepted race (mirrors ``delete_tag_key``): the active-set read, the collision
+        check, and the cascade are not serialized against a concurrent ``apply_tag_changes``.
+        A SET on ``(key, old_value)`` landing after the read is missed (left on the old
+        value), and a SET on ``(key, new_value)`` landing after the collision check can
+        coexist with the rename — surfacing as a transient IntegrityError on the partial
+        UNIQUE (the caller's one retry covers it) or two active SETs that the next apply
+        reconciles. Serializing would need dialect-specific row/advisory locking,
+        disproportionate for a rare manual admin action."""
+        now = datetime.now(timezone.utc)
+        async with self.Session() as session:
+            old_row = (
+                await session.execute(
+                    select(TagValueModel).where(
+                        and_(
+                            TagValueModel.organization_id == organization_id,
+                            TagValueModel.key == key,
+                            TagValueModel.value == old_value,
+                            TagValueModel.deleted_at.is_(None),
+                        )
+                    )
+                )
+            ).scalar_one_or_none()
+
+            active_sets = (
+                (
+                    await session.execute(
+                        select(WorkflowTagEventModel).where(
+                            and_(
+                                WorkflowTagEventModel.organization_id == organization_id,
+                                WorkflowTagEventModel.key == key,
+                                WorkflowTagEventModel.value == old_value,
+                                WorkflowTagEventModel.superseded_at.is_(None),
+                                WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                                WorkflowTagEventModel.deleted_at.is_(None),
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            if old_row is None and not active_sets:
+                return None
+
+            if await self._grouped_value_active(session, organization_id=organization_id, key=key, value=new_value):
+                raise TagValueRenameCollision(
+                    f"tag value '{key}:{new_value}' already exists; rename would merge labels (not supported)"
+                )
+
+            for existing in active_sets:
+                existing.superseded_at = now
+            # Flush supersede UPDATEs before the new SET INSERTs so the active-SET
+            # partial UNIQUE on (org, wpid, key) sees a consistent state.
+            await session.flush()
+            for existing in active_sets:
+                session.add(
+                    WorkflowTagEventModel(
+                        workflow_permanent_id=existing.workflow_permanent_id,
+                        organization_id=organization_id,
+                        key=key,
+                        value=new_value,
+                        event_type=TagEventType.SET.value,
+                        set_at=now,
+                        set_by=context.caller_id,
+                        source=context.source.value,
+                        caller_type=context.caller_type.value if context.caller_type else None,
+                    )
+                )
+
+            carried_color = old_row.color if old_row is not None else random_tag_color()
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = sqlite.insert if dialect_name == "sqlite" else postgresql.insert
+            upsert = (
+                insert(TagValueModel.__table__)
+                .values(organization_id=organization_id, key=key, value=new_value, color=carried_color)
+                .on_conflict_do_update(
+                    index_elements=["organization_id", "key", "value"],
+                    index_where=text("deleted_at IS NULL"),
+                    set_={"color": carried_color, "modified_at": now},
+                )
+            )
+            await session.execute(upsert)
+            await self._soft_delete_tag_value_rows(
+                session, organization_id=organization_id, key=key, now=now, value=old_value
+            )
+            await session.commit()
+            return TagValueRenameResult(
+                key=key,
+                value=new_value,
+                color=carried_color,
+                renamed_workflow_count=len(active_sets),
+            )
+
+    async def _grouped_value_active(
+        self,
+        session: AsyncSession,
+        *,
+        organization_id: str,
+        key: str,
+        value: str,
+    ) -> bool:
+        """True when grouped label ``(key, value)`` exists active org-wide — either a
+        registered color row or an active SET event in use on some workflow."""
+        registered = (
+            await session.execute(
+                select(TagValueModel.tag_value_id)
+                .where(
+                    and_(
+                        TagValueModel.organization_id == organization_id,
+                        TagValueModel.key == key,
+                        TagValueModel.value == value,
+                        TagValueModel.deleted_at.is_(None),
+                    )
+                )
+                .limit(1)
+            )
+        ).first()
+        if registered is not None:
+            return True
+        in_use = (
+            await session.execute(
+                select(WorkflowTagEventModel.tag_event_id)
+                .where(
+                    and_(
+                        WorkflowTagEventModel.organization_id == organization_id,
+                        WorkflowTagEventModel.key == key,
+                        WorkflowTagEventModel.value == value,
+                        WorkflowTagEventModel.superseded_at.is_(None),
+                        WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                        WorkflowTagEventModel.deleted_at.is_(None),
+                    )
+                )
+                .limit(1)
+            )
+        ).first()
+        return in_use is not None

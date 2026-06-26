@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.copilot.recoverable_failure import (
@@ -922,6 +923,7 @@ async def _commit_staged_workflow(
         totp_identifier=staged_workflow.totp_identifier,
         persist_browser_session=staged_workflow.persist_browser_session,
         browser_profile_id=staged_workflow.browser_profile_id,
+        browser_profile_key=staged_workflow.browser_profile_key,
         model=staged_workflow.model,
         max_screenshot_scrolling_times=staged_workflow.max_screenshot_scrolls,
         extra_http_headers=staged_workflow.extra_http_headers,
@@ -958,6 +960,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         totp_identifier=original_workflow.totp_identifier,
         persist_browser_session=original_workflow.persist_browser_session,
         browser_profile_id=original_workflow.browser_profile_id,
+        browser_profile_key=original_workflow.browser_profile_key,
         model=original_workflow.model,
         max_screenshot_scrolling_times=original_workflow.max_screenshot_scrolls,
         extra_http_headers=original_workflow.extra_http_headers,
@@ -1174,7 +1177,9 @@ async def copilot_call_llm(
         global_llm_context = str(global_llm_context)
 
     if action_type == "REPLACE_WORKFLOW":
-        llm_workflow_yaml = action_data.get("workflow_yaml", "")
+        llm_workflow_yaml = default_data_write_continue_on_failure(
+            action_data.get("workflow_yaml", ""), chat_request.workflow_yaml
+        )
         applied_workflow_yaml = llm_workflow_yaml
         try:
             updated_workflow = _process_workflow_yaml(
@@ -1191,15 +1196,18 @@ async def copilot_call_llm(
                     timestamp=datetime.now(timezone.utc),
                 )
             )
-            corrected_workflow_yaml = await _auto_correct_workflow_yaml(
-                llm_api_handler=llm_api_handler,
-                organization_id=organization_id,
-                user_response=user_response,
-                workflow_yaml=llm_workflow_yaml,
-                chat_history=chat_history,
-                global_llm_context=global_llm_context,
-                debug_run_info_text=debug_run_info_text,
-                error=e,
+            corrected_workflow_yaml = default_data_write_continue_on_failure(
+                await _auto_correct_workflow_yaml(
+                    llm_api_handler=llm_api_handler,
+                    organization_id=organization_id,
+                    user_response=user_response,
+                    workflow_yaml=llm_workflow_yaml,
+                    chat_history=chat_history,
+                    global_llm_context=global_llm_context,
+                    debug_run_info_text=debug_run_info_text,
+                    error=e,
+                ),
+                chat_request.workflow_yaml,
             )
             updated_workflow = _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
@@ -1573,6 +1581,7 @@ def _process_workflow_yaml(
         totp_identifier=workflow_yaml_request.totp_identifier,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
         browser_profile_id=workflow_yaml_request.browser_profile_id,
+        browser_profile_key=workflow_yaml_request.browser_profile_key,
         model=workflow_yaml_request.model,
         max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
         extra_http_headers=workflow_yaml_request.extra_http_headers,
