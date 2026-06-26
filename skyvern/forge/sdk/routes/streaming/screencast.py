@@ -71,6 +71,8 @@ async def start_screencast_loop(
     entity_id: str,
     entity_type: str,
     check_finalized: Callable[[], Awaitable[bool]],
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
     cdp_session: CDPSession | None = None
@@ -209,7 +211,7 @@ async def start_screencast_loop(
             data = await frame_queue.get()
             current_url = ""
             try:
-                page = await browser_state.get_working_page()
+                page = await _current_working_page()
                 if page is not None:
                     current_url = page.url
             except Exception:
@@ -247,7 +249,7 @@ async def start_screencast_loop(
         while True:
             await asyncio.sleep(ACTIVE_PAGE_POLL_INTERVAL)
             try:
-                page = await browser_state.get_working_page()
+                page = await _current_working_page()
                 if page is not None and page is not attached_page:
                     await _attach_to_page(page)
             except Exception:
@@ -258,8 +260,21 @@ async def start_screencast_loop(
                     exc_info=True,
                 )
 
+    async def _current_working_page() -> object | None:
+        # A workflow run can swap in a NEW BrowserState for this session after the screencast
+        # started (standalone browser launch -> set_browser_state); the browser_state captured
+        # at connect time then goes stale (idle about:blank). Re-resolve each poll so we follow
+        # the run's live page. (skyvern issue #6703)
+        state = await _resolve_browser_state(entity_id, entity_type, workflow_run_id, organization_id)
+        if state is None:
+            state = browser_state
+        try:
+            return await state.get_working_page()
+        except Exception:
+            return None
+
     try:
-        page = await browser_state.get_working_page()
+        page = await _current_working_page()
         if page is None:
             raise RuntimeError("No working page available for screencast")
 
