@@ -711,6 +711,12 @@ class Settings(BaseSettings):
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 
+        # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
+        # would offer models that resolve to unregistered configs and fail at runtime.
+        if self.ENABLE_OPENROUTER:
+            mapping["deepseek-v4-flash"] = {"llm_key": "OPENROUTER_DEEPSEEK_V4_FLASH", "label": "DeepSeek V4 Flash"}
+            mapping["mimo-v2.5"] = {"llm_key": "OPENROUTER_XIAOMI_MIMO_V2_5", "label": "Xiaomi MiMo V2.5"}
+
         # GPT models: prefer Azure when enabled, fall back to OpenAI
         gpt_models = [
             ("azure/gpt-4.1", self.ENABLE_AZURE_GPT4_1, "AZURE_OPENAI_GPT4_1", "OPENAI_GPT4_1", "GPT 4.1"),
