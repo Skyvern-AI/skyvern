@@ -2241,7 +2241,7 @@
           "Browser Profiles"
         ],
         "summary": "Create a browser profile",
-        "description": "Create a browser profile from a persistent browser session or workflow run.",
+        "description": "Create a blank browser profile, or create one from a persistent browser session or workflow run.",
         "operationId": "create_browser_profile_v1_browser_profiles_post",
         "parameters": [
           {
@@ -2285,7 +2285,7 @@
             }
           },
           "400": {
-            "description": "Invalid request - missing source or source not found"
+            "description": "Invalid request - source not found or source archive unavailable"
           },
           "409": {
             "description": "Browser profile name already exists"
@@ -2307,11 +2307,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a blank browser profile for future runs\nblank_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"Fresh Profile\",\n)\nprint(blank_profile)\n\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
               }
             ]
           }
@@ -9233,26 +9233,28 @@
           "browser_session_id": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               },
               {
                 "type": "null"
               }
             ],
             "title": "Browser Session Id",
-            "description": "Persistent browser session to convert into a profile"
+            "description": "Persistent browser session to convert into a profile. Omit for a blank profile."
           },
           "workflow_run_id": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               },
               {
                 "type": "null"
               }
             ],
             "title": "Workflow Run Id",
-            "description": "Workflow run whose persisted session should be captured"
+            "description": "Workflow run whose persisted session should be captured. Omit for a blank profile."
           }
         },
         "type": "object",

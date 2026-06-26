@@ -907,6 +907,12 @@ console.log(browserSessions);
 CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
+# Create a blank browser profile for future runs
+blank_profile = await skyvern.browser_profiles.create_browser_profile(
+    name="Fresh Profile",
+)
+print(blank_profile)
+
 # Create a browser profile from a persistent browser session
 browser_profile = await skyvern.browser_profiles.create_browser_profile(
     name="My Profile",
@@ -924,6 +930,12 @@ print(browser_profile)
 CREATE_BROWSER_PROFILE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+// Create a blank browser profile for future runs
+const blankProfile = await skyvern.browserProfiles.createBrowserProfile({
+    name: "Fresh Profile",
+});
+console.log(blankProfile);
+
 // Create a browser profile from a persistent browser session
 const browserProfile = await skyvern.browserProfiles.createBrowserProfile({
     name: "My Profile",

@@ -126,6 +126,24 @@ class BrowserSessionsRepository(BaseRepository):
             browser_profile.deleted_at = naive_utc_now()
             await session.commit()
 
+    @db_operation("hard_delete_browser_profile")
+    async def hard_delete_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            await session.delete(browser_profile)
+            await session.commit()
+
     @db_operation("update_browser_profile")
     async def update_browser_profile(
         self,

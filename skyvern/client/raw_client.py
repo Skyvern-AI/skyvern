@@ -2184,7 +2184,7 @@ class RawSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[BrowserProfile]:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -2195,10 +2195,10 @@ class RawSkyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5976,7 +5976,7 @@ class AsyncRawSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[BrowserProfile]:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -5987,10 +5987,10 @@ class AsyncRawSkyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
