@@ -401,8 +401,9 @@ class SkyvernPage(Page):
                         return selector
                     except Exception:
                         pass  # retry failed too — fall through to AI
-                    LOG.warning(
+                    LOG.info(
                         "CSS selector click failed, falling back to AI",
+                        sampling=True,
                         selector=selector,
                         error=str(e),
                     )
