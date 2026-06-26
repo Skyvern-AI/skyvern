@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import string
@@ -28,7 +29,14 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
+from skyvern.forge.sdk.schemas.task_v2 import (
+    TaskV2,
+    TaskV2Metadata,
+    TaskV2Status,
+    Thought,
+    ThoughtScenario,
+    ThoughtType,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import (
@@ -908,6 +916,7 @@ async def run_task_v2_helper(
                     iteration=i,
                     workflow_run_id=workflow_run_id,
                 )
+                await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
@@ -1176,6 +1185,7 @@ async def run_task_v2_helper(
                     workflow_run_id=workflow_run_id,
                     completion_resp=completion_resp,
                 )
+                await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
@@ -1237,12 +1247,17 @@ async def run_task_v2_helper(
                 failure_category_source="llm" if llm_failure_categories else "code_level",
                 failure_category_path="v2_max_steps",
             )
+            summary_description, summarized_output = await _best_effort_failure_deliverable(
+                task_v2, task_history, context
+            )
             task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 failure_reason=full_failure_reason,
                 organization_id=organization_id,
                 failure_category=failure_category,
+                summary=summary_description,
+                output=summarized_output,
             )
             return workflow, workflow_run, task_v2
     else:
@@ -1269,12 +1284,15 @@ async def run_task_v2_helper(
             failure_category_source="code_level",
             failure_category_path="v2_max_iterations",
         )
+        summary_description, summarized_output = await _best_effort_failure_deliverable(task_v2, task_history, context)
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
             failure_reason=max_iterations_failure_reason,
             organization_id=organization_id,
             failure_category=max_iterations_failure_category,
+            summary=summary_description,
+            output=summarized_output,
         )
 
     return workflow, workflow_run, task_v2
@@ -1819,11 +1837,15 @@ async def mark_task_v2_as_failed(
     failure_reason: str | None = None,
     organization_id: str | None = None,
     failure_category: list[dict] | None = None,
+    summary: str | None = None,
+    output: dict[str, Any] | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.failed,
+        summary=summary,
+        output=output,
         failure_category=failure_category,
     )
     if workflow_run_id:
@@ -2078,12 +2100,67 @@ async def _get_navigate_complete_output(
     return None
 
 
-async def _summarize_task_v2(
+async def _persist_completion_tab_screenshots(browser_state: BrowserState, thought: Thought) -> int:
+    """Capture one screenshot per open tab at completion, persisting each as a SCREENSHOT_LLM artifact.
+
+    Best-effort: runs after the goal is already achieved, so nothing here may raise into the
+    completion path and flip a successful run to failed.
+    """
+    captured = 0
+    try:
+        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
+        # close the very tabs we are trying to prove remain open.
+        pages = await browser_state.list_valid_pages(max_pages=0)
+        # A lone tab is already captured by the completion check; only multi-tab runs need this.
+        if len(pages) <= 1:
+            return 0
+
+        per_tab_timeout = settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
+        # Overall budget so a handful of still-loading tabs can't stall the post-success path.
+        async with asyncio.timeout(settings.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
+            for page in pages[: settings.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
+                screenshots: list[bytes] = []
+                try:
+                    # Bound each tab: a slow tab's bring_to_front / load-wait must not stall completion.
+                    async with asyncio.timeout(per_tab_timeout):
+                        try:
+                            # Front each tab so Chromium paints lazily-rendered background content.
+                            await page.bring_to_front()
+                        except Exception:
+                            LOG.debug("Failed to bring tab to front before completion screenshot", exc_info=True)
+                        screenshots = await SkyvernFrame.take_split_screenshots(page=page, scroll=False)
+                except Exception:
+                    LOG.warning("Failed to capture completion screenshot for an open tab", exc_info=True)
+                    continue
+                for screenshot in screenshots:
+                    try:
+                        await app.ARTIFACT_MANAGER.create_thought_artifact(
+                            thought=thought,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
+                        captured += 1
+                    except Exception:
+                        LOG.warning("Failed to persist completion tab screenshot artifact", exc_info=True)
+    except Exception:
+        LOG.warning("Aborted capturing completion tab screenshots", captured=captured, exc_info=True)
+
+    LOG.info(
+        "Captured end-state per-tab screenshots at task_v2 completion",
+        captured=captured,
+        observer_thought_id=thought.observer_thought_id,
+    )
+    return captured
+
+
+async def _generate_task_v2_deliverable(
     task_v2: TaskV2,
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
-) -> TaskV2:
+    is_partial: bool = False,
+) -> tuple[str | None, Any]:
+    # is_partial=True renders the best-effort variant of the summary prompt; does not change task status.
     thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=task_v2.organization_id,
@@ -2099,6 +2176,7 @@ async def _summarize_task_v2(
         user_goal=task_v2.prompt,
         task_history=task_history,
         extracted_information_schema=task_v2.extracted_information_schema,
+        is_partial=is_partial,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
@@ -2108,7 +2186,7 @@ async def _summarize_task_v2(
         prompt_name="task_v2_summary",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
+    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
 
     summary_description = task_v2_summary_resp.get("description")
     summarized_output = task_v2_summary_resp.get("output")
@@ -2118,7 +2196,49 @@ async def _summarize_task_v2(
         thought=summary_description,
         output=task_v2_summary_resp,
     )
+    return summary_description, summarized_output
 
+
+async def _best_effort_failure_deliverable(
+    task_v2: TaskV2,
+    task_history: list[dict],
+    context: SkyvernContext,
+) -> tuple[str | None, Any]:
+    # Never raises: deliverable synthesis must not interfere with terminal failure handling.
+    # Screenshots are skipped — synthesized from task_history; the failure paths already screenshot.
+    if not task_history:
+        return None, None
+    try:
+        return await _generate_task_v2_deliverable(
+            task_v2=task_v2,
+            task_history=task_history,
+            context=context,
+            screenshots=None,
+            is_partial=True,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to synthesize best-effort deliverable for failing task v2",
+            exc_info=True,
+            task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=task_v2.workflow_run_id,
+        )
+        return None, None
+
+
+async def _summarize_task_v2(
+    task_v2: TaskV2,
+    task_history: list[dict],
+    context: SkyvernContext,
+    screenshots: list[bytes] | None = None,
+) -> TaskV2:
+    summary_description, summarized_output = await _generate_task_v2_deliverable(
+        task_v2=task_v2,
+        task_history=task_history,
+        context=context,
+        screenshots=screenshots,
+        is_partial=False,
+    )
     return await mark_task_v2_as_completed(
         task_v2_id=task_v2.observer_cruise_id,
         workflow_run_id=task_v2.workflow_run_id,

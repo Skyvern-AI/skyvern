@@ -640,8 +640,9 @@ async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
     await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
     second = {"ok": True, "data": {"url": url}}
     await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
-    assert [call[0] for call in server.calls] == ["skyvern_click"]
-    assert server.calls[0][1] == {"selector": "#stmt", "selector_mode": "direct"}
+    # count, not list-equality: _resolve_scout_role_name may add a browser read before the click
+    assert [call[0] for call in server.calls].count("skyvern_click") == 1
+    assert server.calls[0] == ("skyvern_click", {"selector": "#stmt", "selector_mode": "direct"})
     assert second["data"]["auto_acted"] == {"tool": "click", "selector": "#stmt", "text": "Download Statement"}
     assert second["data"]["page"]["page_title"] == "Statement"
     assert "next_action" not in second["data"]
@@ -669,7 +670,7 @@ async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypa
     await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
     second = {"ok": True, "data": {"url": url, "result": big}}
     await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
-    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert [call[0] for call in server.calls].count("skyvern_click") == 1
     assert "auto_acted" in second["data"]
     assert second["data"]["auto_acted"]["selector"] == "#stmt"
     assert second["data"]["auto_acted"].get("note")
@@ -717,7 +718,7 @@ async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatc
     await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
     second = {"ok": True, "data": {"url": url, "result": big}}
     await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
-    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert [call[0] for call in server.calls].count("skyvern_click") == 1
     assert "auto_acted" in second["data"]
     assert "page" in second["data"]
     assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
@@ -776,7 +777,7 @@ async def test_auto_act_idempotent_on_unchanged_signature(monkeypatch) -> None:
     for _ in range(3):
         result = {"ok": True, "data": {"url": url}}
         await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
-    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert [call[0] for call in server.calls].count("skyvern_click") == 1
 
 
 @pytest.mark.asyncio

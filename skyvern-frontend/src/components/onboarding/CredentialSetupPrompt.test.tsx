@@ -10,6 +10,11 @@ vi.mock("@/util/onboarding/credentialSetupTelemetry", () => ({
   },
 }));
 
+const { studioState } = vi.hoisted(() => ({ studioState: { enabled: true } }));
+vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
+  useWorkflowStudioEnabled: () => studioState.enabled,
+}));
+
 import { CredentialSetupTelemetry } from "@/util/onboarding/credentialSetupTelemetry";
 import { CredentialSetupPrompt } from "./CredentialSetupPrompt";
 
@@ -27,6 +32,7 @@ function renderPrompt(blocks: Array<{ label: string }>) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  studioState.enabled = true;
 });
 
 describe("CredentialSetupPrompt", () => {
@@ -40,6 +46,16 @@ describe("CredentialSetupPrompt", () => {
       "run_parameters",
       2,
     );
+
+    const cta = screen.getByRole("link", {
+      name: /set up credentials in the editor/i,
+    });
+    expect(cta.getAttribute("href")).toBe("/workflows/wpid_123/studio");
+  });
+
+  it("routes the CTA to /build when the studio preview is off", () => {
+    studioState.enabled = false;
+    renderPrompt([{ label: "Login" }]);
 
     const cta = screen.getByRole("link", {
       name: /set up credentials in the editor/i,

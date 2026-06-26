@@ -915,8 +915,31 @@ class NoIncrementalElementFoundForCustomSelection(SkyvernException):
 
 
 class NoAvailableOptionFoundForCustomSelection(SkyvernException):
-    def __init__(self, reason: str | None) -> None:
-        super().__init__(f"No available option to select. reason: {reason}.")
+    """Raised when the dropdown was populated but no option matched the requested target."""
+
+    def __init__(
+        self,
+        reason: str | None,
+        target_value: str | None = None,
+        observed_options: list[str] | None = None,
+    ) -> None:
+        observed_excerpt = observed_options[:5] if observed_options else []
+        observed_count = len(observed_options) if observed_options is not None else 0
+        parts = ["No available option to select.", "code=OPTION_NOT_AVAILABLE"]
+        if target_value:
+            parts.append(f"target_value={target_value!r}")
+        if observed_options is not None:
+            parts.append(f"observed_options_count={observed_count}")
+        if observed_excerpt:
+            parts.append(f"observed_options_excerpt={observed_excerpt}")
+        if reason:
+            parts.append(f"reason={reason!r}")
+        super().__init__(" ".join(parts))
+        self.code = "OPTION_NOT_AVAILABLE"
+        self.target_value = target_value
+        self.observed_options_count = observed_count
+        self.observed_options_excerpt = observed_excerpt
+        self.reason = reason
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
@@ -1269,3 +1292,11 @@ class ImaginarySecretValue(SkyvernException):
         super().__init__(
             f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )
+
+
+class CodeBlockRunnerSelectionError(SkyvernException):
+    """Raised when the secure CodeBlock runner selection policy cannot be evaluated safely.
+
+    The block-execution call site catches this and fails the block closed instead of
+    silently falling back to in-process execution.
+    """

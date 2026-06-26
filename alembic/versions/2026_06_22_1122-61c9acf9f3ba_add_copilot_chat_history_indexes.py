@@ -1,19 +1,17 @@
 """add copilot chat history indexes
 
-Revision ID: 3aa032781688
+Revision ID: 61c9acf9f3ba
 Revises: 58b0ced36529
-Create Date: 2026-06-22T16:16:41.251007+00:00
+Create Date: 2026-06-22 11:22:49.851792+00:00
 
 """
 
 from typing import Sequence, Union
 
-import sqlalchemy as sa
-
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "3aa032781688"
+revision: str = "61c9acf9f3ba"
 down_revision: Union[str, None] = "58b0ced36529"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

@@ -20,3 +20,7 @@ export const WORKFLOW_TAGGING_FLAG = "WORKFLOW_TAGGING";
 // Opt-in (0% base rollout) preview gating the workflows directory-tree view.
 // Not enrolled reads as disabled, so the default stays the flat folders/list.
 export const WORKFLOWS_DIRECTORY_TREE_FLAG = "WORKFLOWS_DIRECTORY_TREE";
+
+// Opt-in (0% base rollout) preview gating the redesigned workflow studio.
+// Not enrolled reads as disabled, so the default stays the legacy editor.
+export const WORKFLOW_STUDIO_FLAG = "workflow_studio_v2";

@@ -5,7 +5,7 @@ import {
   CrossCircledIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type ActionsApiResponse,
@@ -16,7 +16,11 @@ import {
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
-import { workflowBlockTitle } from "../editor/nodes/types";
+import {
+  CODE_BLOCK_FALLBACK_TITLE,
+  getCodeBlockTitle,
+  workflowBlockTitle,
+} from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
@@ -32,6 +36,7 @@ import {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
+import { findCodeStepForLine } from "../workflowBlockUtils";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
@@ -163,29 +168,54 @@ function formatActionDurationMs(durationMs: number): string {
 }
 
 type ActionRowPresentation = {
+  icon: ReactNode;
   label: string;
   summary: string | null;
+  tone: "default" | "error";
 };
 
-// Design C rows for code blocks: recorded actions summarize as
-// "<description> · line N · <duration>s"; the synthetic failure row
-// (failed null_action) is labeled Error instead of Screenshot.
+// Rows for code blocks summarize recorded actions as
+// "<plain-English step> · line N · <duration>s"; the synthetic failure row
+// (failed null_action) is labeled Error instead of Screenshot. The leading
+// text reuses the matched definition step's plain-English copy so a fired
+// action reads the same as the editor, falling back to the action's own
+// reasoning and finally to the readable action type chip.
 function getCodeActionRowPresentation(
   action: ActionsApiResponse,
+  matchedStep: CodeBlockStep | null,
 ): ActionRowPresentation {
   const isCodeError =
     action.status === Status.Failed &&
     action.action_type === ActionTypes.NullAction;
   const label = isCodeError
     ? "Error"
-    : getReadableActionType(action.action_type);
+    : getReadableActionType(action.action_type, { nullActionLabel: "Step" });
+  const icon = isCodeError ? (
+    <CrossCircledIcon className="size-3.5" />
+  ) : action.action_type === ActionTypes.NullAction ? (
+    <WorkflowBlockIcon workflowBlockType="code" className="size-3.5" />
+  ) : (
+    timelineActionIcons[action.action_type]
+  );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
+  const stepText =
+    !isCodeError && matchedStep
+      ? (normalizeInlineText(matchedStep.title) ??
+        normalizeInlineText(matchedStep.description))
+      : null;
   const parts = [
-    getActionSummary(action) ?? normalizeInlineText(action.description),
+    stepText ??
+      getActionSummary(action) ??
+      normalizeInlineText(action.description),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
-  return { label, summary: parts.length > 0 ? parts.join(" · ") : null };
+  return {
+    icon,
+    label,
+    summary: parts.length > 0 ? parts.join(" · ") : null,
+    tone: isCodeError ? "error" : "default",
+  };
 }
 
 function countSchemaFields(value: WorkflowRunBlock["data_schema"]): number {
@@ -256,6 +286,23 @@ function getTimelineTypeLabel(block: WorkflowRunBlock): string {
     default:
       return workflowBlockTitle[block.block_type];
   }
+}
+
+// getCodeBlockTitle ends at the bare "Code" label for prompt-less runs, which
+// dropped the reasoning subtitle the timeline used to show. Fall back to the
+// block reasoning (description) before bare "Code", normalized like a prompt.
+function getCodeBlockTimelineName(
+  block: WorkflowRunBlock,
+  steps: Array<CodeBlockStep>,
+): string {
+  const title = getCodeBlockTitle({ prompt: block.prompt, steps });
+  if (title !== CODE_BLOCK_FALLBACK_TITLE) {
+    return title;
+  }
+  const reasoning = normalizeInlineText(block.description);
+  return reasoning
+    ? getCodeBlockTitle({ prompt: reasoning, steps: [] })
+    : title;
 }
 
 function getLoopIterationGroups(
@@ -439,6 +486,7 @@ type TimelineActionRowsProps = {
   block: WorkflowRunBlock;
   activeItem: WorkflowRunOverviewActiveElement;
   depth: number;
+  codeSteps: Array<CodeBlockStep>;
   onActionClick: (action: ActionItem) => void;
   workflowRunIsFinalized?: boolean;
 };
@@ -447,6 +495,7 @@ function TimelineActionRows({
   block,
   activeItem,
   depth,
+  codeSteps,
   onActionClick,
   workflowRunIsFinalized,
 }: TimelineActionRowsProps) {
@@ -462,12 +511,19 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const icon = timelineActionIcons[action.action_type];
-        const { label, summary } = isCodeBlock
-          ? getCodeActionRowPresentation(action)
+        const { icon, label, summary, tone } = isCodeBlock
+          ? getCodeActionRowPresentation(
+              action,
+              findCodeStepForLine(
+                codeSteps,
+                getRecordedActionMeta(action).codeLine,
+              ),
+            )
           : {
+              icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
+              tone: "default" as const,
             };
 
         return (
@@ -504,7 +560,14 @@ function TimelineActionRows({
                 <span className="w-7 shrink-0 text-[10px] tabular-nums text-slate-500">
                   #{displayIndex}
                 </span>
-                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+                <span
+                  className={cn(
+                    "shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium",
+                    tone === "error"
+                      ? "border-rose-500/30 bg-rose-500/10 text-rose-300"
+                      : "border-slate-700 text-slate-400",
+                  )}
+                >
                   {label}
                 </span>
                 {summary && (
@@ -529,6 +592,40 @@ function formatCodeStepLines(step: CodeBlockStep): string | null {
     return `L${step.line_start}`;
   }
   return `L${step.line_start}-${step.line_end}`;
+}
+
+// The line where a code block stopped: use the synthetic error row's code line
+// (failed null_action) when present, and avoid inferring skipped definition
+// steps without that explicit failure marker.
+function getCodeBlockFailureLine(
+  actions: Array<ActionsApiResponse>,
+): number | null {
+  let errorLine: number | null = null;
+  for (const action of actions) {
+    const { codeLine } = getRecordedActionMeta(action);
+    if (codeLine === null) continue;
+    if (
+      action.action_type === ActionTypes.NullAction &&
+      action.status === Status.Failed
+    ) {
+      errorLine = errorLine === null ? codeLine : Math.max(errorLine, codeLine);
+    }
+  }
+  return errorLine;
+}
+
+// Definition steps whose code position is strictly after the failure line never
+// executed. Steps without a line position, or whose range starts at/before the
+// failure, are excluded — they either ran or were in progress when it stopped.
+function getUnfiredCodeSteps(
+  steps: Array<CodeBlockStep>,
+  actions: Array<ActionsApiResponse>,
+): Array<CodeBlockStep> {
+  const failureLine = getCodeBlockFailureLine(actions);
+  if (failureLine === null) return [];
+  return steps.filter(
+    (step) => step.line_start != null && step.line_start > failureLine,
+  );
 }
 
 type TimelineCodeStepRowsProps = {
@@ -579,7 +676,7 @@ function TimelineCodeStepRows({
                   #{index + 1}
                 </span>
                 <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
-                  {step.action_type}
+                  {getReadableActionType(step.action_type)}
                 </span>
                 {summary && (
                   <span className="min-w-0 flex-1 truncate text-slate-500">
@@ -591,6 +688,87 @@ function TimelineCodeStepRows({
                     {lines}
                   </span>
                 )}
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+type TimelineSkippedStepRowsProps = {
+  block: WorkflowRunBlock;
+  steps: Array<CodeBlockStep>;
+  depth: number;
+  onBlockItemClick: (block: WorkflowRunBlock) => void;
+};
+
+// Negative-space sibling of TimelineActionRows: when a code block fails partway,
+// its definition steps after the failure point never ran. Mirror the block-level
+// "didn't run" treatment (WorkflowRunTimelineUnexecutedBlockItem) one level down
+// — dimmed, hollow dashed marker, neutral slate (never the rose error tone).
+function TimelineSkippedStepRows({
+  block,
+  steps,
+  depth,
+  onBlockItemClick,
+}: TimelineSkippedStepRowsProps) {
+  if (steps.length === 0) return null;
+
+  return (
+    <div className="space-y-1 pb-1">
+      {steps.map((step, index) => {
+        const lines = formatCodeStepLines(step);
+        const summary =
+          normalizeInlineText(step.title) ??
+          normalizeInlineText(step.description);
+
+        return (
+          <div
+            key={`skipped-${index}`}
+            className="flex min-h-[24px] items-stretch text-xs opacity-60"
+          >
+            <IndentRails depth={depth} />
+            <div
+              className={cn(
+                "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
+                "hover:bg-slate-800/60",
+              )}
+              style={railHighlightStyle}
+            >
+              <div className="size-4 shrink-0" />
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onBlockItemClick(block);
+                }}
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+              >
+                <span
+                  className="size-2 shrink-0 rounded-full border border-dashed border-slate-500"
+                  aria-hidden="true"
+                />
+                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+                  {getReadableActionType(step.action_type)}
+                </span>
+                {summary && (
+                  <span className="min-w-0 flex-1 truncate text-slate-500">
+                    · {summary}
+                  </span>
+                )}
+                {lines && (
+                  <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                    {lines}
+                  </span>
+                )}
+                <span
+                  className="ml-auto shrink-0 rounded bg-slate-800 px-1 text-[10px] uppercase tracking-wide text-slate-400"
+                  title="This step did not execute because the code block stopped before reaching it."
+                >
+                  didn't run
+                </span>
               </button>
             </div>
           </div>
@@ -622,22 +800,39 @@ function WorkflowRunTimelineBlockItem({
     block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
   const blockTypeTitle = workflowBlockTitle[block.block_type];
   const blockTypeLabel = getTimelineTypeLabel(block);
-  const blockName = block.label ?? block.title ?? blockTypeTitle;
   const blockIndex = blockOrder?.get(block.workflow_run_block_id);
-  const descriptor = getTimelineDescriptor(block);
   const actions = block.actions ?? [];
   const actionCount = actions.length;
 
   const hasActions = actionCount > 0;
   const isCodeBlock = block.block_type === WorkflowBlockTypes.Code;
+  const definitionCodeSteps = isCodeBlock
+    ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
+    : [];
+  const blockName = isCodeBlock
+    ? getCodeBlockTimelineName(block, definitionCodeSteps)
+    : (block.label ?? block.title ?? blockTypeTitle);
+  const descriptor = isCodeBlock
+    ? (block.label ?? "Code block")
+    : getTimelineDescriptor(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
-  const codeSteps =
-    isCodeBlock && !hasActions
-      ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
-      : [];
+  const codeSteps = isCodeBlock && !hasActions ? definitionCodeSteps : [];
   const hasCodeSteps = codeSteps.length > 0;
+  // When a code block fails partway, the definition steps after the failure
+  // point left no action record — surface them as dimmed "didn't run" rows so
+  // the timeline shows what never executed, not just what did.
+  const blockFailed =
+    block.status === Status.Failed ||
+    block.status === Status.Terminated ||
+    block.status === Status.TimedOut ||
+    block.status === Status.Canceled;
+  const skippedCodeSteps =
+    isCodeBlock && blockFailed && hasActions
+      ? getUnfiredCodeSteps(definitionCodeSteps, actions)
+      : [];
+  const hasSkippedCodeSteps = skippedCodeSteps.length > 0;
   const isForLoopBlock = block.block_type === "for_loop";
   const isWhileLoopBlock = block.block_type === "while_loop";
   const isLoopBlock = isForLoopBlock || isWhileLoopBlock;
@@ -832,6 +1027,7 @@ function WorkflowRunTimelineBlockItem({
                 block={block}
                 activeItem={activeItem}
                 depth={depth + 1}
+                codeSteps={definitionCodeSteps}
                 onActionClick={onActionClick}
                 workflowRunIsFinalized={workflowRunIsFinalized}
               />
@@ -840,6 +1036,14 @@ function WorkflowRunTimelineBlockItem({
               <TimelineCodeStepRows
                 block={block}
                 steps={codeSteps}
+                depth={depth + 1}
+                onBlockItemClick={onBlockItemClick}
+              />
+            )}
+            {hasSkippedCodeSteps && (
+              <TimelineSkippedStepRows
+                block={block}
+                steps={skippedCodeSteps}
                 depth={depth + 1}
                 onBlockItemClick={onBlockItemClick}
               />

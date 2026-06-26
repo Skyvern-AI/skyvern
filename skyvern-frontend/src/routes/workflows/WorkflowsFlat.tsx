@@ -70,6 +70,9 @@ import React, {
   useState,
 } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "./studioNavigation";
 import { useDebounce } from "use-debounce";
 import {
   DropdownMenu,
@@ -88,6 +91,7 @@ import { HighlightText } from "./components/HighlightText";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { TagChipList } from "./components/tagging/TagChipList";
@@ -156,6 +160,7 @@ function WorkflowsFlat() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
@@ -412,6 +417,8 @@ function WorkflowsFlat() {
       ),
     [tagKeys],
   );
+  // (key, value) -> palette color for grouped tag chips.
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   // One batch fetch of current tags for every workflow on the page (no N+1).
   const workflowIds = useMemo(
@@ -783,6 +790,7 @@ function WorkflowsFlat() {
                 onChange={setTagFilters}
                 labelSuggestions={labelSuggestions}
                 valueSuggestionsByKey={valueSuggestionsByKey}
+                colors={tagColors}
               />
             ) : null}
           </div>
@@ -1034,6 +1042,7 @@ function WorkflowsFlat() {
                                 <TagChipList
                                   tags={workflowTags}
                                   descriptions={tagDescriptions}
+                                  colors={tagColors}
                                 />
                               ) : null}
                             </div>
@@ -1115,6 +1124,7 @@ function WorkflowsFlat() {
                                       valueSuggestionsByKey={
                                         valueSuggestionsByKey
                                       }
+                                      colorMap={tagColors}
                                     />
                                   ) : null}
                                 </>
@@ -1129,7 +1139,10 @@ function WorkflowsFlat() {
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
-                                          `/workflows/${workflow.workflow_permanent_id}/build`,
+                                          workflowEditorPath(
+                                            workflow.workflow_permanent_id,
+                                            studioEnabled,
+                                          ),
                                         );
                                       }}
                                     >

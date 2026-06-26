@@ -45,7 +45,6 @@ from skyvern.forge.sdk.copilot.config import (
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
-    POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     POST_UPDATE_NUDGE,
     PRE_DISCOVERY_URL_QUESTION_NUDGE,
@@ -76,6 +75,11 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     run_outcome_display_reason,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.terminal_predicates import (
+    artifact_health_blocked,
+    outcome_criteria_evaluated,
+    outcome_fully_verified,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
@@ -109,9 +113,6 @@ MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
 # longer willing to re-run extraction.
 MAX_SUSPICIOUS_SUCCESS_NUDGES = 2
-# Escalate after this many consecutive all-null extraction runs so the agent
-# inspects browser state instead of re-prompting the extractor.
-NULL_DATA_STREAK_ESCALATE_AT = 2
 # Streak levels for repeated-failure (same frontier + same failure signature).
 REPEATED_FRONTIER_STREAK_ESCALATE_AT = 2
 REPEATED_FRONTIER_STREAK_STOP_AT = 3
@@ -130,6 +131,15 @@ MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
 # trips the agent should already be at single-block granularity; further
 # trips fall through to the repeated-frontier escalation path.
 MAX_PER_TOOL_BUDGET_NUDGES = 2
+# Code-authoring guardrail churn: distinct-reject convergence backstop. An
+# accepted persist resets the counter, so this many unaccepted rejections is
+# pathological and leaves three free repair attempts before the halt fires —
+# far inside both the 900s budget and the SDK max-turns cap.
+MAX_CODE_AUTHORING_GUARDRAIL_REJECTS = 4
+# Credential-priority rejects defer to the credential-scout message until this
+# higher bound, which must stay above MAX_CODE_AUTHORING_GUARDRAIL_REJECTS so the
+# non-credential backstop and the low-count credential deferral are untouched.
+MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS = 8
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -310,6 +320,67 @@ def repair_ceiling_stop_signal(
     )
 
 
+def code_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "code_authoring_guardrail_reject_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "code_authoring_guardrail_churn", evidence, blocked_tool="update_workflow"
+    )
+    agent_steering = (
+        f"The generated code has been rejected {count} times without an accepted save; "
+        "stop rewriting it and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="code_authoring_guardrail_churn",
+        blocked_tool="update_workflow",
+    )
+
+
+def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "code_authoring_guardrail_reject_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "credential_priority_authoring_churn", evidence, blocked_tool="update_workflow"
+    )
+    agent_steering = (
+        f"The credential-scout gate has rejected the generated code {count} times without an accepted save; "
+        "stop rewriting it and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="credential_priority_authoring_churn",
+        blocked_tool="update_workflow",
+    )
+
+
+def _needs_code_authoring_churn_halt(ctx: Any) -> bool:
+    count = _get_int(ctx, "code_authoring_guardrail_reject_count")
+    if getattr(ctx, "last_code_authoring_reject_was_credential_priority", False) is True:
+        return count >= MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+    return count >= MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+
+
+def _churn_signal_if_halting(ctx: Any) -> CopilotToolBlockerSignal | None:
+    if not _needs_code_authoring_churn_halt(ctx):
+        return None
+    if getattr(ctx, "last_code_authoring_reject_was_credential_priority", False) is True:
+        return credential_priority_authoring_churn_stop_signal(ctx)
+    return code_authoring_churn_stop_signal(ctx)
+
+
 def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
     outcome = getattr(ctx, "last_run_outcome", None)
     if not isinstance(outcome, RecordedRunOutcome):
@@ -488,28 +559,7 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
 
 
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
-    result = ctx.completion_verification_result
-    return result is not None and result.status == "evaluated"
-
-
-def artifact_health_blocked(ctx: CopilotContext) -> bool:
-    reason = ctx.last_artifact_health_blocker_reason
-    return isinstance(reason, str) and bool(reason.strip())
-
-
-def outcome_fully_verified(ctx: CopilotContext) -> bool:
-    """The judge confirmed every outcome criterion from the evidence this run produced.
-
-    This evidence is authoritative over run status: a run that reached the goal is
-    recognized even when it was canceled or only partially completed. Run status must
-    never suppress recognition of an outcome the user can observe was achieved.
-    """
-    if artifact_health_blocked(ctx):
-        return False
-    if not _outcome_criteria_evaluated(ctx):
-        return False
-    result = ctx.completion_verification_result
-    return result is not None and result.is_fully_satisfied()
+    return outcome_criteria_evaluated(ctx)
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
@@ -1117,17 +1167,6 @@ def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
     return _get_int(ctx, "probable_site_block_stop_nudge_count") < MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
 
 
-def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
-    """Return True when suspicious-success has happened enough times to escalate."""
-    # Same as above: non-retriable nav state never belongs on this branch.
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return False
-    if not getattr(ctx, "last_test_suspicious_success", False):
-        return False
-    streak = getattr(ctx, "null_data_streak_count", 0)
-    return streak >= NULL_DATA_STREAK_ESCALATE_AT
-
-
 def _get_int(ctx: Any, name: str, default: int = 0) -> int:
     value = getattr(ctx, name, default)
     return value if isinstance(value, int) else default
@@ -1193,12 +1232,16 @@ def _check_enforcement(
     result: RunResultStreaming | None = None,
     config: CopilotConfig | None = None,
 ) -> str | None:
+    verified = outcome_fully_verified(ctx)
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
     terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
     if terminal_signal is not None:
         stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
+
+    if verified:
+        raise CopilotGoalSatisfied()
 
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
@@ -1211,7 +1254,7 @@ def _check_enforcement(
             signal,
             consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
         )
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
@@ -1241,7 +1284,7 @@ def _check_enforcement(
         return None
 
     _maybe_stash_terminal_challenge_halt(ctx)
-    raise_if_turn_halt(ctx)
+    raise_if_turn_halt(ctx, verified=verified)
 
     # If the last run had confirmed challenge evidence, do not misdiagnose a
     # challenge-solving loop as a long-chain budgeting problem.
@@ -1276,9 +1319,6 @@ def _check_enforcement(
     # Do NOT clear last_test_suspicious_success here. tools._record_run_blocks_result
     # resets it on every new run; if the agent ignores the nudge and answers
     # without rerunning, we want _check_enforcement to re-emit the nudge.
-    if _needs_repeated_null_data_nudge(ctx):
-        return _nudge(config, "post_repeated_null_data")
-
     if _needs_suspicious_success_nudge(ctx):
         ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
         return _nudge(config, "post_suspicious_success")
@@ -1291,13 +1331,25 @@ def _check_enforcement(
         signal = _probable_site_block_stop_signal(ctx, config)
         stash_blocker_signal(ctx, signal)
         stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        raise_if_turn_halt(ctx)
+        raise_if_turn_halt(ctx, verified=verified)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
         if _needs_inspect_before_repair_nudge(ctx):
             return _nudge(config, "post_failed_test_inspect_first")
         return _nudge(config, "post_failed_test")
+
+    # The convergence floor for code-authoring guardrail churn. It is the last
+    # halt so every genuinely-terminal stop and recoverable nudge above gets its
+    # turn first. The permanent non-retriable nav raise is the one stop ordering
+    # cannot front-run (it lives after _check_enforcement returns None, at the
+    # run_with_enforcement return sites), so the floor yields to it explicitly.
+    if not getattr(ctx, "last_test_non_retriable_nav_error", None):
+        churn_signal = _churn_signal_if_halting(ctx)
+        if churn_signal is not None:
+            stash_blocker_signal(ctx, churn_signal)
+            stash_turn_halt_from_blocker_signal(ctx, churn_signal, source="enforcement_backstop")
+            raise_if_turn_halt(ctx)
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
     # (always allowed) from a REPLY with a coverage gap or progress-narration.
@@ -1587,7 +1639,6 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_NAVIGATE_NUDGE: "post_navigate",
     POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE: "explore_without_workflow",
     POST_SUSPICIOUS_SUCCESS_NUDGE: "suspicious_success",
-    POST_REPEATED_NULL_DATA_NUDGE: "repeated_null_data",
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE: "repeated_frontier_failure_warn",
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE: "repeated_frontier_failure_stop",
     POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE: "non_retriable_nav_error_stop",
@@ -1611,7 +1662,6 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_navigate": "post_navigate",
     "post_explore_without_workflow": "explore_without_workflow",
     "post_suspicious_success": "suspicious_success",
-    "post_repeated_null_data": "repeated_null_data",
     "post_repeated_frontier_failure_warn": "repeated_frontier_failure_warn",
     "post_repeated_frontier_failure_stop": "repeated_frontier_failure_stop",
     "post_non_retriable_nav_error_stop": "non_retriable_nav_error_stop",

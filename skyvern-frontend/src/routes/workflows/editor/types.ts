@@ -20,6 +20,7 @@ export type SkyvernCredential = {
   description?: string | null;
   parameterType: "credential";
   credentialId: string;
+  dataType?: typeof WorkflowParameterValueType.CredentialId;
 };
 
 export type OnePasswordCredential = {

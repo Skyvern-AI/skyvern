@@ -12,6 +12,10 @@ metadata:
   - Credit card credentials: ``last_four``, ``brand``
   - Secret credentials: ``secret_label``
 
+The one narrow exception is ``GET /credentials/{credential_id}/totp-code``,
+which may return a transient current authenticator code derived from a stored
+TOTP seed. It must never return the seed itself.
+
 This is enforced by the ``*CredentialResponse`` Pydantic models and the
 ``_convert_to_response()`` helper. When adding new credential types or
 modifying existing ones, ensure that:
@@ -28,10 +32,13 @@ exact threat the vault architecture is designed to prevent.
 
 import asyncio
 import json
+import time
+from dataclasses import dataclass
 from typing import Annotated
 
+import pyotp
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
 from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
@@ -67,12 +74,14 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialResponse,
+    CredentialTotpCodeResponse,
     CredentialType,
     CredentialVaultType,
     CreditCardCredentialResponse,
     NonEmptyPasswordCredential,
     OnePasswordItemOverview,
     OnePasswordItemsResponse,
+    PasswordCredential,
     PasswordCredentialResponse,
     SecretCredentialResponse,
     TestCredentialRequest,
@@ -80,6 +89,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TestCredentialStatusResponse,
     TestLoginRequest,
     TestLoginResponse,
+    TotpType,
     UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import (
@@ -102,6 +112,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCrea
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credentials import parse_totp_config
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -145,6 +156,132 @@ _ORG_AUTH_CREDENTIAL_TOKEN_TYPES = {
 _SESSION_PERSIST_MAX_WAIT_SECONDS = (_SESSION_PERSIST_MAX_RETRIES - 1) * _SESSION_PERSIST_RETRY_INTERVAL_SECONDS
 # Buffer over the max wait so the status endpoint doesn't misreport while the task still retries.
 _PROFILE_GRACE_PERIOD_HEADROOM_SECONDS = 15
+_AUTHENTICATOR_SECRET_REQUIRED_DETAIL = (
+    "Authenticator key is required. Paste the raw setup key or full otpauth:// URI from the website's 2FA setup screen."
+)
+_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
+    "Invalid authenticator key. Paste the raw Base32 setup key or full otpauth:// URI "
+    "from the website's 2FA setup screen."
+)
+_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
+    "Saved authenticator key is invalid. Edit the credential and paste the raw setup key "
+    "or full otpauth:// URI from the website's 2FA setup screen."
+)
+_TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
+
+
+@dataclass(frozen=True)
+class _TotpCodePreviewCacheEntry:
+    code: str
+    expires_at: int
+
+
+_TOTP_CODE_PREVIEW_CACHE: dict[tuple[str, str], _TotpCodePreviewCacheEntry] = {}
+# Best-effort, per-process UX cache. Correctness never depends on sharing this
+# across workers; entries are bounded and expire at the active TOTP window.
+
+
+def _parse_authenticator_totp_config_or_raise(
+    totp_secret: str | None,
+    *,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> tuple[pyotp.TOTP, str]:
+    raw_totp_secret = (totp_secret or "").strip()
+    if raw_totp_secret == "":
+        raise HTTPException(status_code=400, detail=missing_detail)
+
+    normalized_input = "".join(raw_totp_secret.split())
+    totp = parse_totp_config(normalized_input)
+    if not totp:
+        raise HTTPException(status_code=400, detail=invalid_detail)
+    normalized_totp_secret = normalized_input if normalized_input.lower().startswith("otpauth://") else totp.secret
+    return totp, normalized_totp_secret
+
+
+def _build_authenticator_totp_or_raise(
+    totp_secret: str | None,
+    *,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> pyotp.TOTP:
+    totp, _ = _parse_authenticator_totp_config_or_raise(
+        totp_secret,
+        missing_detail=missing_detail,
+        invalid_detail=invalid_detail,
+    )
+    return totp
+
+
+def _parse_authenticator_totp_or_raise(
+    totp_secret: str | None,
+    *,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> str:
+    _, normalized_totp_secret = _parse_authenticator_totp_config_or_raise(
+        totp_secret,
+        missing_detail=missing_detail,
+        invalid_detail=invalid_detail,
+    )
+    return normalized_totp_secret
+
+
+def _normalize_authenticator_totp_or_raise(credential: PasswordCredential | TestLoginRequest) -> None:
+    if credential.totp_type != TotpType.AUTHENTICATOR:
+        return
+
+    credential.totp = _parse_authenticator_totp_or_raise(credential.totp)
+
+
+def _get_cached_totp_code_preview(
+    *,
+    organization_id: str,
+    credential_id: str,
+    now: int,
+) -> CredentialTotpCodeResponse | None:
+    cache_key = (organization_id, credential_id)
+    cached = _TOTP_CODE_PREVIEW_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    if cached.expires_at <= now:
+        _TOTP_CODE_PREVIEW_CACHE.pop(cache_key, None)
+        return None
+    return CredentialTotpCodeResponse(code=cached.code, seconds_remaining=cached.expires_at - now)
+
+
+def _clear_cached_totp_code_preview(*, organization_id: str, credential_id: str) -> None:
+    """Clear this worker's best-effort preview cache entry after a mutation.
+
+    The cache is intentionally per-process UX protection for repeated preview
+    reads. Other workers can keep serving the previous within-window code or
+    error until the active TOTP window expires.
+    """
+    _TOTP_CODE_PREVIEW_CACHE.pop((organization_id, credential_id), None)
+
+
+def _prune_totp_code_preview_cache(*, now: int) -> None:
+    for cache_key, cached in list(_TOTP_CODE_PREVIEW_CACHE.items()):
+        if cached.expires_at <= now:
+            _TOTP_CODE_PREVIEW_CACHE.pop(cache_key, None)
+
+
+def _cache_totp_code_preview(
+    *,
+    organization_id: str,
+    credential_id: str,
+    code: str,
+    now: int,
+    expires_at: int,
+) -> None:
+    _prune_totp_code_preview_cache(now=now)
+    while len(_TOTP_CODE_PREVIEW_CACHE) >= _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES:
+        _TOTP_CODE_PREVIEW_CACHE.pop(next(iter(_TOTP_CODE_PREVIEW_CACHE)))
+
+    _TOTP_CODE_PREVIEW_CACHE[(organization_id, credential_id)] = _TotpCodePreviewCacheEntry(
+        code=code,
+        expires_at=expires_at,
+    )
 
 
 async def fetch_credential_item_background(item_id: str) -> None:
@@ -360,6 +497,9 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
+    if isinstance(data.credential, NonEmptyPasswordCredential):
+        _normalize_authenticator_totp_or_raise(data.credential)
+
     credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
 
     try:
@@ -580,6 +720,7 @@ async def test_login(
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
     organization_id = current_org.organization_id
+    _normalize_authenticator_totp_or_raise(data)
 
     # Create a temporary credential
     create_request = CreateCredentialRequest(
@@ -1208,12 +1349,28 @@ async def _create_browser_profile_after_workflow(
 
             # Session persistence lags the run reaching completed (see clean_up_workflow),
             # so retrieval retries on a budget sized to that lag.
+            workflow = await app.DATABASE.workflows.get_workflow(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+            )
+            if not workflow:
+                LOG.warning(
+                    "Workflow not found during browser profile creation",
+                    credential_id=credential_id,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
+                return
+            browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
+                workflow=workflow,
+                workflow_run=workflow_run,
+            )
             session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
                 session_dir = await app.STORAGE.retrieve_browser_session(
                     organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_permanent_id=browser_session_storage_key,
                 )
                 if session_dir:
                     break
@@ -1380,6 +1537,9 @@ async def update_credential(
     if not existing_credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
+    if isinstance(data.credential, NonEmptyPasswordCredential):
+        _normalize_authenticator_totp_or_raise(data.credential)
+
     vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
     if not credential_service:
@@ -1410,6 +1570,8 @@ async def update_credential(
 
     if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
         background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
+
+    _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
 
     return _convert_to_response(updated_credential)
 
@@ -1478,7 +1640,100 @@ async def delete_credential(
             credential.organization_id,
         )
 
+    _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
+
     return None
+
+
+@base_router.get(
+    "/credentials/{credential_id}/totp-code",
+    response_model=CredentialTotpCodeResponse,
+    summary="Get current credential TOTP code",
+    description="Returns the current generated authenticator code for a password credential.",
+    tags=["Credentials"],
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/{credential_id}/totp-code/",
+    response_model=CredentialTotpCodeResponse,
+    include_in_schema=False,
+)
+async def get_credential_totp_code(
+    response: Response,
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential",
+        examples=["cred_1234567890"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialTotpCodeResponse:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+    credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    if credential.credential_type != CredentialType.PASSWORD or credential.totp_type != TotpType.AUTHENTICATOR:
+        raise HTTPException(status_code=400, detail="This credential does not have an authenticator app configured.")
+
+    now = int(time.time())
+    cached_response = _get_cached_totp_code_preview(
+        organization_id=current_org.organization_id,
+        credential_id=credential_id,
+        now=now,
+    )
+    if cached_response is not None:
+        return cached_response
+
+    credential_service = await _get_credential_vault_service(vault_type_override=credential.vault_type)
+    try:
+        credential_item = await credential_service.get_credential_item(credential)
+    except SkyvernHttpException as e:
+        detail = (
+            f"Custom credential service returned {e.error_message}"
+            if e.error_message
+            else f"Custom credential service returned HTTP {e.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=detail)
+    except Exception as e:
+        LOG.exception(
+            "Failed to retrieve credential item for TOTP code preview",
+            credential_id=credential_id,
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail="Unable to retrieve credential from vault") from e
+
+    if not isinstance(credential_item.credential, PasswordCredential):
+        raise HTTPException(status_code=400, detail="This credential does not have an authenticator app configured.")
+
+    try:
+        totp = _build_authenticator_totp_or_raise(
+            credential_item.credential.totp,
+            missing_detail=_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
+            invalid_detail=_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
+        )
+    except HTTPException:
+        LOG.warning(
+            "Saved authenticator key is invalid for TOTP code preview",
+            credential_id=credential_id,
+            organization_id=current_org.organization_id,
+            vault_type=credential.vault_type,
+        )
+        raise
+
+    expires_at = ((now // totp.interval) + 1) * totp.interval
+    code = totp.at(now)
+    _cache_totp_code_preview(
+        organization_id=current_org.organization_id,
+        credential_id=credential_id,
+        code=code,
+        now=now,
+        expires_at=expires_at,
+    )
+    return CredentialTotpCodeResponse(code=code, seconds_remaining=expires_at - now)
 
 
 @legacy_base_router.get("/credentials/{credential_id}")

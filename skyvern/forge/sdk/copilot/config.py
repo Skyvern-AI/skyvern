@@ -126,24 +126,6 @@ POST_SUSPICIOUS_SUCCESS_NUDGE = (
     "status alone. Verify the actual extracted data answers the user's question."
 )
 
-POST_REPEATED_NULL_DATA_NUDGE = (
-    "STOP — you have now produced multiple consecutive test runs where "
-    "extraction/text_prompt blocks returned all-null or empty data. "
-    "Re-prompting the extractor is not working — the problem is almost "
-    "certainly NOT how the extraction goal is worded.\n"
-    "You MUST now do ONE of the following before another update_workflow call:\n"
-    "1. Call get_browser_screenshot on the workflow's browser session to see "
-    "exactly what page the workflow is actually loading (it may differ from "
-    "what you expect — e.g. a 'no results' fallback, cookie wall, or bot block).\n"
-    "2. Call evaluate with JavaScript that searches for the expected content "
-    "on the workflow's browser — confirm whether the data is even present.\n"
-    "3. If the page the workflow loads genuinely does not contain the data, "
-    "pivot to a different URL or source entirely — do NOT keep retrying "
-    "extraction against the same failing page.\n"
-    "Do NOT call update_and_run_blocks again until you have concrete evidence "
-    "about what the workflow browser is actually seeing."
-)
-
 POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE = (
     "STOP — this is the second run with the same frontier and the same failure "
     "signature. Re-running the same change again is unlikely to help.\n"
@@ -349,7 +331,6 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_failed_test_inspect_first": POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
     "post_suspicious_success": POST_SUSPICIOUS_SUCCESS_NUDGE,
-    "post_repeated_null_data": POST_REPEATED_NULL_DATA_NUDGE,
     "post_repeated_frontier_failure_warn": POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
     "post_repeated_frontier_failure_stop": POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     "post_parameter_binding_warn": POST_PARAMETER_BINDING_WARN_NUDGE,
@@ -385,6 +366,7 @@ class CopilotConfig:
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     impose_synthesized_code_block: bool = False
+    requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

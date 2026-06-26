@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -78,8 +79,19 @@ class CompletionVerificationResult:
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
             return False
-        satisfied = {verdict.criterion_id for verdict in self.verdicts if verdict.satisfied}
-        return all(criterion_id in satisfied for criterion_id in self.criterion_ids)
+        verdict_by_id = {verdict.criterion_id: verdict for verdict in self.verdicts}
+        satisfied_count = 0
+        for criterion_id in self.criterion_ids:
+            verdict = verdict_by_id.get(criterion_id)
+            if verdict is not None and verdict.satisfied:
+                satisfied_count += 1
+                continue
+            # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
+            # so it must not veto a run whose observable outcome evidence is fully confirmed.
+            if verdict is not None and _is_definition_plane_abstention(verdict):
+                continue
+            return False
+        return satisfied_count > 0
 
     def to_trace_data(self) -> dict[str, Any]:
         unmet = [verdict for verdict in self.verdicts if not verdict.satisfied]
@@ -240,7 +252,8 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
             flags += " (implicit)"
         if criterion.method_mandated:
             flags += " (method_mandated)"
-        parts.append(f"- {criterion.id}: {criterion.outcome}{flags}")
+        output_path = f" [required_output_path={criterion.output_path}]" if criterion.output_path else ""
+        parts.append(f"- {criterion.id}: {criterion.outcome}{output_path}{flags}")
     return "\n".join(parts)
 
 
@@ -388,12 +401,12 @@ def grade_definition_criteria(criteria: list[CompletionCriterion], workflow_yaml
             )
             continue
         defined, referenced = reference_state
+        named = _named_definition_inputs(criterion.outcome)
         if defined and referenced:
             # When the criterion names specific inputs, each must match a defined
             # parameter key; one stray parameter must not satisfy a multi-input ask.
             # An unmatchable name degrades to unknown, not unsatisfied — extraction
             # is heuristic and a false negative would drive repair of correct YAML.
-            named = _named_definition_inputs(criterion.outcome)
             normalized_keys = [_normalize_input_phrase(key) for key in defined]
             if named and not all(_input_matches_any_key(candidate, normalized_keys) for candidate in named):
                 verdicts.append(
@@ -409,6 +422,13 @@ def grade_definition_criteria(criteria: list[CompletionCriterion], workflow_yaml
                     reason_code="definition_parameters_referenced",
                     evidence_ref="workflow_yaml:" + ",".join(referenced[:8]),
                 )
+            )
+        elif not named:
+            # A reusable-inputs hint with no specific named inputs cannot be proven
+            # false: a read-only/validation workflow legitimately defines none, so a
+            # missing/unreferenced parameter set abstains rather than sinking the run.
+            verdicts.append(
+                CriterionVerdict(criterion_id=criterion.id, state="unknown", reason_code="definition_parameters_absent")
             )
         elif defined:
             verdicts.append(
@@ -433,18 +453,25 @@ _ISO_DATE_LITERAL_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 # A bare digit run qualifies as an identifier only at >=5 digits: a 4-digit run is
 # usually a year and too low-specificity to credit on a coincidental output match.
 _LONG_DIGIT_LITERAL_RE = re.compile(r"\b\d{5,}\b")
+# A mixed alphanumeric code (e.g. WTR-1842-DEMO, ABC12345) credits only via the
+# letter+digit, >=6 alnum filter below, which excludes bare words and bare years.
+_STRUCTURED_ID_LITERAL_RE = re.compile(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\b")
 
 
 def _normalize_present_value(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
+def _is_structured_identifier(token: str) -> bool:
+    alnum = [ch for ch in token if ch.isalnum()]
+    return len(alnum) >= 6 and any(ch.isalpha() for ch in alnum) and any(ch.isdigit() for ch in alnum)
+
+
 def _extract_present_value_literals(outcome: str) -> list[str]:
-    literals: list[str] = []
-    for match in _QUOTED_LITERAL_RE.finditer(outcome):
-        literals.append(match.group(1))
+    literals: list[str] = [match.group(1) for match in _QUOTED_LITERAL_RE.finditer(outcome)]
     for pattern in (_CURRENCY_LITERAL_RE, _ISO_DATE_LITERAL_RE, _LONG_DIGIT_LITERAL_RE):
         literals.extend(pattern.findall(outcome))
+    literals.extend(token for token in _STRUCTURED_ID_LITERAL_RE.findall(outcome) if _is_structured_identifier(token))
     normalized: list[str] = []
     seen: set[str] = set()
     for literal in literals:
@@ -529,7 +556,574 @@ def grade_present_value_criteria(
     return verdicts
 
 
+def grade_record_semantic_consistency(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    """Deterministically reject internally contradictory structured-record status outputs."""
+
+    criterion = next(iter(_status_consistency_criterion(criteria)), None)
+    if criterion is None:
+        return []
+
+    for label, payload in snapshot.block_outputs.items():
+        contradiction = _structured_record_contradiction(payload)
+        if contradiction:
+            return [
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unsatisfied",
+                    reason_code="evidence_contradicts",
+                    evidence_ref=f"block_outputs:{label}",
+                    missing_evidence=contradiction,
+                )
+            ]
+    return []
+
+
+_STRUCTURED_RECORD_CRITERION_IDS = frozenset(
+    {
+        "fallback_record_identity",
+        "fallback_record_identifier",
+        "fallback_record_groups",
+        "fallback_record_status",
+    }
+)
+
+
+def grade_structured_record_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    """Deterministically credit generic structured-record fallback criteria.
+
+    Single-block-wins: a criterion set is credited only when one block satisfies it.
+    Verdicts are never merged across blocks because a structured record is a single
+    coherent record, and crediting fields drawn from different blocks could certify a
+    record the run never produced as a whole.
+    """
+
+    criteria_by_id = {
+        criterion.id: criterion for criterion in criteria if criterion.id in _STRUCTURED_RECORD_CRITERION_IDS
+    }
+    if not criteria_by_id:
+        return []
+    best_verdicts: list[CriterionVerdict] = []
+    for label, payload in snapshot.block_outputs.items():
+        record = _structured_record_payload(payload)
+        if record is None:
+            continue
+        verdicts: list[CriterionVerdict] = []
+        if "fallback_record_identity" in criteria_by_id and structured_record_has_identity(record):
+            verdicts.append(_structured_record_satisfied("fallback_record_identity", label))
+        if "fallback_record_identifier" in criteria_by_id and _structured_record_has_identifier(record):
+            verdicts.append(_structured_record_satisfied("fallback_record_identifier", label))
+        if "fallback_record_groups" in criteria_by_id and _structured_record_has_group_entries(record):
+            verdicts.append(_structured_record_satisfied("fallback_record_groups", label))
+        if "fallback_record_status" in criteria_by_id:
+            contradiction = _structured_record_contradiction(record)
+            if contradiction:
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id="fallback_record_status",
+                        state="unsatisfied",
+                        reason_code="evidence_contradicts",
+                        evidence_ref=f"block_outputs:{label}",
+                        missing_evidence=contradiction,
+                    )
+                )
+            elif _structured_record_has_status(record):
+                verdicts.append(_structured_record_satisfied("fallback_record_status", label))
+        if verdicts:
+            if len(verdicts) == len(criteria_by_id):
+                return verdicts
+            if len(verdicts) > len(best_verdicts):
+                best_verdicts = verdicts
+    return best_verdicts
+
+
+_TERMINAL_ACTION_KEY_TOKENS = (
+    (("submitted",), "submission"),
+    (("request", "submitted"), "request"),
+    (("application", "submitted"), "application"),
+    (("form", "submitted"), "form"),
+    (("order", "placed"), "order"),
+)
+_TERMINAL_ARTIFACT_KEY_TOKENS = (
+    (("confirmation", "number"), "confirmation"),
+    (("confirmation", "id"), "confirmation"),
+    (("request", "number"), "request"),
+    (("request", "id"), "request"),
+    (("submission", "id"), "submission"),
+    (("submission", "number"), "submission"),
+    (("application", "number"), "application"),
+    (("application", "id"), "application"),
+    (("order", "number"), "order"),
+    (("order", "id"), "order"),
+    (("receipt", "number"), "receipt"),
+    (("receipt", "id"), "receipt"),
+    (("reference", "number"), "reference"),
+    (("reference", "id"), "reference"),
+)
+_TERMINAL_CRITERION_VERBS = frozenset({"submit", "submitted", "submission", "place", "placed"})
+_TERMINAL_CRITERION_ABSTAIN_TOKENS = frozenset(
+    {
+        "lookup",
+        "looked",
+        "retrieve",
+        "retrieved",
+        "retrieval",
+        "return",
+        "returned",
+        "status",
+    }
+)
+_NEGATIVE_GUARD_TOKENS = frozenset({"blocker", "error", "failure", "failed", "challenge"})
+_NEGATIVE_TERMINAL_STATUS_VALUES = frozenset(
+    {
+        "blocked",
+        "cancelled",
+        "canceled",
+        "captcha required",
+        "denied",
+        "error",
+        "failed",
+        "failure",
+        "incomplete",
+        "not submitted",
+        "timeout",
+        "unable",
+    }
+)
+_TERMINAL_RECORD_FAMILY_ARTIFACTS = {
+    "request": frozenset({"confirmation", "reference", "request", "submission"}),
+    "application": frozenset({"application", "confirmation", "reference", "submission"}),
+    "form": frozenset({"confirmation", "reference", "submission"}),
+    "order": frozenset({"order", "receipt"}),
+}
+_TERMINAL_RECORD_FAMILY_ACTIONS = {
+    "request": frozenset({"request", "submission"}),
+    "application": frozenset({"application", "submission"}),
+    "form": frozenset({"form", "submission"}),
+    "order": frozenset({"order"}),
+}
+
+
+def grade_terminal_goal_record_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    verdicts: list[CriterionVerdict] = []
+    eligible_criteria = [
+        (criterion, family)
+        for criterion in criteria
+        if (family := _terminal_goal_criterion_family(criterion.outcome)) is not None
+    ]
+    if not eligible_criteria:
+        return []
+    for label, payload in snapshot.block_outputs.items():
+        record = _structured_record_payload(payload)
+        if record is None:
+            continue
+        for criterion, family in eligible_criteria:
+            if _terminal_goal_record_confirmed(record, family):
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="satisfied",
+                        reason_code="evidence_confirms",
+                        evidence_ref=f"block_outputs:{label}",
+                    )
+                )
+        if verdicts:
+            return verdicts
+    return []
+
+
+def _terminal_goal_criterion_family(outcome: str) -> str | None:
+    if _extract_present_value_literals(outcome):
+        return None
+    tokens = set(_status_word_tokens(outcome))
+    if tokens & _TERMINAL_CRITERION_ABSTAIN_TOKENS:
+        return None
+    if not tokens & _TERMINAL_CRITERION_VERBS:
+        return None
+    families = [family for family in ("request", "application", "form", "order") if family in tokens]
+    if len(families) != 1:
+        return None
+    family = families[0]
+    if family == "order" and "placed" not in tokens:
+        return None
+    return family
+
+
+def _terminal_goal_record_confirmed(record: dict[str, Any], family: str) -> bool:
+    if _terminal_goal_record_has_negative_guard(record):
+        return False
+    if _structured_record_contradiction(record):
+        return False
+    action_families = [
+        action_family
+        for key, value in _walk_record_scalars(record)
+        if (action_family := _terminal_action_family_for_key(key)) is not None and value is True
+    ]
+    if any(
+        value is False
+        for key, value in _walk_record_scalars(record)
+        if _terminal_action_family_for_key(key) is not None
+    ):
+        return False
+    has_family_artifact = _terminal_goal_record_has_artifact_for_family(record, family)
+    if not action_families:
+        return has_family_artifact and not _terminal_goal_record_has_generic_success_claim(record)
+    if family not in _TERMINAL_RECORD_FAMILY_ACTIONS:
+        return False
+    if not any(action_family in _TERMINAL_RECORD_FAMILY_ACTIONS[family] for action_family in action_families):
+        return False
+    return has_family_artifact
+
+
+def _terminal_action_family_for_key(key: str) -> str | None:
+    leaf_tokens = _record_key_leaf_tokens(key)
+    for key_tokens, family in _TERMINAL_ACTION_KEY_TOKENS:
+        if leaf_tokens == key_tokens:
+            return family
+    return None
+
+
+def _terminal_goal_record_has_generic_success_claim(record: dict[str, Any]) -> bool:
+    generic_success_keys = {
+        ("completed",),
+        ("succeeded",),
+        ("success",),
+    }
+    for key, value in _walk_record_scalars(record):
+        leaf_tokens = _record_key_leaf_tokens(key)
+        if value is True and _terminal_action_family_for_key(key) is None and leaf_tokens:
+            if leaf_tokens[-1] in _TERMINAL_CRITERION_VERBS:
+                return True
+        if leaf_tokens in generic_success_keys and value is True:
+            return True
+        if "status" in _key_word_tokens(key) and isinstance(value, str):
+            polarity = _status_polarity(value)
+            if polarity is not None and not polarity[0]:
+                return True
+    return False
+
+
+def _terminal_goal_record_has_negative_guard(record: dict[str, Any]) -> bool:
+    for key, value in _walk_record_scalars(record):
+        tokens = _key_word_tokens(key)
+        if tokens & _NEGATIVE_GUARD_TOKENS and _is_meaningful_record_value(value) and value is not False:
+            return True
+        if "status" in tokens and isinstance(value, str):
+            normalized_status = _normalize_present_value(value)
+            if normalized_status in _NEGATIVE_TERMINAL_STATUS_VALUES or any(
+                phrase in normalized_status for phrase in ("captcha required", "not submitted", "unable")
+            ):
+                return True
+            polarity = _status_polarity(value)
+            if polarity is not None and polarity[0]:
+                return True
+    return False
+
+
+def _terminal_goal_record_has_artifact_for_family(record: dict[str, Any], family: str) -> bool:
+    allowed_artifacts = _TERMINAL_RECORD_FAMILY_ARTIFACTS[family]
+    for key, value in _walk_record_scalars(record):
+        if isinstance(value, bool) or not _is_meaningful_record_value(value):
+            continue
+        leaf_tokens = _record_key_leaf_tokens(key)
+        for key_tokens, artifact_family in _TERMINAL_ARTIFACT_KEY_TOKENS:
+            if leaf_tokens == key_tokens and artifact_family in allowed_artifacts:
+                return True
+    return False
+
+
+def _record_key_leaf_tokens(key: str) -> tuple[str, ...]:
+    leaf = re.sub(r"\[\d+\]$", "", key.rsplit(".", 1)[-1])
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", leaf).casefold()
+    return tuple(re.findall(r"[a-z0-9]+", spaced))
+
+
+def _structured_record_satisfied(criterion_id: str, label: str) -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=criterion_id,
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref=f"block_outputs:{label}",
+    )
+
+
+def _structured_record_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    for key, value in payload.items():
+        if (
+            isinstance(key, str)
+            and key.endswith("_output")
+            and isinstance(value, dict)
+            and _looks_like_structured_record(value)
+        ):
+            return value
+    if _looks_like_structured_record(payload):
+        return payload
+    return None
+
+
+def _looks_like_structured_record(value: dict[str, Any]) -> bool:
+    return (
+        structured_record_has_identity(value)
+        or _structured_record_has_identifier(value)
+        or _structured_record_has_group_entries(value)
+        or _structured_record_has_status(value)
+    )
+
+
+def structured_record_has_identity(record: dict[str, Any]) -> bool:
+    if any(value is True for key, value in record.items() if isinstance(key, str) and key.endswith("_found")):
+        return True
+    return any(
+        isinstance(value, str) and bool(value.strip())
+        for key, value in record.items()
+        if isinstance(key, str) and _key_has_identity_token(key)
+    )
+
+
+def _key_has_identity_token(key: str) -> bool:
+    normalized_key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", key).casefold().replace("_", " ")
+    return any(
+        re.search(rf"(?:^|[^a-z0-9]){re.escape(token)}(?:$|[^a-z0-9])", normalized_key)
+        for token in ("name", "title", "entity", "label")
+    )
+
+
+def structured_record_has_goal_content(record: dict[str, Any]) -> bool:
+    """Return True only when a structured record has the full terminal-proof shape."""
+
+    if (
+        not structured_record_has_identity(record)
+        or not _structured_record_has_identifier(record)
+        or not _record_summary_status(record)
+    ):
+        return False
+    return any(
+        bool(status.strip())
+        and any(
+            _is_meaningful_record_value(item_value)
+            for item_key, item_value in item.items()
+            if not (isinstance(item_key, str) and "status" in item_key.casefold())
+        )
+        for status, item in _record_row_statuses(record)
+    )
+
+
+def _key_word_tokens(key: str) -> set[str]:
+    """Split a (possibly dotted/camelCase) record key path into whole-word tokens."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", key).casefold()
+    return set(re.findall(r"[a-z0-9]+", spaced))
+
+
+def _structured_record_has_identifier(record: dict[str, Any]) -> bool:
+    for key, value in _walk_record_scalars(record):
+        value_text = str(value)
+        digit_runs = "".join(ch if ch.isdigit() else " " for ch in value_text).split()
+        if any(len(run) >= 6 for run in digit_runs):
+            return True
+        if _key_word_tokens(key) & {"identifier", "id", "number"} and value_text.strip():
+            return True
+    return False
+
+
+def _structured_record_has_group_entries(record: dict[str, Any]) -> bool:
+    for value in record.values():
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict) and any(_is_meaningful_record_value(nested) for nested in item.values()):
+                return True
+    return False
+
+
+def _structured_record_has_status(record: dict[str, Any]) -> bool:
+    summary_status = _record_summary_status(record)
+    row_statuses = _record_row_statuses(record)
+    return bool(summary_status and row_statuses)
+
+
+def _status_consistency_criterion(criteria: list[CompletionCriterion]) -> Iterable[CompletionCriterion]:
+    for criterion in criteria:
+        normalized = _normalize_present_value(criterion.outcome)
+        if "status" in normalized and (
+            "consistent" in normalized or "overall" in normalized or "summary" in normalized or "per-" in normalized
+        ):
+            yield criterion
+
+
+def _structured_record_contradiction(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if not (_structured_record_has_group_entries(payload) or _structured_record_has_status(payload)):
+        return None
+    summary_status = _record_summary_status(payload)
+    summary_polarity = _status_polarity(summary_status) if summary_status else None
+    row_statuses = _record_row_statuses(payload)
+    for status, item in row_statuses:
+        polarity = _status_polarity(status)
+        if polarity is None:
+            continue
+        is_negative, positive_phrase = polarity
+        if not is_negative:
+            continue
+        non_status_text = " ".join(
+            str(value)
+            for key, value in item.items()
+            if not (isinstance(key, str) and "status" in key.casefold()) and value is not None
+        )
+        if _contains_positive_status_phrase(non_status_text, positive_phrase):
+            return (
+                "a parsed row reports a negative status, but non-status fields include the positive status text; "
+                "parse name/address/status from cells in the same row"
+            )
+    if summary_polarity is not None:
+        summary_negative, summary_positive_phrase = summary_polarity
+        if summary_negative and any(
+            (row_polarity := _status_polarity(status)) is not None and row_polarity == (False, summary_positive_phrase)
+            for status, _item in row_statuses
+        ):
+            return "summary status is negative, but a parsed row has the matching positive status"
+
+    evidence_text = payload.get("evidence_text")
+    if isinstance(evidence_text, str) and summary_polarity is not None:
+        summary_negative, summary_positive_phrase = summary_polarity
+        if (
+            summary_negative
+            and row_statuses
+            and not any(_status_polarity(status) == (False, summary_positive_phrase) for status, _item in row_statuses)
+            and _contains_positive_status_phrase(evidence_text, summary_positive_phrase)
+        ):
+            return (
+                "evidence_text contains positive status rows, but structured rows and summary report a negative status"
+            )
+    return None
+
+
+def _record_summary_status(record: dict[str, Any]) -> str | None:
+    for key, value in record.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        normalized_key = key.casefold()
+        if "status" in normalized_key and ("overall" in normalized_key or "summary" in normalized_key):
+            return value
+    value = record.get("status")
+    return value if isinstance(value, str) else None
+
+
+def _record_row_statuses(record: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    statuses: list[tuple[str, dict[str, Any]]] = []
+    for value in record.values():
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            for item_key, item_value in item.items():
+                if isinstance(item_key, str) and "status" in item_key.casefold() and isinstance(item_value, str):
+                    statuses.append((item_value, item))
+    return statuses
+
+
+_NEGATIVE_STATUS_POSITIVE_COUNTERPARTS = {
+    "expired": "active",
+    "inactive": "active",
+    "lapsed": "active",
+    "pending": "active",
+    "revoked": "active",
+    "suspended": "active",
+    "terminated": "active",
+}
+
+
+def _status_polarity(value: str) -> tuple[bool, str] | None:
+    normalized = _normalize_present_value(value)
+    if not normalized:
+        return None
+    if normalized in _NEGATIVE_STATUS_POSITIVE_COUNTERPARTS:
+        return True, _NEGATIVE_STATUS_POSITIVE_COUNTERPARTS[normalized]
+    for prefix in ("not ", "non-", "non "):
+        if normalized.startswith(prefix):
+            positive_phrase = normalized[len(prefix) :].strip()
+            return (True, positive_phrase) if positive_phrase else None
+    return False, normalized
+
+
+# Negators, temporal qualifiers, and negative-status words that, near a positive-status
+# word, flip it into a negative or adjectival usage ("no longer active", "previously
+# active", "the active license expired") rather than a positive status assertion.
+_STATUS_NEGATION_QUALIFIERS = frozenset(
+    {
+        "not",
+        "non",
+        "no",
+        "longer",
+        "previously",
+        "formerly",
+        "once",
+        "currently",
+        "recently",
+        "was",
+        "were",
+        "until",
+        "never",
+        *_NEGATIVE_STATUS_POSITIVE_COUNTERPARTS,
+    }
+)
+
+
+def _status_word_tokens(text: str) -> list[str]:
+    return "".join(char if char.isalnum() else " " for char in text.casefold()).split()
+
+
+def _contains_positive_status_phrase(text: str, positive_phrase: str) -> bool:
+    tokens = _status_word_tokens(text)
+    phrase_tokens = _status_word_tokens(positive_phrase)
+    if not tokens or not phrase_tokens:
+        return False
+    span = len(phrase_tokens)
+    for start in range(len(tokens) - span + 1):
+        if tokens[start : start + span] != phrase_tokens:
+            continue
+        window = set(tokens[max(0, start - 3) : start]) | set(tokens[start + span : start + span + 3])
+        if not window & _STATUS_NEGATION_QUALIFIERS:
+            return True
+    return False
+
+
+def _walk_record_scalars(value: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_text = str(key)
+            nested_prefix = f"{prefix}.{key_text}" if prefix else key_text
+            yield from _walk_record_scalars(nested, nested_prefix)
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            yield from _walk_record_scalars(nested, f"{prefix}[{index}]")
+    elif value is not None:
+        yield prefix, value
+
+
+def _is_meaningful_record_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
 _DEFINITION_REASON_PREFIX = "definition_"
+
+
+def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
+    return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
 
 
 def run_plane_all_no_evidence(result: CompletionVerificationResult) -> bool:

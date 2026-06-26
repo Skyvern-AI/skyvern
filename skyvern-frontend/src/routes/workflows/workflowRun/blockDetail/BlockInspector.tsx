@@ -8,13 +8,12 @@ import { Link } from "react-router-dom";
 
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Status } from "@/api/types";
 import { cn } from "@/util/utils";
 import {
-  hasExtractedInformation,
+  getBlockOutputDisplayValue,
+  shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
-import { isTaskVariantBlock } from "../../types/workflowTypes";
 
 type InspectorField = {
   label: string;
@@ -356,14 +355,7 @@ function getInputFields(block: WorkflowRunBlock): Array<InspectorField> {
 }
 
 function getOutputValue(block: WorkflowRunBlock): unknown {
-  if (
-    isTaskVariantBlock(block) &&
-    block.status === Status.Completed &&
-    hasExtractedInformation(block.output)
-  ) {
-    return block.output.extracted_information;
-  }
-  return block.output;
+  return getBlockOutputDisplayValue(block);
 }
 
 function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
@@ -381,7 +373,14 @@ function BlockInspector({ block }: { block: WorkflowRunBlock }) {
   const inputFields = useMemo(() => getInputFields(block), [block]);
   const summaryFields = useMemo(() => getSummaryFields(block), [block]);
   const outputValue = getOutputValue(block);
-  const hasOutput = !isEmptyValue(outputValue);
+  const showsExtractedInformation = shouldShowExtractedInformation(block);
+  const hasOutput = showsExtractedInformation || !isEmptyValue(outputValue);
+  const outputRootLabel = showsExtractedInformation
+    ? "extracted_information"
+    : "output";
+  const outputTabLabel = showsExtractedInformation
+    ? "Extracted Information"
+    : "Outputs";
   const defaultTab = hasOutput ? "outputs" : "summary";
   const [activeTab, setActiveTab] = useState(defaultTab);
   const triggerClassName =
@@ -413,7 +412,7 @@ function BlockInspector({ block }: { block: WorkflowRunBlock }) {
             disabled={!hasOutput}
             value="outputs"
           >
-            Outputs
+            {outputTabLabel}
           </TabsTrigger>
           {block.task_id && (
             <Link
@@ -441,7 +440,7 @@ function BlockInspector({ block }: { block: WorkflowRunBlock }) {
         </TabsContent>
         <TabsContent value="outputs" className="m-0">
           {hasOutput ? (
-            <JsonExplorer value={outputValue} rootLabel="output" />
+            <JsonExplorer value={outputValue} rootLabel={outputRootLabel} />
           ) : (
             <div className="text-xs text-slate-500">No block output.</div>
           )}

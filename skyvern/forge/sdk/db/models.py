@@ -54,6 +54,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
+    generate_tag_value_id,
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
@@ -447,6 +448,40 @@ class TagKeyModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class TagValueModel(Base):
+    """Org-scoped registry of the color for each grouped tag ``(key, value)``, auto-registered
+    on first SET (random palette unless supplied). Partial-UNIQUE on (org, key, value)
+    WHERE deleted_at IS NULL mirrors TagKeyModel; standalone labels (no key) are not colored."""
+
+    __tablename__ = "tag_values"
+    __table_args__ = (
+        Index(
+            "ix_tag_values_org_key_value_active",
+            "organization_id",
+            "key",
+            "value",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    tag_value_id = Column(String, primary_key=True, default=generate_tag_value_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(String, nullable=False)
+    color = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 # TODO: ~22 other models with manual deleted_at columns could inherit SoftDeleteMixin.
 # WorkflowModel is the proof of concept; remaining models will be migrated in a follow-up PR.
 class WorkflowModel(SoftDeleteMixin, Base):
@@ -479,6 +514,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     browser_profile_id = Column(String, nullable=True)
+    browser_profile_key = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
