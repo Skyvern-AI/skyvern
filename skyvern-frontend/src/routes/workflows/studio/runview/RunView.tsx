@@ -28,7 +28,6 @@ import {
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
-import { Filmstrip } from "./Filmstrip";
 import { RunDetailsButton } from "./RunDetailsButton";
 import { RunHero } from "./RunHero";
 import { RunInputsButton, type RunInputMeta } from "./RunInputsButton";
@@ -41,8 +40,8 @@ type RunViewProps = {
 };
 
 /**
- * Fused run view: browser hero + action filmstrip on the left, run timeline tree
- * + block detail on the right, sharing one pinned item via RunViewStore.
+ * Fused run view: browser hero on the left, run timeline tree + block detail on
+ * the right, sharing one pinned item via RunViewStore.
  */
 export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
@@ -340,11 +339,6 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
             onRecordingPlay={onRecordingPlay}
             onFix={onFix}
             onRetry={onRetry}
-          />
-          <Filmstrip
-            frames={frames}
-            shownFrameId={shownFrame?.id ?? null}
-            running={running}
           />
         </div>
         <div className="relative w-[26rem] shrink-0">
