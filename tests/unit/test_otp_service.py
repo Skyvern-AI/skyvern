@@ -70,6 +70,9 @@ class TestIsMfaLikeParameterKey:
 class TestExtractTotpFromNavigationInputs:
     """extract_totp_from_navigation_inputs should only return actual OTP codes."""
 
+    def test_untyped_short_numeric_value_defaults_to_totp(self) -> None:
+        assert OTPValue(value="123456").get_otp_type() == OTPType.TOTP
+
     def test_returns_none_for_none_payload(self) -> None:
         assert extract_totp_from_navigation_inputs(None) is None
 
@@ -81,6 +84,14 @@ class TestExtractTotpFromNavigationInputs:
         result = extract_totp_from_navigation_inputs(payload)
         assert result is not None
         assert result.value == "123456"
+        assert result.get_otp_type() == OTPType.TOTP
+
+    def test_extracts_magic_link_from_payload(self) -> None:
+        payload = {"verification_code": "https://example.com/login/magic?token=abc123"}
+        result = extract_totp_from_navigation_inputs(payload)
+        assert result is not None
+        assert result.value == "https://example.com/login/magic?token=abc123"
+        assert result.get_otp_type() == OTPType.MAGIC_LINK
 
     def test_ignores_totp_identifier_key(self) -> None:
         """The core bug: totp_identifier value must NOT be returned as OTP code."""
@@ -523,6 +534,150 @@ class TestPollOtpValueRetry:
         assert mock_fetch.call_count == 3
 
     @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.settings")
+    async def test_falls_back_to_db_when_gmail_has_no_code(
+        self,
+        mock_settings: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_gmail.return_value = None
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_db.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+        )
+
+        assert result == otp
+        mock_gmail.assert_awaited_once()
+        mock_db.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_prefers_url_before_gmail_and_db_when_url_has_code(
+        self,
+        mock_settings: MagicMock,
+        mock_app: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_url: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_url.return_value = otp
+        mock_gmail.return_value = OTPValue(value="654321", type=OTPType.TOTP)
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_url.assert_awaited_once()
+        mock_gmail.assert_not_awaited()
+        mock_db.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_falls_back_to_gmail_before_db_when_url_has_no_code(
+        self,
+        mock_settings: MagicMock,
+        mock_app: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_url: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_url.return_value = None
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_gmail.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_url.assert_awaited_once()
+        mock_gmail.assert_awaited_once()
+        mock_db.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    @patch("skyvern.services.otp_service.datetime")
+    async def test_falls_back_to_db_after_url_and_gmail_preserves_db_cutoff_default(
+        self,
+        mock_datetime: MagicMock,
+        mock_settings: MagicMock,
+        mock_app: MagicMock,
+        mock_gmail: AsyncMock,
+        mock_url: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        start = datetime(2026, 1, 1, 12, 0, 0)
+        mock_datetime.utcnow.return_value = start
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_url.return_value = None
+        mock_gmail.return_value = None
+        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        mock_db.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_identifier="otp@example.com",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_url.assert_awaited_once()
+        mock_gmail.assert_awaited_once()
+        mock_db.assert_awaited_once()
+        assert mock_gmail.await_args.kwargs["created_after"] == start
+        assert mock_db.await_args.kwargs["created_after"] is None
+
+    @pytest.mark.asyncio
     async def test_does_not_short_circuit_during_extended_outage(self) -> None:
         """Persistent webhook errors must not exit polling before the wall-clock timeout fires (SKY-9553)."""
         base = datetime(2026, 1, 1, 12, 0, 0)
@@ -770,6 +925,29 @@ class TestTryGenerateTotpFromCredential:
 
         assert result is not None
         assert result.value == "424242"
+
+    def test_active_credential_with_otpauth_uri_uses_uri_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        totp_uri = (
+            "otpauth://totp/Example:user@example.com"
+            "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+        )
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u_b", "password": "p_b", "totp": "tot_b"}},
+            secrets={"tot_b_value": totp_uri},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        generate_totp_code_mock = MagicMock(return_value="12345678")
+        monkeypatch.setattr(otp_service, "generate_totp_code", generate_totp_code_mock)
+
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is not None
+        assert result.value == "12345678"
+        assert len(result.value) == 8
+        generate_totp_code_mock.assert_called_once_with(totp_uri)
 
     def test_no_active_credential_with_multiple_totps_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Avoid the original bug: walking all credentials when which is active is unknown."""

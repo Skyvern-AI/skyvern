@@ -9,11 +9,13 @@ import ast
 import json
 import keyword
 import sys
+import textwrap
 from typing import Any
 
 import pytest
 
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
+from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
     _MAX_STEPS,
@@ -1360,6 +1362,47 @@ class TestPreflightSurfacesSyntaxError:
         # A malformed block must be caught at authoring time, not swallowed into a silent run-time failure.
         diagnostics = preflight_code_block('await page.goto("unterminated)\n', parameter_keys=())
         assert any(d.code == "SYNTAX_ERROR" for d in diagnostics)
+
+    @pytest.mark.parametrize(
+        ("code", "reason"),
+        [
+            ("await page.request.post('https://example.com/collect')", "AUTHOR_PAGE_REQUEST"),
+            ("state = await page.context.storage_state()", "AUTHOR_PAGE_CONTEXT"),
+            ("text = await page.evaluate('() => document.body.innerText')", "AUTHOR_PAGE_EVALUATE"),
+            ("handle = await page.evaluate_handle('() => document.body')", "AUTHOR_PAGE_EVALUATE"),
+        ],
+    )
+    def test_denied_page_api_attributes_surface_preflight_reason_codes(self, code: str, reason: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert [diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")] == [reason]
+        assert any("not allowed in persisted workflow code blocks" in diagnostic.message for diagnostic in diagnostics)
+
+    def test_denied_page_api_preflight_reason_codes_match_author_time_security_source(self) -> None:
+        code = """
+        await page.request.post("https://example.com/collect")
+        state = await page.context.storage_state()
+        text = await page.evaluate("() => document.body.innerText")
+        handle = await page.evaluate_handle("() => document.body")
+        """
+
+        normalized_code = textwrap.dedent(code).strip()
+        diagnostics = preflight_code_block(code, parameter_keys=())
+        security_errors = author_time_code_security_errors(label="search_registry", code=normalized_code)
+
+        preflight_reasons = {
+            diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")
+        }
+        security_reasons = {error.reason_code for error in security_errors}
+        assert (
+            preflight_reasons
+            == security_reasons
+            == {
+                "AUTHOR_PAGE_REQUEST",
+                "AUTHOR_PAGE_CONTEXT",
+                "AUTHOR_PAGE_EVALUATE",
+            }
+        )
 
     def test_broad_body_text_wait_for_function_surfaces_selection_diagnostic(self) -> None:
         code = (

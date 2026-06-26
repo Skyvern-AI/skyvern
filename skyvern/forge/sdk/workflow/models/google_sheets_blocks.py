@@ -426,6 +426,9 @@ class GoogleSheetsWriteBlock(Block):
                 if isinstance(inner, list):
                     raw = inner
                     break
+            else:
+                # A bare object (no values/rows wrapper) is a single record; write it as one row.
+                raw = [raw]
         if not isinstance(raw, list):
             raise ValueError("Google Sheets write expects a JSON array of rows")
         if not raw:
@@ -456,6 +459,16 @@ class GoogleSheetsWriteBlock(Block):
                     )
                 seen_columns.add(col_index)
                 indexed.append((pos, field_key))
+            available_keys: set[str] = set()
+            for row in raw:
+                available_keys.update(row.keys())
+            if available_keys.isdisjoint(self.column_mapping.keys()):
+                raise ValueError(
+                    "column_mapping does not match the data: it maps fields "
+                    f"{sorted(self.column_mapping.keys())}, but the data rows only contain "
+                    f"{sorted(available_keys)}. Field names are case-sensitive; check that each "
+                    "column_mapping key exactly matches a key in your data."
+                )
             width = max(pos for pos, _ in indexed) + 1
             coerced: list[list[Any]] = []
             for row in raw:
@@ -636,15 +649,9 @@ class GoogleSheetsWriteBlock(Block):
             rows = self._coerce_values(parsed_values, column_offset=leading_column_offset(a1))
         except ValueError as e:
             snippet = self.values[:200] if self.values else ""
-            extra = ""
-            if isinstance(parsed_values, dict):
-                extra = (
-                    " Rendered a single object instead of a list; reference a list field "
-                    "(e.g. {{ block_1.output.rows | tojson }}) or wrap the object in an array."
-                )
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Invalid values payload: {str(e)}.{extra} Rendered values: {snippet!r}",
+                failure_reason=f"Invalid values payload: {str(e)} Rendered values: {snippet!r}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,

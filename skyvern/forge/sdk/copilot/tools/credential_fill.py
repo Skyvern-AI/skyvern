@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pyotp
 import structlog
 
 from skyvern.cli.core.session_manager import get_page
@@ -17,7 +16,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential, TotpType
-from skyvern.forge.sdk.services.credentials import parse_totp_secret
+from skyvern.forge.sdk.services.credentials import generate_totp_code
 
 from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import _tool_loop_error
@@ -135,7 +134,7 @@ async def _resolve_credential_fill_value(
                 return None, "", _runtime_otp_steering_error(credential_id)
             return None, "", f"Credential `{credential_id}` has no TOTP secret configured."
         try:
-            value = pyotp.TOTP(parse_totp_secret(credential.totp)).now()
+            value = generate_totp_code(credential.totp)
         except Exception:
             LOG.warning(
                 "fill_credential_field could not generate a TOTP code",

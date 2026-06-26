@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
+    # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
+    # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
+    # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
+    # instead of surfacing an opaque ECONNREFUSED.
+    CDP_CONNECT_RETRY_ATTEMPTS: int = 6
+    CDP_CONNECT_RETRY_BACKOFF_SECONDS: list[float] = [1, 2, 3, 4, 5]
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
@@ -111,6 +117,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
+    # Pre-screenshot readiness guard; kept short so a page that never settles
+    # degrades fast instead of burning the full loading-timeout budget.
+    BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS: int = 5000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
     CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
     # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
@@ -120,6 +129,11 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
+    # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
+    MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
+    # Overall wall-clock budget for the completion screenshot loop.
+    COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS: float = 60.0
     MAX_NUM_SCREENSHOTS: int = 10
     # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
     # screenshot spend can be monitored independently of the provider's blended tokens.

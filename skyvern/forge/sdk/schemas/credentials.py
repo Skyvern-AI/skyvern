@@ -52,6 +52,21 @@ class PasswordCredentialResponse(BaseModel):
     )
 
 
+class CredentialTotpCodeResponse(BaseModel):
+    """Current authenticator code for a password credential.
+
+    SECURITY: This response must never include the TOTP seed/secret.
+    """
+
+    code: str = Field(..., description="Current generated authenticator code", examples=["123456"])
+    seconds_remaining: int = Field(
+        ...,
+        ge=0,
+        description="Seconds until this code rolls over",
+        examples=[24],
+    )
+
+
 class CreditCardCredentialResponse(BaseModel):
     """Response model for credit card credentials — non-sensitive fields only.
 

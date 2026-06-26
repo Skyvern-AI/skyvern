@@ -1,3 +1,5 @@
+import { type ReactElement } from "react";
+
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -19,19 +21,27 @@ type ApiWebhookActionsMenuProps = {
   runId?: string;
   webhookDisabled?: boolean;
   onTestWebhook: () => void;
+  size?: "default" | "sm";
+  // Single element forwarded to the trigger via Radix `asChild`; when set,
+  // `size` is unused. Defaults to the solid secondary button (legacy pages).
+  trigger?: ReactElement;
 };
 
 export function ApiWebhookActionsMenu({
   getOptions,
   webhookDisabled = false,
   onTestWebhook,
+  size = "default",
+  trigger,
 }: ApiWebhookActionsMenuProps) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button type="button" variant="secondary">
-          API & Webhooks
-        </Button>
+        {trigger ?? (
+          <Button type="button" variant="secondary" size={size}>
+            API & Webhooks
+          </Button>
+        )}
       </DropdownMenuTrigger>
       <DropdownMenuContent>
         <DropdownMenuLabel className="py-2 text-base">

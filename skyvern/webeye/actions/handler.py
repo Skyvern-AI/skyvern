@@ -7,11 +7,11 @@ import shutil
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List
 
-import pyotp
 import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
@@ -83,7 +83,12 @@ from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_te
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import (
+    AzureVaultConstants,
+    OnePasswordConstants,
+    generate_totp_code,
+    parse_totp_config,
+)
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
@@ -1695,7 +1700,6 @@ async def handle_click_to_download_file_action(
 
 
 # TOTP timing constants
-TOTP_TIME_STEP_SECONDS = 30
 TOTP_EXPIRY_THRESHOLD_SECONDS = 20
 
 
@@ -1716,11 +1720,13 @@ async def _handle_multi_field_totp_sequence(
     if action_index == 0:
         # First digit: generate TOTP and cache it
         totp_secret = timing_info["totp_secret"]
-        totp = pyotp.TOTP(totp_secret)
+        totp = parse_totp_config(totp_secret)
+        if not totp:
+            raise ValueError("Invalid TOTP secret or otpauth URI")
 
         # Check current TOTP expiry time
         current_time = int(time.time())
-        current_totp_valid_until = ((current_time // TOTP_TIME_STEP_SECONDS) + 1) * TOTP_TIME_STEP_SECONDS
+        current_totp_valid_until = ((current_time // totp.interval) + 1) * totp.interval
         seconds_until_expiry = current_totp_valid_until - current_time
 
         # If less than threshold seconds until expiry, use the next TOTP
@@ -1757,11 +1763,13 @@ async def _handle_multi_field_totp_sequence(
 
         # Check if cached TOTP has expired
         totp_secret = timing_info["totp_secret"]
-        totp = pyotp.TOTP(totp_secret)
+        totp = parse_totp_config(totp_secret)
+        if not totp:
+            raise ValueError("Invalid TOTP secret or otpauth URI")
 
         # Get current time and calculate TOTP expiry
         current_time = int(time.time())
-        totp_valid_until = ((current_time // TOTP_TIME_STEP_SECONDS) + 1) * TOTP_TIME_STEP_SECONDS
+        totp_valid_until = ((current_time // totp.interval) + 1) * totp.interval
 
         if current_time >= totp_valid_until:
             LOG.error(
@@ -1785,7 +1793,7 @@ async def _handle_multi_field_totp_sequence(
     if action_index == 5:
         # Calculate when this TOTP becomes valid (valid_from time)
         # If we used the next TOTP window, valid_from is the start of that window
-        totp_valid_from = totp_valid_until - TOTP_TIME_STEP_SECONDS
+        totp_valid_from = totp_valid_until - totp.interval
 
         if current_time < totp_valid_from:
             # TOTP is not yet valid, wait until it becomes valid
@@ -2251,6 +2259,10 @@ async def handle_input_text_action(
                     )
                     if select_result and select_result.action_result and select_result.action_result.success:
                         auto_complete_hacky_flag = False
+                        # A matching option was committed during this INPUT_TEXT. Stop the batch only when
+                        # the next queued action would clobber it (a trailing Enter/Return); next step re-scrapes.
+                        if action.stop_batch_after_dropdown_select:
+                            select_result.action_result.skip_remaining_actions = True
                         return [select_result.action_result]
         except PlaywrightError as inc_error:
             # Handle Playwright-specific errors during incremental element processing
@@ -3253,7 +3265,11 @@ async def handle_goto_url_action(
     step: Step,
 ) -> list[ActionResult]:
     await page.goto(action.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-    return [ActionSuccess()]
+    # Navigation invalidates the current scraped page's element ids; stop the batch so the
+    # next step re-scrapes before any later actions run against the new DOM.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
 
 
 async def handle_go_back_action(
@@ -3286,7 +3302,11 @@ async def handle_reload_page_action(
     step: Step,
 ) -> list[ActionResult]:
     await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-    return [ActionSuccess()]
+    # Reloading re-renders the DOM and invalidates the scraped page's element ids; stop the
+    # batch so the next step re-scrapes before any later actions run.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
 
 
 @traced(name="skyvern.agent.action.close_page")
@@ -3458,7 +3478,7 @@ def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
     if not totp_secret:
         LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
         return parameter
-    return pyotp.TOTP(totp_secret).now()
+    return generate_totp_code(totp_secret)
 
 
 def generate_totp_value_with_task(task: Task, parameter: str) -> str:
@@ -4584,6 +4604,62 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
+def _collect_option_texts(elements: list[dict]) -> list[str]:
+    """BFS over an element tree, returning option-like text in document order with duplicates removed.
+
+    Native ``<select>`` options live on the element's ``options`` field
+    (``[{text, value, optionIndex}, ...]``); the scraper skips their child
+    ``<option>`` nodes, so this walker must inspect that field directly.
+    """
+    queue: deque[dict] = deque(elements)
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _record(text: str) -> None:
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+
+    while queue:
+        node = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes") or {}
+        role = str(attrs.get("role") or "").lower()
+        tag = str(node.get("tagName") or "").lower()
+        if role == "option" or tag in ("li", "option"):
+            _record(str(node.get("text") or "").strip())
+        for option in node.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            # Strip text before falling back to value so whitespace-only text
+            # (e.g. "   ") is treated as missing rather than recorded as empty.
+            option_text = str(option.get("text") or "").strip()
+            if not option_text:
+                option_text = str(option.get("value") or "").strip()
+            _record(option_text)
+        for child in node.get("children") or []:
+            queue.append(child)
+    return out
+
+
+def _no_match_exception_for_dropdown(
+    *,
+    reasoning: str | None,
+    target_value: str | None,
+    observed_options: list[str],
+    transient_fallback_element_id: str | None,
+) -> Exception:
+    """Return the right no-match exception: transient when the dropdown opened with zero options, permanent otherwise."""
+    if not observed_options and transient_fallback_element_id is not None:
+        return NoIncrementalElementFoundForCustomSelection(element_id=transient_fallback_element_id)
+    return NoAvailableOptionFoundForCustomSelection(
+        reason=reasoning,
+        target_value=target_value or None,
+        observed_options=observed_options,
+    )
+
+
 def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
     """Walk *elements* and return the minimal set of subtrees rooted at new IDs.
 
@@ -4702,11 +4778,18 @@ async def select_from_emerging_elements(
         response=json_response,
     )
 
-    action_type_str: str = json_response.get("action_type", "") or ""
-    action_type = ActionType(action_type_str.lower())
+    # Check the no-match shape before ``ActionType`` coercion — coercing an empty
+    # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
+    raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
-        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+        raise _no_match_exception_for_dropdown(
+            reasoning=json_response.get("reasoning"),
+            target_value=options.target_value,
+            observed_options=_collect_option_texts(new_element_subtrees),
+            transient_fallback_element_id=None,
+        )
+    action_type = ActionType(raw_action_type)
 
     new_ids_set = set(new_interactable_element_ids)
     if element_id not in new_ids_set:
@@ -4840,12 +4923,19 @@ async def select_from_dropdown(
         response=json_response,
     )
 
-    action_type: str = json_response.get("action_type", "") or ""
-    action_type = action_type.lower()
-    single_select_result.action_type = ActionType(action_type)
+    # Check the no-match shape before ``ActionType`` coercion — coercing an empty
+    # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
+    raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
-        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+        raise _no_match_exception_for_dropdown(
+            reasoning=json_response.get("reasoning"),
+            target_value=target_value,
+            observed_options=_collect_option_texts(trimmed_element_tree),
+            transient_fallback_element_id=skyvern_element.get_id(),
+        )
+    single_select_result.action_type = ActionType(raw_action_type)
+    action_type = single_select_result.action_type
 
     if not force_select and target_value:
         if not json_response.get("relevant", False):

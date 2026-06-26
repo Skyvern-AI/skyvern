@@ -288,3 +288,103 @@ def test_get_by_role_without_name_falls_back_to_the_element():
     code = "async def run(page):\n    await page.get_by_role('button').click()\n"
     steps = derive_code_block_steps(code)
     assert steps[0]["description"] == "Click the element"
+
+
+def test_extract_call_surfaces_as_a_distinct_step_with_prompt_copy():
+    # page.extract() is the code-first extraction surface and must surface as its own step.
+    code = (
+        "async def run(page):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    data = await page.extract(prompt='Extract the URLs of the top 20 posts', schema={'type': 'object'})\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["goto_url", "extract"]
+    assert steps[1]["description"] == "Extract the URLs of the top 20 posts"
+
+
+def test_multiline_prompt_literal_renders_without_backslash_escapes():
+    # A YAML block-scalar / multiline prompt must collapse to readable copy, not leak
+    # the source-level "\n" escape that ast.unparse would re-introduce.
+    code = "async def run(page):\n    await page.extract(prompt='Extract the URLs\\nof the top 20 posts')\n"
+    steps = derive_code_block_steps(code)
+    assert steps[0]["action_type"] == "extract"
+    assert steps[0]["description"] == "Extract the URLs of the top 20 posts"
+
+
+def test_extract_without_prompt_literal_falls_back_to_a_generic_extract_label():
+    code = "async def run(page):\n    data = await page.extract(prompt=goal)\n"
+    steps = derive_code_block_steps(code)
+    assert steps[0]["action_type"] == "extract"
+    assert steps[0]["description"] == "Extract information from the page"
+
+
+def test_whitespace_only_prompt_falls_back_instead_of_rendering_blank_copy():
+    code = "async def run(page):\n    data = await page.extract(prompt='   \\n  ')\n"
+    steps = derive_code_block_steps(code)
+    assert steps[0]["action_type"] == "extract"
+    assert steps[0]["description"] == "Extract information from the page"
+
+
+def test_check_and_uncheck_map_to_checkbox_matching_the_recorder():
+    code = (
+        "async def run(page):\n"
+        "    await page.get_by_label('Remember me').check()\n"
+        "    await page.get_by_label('Subscribe').uncheck()\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["checkbox", "checkbox"]
+    assert steps[0]["description"] == 'Toggle "Remember me"'
+
+
+def test_extraction_then_looped_navigation_are_distinguishable():
+    # The canonical failing case: open a site, extract a list of links, then for
+    # each link open it and extract its contents. Every step must read as the
+    # action it performs, and the two navigations must not be the same generic copy.
+    code = (
+        "async def run(page, limit):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    posts = await page.extract(prompt='Extract the URLs of the top posts')\n"
+        "    for post in posts['posts'][:limit]:\n"
+        "        await page.goto(post['url'])\n"
+        "        await page.extract(prompt='Extract the top comment on the post')\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["goto_url", "extract", "goto_url", "extract"]
+    descriptions = [s["description"] for s in steps]
+    assert descriptions == [
+        "Open https://example.com/",
+        "Extract the URLs of the top posts",
+        "Open each post",
+        "Extract the top comment on the post",
+    ]
+    # The follow-up navigation must be distinguishable from the first, not a repeated label.
+    assert descriptions[0] != descriptions[2]
+
+
+def test_goto_with_non_literal_url_outside_a_loop_describes_a_linked_page():
+    code = "async def run(page, target_url):\n    await page.goto(target_url)\n"
+    steps = derive_code_block_steps(code)
+    assert steps[0]["action_type"] == "goto_url"
+    assert steps[0]["description"] == "Open the linked page"
+
+
+def test_prompt_kwarg_is_preferred_as_step_copy_for_interactions():
+    code = "async def run(page):\n    await page.click('#login', prompt='Click the login button')\n"
+    steps = derive_code_block_steps(code)
+    assert steps[0]["action_type"] == "click"
+    assert steps[0]["description"] == "Click the login button"
+
+
+def test_skyvern_page_high_level_actions_surface_as_steps():
+    # The durable copilot surface is the @action_wrap-decorated SkyvernPage API,
+    # not only raw Playwright calls; these must each render as their own step.
+    code = (
+        "async def run(page, doc):\n"
+        "    await page.select_option('#country', prompt='Choose the country')\n"
+        "    await page.upload_file('#file', files=str(doc))\n"
+        "    await page.complete(prompt='Confirm the form was submitted')\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["select_option", "upload_file", "complete"]
+    assert steps[0]["description"] == "Choose the country"
+    assert steps[2]["description"] == "Confirm the form was submitted"

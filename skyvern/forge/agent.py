@@ -151,6 +151,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
+from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
@@ -1844,12 +1845,15 @@ class ForgeAgent:
                 # Tell the handler to skip the auto-completion Tab hack when the
                 # next batched action would be broken by a focus change — e.g. a
                 # KEYPRESS Enter or another action on the same element.
-                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
-                    next_action = action_linked_list[action_idx + 1].action
+                if action.action_type == ActionType.INPUT_TEXT:
+                    next_action = (
+                        action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
+                    )
                     if isinstance(next_action, KeypressAction) or (
                         isinstance(next_action, WebAction) and next_action.element_id == action.element_id
                     ):
                         action.skip_auto_complete_tab = True
+                    action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
 
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,
@@ -2069,9 +2073,15 @@ class ForgeAgent:
 
             # if the last action is complete and is successful, check if there's a data extraction goal
             # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
+            # skip when the step already ran a successful planner-emitted EXTRACT action — re-extracting would be a duplicate
+            step_has_successful_extract = any(
+                executed_action.action_type == ActionType.EXTRACT and any(result.success for result in results)
+                for executed_action, results in detailed_agent_step_output.actions_and_results
+            )
             if (
                 task.navigation_goal
                 and task.data_extraction_goal
+                and not step_has_successful_extract
                 and self.step_has_completed_goal(detailed_agent_step_output)
             ):
                 working_page = await browser_state.must_get_working_page()
@@ -3546,11 +3556,13 @@ class ForgeAgent:
         enriched_tree_enabled: bool = False,
         llm_screenshots_enabled: bool = True,
         slim_output: str | None = None,
+        has_data_extraction_goal: bool = False,
+        enable_new_planner_actions: bool = False,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, close-page availability, complete criteria, slim output)
-        do not reuse the same Vertex cache object.
+        differ meaningfully (OTP, close-page availability, complete criteria, slim output,
+        data extraction goal availability, new planner actions) do not reuse the same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
@@ -3561,6 +3573,10 @@ class ForgeAgent:
             variant_parts.append("nt")
         if show_switch_tab_action:
             variant_parts.append("st")
+        if has_data_extraction_goal:
+            variant_parts.append("de")
+        if enable_new_planner_actions:
+            variant_parts.append("np")
         if enriched_tree_enabled:
             variant_parts.append("et")
         if enriched_tree_enabled and not llm_screenshots_enabled:
@@ -3843,6 +3859,14 @@ class ForgeAgent:
         llm_screenshots_enabled = context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
         enriched_tree_enabled = context.enriched_tree_enabled()
 
+        # Off keeps pre-PR behavior: the planner is never offered these actions, so the parser and
+        # is_goal_achieved branches stay dormant. Per-run randomization, like DISABLE_USER_GOAL_CHECK.
+        enable_new_planner_actions = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "ENABLE_NEW_PLANNER_ACTIONS",
+            task.workflow_run_id if task.workflow_run_id else task.task_id,
+            properties={"task_url": task.url, "organization_id": task.organization_id},
+        )
+
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
         recent_dialog_messages_str = (
@@ -3858,6 +3882,7 @@ class ForgeAgent:
                     "starting_url": starting_url,
                     "current_url": current_url,
                     "data_extraction_goal": task.data_extraction_goal,
+                    "enable_new_planner_actions": enable_new_planner_actions,
                     "action_history": actions_and_results_str,
                     "error_code_mapping_str": (
                         json.dumps(task.error_code_mapping) if task.error_code_mapping else None
@@ -3884,6 +3909,8 @@ class ForgeAgent:
                     enriched_tree_enabled=enriched_tree_enabled,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     slim_output=slim_output,
+                    has_data_extraction_goal=bool(task.data_extraction_goal),
+                    enable_new_planner_actions=enable_new_planner_actions,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3963,6 +3990,7 @@ class ForgeAgent:
             starting_url=starting_url,
             current_url=current_url,
             data_extraction_goal=task.data_extraction_goal,
+            enable_new_planner_actions=enable_new_planner_actions,
             action_history=actions_and_results_str,
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             local_datetime=datetime.now(context.tz_info).isoformat(),
@@ -5712,7 +5740,7 @@ class ForgeAgent:
         task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
         should_verify = (
             complete_verification
-            and not step.is_goal_achieved()
+            and not step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal))
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
             and not task_completes_on_download
@@ -5744,7 +5772,7 @@ class ForgeAgent:
                     task_block=task_block,
                 )
 
-        if step.is_goal_achieved():
+        if step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal)):
             LOG.info(
                 "Step completed and goal achieved, marking task as completed",
                 step_order=step.order,

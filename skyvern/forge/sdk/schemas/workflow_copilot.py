@@ -153,6 +153,17 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
 
 
+class WorkflowCopilotChatSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID the chat belongs to")
+    workflow_title: str | None = Field(None, description="Title of the workflow the chat belongs to")
+    title: str = Field(..., description="Single-line preview derived from the chat's first message")
+    created_at: datetime = Field(..., description="When the chat was created")
+    modified_at: datetime = Field(..., description="When the chat was last modified")
+
+
 class WorkflowCopilotAudioUploadResponse(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="Chat ID the audio artifact is associated with")
     audio_artifact_id: str = Field(..., description="Stored audio artifact ID")

@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, List, Literal
+from typing import Any, List
 
 from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 from typing_extensions import deprecated
@@ -138,6 +138,7 @@ class Workflow(BaseModel):
     totp_identifier: str | None = None
     persist_browser_session: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
@@ -342,7 +343,6 @@ class WorkflowRunResponseBase(BaseModel):
     failure_category: list[dict[str, Any]] | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
-    webhook_delivery_status: Literal["pending", "failed"] | None = None
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None

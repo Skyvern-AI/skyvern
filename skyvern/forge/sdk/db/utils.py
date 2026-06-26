@@ -108,6 +108,19 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
+    # Collapse the opening message to one line so multi-line prompts read cleanly in the history dropdown.
+    collapsed = " ".join(content.split())
+    if len(collapsed) <= max_length:
+        return collapsed
+    return collapsed[: max_length - 1].rstrip() + "…"
+
+
+def escape_like_term(term: str) -> str:
+    # Escape SQL LIKE metacharacters so user input matches literally; pair with ilike(escape="\\").
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def nullable_column_equals(column: Any, value: Any) -> Any:
     return column.is_(None) if value is None else column == value
 
@@ -542,6 +555,7 @@ def convert_to_workflow(
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
         browser_profile_id=workflow_model.browser_profile_id,
+        browser_profile_key=workflow_model.browser_profile_key,
         model=workflow_model.model,
         proxy_location=deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,

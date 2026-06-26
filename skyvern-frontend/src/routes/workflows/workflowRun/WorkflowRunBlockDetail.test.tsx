@@ -102,6 +102,65 @@ describe("WorkflowRunBlockDetail router", () => {
     ).toBeGreaterThanOrEqual(1);
   });
 
+  it("renders code block extracted information without the raw output wrapper", () => {
+    const block = buildBlock({
+      block_type: "code",
+      label: "collect_data",
+      output: {
+        extracted_information: {
+          account_status: "active",
+          reference_id: "ref_123",
+        },
+        raw_code_output: "debug payload",
+      },
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    expect(
+      screen.getByRole("tab", { name: "Extracted Information" }),
+    ).toBeDefined();
+    expect(screen.getByText("account_status")).toBeDefined();
+    expect(screen.getByText('"active"')).toBeDefined();
+    expect(screen.queryByText("raw_code_output")).toBeNull();
+    expect(screen.queryByText('"debug payload"')).toBeNull();
+  });
+
+  it("renders a string code block extraction without dropping it", () => {
+    const block = buildBlock({
+      block_type: "code",
+      label: "collect_summary",
+      output: {
+        extracted_information: "Order #1024 shipped on Tuesday",
+      },
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    expect(
+      screen.getByRole("tab", { name: "Extracted Information" }),
+    ).toBeDefined();
+    expect(screen.getByText('"Order #1024 shipped on Tuesday"')).toBeDefined();
+  });
+
+  it("keeps a null code block extraction visible in the detail panel", () => {
+    const block = buildBlock({
+      block_type: "code",
+      label: "collect_empty",
+      output: {
+        extracted_information: null,
+      },
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    const tab = screen.getByRole("tab", { name: "Extracted Information" });
+    expect(tab.hasAttribute("disabled")).toBe(false);
+    expect(tab.getAttribute("data-state")).toBe("active");
+    expect(screen.getByText("null")).toBeDefined();
+    expect(screen.queryByText("No block output.")).toBeNull();
+  });
+
   it("renders block inputs and searchable outputs inside the detail panel inspector", () => {
     const block = buildBlock({
       block_type: "http_request",

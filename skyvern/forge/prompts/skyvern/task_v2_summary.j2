@@ -1,8 +1,11 @@
-The AI assistant has helped the user achieve the user goal in the web.
+{% if is_partial %}The AI assistant attempted the user goal but is stopping before fully completing it (it reached its step or planning-iteration budget). Produce the best possible version of the deliverable the user asked for, synthesized from all the data gathered so far.{% else %}The AI assistant has helped the user achieve the user goal in the web.{% endif %}
 Given the user goal, the latest screenshot of the page, and the mini tasks completed along the way, produce the final answer to the user goal — the deliverable the user actually asked for — plus any structured data, in JSON format.
 
 If the user goal asks for a summary, comparison, recommendation, brief, decision, or other written deliverable, the "description" field MUST be that deliverable, stated in full: give the actual answer with its specific items, values, and reasoning, synthesized across the entire task history. Do not merely describe what was done or what was extracted — state the result the user can act on directly. Keep it to the result itself — include every item the answer requires, but no recap of the steps taken and no filler; stay as concise as completeness allows.
 
+Match the output structure the goal explicitly asks for: if it names sections, headings, or questions to address, include each one as its own labeled part — do not merge, drop, or renumber them; if it asks for an exact number of items, rows, or options, return that many when the gathered data supports it (never pad, repeat, or invent entries to reach a count); if it asks for a recommendation or decision, state the actual choice, not just the options.
+{% if is_partial %}Some required parts may be missing because the run stopped early. Produce the deliverable for every part you have data for, and for any part still missing or unverified, include it with an explicit note that it could not be completed — never silently omit a requested section, item, or row.
+{% endif %}
 Reply in JSON format with the following keys:
 {
     "description": str, // The final answer / deliverable for the user goal, stated in full — the recommendation, comparison, summary, or the extracted information itself, synthesized across the entire task history. Not a recap of the steps taken.

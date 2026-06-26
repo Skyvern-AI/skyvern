@@ -27,6 +27,16 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
 let mockCredentials: GoogleOAuthCredential[] = [];
 let mockIsLoading = false;
 let mockIsFetching = false;
+const GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
+const GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const GOOGLE_DRIVE_METADATA_SCOPE =
+  "https://www.googleapis.com/auth/drive.metadata.readonly";
+const GOOGLE_SHEETS_REQUIRED_SCOPES = [
+  GOOGLE_SHEETS_SCOPE,
+  GOOGLE_DRIVE_FILE_SCOPE,
+  GOOGLE_DRIVE_METADATA_SCOPE,
+];
+const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 
 vi.mock("@/hooks/useGoogleOAuthCredentials", async () => {
   const actual = await vi.importActual<
@@ -42,12 +52,34 @@ vi.mock("@/hooks/useGoogleOAuthCredentials", async () => {
   };
 });
 
-function credential(id: string, valid: boolean = true): GoogleOAuthCredential {
+function credential(
+  id: string,
+  state: string = "active",
+  scopesGranted: string[] = GOOGLE_SHEETS_REQUIRED_SCOPES,
+): GoogleOAuthCredential {
   return {
     id,
     organization_id: "o_1",
     credential_name: id,
-    scopes: null,
+    provider: "google",
+    state,
+    scopes_requested: scopesGranted,
+    scopes_granted: scopesGranted,
+    created_at: "",
+    modified_at: "",
+  };
+}
+
+function legacyCredential(
+  id: string,
+  valid: boolean = true,
+  scopes: string[] = GOOGLE_SHEETS_REQUIRED_SCOPES,
+): GoogleOAuthCredential {
+  return {
+    id,
+    organization_id: "o_1",
+    credential_name: id,
+    scopes,
     valid,
     created_at: "",
     modified_at: "",
@@ -153,10 +185,19 @@ describe("useResolveDefaultGoogleSheetsCredential (SKY-11219)", () => {
     });
   });
 
+  test("fills from the legacy credential response shape during split deploys", () => {
+    mockCredentials = [legacyCredential("cred_legacy")];
+    render(<Harness nodes={[writeNode("g1", "")]} />);
+
+    expect(updateNodeData).toHaveBeenCalledWith("g1", {
+      credentialId: "cred_legacy",
+    });
+  });
+
   test("prefers the first valid credential over an invalid one", () => {
     mockCredentials = [
-      credential("cred_invalid", false),
-      credential("cred_valid", true),
+      credential("cred_invalid", "revoked"),
+      credential("cred_valid", "active"),
     ];
     render(<Harness nodes={[writeNode("g1", "")]} />);
 
@@ -166,11 +207,35 @@ describe("useResolveDefaultGoogleSheetsCredential (SKY-11219)", () => {
   });
 
   test("falls back to the only (invalid) credential rather than leaving it blank", () => {
-    mockCredentials = [credential("cred_only", false)];
+    mockCredentials = [credential("cred_only", "revoked")];
     render(<Harness nodes={[writeNode("g1", "")]} />);
 
     expect(updateNodeData).toHaveBeenCalledWith("g1", {
       credentialId: "cred_only",
+    });
+  });
+
+  test("ignores Gmail-only credentials when filling Sheets blocks", () => {
+    mockCredentials = [
+      credential("cred_gmail", "active", [GMAIL_SCOPE]),
+      credential("cred_sheets"),
+    ];
+    render(<Harness nodes={[writeNode("g1", "")]} />);
+
+    expect(updateNodeData).toHaveBeenCalledWith("g1", {
+      credentialId: "cred_sheets",
+    });
+  });
+
+  test("ignores partial Sheets grants that are missing Drive scopes", () => {
+    mockCredentials = [
+      credential("cred_spreadsheets_only", "active", [GOOGLE_SHEETS_SCOPE]),
+      credential("cred_sheets"),
+    ];
+    render(<Harness nodes={[writeNode("g1", "")]} />);
+
+    expect(updateNodeData).toHaveBeenCalledWith("g1", {
+      credentialId: "cred_sheets",
     });
   });
 

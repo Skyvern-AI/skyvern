@@ -1,3 +1,4 @@
+import random
 import re
 
 import structlog
@@ -141,6 +142,44 @@ def normalize_optional_tag_value(value: object) -> str | None:
     if isinstance(value, str) and not value.strip():
         return None
     return normalize_tag_value(value)
+
+
+# Curated, semantic color names (not freeform hex) so the frontend can guarantee
+# legible light/dark renderings by mapping each name to a vetted pair. This list is
+# the server-side source of truth; the frontend mirrors it. Order is the random-pick
+# pool — keep it stable so colors don't churn across deploys.
+TAG_COLOR_PALETTE: tuple[str, ...] = (
+    "gray",
+    "red",
+    "orange",
+    "amber",
+    "yellow",
+    "green",
+    "teal",
+    "blue",
+    "cyan",
+    "indigo",
+    "purple",
+    "pink",
+)
+_TAG_COLOR_PALETTE_SET = frozenset(TAG_COLOR_PALETTE)
+
+
+def normalize_tag_color(color: object) -> str:
+    """Validate a palette color name against the curated palette. Trims and
+    lowercases; raises ValueError for anything outside the palette so freeform
+    hex / arbitrary names can't bypass the legible light/dark guarantee."""
+    if not isinstance(color, str):
+        raise ValueError("tag color must be a string")
+    normalized = color.strip().lower()
+    if normalized not in _TAG_COLOR_PALETTE_SET:
+        raise ValueError(f"tag color must be one of: {', '.join(TAG_COLOR_PALETTE)}")
+    return normalized
+
+
+def random_tag_color() -> str:
+    """Pick a palette color for a newly registered (key, value) with no explicit color."""
+    return random.choice(TAG_COLOR_PALETTE)
 
 
 def normalize_tag_description(v: str | None) -> str | None:

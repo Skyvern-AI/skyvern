@@ -1,5 +1,10 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
-import { DebugToBuildRedirect } from "@/routes/workflows/DebugToBuildRedirect";
+import {
+  BuildRoute,
+  DebugRoute,
+  EditRoute,
+  StudioRoute,
+} from "@/routes/workflows/StudioRouteGates";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { BrowserSessions } from "@/routes/browserSessions/BrowserSessions";
 import { PageLayout } from "./components/PageLayout";
@@ -15,7 +20,6 @@ import { TaskDetails } from "./routes/tasks/detail/TaskDetails";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
-import { Debugger } from "@/routes/workflows/debugger/Debugger";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowScriptDetailPage } from "./routes/workflows/WorkflowScriptDetailPage";
 import { WorkflowScriptsPage } from "./routes/workflows/WorkflowScriptsPage";
@@ -23,7 +27,6 @@ import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
-import { WorkflowEditor } from "./routes/workflows/editor/WorkflowEditor";
 import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
@@ -229,23 +232,27 @@ const router = createBrowserRouter([
               },
               {
                 path: "build",
-                element: <Debugger />,
+                element: <BuildRoute />,
               },
               {
                 path: ":workflowRunId/:blockLabel/build",
-                element: <Debugger />,
+                element: <BuildRoute />,
               },
               {
                 path: "debug",
-                element: <DebugToBuildRedirect />,
+                element: <DebugRoute />,
               },
               {
                 path: ":workflowRunId/:blockLabel/debug",
-                element: <DebugToBuildRedirect />,
+                element: <DebugRoute />,
               },
               {
                 path: "edit",
-                element: <WorkflowEditor />,
+                element: <EditRoute />,
+              },
+              {
+                path: "studio",
+                element: <StudioRoute />,
               },
               {
                 path: "run",

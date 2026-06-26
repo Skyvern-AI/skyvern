@@ -4,7 +4,6 @@ import re
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import pyotp
 import structlog
 from pydantic import BaseModel, Field
 
@@ -20,7 +19,10 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import DEFAULT_REQUEST_TIMEOUT
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.services.credentials import generate_totp_code
+from skyvern.services.otp_gmail import GmailOTPVerificationContext
 
 LOG = structlog.get_logger()
 
@@ -110,7 +112,7 @@ def _is_mfa_like_parameter_key(key: object) -> bool:
 
 
 def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
-    """Extract TOTP from runtime navigation inputs.
+    """Extract inline OTP or magic-link content from runtime navigation inputs.
 
     Runtime inline OTP extraction is intentionally payload-only.
     """
@@ -124,7 +126,10 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
         current_item = traversal_stack.pop()
 
         if isinstance(current_item, str):
-            return OTPValue(value=current_item, type=OTPType.TOTP)
+            otp_type = (
+                OTPType.MAGIC_LINK if current_item.strip().lower().startswith(("https://", "http://")) else OTPType.TOTP
+            )
+            return OTPValue(value=current_item, type=otp_type)
 
         current_id = id(current_item)
         if current_id in visited_container_ids:
@@ -283,7 +288,7 @@ def try_generate_totp_for_credential(
     if not totp_secret:
         return None
     try:
-        code = pyotp.TOTP(totp_secret).now()
+        code = generate_totp_code(totp_secret)
         LOG.info(
             "Generated TOTP from credential secret",
             workflow_run_id=workflow_run_id,
@@ -421,12 +426,8 @@ async def poll_otp_value(
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
-    org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
-        organization_id, OrganizationAuthTokenType.api.value
-    )
-    if not org_token:
-        LOG.error("Failed to get organization token when trying to get otp value")
-        return None
+    gmail_created_after = created_after or start_datetime
+    db_created_after = created_after
     LOG.info(
         "Polling otp value",
         task_id=task_id,
@@ -435,6 +436,8 @@ async def poll_otp_value(
     )
     consecutive_failures = 0
     last_error_reason: str | None = None
+    org_token: OrganizationAuthToken | None = None
+    gmail_otp_context = GmailOTPVerificationContext()
     while True:
         await asyncio.sleep(10)
         if datetime.utcnow() > timeout_datetime:
@@ -458,7 +461,18 @@ async def poll_otp_value(
             )
         otp_value: OTPValue | None = None
         try:
+            # Keep an explicit webhook as the primary source. Gmail and DB are
+            # intentional backstops only when the webhook has no code yet.
             if totp_verification_url:
+                if org_token is None:
+                    # The org token is only needed for webhook polling. Gmail
+                    # and DB-only polling should not fail on missing webhook auth.
+                    org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+                        organization_id, OrganizationAuthTokenType.api.value
+                    )
+                if not org_token:
+                    LOG.error("Failed to get organization token when trying to get otp value")
+                    return None
                 otp_value = await _get_otp_value_from_url(
                     organization_id,
                     totp_verification_url,
@@ -467,14 +481,25 @@ async def poll_otp_value(
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
                 )
-            elif totp_identifier:
+            if otp_value is None and totp_identifier:
+                otp_value = await _get_otp_value_from_gmail(
+                    organization_id=organization_id,
+                    totp_identifier=totp_identifier,
+                    workflow_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run_id,
+                    created_after=gmail_created_after,
+                    context=gmail_otp_context,
+                )
+            if otp_value is None and totp_identifier:
+                # Preserve the historical DB behavior: callers that omit
+                # created_after may still read codes inserted before this poll began.
                 otp_value = await _get_otp_value_from_db(
                     organization_id,
                     totp_identifier,
                     task_id=task_id,
                     workflow_id=workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
-                    created_after=created_after,
+                    created_after=db_created_after,
                 )
         except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
@@ -609,6 +634,24 @@ async def _get_otp_value_from_url(
         return None
 
     return otp_value
+
+
+async def _get_otp_value_from_gmail(
+    organization_id: str,
+    totp_identifier: str,
+    workflow_id: str | None = None,
+    workflow_run_id: str | None = None,
+    created_after: datetime | None = None,
+    context: GmailOTPVerificationContext | None = None,
+) -> OTPValue | None:
+    return await app.AGENT_FUNCTION.get_otp_value_from_gmail(
+        organization_id=organization_id,
+        totp_identifier=totp_identifier,
+        workflow_id=workflow_id,
+        workflow_run_id=workflow_run_id,
+        created_after=created_after,
+        context=context,
+    )
 
 
 async def _get_otp_value_from_db(

@@ -18,6 +18,7 @@ Channel data:
 
 import asyncio
 import dataclasses
+import time
 import typing as t
 from enum import IntEnum
 from urllib.parse import urlparse
@@ -70,6 +71,10 @@ Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
 class MessageType(IntEnum):
     Keyboard = 4
     Mouse = 5
+    ClientCutText = 6
+
+
+REMOTE_CLIPBOARD_SYNC_PASTE_GRACE_SECONDS = 2.0
 
 
 class Keys:
@@ -162,6 +167,7 @@ class VncChannel:
 
     browser_session: AddressablePersistentBrowserSession | None = None
     key_state: KeyState = dataclasses.field(default_factory=KeyState)
+    remote_clipboard_synced_at: float | None = None
     task: Task | None = None
     workflow_run: WorkflowRun | None = None
 
@@ -238,6 +244,14 @@ class VncChannel:
             self.key_state.cmd_is_down = True
         elif data == Keys.Up.Cmd:
             self.key_state.cmd_is_down = False
+
+    def mark_remote_clipboard_synced(self) -> None:
+        self.remote_clipboard_synced_at = time.monotonic()
+
+    def remote_clipboard_was_recently_synced(self) -> bool:
+        if self.remote_clipboard_synced_at is None:
+            return False
+        return time.monotonic() - self.remote_clipboard_synced_at <= REMOTE_CLIPBOARD_SYNC_PASTE_GRACE_SECONDS
 
 
 async def copy_text(vnc_channel: VncChannel) -> None:
@@ -384,11 +398,17 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                             if vnc_channel.key_state.is_copy(data):
                                 await copy_text(vnc_channel)
 
-                            if vnc_channel.key_state.is_paste(data):
+                            if (
+                                vnc_channel.key_state.is_paste(data)
+                                and not vnc_channel.remote_clipboard_was_recently_synced()
+                            ):
                                 await ask_for_clipboard(vnc_channel)
 
                             if vnc_channel.key_state.is_forbidden(data):
                                 continue
+
+                        if message_type == MessageType.ClientCutText.value:
+                            vnc_channel.mark_remote_clipboard_synced()
 
                         # prevent right-mouse-button clicks for "security" reasons
                         if message_type == MessageType.Mouse.value:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 import pytest
@@ -13,12 +14,15 @@ from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import (
     Base,
     TagKeyModel,
+    TagValueModel,
+    WorkflowModel,
     WorkflowTagEventModel,
 )
 from skyvern.forge.sdk.db.repositories.tags import (
     MAX_TAGS_PER_WORKFLOW,
     TagCountLimitExceeded,
     TagsRepository,
+    TagValueRenameCollision,
 )
 from skyvern.forge.sdk.workflow.models.tags import (
     CallerType,
@@ -26,6 +30,7 @@ from skyvern.forge.sdk.workflow.models.tags import (
     TagSource,
     TagWriteContext,
 )
+from skyvern.forge.sdk.workflow.models.validators import TAG_COLOR_PALETTE
 
 ORG_ID = "o_test"
 WPID = "wpid_alpha"
@@ -71,6 +76,23 @@ def _ctx(caller_id: str = "user_abc") -> TagWriteContext:
         source=TagSource.MANUAL,
         caller_type=CallerType.USER,
     )
+
+
+async def _seed_workflow(repo: TagsRepository, wpid: str, *, org_id: str = ORG_ID, deleted: bool = False) -> None:
+    """Insert a WorkflowModel row so the non-deleted-workflow filter on the value
+    counts can resolve a workflow (a tag only exists on a real workflow). Pass
+    ``deleted=True`` to seed a soft-deleted workflow."""
+    async with repo.Session() as session:
+        session.add(
+            WorkflowModel(
+                organization_id=org_id,
+                workflow_permanent_id=wpid,
+                title="t",
+                workflow_definition={},
+                deleted_at=datetime.now(timezone.utc) if deleted else None,
+            )
+        )
+        await session.commit()
 
 
 @pytest.mark.asyncio
@@ -451,8 +473,6 @@ async def test_update_tag_key_description_org_scoped(repo: TagsRepository) -> No
 @pytest.mark.asyncio
 async def test_get_tag_event_history_filters_by_since(repo: TagsRepository) -> None:
     """`since` is inclusive; events earlier than the cutoff are excluded."""
-    from datetime import datetime, timezone
-
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
     cutoff = datetime.now(timezone.utc)
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "stage"}, deletes=set(), context=_ctx())
@@ -662,3 +682,374 @@ async def test_batch_includes_standalone_labels(repo: TagsRepository) -> None:
     )
     result = await repo.get_active_tags_for_workflows([WPID], ORG_ID)
     assert set(result[WPID]) == {("env", "prod"), (None, "urgent")}
+
+
+async def _tag_value_rows(repo: TagsRepository) -> list[TagValueModel]:
+    async with repo.Session() as session:
+        result = await session.execute(
+            select(TagValueModel)
+            .where(TagValueModel.deleted_at.is_(None))
+            .order_by(TagValueModel.key, TagValueModel.value)
+        )
+        return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_set_without_color_registers_random_palette_color(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    rows = await _tag_value_rows(repo)
+    assert len(rows) == 1
+    assert (rows[0].key, rows[0].value) == ("env", "prod")
+    assert rows[0].color in TAG_COLOR_PALETTE
+
+
+@pytest.mark.asyncio
+async def test_set_with_color_persists_provided_color(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+
+    rows = await _tag_value_rows(repo)
+    assert len(rows) == 1
+    assert rows[0].color == "blue"
+
+
+@pytest.mark.asyncio
+async def test_tag_value_color_is_idempotent_without_color(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "teal"}
+    )
+    # Re-SET the same (key, value) with no color: the existing color must be kept,
+    # and no duplicate registry row may appear under the partial unique.
+    await repo.apply_tag_changes("wpid_other", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    rows = await _tag_value_rows(repo)
+    assert len(rows) == 1
+    assert rows[0].color == "teal"
+
+
+@pytest.mark.asyncio
+async def test_tag_value_color_override_updates_existing(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    await repo.apply_tag_changes(
+        "wpid_other", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "green"}
+    )
+
+    rows = await _tag_value_rows(repo)
+    assert len(rows) == 1
+    assert rows[0].color == "green"
+
+
+@pytest.mark.asyncio
+async def test_color_override_applies_on_idempotent_set(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    # Re-SET the same (key, value) on the same workflow: an idempotent tag op that emits no
+    # tag event must still apply the new color override to the registry row.
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "green"}
+    )
+
+    rows = await _tag_value_rows(repo)
+    assert len(rows) == 1
+    assert rows[0].color == "green"
+
+
+@pytest.mark.asyncio
+async def test_distinct_values_under_same_key_get_distinct_color_rows(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx(), colors={"env": "red"}
+    )
+
+    rows = await _tag_value_rows(repo)
+    assert {(r.value, r.color) for r in rows} == {("prod", "blue"), ("stg", "red")}
+
+
+@pytest.mark.asyncio
+async def test_standalone_labels_are_not_colored(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["urgent"])
+    assert await _tag_value_rows(repo) == []
+
+
+@pytest.mark.asyncio
+async def test_list_tag_values_returns_active_rows_ordered(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID,
+        ORG_ID,
+        sets={"team": "core", "env": "prod"},
+        deletes=set(),
+        context=_ctx(),
+        colors={"team": "purple", "env": "blue"},
+    )
+
+    values = await repo.list_tag_values(ORG_ID)
+    assert [(v.key, v.value, v.color) for v in values] == [("env", "prod", "blue"), ("team", "core", "purple")]
+
+
+@pytest.mark.asyncio
+async def test_list_tag_values_is_org_scoped(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    assert await repo.list_tag_values("o_someone_else") == []
+
+
+@pytest.mark.asyncio
+async def test_recolor_tag_value_updates_color(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+
+    updated = await repo.recolor_tag_value(ORG_ID, "env", "prod", "pink")
+    assert updated is not None
+    assert updated.color == "pink"
+    assert [v.color for v in await repo.list_tag_values(ORG_ID)] == ["pink"]
+
+
+@pytest.mark.asyncio
+async def test_recolor_tag_value_returns_none_when_absent(repo: TagsRepository) -> None:
+    assert await repo.recolor_tag_value(ORG_ID, "env", "prod", "pink") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_soft_deletes_value_colors(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    assert len(await repo.list_tag_values(ORG_ID)) == 1
+
+    await repo.delete_tag_key(ORG_ID, "env", _ctx())
+    # The key's color rows must not survive the key delete and keep showing in GET /tag-values.
+    assert await repo.list_tag_values(ORG_ID) == []
+
+
+# ---------------------- SKY-11336: per-label count, rename, soft-delete ----------------------
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_per_value(repo: TagsRepository) -> None:
+    for wpid in ("wpid_a", "wpid_b", "wpid_c"):
+        await _seed_workflow(repo, wpid)
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_c", ORG_ID, sets={"env": "stg", "team": "core"}, deletes=set(), context=_ctx())
+
+    counts = await repo.count_active_workflows_per_value(ORG_ID)
+    assert counts == {("env", "prod"): 2, ("env", "stg"): 1, ("team", "core"): 1}
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_per_value_excludes_soft_deleted_workflows(repo: TagsRepository) -> None:
+    await _seed_workflow(repo, "wpid_live")
+    await _seed_workflow(repo, "wpid_gone", deleted=True)
+    await repo.apply_tag_changes("wpid_live", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_gone", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    # The soft-deleted workflow's lingering SET event must not inflate the count.
+    assert await repo.count_active_workflows_per_value(ORG_ID) == {("env", "prod"): 1}
+    assert await repo.count_active_workflows_for_value(ORG_ID, "env", "prod") == 1
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_per_value_ignores_deleted_and_standalone(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        "wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), label_sets=["urgent"]
+    )
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={}, deletes={"env"}, context=_ctx())
+    # The deleted grouped tag and the standalone label must not appear in per-value counts.
+    assert await repo.count_active_workflows_per_value(ORG_ID) == {}
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_for_value_targeted(repo: TagsRepository) -> None:
+    for wpid in ("wpid_a", "wpid_b", "wpid_c"):
+        await _seed_workflow(repo, wpid)
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_c", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
+
+    assert await repo.count_active_workflows_for_value(ORG_ID, "env", "prod") == 2
+    assert await repo.count_active_workflows_for_value(ORG_ID, "env", "stg") == 1
+    # Unknown pair and other org both count zero.
+    assert await repo.count_active_workflows_for_value(ORG_ID, "env", "dev") == 0
+    assert await repo.count_active_workflows_for_value("o_other", "env", "prod") == 0
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_cascades_and_carries_color(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        "wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    await repo.apply_tag_changes(
+        "wpid_b", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+
+    result = await repo.rename_tag_value(ORG_ID, "env", "prod", "production", _ctx())
+
+    assert result is not None
+    assert (result.key, result.value, result.color) == ("env", "production", "blue")
+    assert result.renamed_workflow_count == 2
+    # Both workflows now carry the new value...
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "production"}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_b", ORG_ID) == {"env": "production"}
+    # ...the new color row replaces the old one, carrying the color forward.
+    assert [(v.key, v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("env", "production", "blue")]
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_preserves_history(repo: TagsRepository) -> None:
+    """Append-only invariant: the old value's SET event stays in history (superseded),
+    a fresh SET records the new value — past events are never rewritten."""
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.rename_tag_value(ORG_ID, "env", "prod", "production", _ctx())
+
+    history = await repo.get_tag_event_history("wpid_a", ORG_ID)
+    values = [(row.event_type, row.value) for row in history]
+    # Newest-first: the new SET, then the superseded old SET. The old value is preserved.
+    assert values == [(TagEventType.SET.value, "production"), (TagEventType.SET.value, "prod")]
+    assert history[1].superseded_at is not None
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_unknown_returns_none(repo: TagsRepository) -> None:
+    assert await repo.rename_tag_value(ORG_ID, "env", "prod", "production", _ctx()) is None
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_rejects_org_wide_collision(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
+
+    with pytest.raises(TagValueRenameCollision):
+        await repo.rename_tag_value(ORG_ID, "env", "prod", "stg", _ctx())
+    # The cascade must not have run: prod is untouched.
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "prod"}
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_collision_detects_in_use_value(repo: TagsRepository) -> None:
+    """Collision is org-wide: a target value in use on a workflow (active SET) blocks
+    the rename even when its color row was soft-deleted out of band."""
+    from sqlalchemy import update as _update
+
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
+    # Drop only the stg color row; the active SET still makes stg exist org-wide.
+    async with repo.Session() as session:
+        await session.execute(
+            _update(TagValueModel)
+            .where(TagValueModel.key == "env", TagValueModel.value == "stg")
+            .values(deleted_at=datetime.now(timezone.utc))
+        )
+        await session.commit()
+
+    with pytest.raises(TagValueRenameCollision):
+        await repo.rename_tag_value(ORG_ID, "env", "prod", "stg", _ctx())
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_reuses_soft_deleted_target(repo: TagsRepository) -> None:
+    """A previously soft-deleted target value is NOT a collision — rename succeeds."""
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
+    # Remove stg entirely (color row soft-deleted, SET superseded).
+    await repo.delete_tag_value(ORG_ID, "env", "stg", _ctx())
+
+    result = await repo.rename_tag_value(ORG_ID, "env", "prod", "stg", _ctx())
+    assert result is not None
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "stg"}
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_carries_random_color_when_no_color_row(repo: TagsRepository) -> None:
+    """If the source has active SETs but no color row, the rename still registers the
+    new label with a palette color rather than failing."""
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    async with repo.Session() as session:
+        from sqlalchemy import update as _update
+
+        await session.execute(
+            _update(TagValueModel)
+            .where(TagValueModel.key == "env", TagValueModel.value == "prod")
+            .values(deleted_at=datetime.now(timezone.utc))
+        )
+        await session.commit()
+
+    result = await repo.rename_tag_value(ORG_ID, "env", "prod", "production", _ctx())
+    assert result is not None
+    assert result.color in TAG_COLOR_PALETTE
+    assert result.renamed_workflow_count == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_cascades_and_counts(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_c", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
+
+    removed = await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx())
+
+    assert removed == 2
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_b", ORG_ID) == {}
+    # A sibling value under the same key is untouched.
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_c", ORG_ID) == {"env": "stg"}
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_writes_delete_event_carrying_value(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx())
+
+    rows = await _all_events(repo)
+    assert rows[-1].event_type == TagEventType.DELETE.value
+    # Per-value delete records which value was removed (vs the whole-key delete's null value).
+    assert rows[-1].key == "env"
+    assert rows[-1].value == "prod"
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_soft_deletes_only_that_color_row(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        "wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "blue"}
+    )
+    await repo.apply_tag_changes(
+        "wpid_b", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx(), colors={"env": "red"}
+    )
+
+    await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx())
+    # prod's color row is gone; stg's survives.
+    assert [(v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("stg", "red")]
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_unknown_returns_none(repo: TagsRepository) -> None:
+    assert await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx()) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_idempotent(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    assert await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx()) == 1
+    # Second call: no active SET, no active color row left.
+    assert await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx()) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_then_reapply_reregisters(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx())
+
+    await repo.apply_tag_changes(
+        "wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "green"}
+    )
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "prod"}
+    assert [(v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("prod", "green")]

@@ -29,6 +29,8 @@ class _FakeContext:
     turn_id: str = "turn_example"
     workflow_copilot_chat_id: str = "chat_example"
     total_tokens_used: int | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    completion_verification_result: Any = None
 
 
 # `on_tool_end(context, agent, tool, result)` only reads `tool` and `result`;
