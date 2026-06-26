@@ -51,16 +51,21 @@ class StateMachineWait(StateMachine):
             return None
 
         if self.last_event_timestamp is not None:
-            duration_ms = int(event.params.timestamp - self.last_event_timestamp)
+            gap_ms = int(event.params.timestamp - self.last_event_timestamp)
 
-            if duration_ms >= self.threshold_ms:
-                if not self._page_was_active(self.last_event_timestamp, event.params.timestamp):
+            if gap_ms >= self.threshold_ms:
+                # Size the wait to the page-busy span, not the full gap (drops the idle/think/lag tail).
+                last_activity_ms = self._last_activity_in_gap_ms(self.last_event_timestamp, event.params.timestamp)
+                busy_ms = int(last_activity_ms - self.last_event_timestamp) if last_activity_ms is not None else 0
+
+                if last_activity_ms is None or busy_ms < self.threshold_ms:
                     LOG.debug(
-                        "~ suppressing wait action: no page activity during idle gap",
-                        duration_ms=duration_ms,
+                        "~ suppressing wait action: page settled before the wait threshold",
+                        gap_ms=gap_ms,
+                        busy_ms=busy_ms,
                     )
                 else:
-                    LOG.debug("~ emitting wait action", duration_ms=duration_ms)
+                    LOG.debug("~ emitting wait action", gap_ms=gap_ms, busy_ms=busy_ms)
 
                     action_target = ActionTarget(
                         class_name=None,
@@ -75,9 +80,9 @@ class StateMachineWait(StateMachine):
                         kind=ActionKind.WAIT.value,
                         target=action_target,
                         timestamp_start=self.last_event_timestamp,
-                        timestamp_end=event.params.timestamp,
+                        timestamp_end=last_activity_ms,
                         url=event.params.url,
-                        duration_ms=duration_ms,
+                        duration_ms=busy_ms,
                     )
 
                     self.reset()
@@ -88,11 +93,12 @@ class StateMachineWait(StateMachine):
 
         return None
 
-    def _page_was_active(self, gap_start_ms: float, gap_end_ms: float) -> bool:
+    def _last_activity_in_gap_ms(self, gap_start_ms: float, gap_end_ms: float) -> float | None:
         while self.page_activity_timestamps_ms and self.page_activity_timestamps_ms[0] < gap_start_ms:
             self.page_activity_timestamps_ms.popleft()
 
-        return any(timestamp <= gap_end_ms for timestamp in self.page_activity_timestamps_ms)
+        in_gap = [timestamp for timestamp in self.page_activity_timestamps_ms if timestamp <= gap_end_ms]
+        return max(in_gap) if in_gap else None
 
     def on_action(self, action: Action, current_actions: list[Action]) -> bool:
         if action.kind == ActionKind.HOVER:
