@@ -350,15 +350,31 @@ def _repair_context_root_cause_identity(
         payload["selector"] = selector
         payload["refiner_selector"] = refiner_selector
         selector_kind = "selector" if selector else ""
+    elif reason_code == "runtime_block_failure":
+        runtime_failure_class = _safe_text(repair_context.runtime_failure_class, 80)
+        payload["runtime_failure_class"] = runtime_failure_class
+        payload["failed_block_status"] = _safe_text(repair_context.failed_block_status, 80)
+        payload["current_origin"] = _safe_text(repair_context.current_origin, 120)
+        payload["current_url_present"] = repair_context.current_url_present
+        payload["current_title_present"] = repair_context.current_title_present
+        payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
+        payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
+        payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
+        payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
+        payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
+        payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
     elif repair_context.unresolved_names:
         payload["unresolved_names"] = _safe_identity_list(repair_context.unresolved_names)
 
+    error_class_suffix = _identity_token(reason_code)
+    if reason_code == "runtime_block_failure" and repair_context.runtime_failure_class:
+        error_class_suffix = f"{error_class_suffix}_{_identity_token(repair_context.runtime_failure_class)}"
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return RepairRootCauseIdentity(
         root_cause_signature=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         primary_category=_AUTHORING_REPAIR_CATEGORY,
         failure_categories=(_AUTHORING_REPAIR_CATEGORY,),
-        error_class=f"code_authoring_{_identity_token(reason_code)}",
+        error_class=f"code_authoring_{error_class_suffix}",
         selector_kind=selector_kind,
         selector=selector,
     )

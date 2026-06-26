@@ -28,6 +28,9 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    finalize_runtime_authoring_repair_context_from_page_observation,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -840,6 +843,7 @@ async def _inspect_page_for_composition_impl(
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     copilot_ctx.composition_page_evidence = evidence
+    finalize_runtime_authoring_repair_context_from_page_observation(copilot_ctx)
     if (
         isinstance(run_id, str)
         and run_id
