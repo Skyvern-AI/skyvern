@@ -93,6 +93,11 @@ def unregister_copilot_session(session_id: str) -> None:
     _copilot_sessions.pop(session_id, None)
 
 
+def active_copilot_session_ids() -> set[str]:
+    """Browser-session IDs currently bound to an active copilot turn."""
+    return set(_copilot_sessions)
+
+
 def _explicit_cloud_session_can_access_localhost() -> bool:
     return settings.ENV == "local"
 
