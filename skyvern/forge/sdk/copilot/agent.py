@@ -3559,6 +3559,16 @@ async def _run_copilot_turn_impl(
         copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
     )
+    LOG.info(
+        "copilot_block_authoring_policy_resolved",
+        block_authoring_policy=normalize_block_authoring_policy(ctx.block_authoring_policy).name,
+        block_authoring_policy_value=normalize_block_authoring_policy(ctx.block_authoring_policy).value,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        workflow_id=ctx.workflow_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+        turn_id=ctx.turn_id,
+        impose_synthesized_code_block=ctx.impose_synthesized_code_block,
+    )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
     # different ids and correlation would silently break. Uses a real

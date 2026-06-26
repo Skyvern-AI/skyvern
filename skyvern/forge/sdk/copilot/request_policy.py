@@ -621,7 +621,8 @@ def _normalize_requested_output_aliases(aliases: dict[str, str] | None) -> dict[
     return normalized
 
 
-def _lookup_requested_output_path_alias(field_name: str, aliases: dict[str, str] | None) -> str | None:
+# Shared within the Copilot subsystem; not a general public API.
+def lookup_requested_output_path_alias(field_name: str, aliases: dict[str, str] | None) -> str | None:
     normalized_aliases = _normalize_requested_output_aliases(aliases)
     field_key = " ".join(_word_tokens(field_name))
     if not field_key:
@@ -636,7 +637,7 @@ def _lookup_requested_output_path_alias(field_name: str, aliases: dict[str, str]
     return None
 
 
-def _schema_output_path_aliases_from_criteria(criteria: list[CompletionCriterion]) -> dict[str, str]:
+def schema_output_path_aliases_from_criteria(criteria: list[CompletionCriterion]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for criterion in criteria:
         if criterion.level == "definition" or criterion.method_mandated or not criterion.output_path:
@@ -675,7 +676,7 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     for word in candidate_words:
         if " ".join(_word_tokens(word)) in normalized_aliases:
             return word
-    if _lookup_requested_output_path_alias(candidate, aliases) is not None:
+    if lookup_requested_output_path_alias(candidate, aliases) is not None:
         return candidate
 
     acronyms = [
@@ -683,7 +684,7 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
         for token in _OUTPUT_ACRONYM_RE.findall(candidate)
         if token.casefold() not in _OUTPUT_METHOD_WORDS
         and token.casefold() not in _OUTPUT_GENERIC_WORDS
-        and _lookup_requested_output_path_alias(token, aliases) is not None
+        and lookup_requested_output_path_alias(token, aliases) is not None
     ]
     if acronyms:
         return acronyms[0]
@@ -740,7 +741,7 @@ def _requested_output_fields(user_message: str, aliases: dict[str, str] | None =
 
 
 def requested_output_path_for_field(field_name: str, aliases: dict[str, str] | None = None) -> str:
-    alias_path = _lookup_requested_output_path_alias(field_name, aliases)
+    alias_path = lookup_requested_output_path_alias(field_name, aliases)
     if alias_path is not None:
         return alias_path
     words = _word_tokens(field_name)
@@ -844,7 +845,7 @@ def _cap_completion_criteria(
 def _apply_requested_output_completion_criteria(
     policy: RequestPolicy, user_message: str, aliases: dict[str, str] | None = None
 ) -> None:
-    schema_aliases = _schema_output_path_aliases_from_criteria(policy.completion_criteria)
+    schema_aliases = schema_output_path_aliases_from_criteria(policy.completion_criteria)
     config_aliases = _normalize_requested_output_aliases(aliases)
     schema_aliases = _normalize_requested_output_aliases(schema_aliases)
     detection_aliases = {**config_aliases, **schema_aliases}
@@ -856,8 +857,8 @@ def _apply_requested_output_completion_criteria(
     requested_output_paths: set[str] = set()
     for field_name in requested_fields:
         output_path = (
-            _lookup_requested_output_path_alias(field_name, schema_aliases)
-            or _lookup_requested_output_path_alias(field_name, config_aliases)
+            lookup_requested_output_path_alias(field_name, schema_aliases)
+            or lookup_requested_output_path_alias(field_name, config_aliases)
             or requested_output_path_for_field(field_name)
         )
         field_label = _requested_output_field_label(field_name, output_path)
