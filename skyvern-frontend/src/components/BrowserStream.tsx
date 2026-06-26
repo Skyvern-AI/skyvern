@@ -47,6 +47,15 @@ import { handleVncClipboardPasteShortcut } from "@/components/browserStreamClipb
 
 import "./browser-stream.css";
 
+const MESSAGE_RECONNECT_DELAY_MS = 1000;
+const MESSAGE_MAX_RECONNECT_ATTEMPTS = 20;
+const STREAM_GAVE_UP_DIAGNOSTIC: StreamDiagnostic = {
+  title: "Browser stream connection lost",
+  detail:
+    "The browser session stopped responding after several reconnect attempts.",
+  hint: "Refresh the page to try again.",
+};
+
 interface BrowserSession {
   browser_session_id: string;
   status?: string | null;
@@ -219,6 +228,10 @@ function BrowserStream({
   const rfbRef = useRef<RFB | null>(null);
   const userCanSendVncInputRef = useRef(false);
   const observerRef = useRef<MutationObserver | null>(null);
+  const messageReconnectAttemptsRef = useRef(0);
+  const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const clientId = useClientIdStore((state) => state.clientId);
   const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
@@ -236,6 +249,11 @@ function BrowserStream({
     setIsMessageConnected(false);
     setHasBrowserSession(true);
     setTerminalDiagnostic(null);
+    messageReconnectAttemptsRef.current = 0;
+    if (messageReconnectTimerRef.current) {
+      clearTimeout(messageReconnectTimerRef.current);
+      messageReconnectTimerRef.current = null;
+    }
     if (rfbRef.current) {
       rfbRef.current.disconnect();
       rfbRef.current = null;
@@ -297,13 +315,54 @@ function BrowserStream({
     prevVncConnectedRef.current = isVncConnected;
   }, [isVncConnected, onClose]);
 
-  // effect for message disconnects only
+  // message channel reconnect policy
   useEffect(() => {
-    if (prevMessageConnectedRef.current && !isMessageConnected) {
-      setMessagesDisconnectedTrigger((x) => x + 1);
-    }
+    const messageJustClosed =
+      prevMessageConnectedRef.current && !isMessageConnected;
     prevMessageConnectedRef.current = isMessageConnected;
-  }, [isMessageConnected]);
+
+    if (isMessageConnected) {
+      return;
+    }
+
+    // A live VNC stream proves the session is real: reconnect now and drop the cap (also recovers a late VNC connect).
+    if (isVncConnected) {
+      messageReconnectAttemptsRef.current = 0;
+      if (messageReconnectTimerRef.current) {
+        clearTimeout(messageReconnectTimerRef.current);
+        messageReconnectTimerRef.current = null;
+      }
+      setMessagesDisconnectedTrigger((x) => x + 1);
+      return;
+    }
+
+    if (!messageJustClosed) {
+      return;
+    }
+
+    // No stream is live; a session the backend can't find would respin forever, so cap it.
+    if (messageReconnectAttemptsRef.current >= MESSAGE_MAX_RECONNECT_ATTEMPTS) {
+      setTerminalDiagnostic((prev) => prev ?? STREAM_GAVE_UP_DIAGNOSTIC);
+      return;
+    }
+
+    messageReconnectAttemptsRef.current += 1;
+    if (messageReconnectTimerRef.current) {
+      clearTimeout(messageReconnectTimerRef.current);
+    }
+    messageReconnectTimerRef.current = setTimeout(() => {
+      messageReconnectTimerRef.current = null;
+      setMessagesDisconnectedTrigger((x) => x + 1);
+    }, MESSAGE_RECONNECT_DELAY_MS);
+  }, [isMessageConnected, isVncConnected]);
+
+  useEffect(() => {
+    return () => {
+      if (messageReconnectTimerRef.current) {
+        clearTimeout(messageReconnectTimerRef.current);
+      }
+    };
+  }, []);
 
   // vnc socket
   useEffect(
@@ -385,6 +444,7 @@ function BrowserStream({
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
           setTerminalDiagnostic(null);
+          messageReconnectAttemptsRef.current = 0;
         });
 
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
