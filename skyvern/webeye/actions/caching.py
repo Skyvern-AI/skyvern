@@ -100,7 +100,7 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
             )
             break
         else:
-            LOG.warning("No element found with the hash", element_hash=cached_action.skyvern_element_hash)
+            LOG.info("No element found with the hash", element_hash=cached_action.skyvern_element_hash, sampling=True)
             break
 
     # If there are no items in the list we just built, we need to revert back to no-cache mode. Return empty list.

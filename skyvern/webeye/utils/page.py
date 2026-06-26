@@ -877,7 +877,7 @@ class SkyvernFrame:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 loading_indicator_result = "timeout"
-                LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+                LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
             except Exception:
                 loading_indicator_result = "error"
                 LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
@@ -893,7 +893,7 @@ class SkyvernFrame:
                 await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 network_idle_result = "timeout"
-                LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+                LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 

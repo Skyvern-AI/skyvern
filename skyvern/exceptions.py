@@ -161,6 +161,16 @@ class InvalidOpenAIResponseFormat(SkyvernException):
         super().__init__(f"Invalid response format: {message}")
 
 
+class PhoneNumberInputMismatch(SkyvernException):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        self.expected_digit_count = expected_digit_count
+        self.actual_digit_count = actual_digit_count
+        super().__init__(
+            "Phone input read-back mismatch: "
+            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
