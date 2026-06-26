@@ -239,7 +239,11 @@ export function RunHero({
             onPlay={onRecordingPlay}
           />
         ) : shownFrame ? (
-          <HeroScreenshot artifactId={shownFrame.screenshotArtifactId} />
+          <HeroScreenshot
+            workflowRunBlockId={shownFrame.blockId}
+            blockType={shownFrame.blockType}
+            running={running}
+          />
         ) : (
           <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
             Waiting for the first action…

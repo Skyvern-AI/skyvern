@@ -129,6 +129,7 @@ describe("buildFilmstrip", () => {
     expect(frames.map((f) => f.id)).toEqual(["oldest", "newest"]);
     expect(frames.map((f) => f.index)).toEqual([1, 2]);
     expect(frames.map((f) => f.isBlockStart)).toEqual([true, false]);
+    expect(frames.map((f) => f.blockType)).toEqual(["task", "task"]);
   });
 
   test("marks block boundaries across a multi-block run", () => {

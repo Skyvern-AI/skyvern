@@ -6,21 +6,53 @@ import { getClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
+import { apiPathPrefix } from "@/util/env";
 
+import { selectBlockScreenshot } from "../../workflowRun/blockScreenshot";
 import { screenshotZoomClasses } from "./HeroScreenshot.utils";
 
 /**
- * The pinned/active action screenshot, fit to the run-hero width and scrollable
- * for long captures. Shares the ["artifact", id] cache with the filmstrip
- * thumbnails so each is fetched once.
+ * The active block's screenshot, fit to the run-hero width and scrollable for long
+ * captures. Prefers the full-page LLM screenshot (what the agent saw) over the
+ * per-action screenshot via `selectBlockScreenshot`, matching the legacy run page.
  */
-export function HeroScreenshot({ artifactId }: { artifactId: string | null }) {
+export function HeroScreenshot({
+  workflowRunBlockId,
+  blockType,
+  running,
+}: {
+  workflowRunBlockId: string | null;
+  blockType: string | null;
+  running: boolean;
+}) {
   const credentialGetter = useCredentialGetter();
   const [zoomed, setZoomed] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
+    queryKey: ["workflowRunBlock", workflowRunBlockId, "artifacts"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      return client
+        .get(
+          `${apiPathPrefix}/workflow_run_block/${workflowRunBlockId}/artifacts`,
+        )
+        .then((response) => response.data);
+    },
+    enabled: Boolean(workflowRunBlockId),
+    refetchInterval: running ? 5000 : false,
+    refetchOnWindowFocus: false,
+    // Artifacts are immutable once the run finishes; only keep polling while live.
+    staleTime: running ? 0 : Infinity,
+    retry: 1,
+  });
+
+  const screenshot = selectBlockScreenshot(artifacts, blockType ?? undefined);
+  const screenshotId = screenshot?.artifact_id ?? null;
+
   useEffect(() => {
     setZoomed(false);
-  }, [artifactId]);
+  }, [screenshotId]);
 
   // Start each view at the top; when zoomed, center horizontally too (margin-auto
   // resolves to 0 once the image overflows, so the scroll would default to left).
@@ -31,43 +63,31 @@ export function HeroScreenshot({ artifactId }: { artifactId: string | null }) {
     }
     el.scrollTop = 0;
     el.scrollLeft = zoomed ? (el.scrollWidth - el.clientWidth) / 2 : 0;
-  }, [zoomed, artifactId]);
-  const { data, isLoading } = useQuery<ArtifactApiResponse>({
-    queryKey: ["artifact", artifactId],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter, "sans-api-v1");
-      return client
-        .get(`/artifacts/${artifactId}`)
-        .then((response) => response.data);
-    },
-    enabled: Boolean(artifactId),
-    refetchOnWindowFocus: false,
-    refetchOnMount: false,
-    staleTime: Infinity,
-    retry: 1,
-  });
+  }, [zoomed, screenshotId]);
 
-  if (!artifactId) {
+  if (!workflowRunBlockId) {
     return (
       <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
         No screenshot for this action.
       </div>
     );
   }
-  if (isLoading) {
+  // Spinner only on the first load, not on poll refetches (which keep prior data).
+  if (isLoading && !artifacts) {
     return (
       <div className="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <ReloadIcon className="h-5 w-5 animate-spin" /> Loading screenshot…
       </div>
     );
   }
-  if (!data || data.archived) {
+  if (!screenshot || screenshot.archived) {
     return (
       <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
         Screenshot unavailable.
       </div>
     );
   }
+
   const toggleZoom = () => setZoomed((z) => !z);
   const zoom = screenshotZoomClasses(zoomed);
   return (
@@ -86,8 +106,8 @@ export function HeroScreenshot({ artifactId }: { artifactId: string | null }) {
       }}
     >
       <img
-        src={getImageURL(data)}
-        alt="action screenshot"
+        src={getImageURL(screenshot)}
+        alt="block screenshot"
         className={zoom.image}
       />
     </div>
