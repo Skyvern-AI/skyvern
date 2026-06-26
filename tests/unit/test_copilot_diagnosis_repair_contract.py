@@ -10,6 +10,7 @@ import pytest
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
@@ -19,6 +20,10 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+)
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    finalize_runtime_authoring_repair_context_from_page_observation,
+    inject_runtime_authoring_repair_context,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
@@ -129,20 +134,28 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
 
 def test_authoring_repair_contexts_have_distinct_structural_root_cause_signatures() -> None:
     ambiguous = CodeAuthoringRepairContext(
-        block_label="retrieve_resale_demand_document_link",
+        block_label="retrieve_document_link",
         reason_code="ambiguous_bare_selector",
         selector="button",
         refiner_selector="xpath=//button[normalize-space()='View / Download']",
     )
     sandbox = CodeAuthoringRepairContext(
-        block_label="retrieve_resale_demand_document_link",
+        block_label="retrieve_document_link",
         reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
         unresolved_names=["row_text", "confirmation_number"],
     )
     sandbox_reordered = CodeAuthoringRepairContext(
-        block_label="retrieve_resale_demand_document_link",
+        block_label="retrieve_document_link",
         reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
         unresolved_names=["confirmation_number", "row_text"],
+    )
+    synthesized_binding = CodeAuthoringRepairContext(
+        block_label="retrieve_document_link",
+        reason_code="synthesized_parameter_binding_ambiguous",
+        unresolved_names=["enter_confirmation"],
+        parameter_keys=["enter_confirmation"],
+        available_parameter_keys=["confirmation_number"],
+        binding_candidates=["enter_confirmation", "confirmation_number"],
     )
 
     ambiguous_contract = build_diagnosis_repair_contract(
@@ -160,14 +173,28 @@ def test_authoring_repair_contexts_have_distinct_structural_root_cause_signature
         result=_authoring_repair_result(sandbox_reordered),
         ctx=_ctx(),
     )
+    synthesized_binding_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(synthesized_binding),
+        ctx=_ctx(),
+    )
 
     ambiguous_signature = ambiguous_contract.to_trace_data()["root_cause_signature"]
     sandbox_signature = sandbox_contract.to_trace_data()["root_cause_signature"]
+    synthesized_binding_signature = synthesized_binding_contract.to_trace_data()["root_cause_signature"]
     assert ambiguous_contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert synthesized_binding_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert synthesized_binding_contract.repair_decision.target_blocks == ["retrieve_document_link"]
     assert ambiguous_signature is not None
     assert sandbox_signature is not None
+    assert synthesized_binding_signature is not None
     assert ambiguous_signature != sandbox_signature
+    assert synthesized_binding_signature not in {ambiguous_signature, sandbox_signature}
+    assert (
+        synthesized_binding_contract.diagnosis_result.root_cause_identity.error_class
+        == "code_authoring_synthesized_parameter_binding_ambiguous"
+    )
     assert sandbox_reordered_contract.to_trace_data()["root_cause_signature"] == sandbox_signature
 
 
@@ -197,16 +224,56 @@ def test_missing_required_output_key_repair_identity_uses_structural_context_onl
     assert contract.diagnosis_result.root_cause_identity.error_class == "code_authoring_missing_required_output_key"
 
 
+def test_runtime_authoring_repair_context_identity_includes_bounded_page_state() -> None:
+    base = CodeAuthoringRepairContext(
+        block_label="search_registry",
+        reason_code="runtime_block_failure",
+        runtime_failure_reason='Timeout waiting for locator("#results")',
+        runtime_failure_class="timeout_waiting_for_selector",
+        failed_block_status="failed",
+        workflow_run_id="wr_failed",
+        current_origin="https://example.test",
+        current_url_present=True,
+        current_title_present=True,
+        page_evidence_source="inspect_page_for_composition",
+        observed_after_workflow_run=True,
+        page_form_summaries=["text input labeled Search"],
+        page_result_summaries=["no results container is visible"],
+        page_action_summaries=["button Search is disabled"],
+    )
+    changed_page = base.model_copy(update={"page_result_summaries": ["results table is visible"]})
+
+    base_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(base),
+        ctx=_ctx(),
+    )
+    changed_page_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(changed_page),
+        ctx=_ctx(),
+    )
+
+    assert base_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert (
+        base_contract.to_trace_data()["root_cause_signature"]
+        != changed_page_contract.to_trace_data()["root_cause_signature"]
+    )
+    assert base_contract.diagnosis_result.root_cause_identity.error_class == (
+        "code_authoring_runtime_block_failure_timeout_waiting_for_selector"
+    )
+
+
 def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes() -> None:
     ctx = _ctx()
     ambiguous = CodeAuthoringRepairContext(
-        block_label="retrieve_resale_demand_document_link",
+        block_label="retrieve_document_link",
         reason_code="ambiguous_bare_selector",
         selector="button",
         refiner_selector="xpath=//button[normalize-space()='View / Download']",
     )
     sandbox = CodeAuthoringRepairContext(
-        block_label="retrieve_resale_demand_document_link",
+        block_label="retrieve_document_link",
         reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
         unresolved_names=["confirmation_number", "row_text"],
     )
@@ -232,6 +299,446 @@ def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes
     assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 1
     assert sandbox_contract.repair_loop_state.ceiling_reached is False
     assert getattr(ctx, "blocker_signal", None) is None
+
+
+def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+    run_execution_module._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "error": "Run failed.",
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "overall_status": "failed",
+                "blocks": [
+                    {
+                        "label": "search_registry",
+                        "status": "failed",
+                        "failure_reason": 'Timeout waiting for locator("#results")',
+                    }
+                ],
+            },
+        },
+    )
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.block_label == "search_registry"
+    assert pending_context.workflow_run_id == "wr_failed"
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search?case=secret",
+        "page_title": "Search results",
+        "forms": [{"label": "Search", "selector": "#search", "input_type": "text"}],
+        "result_containers": [{"label": "No results", "text": "No matching records"}],
+        "navigation_targets": [{"label": "Search", "selector": "button.search", "disabled": True}],
+    }
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {"workflow_run_id": "wr_failed", "overall_status": "failed"},
+    }
+
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    repair_context = ctx.last_code_authoring_repair_context
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert result["data"]["authoring_repair_context"] == repair_context.model_dump(mode="json")
+    assert repair_context.block_label == "search_registry"
+    assert repair_context.runtime_failure_class == "timeout_waiting_for_selector"
+    assert repair_context.current_origin == "https://example.test"
+    assert repair_context.current_url_present is True
+    assert repair_context.current_title_present is True
+    assert repair_context.page_evidence_source == "inspect_page_for_composition"
+    assert repair_context.observed_after_workflow_run is True
+    assert repair_context.page_form_summaries == ["Search #search"]
+    assert repair_context.page_result_summaries == ["No results No matching records"]
+    assert repair_context.page_action_summaries == ["Search button.search disabled"]
+    assert "case=secret" not in repair_context.model_dump_json()
+
+
+def test_failed_run_injects_pending_runtime_authoring_context_before_page_observation() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "search_registry",
+                    "status": "failed",
+                    "failure_reason": 'Locator.wait_for: strict mode violation: get_by_text("Order Details")',
+                }
+            ],
+        },
+    }
+
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+    inject_runtime_authoring_repair_context(ctx, run_result)
+
+    raw_context = run_result["data"]["authoring_repair_context"]
+    repair_context = CodeAuthoringRepairContext.model_validate(raw_context)
+    assert repair_context.reason_code == "runtime_block_failure"
+    assert repair_context.block_label == "search_registry"
+    assert repair_context.workflow_run_id == "wr_failed"
+    assert repair_context.runtime_failure_class
+    assert repair_context.observed_after_workflow_run is False
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=run_result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.diagnosis_result.root_cause_identity.primary_category == "CODE_AUTHORING_REPAIR"
+    assert contract.diagnosis_result.root_cause_identity.error_class.startswith("code_authoring_runtime_block_failure")
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["search_registry"]
+
+
+def test_runtime_authoring_repair_context_suppressed_for_stale_or_successful_runs() -> None:
+    stale_ctx = _ctx()
+    run_execution_module._record_run_blocks_result(
+        stale_ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "overall_status": "failed",
+                "blocks": [{"label": "search_registry", "status": "failed", "failure_reason": "Button missing"}],
+            },
+        },
+    )
+    stale_ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_other",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search",
+        "forms": [{"label": "Search", "selector": "#search"}],
+    }
+    stale_result = {"ok": False, "data": {"workflow_run_id": "wr_failed", "overall_status": "failed"}}
+
+    inject_runtime_authoring_repair_context(stale_ctx, stale_result)
+
+    assert "authoring_repair_context" not in stale_result["data"]
+    assert stale_ctx.last_code_authoring_repair_context is None
+
+    success_ctx = _ctx()
+    success_ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="search_registry",
+        reason_code="runtime_block_failure",
+    )
+    run_execution_module._record_run_blocks_result(success_ctx, _clean_completed_result())
+
+    assert success_ctx.last_code_authoring_repair_context is None
+
+
+def test_runtime_authoring_repair_context_does_not_override_terminal_stop() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_terminal",
+                "overall_status": "failed",
+                "blocks": [
+                    {
+                        "label": "search_registry",
+                        "status": "failed",
+                        "failure_reason": "Browser session not found.",
+                    }
+                ],
+            },
+        },
+    )
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_terminal",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search",
+        "forms": [{"label": "Search", "selector": "#search"}],
+    }
+    result = {
+        "ok": False,
+        "error": "Browser session not found.",
+        "data": {
+            "workflow_run_id": "wr_terminal",
+            "overall_status": "failed",
+            "failure_categories": [{"category": "UNRECOVERABLE_TOOL_ERROR"}],
+        },
+    }
+
+    contract = run_execution_module._record_diagnosis_repair_contract(
+        ctx,
+        source_tool="update_and_run_blocks",
+        result=result,
+        workflow_updated=True,
+    )
+
+    assert "authoring_repair_context" not in result["data"]
+    assert ctx.last_code_authoring_repair_context is None
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+
+
+def test_runtime_authoring_repair_context_requires_bounded_inspect_evidence() -> None:
+    for evidence_update in (
+        {"source_tool": "evaluate", "forms": [{"label": "Search", "selector": "#search"}]},
+        {"source_tool": "inspect_page_for_composition", "forms": []},
+    ):
+        ctx = _ctx()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        run_execution_module._record_run_blocks_result(
+            ctx,
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_failed",
+                    "overall_status": "failed",
+                    "blocks": [{"label": "search_registry", "status": "failed", "failure_reason": "Button missing"}],
+                },
+            },
+        )
+        ctx.composition_page_evidence = {
+            "workflow_run_id": "wr_failed",
+            "observed_after_workflow_run": True,
+            "current_url": "https://example.test/search",
+            **evidence_update,
+        }
+
+        assert finalize_runtime_authoring_repair_context_from_page_observation(ctx) is None
+        assert ctx.last_code_authoring_repair_context is None
+
+
+def test_runtime_authoring_repair_context_suppressed_for_terminal_page_evidence() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "overall_status": "failed",
+                "blocks": [{"label": "search_registry", "status": "failed", "failure_reason": "Search disabled"}],
+            },
+        },
+    )
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search",
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    assert finalize_runtime_authoring_repair_context_from_page_observation(ctx) is None
+    assert ctx.pending_code_authoring_runtime_repair_context is None
+    assert ctx.last_code_authoring_repair_context is None
+
+
+def test_runtime_authoring_repair_context_suppressed_for_authority_ask_and_state_stop() -> None:
+    ask_ctx = _ctx()
+    ask_ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ask_ctx.turn_intent.authority.may_update_workflow = False
+    run_execution_module._record_run_blocks_result(
+        ask_ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_ask",
+                "overall_status": "failed",
+                "blocks": [{"label": "search_registry", "status": "failed", "failure_reason": "Button missing"}],
+            },
+        },
+    )
+    ask_ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_ask",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search",
+        "forms": [{"label": "Search", "selector": "#search"}],
+    }
+    ask_result = {"ok": False, "data": {"workflow_run_id": "wr_ask", "overall_status": "failed"}}
+
+    inject_runtime_authoring_repair_context(ask_ctx, ask_result)
+
+    assert "authoring_repair_context" not in ask_result["data"]
+    assert ask_ctx.last_code_authoring_repair_context is None
+
+    stop_ctx = _ctx()
+    stop_ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    stop_ctx.last_test_non_retriable_nav_error = "net::ERR_NAME_NOT_RESOLVED"
+    run_execution_module._record_run_blocks_result(
+        stop_ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_stop",
+                "overall_status": "failed",
+                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+            },
+        },
+    )
+    stop_ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_stop",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search",
+        "forms": [{"label": "Search", "selector": "#search"}],
+    }
+    stop_result = {
+        "ok": False,
+        "error": "Failed to navigate to url https://bad.example.",
+        "data": {"workflow_run_id": "wr_stop", "overall_status": "failed"},
+    }
+
+    inject_runtime_authoring_repair_context(stop_ctx, stop_result)
+
+    assert "authoring_repair_context" not in stop_result["data"]
+    assert stop_ctx.last_code_authoring_repair_context is None
+
+
+def test_direct_runtime_authoring_repair_finalization_suppresses_stop_class_state() -> None:
+    cases = [
+        {
+            "failure_reason": "Failed to navigate to url https://bad.example.",
+            "ctx_attr": ("last_test_non_retriable_nav_error", "net::ERR_NAME_NOT_RESOLVED"),
+        },
+        {
+            "failure_reason": "Browser session not found while taking screenshot.",
+            "ctx_attr": None,
+        },
+        {
+            "failure_reason": "Skipped test run: required credentials are not configured.",
+            "ctx_attr": None,
+        },
+    ]
+    for case in cases:
+        ctx = _ctx()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        run_execution_module._record_run_blocks_result(
+            ctx,
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_stop",
+                    "overall_status": "failed",
+                    "blocks": [
+                        {
+                            "label": "search_registry",
+                            "status": "failed",
+                            "failure_reason": case["failure_reason"],
+                        }
+                    ],
+                },
+            },
+        )
+        ctx_attr = case["ctx_attr"]
+        if ctx_attr is not None:
+            setattr(ctx, ctx_attr[0], ctx_attr[1])
+        ctx.composition_page_evidence = {
+            "workflow_run_id": "wr_stop",
+            "observed_after_workflow_run": True,
+            "source_tool": "inspect_page_for_composition",
+            "current_url": "https://example.test/search",
+            "forms": [{"label": "Search", "selector": "#search"}],
+        }
+
+        assert finalize_runtime_authoring_repair_context_from_page_observation(ctx) is None
+        assert ctx.pending_code_authoring_runtime_repair_context is None
+        assert ctx.last_code_authoring_repair_context is None
+
+
+def test_new_pending_runtime_failure_clears_prior_finalized_runtime_context() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="old_search",
+        reason_code="runtime_block_failure",
+        runtime_failure_reason="Old failure",
+        workflow_run_id="wr_old",
+        current_origin="https://old.example",
+        observed_after_workflow_run=True,
+        page_form_summaries=["Old #search"],
+    )
+
+    run_execution_module._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_new",
+                "overall_status": "failed",
+                "blocks": [{"label": "new_search", "status": "failed", "failure_reason": "New button missing"}],
+            },
+        },
+    )
+
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.block_label == "new_search"
+    assert pending_context.workflow_run_id == "wr_new"
+    assert ctx.last_code_authoring_repair_context is None
+
+
+def test_runtime_authoring_repair_context_sanitizes_failure_and_page_summaries() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_secret",
+                "overall_status": "failed",
+                "blocks": [
+                    {
+                        "label": "search_registry",
+                        "status": "failed",
+                        "failure_reason": "Timeout after entering password=hunter2",
+                    }
+                ],
+            },
+        },
+    )
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_secret",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://user:secret@example.test/search?password=hunter2",
+        "page_title": "Search",
+        "forms": [{"label": "Password password=hunter2", "selector": "#password"}],
+        "result_containers": [{"label": "Result", "text": "token=secret-token"}],
+    }
+    result = {"ok": False, "data": {"workflow_run_id": "wr_secret", "overall_status": "failed"}}
+
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    repair_context = ctx.last_code_authoring_repair_context
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    dumped = repair_context.model_dump_json()
+    assert "hunter2" not in dumped
+    assert "secret-token" not in dumped
+    assert "user:secret" not in dumped
+    assert "password=hunter2" not in dumped
+    assert repair_context.current_origin == "https://example.test"
 
 
 def test_schema_incompatibility_failure_type_stops_without_repair() -> None:

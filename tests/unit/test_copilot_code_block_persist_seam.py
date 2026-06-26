@@ -1991,6 +1991,65 @@ class TestCompiledAuthoringImposition:
         assert ctx.workflow_yaml == ""
 
     @pytest.mark.asyncio
+    async def test_multi_input_missing_synthesized_parameter_rejects_with_repair_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#confirmation",
+                "source_url": "https://example.com/orders",
+                "typed_length": 10,
+                "role": "textbox",
+                "accessible_name": "Enter Confirmation",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#postal",
+                "source_url": "https://example.com/orders",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "ZIP Code",
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Order lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: order_lookup}
+              blocks:
+              - block_type: code
+                label: order_status
+                parameter_keys: [order_lookup]
+                code: |
+                  await page.locator("#confirmation").fill(str(order_lookup))
+                  await page.locator("#postal").fill(str(order_lookup))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "missing submitted workflow parameter and literal binding is ambiguous" in result["error"]
+        assert ctx.workflow_yaml == ""
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["block_label"] == "order_status"
+        assert repair_context["unresolved_names"] == ["enter_confirmation"]
+        assert repair_context["available_parameter_keys"] == ["order_lookup"]
+        assert repair_context["binding_candidates"] == ["enter_confirmation", "order_lookup"]
+        assert "update_and_run_blocks" in repair_context["repair_instruction"]
+        assert "secret" not in str(repair_context).lower()
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
+
+    @pytest.mark.asyncio
     async def test_synthesized_internal_parameter_aliases_to_existing_declared_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
