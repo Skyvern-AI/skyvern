@@ -62,6 +62,23 @@ def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriter
     return run_criteria, definition_criteria
 
 
+def _classifier_status(copilot_ctx: Any) -> str:
+    policy = getattr(copilot_ctx, "request_policy", None)
+    return policy.classifier_status if policy is not None else "not_run"
+
+
+def _no_gradeable_run_plane_result(criterion_ids: list[str]) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=list(criterion_ids),
+        verdicts=[
+            CriterionVerdict(criterion_id=criterion_id, state="unknown", reason_code="unknown")
+            for criterion_id in criterion_ids
+        ],
+        no_gradeable_run_plane=True,
+    )
+
+
 def _definition_plane_workflow_yaml(copilot_ctx: Any) -> str | None:
     last_yaml = getattr(copilot_ctx, "last_workflow_yaml", None)
     if isinstance(last_yaml, str) and last_yaml.strip():
@@ -134,10 +151,17 @@ async def _maybe_run_completion_verification_from_page_observation(
     if getattr(copilot_ctx, "post_run_page_observation_after_failed_test", False) is not True:
         return None
     criteria = _completion_verification_criteria(copilot_ctx)
-    if not criteria:
-        return None
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
+    if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
+        verification = _no_gradeable_run_plane_result(criterion_ids)
+        copilot_ctx.completion_verification_result = verification
+        record_completion_verification(copilot_ctx, verification)
+        _record_adjudication_on_turn_state(copilot_ctx, verification)
+        _emit_completion_verification_trace(copilot_ctx, verification)
+        return verification
+    if not criteria:
+        return None
     definition_verdicts = (
         grade_definition_criteria(definition_criteria, _definition_plane_workflow_yaml(copilot_ctx))
         if definition_criteria
@@ -538,16 +562,18 @@ async def _maybe_run_completion_verification(
 ) -> CompletionVerificationResult | None:
     if getattr(copilot_ctx, "copilot_total_timeout_exceeded", False):
         return None
-    criteria = _completion_verification_criteria(copilot_ctx)
-    if not criteria:
-        return None
     if not (
         _is_outcome_evidence_candidate(copilot_ctx, result)
         or _is_unfinished_run_verification_candidate(copilot_ctx, result)
     ):
         return None
+    criteria = _completion_verification_criteria(copilot_ctx)
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
+    if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
+        return _no_gradeable_run_plane_result(criterion_ids)
+    if not criteria:
+        return None
     definition_verdicts = (
         grade_definition_criteria(definition_criteria, _definition_plane_workflow_yaml(copilot_ctx))
         if definition_criteria
@@ -635,6 +661,11 @@ def _outcome_unverified_reason(
     if completion_verification.status == "evaluated":
         if completion_verification.is_fully_satisfied():
             return None
+        if completion_verification.no_gradeable_run_plane:
+            return (
+                "The run completed but the goal outcome could not be independently verified "
+                "(no run-gradeable outcome in this contract). Review the draft before using it."
+            )
         policy = getattr(copilot_ctx, "request_policy", None)
         criteria: list[CompletionCriterion] = list(policy.completion_criteria) if policy is not None else []
         known_good = _known_good_revision_hint(copilot_ctx)
