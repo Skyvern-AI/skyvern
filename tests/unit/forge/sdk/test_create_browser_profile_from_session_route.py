@@ -21,6 +21,7 @@ from skyvern.forge.sdk.routes import browser_profiles as browser_profiles_route
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile, CreateBrowserProfileRequest
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.schemas.runs import ProxyLocation
 
 _default_profile_template_candidates = browser_profiles_route._default_browser_profile_template_candidates
 
@@ -204,12 +205,37 @@ def test_create_empty_profile_stores_default_profile_seed(
         organization_id="org_oss",
         name="fresh profile",
         description="blank",
+        proxy_location=None,
+        proxy_session_id=None,
     )
     mocks.store_profile.assert_awaited_once()
     assert captured_directory["path"]
     assert not Path(captured_directory["path"]).exists()
     mocks.delete_db_profile.assert_not_awaited()
     mocks.hard_delete_db_profile.assert_not_awaited()
+
+
+def test_create_empty_profile_persists_requested_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, mocks = _build_client(monkeypatch)
+
+    response = client.post(
+        "/v1/browser_profiles/",
+        json={
+            "name": "fresh profile",
+            "proxy_location": ProxyLocation.RESIDENTIAL_ISP,
+            "proxy_session_id": "abc1234567",
+        },
+    )
+
+    assert response.status_code == 200
+    mocks.create_profile.assert_awaited_once_with(
+        organization_id="org_oss",
+        name="fresh profile",
+        description=None,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+    mocks.store_profile.assert_awaited_once()
 
 
 def test_default_profile_template_candidates_come_from_configured_directory(
@@ -377,6 +403,8 @@ def test_create_profile_route_delegates_workflow_run_source(monkeypatch: pytest.
             "name": "my profile",
             "description": "from workflow",
             "workflow_run_id": "wr_1",
+            "proxy_location": None,
+            "proxy_session_id": None,
         }
     ]
     mocks.rate_limit_submit_run.assert_not_awaited()
@@ -457,6 +485,48 @@ def test_promote_deletes_source_session_blob(monkeypatch: pytest.MonkeyPatch) ->
     mocks.rate_limit_submit_run.assert_not_awaited()
     mocks.store_profile.assert_awaited_once()
     mocks.delete_profile_blob.assert_awaited_once_with(organization_id="org_oss", profile_id="pbs_1")
+
+
+def test_promote_inherits_session_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session(
+        generate_browser_profile=True,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+    mocks.retrieve_profile.return_value = "/tmp/session_dir"
+
+    response = client.post("/v1/browser_profiles/", json={"name": "my profile", "browser_session_id": "pbs_1"})
+
+    assert response.status_code == 200
+    assert mocks.create_profile.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
+    assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "abc1234567"
+
+
+def test_promote_inherits_session_proxy_pin_for_blank_residential_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session(
+        generate_browser_profile=True,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+    mocks.retrieve_profile.return_value = "/tmp/session_dir"
+
+    response = client.post(
+        "/v1/browser_profiles/",
+        json={
+            "name": "my profile",
+            "browser_session_id": "pbs_1",
+            "proxy_location": ProxyLocation.RESIDENTIAL_ISP,
+            "proxy_session_id": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert mocks.create_profile.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
+    assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "abc1234567"
 
 
 def test_failed_promote_does_not_delete_source_blob(monkeypatch: pytest.MonkeyPatch) -> None:
