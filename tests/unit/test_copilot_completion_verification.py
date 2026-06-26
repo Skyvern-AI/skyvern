@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import textwrap
 import time
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
@@ -1058,6 +1059,35 @@ def _terminal_goal_output_result(**payload_overrides: Any) -> dict:
                 }
             ],
         },
+    }
+
+
+def _requested_output_result(output: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_requested_output",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_profile"],
+            "current_url": "https://example.test/profile",
+            "blocks": [
+                {
+                    "label": "extract_profile",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": output,
+                }
+            ],
+        },
+    }
+
+
+def _metadata_for_requested_paths(*paths: str) -> dict[str, Any]:
+    return {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": list(paths)}],
+            "terminal_verifier_expectations": [{"goal_value_paths": list(paths)}],
+        }
     }
 
 
@@ -2276,6 +2306,441 @@ def test_snapshot_uses_structured_record_top_level_output_parameters() -> None:
 
 
 @pytest.mark.asyncio
+async def test_requested_output_path_ignores_evidence_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"evidence_text": "The provider NPI is 1234567890."}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_ignores_block_level_prose(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result("The provider NPI is 1234567890."),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_exact_runtime_field_satisfies(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("exact requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.npi"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_does_not_match_block_label_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "npi")
+    ctx.code_artifact_metadata = {"npi": _metadata_for_requested_paths("npi")["extract_profile"]}
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_requested_output",
+                "overall_status": "completed",
+                "executed_block_labels": ["npi"],
+                "current_url": "https://example.test/profile",
+                "blocks": [
+                    {
+                        "label": "npi",
+                        "block_type": "CODE",
+                        "status": "completed",
+                        "extracted_data": {"value": "1234567890"},
+                    }
+                ],
+            },
+        },
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("goal_value_path", "requested_path", "runtime_output", "evidence_ref"),
+    [
+        ("$.npi", "output.npi", {"npi": "1234567890"}, "block_outputs:extract_profile.npi"),
+        ("$[*].npi", "output.npi", [{"npi": "1234567890"}], "block_outputs:extract_profile.npi"),
+        ("$[0].npi", "output.[].npi", [{"npi": "1234567890"}], "block_outputs:extract_profile.[].npi"),
+        ("$[].npi", "output.[].npi", [{"npi": "1234567890"}], "block_outputs:extract_profile.[].npi"),
+        (
+            "records[0].npi",
+            "output.records[].npi",
+            {"records": [{"npi": "1234567890"}]},
+            "block_outputs:extract_profile.records[].npi",
+        ),
+        (
+            "output.records[0].npi",
+            "output.records[].npi",
+            {"records": [{"npi": "1234567890"}]},
+            "block_outputs:extract_profile.records[].npi",
+        ),
+    ],
+)
+async def test_requested_output_path_normalizes_jsonpath_and_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+    goal_value_path: str,
+    requested_path: str,
+    runtime_output: Any,
+    evidence_ref: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("normalized requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(goal_value_path)
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path=requested_path)
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(runtime_output),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == evidence_ref
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_aliases_authored_contract_to_requested_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("aliased requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The nested record NPI is returned.",
+                output_path="output.records[].npi",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"records": [{"npi": "1234567890"}]}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.records[].npi"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_requires_exact_nested_runtime_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("locations[].address")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_address",
+                outcome="Each listed location includes address.",
+                output_path="output.locations[].address",
+            )
+        ]
+    )
+
+    missing = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"locations": [{"name": "North Clinic"}]}),
+        time.monotonic(),
+    )
+    assert missing is not None
+    assert missing.is_fully_satisfied() is False
+    assert missing.verdicts[0].reason_code == "missing_exact_field"
+
+    satisfied = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"locations": [{"address": "100 Main St"}]}),
+        time.monotonic(),
+    )
+    assert satisfied is not None
+    assert satisfied.is_fully_satisfied() is True
+    assert satisfied.verdicts[0].evidence_ref == "block_outputs:extract_profile.locations[].address"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_uses_only_accepted_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("unproducible requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.raw_code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    rejected = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+    assert rejected is not None
+    assert rejected.is_fully_satisfied() is False
+    assert rejected.verdicts[0].reason_code == "unproducible"
+    assert "unproducible" in rejected.to_trace_data()["reason_codes"]
+
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    accepted = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+    assert accepted is not None
+    assert accepted.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_can_use_static_return_key_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("static requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {"extract_profile": {"claimed_outcomes": [{}]}}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_profile
+              code: |
+                return {"npi": await page.locator("#npi").inner_text()}
+        """
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_can_use_static_list_return_key_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("static list requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {"extract_profile": {"claimed_outcomes": [{}]}}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_profile
+              code: |
+                return [{"npi": "1234567890"}]
+        """
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.[].npi")
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result([{"npi": "1234567890"}]),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.[].npi"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_criteria_are_not_sent_to_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_prompts: list[str] = []
+
+    async def handler(**kwargs: object) -> dict:
+        prompt = str(kwargs.get("prompt") or "")
+        seen_prompts.append(prompt)
+        return {"verdicts": [{"criterion_id": "c_cart", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi"),
+            CompletionCriterion(id="c_cart", outcome="The cart contains the selected item."),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890", "items": ["a"]}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert seen_prompts and "c_npi" not in seen_prompts[0]
+    assert "c_cart" in seen_prompts[0]
+    assert {verdict.criterion_id for verdict in verification.verdicts} == {"c_npi", "c_cart"}
+
+
+@pytest.mark.asyncio
+async def test_requested_output_bypasses_judge_satisfaction_without_exact_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c_npi", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"evidence_text": "The provider NPI is 1234567890."}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verdict_survives_unavailable_judge_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"no_verdicts_key": []}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi"),
+            CompletionCriterion(id="c_cart", outcome="The cart contains the selected item."),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"items": ["a"]}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == "missing_exact_field"
+    assert verdicts["c_npi"].satisfied is False
+    assert verdicts["c_cart"].state == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_completion_verification_treats_fallback_record_as_criteria_less(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2306,6 +2771,35 @@ async def test_maybe_run_completion_verification_treats_fallback_record_as_crite
     # verified result, and the path short-circuits before any judge lookup.
     assert verification is None
     assert handler_lookup_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_requested_output_satisfaction_is_not_vetoed_by_fallback_record_abstentions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-agnostic fallback criteria must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi"),
+            *_structured_record_criteria(),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert [verdict.criterion_id for verdict in verification.verdicts] == ["c_npi"]
 
 
 @pytest.mark.asyncio

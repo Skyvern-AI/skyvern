@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -2805,6 +2806,73 @@ class TestCredentialRefusalReachesAgent:
         assert "Use validate_block only for allowed non-browser helper blocks" in prompt
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        def fake_resolve_model_config(_handler, *, copilot_config=None, llm_key_override=None):
+            del copilot_config, llm_key_override
+            return "model-primary", object(), "PRIMARY", True
+
+        run_with_enforcement = AsyncMock(
+            return_value=_fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True})
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        with capture_logs() as logs:
+            result = await agent_module.run_copilot_agent(
+                stream=MagicMock(),
+                organization_id="org-1",
+                chat_request=SimpleNamespace(
+                    message="build it",
+                    workflow_id="wf-1",
+                    workflow_permanent_id="wfp-1",
+                    workflow_copilot_chat_id="chat-1",
+                    workflow_yaml="",
+                    browser_session_id=None,
+                ),
+                chat_history=[],
+                global_llm_context=None,
+                debug_run_info_text="",
+                llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+                api_key="sk-test",
+                config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
+                turn_id="turn-1",
+            )
+
+        policy_event = next(log for log in logs if log["event"] == "copilot_block_authoring_policy_resolved")
+
+        assert result.user_response == "ok"
+        assert policy_event["block_authoring_policy"] == "CODE_ONLY_BROWSER"
+        assert policy_event["block_authoring_policy_value"] == BlockAuthoringPolicy.CODE_ONLY_BROWSER.value
+        assert policy_event["workflow_permanent_id"] == "wfp-1"
+        assert policy_event["workflow_id"] == "wf-1"
+        assert policy_event["workflow_copilot_chat_id"] == "chat-1"
+        assert policy_event["turn_id"] == "turn-1"
 
     def test_native_tools_carry_refusal_reference(self) -> None:
         import re
