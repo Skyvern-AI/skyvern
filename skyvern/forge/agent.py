@@ -162,7 +162,7 @@ from skyvern.webeye.actions.parse_actions import (
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 
@@ -334,35 +334,6 @@ async def _cancel_pending_prefetch_task(task: asyncio.Task | None) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-
-
-async def _build_open_tabs_context(
-    browser_state: BrowserState,
-    working_page: Page | None,
-) -> str | None:
-    if working_page is None:
-        return None
-    pages = await browser_state.list_valid_pages()
-    if len(pages) <= 1:
-        return None
-    lines: list[str] = []
-    for i, p in enumerate(pages):
-        marker = " [current]" if p == working_page else ""
-        url = p.url
-        try:
-            title = await asyncio.wait_for(p.title(), timeout=1.0)
-        except Exception:
-            LOG.debug("tab_title_fetch_failed", url=url)
-            title = ""
-        if len(url) > 120:
-            url = url[:117] + "..."
-        if len(title) > 80:
-            title = title[:77] + "..."
-        entry = f"Tab {i}{marker}: {url}"
-        if title:
-            entry += f" ({title})"
-        lines.append(entry)
-    return "\n".join(lines)
 
 
 def _build_totp_timeout_reasoning(task: Task) -> str:
@@ -3849,7 +3820,7 @@ class ForgeAgent:
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
-        open_tabs_context = await _build_open_tabs_context(browser_state, page)
+        open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
         # NEW_TAB/SWITCH_TAB are gated behind a flag (default off) so single-tab tasks are
         # unaffected. SWITCH_TAB additionally requires >= 2 open tabs, like CLOSE_PAGE.

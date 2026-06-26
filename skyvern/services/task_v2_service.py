@@ -79,7 +79,7 @@ from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -851,6 +851,11 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
+            try:
+                open_tabs_context = await build_open_tabs_context(browser_state, page)
+            except Exception:
+                LOG.warning("Failed to build open-tabs context for the planner", exc_info=True)
+                open_tabs_context = None
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
@@ -858,6 +863,7 @@ async def run_task_v2_helper(
                 current_url=current_url,
                 user_goal=user_prompt,
                 task_history=task_history,
+                open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
             )
             thought = await app.DATABASE.observer.create_thought(
@@ -1117,6 +1123,7 @@ async def run_task_v2_helper(
         if block_result.success is True:
             completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None
+            completion_open_tabs_context: str | None = None
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
@@ -1131,13 +1138,21 @@ async def run_task_v2_helper(
                 )
                 completion_screenshots = completion_scraped_page.screenshots
             except Exception:
-                LOG.warning("Failed to scrape the website for task v2 completion check")
+                LOG.warning("Failed to scrape the website for task v2 completion check", exc_info=True)
+            if completion_scraped_page is not None:
+                try:
+                    completion_open_tabs_context = await build_open_tabs_context(
+                        browser_state, await browser_state.get_working_page()
+                    )
+                except Exception:
+                    LOG.warning("Failed to build open-tabs context for completion check", exc_info=True)
 
             # validate completion only happens at the last iteration
             task_v2_completion_prompt = prompt_engine.load_prompt(
                 "task_v2_check_completion",
                 user_goal=user_prompt,
                 task_history=task_history,
+                open_tabs_context=completion_open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
             )
             thought = await app.DATABASE.observer.create_thought(

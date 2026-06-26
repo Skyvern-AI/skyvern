@@ -3444,8 +3444,26 @@ async def handle_close_page_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.close(reason=action.reasoning)
-    return [ActionSuccess()]
+    target_page = page
+    if action.tab_index is not None:
+        browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+        if browser_state is None:
+            return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
+        pages = await browser_state.list_valid_pages()
+        if action.tab_index < 0 or action.tab_index >= len(pages):
+            return [
+                ActionFailure(
+                    Exception(f"CLOSE_PAGE tab_index {action.tab_index} is out of range (0-{len(pages) - 1})"),
+                    stop_execution_on_failure=False,
+                )
+            ]
+        target_page = pages[action.tab_index]
+    await target_page.close(reason=action.reasoning)
+    # Closing a tab shifts the remaining tab indices; stop the batch so the next step re-scrapes
+    # and re-indexes the open tabs before any further close/switch action runs against stale indices.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
 
 
 @traced(name="skyvern.agent.action.new_tab")
