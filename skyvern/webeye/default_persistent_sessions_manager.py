@@ -311,6 +311,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         timeout_minutes: int | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        proxy_session_id: str | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
@@ -327,6 +328,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             runnable_id=runnable_id,
             timeout_minutes=timeout_minutes,
             proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
             extensions=extensions,
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
@@ -356,15 +358,28 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         url: str | None = None,
     ) -> None:
         try:
+            session = await self.get_session(session_id, organization_id)
+            if session is None or is_final_status(session.status) or session.completed_at is not None:
+                LOG.info(
+                    "Session closed before browser launch, skipping browser launch",
+                    browser_session_id=session_id,
+                )
+                return
+
+            launch_proxy_location = session.proxy_location if session.proxy_location is not None else proxy_location
+            extra_http_headers = app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(session.proxy_session_id)
+
             browser_state = await RealBrowserManager._create_browser_state(
-                proxy_location=proxy_location,
+                proxy_location=launch_proxy_location,
                 url=url,
                 organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
             )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",
-                proxy_location=proxy_location,
+                proxy_location=launch_proxy_location,
                 organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
             )
 
             session = await self.get_session(session_id, organization_id)

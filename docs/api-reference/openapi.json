@@ -8640,6 +8640,35 @@
             ],
             "title": "Source Browser Type"
           },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -9753,6 +9782,37 @@
             ],
             "title": "Workflow Run Id",
             "description": "Workflow run whose persisted session should be captured. Omit for a blank profile."
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Explicit sticky-session id for this profile's pinned proxy identity."
           }
         },
         "type": "object",
@@ -9796,6 +9856,18 @@
             ],
             "title": "Proxy Location",
             "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}, or a custom proxy URL dict for self-hosted deployments: {\"url\": \"http://user:password@proxy.example.com:8080\"}"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions."
           },
           "extensions": {
             "anyOf": [
@@ -9896,6 +9968,37 @@
               "azure_vault",
               "bitwarden"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Optional advanced reuse key for this credential's pinned proxy identity."
           }
         },
         "type": "object",
@@ -10240,6 +10343,37 @@
             "examples": [
               "cfld_1234567890"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location used for the credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
           }
         },
         "type": "object",
@@ -21416,6 +21550,37 @@
             ],
             "title": "Description",
             "description": "New description for the browser profile"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
           }
         },
         "type": "object",

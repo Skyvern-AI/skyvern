@@ -133,6 +133,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
+    ProxyLocation,
     ProxyLocationInput,
     RunStatus,
     RunType,
@@ -2795,6 +2796,12 @@ class WorkflowService:
             )
 
             if block.block_type == BlockType.LOGIN:
+                await self._apply_login_block_credential_proxy_pin(
+                    block=block,
+                    workflow_run=workflow_run,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
                 resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
                     block=block,
                     workflow_run_id=workflow_run_id,
@@ -3484,10 +3491,60 @@ class WorkflowService:
         # so it must not reuse (and boot read-only from) the credential's saved profile.
         if isinstance(block, LoginBlock) and block.skip_saved_profile:
             return None
+        credential_ids = await self._resolve_login_block_credential_ids(
+            block=block,
+            workflow_run_id=workflow_run_id,
+        )
+
+        for credential_id in credential_ids:
+            if not organization_id:
+                continue
+            try:
+                db_cred = await app.DATABASE.credentials.get_credential(
+                    credential_id=credential_id,
+                    organization_id=organization_id,
+                )
+                if db_cred and db_cred.browser_profile_id:
+                    # Verify the browser profile still exists before using it
+                    profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                        profile_id=db_cred.browser_profile_id,
+                        organization_id=organization_id,
+                    )
+                    if not profile:
+                        LOG.warning(
+                            "Credential has browser_profile_id but profile not found, ignoring",
+                            credential_id=credential_id,
+                            browser_profile_id=db_cred.browser_profile_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                        continue
+                    LOG.info(
+                        "Resolved browser_profile_id from LoginBlock credential",
+                        credential_id=credential_id,
+                        browser_profile_id=db_cred.browser_profile_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return db_cred.browser_profile_id
+            except Exception:
+                LOG.warning(
+                    "Failed to look up credential for browser profile",
+                    credential_id=credential_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+        return None
+
+    async def _resolve_login_block_credential_ids(
+        self,
+        block: Block,
+        workflow_run_id: str | None,
+    ) -> list[str]:
+        """Return credential ids bound to this block, preserving parameter order."""
         params = block.parameters
 
         # Pre-fetch run parameters once (used by WorkflowParameter/CREDENTIAL_ID style).
         run_param_tuples: list[tuple[Any, Any]] | None = None
+        credential_ids: list[str] = []
 
         for param in params:
             credential_id: str | None = None
@@ -3532,8 +3589,29 @@ class WorkflowService:
 
             if not credential_id:
                 continue
+            credential_ids.append(credential_id)
 
-            # Look up the credential and check for a browser_profile_id
+        return credential_ids
+
+    async def _apply_login_block_credential_proxy_pin(
+        self,
+        *,
+        block: Block,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        organization_id: str | None,
+    ) -> None:
+        if not organization_id:
+            return
+        headers = dict(workflow_run.extra_http_headers or {})
+        if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(headers):
+            return
+
+        credential_ids = await self._resolve_login_block_credential_ids(
+            block=block,
+            workflow_run_id=workflow_run_id,
+        )
+        for credential_id in credential_ids:
             if not organization_id:
                 continue
             try:
@@ -3541,35 +3619,67 @@ class WorkflowService:
                     credential_id=credential_id,
                     organization_id=organization_id,
                 )
-                if db_cred and db_cred.browser_profile_id:
-                    # Verify the browser profile still exists before using it
+                if not db_cred:
+                    continue
+                proxy_session_id = db_cred.proxy_session_id
+                proxy_location = db_cred.proxy_location
+                browser_profile_id = getattr(db_cred, "browser_profile_id", None)
+                if browser_profile_id:
                     profile = await app.DATABASE.browser_sessions.get_browser_profile(
-                        profile_id=db_cred.browser_profile_id,
+                        profile_id=browser_profile_id,
                         organization_id=organization_id,
                     )
-                    if not profile:
-                        LOG.warning(
-                            "Credential has browser_profile_id but profile not found, ignoring",
+                    if profile:
+                        if not profile.proxy_session_id:
+                            LOG.info(
+                                "Skipping LoginBlock credential proxy pin because linked browser profile is unpinned",
+                                credential_id=credential_id,
+                                browser_profile_id=browser_profile_id,
+                                workflow_run_id=workflow_run_id,
+                            )
+                            return
+                        proxy_session_id = profile.proxy_session_id
+                        proxy_location = profile.proxy_location or ProxyLocation.RESIDENTIAL_ISP
+                        LOG.info(
+                            "Using linked browser profile proxy pin for LoginBlock",
                             credential_id=credential_id,
-                            browser_profile_id=db_cred.browser_profile_id,
+                            browser_profile_id=browser_profile_id,
                             workflow_run_id=workflow_run_id,
                         )
-                        continue
-                    LOG.info(
-                        "Resolved browser_profile_id from LoginBlock credential",
-                        credential_id=credential_id,
-                        browser_profile_id=db_cred.browser_profile_id,
-                        workflow_run_id=workflow_run_id,
+                if proxy_session_id:
+                    updated_headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
+                        headers, proxy_session_id
                     )
-                    return db_cred.browser_profile_id
+                    # The OSS AgentFunction stub returns the original headers; only persist when cloud injected a pin.
+                    if updated_headers == headers:
+                        return
+                    proxy_location_update: ProxyLocationInput | None = None
+                    if workflow_run.proxy_location is None:
+                        proxy_location_update = proxy_location or ProxyLocation.RESIDENTIAL_ISP
+                    update_kwargs: dict[str, Any] = {
+                        "workflow_run_id": workflow_run_id,
+                        "extra_http_headers": updated_headers,
+                    }
+                    if proxy_location_update is not None:
+                        update_kwargs["proxy_location"] = proxy_location_update
+                    await app.DATABASE.workflow_runs.update_workflow_run(**update_kwargs)
+                    workflow_run.extra_http_headers = updated_headers
+                    if proxy_location_update is not None:
+                        workflow_run.proxy_location = proxy_location_update
+                    LOG.info(
+                        "Applied LoginBlock credential proxy pin to workflow run",
+                        credential_id=credential_id,
+                        workflow_run_id=workflow_run_id,
+                        proxy_location=str(workflow_run.proxy_location),
+                    )
+                    return
             except Exception:
-                LOG.warning(
-                    "Failed to look up credential for browser profile",
+                LOG.error(
+                    "Failed to apply LoginBlock credential proxy pin",
                     credential_id=credential_id,
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
-        return None
 
     async def _evaluate_debug_session_profile_decision(
         self,
