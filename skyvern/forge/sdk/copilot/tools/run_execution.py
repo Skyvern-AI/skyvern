@@ -83,6 +83,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ensure_browser_session,
 )
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    clear_runtime_authoring_repair_context,
+    inject_runtime_authoring_repair_context,
+    record_pending_runtime_authoring_repair_context,
+)
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -2003,6 +2008,7 @@ def _record_run_blocks_result(
     copilot_ctx.post_run_page_observation_workflow_run_id = None
     copilot_ctx.post_run_page_observation_after_failed_test = False
     copilot_ctx.post_run_current_page_inspection_workflow_run_id = None
+    record_pending_runtime_authoring_repair_context(copilot_ctx, result)
 
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
@@ -2071,6 +2077,7 @@ def _record_run_blocks_result(
             stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
 
     if terminal_challenge is not None:
+        clear_runtime_authoring_repair_context(copilot_ctx)
         # A structured challenge is the more actionable terminal blocker when
         # artifact-health evidence and challenge evidence appear in the same run.
         blocked_verification = _terminal_challenge_completion_verification(
@@ -2424,6 +2431,7 @@ def _record_diagnosis_repair_contract(
     result: dict[str, Any],
     workflow_updated: bool = False,
 ) -> DiagnosisRepairContract:
+    inject_runtime_authoring_repair_context(copilot_ctx, result)
     contract = build_diagnosis_repair_contract(
         source_tool=source_tool,
         result=result,

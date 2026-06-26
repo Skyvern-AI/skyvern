@@ -145,6 +145,8 @@ _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "
 
 _MAX_COMPLETION_CRITERIA = 8
 _COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
+_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS = 200
+_CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE = re.compile(r"^output\.[A-Za-z_][A-Za-z0-9_]*$")
 _REQUESTED_OUTPUT_CRITERION_ID_PREFIX = "__copilot_requested_output__"
 
 FALLBACK_FLOOR_CRITERION_ID_PREFIX = "__copilot_fallback_floor__"
@@ -195,6 +197,8 @@ _OUTPUT_OUTCOME_WORDS = frozenset(
 class CompletionCriterion:
     id: str
     outcome: str
+    contingent_on: str | None = None
+    contingent_antecedent_output_path: str | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -555,7 +559,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     if not isinstance(raw, list):
         return []
     criteria: list[CompletionCriterion] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -567,7 +571,21 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             continue
         output_path_raw = item.get("output_path")
         output_path = output_path_raw.strip() if isinstance(output_path_raw, str) and output_path_raw.strip() else None
-        key = output_path or normalized_criterion_outcome_key(outcome)
+        contingent_on_raw = item.get("contingent_on")
+        contingent_on = (
+            " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
+            if isinstance(contingent_on_raw, str)
+            else None
+        )
+        contingent_on = contingent_on or None
+        contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
+            item.get("contingent_antecedent_output_path")
+        )
+        key = (
+            contingent_on or "",
+            contingent_antecedent_output_path or "",
+            output_path or normalized_criterion_outcome_key(outcome),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -576,6 +594,8 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             CompletionCriterion(
                 id=f"c{len(criteria)}",
                 outcome=outcome,
+                contingent_on=contingent_on,
+                contingent_antecedent_output_path=contingent_antecedent_output_path,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=cast(CriterionLevel, level_raw)
@@ -587,6 +607,13 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
             break
     return criteria
+
+
+def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    path = raw.strip()
+    return path if _CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE.fullmatch(path) else None
 
 
 def normalized_criterion_outcome_key(outcome: str) -> str:
@@ -870,6 +897,19 @@ def _apply_requested_output_completion_criteria(
     if not requested_output_paths:
         return
 
+    contingent_metadata_by_output_path: dict[str, tuple[str | None, str | None]] = {}
+    for criterion in policy.completion_criteria:
+        if criterion.level == "definition" or criterion.method_mandated:
+            continue
+        if not criterion.contingent_on and not criterion.contingent_antecedent_output_path:
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path == output_path or _criterion_text_covers_requested_output(criterion, field_name):
+                contingent_metadata_by_output_path.setdefault(
+                    output_path,
+                    (criterion.contingent_on, criterion.contingent_antecedent_output_path),
+                )
+
     preserved_criteria = [
         criterion
         for criterion in policy.completion_criteria
@@ -886,6 +926,8 @@ def _apply_requested_output_completion_criteria(
             outcome=f"The returned record includes {field_label}.",
             level="run",
             output_path=output_path,
+            contingent_on=contingent_metadata_by_output_path.get(output_path, (None, None))[0],
+            contingent_antecedent_output_path=contingent_metadata_by_output_path.get(output_path, (None, None))[1],
         )
         for _field_name, output_path, field_label in requested_specs
     ]
@@ -906,6 +948,10 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
         }
+        if criterion.contingent_on:
+            item["contingent_on"] = criterion.contingent_on
+        if criterion.contingent_antecedent_output_path:
+            item["contingent_antecedent_output_path"] = criterion.contingent_antecedent_output_path
         if criterion.output_path:
             item["output_path"] = criterion.output_path
         rendered.append(item)

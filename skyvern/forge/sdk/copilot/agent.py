@@ -623,6 +623,42 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
         lines.append(f"source_url: {_clean_authoring_repair_prompt_atom(repair_context.source_url)}")
     if repair_context.refiner_selector:
         lines.append(f"refiner_selector: {_clean_authoring_repair_prompt_atom(repair_context.refiner_selector)}")
+    if repair_context.reason_code == "runtime_block_failure":
+        if repair_context.runtime_failure_reason:
+            lines.append(
+                f"runtime_failure_reason: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_reason)}"
+            )
+        if repair_context.runtime_failure_class:
+            lines.append(
+                f"runtime_failure_class: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_class)}"
+            )
+        if repair_context.failed_block_status:
+            lines.append(
+                f"failed_block_status: {_clean_authoring_repair_prompt_atom(repair_context.failed_block_status)}"
+            )
+        if repair_context.workflow_run_id:
+            workflow_run_id = _clean_authoring_repair_prompt_atom(repair_context.workflow_run_id)
+            if workflow_run_id:
+                lines.append(f"workflow_run_id: {workflow_run_id}")
+        if repair_context.current_origin:
+            lines.append(f"current_origin: {_clean_authoring_repair_prompt_atom(repair_context.current_origin)}")
+        lines.append(f"current_url_present: {str(repair_context.current_url_present).lower()}")
+        lines.append(f"current_title_present: {str(repair_context.current_title_present).lower()}")
+        if repair_context.page_evidence_source:
+            page_evidence_source = _clean_authoring_repair_prompt_atom(repair_context.page_evidence_source)
+            if page_evidence_source:
+                lines.append(f"page_evidence_source: {page_evidence_source}")
+        lines.append(f"observed_after_workflow_run: {str(repair_context.observed_after_workflow_run).lower()}")
+        if repair_context.page_form_summaries:
+            lines.append(f"page_forms: {_render_authoring_repair_prompt_list(repair_context.page_form_summaries)}")
+        if repair_context.page_result_summaries:
+            lines.append(f"page_results: {_render_authoring_repair_prompt_list(repair_context.page_result_summaries)}")
+        if repair_context.page_action_summaries:
+            lines.append(f"page_actions: {_render_authoring_repair_prompt_list(repair_context.page_action_summaries)}")
+        if repair_context.page_challenge_summaries:
+            lines.append(
+                f"page_challenges: {_render_authoring_repair_prompt_list(repair_context.page_challenge_summaries)}"
+            )
     selector_alternative_lines = _render_selector_repair_alternatives(repair_context.selector_alternatives)
     if selector_alternative_lines:
         lines.append("same_page_selector_alternatives:")
@@ -646,11 +682,28 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "list the exact key in the code block's parameter_keys, reference the exact key as a bare Python "
             "variable in code, do not hardcode the eval value, and rerun via update_and_run_blocks."
         )
+    if repair_context.reason_code == "synthesized_parameter_binding_ambiguous":
+        binding_action_lines = _render_unresolved_name_binding_actions(
+            repair_context.unresolved_names, available_parameter_keys
+        )
+        if binding_action_lines:
+            lines.append("binding_actions:")
+            lines.extend(binding_action_lines)
+        lines.append(
+            "For synthesized parameter binding, declare and use the exact workflow input key, include that exact "
+            "key in the code block's parameter_keys, reference it as a bare Python variable in code, do not guess "
+            "or hardcode the runtime value, and rerun via update_and_run_blocks."
+        )
     if repair_context.reason_code == "ambiguous_bare_selector":
         lines.append(
             "For ambiguous selectors, do not re-emit the bare selector or a positional nth selector. "
             "Use the same-page alternatives when they are stable, or re-scout the same page and choose a "
             "stable role/name/data attribute."
+        )
+    if repair_context.reason_code == "runtime_block_failure":
+        lines.append(
+            "For runtime failures, adapt the next code block to the observed page state and do not re-emit "
+            "the same failing selector or name path."
         )
     lines.append(_clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=260))
     return "\n\n" + "\n".join(line for line in lines if line)

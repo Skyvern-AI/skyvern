@@ -39,6 +39,9 @@ _MISSING_EVIDENCE_MAX_CHARS = 500
 _MAX_BLOCK_OUTPUTS = 20
 _MAX_TRACE_VERDICTS = 8
 _REASON_CODES = frozenset({"evidence_confirms", "no_evidence", "evidence_contradicts", "unknown"})
+_CONTINGENT_ABSTENTION_REASON_CODES = frozenset(
+    {"unknown", "no_evidence", "evidence_contradicts", "missing_exact_field", "unproducible"}
+)
 _PAGE_EVIDENCE_KEYS = (
     "current_url",
     "page_title",
@@ -80,6 +83,10 @@ class CompletionVerificationResult:
     criterion_ids: list[str] = field(default_factory=list)
     verdicts: list[CriterionVerdict] = field(default_factory=list)
     no_gradeable_run_plane: bool = False
+    contingent_criterion_ids: list[str] = field(default_factory=list)
+    contingent_on_by_criterion_id: dict[str, str] = field(default_factory=dict)
+    contingent_antecedent_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
+    structural_unfired_criterion_ids: list[str] = field(default_factory=list)
 
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
@@ -99,11 +106,28 @@ class CompletionVerificationResult:
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
             if verdict is not None and _is_definition_plane_abstention(verdict):
                 continue
+            if verdict is not None and _is_contingent_abstention(
+                verdict,
+                self.contingent_criterion_ids,
+                self.structural_unfired_criterion_ids,
+            ):
+                continue
             return False
         return satisfied_run_plane_count > 0
 
+    def is_structural_contingent_abstention(self, verdict: CriterionVerdict) -> bool:
+        return _is_contingent_abstention(
+            verdict,
+            self.contingent_criterion_ids,
+            self.structural_unfired_criterion_ids,
+        )
+
     def to_trace_data(self) -> dict[str, Any]:
-        unmet = [verdict for verdict in self.verdicts if not verdict.satisfied]
+        unmet = [
+            verdict
+            for verdict in self.verdicts
+            if not verdict.satisfied and not self.is_structural_contingent_abstention(verdict)
+        ]
         missing_evidence: list[str] = []
         for verdict in unmet:
             detail = verdict_missing_evidence(verdict)
@@ -121,15 +145,27 @@ class CompletionVerificationResult:
             "unmet_criterion_ids": [verdict.criterion_id for verdict in unmet],
             "missing_evidence": missing_evidence,
         }
+        if self.contingent_criterion_ids:
+            data["contingent_criterion_ids"] = list(self.contingent_criterion_ids)
+        if self.structural_unfired_criterion_ids:
+            data["structural_unfired_criterion_ids"] = list(self.structural_unfired_criterion_ids)
         for index, verdict in enumerate(self.verdicts[:_MAX_TRACE_VERDICTS]):
             prefix = f"verdict_{index}"
             data[f"{prefix}_criterion_id"] = verdict.criterion_id
+            data[f"{prefix}_state"] = verdict.state
             data[f"{prefix}_satisfied"] = verdict.satisfied
             data[f"{prefix}_reason_code"] = verdict.reason_code
+            if contingent_on := self.contingent_on_by_criterion_id.get(verdict.criterion_id):
+                data[f"{prefix}_contingent_on"] = contingent_on
+            if contingent_path := self.contingent_antecedent_output_path_by_criterion_id.get(verdict.criterion_id):
+                data[f"{prefix}_contingent_antecedent_output_path"] = contingent_path
+                data[f"{prefix}_structural_unfired"] = verdict.criterion_id in set(
+                    self.structural_unfired_criterion_ids
+                )
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
-            detail = verdict_missing_evidence(verdict)
+            detail = None if self.is_structural_contingent_abstention(verdict) else verdict_missing_evidence(verdict)
             if detail:
                 data[f"{prefix}_missing_evidence"] = detail
         return data
@@ -262,12 +298,86 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
             flags += " (implicit)"
         if criterion.method_mandated:
             flags += " (method_mandated)"
+        contingent_on = f" [contingent_on={criterion.contingent_on}]" if criterion.contingent_on else ""
+        antecedent_output_path = (
+            f" [contingent_antecedent_output_path={criterion.contingent_antecedent_output_path}]"
+            if criterion.contingent_antecedent_output_path
+            else ""
+        )
         output_path = f" [required_output_path={criterion.output_path}]" if criterion.output_path else ""
-        parts.append(f"- {criterion.id}: {criterion.outcome}{output_path}{flags}")
+        parts.append(
+            f"- {criterion.id}: {criterion.outcome}{contingent_on}{antecedent_output_path}{output_path}{flags}"
+        )
     return "\n".join(parts)
 
 
-def _coerce_result(raw: Any, criterion_ids: list[str]) -> CompletionVerificationResult:
+def _contingent_metadata_for_criteria(
+    criteria: Iterable[CompletionCriterion],
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    contingent_on_by_id = {
+        criterion.id: criterion.contingent_on for criterion in criteria if criterion.contingent_on is not None
+    }
+    contingent_antecedent_output_path_by_id = {
+        criterion.id: criterion.contingent_antecedent_output_path
+        for criterion in criteria
+        if criterion.contingent_antecedent_output_path is not None
+    }
+    contingent_ids = list(dict.fromkeys([*contingent_on_by_id, *contingent_antecedent_output_path_by_id]))
+    return contingent_ids, contingent_on_by_id, contingent_antecedent_output_path_by_id
+
+
+def _output_path_field(path: str) -> str:
+    return path.removeprefix("output.")
+
+
+def _field_aliases_for_output_path(path: str) -> tuple[str, str]:
+    field = _output_path_field(path)
+    return field, f"{field}_output"
+
+
+def _find_structured_field_values(value: Any, field_names: set[str]) -> Iterable[Any]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key in field_names:
+                yield item
+            yield from _find_structured_field_values(item, field_names)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _find_structured_field_values(item, field_names)
+
+
+def structural_unfired_contingent_criterion_ids(
+    criteria: Iterable[CompletionCriterion],
+    snapshot: RunEvidenceSnapshot,
+) -> list[str]:
+    unfired_ids: list[str] = []
+    for criterion in criteria:
+        path = criterion.contingent_antecedent_output_path
+        if not path:
+            continue
+        field_names = set(_field_aliases_for_output_path(path))
+        values: list[Any] = []
+        for key, value in snapshot.block_outputs.items():
+            if key in field_names:
+                values.append(value)
+            values.extend(_find_structured_field_values(value, field_names))
+        if not values:
+            continue
+        if any(_is_meaningful_contingent_antecedent_value(value) for value in values):
+            continue
+        unfired_ids.append(criterion.id)
+    return unfired_ids
+
+
+def _coerce_result(
+    raw: Any,
+    criterion_ids: list[str],
+    *,
+    contingent_criterion_ids: Iterable[str] = (),
+    contingent_on_by_criterion_id: dict[str, str] | None = None,
+    contingent_antecedent_output_path_by_criterion_id: dict[str, str] | None = None,
+    structural_unfired_criterion_ids: Iterable[str] = (),
+) -> CompletionVerificationResult:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str):
@@ -287,7 +397,7 @@ def _coerce_result(raw: Any, criterion_ids: list[str]) -> CompletionVerification
         if criterion_id not in allowed or criterion_id in by_id:
             continue
         reason = item.get("reason_code")
-        reason_code = reason if reason in _REASON_CODES else "unknown"
+        reason_code = reason if isinstance(reason, str) and reason in _REASON_CODES else "unknown"
         # A criterion counts as satisfied only when the judge cites confirming
         # evidence; "no_evidence"/"contradicts" are affirmative negatives, while an
         # incoherent or "unknown" verdict stays unknown — it never passes and never fails.
@@ -312,7 +422,15 @@ def _coerce_result(raw: Any, criterion_ids: list[str]) -> CompletionVerification
         )
 
     verdicts = [by_id.get(criterion_id, _missing_verdict(criterion_id)) for criterion_id in criterion_ids]
-    return CompletionVerificationResult(status="evaluated", criterion_ids=list(criterion_ids), verdicts=verdicts)
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=list(criterion_ids),
+        verdicts=verdicts,
+        contingent_criterion_ids=list(contingent_criterion_ids),
+        contingent_on_by_criterion_id=dict(contingent_on_by_criterion_id or {}),
+        contingent_antecedent_output_path_by_criterion_id=dict(contingent_antecedent_output_path_by_criterion_id or {}),
+        structural_unfired_criterion_ids=list(structural_unfired_criterion_ids),
+    )
 
 
 _DEFINITION_PARAMETER_HINT_RE = re.compile(r"\b(?:inputs?|parameters?|params?|reusable|configurable)\b", re.I)
@@ -1159,11 +1277,30 @@ def _is_meaningful_record_value(value: Any) -> bool:
     return True
 
 
+def _is_meaningful_contingent_antecedent_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _is_meaningful_record_value(value)
+
+
 _DEFINITION_REASON_PREFIX = "definition_"
 
 
 def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
+
+
+def _is_contingent_abstention(
+    verdict: CriterionVerdict,
+    contingent_criterion_ids: Iterable[str],
+    structural_unfired_criterion_ids: Iterable[str],
+) -> bool:
+    return (
+        verdict.criterion_id in set(contingent_criterion_ids)
+        and verdict.criterion_id in set(structural_unfired_criterion_ids)
+        and not verdict.satisfied
+        and verdict.reason_code in _CONTINGENT_ABSTENTION_REASON_CODES
+    )
 
 
 def run_plane_all_no_evidence(result: CompletionVerificationResult) -> bool:
@@ -1183,11 +1320,35 @@ def combine_verification_results(
     criterion_ids: list[str],
     run_result: CompletionVerificationResult | None,
     definition_verdicts: list[CriterionVerdict],
+    *,
+    contingent_criterion_ids: Iterable[str] = (),
+    contingent_on_by_criterion_id: dict[str, str] | None = None,
+    contingent_antecedent_output_path_by_criterion_id: dict[str, str] | None = None,
+    structural_unfired_criterion_ids: Iterable[str] = (),
 ) -> CompletionVerificationResult:
     """One result spanning both evidence planes; a judge that could not evaluate
     keeps the whole result unavailable so fail-closed messaging is preserved."""
+    contingent_ids = list(contingent_criterion_ids)
+    contingent_on_by_id = dict(contingent_on_by_criterion_id or {})
+    contingent_path_by_id = dict(contingent_antecedent_output_path_by_criterion_id or {})
+    structural_unfired_ids = list(structural_unfired_criterion_ids)
+    if run_result is not None:
+        contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
+        contingent_on_by_id.update(run_result.contingent_on_by_criterion_id)
+        contingent_path_by_id.update(run_result.contingent_antecedent_output_path_by_criterion_id)
+        structural_unfired_ids = list(
+            dict.fromkeys([*structural_unfired_ids, *run_result.structural_unfired_criterion_ids])
+        )
     if run_result is not None and run_result.status != "evaluated":
-        return run_result
+        return CompletionVerificationResult(
+            status=run_result.status,
+            criterion_ids=list(criterion_ids),
+            verdicts=list(run_result.verdicts),
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            structural_unfired_criterion_ids=structural_unfired_ids,
+        )
     verdict_by_id = {verdict.criterion_id: verdict for verdict in definition_verdicts}
     if run_result is not None:
         verdict_by_id.update({verdict.criterion_id: verdict for verdict in run_result.verdicts})
@@ -1200,6 +1361,10 @@ def combine_verification_results(
         criterion_ids=list(criterion_ids),
         verdicts=verdicts,
         no_gradeable_run_plane=run_result is None,
+        contingent_criterion_ids=contingent_ids,
+        contingent_on_by_criterion_id=contingent_on_by_id,
+        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        structural_unfired_criterion_ids=structural_unfired_ids,
     )
 
 
@@ -1209,9 +1374,20 @@ async def evaluate_completion_criteria(
     handler: Any,
 ) -> CompletionVerificationResult:
     if handler is None or not criteria:
-        return _UNAVAILABLE
+        if not criteria:
+            return _UNAVAILABLE
+        contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
+        return CompletionVerificationResult(
+            status="unavailable",
+            criterion_ids=[criterion.id for criterion in criteria],
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        )
 
     criterion_ids = [criterion.id for criterion in criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(criteria, snapshot)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_TEMPLATE_NAME,
         criteria=escape_code_fences(_render_criteria(criteria)),
@@ -1224,9 +1400,30 @@ async def evaluate_completion_criteria(
         )
     except asyncio.TimeoutError:
         LOG.warning("completion-verification judge timed out")
-        return _UNAVAILABLE
+        return CompletionVerificationResult(
+            status="unavailable",
+            criterion_ids=criterion_ids,
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            structural_unfired_criterion_ids=structural_unfired_ids,
+        )
     except Exception as exc:
         LOG.warning("completion-verification judge failed", error=str(exc))
-        return _UNAVAILABLE
+        return CompletionVerificationResult(
+            status="unavailable",
+            criterion_ids=criterion_ids,
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            structural_unfired_criterion_ids=structural_unfired_ids,
+        )
 
-    return _coerce_result(raw, criterion_ids)
+    return _coerce_result(
+        raw,
+        criterion_ids,
+        contingent_criterion_ids=contingent_ids,
+        contingent_on_by_criterion_id=contingent_on_by_id,
+        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        structural_unfired_criterion_ids=structural_unfired_ids,
+    )

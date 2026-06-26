@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
     RunEvidenceSnapshot,
+    _contingent_metadata_for_criteria,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_record_semantic_consistency,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    structural_unfired_contingent_criterion_ids,
     summarize_unsatisfied_outcomes,
     verdict_missing_evidence,
 )
@@ -158,6 +160,10 @@ async def _maybe_run_completion_verification_from_page_observation(
     criteria = _completion_verification_criteria(copilot_ctx)
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
+    run_contingent_ids, run_contingent_on_by_id, run_contingent_path_by_id = _contingent_metadata_for_criteria(
+        run_criteria
+    )
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
         copilot_ctx.completion_verification_result = verification
@@ -173,7 +179,14 @@ async def _maybe_run_completion_verification_from_page_observation(
         else []
     )
     if not run_criteria:
-        verification = combine_verification_results(criterion_ids, None, definition_verdicts)
+        verification = combine_verification_results(
+            criterion_ids,
+            None,
+            definition_verdicts,
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        )
     else:
         snapshot = _build_page_observation_evidence_snapshot(
             copilot_ctx,
@@ -181,6 +194,7 @@ async def _maybe_run_completion_verification_from_page_observation(
             title=title,
             observed_data=observed_data,
         )
+        run_structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
         requested_output_criteria, judgeable_run_criteria = split_requested_output_criteria(run_criteria)
         requested_output_verdicts = (
             grade_requested_output_criteria(copilot_ctx, requested_output_criteria, snapshot)
@@ -193,11 +207,29 @@ async def _maybe_run_completion_verification_from_page_observation(
             and remaining
             <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
         ):
-            run_result = _merge_run_verdicts_if_requested_output_exists(run_criteria, requested_output_verdicts)
+            run_result = _merge_run_verdicts_if_requested_output_exists(
+                run_criteria,
+                requested_output_verdicts,
+                structural_unfired_criterion_ids=run_structural_unfired_ids,
+            )
             verification = (
-                combine_verification_results(criterion_ids, run_result, definition_verdicts)
+                combine_verification_results(
+                    criterion_ids,
+                    run_result,
+                    definition_verdicts,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                )
                 if run_result is not None
-                else CompletionVerificationResult(status="unavailable")
+                else CompletionVerificationResult(
+                    status="unavailable",
+                    criterion_ids=criterion_ids,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
             )
         else:
             if not snapshot.has_evidence():
@@ -209,13 +241,25 @@ async def _maybe_run_completion_verification_from_page_observation(
                         CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
                         for criterion in judgeable_run_criteria
                     ],
+                    contingent_criterion_ids=run_contingent_ids,
+                    contingent_on_by_criterion_id=run_contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
             elif not judgeable_run_criteria:
-                run_result = _merge_run_verdicts(run_criteria, requested_output_verdicts)
+                run_result = _merge_run_verdicts(
+                    run_criteria,
+                    requested_output_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
             else:
                 handler = await _completion_verification_handler(copilot_ctx)
                 if handler is None:
-                    run_result = _merge_run_verdicts_if_requested_output_exists(run_criteria, requested_output_verdicts)
+                    run_result = _merge_run_verdicts_if_requested_output_exists(
+                        run_criteria,
+                        requested_output_verdicts,
+                        structural_unfired_criterion_ids=run_structural_unfired_ids,
+                    )
                     if run_result is None:
                         return None
                 else:
@@ -223,7 +267,11 @@ async def _maybe_run_completion_verification_from_page_observation(
                     judgeable_result = _apply_present_value_upgrades(judgeable_result, judgeable_run_criteria, snapshot)
                     if judgeable_result.status != "evaluated":
                         run_result = (
-                            _merge_run_verdicts_if_requested_output_exists(run_criteria, requested_output_verdicts)
+                            _merge_run_verdicts_if_requested_output_exists(
+                                run_criteria,
+                                requested_output_verdicts,
+                                structural_unfired_criterion_ids=run_structural_unfired_ids,
+                            )
                             or judgeable_result
                         )
                     else:
@@ -231,8 +279,16 @@ async def _maybe_run_completion_verification_from_page_observation(
                             run_criteria,
                             requested_output_verdicts,
                             judgeable_result.verdicts,
+                            structural_unfired_criterion_ids=run_structural_unfired_ids,
                         )
-            verification = combine_verification_results(criterion_ids, run_result, definition_verdicts)
+            verification = combine_verification_results(
+                criterion_ids,
+                run_result,
+                definition_verdicts,
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            )
 
     if (
         isinstance(existing, CompletionVerificationResult)
@@ -438,17 +494,13 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
             for output_key, output_value in _workflow_output_parameter_payloads(output).items():
-                if _is_meaningful_extracted_data(output_value):
-                    block_outputs[output_key] = output_value
+                block_outputs[output_key] = output_value
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
-        if _is_meaningful_extracted_data(output_value):
-            block_outputs[output_key] = output_value
+        block_outputs[output_key] = output_value
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
         registered_output_value = registered.get("value")
         registered_block_label = registered.get("block_label")
-        if not _is_meaningful_extracted_data(registered_output_value):
-            continue
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
         if isinstance(registered_block_label, str) and registered_block_label in current_labels:
@@ -535,17 +587,32 @@ def _apply_present_value_upgrades(
 
     verdicts = [_merged(verdict) for verdict in run_result.verdicts]
     return CompletionVerificationResult(
-        status="evaluated", criterion_ids=list(run_result.criterion_ids), verdicts=verdicts
+        status="evaluated",
+        criterion_ids=list(run_result.criterion_ids),
+        verdicts=verdicts,
+        contingent_criterion_ids=list(run_result.contingent_criterion_ids),
+        contingent_on_by_criterion_id=dict(run_result.contingent_on_by_criterion_id),
+        contingent_antecedent_output_path_by_criterion_id=dict(
+            run_result.contingent_antecedent_output_path_by_criterion_id
+        ),
+        structural_unfired_criterion_ids=list(run_result.structural_unfired_criterion_ids),
     )
 
 
 def _merge_run_verdicts(
     run_criteria: list[CompletionCriterion],
     *verdict_groups: list[CriterionVerdict],
+    contingent_criterion_ids: list[str] | None = None,
+    contingent_on_by_criterion_id: dict[str, str] | None = None,
+    contingent_antecedent_output_path_by_criterion_id: dict[str, str] | None = None,
+    structural_unfired_criterion_ids: list[str] | None = None,
 ) -> CompletionVerificationResult:
     verdict_by_id: dict[str, CriterionVerdict] = {}
     for verdicts in verdict_groups:
         verdict_by_id.update({verdict.criterion_id: verdict for verdict in verdicts})
+    default_contingent_ids, default_contingent_on_by_id, default_contingent_path_by_id = (
+        _contingent_metadata_for_criteria(run_criteria)
+    )
     criterion_ids = [criterion.id for criterion in run_criteria]
     return CompletionVerificationResult(
         status="evaluated",
@@ -554,6 +621,12 @@ def _merge_run_verdicts(
             verdict_by_id.get(criterion_id, CriterionVerdict(criterion_id, "unknown", "unknown"))
             for criterion_id in criterion_ids
         ],
+        contingent_criterion_ids=contingent_criterion_ids or default_contingent_ids,
+        contingent_on_by_criterion_id=contingent_on_by_criterion_id or default_contingent_on_by_id,
+        contingent_antecedent_output_path_by_criterion_id=(
+            contingent_antecedent_output_path_by_criterion_id or default_contingent_path_by_id
+        ),
+        structural_unfired_criterion_ids=structural_unfired_criterion_ids or [],
     )
 
 
@@ -561,10 +634,16 @@ def _merge_run_verdicts_if_requested_output_exists(
     run_criteria: list[CompletionCriterion],
     requested_output_verdicts: list[CriterionVerdict],
     *verdict_groups: list[CriterionVerdict],
+    structural_unfired_criterion_ids: list[str] | None = None,
 ) -> CompletionVerificationResult | None:
     if not requested_output_verdicts:
         return None
-    return _merge_run_verdicts(run_criteria, requested_output_verdicts, *verdict_groups)
+    return _merge_run_verdicts(
+        run_criteria,
+        requested_output_verdicts,
+        *verdict_groups,
+        structural_unfired_criterion_ids=structural_unfired_criterion_ids,
+    )
 
 
 def _run_criteria_for_verdicts(
@@ -587,6 +666,8 @@ def _deterministic_run_verification_result(
     remaining criterion stays fail-closed through the normal judge path.
     """
     criterion_ids = [criterion.id for criterion in run_criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(run_criteria)
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
     semantic_verdicts = grade_record_semantic_consistency(run_criteria, snapshot)
     if any(not verdict.satisfied for verdict in semantic_verdicts):
         return (
@@ -594,6 +675,10 @@ def _deterministic_run_verification_result(
                 status="evaluated",
                 criterion_ids=criterion_ids,
                 verdicts=list(semantic_verdicts),
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                structural_unfired_criterion_ids=structural_unfired_ids,
             ),
             [],
         )
@@ -617,6 +702,10 @@ def _deterministic_run_verification_result(
                 status="evaluated",
                 criterion_ids=criterion_ids,
                 verdicts=[deterministic_by_id[criterion_id] for criterion_id in criterion_ids],
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                structural_unfired_criterion_ids=structural_unfired_ids,
             ),
             [],
         )
@@ -629,6 +718,10 @@ def _deterministic_run_verification_result(
             status="evaluated",
             criterion_ids=criterion_ids,
             verdicts=list(deterministic_by_id.values()),
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            structural_unfired_criterion_ids=structural_unfired_ids,
         ),
         remaining_criteria,
     )
@@ -647,6 +740,10 @@ async def _maybe_run_completion_verification(
     criteria = _completion_verification_criteria(copilot_ctx)
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
+    run_contingent_ids, run_contingent_on_by_id, run_contingent_path_by_id = _contingent_metadata_for_criteria(
+        run_criteria
+    )
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         return _no_gradeable_run_plane_result(criterion_ids)
     if not criteria:
@@ -657,8 +754,16 @@ async def _maybe_run_completion_verification(
         else []
     )
     if not run_criteria:
-        return combine_verification_results(criterion_ids, None, definition_verdicts)
+        return combine_verification_results(
+            criterion_ids,
+            None,
+            definition_verdicts,
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        )
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
+    run_structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
     requested_output_criteria, judgeable_run_criteria = split_requested_output_criteria(run_criteria)
     requested_output_verdicts = (
         grade_requested_output_criteria(copilot_ctx, requested_output_criteria, snapshot)
@@ -682,13 +787,29 @@ async def _maybe_run_completion_verification(
             return combine_verification_results(
                 [criterion.id for criterion in scoped_run_criteria]
                 + [criterion.id for criterion in definition_criteria],
-                _merge_run_verdicts(scoped_run_criteria, requested_output_verdicts, contradictions),
+                _merge_run_verdicts(
+                    scoped_run_criteria,
+                    requested_output_verdicts,
+                    contradictions,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                ),
                 definition_verdicts,
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
             )
         if not definition_verdicts:
             return None
+        definition_contingent_ids, definition_contingent_on_by_id, definition_contingent_path_by_id = (
+            _contingent_metadata_for_criteria(definition_criteria)
+        )
         return combine_verification_results(
-            [criterion.id for criterion in definition_criteria], None, definition_verdicts
+            [criterion.id for criterion in definition_criteria],
+            None,
+            definition_verdicts,
+            contingent_criterion_ids=definition_contingent_ids,
+            contingent_on_by_criterion_id=definition_contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=definition_contingent_path_by_id,
         )
     if not snapshot.has_evidence():
         run_result = _merge_run_verdicts(
@@ -698,24 +819,53 @@ async def _maybe_run_completion_verification(
                 CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
                 for criterion in judgeable_run_criteria
             ],
+            contingent_criterion_ids=run_contingent_ids,
+            contingent_on_by_criterion_id=run_contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
+            structural_unfired_criterion_ids=run_structural_unfired_ids,
         )
     elif not judgeable_run_criteria:
-        run_result = _merge_run_verdicts(run_criteria, requested_output_verdicts)
+        run_result = _merge_run_verdicts(
+            run_criteria,
+            requested_output_verdicts,
+            structural_unfired_criterion_ids=run_structural_unfired_ids,
+        )
     else:
         deterministic_result, remaining_criteria = _deterministic_run_verification_result(
             judgeable_run_criteria, snapshot
         )
         if deterministic_result is not None and not remaining_criteria:
-            run_result = _merge_run_verdicts(run_criteria, requested_output_verdicts, deterministic_result.verdicts)
+            run_result = _merge_run_verdicts(
+                run_criteria,
+                requested_output_verdicts,
+                deterministic_result.verdicts,
+                structural_unfired_criterion_ids=run_structural_unfired_ids,
+            )
         else:
             handler = await _completion_verification_handler(copilot_ctx)
             if handler is None:
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
-                    run_criteria, requested_output_verdicts
+                    run_criteria,
+                    requested_output_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 if requested_output_result is not None:
-                    return combine_verification_results(criterion_ids, requested_output_result, definition_verdicts)
-                return CompletionVerificationResult(status="unavailable")
+                    return combine_verification_results(
+                        criterion_ids,
+                        requested_output_result,
+                        definition_verdicts,
+                        contingent_criterion_ids=contingent_ids,
+                        contingent_on_by_criterion_id=contingent_on_by_id,
+                        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    )
+                return CompletionVerificationResult(
+                    status="unavailable",
+                    criterion_ids=criterion_ids,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
             # Too little budget to verify a candidate run: fail closed (unavailable)
             # rather than let the run-status proxy claim an unverified outcome as success.
             remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
@@ -724,16 +874,36 @@ async def _maybe_run_completion_verification(
                 <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
             ):
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
-                    run_criteria, requested_output_verdicts
+                    run_criteria,
+                    requested_output_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 if requested_output_result is not None:
-                    return combine_verification_results(criterion_ids, requested_output_result, definition_verdicts)
-                return CompletionVerificationResult(status="unavailable")
+                    return combine_verification_results(
+                        criterion_ids,
+                        requested_output_result,
+                        definition_verdicts,
+                        contingent_criterion_ids=contingent_ids,
+                        contingent_on_by_criterion_id=contingent_on_by_id,
+                        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    )
+                return CompletionVerificationResult(
+                    status="unavailable",
+                    criterion_ids=criterion_ids,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
             judged_result = await evaluate_completion_criteria(remaining_criteria, snapshot, handler)
             if judged_result.status != "evaluated":
                 # Deterministic requested-output verdicts can still ground completion when the judge abstains.
                 run_result = (
-                    _merge_run_verdicts_if_requested_output_exists(run_criteria, requested_output_verdicts)
+                    _merge_run_verdicts_if_requested_output_exists(
+                        run_criteria,
+                        requested_output_verdicts,
+                        structural_unfired_criterion_ids=run_structural_unfired_ids,
+                    )
                     or judged_result
                 )
             else:
@@ -745,6 +915,10 @@ async def _maybe_run_completion_verification(
                     status="evaluated",
                     criterion_ids=[criterion.id for criterion in run_criteria],
                     verdicts=verdicts,
+                    contingent_criterion_ids=run_contingent_ids,
+                    contingent_on_by_criterion_id=run_contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 run_result = _apply_present_value_upgrades(
                     run_result,
@@ -752,8 +926,20 @@ async def _maybe_run_completion_verification(
                     snapshot,
                     include_terminal_goal_records=True,
                 )
-                run_result = _merge_run_verdicts(run_criteria, requested_output_verdicts, run_result.verdicts)
-    return combine_verification_results(criterion_ids, run_result, definition_verdicts)
+                run_result = _merge_run_verdicts(
+                    run_criteria,
+                    requested_output_verdicts,
+                    run_result.verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+    return combine_verification_results(
+        criterion_ids,
+        run_result,
+        definition_verdicts,
+        contingent_criterion_ids=contingent_ids,
+        contingent_on_by_criterion_id=contingent_on_by_id,
+        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+    )
 
 
 def _outcome_unverified_reason(
@@ -811,7 +997,7 @@ def _missing_evidence_detail(
     outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
     parts: list[str] = []
     for verdict in completion_verification.verdicts:
-        if verdict.satisfied:
+        if verdict.satisfied or completion_verification.is_structural_contingent_abstention(verdict):
             continue
         missing_evidence = verdict_missing_evidence(verdict)
         if not missing_evidence:

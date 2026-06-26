@@ -147,6 +147,19 @@ class CodeAuthoringRepairContext(BaseModel):
     selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
     allowed_global_names: list[str] = Field(default_factory=list)
     allowed_helper_surface: dict[str, list[str]] = Field(default_factory=dict)
+    runtime_failure_reason: str | None = None
+    runtime_failure_class: str | None = None
+    failed_block_status: str | None = None
+    workflow_run_id: str | None = None
+    current_origin: str | None = None
+    current_url_present: bool = False
+    current_title_present: bool = False
+    page_evidence_source: str | None = None
+    observed_after_workflow_run: bool = False
+    page_form_summaries: list[str] = Field(default_factory=list)
+    page_result_summaries: list[str] = Field(default_factory=list)
+    page_action_summaries: list[str] = Field(default_factory=list)
+    page_challenge_summaries: list[str] = Field(default_factory=list)
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
@@ -499,6 +512,7 @@ class CopilotContext(AgentContext):
     # True when the most-recent such rejection deferred to the credential-scout
     # gate, so the churn backstop yields to that message instead of pre-empting it.
     last_code_authoring_reject_was_credential_priority: bool = False
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the

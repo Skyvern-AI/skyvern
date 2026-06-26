@@ -8,6 +8,7 @@ Rules:
 - If the evidence does not contain anything that shows the outcome, set satisfied=false and reason_code=no_evidence. Do not infer the outcome from the presence of a step or from the criterion text itself.
 - If the evidence shows the outcome did NOT happen (e.g. the cart is empty, an error/blocker, a contradicting value), set satisfied=false and reason_code=evidence_contradicts.
 - If you cannot tell from the evidence, set satisfied=false and reason_code=unknown.
+- A criterion may include [contingent_on=...] and [contingent_antecedent_output_path=output.<field>]. The server handles whether the antecedent fired from structured run output; you must grade the listed outcome normally against the produced evidence. Use evidence_confirms only when the consequent is shown, no_evidence when the required blocker/report evidence is missing, and evidence_contradicts when the evidence refutes it.
 - For an implicit constraint (e.g. "added exactly once"), check the end-state value (e.g. a cart quantity), not whether an add step ran.
 - evidence_ref: a short pointer to the specific evidence you used (a block label or the observed URL), or null.
 
