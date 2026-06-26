@@ -34,6 +34,8 @@ type Props = {
   activeIteration?: number | null;
   // When set, read this run's timeline instead of the URL's (studio shell).
   workflowRunId?: string;
+  // Studio owns live-status in its own header; let it hide this duplicate badge.
+  hideLiveBadge?: boolean;
   onLiveStreamSelected: () => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
@@ -84,6 +86,7 @@ function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
   workflowRunId,
+  hideLiveBadge = false,
   onLiveStreamSelected,
   onActionItemSelected,
   onBlockItemSelected,
@@ -187,7 +190,7 @@ function WorkflowRunTimeline({
           ).toLocaleString()}{" "}
           credits
         </span>
-        {workflowRunIsNotFinalized && (
+        {workflowRunIsNotFinalized && !hideLiveBadge && (
           <button
             type="button"
             onClick={onLiveStreamSelected}

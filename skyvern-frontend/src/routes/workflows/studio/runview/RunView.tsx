@@ -352,6 +352,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
             <div className="min-h-0 overflow-hidden">
               <WorkflowRunTimeline
                 workflowRunId={workflowRunId}
+                hideLiveBadge
                 activeItem={activeItem}
                 activeIteration={activeIteration}
                 onActionItemSelected={(item) => pinFrame(item.action.action_id)}
