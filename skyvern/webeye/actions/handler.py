@@ -59,6 +59,7 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
+    PhoneNumberInputMismatch,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -152,6 +153,8 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
+
+FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
@@ -545,6 +548,88 @@ async def check_phone_number_format(
         recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
     )
     return check_phone_number_format_response.recommended_phone_number
+
+
+def _phone_digits(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _is_plain_nanp_number(value: str | None) -> bool:
+    # A 10-digit North American number with no '+'/country-code/extension markers. There is no
+    # international handling, so a value carrying a '+' or letters (an extension) is excluded.
+    text = value or ""
+    if "+" in text or re.search(r"[A-Za-z]", text):
+        return False
+    return len(_phone_digits(text)) == 10
+
+
+def _tel_pattern_allows_bare_digits(pattern: str | None, bare_digits: str) -> bool:
+    # An HTML `pattern` is an implicitly-anchored constraint on the field's value. If the bare national
+    # digits do not satisfy it, the field requires a specific mask (e.g. "(ddd) ddd-dddd") and bare
+    # digits would fail validation, so they must not be used. A missing or unparseable pattern is
+    # treated as permissive.
+    if not pattern:
+        return True
+    try:
+        return re.fullmatch(pattern, bare_digits) is not None
+    except re.error:
+        return True
+
+
+def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | None) -> tuple[str, bool, bool]:
+    # Decide how to fill a tel field. Returns (text_to_type, used_bare_nanp, run_format_check).
+    # A separator-formatted value is long enough to fill()-split into a half-open "(ddd" that a
+    # self-formatting field collapses, dropping a digit; bare national digits avoid that. Stripping is a
+    # local transform, so it is applied to secret values too. The format-check LLM is reserved for
+    # non-secret values that the bare-digit path does not handle.
+    if is_tel and _is_plain_nanp_number(value) and _tel_pattern_allows_bare_digits(pattern, _phone_digits(value)):
+        return _phone_digits(value), True, False
+    return value, False, is_tel and not is_secret
+
+
+async def _is_tel_digit_fix_enabled(task: Task) -> bool:
+    organization_id = task.organization_id
+    if not organization_id:
+        return False
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+    try:
+        # Bucket by org (not per-run) for a stable, monitorable ramp and clean rollback.
+        return bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                FIX_TEL_INPUT_DIGIT_DROP_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate tel-digit-fix flag; defaulting to disabled",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
+    # Compare digit counts only — never the raw value, which may be a secret.
+    actual_value = await get_input_value(tag_name=tag_name, locator=locator)
+    expected_digits = _phone_digits(expected_value)
+    actual_digits = _phone_digits(actual_value)
+    if expected_digits != actual_digits:
+        raise PhoneNumberInputMismatch(
+            expected_digit_count=len(expected_digits),
+            actual_digit_count=len(actual_digits),
+        )
+
+
+async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_name: str, expected_value: str) -> None:
+    await verify_phone_input_digits(
+        tag_name=tag_name,
+        locator=skyvern_element.get_locator(),
+        expected_value=expected_value,
+    )
 
 
 async def check_date_format(
@@ -2076,8 +2161,20 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
-    # check the phone number format when type=tel and the text is not a secret value
-    if not is_secret_value and await skyvern_element.get_attr("type") == "tel":
+    is_tel = await skyvern_element.get_attr("type") == "tel"
+    is_plain_nanp_tel = False
+    run_phone_format_check = False
+    if is_tel and await _is_tel_digit_fix_enabled(task):
+        # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
+        # byte-for-byte. Plain-NANP tel is typed as bare digits (skipping the format-check LLM) unless
+        # the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
+        tel_pattern = await skyvern_element.get_attr("pattern")
+        text, is_plain_nanp_tel, run_phone_format_check = _plan_tel_text(
+            is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
+        )
+    elif is_tel and not is_secret_value:
+        run_phone_format_check = True
+    if run_phone_format_check:
         try:
             action.set_has_mini_agent()
             text = await check_phone_number_format(
@@ -2219,10 +2316,40 @@ async def handle_input_text_action(
                     auto_complete_hacky_flag = False
                     return [result]
 
+        # Only the bare-digit NANP fill is read back to verify; other tel shapes are left unverified.
+        verify_tel_input_after_fill = is_plain_nanp_tel
+
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
         try:
             await skyvern_element.input_sequentially(text=text)
+            if verify_tel_input_after_fill:
+                # Read the typed digits back; on mismatch, clear and retype once. A second mismatch
+                # fails the action here rather than letting it surface as a silent wrong fill.
+                try:
+                    await _verify_tel_input_after_fill(
+                        skyvern_element=skyvern_element,
+                        tag_name=tag_name,
+                        expected_value=text,
+                    )
+                except PhoneNumberInputMismatch:
+                    await skyvern_element.input_clear()
+                    await skyvern_element.input_sequentially(text=text)
+                    try:
+                        await _verify_tel_input_after_fill(
+                            skyvern_element=skyvern_element,
+                            tag_name=tag_name,
+                            expected_value=text,
+                        )
+                    except PhoneNumberInputMismatch as mismatch:
+                        LOG.warning(
+                            "Phone input read-back mismatch after retry",
+                            action=action,
+                            element_id=skyvern_element.get_id(),
+                            expected_digit_count=mismatch.expected_digit_count,
+                            actual_digit_count=mismatch.actual_digit_count,
+                        )
+                        return [ActionFailure(mismatch)]
 
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
