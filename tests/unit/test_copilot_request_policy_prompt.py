@@ -397,10 +397,10 @@ class TestClassifierFallbackCompletionCriteria:
                 "present",
                 {"output.user_name", "output.id", "output.address", "output.status"},
             ),
-            ("Open https://example.com and click the pricing link.", "unknown", set()),
+            ("Open https://example.com and click the pricing link.", "present", set()),
             # Substring matches ("read" in "already", "name" in "filename", "id" in "decided")
             # must not satisfy the whole-word gate.
-            ("I already decided the filename and reviewed the status of locations.", "unknown", set()),
+            ("I already decided the filename and reviewed the status of locations.", "present", set()),
             # Generic structural group term ("entries") satisfies the group gate.
             (
                 "Return a record with the entity name, identifier 1234567890, status, and the grouped entries.",

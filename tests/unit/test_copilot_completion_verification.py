@@ -46,7 +46,12 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy, _parse_completion_criteria
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    RequestPolicy,
+    _parse_completion_criteria,
+    build_classifier_fallback_floor,
+)
 from skyvern.forge.sdk.copilot.tools import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     _active_run_terminal_evidence_needs_visual_fallback,
@@ -2855,6 +2860,108 @@ async def test_maybe_run_completion_verification_terminal_goal_without_boolean_b
     assert verification is not None
     assert verification.is_fully_satisfied() is True
     assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_recorded_terminal_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("recorded fallback-floor outcome must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _terminal_goal_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.to_trace_data()["criterion_count"] == 1
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_page_end_state_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict:
+        captured["prompt"] = prompt
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "__copilot_fallback_floor__run",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_review",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert "observed_end_state_url: https://example.test/review" in captured["prompt"]
+    assert "observed_end_state_page_title: Start Service - Review" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_without_evidence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("true no-evidence fallback floor must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_empty",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "blocks": [],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
 
 
 @pytest.mark.asyncio
