@@ -62,7 +62,7 @@ export type FilmstripFrame = {
   actionType: ActionType;
   label: string;
   status: Status;
-  screenshotArtifactId: string | null;
+  blockType: string | null;
   stepId: string | null;
   actionOrder: number | null;
 };
@@ -108,7 +108,7 @@ export function buildFilmstrip(
             actionType: action.action_type,
             label: actionLabel(action),
             status: action.status,
-            screenshotArtifactId: action.screenshot_artifact_id ?? null,
+            blockType: block.block_type ?? null,
             stepId: action.step_id,
             actionOrder: action.action_order,
           });
