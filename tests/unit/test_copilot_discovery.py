@@ -6,9 +6,15 @@ from typing import Any
 
 import pytest
 
+from skyvern.forge.agent_functions import CopilotAliasResolution
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
-from skyvern.forge.sdk.copilot.tools import _discovery_walk, _inspect_page_for_composition_impl
+from skyvern.forge.sdk.copilot.tools import (
+    _discovery_walk,
+    _inspect_page_for_composition_impl,
+    _resolve_discovery_entry_url,
+    discovery,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
@@ -263,6 +269,83 @@ class _TargetThenCurrentPageServer:
             assert "getComputedStyle" in arguments["expression"]
             return {"ok": True, "data": {"result": []}}
         raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _AliasAgentFunction:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def resolve_copilot_entrypoint_alias(
+        self,
+        *,
+        site_or_url: str,
+        normalized_alias: str,
+    ) -> CopilotAliasResolution | None:
+        self.calls.append((site_or_url, normalized_alias))
+        if normalized_alias == "publicalias":
+            return CopilotAliasResolution(url="https://public-alias.test/start")
+        return None
+
+
+@pytest.mark.parametrize(
+    "site_or_url",
+    [
+        "public-alias",
+        "public alias",
+        "PUBLIC_ALIAS",
+    ],
+)
+def test_resolve_discovery_entry_url_uses_configured_alias_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    site_or_url: str,
+) -> None:
+    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", _AliasAgentFunction())
+
+    assert _resolve_discovery_entry_url(site_or_url) == (
+        "https://public-alias.test/start",
+        "canonical_alias",
+    )
+
+
+@pytest.mark.parametrize(
+    ("site_or_url", "expected"),
+    [
+        ("https://example.com/login", ("https://example.com/login", "url")),
+        ("HTTP://example.com/login", ("HTTP://example.com/login", "url")),
+        ("example.com", ("https://example.com", "domain")),
+        ("example.com/login?x=y", ("https://example.com/login?x=y", "domain")),
+    ],
+)
+def test_resolve_discovery_entry_url_preserves_url_and_domain_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    site_or_url: str,
+    expected: tuple[str, str],
+) -> None:
+    agent_function = _AliasAgentFunction()
+    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+
+    assert _resolve_discovery_entry_url(site_or_url) == expected
+    assert agent_function.calls == []
+
+
+def test_resolve_discovery_entry_url_unknown_bare_word_still_falls_back_to_www(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_function = _AliasAgentFunction()
+    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+
+    assert _resolve_discovery_entry_url("example") == ("https://www.example.com", "word")
+    assert agent_function.calls == [("example", "example")]
+
+
+def test_resolve_discovery_entry_url_unknown_spaced_phrase_remains_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_function = _AliasAgentFunction()
+    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+
+    assert _resolve_discovery_entry_url("example search portal") == (None, "unresolved")
+    assert agent_function.calls == [("example search portal", "examplesearchportal")]
 
 
 @pytest.mark.asyncio
