@@ -724,6 +724,30 @@ workflow_definition:
         assert "do not hardcode the eval value" in prompt
         assert "rerun via update_and_run_blocks" in prompt
 
+    def test_synthesized_parameter_binding_prompt_uses_exact_key(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="synthesized_parameter_binding_ambiguous",
+            unresolved_names=["enter_confirmation"],
+            parameter_keys=["enter_confirmation"],
+            available_parameter_keys=["confirmation_number"],
+            binding_candidates=["enter_confirmation", "confirmation_number"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "reason_code: synthesized_parameter_binding_ambiguous" in prompt
+        assert "binding_candidates: enter_confirmation, confirmation_number" in prompt
+        assert "declare and use the exact workflow input key" in prompt
+        assert "include that exact key in the code block's parameter_keys" in prompt
+        assert "reference it as a bare Python variable in code" in prompt
+        assert "do not guess or hardcode the runtime value" in prompt
+        assert "rerun via update_and_run_blocks" in prompt
+
     def test_ambiguous_selector_repair_context_prompt_includes_selector_details(self) -> None:
         repair_context = CodeAuthoringRepairContext(
             block_label="order_status",
@@ -774,6 +798,43 @@ workflow_definition:
         assert "stable role/name/data attribute" in prompt
         assert "button:nth-of-type" not in prompt
         assert "secret-token" not in prompt
+
+    def test_runtime_repair_context_prompt_includes_failure_and_page_state(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="search_registry",
+            reason_code="runtime_block_failure",
+            runtime_failure_reason='Timeout waiting for locator("#results")',
+            runtime_failure_class="timeout_waiting_for_selector",
+            failed_block_status="failed",
+            workflow_run_id="wr_failed",
+            current_origin="https://example.test",
+            current_url_present=True,
+            current_title_present=True,
+            page_evidence_source="inspect_page_for_composition",
+            observed_after_workflow_run=True,
+            page_form_summaries=["Search #search"],
+            page_result_summaries=["No results No matching records"],
+            page_action_summaries=["Search button.search disabled"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert 'runtime_failure_reason: Timeout waiting for locator("#results")' in prompt
+        assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
+        assert "failed_block_status: failed" in prompt
+        assert "current_origin: https://example.test" in prompt
+        assert "current_url_present: true" in prompt
+        assert "current_title_present: true" in prompt
+        assert "observed_after_workflow_run: true" in prompt
+        assert "page_forms: Search #search" in prompt
+        assert "page_results: No results No matching records" in prompt
+        assert "page_actions: Search button.search disabled" in prompt
+        assert "adapt the next code block to the observed page state" in prompt
+        assert "do not re-emit the same failing selector or name path" in prompt
 
 
 class TestVerifiedWorkflowOrNone:
