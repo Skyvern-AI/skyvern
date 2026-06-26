@@ -95,6 +95,12 @@ class TOTPVerificationResponse:
     headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class CopilotAliasResolution:
+    url: str
+    kind: str = "canonical_alias"
+
+
 def _remove_rect(element: dict) -> None:
     if "rect" in element:
         del element["rect"]
@@ -1428,6 +1434,14 @@ class AgentFunction:
         OSS returns empty string (no hardening).
         """
         return ""
+
+    def resolve_copilot_entrypoint_alias(
+        self,
+        *,
+        site_or_url: str,
+        normalized_alias: str,
+    ) -> CopilotAliasResolution | None:
+        return None
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
