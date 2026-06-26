@@ -2965,7 +2965,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "timeout"
         assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_slow_but_within_budget_returns_real_policy(self, monkeypatch) -> None:
@@ -3020,7 +3020,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_retries_transient_error_then_succeeds(self) -> None:
@@ -3078,7 +3078,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_non_retriable_error_does_not_retry(self) -> None:
@@ -3101,7 +3101,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_transient_error_exhausting_budget_labels_transient(
@@ -3135,7 +3135,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "transient_error"
         assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
@@ -3623,7 +3623,7 @@ workflow_definition:
 
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
         assert policy.credential_input_kind == "credential_name"
         assert policy.credential_refs == ["mock-portal-login"]
         assert policy.resolved_credentials == [credential]
@@ -3650,7 +3650,7 @@ workflow_definition:
         )
 
         assert policy.classifier_status == "fallback"
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
         assert policy.credential_input_kind == "none"
         assert policy.credential_refs == []
         credentials.get_credentials.assert_not_called()
@@ -5562,7 +5562,7 @@ class TestStructuralInfeasibilityQuestion:
 
 class TestClassifierFallbackCompletionFloor:
     @pytest.mark.asyncio
-    async def test_timeout_fallback_emits_method_mandated_run_floor(self, monkeypatch) -> None:
+    async def test_timeout_fallback_emits_gradeable_run_floor(self, monkeypatch) -> None:
         monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
 
         async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
@@ -5582,22 +5582,22 @@ class TestClassifierFallbackCompletionFloor:
         assert policy.completion_criteria
         assert all(c.level == "run" for c in policy.completion_criteria)
         assert all(c.implicit for c in policy.completion_criteria)
-        assert all(c.method_mandated for c in policy.completion_criteria)
+        assert policy.completion_criteria[0].method_mandated is False
         assert all(is_fallback_floor_criterion(c) for c in policy.completion_criteria)
         assert policy.completion_contract is None
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
         trace = policy.to_trace_data()
-        assert trace["completion_criteria_count"] == 0
-        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria)
+        assert trace["completion_criteria_count"] == 1
+        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria) - 1
         assert trace["has_completion_contract"] is False
 
-    def test_floor_is_excluded_from_judge_satisfaction_set(self) -> None:
+    def test_floor_base_reaches_judge_satisfaction_set(self) -> None:
         policy = _classifier_fallback_policy([], raw_secret_present=False, failure_kind="timeout")
         ctx = SimpleNamespace(request_policy=policy)
 
         assert policy.completion_criteria
-        assert _completion_verification_criteria(ctx) == []
+        assert _completion_verification_criteria(ctx) == [policy.completion_criteria[0]]
 
     def test_credential_aware_floor_adds_one_run_plane_criterion(self) -> None:
         base = build_classifier_fallback_floor([])
@@ -5605,7 +5605,9 @@ class TestClassifierFallbackCompletionFloor:
 
         assert len(credentialed) == len(base) + 1
         assert all(c.level == "run" for c in credentialed)
-        assert all(c.implicit and c.method_mandated for c in credentialed)
+        assert all(c.implicit for c in credentialed)
+        assert credentialed[0].method_mandated is False
+        assert credentialed[1].method_mandated is True
         assert len({c.id for c in credentialed}) == len(credentialed)
 
     def test_floor_respects_max_criteria_cap(self) -> None:
