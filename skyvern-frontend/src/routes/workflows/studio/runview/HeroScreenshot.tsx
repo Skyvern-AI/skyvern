@@ -1,3 +1,4 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
 
@@ -6,12 +7,31 @@ import { ArtifactApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 
+import { screenshotZoomClasses } from "./HeroScreenshot.utils";
+
 /**
- * The pinned/active action screenshot, letterboxed to fit the run hero. Shares the
- * ["artifact", id] cache with the filmstrip thumbnails so each is fetched once.
+ * The pinned/active action screenshot, fit to the run-hero width and scrollable
+ * for long captures. Shares the ["artifact", id] cache with the filmstrip
+ * thumbnails so each is fetched once.
  */
 export function HeroScreenshot({ artifactId }: { artifactId: string | null }) {
   const credentialGetter = useCredentialGetter();
+  const [zoomed, setZoomed] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    setZoomed(false);
+  }, [artifactId]);
+
+  // Start each view at the top; when zoomed, center horizontally too (margin-auto
+  // resolves to 0 once the image overflows, so the scroll would default to left).
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) {
+      return;
+    }
+    el.scrollTop = 0;
+    el.scrollLeft = zoomed ? (el.scrollWidth - el.clientWidth) / 2 : 0;
+  }, [zoomed, artifactId]);
   const { data, isLoading } = useQuery<ArtifactApiResponse>({
     queryKey: ["artifact", artifactId],
     queryFn: async () => {
@@ -48,11 +68,28 @@ export function HeroScreenshot({ artifactId }: { artifactId: string | null }) {
       </div>
     );
   }
+  const toggleZoom = () => setZoomed((z) => !z);
+  const zoom = screenshotZoomClasses(zoomed);
   return (
-    <img
-      src={getImageURL(data)}
-      alt="action screenshot"
-      className="absolute inset-0 h-full w-full object-contain"
-    />
+    <div
+      ref={containerRef}
+      className={zoom.container}
+      role="button"
+      tabIndex={0}
+      aria-label={zoomed ? "Zoom screenshot out" : "Zoom screenshot in"}
+      onClick={toggleZoom}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggleZoom();
+        }
+      }}
+    >
+      <img
+        src={getImageURL(data)}
+        alt="action screenshot"
+        className={zoom.image}
+      />
+    </div>
   );
 }
