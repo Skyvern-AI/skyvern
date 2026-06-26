@@ -177,3 +177,42 @@ describe("shared semantic tokens are consistent across cloud/eval/src", () => {
     expectConsistentToken("--cta-hover", ".dark");
   });
 });
+
+// The primary CTA must track the DS --primary token, not an independent
+// brand value. Locks SKY-10608: --cta aliases --primary so the neutral
+// primary is the single source of truth and #606bd2 cannot drift back.
+describe("--cta tracks the DS --primary (SKY-10608)", () => {
+  function tokenValue(css: string, selector: string, token: string): string {
+    const block = blockBetween(css, selector);
+    const m = block.match(new RegExp(`${token}:\\s*([^;]+);`));
+    return (m?.[1] ?? "").trim();
+  }
+
+  describe.each(CSS_FILES)("%s", (file) => {
+    const css = load(file);
+
+    it("light-mode --cta equals --primary", () => {
+      expect(tokenValue(css, ":root", "--cta")).toBe(
+        tokenValue(css, ":root", "--primary"),
+      );
+    });
+
+    it("dark-mode --cta equals --primary", () => {
+      expect(tokenValue(css, ".dark", "--cta")).toBe(
+        tokenValue(css, ".dark", "--primary"),
+      );
+    });
+
+    it("light-mode --cta-foreground equals --primary-foreground", () => {
+      expect(tokenValue(css, ":root", "--cta-foreground")).toBe(
+        tokenValue(css, ":root", "--primary-foreground"),
+      );
+    });
+
+    it("dark-mode --cta-foreground equals --primary-foreground", () => {
+      expect(tokenValue(css, ".dark", "--cta-foreground")).toBe(
+        tokenValue(css, ".dark", "--primary-foreground"),
+      );
+    });
+  });
+});

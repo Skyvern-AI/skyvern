@@ -26,6 +26,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
 )
+from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -255,6 +256,17 @@ class AzureStorage(BaseStorage):
         unzip_files(temp_zip_file_path, temp_dir)
         temp_zip_file.close()
         return temp_dir
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a browser profile from Azure."""
+        profile_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        LOG.info(
+            "Deleting browser profile",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            profile_uri=profile_uri,
+        )
+        await self.async_client.delete_file(profile_uri)
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -717,6 +729,8 @@ class AzureStorage(BaseStorage):
         date: str | None = None,
     ) -> str:
         """Sync a file from local browser session to Azure."""
+        # Anchor per-run clip offsets to browser close, captured before the upload below.
+        recording_finalized_at = datetime.now(timezone.utc)
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -758,6 +772,26 @@ class AzureStorage(BaseStorage):
                 checksum=checksum,
                 file_size=file_size,
             )
+
+            async def _upload_clip(run_id: str, clip_path: str, filename: str) -> str:
+                clip_uri = self._build_browser_session_uri(
+                    organization_id, browser_session_id, RUN_RECORDING_PATH_SEGMENT, f"{run_id}/{filename}", date
+                )
+                await self.async_client.upload_file_from_path(clip_uri, clip_path, tier=tier, tags=tags)
+                return clip_uri
+
+            try:
+                await sync_run_recording_clips(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    source_path=local_file_path,
+                    upload_clip=_upload_clip,
+                    now=recording_finalized_at,
+                )
+            except Exception:
+                LOG.warning(
+                    "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True
+                )
 
         return uri
 

@@ -1,0 +1,15 @@
+# Per-Dockerfile ignore for Dockerfile.ui (overrides .dockerignore).
+# The UI image only needs the frontend source and the entrypoint script;
+# everything else in the repo is irrelevant to this build context.
+
+*
+
+!skyvern-frontend
+!entrypoint-skyvernui.sh
+
+# Re-exclude noise inside skyvern-frontend so host-side state (a populated
+# node_modules whose .bin shims don't resolve inside Linux, a stale dist/,
+# local .env files) can't leak into the build.
+skyvern-frontend/node_modules
+skyvern-frontend/dist
+skyvern-frontend/.env*

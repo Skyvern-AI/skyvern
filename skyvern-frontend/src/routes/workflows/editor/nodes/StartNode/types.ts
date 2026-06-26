@@ -9,8 +9,10 @@ export type WorkflowStartNodeData = {
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
   browserProfileId: string | null;
+  browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
+  maxElapsedTimeMinutes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
   cdpConnectHeaders: string | Record<string, unknown> | null;
   editable: boolean;

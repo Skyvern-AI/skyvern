@@ -4,20 +4,59 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 
 import structlog
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Query
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable
 from skyvern.forge import app
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
-from skyvern.forge.sdk.schemas.debug_sessions import DebugSession, DebugSessionRuns
+from skyvern.forge.sdk.schemas.debug_sessions import (
+    DebugLoginBlockCompatibility,
+    DebugSession,
+    DebugSessionRuns,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.forge.sdk.workflow.models.block import LoginBlock
+from skyvern.forge.sdk.workflow.service import (
+    DEBUG_SESSION_PROFILE_REASON_DIFFERENT,
+    DEBUG_SESSION_PROFILE_REASON_NO_PROFILE,
+)
+from skyvern.schemas.proxy_location import runtime_proxy_location
 
 LOG = structlog.get_logger()
+
+
+async def _hydrate_pbs_browser_profile_id(
+    debug_session: DebugSession,
+    organization_id: str,
+) -> DebugSession:
+    """Populate the visible PBS's saved browser_profile_id on the response.
+
+    Looked up lazily here (rather than carried on the debug_sessions row) so
+    profile rotations after session creation are reflected at fetch time.
+    The UI keys on this value to detect LoginBlock credential-profile
+    incompatibility before kicking off a debug run.
+    """
+    try:
+        pbs = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+            debug_session.browser_session_id,
+            organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to hydrate pbs_browser_profile_id on debug session",
+            debug_session_id=debug_session.debug_session_id,
+            browser_session_id=debug_session.browser_session_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return debug_session
+    if pbs is not None and debug_session.pbs_browser_profile_id is None:
+        debug_session.pbs_browser_profile_id = pbs.browser_profile_id
+    return debug_session
 
 
 @base_router.get(
@@ -75,6 +114,12 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
         debug_session.browser_session_id,
         current_org.organization_id,
     )
+    # Reuse the already-fetched PBS row to populate pbs_browser_profile_id
+    # rather than going through _hydrate_pbs_browser_profile_id, which would
+    # round-trip the DB a second time. If the PBS lookup itself raises, that
+    # surfaces here intentionally so the renewal block can react.
+    if session is not None:
+        debug_session.pbs_browser_profile_id = session.browser_profile_id
     if session and session.started_at is None and session.completed_at is None:
         created_at_utc = (
             session.created_at.replace(tzinfo=timezone.utc) if session.created_at.tzinfo is None else session.created_at
@@ -151,7 +196,7 @@ async def new_debug_session(
                     user_id=current_user_id,
                     workflow_permanent_id=workflow_permanent_id,
                 )
-                return debug_session
+                return await _hydrate_pbs_browser_profile_id(debug_session, current_org.organization_id)
 
     completed_debug_sessions = await app.DATABASE.debug.complete_debug_sessions(
         organization_id=current_org.organization_id,
@@ -167,7 +212,7 @@ async def new_debug_session(
         workflow_permanent_id=workflow_permanent_id,
     )
 
-    if completed_debug_sessions:
+    if completed_debug_sessions and settings.ENV != "local":
         closeable_browser_sessions: list[PersistentBrowserSession] = []
 
         for debug_session in completed_debug_sessions:
@@ -225,6 +270,14 @@ async def new_debug_session(
                     current_org.organization_id,
                 )
             )
+    elif completed_debug_sessions:
+        LOG.info(
+            "Local mode: skipping debug-session close tasks before creating replacement browser session",
+            num_completed_debug_sessions=len(completed_debug_sessions),
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
 
     # Look up the workflow's proxy_location so the debug session browser
     # uses the same proxy region the user configured on the workflow.
@@ -232,12 +285,13 @@ async def new_debug_session(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
-    proxy_location = workflow.proxy_location or ProxyLocation.RESIDENTIAL
+    proxy_location = runtime_proxy_location(workflow.proxy_location)
 
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
         proxy_location=proxy_location,
+        wait_for_startup=settings.ENV != "local",
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(
@@ -245,9 +299,9 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
-        vnc_streaming_supported=True if new_browser_session.ip_address else False,
-        # NOTE(jdo:streaming-local-dev)
-        # vnc_streaming_supported=True,
+        vnc_streaming_supported=(
+            settings.ENV == "local" or bool(new_browser_session.ip_address or new_browser_session.browser_address)
+        ),
     )
 
     LOG.info(
@@ -260,6 +314,8 @@ async def new_debug_session(
         proxy_location=str(proxy_location),
     )
 
+    # The freshly created session row carries the browser_profile_id already.
+    debug_session.pbs_browser_profile_id = new_browser_session.browser_profile_id
     return debug_session
 
 
@@ -280,6 +336,69 @@ async def get_block_outputs_for_debug_session(
         user_id=current_user_id,
         version=version,
     )
+
+
+@base_router.get(
+    "/debug-session/{workflow_permanent_id}/login-block-compatibility",
+    response_model=DebugLoginBlockCompatibility,
+    include_in_schema=False,
+)
+async def get_login_block_compatibility(
+    workflow_permanent_id: str,
+    block_label: str = Query(..., min_length=1),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> DebugLoginBlockCompatibility:
+    """Backend-authoritative compatibility verdict for one debugger LoginBlock.
+
+    The FE pre-check normally resolves the credential off the bounded
+    `useCredentialsQuery` window; if the block references a credential past
+    that window (pagination miss / inaccessible), this endpoint runs the same
+    org-scoped resolution the run path uses so a Play retry can recover.
+    Returns the same shape the FE's compatibility gate consumes.
+    """
+    debug_session = await app.DATABASE.debug.get_debug_session(
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+    if not debug_session:
+        return DebugLoginBlockCompatibility(compatible=True, reason=None)
+
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    if workflow is None or workflow.workflow_definition is None:
+        return DebugLoginBlockCompatibility(compatible=True, reason=None)
+
+    block = next(
+        (b for b in workflow.workflow_definition.blocks if getattr(b, "label", None) == block_label),
+        None,
+    )
+    if block is None or not isinstance(block, LoginBlock):
+        return DebugLoginBlockCompatibility(compatible=True, reason=None)
+
+    resolved_profile_id = await app.WORKFLOW_SERVICE.resolve_login_block_browser_profile_id_pre_run(
+        block=block,
+        organization_id=current_org.organization_id,
+    )
+    if resolved_profile_id is None:
+        return DebugLoginBlockCompatibility(compatible=True, reason=None)
+
+    pbs = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        debug_session.browser_session_id,
+        current_org.organization_id,
+    )
+    pbs_profile_id = pbs.browser_profile_id if pbs is not None else None
+
+    if pbs_profile_id == resolved_profile_id:
+        return DebugLoginBlockCompatibility(compatible=True, reason=None)
+
+    reason = (
+        DEBUG_SESSION_PROFILE_REASON_NO_PROFILE if pbs_profile_id is None else DEBUG_SESSION_PROFILE_REASON_DIFFERENT
+    )
+    return DebugLoginBlockCompatibility(compatible=False, reason=reason)
 
 
 @base_router.get(

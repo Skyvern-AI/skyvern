@@ -13,7 +13,7 @@ import pdfplumber
 import structlog
 from pypdf import PdfReader
 
-from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS
+from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS, MAX_PDF_OCR_PAGES
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.token_counter import count_tokens
@@ -216,20 +216,21 @@ def validate_pdf_file(
 def render_pdf_pages_as_images(
     file_path: str,
     file_identifier: str | None = None,
-    max_pages: int = 10,
+    max_pages: int | None = MAX_PDF_OCR_PAGES,
     resolution: int = 150,
 ) -> list[bytes]:
     """Render PDF pages as PNG images using pdfplumber.
 
-    Returns a list of PNG byte buffers, one per page (up to max_pages).
-    Intended for vision-LLM fallback when text extraction returns nothing
-    (e.g. scanned / image-based PDFs).
+    Returns a list of PNG byte buffers, one per page. Defaults to a bounded page
+    cap; pass ``max_pages=None`` to deliberately render every page. Intended for
+    vision-LLM fallback when text extraction returns nothing (e.g. scanned /
+    image-based PDFs).
     """
     identifier = file_identifier or file_path
     page_images: list[bytes] = []
 
     with pdfplumber.open(file_path) as pdf:
-        pages_to_render = min(len(pdf.pages), max_pages)
+        pages_to_render = len(pdf.pages) if max_pages is None else min(len(pdf.pages), max_pages)
         if pages_to_render < len(pdf.pages):
             LOG.warning(
                 "PDF has more pages than max_pages for image rendering, truncating",

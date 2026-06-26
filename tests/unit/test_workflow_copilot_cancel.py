@@ -37,6 +37,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
     _copilot_cancel_key,
     _persist_cancel_turn,
+    _persist_proposed_workflow_state,
     _watch_for_cancel,
     workflow_copilot_cancel,
     workflow_copilot_chat_post,
@@ -189,12 +190,25 @@ def _setup_route_mocks(
     original_workflow: SimpleNamespace,
     agent_result: SimpleNamespace,
 ) -> tuple[AsyncMock, SimpleNamespace]:
+    if not hasattr(agent_result, "total_tokens"):
+        agent_result.total_tokens = None
+    if not hasattr(agent_result, "response_type"):
+        agent_result.response_type = "REPLY"
+    if not hasattr(agent_result, "output_policy_diagnostics"):
+        agent_result.output_policy_diagnostics = None
+    if not hasattr(agent_result, "turn_id"):
+        agent_result.turn_id = None
+    if not hasattr(agent_result, "narrative_summary"):
+        agent_result.narrative_summary = None
+    if not hasattr(agent_result, "narrative_payload"):
+        agent_result.narrative_payload = None
+
     async def fake_llm_handler(*args: object, **kwargs: object) -> None:
         del args, kwargs
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
 
@@ -246,6 +260,42 @@ def _make_original_workflow() -> SimpleNamespace:
         description="Original description",
         workflow_definition=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_timeout_wip_persists_proposed_workflow_with_yaml_when_canonical_restored() -> None:
+    workflow_params = SimpleNamespace(update_workflow_copilot_chat=AsyncMock())
+    app.DATABASE.workflow_params = workflow_params
+    chat = _make_chat(auto_accept=False)
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {
+        "workflow_id": "wf-canonical",
+        "workflow_definition": {
+            "parameters": [{"key": "full_name", "parameter_type": "workflow"}],
+            "blocks": [{"block_type": "code", "label": "extract_record_status_info"}],
+        },
+    }
+    agent_result = AgentResult(
+        user_response="Timed out, but I have a tested draft.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml=(
+            "title: Record lookup\n"
+            "workflow_definition:\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: extract_record_status_info\n"
+        ),
+        proposal_disposition="review_tested",
+    )
+
+    await _persist_proposed_workflow_state(chat, agent_result, restored=True)
+
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    proposed_workflow = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposed_workflow["workflow_definition"]["blocks"][0]["label"] == "extract_record_status_info"
+    assert proposed_workflow["_copilot_yaml"].startswith("title: Record lookup")
+    assert "_copilot_unvalidated" not in proposed_workflow
 
 
 async def _drive_cancel_route(
@@ -653,6 +703,57 @@ async def test_timeout_wip_result_streams_normal_response_frame(
 
 
 @pytest.mark.asyncio
+async def test_verified_terminal_timeout_result_persists_proposed_workflow_with_blocks_and_params() -> None:
+    workflow_params = SimpleNamespace(update_workflow_copilot_chat=AsyncMock())
+    app.DATABASE.workflow_params = workflow_params
+    chat = _make_chat(proposed_workflow=None, auto_accept=False)
+    blocks = [
+        {"block_type": "code", "label": "open_search_search_page"},
+        {"block_type": "code", "label": "search_and_open_record_details"},
+        {"block_type": "code", "label": "extract_record_status_record"},
+    ]
+    params = [{"key": f"param_{index}", "parameter_type": "workflow"} for index in range(6)]
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.side_effect = lambda mode="json": {
+        "workflow_id": "wf-draft",
+        "title": "Record Status Draft",
+        "workflow_definition": {"blocks": blocks, "parameters": params},
+    }
+    agent_result = AgentResult(
+        user_response="I created and tested the workflow successfully.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml=(
+            "title: Record Status Draft\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - key: param_0\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: open_search_search_page\n"
+            "  - block_type: code\n"
+            "    label: search_and_open_record_details\n"
+            "  - block_type: code\n"
+            "    label: extract_record_status_record\n"
+        ),
+        workflow_was_persisted=True,
+        proposal_disposition="auto_applicable",
+    )
+
+    await _persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    proposal = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposal["_copilot_yaml"].startswith("title: Record Status Draft")
+    assert [block["label"] for block in proposal["workflow_definition"]["blocks"]] == [
+        "open_search_search_page",
+        "search_and_open_record_details",
+        "extract_record_status_record",
+    ]
+    assert len(proposal["workflow_definition"]["parameters"]) == 6
+    assert "_copilot_unvalidated" not in proposal
+
+
+@pytest.mark.asyncio
 async def test_timeout_wip_review_tested_propagates_to_response_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -811,7 +912,7 @@ async def test_operational_cancel_does_not_persist_cancelled_message(
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
     monkeypatch.setattr(

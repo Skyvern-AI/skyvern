@@ -7,11 +7,13 @@ overwrite the shared S3 profile with their dirty state.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
@@ -19,6 +21,7 @@ def _make_workflow(persist: bool = True) -> MagicMock:
     wf = MagicMock()
     wf.persist_browser_session = persist
     wf.workflow_permanent_id = "wpid_test"
+    wf.browser_profile_key = None
     return wf
 
 
@@ -76,6 +79,39 @@ async def test_profile_persisted_on_completed_run(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_profile_persisted_to_segmented_key_on_completed_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Segmented workflows should write back to the segment-specific storage key."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow = _make_workflow(persist=True)
+    workflow.browser_profile_key = "{{ credential_id }}"
+    workflow_run = _make_workflow_run(WorkflowRunStatus.completed)
+    browser_state = _make_browser_state()
+    store_mock = _patch_clean_up_deps(monkeypatch, browser_state)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run_parameters",
+        AsyncMock(
+            return_value=[
+                (
+                    SimpleNamespace(key="credential_id"),
+                    SimpleNamespace(value="cred_123"),
+                )
+            ]
+        ),
+    )
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+
+    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
+
+    storage_key = build_workflow_browser_session_storage_key("wpid_test", "cred_123")
+    store_mock.assert_awaited_once_with("o_test", storage_key, "/tmp/fake_profile")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
     [
@@ -105,3 +141,59 @@ async def test_profile_not_persisted_on_non_completed_run(
     await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
 
     store_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_cookies_persisted_before_store_when_browser_stays_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote-browser / existing-session runs keep the browser alive, so close() never persists the
+    sidecar; clean_up_workflow must snapshot session cookies before archiving the profile."""
+    from skyvern.forge.sdk.workflow import service as service_module
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow = _make_workflow(persist=True)
+    workflow_run = _make_workflow_run(WorkflowRunStatus.completed)
+    workflow_run.browser_address = "ws://remote-browser"
+    browser_state = _make_browser_state()
+    store_mock = _patch_clean_up_deps(monkeypatch, browser_state)
+
+    order: list[str] = []
+    persist_mock = AsyncMock(side_effect=lambda *a, **k: order.append("persist"))
+    store_mock.side_effect = lambda *a, **k: order.append("store")
+    monkeypatch.setattr(service_module, "persist_session_cookies", persist_mock)
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+
+    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
+
+    persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
+    assert order == ["persist", "store"]
+
+
+@pytest.mark.asyncio
+async def test_session_cookies_not_double_persisted_when_browser_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the browser closes on completion, close() already wrote the sidecar — clean_up_workflow
+    must not persist again."""
+    from skyvern.forge.sdk.workflow import service as service_module
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow = _make_workflow(persist=True)
+    workflow_run = _make_workflow_run(WorkflowRunStatus.completed)
+    browser_state = _make_browser_state()
+    _patch_clean_up_deps(monkeypatch, browser_state)
+
+    persist_mock = AsyncMock()
+    monkeypatch.setattr(service_module, "persist_session_cookies", persist_mock)
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+
+    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
+
+    persist_mock.assert_not_awaited()

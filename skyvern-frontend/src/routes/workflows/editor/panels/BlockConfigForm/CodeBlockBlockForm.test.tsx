@@ -24,33 +24,6 @@ vi.mock("@xyflow/react", async () => {
   };
 });
 
-vi.mock("@/components/WorkflowBlockInputSet", () => ({
-  WorkflowBlockInputSet: ({
-    nodeId,
-    values,
-    onChange,
-  }: {
-    nodeId: string;
-    values: Set<string>;
-    onChange: (parameterKeys: Set<string>) => void;
-  }) => (
-    <div data-testid="workflow-block-input-set" data-node-id={nodeId}>
-      <button
-        type="button"
-        data-testid="add-param"
-        onClick={() => {
-          const next = new Set(values);
-          next.add("new_param");
-          onChange(next);
-        }}
-      >
-        add
-      </button>
-      <span data-testid="parameter-count">{values.size}</span>
-    </div>
-  ),
-}));
-
 vi.mock("@/routes/workflows/components/CodeEditor", () => ({
   CodeEditor: ({
     value,
@@ -130,15 +103,13 @@ describe("CodeBlockBlockForm (SKY-9380)", () => {
   });
 
   test("renders the migrated fields the inline tile exposes", () => {
-    // Mirrors the inline CodeBlockNode JSX: Input Parameters set and a
-    // python CodeEditor. If a field disappears here it disappears from
-    // the sidebar UI.
+    // Mirrors the inline CodeBlockNode JSX: the Inputs selector and a python
+    // CodeEditor. If a field disappears here it disappears from the sidebar UI.
     mockGetNode.mockReturnValue(baseCodeBlockNode());
     render(<CodeBlockBlockForm blockId="code-1" />);
 
-    expect(screen.getByText("Input Parameters")).toBeDefined();
     expect(screen.getByText("Code Input")).toBeDefined();
-    expect(screen.getByTestId("workflow-block-input-set")).toBeDefined();
+    expect(screen.getByText("Inputs")).toBeDefined();
     expect(screen.getByTestId("code-editor")).toBeDefined();
     expect(
       screen.getByTestId("code-editor").getAttribute("data-language"),
@@ -154,35 +125,6 @@ describe("CodeBlockBlockForm (SKY-9380)", () => {
 
     expect(mockUpdateNodeData).toHaveBeenCalledWith("code-1", {
       code: "y = 10",
-    });
-  });
-
-  test("dispatches updateNodeData when parameter keys change", () => {
-    mockGetNode.mockReturnValue(baseCodeBlockNode());
-    render(<CodeBlockBlockForm blockId="code-1" />);
-
-    fireEvent.click(screen.getByTestId("add-param"));
-
-    expect(mockUpdateNodeData).toHaveBeenCalledWith("code-1", {
-      parameterKeys: ["new_param"],
-    });
-  });
-
-  test("does not redispatch parameterKeys when the new set deep-equals the old", () => {
-    // Validation parity with the inline tile: the inline
-    // `WorkflowBlockInputSet.onChange` callback short-circuits via
-    // `deepEqualStringArrays` so identical-content sets do not bump
-    // node data and thereby preserve byte-identical YAML/JSON output.
-    mockGetNode.mockReturnValue(baseCodeBlockNode({ parameterKeys: ["a"] }));
-    render(<CodeBlockBlockForm blockId="code-1" />);
-
-    // Re-emit a Set containing the same single value via mock add (will
-    // produce ["a","new_param"]) — the deep-equal short-circuit only
-    // skips when arrays are identical, which we verify by re-rendering
-    // with an unchanged value below. Here we assert the positive path.
-    fireEvent.click(screen.getByTestId("add-param"));
-    expect(mockUpdateNodeData).toHaveBeenCalledWith("code-1", {
-      parameterKeys: ["a", "new_param"],
     });
   });
 
@@ -213,5 +155,24 @@ describe("CodeBlockBlockForm (SKY-9380)", () => {
     const commit = usePendingCommitsStore.getState().commits["code-1"];
     expect(commit).toBeDefined();
     expect(commit?.()).toBe(true);
+  });
+
+  test("stamps the savedAt footer when code-first fields change", () => {
+    const codeFirstFields = {
+      prompt: "Open {{ url }}",
+      steps: [{ description: "Open the page", action_type: "goto_url" }],
+    };
+    mockGetNode.mockReturnValue(baseCodeBlockNode(codeFirstFields));
+    const { rerender } = render(<CodeBlockBlockForm blockId="code-1" />);
+
+    mockGetNode.mockReturnValue(
+      baseCodeBlockNode({ ...codeFirstFields, prompt: "Open {{ link }}" }),
+    );
+    rerender(<CodeBlockBlockForm blockId="code-1" />);
+    vi.advanceTimersByTime(400);
+
+    expect(
+      useSidebarSaveStateStore.getState().getLastUpdatedAt("code-1"),
+    ).not.toBeNull();
   });
 });

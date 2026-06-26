@@ -1,6 +1,7 @@
 import ast
 import re
 from typing import Any, Dict, Match
+from urllib.parse import urlparse
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -9,7 +10,12 @@ from pydantic import ValidationError
 
 from skyvern.constants import EXTRACT_ACTION_SCROLL_AMOUNT, SCROLL_AMOUNT_MULTIPLIER
 from skyvern.errors.errors import GetTOTPVerificationCodeError, MissingTOTPSourceError
-from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
+from skyvern.exceptions import (
+    FailedToGetTOTPVerificationCode,
+    InvalidUrl,
+    NoTOTPVerificationCodeFound,
+    UnsupportedActionType,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
@@ -18,12 +24,12 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
+    has_credential_totp_candidate,
     poll_otp_value,
-    try_generate_totp_from_credential,
+    resolve_otp_value,
 )
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
-from skyvern.utils.url_validators import strip_query_params
+from skyvern.utils.url_validators import is_blocked_host, prepend_scheme_and_validate_url, strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -35,6 +41,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    ExtractAction,
     GotoUrlAction,
     HoverAction,
     InputOrSelectContext,
@@ -42,11 +49,14 @@ from skyvern.webeye.actions.actions import (
     KeypressAction,
     LeftMouseAction,
     MoveAction,
+    NewTabAction,
     NullAction,
+    ReloadPageAction,
     ScrollAction,
     SelectOption,
     SelectOptionAction,
     SolveCaptchaAction,
+    SwitchTabAction,
     TerminateAction,
     UploadFileAction,
     VerificationCodeAction,
@@ -57,33 +67,11 @@ from skyvern.webeye.scraper.scraped_page import ScrapedPage
 LOG = structlog.get_logger()
 
 
-def _has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
-    # Mirrors try_generate_totp_from_credential selection: active-with-TOTP, or
-    # exactly one TOTP-bearing candidate when no active is set (multi-no-active -> False).
-    if not workflow_run_id:
-        return False
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    if not workflow_run_context:
-        return False
-
-    current_context = skyvern_context.current()
-    active_credential_key = current_context.active_credential_parameter_key if current_context else None
-    if active_credential_key:
-        value = workflow_run_context.values.get(active_credential_key)
-        return isinstance(value, dict) and isinstance(value.get("totp"), str)
-
-    candidate_keys = [
-        key
-        for key, value in workflow_run_context.values.items()
-        if isinstance(value, dict) and isinstance(value.get("totp"), str)
-    ]
-    return len(candidate_keys) == 1
-
-
 def parse_action(
     action: Dict[str, Any],
     scraped_page: ScrapedPage,
     data_extraction_goal: str | None = None,
+    extracted_information_schema: dict[str, Any] | list | str | None = None,
     totp_code_required: bool = False,
 ) -> Action:
     if "id" in action:
@@ -129,6 +117,9 @@ def parse_action(
     # Backward compat: map PRESS_ENTER to KEYPRESS (old prompt used PRESS_ENTER)
     if action_type_str == "PRESS_ENTER":
         action_type_str = "KEYPRESS"
+    # The prompt exposes EXTRACT as EXTRACT_INFORMATION; map it back to the internal enum name
+    if action_type_str == "EXTRACT_INFORMATION":
+        action_type_str = "EXTRACT"
     action_type = ActionType[action_type_str]
 
     if not action_type.is_web_action() and action_type != ActionType.SCROLL:
@@ -149,7 +140,7 @@ def parse_action(
         return ClickAction(
             **base_action_dict,
             file_url=file_url,
-            download=action.get("download", False),
+            download=action.get("download") or False,
             click_context=click_context,
             repeat=2 if double_click else 1,
         )
@@ -200,7 +191,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
-            download=action.get("download", False),
+            download=action.get("download") or False,
         )
 
     if action_type == ActionType.CHECKBOX:
@@ -269,7 +260,85 @@ def parse_action(
         return ScrollAction(**base_action_dict, scroll_x=scroll_x, scroll_y=scroll_y)
 
     if action_type == ActionType.CLOSE_PAGE:
-        return ClosePageAction(**base_action_dict)
+        raw_index = action.get("tab_index")
+        if raw_index is None:
+            return ClosePageAction(**base_action_dict)
+        try:
+            tab_index = int(raw_index)
+        except (TypeError, ValueError):
+            LOG.warning(
+                "CLOSE_PAGE action returned with a non-integer tab_index, closing the current tab instead",
+                raw_action=action,
+            )
+            return ClosePageAction(**base_action_dict)
+        return ClosePageAction(**base_action_dict, tab_index=tab_index)
+
+    if action_type == ActionType.EXTRACT:
+        # EXTRACT is a global page action, not element-targeted
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        if not data_extraction_goal:
+            LOG.warning("EXTRACT action returned without a data extraction goal, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        return ExtractAction(
+            **base_action_dict,
+            data_extraction_goal=data_extraction_goal,
+            data_extraction_schema=extracted_information_schema,
+        )
+
+    if action_type == ActionType.GOTO_URL:
+        # GOTO_URL is a global navigation action, not element-targeted
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        url = action.get("url")
+        if not url or not isinstance(url, str):
+            LOG.warning("GOTO_URL action returned without a url, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        try:
+            validated_url = prepend_scheme_and_validate_url(url.strip())
+        except InvalidUrl:
+            LOG.warning("GOTO_URL action returned with an invalid url, skipping action", url=url)
+            return NullAction(**base_action_dict)
+        # LLM-generated navigation targets can be steered by page content, so block
+        # private/loopback/link-local hosts the same way the task URL boundary does.
+        host = urlparse(validated_url).hostname
+        if not host or is_blocked_host(host):
+            LOG.warning("GOTO_URL action targets a blocked host, skipping action", url=validated_url)
+            return NullAction(**base_action_dict)
+        return GotoUrlAction(**base_action_dict, url=validated_url)
+
+    if action_type == ActionType.RELOAD_PAGE:
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        return ReloadPageAction(**base_action_dict)
+
+    if action_type == ActionType.NEW_TAB:
+        url = action.get("url")
+        if not url or not isinstance(url, str):
+            LOG.warning("NEW_TAB action returned without a url, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        try:
+            validated_url = prepend_scheme_and_validate_url(url.strip())
+        except InvalidUrl:
+            LOG.warning("NEW_TAB action returned with an invalid url, skipping action", url=url)
+            return NullAction(**base_action_dict)
+        host = urlparse(validated_url).hostname
+        if not host or is_blocked_host(host):
+            LOG.warning("NEW_TAB action targets a blocked host, skipping action", url=validated_url)
+            return NullAction(**base_action_dict)
+        return NewTabAction(**base_action_dict, url=validated_url)
+
+    if action_type == ActionType.SWITCH_TAB:
+        raw_index = action.get("tab_index")
+        if raw_index is None:
+            LOG.warning("SWITCH_TAB action returned without a tab_index, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        try:
+            tab_index = int(raw_index)
+        except (TypeError, ValueError):
+            LOG.warning("SWITCH_TAB action returned with a non-integer tab_index, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        return SwitchTabAction(**base_action_dict, tab_index=tab_index)
 
     raise UnsupportedActionType(action_type=action_type)
 
@@ -290,6 +359,7 @@ def parse_actions(
                 action=action,
                 scraped_page=scraped_page,
                 data_extraction_goal=task.data_extraction_goal,
+                extracted_information_schema=task.extracted_information_schema,
                 totp_code_required=totp_code_required,
             )
             action_instance.organization_id = task.organization_id
@@ -976,37 +1046,16 @@ async def generate_cua_fallback_actions(
             )
 
     elif skyvern_action_type == "get_verification_code":
-        # 1. Check navigation payload first for inline OTP.
-        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        # 2. Then try to generate TOTP from credential if payload has no OTP.
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
-        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
-            LOG.info(
-                "Getting verification code for CUA",
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                workflow_run_id=task.workflow_run_id,
-                totp_verification_url=strip_query_params(task.totp_verification_url)
-                if task.totp_verification_url
-                else None,
-                totp_identifier=task.totp_identifier,
-            )
-            try:
-                otp_value = await poll_otp_value(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
-            except NoTOTPVerificationCodeFound:
-                reasoning_suffix = "No verification code found"
-                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
-            except FailedToGetTOTPVerificationCode as e:
-                reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
-                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+        try:
+            otp_value = await resolve_otp_value(task)
+        except NoTOTPVerificationCodeFound:
+            otp_value = None
+            reasoning_suffix = "No verification code found"
+            reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+        except FailedToGetTOTPVerificationCode as e:
+            otp_value = None
+            reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
+            reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
 
         # OTP value obtained - use it as verification code
         if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
@@ -1021,7 +1070,7 @@ async def generate_cua_fallback_actions(
             # Three-way classification: missing config, configured-but-empty (any of
             # URL / identifier / credential), or wrong-type otp_value. Each gets a
             # distinct customer-visible signal so webhook consumers can branch.
-            has_credential = _has_credential_totp_candidate(task.workflow_run_id)
+            has_credential = has_credential_totp_candidate(task.workflow_run_id)
             no_source_configured = (
                 otp_value is None and not task.totp_verification_url and not task.totp_identifier and not has_credential
             )

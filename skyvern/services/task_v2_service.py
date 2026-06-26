@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import string
@@ -28,7 +29,14 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
+from skyvern.forge.sdk.schemas.task_v2 import (
+    TaskV2,
+    TaskV2Metadata,
+    TaskV2Status,
+    Thought,
+    ThoughtScenario,
+    ThoughtType,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import (
@@ -41,8 +49,8 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
-    ProxyLocation,
     ProxyLocationInput,
     RunEngine,
     RunStatus,
@@ -68,10 +76,10 @@ from skyvern.schemas.workflows import (
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
+from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -79,6 +87,13 @@ RANDOM_STRING_POOL = string.ascii_letters + string.digits
 # Maximum number of planning iterations for TaskV2
 # This limits how many times the LLM can plan and execute actions
 DEFAULT_MAX_ITERATIONS = 50
+
+# Cap a navigate block's recovered terminal output: task_history is re-fed to the
+# planner every iteration, so an unbounded reasoning blob would grow context.
+NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS = 2000
+# Structured (dict/list) output can't be sliced without corrupting it; one that exceeds
+# this is dropped entirely rather than written uncapped to task_history.
+NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS = 10 * NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -140,7 +155,6 @@ async def _summarize_max_steps_failure_reason(
             navigation_goal=task_v2.prompt,
             history=history,
             local_datetime=datetime.now(context.tz_info).isoformat(),
-            non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
         )
 
         json_response = await app.LLM_API_HANDLER(
@@ -469,6 +483,7 @@ async def run_task_v2(
     task_v2_id: str,
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
+    max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
@@ -507,17 +522,19 @@ async def run_task_v2(
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
+        consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
     # work for subsequent blocks in the same loop iteration.
-    with skyvern_context.scoped(context):
+    with skyvern_context.scoped(context, propagate_captcha_timeout=True):
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,
                 task_v2=task_v2,
                 request_id=request_id,
                 max_steps_override=max_steps_override,
+                max_iterations_override=max_iterations_override,
                 browser_session_id=browser_session_id,
             )
         except TaskTerminationError as e:
@@ -567,11 +584,29 @@ async def run_task_v2(
     return task_v2
 
 
+def _resolve_max_iterations(max_iterations_override: str | int | None) -> int:
+    """Resolve the planner-iteration budget, never below the historical floor.
+
+    The planner always ran DEFAULT_MAX_ITERATIONS regardless of the block field, so workflows
+    persisted with the old (smaller) default must not regress — floor every value at it.
+    """
+    if max_iterations_override:
+        try:
+            return max(int(max_iterations_override), DEFAULT_MAX_ITERATIONS)
+        except (ValueError, TypeError):
+            LOG.info(
+                "max_iterations_override isn't an integer, won't override",
+                max_iterations_override=max_iterations_override,
+            )
+    return DEFAULT_MAX_ITERATIONS
+
+
 async def run_task_v2_helper(
     organization: Organization,
     task_v2: TaskV2,
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
+    max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
@@ -701,11 +736,12 @@ async def run_task_v2_helper(
     url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
+    max_iterations = _resolve_max_iterations(max_iterations_override)
 
     # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
-    # The DEFAULT_MAX_ITERATIONS limit applies to this single TaskV2 execution
-    for i in range(DEFAULT_MAX_ITERATIONS):
+    # The max_iterations limit applies to this single TaskV2 execution
+    for i in range(max_iterations):
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
             organization_id=organization_id,
@@ -815,6 +851,11 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
+            try:
+                open_tabs_context = await build_open_tabs_context(browser_state, page)
+            except Exception:
+                LOG.warning("Failed to build open-tabs context for the planner", exc_info=True)
+                open_tabs_context = None
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
@@ -822,11 +863,8 @@ async def run_task_v2_helper(
                 current_url=current_url,
                 user_goal=user_prompt,
                 task_history=task_history,
+                open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
-                non_vision_page_context=await build_non_vision_page_context_if_needed(
-                    scraped_page=scraped_page,
-                    page=page,
-                ),
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -884,15 +922,12 @@ async def run_task_v2_helper(
                     iteration=i,
                     workflow_run_id=workflow_run_id,
                 )
+                await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
                     context=context,
                     screenshots=scraped_page.screenshots,
-                    non_vision_page_context=await build_non_vision_page_context_if_needed(
-                        scraped_page=scraped_page,
-                        page=page,
-                    ),
                 )
                 if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
@@ -1008,7 +1043,7 @@ async def run_task_v2_helper(
         workflow_create_request = WorkflowCreateYAMLRequest(
             title=workflow.title,
             description=workflow.description,
-            proxy_location=task_v2.proxy_location or ProxyLocation.RESIDENTIAL,
+            proxy_location=runtime_proxy_location(task_v2.proxy_location),
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
@@ -1037,6 +1072,30 @@ async def run_task_v2_helper(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
         )
+        # Fallback for navigate: recover from the COMPLETE action only when extraction was
+        # expected but came back null (extracted_information present and None). A navigate
+        # block's output is always a TaskOutput dump, so the key is always present here.
+        block_output = block_result.output_parameter_value
+        if (
+            extracted_data is None
+            and task_type == "navigate"
+            and block_result.success
+            and isinstance(block_output, dict)
+            and "extracted_information" in block_output
+            and block_output["extracted_information"] is None
+        ):
+            extracted_data = await _get_navigate_complete_output(
+                block_result,
+                organization_id,
+                task_v2_id=task_v2_id,
+                workflow_run_id=workflow_run_id,
+            )
+            if extracted_data is not None:
+                LOG.info(
+                    "Recovered navigate terminal output from COMPLETE action",
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                )
         if extracted_data is not None:
             task_history_record["extracted_data"] = extracted_data
         task_history.append(task_history_record)
@@ -1064,6 +1123,7 @@ async def run_task_v2_helper(
         if block_result.success is True:
             completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None
+            completion_open_tabs_context: str | None = None
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
@@ -1078,17 +1138,22 @@ async def run_task_v2_helper(
                 )
                 completion_screenshots = completion_scraped_page.screenshots
             except Exception:
-                LOG.warning("Failed to scrape the website for task v2 completion check")
+                LOG.warning("Failed to scrape the website for task v2 completion check", exc_info=True)
+            if completion_scraped_page is not None:
+                try:
+                    completion_open_tabs_context = await build_open_tabs_context(
+                        browser_state, await browser_state.get_working_page()
+                    )
+                except Exception:
+                    LOG.warning("Failed to build open-tabs context for completion check", exc_info=True)
 
             # validate completion only happens at the last iteration
             task_v2_completion_prompt = prompt_engine.load_prompt(
                 "task_v2_check_completion",
                 user_goal=user_prompt,
                 task_history=task_history,
+                open_tabs_context=completion_open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
-                non_vision_page_context=await build_non_vision_page_context_if_needed(
-                    scraped_page=completion_scraped_page
-                ),
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -1135,14 +1200,12 @@ async def run_task_v2_helper(
                     workflow_run_id=workflow_run_id,
                     completion_resp=completion_resp,
                 )
+                await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
                     context=context,
                     screenshots=completion_screenshots,
-                    non_vision_page_context=await build_non_vision_page_context_if_needed(
-                        scraped_page=completion_scraped_page
-                    ),
                 )
                 if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
@@ -1199,23 +1262,28 @@ async def run_task_v2_helper(
                 failure_category_source="llm" if llm_failure_categories else "code_level",
                 failure_category_path="v2_max_steps",
             )
+            summary_description, summarized_output = await _best_effort_failure_deliverable(
+                task_v2, task_history, context
+            )
             task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 failure_reason=full_failure_reason,
                 organization_id=organization_id,
                 failure_category=failure_category,
+                summary=summary_description,
+                output=summarized_output,
             )
             return workflow, workflow_run, task_v2
     else:
         # Loop completed without early exit - task exceeded max iterations
-        max_iterations_failure_reason = f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps."
+        max_iterations_failure_reason = f"Task exceeded maximum of {max_iterations} planning iterations. Consider simplifying the task or breaking it into smaller steps."
         max_iterations_failure_category = classify_from_failure_reason(
             max_iterations_failure_reason, fallback_to_unknown=True
         )
         LOG.info(
             "Task v2 failed - exceeded maximum iterations",
-            max_iterations=DEFAULT_MAX_ITERATIONS,
+            max_iterations=max_iterations,
             workflow_run_id=workflow_run_id,
         )
         LOG.info(
@@ -1231,12 +1299,15 @@ async def run_task_v2_helper(
             failure_category_source="code_level",
             failure_category_path="v2_max_iterations",
         )
+        summary_description, summarized_output = await _best_effort_failure_deliverable(task_v2, task_history, context)
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
             failure_reason=max_iterations_failure_reason,
             organization_id=organization_id,
             failure_category=max_iterations_failure_category,
+            summary=summary_description,
+            output=summarized_output,
         )
 
     return workflow, workflow_run, task_v2
@@ -1454,7 +1525,9 @@ async def _generate_loop_task(
     else:
         LOG.info("Loop values are not links", loop_values=loop_values)
         url = None
-        context_parameter_key = "target"
+        # Suffix with the per-loop random string so multiple non-link loop tasks in one run
+        # don't all emit a parameter keyed "target", which fails duplicate-key validation.
+        context_parameter_key = f"target_{loop_random_string}"
 
     # create ContextParameter for the value
     url_value_context_parameter = ContextParameter(
@@ -1479,7 +1552,6 @@ async def _generate_loop_task(
         local_datetime=datetime.now(context.tz_info).isoformat(),
         is_link=is_loop_value_link,
         loop_values=loop_values,
-        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page),
     )
     thought_task_in_loop = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -1590,7 +1662,6 @@ async def _generate_extraction_task(
         current_url=current_url,
         data_extraction_goal=data_extraction_goal,
         local_datetime=datetime.now(context.tz_info).isoformat(),
-        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page),
     )
 
     max_retries = 3
@@ -1781,11 +1852,15 @@ async def mark_task_v2_as_failed(
     failure_reason: str | None = None,
     organization_id: str | None = None,
     failure_category: list[dict] | None = None,
+    summary: str | None = None,
+    output: dict[str, Any] | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.failed,
+        summary=summary,
+        output=output,
         failure_category=failure_category,
     )
     if workflow_run_id:
@@ -1917,14 +1992,14 @@ def _get_extracted_data_from_block_result(
 
     Args:
         block_result: The result from block execution
-        task_type: Type of task ("extract" or "loop")
+        task_type: Type of task ("extract", "navigate", or "loop")
         task_v2_id: Optional ID for logging
         workflow_run_id: Optional ID for logging
 
     Returns:
         Extracted data if available, None otherwise
     """
-    if task_type == "extract":
+    if task_type in ("extract", "navigate"):
         if (
             isinstance(block_result.output_parameter_value, dict)
             and "extracted_information" in block_result.output_parameter_value
@@ -1976,13 +2051,131 @@ def _get_extracted_data_from_block_result(
     return None
 
 
-async def _summarize_task_v2(
+async def _get_navigate_complete_output(
+    block_result: BlockResult,
+    organization_id: str | None,
+    task_v2_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> Any:
+    """Recover a navigate block's terminal answer from its verifying COMPLETE action.
+
+    Falls back through response, output, then reasoning, capping str candidates.
+    """
+    if not isinstance(block_result.output_parameter_value, dict):
+        return None
+    task_id = block_result.output_parameter_value.get("task_id")
+    if not task_id:
+        return None
+    try:
+        actions = await app.DATABASE.tasks.get_task_actions(task_id=task_id, organization_id=organization_id)
+    except Exception:
+        LOG.warning(
+            "Failed to load navigate task actions; skipping terminal-output recovery",
+            task_id=task_id,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    for action in reversed(actions):
+        if action.action_type != ActionType.COMPLETE:
+            continue
+        for candidate in (action.response, action.output, action.reasoning):
+            if not candidate:
+                continue
+            if isinstance(candidate, str):
+                if len(candidate) > NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS:
+                    LOG.warning(
+                        "Truncating navigate terminal output before writing to task_history",
+                        task_id=task_id,
+                        original_length=len(candidate),
+                        cap=NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS,
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return candidate[:NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS]
+                return candidate
+            # Structured output (dict/list from CUA engines) can't be sliced without
+            # corrupting it, so drop an oversized one entirely (forcing a separate extract
+            # task) rather than let it bloat the task_history fed to the planner.
+            structured_len = len(str(candidate))
+            if structured_len > NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS:
+                LOG.warning(
+                    "Dropping oversized structured navigate terminal output; expecting a separate extract task",
+                    task_id=task_id,
+                    approx_length=structured_len,
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                return None
+            return candidate
+        # Only the terminal COMPLETE is authoritative: if it carries no data,
+        # don't fall back to a stale earlier COMPLETE.
+        return None
+    return None
+
+
+async def _persist_completion_tab_screenshots(browser_state: BrowserState, thought: Thought) -> int:
+    """Capture one screenshot per open tab at completion, persisting each as a SCREENSHOT_LLM artifact.
+
+    Best-effort: runs after the goal is already achieved, so nothing here may raise into the
+    completion path and flip a successful run to failed.
+    """
+    captured = 0
+    try:
+        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
+        # close the very tabs we are trying to prove remain open.
+        pages = await browser_state.list_valid_pages(max_pages=0)
+        # A lone tab is already captured by the completion check; only multi-tab runs need this.
+        if len(pages) <= 1:
+            return 0
+
+        per_tab_timeout = settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
+        # Overall budget so a handful of still-loading tabs can't stall the post-success path.
+        async with asyncio.timeout(settings.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
+            for page in pages[: settings.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
+                screenshots: list[bytes] = []
+                try:
+                    # Bound each tab: a slow tab's bring_to_front / load-wait must not stall completion.
+                    async with asyncio.timeout(per_tab_timeout):
+                        try:
+                            # Front each tab so Chromium paints lazily-rendered background content.
+                            await page.bring_to_front()
+                        except Exception:
+                            LOG.debug("Failed to bring tab to front before completion screenshot", exc_info=True)
+                        screenshots = await SkyvernFrame.take_split_screenshots(page=page, scroll=False)
+                except Exception:
+                    LOG.warning("Failed to capture completion screenshot for an open tab", exc_info=True)
+                    continue
+                for screenshot in screenshots:
+                    try:
+                        await app.ARTIFACT_MANAGER.create_thought_artifact(
+                            thought=thought,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
+                        captured += 1
+                    except Exception:
+                        LOG.warning("Failed to persist completion tab screenshot artifact", exc_info=True)
+    except Exception:
+        LOG.warning("Aborted capturing completion tab screenshots", captured=captured, exc_info=True)
+
+    LOG.info(
+        "Captured end-state per-tab screenshots at task_v2 completion",
+        captured=captured,
+        observer_thought_id=thought.observer_thought_id,
+    )
+    return captured
+
+
+async def _generate_task_v2_deliverable(
     task_v2: TaskV2,
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
-    non_vision_page_context: str | None = None,
-) -> TaskV2:
+    is_partial: bool = False,
+) -> tuple[str | None, Any]:
+    # is_partial=True renders the best-effort variant of the summary prompt; does not change task status.
     thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
         organization_id=task_v2.organization_id,
@@ -1998,8 +2191,8 @@ async def _summarize_task_v2(
         user_goal=task_v2.prompt,
         task_history=task_history,
         extracted_information_schema=task_v2.extracted_information_schema,
+        is_partial=is_partial,
         local_datetime=datetime.now(context.tz_info).isoformat(),
-        non_vision_page_context=non_vision_page_context,
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
         prompt=task_v2_summary_prompt,
@@ -2008,7 +2201,7 @@ async def _summarize_task_v2(
         prompt_name="task_v2_summary",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
+    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
 
     summary_description = task_v2_summary_resp.get("description")
     summarized_output = task_v2_summary_resp.get("output")
@@ -2018,7 +2211,49 @@ async def _summarize_task_v2(
         thought=summary_description,
         output=task_v2_summary_resp,
     )
+    return summary_description, summarized_output
 
+
+async def _best_effort_failure_deliverable(
+    task_v2: TaskV2,
+    task_history: list[dict],
+    context: SkyvernContext,
+) -> tuple[str | None, Any]:
+    # Never raises: deliverable synthesis must not interfere with terminal failure handling.
+    # Screenshots are skipped — synthesized from task_history; the failure paths already screenshot.
+    if not task_history:
+        return None, None
+    try:
+        return await _generate_task_v2_deliverable(
+            task_v2=task_v2,
+            task_history=task_history,
+            context=context,
+            screenshots=None,
+            is_partial=True,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to synthesize best-effort deliverable for failing task v2",
+            exc_info=True,
+            task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=task_v2.workflow_run_id,
+        )
+        return None, None
+
+
+async def _summarize_task_v2(
+    task_v2: TaskV2,
+    task_history: list[dict],
+    context: SkyvernContext,
+    screenshots: list[bytes] | None = None,
+) -> TaskV2:
+    summary_description, summarized_output = await _generate_task_v2_deliverable(
+        task_v2=task_v2,
+        task_history=task_history,
+        context=context,
+        screenshots=screenshots,
+        is_partial=False,
+    )
     return await mark_task_v2_as_completed(
         task_v2_id=task_v2.observer_cruise_id,
         workflow_run_id=task_v2.workflow_run_id,

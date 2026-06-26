@@ -35,15 +35,9 @@ User details:
 ```
 
 {% if open_tabs_context %}
-Open browser tabs (CLOSE_PAGE always closes the tab marked [current] — other tabs are shown for context only):
+Open browser tabs ({% if show_switch_tab_action %}use SWITCH_TAB with the tab's number to make a different tab active; CLOSE_PAGE closes the tab marked [current], or set its "tab_index" to close a specific tab{% else %}CLOSE_PAGE closes the tab marked [current] by default, or set its "tab_index" to the number of a specific tab to close that one{% endif %}):
 ```
 {{ open_tabs_context }}
-```
-{% endif %}
-{% if non_vision_page_context %}
-Non-vision page context and accessibility tree:
-```json
-{{ non_vision_page_context }}
 ```
 {% endif %}
 Clickable elements from `{{ current_url }}`:

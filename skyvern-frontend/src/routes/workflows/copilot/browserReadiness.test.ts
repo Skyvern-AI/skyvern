@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  resolveCopilotLiveBrowserReady,
   shouldQueuePromptForLiveBrowser,
   shouldWaitForLiveBrowser,
 } from "./browserReadiness";
@@ -63,5 +64,59 @@ describe("shouldQueuePromptForLiveBrowser", () => {
         message: "Build a workflow",
       }),
     ).toBe(false);
+  });
+});
+
+describe("resolveCopilotLiveBrowserReady", () => {
+  describe("with the headless drain affordance off", () => {
+    it.each([
+      [false, false],
+      [false, true],
+      [true, false],
+      [true, true],
+    ])(
+      "returns displayReady unchanged (display=%s, backend=%s)",
+      (displayReady, hasBackendSession) => {
+        expect(
+          resolveCopilotLiveBrowserReady({
+            displayReady,
+            hasBackendSession,
+            headlessTurnDrainEnabled: false,
+          }),
+        ).toBe(displayReady);
+      },
+    );
+  });
+
+  describe("with the headless drain affordance on", () => {
+    it("becomes ready on a backend session even without a painted display", () => {
+      expect(
+        resolveCopilotLiveBrowserReady({
+          displayReady: false,
+          hasBackendSession: true,
+          headlessTurnDrainEnabled: true,
+        }),
+      ).toBe(true);
+    });
+
+    it("stays not-ready without a backend session id", () => {
+      expect(
+        resolveCopilotLiveBrowserReady({
+          displayReady: false,
+          hasBackendSession: false,
+          headlessTurnDrainEnabled: true,
+        }),
+      ).toBe(false);
+    });
+
+    it("stays ready when the display is ready regardless of the backend session", () => {
+      expect(
+        resolveCopilotLiveBrowserReady({
+          displayReady: true,
+          hasBackendSession: false,
+          headlessTurnDrainEnabled: true,
+        }),
+      ).toBe(true);
+    });
   });
 });

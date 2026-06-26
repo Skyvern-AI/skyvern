@@ -14,16 +14,21 @@ import { PasswordCredentialContent } from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
+import {
+  CreditCardCredentialContent,
+  type CreditCardCredentialValues,
+} from "./CreditCardCredentialContent";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  CreateCredentialRequest,
-  CredentialApiResponse,
+  type CreateCredentialRequest,
+  type CreditCardBillingAddress,
+  type CreditCardCredential,
+  type CredentialApiResponse,
   isPasswordCredential,
   isCreditCardCredential,
   isSecretCredential,
-  TestCredentialStatusResponse,
-  TestLoginResponse,
+  type TestCredentialStatusResponse,
+  type TestLoginResponse,
 } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -44,6 +49,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import { getAuthenticatorKeyError } from "./credentialTotpValidation";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -54,14 +60,27 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   totp_identifier: "",
 };
 
-const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
-  name: "",
-  cardNumber: "",
-  cardExpirationDate: "",
-  cardCode: "",
-  cardBrand: "",
-  cardHolderName: "",
-};
+function createCreditCardCredentialInitialValues(): CreditCardCredentialValues {
+  return {
+    name: "",
+    cardNumber: "",
+    cardExpirationDate: "",
+    cardCode: "",
+    cardBrand: "",
+    cardHolderName: "",
+    billingAddressLine1: "",
+    billingAddressLine2: "",
+    billingCity: "",
+    billingState: "",
+    billingStateCode: "",
+    billingPostalCode: "",
+    billingCountry: "",
+    billingCountryCode: "",
+    billingEmail: "",
+    billingPhone: "",
+    metadata: [{ key: "", value: "" }],
+  };
+}
 
 const SECRET_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -69,8 +88,8 @@ const SECRET_CREDENTIAL_INITIAL_VALUES = {
   secretValue: "",
 };
 
-// Maximum polling duration: 5 minutes
-const MAX_POLL_DURATION_MS = 5 * 60 * 1000;
+// Maximum polling duration: 10 minutes (matches the backend profile-creation budget)
+const MAX_POLL_DURATION_MS = 10 * 60 * 1000;
 
 // Progressive status messages during test — each advances once at a real interval
 const TEST_STATUS_MESSAGES = [
@@ -99,6 +118,60 @@ function generateDefaultCredentialName(existingNames: string[]): string {
   }
 
   return `${baseName}_${counter}`;
+}
+
+function trimmedOrNull(value: string) {
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function buildBillingAddress(
+  values: CreditCardCredentialValues,
+): CreditCardBillingAddress | null {
+  const billingAddress: CreditCardBillingAddress = {};
+
+  const line1 = trimmedOrNull(values.billingAddressLine1);
+  const line2 = trimmedOrNull(values.billingAddressLine2);
+  const city = trimmedOrNull(values.billingCity);
+  const state = trimmedOrNull(values.billingState);
+  const stateCode = trimmedOrNull(values.billingStateCode);
+  const postalCode = trimmedOrNull(values.billingPostalCode);
+  const country = trimmedOrNull(values.billingCountry);
+  const countryCode = trimmedOrNull(values.billingCountryCode);
+
+  if (line1) billingAddress.line1 = line1;
+  if (line2) billingAddress.line2 = line2;
+  if (city) billingAddress.city = city;
+  if (state) billingAddress.state = state;
+  if (stateCode) billingAddress.state_code = stateCode;
+  if (postalCode) billingAddress.postal_code = postalCode;
+  if (country) billingAddress.country = country;
+  if (countryCode) billingAddress.country_code = countryCode;
+
+  return Object.keys(billingAddress).length > 0 ? billingAddress : null;
+}
+
+function buildMetadata(values: CreditCardCredentialValues) {
+  const metadata: Record<string, string> = {};
+  let hasIncompleteEntry = false;
+
+  for (const entry of values.metadata) {
+    const key = entry.key.trim();
+    const value = entry.value.trim();
+    if (!key && !value) {
+      continue;
+    }
+    if (!key || !value) {
+      hasIncompleteEntry = true;
+      continue;
+    }
+    metadata[key] = value;
+  }
+
+  return {
+    metadata: Object.keys(metadata).length > 0 ? metadata : null,
+    hasIncompleteEntry,
+  };
 }
 
 type Props = {
@@ -151,7 +224,7 @@ function CredentialsModal({
     PASSWORD_CREDENTIAL_INITIAL_VALUES,
   );
   const [creditCardCredentialValues, setCreditCardCredentialValues] = useState(
-    CREDIT_CARD_CREDENTIAL_INITIAL_VALUES,
+    createCreditCardCredentialInitialValues,
   );
   const [secretCredentialValues, setSecretCredentialValues] = useState(
     SECRET_CREDENTIAL_INITIAL_VALUES,
@@ -248,16 +321,23 @@ function CredentialsModal({
     testUrl,
   ]);
 
-  const nameInitializedRef = useRef(false);
+  const formInitializedRef = useRef(false);
 
-  // Set default name when modal opens, or pre-populate fields in edit mode
+  // Initialize the form once per modal open — guarded by a ref so a background
+  // credentials refetch (e.g. the test-completion poll) can't re-run this and
+  // wipe typed values or in-progress test state.
   useEffect(() => {
     if (!isOpen) {
-      nameInitializedRef.current = false;
+      formInitializedRef.current = false;
+      return;
+    }
+
+    if (formInitializedRef.current) {
       return;
     }
 
     if (isEditMode) {
+      formInitializedRef.current = true;
       reset();
       const cred = editingCredential.credential;
       if (editingCredential.tested_url) {
@@ -283,6 +363,7 @@ function CredentialsModal({
         });
       } else if (isCreditCardCredential(cred)) {
         setCreditCardCredentialValues({
+          ...createCreditCardCredentialInitialValues(),
           name: editingCredential.name,
           cardNumber: "",
           cardExpirationDate: "",
@@ -300,8 +381,8 @@ function CredentialsModal({
       return;
     }
 
-    if (credentials && !nameInitializedRef.current) {
-      nameInitializedRef.current = true;
+    if (credentials) {
+      formInitializedRef.current = true;
       const existingNames = credentials.map((c) => c.name);
       const defaultName = generateDefaultCredentialName(existingNames);
 
@@ -323,7 +404,7 @@ function CredentialsModal({
   function reset() {
     setVaultType("default");
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
-    setCreditCardCredentialValues(CREDIT_CARD_CREDENTIAL_INITIAL_VALUES);
+    setCreditCardCredentialValues(createCreditCardCredentialInitialValues());
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
     setEditingGroups({ name: false, values: false });
     setTestAndSave(false);
@@ -364,12 +445,12 @@ function CredentialsModal({
         pollIntervalRef.current = null;
         setTestStatus("failed");
         setTestFailureReason(
-          "The test timed out after 5 minutes. The login may be taking too long or requires manual interaction.",
+          "The test timed out after 10 minutes. The login may be taking too long or requires manual interaction.",
         );
         toast({
           title: "Credential test timed out",
           description:
-            "The test did not complete within 5 minutes. Please try again.",
+            "The test did not complete within 10 minutes. Please try again.",
           variant: "destructive",
         });
         // Cancel the backend workflow run so it stops consuming resources
@@ -811,6 +892,9 @@ function CredentialsModal({
         });
         return;
       }
+      if (authenticatorKeyError) {
+        return;
+      }
 
       // If test passed, rename the temp credential instead of creating a new one
       if (testAndSave && testStatus === "completed" && testCredentialId) {
@@ -902,17 +986,40 @@ function CredentialsModal({
       }
       // remove all spaces from the card number
       const number = creditCardCredentialValues.cardNumber.replace(/\s/g, "");
+      const billingAddress = buildBillingAddress(creditCardCredentialValues);
+      const billingEmail = trimmedOrNull(
+        creditCardCredentialValues.billingEmail,
+      );
+      const billingPhone = trimmedOrNull(
+        creditCardCredentialValues.billingPhone,
+      );
+      const { metadata, hasIncompleteEntry } = buildMetadata(
+        creditCardCredentialValues,
+      );
+      if (hasIncompleteEntry) {
+        toast({
+          title: "Error",
+          description: "Metadata rows need both a key and a value",
+          variant: "destructive",
+        });
+        return;
+      }
+      const credentialPayload: CreditCardCredential = {
+        card_number: number,
+        card_cvv: cardCode,
+        card_exp_month: cardExpirationMonth,
+        card_exp_year: cardExpirationYear,
+        card_brand: cardBrand,
+        card_holder_name: cardHolderName,
+        ...(billingAddress ? { billing_address: billingAddress } : {}),
+        ...(billingEmail ? { billing_email: billingEmail } : {}),
+        ...(billingPhone ? { billing_phone: billingPhone } : {}),
+        ...(metadata ? { metadata } : {}),
+      };
       activeMutation.mutate({
         name,
         credential_type: "credit_card",
-        credential: {
-          card_number: number,
-          card_cvv: cardCode,
-          card_exp_month: cardExpirationMonth,
-          card_exp_year: cardExpirationYear,
-          card_brand: cardBrand,
-          card_holder_name: cardHolderName,
-        },
+        credential: credentialPayload,
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
       });
     } else if (type === CredentialModalTypes.SECRET) {
@@ -983,6 +1090,13 @@ function CredentialsModal({
       </div>
     ) : undefined;
 
+  const shouldValidateAuthenticatorKey =
+    type === CredentialModalTypes.PASSWORD &&
+    (!isEditMode || editingGroups.values);
+  const authenticatorKeyError = shouldValidateAuthenticatorKey
+    ? getAuthenticatorKeyError(passwordCredentialValues)
+    : null;
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -997,6 +1111,7 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          totpError={authenticatorKeyError}
           beforeCredentialFields={customVaultCheckbox}
           afterUrl={
             <div className="space-y-3">
@@ -1159,6 +1274,9 @@ function CredentialsModal({
       });
       return;
     }
+    if (authenticatorKeyError) {
+      return;
+    }
 
     // Set testing state immediately to avoid button flash
     pollCancelledRef.current = false;
@@ -1213,6 +1331,7 @@ function CredentialsModal({
     testUrl.trim() !== "" &&
     passwordCredentialValues.username.trim() !== "" &&
     passwordCredentialValues.password.trim() !== "" &&
+    !authenticatorKeyError &&
     !isTestInProgress;
 
   return (

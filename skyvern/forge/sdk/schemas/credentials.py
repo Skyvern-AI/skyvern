@@ -12,6 +12,7 @@ from skyvern.utils.url_validators import validate_url
 class CredentialVaultType(StrEnum):
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
+    GCP = "gcp"
     CUSTOM = "custom"
 
 
@@ -51,14 +52,45 @@ class PasswordCredentialResponse(BaseModel):
     )
 
 
+class CredentialTotpCodeResponse(BaseModel):
+    """Current authenticator code for a password credential.
+
+    SECURITY: This response must never include the TOTP seed/secret.
+    """
+
+    code: str = Field(..., description="Current generated authenticator code", examples=["123456"])
+    seconds_remaining: int = Field(
+        ...,
+        ge=0,
+        description="Seconds until this code rolls over",
+        examples=[24],
+    )
+
+
 class CreditCardCredentialResponse(BaseModel):
     """Response model for credit card credentials — non-sensitive fields only.
 
-    SECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name.
+    SECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,
+    billing fields, or metadata.
     """
 
     last_four: str = Field(..., description="Last four digits of the credit card number", examples=["1234"])
     brand: str = Field(..., description="Brand of the credit card", examples=["visa"])
+
+
+class CreditCardBillingAddress(BaseModel):
+    """Optional billing address fields associated with a credit card credential."""
+
+    line1: str | None = Field(default=None, description="Billing address line 1", examples=["123 Main St"])
+    line2: str | None = Field(default=None, description="Billing address line 2", examples=["Apt 4B"])
+    city: str | None = Field(default=None, description="Billing city", examples=["San Francisco"])
+    state: str | None = Field(default=None, description="Billing state or region", examples=["California"])
+    state_code: str | None = Field(default=None, description="Billing state or region code", examples=["CA"])
+    postal_code: str | None = Field(default=None, description="Billing postal code", examples=["94105"])
+    country: str | None = Field(default=None, description="Billing country", examples=["United States"])
+    country_code: str | None = Field(
+        default=None, description="ISO 3166-1 alpha-2 billing country code", examples=["US"]
+    )
 
 
 class SecretCredentialResponse(BaseModel):
@@ -115,6 +147,24 @@ class CreditCardCredential(BaseModel):
     card_exp_year: str = Field(..., description="The card's expiration year", examples=["2025"])
     card_brand: str = Field(..., description="The card's brand", examples=["visa"])
     card_holder_name: str = Field(..., description="The name of the card holder", examples=["John Doe"])
+    billing_address: CreditCardBillingAddress | None = Field(
+        default=None,
+        description="Optional billing address associated with the card",
+    )
+    billing_email: str | None = Field(default=None, description="Optional billing email address")
+    billing_phone: str | None = Field(default=None, description="Optional billing phone number")
+    metadata: dict[str, str] | None = Field(
+        default=None,
+        description="Optional additional credit card metadata fields",
+    )
+
+    @model_validator(mode="after")
+    def normalize_empty_optional_fields(self) -> Self:
+        if self.billing_address is not None and not self.billing_address.model_dump(exclude_none=True):
+            self.billing_address = None
+        if self.metadata == {}:
+            self.metadata = None
+        return self
 
 
 class NonEmptyCreditCardCredential(CreditCardCredential):
@@ -195,6 +245,49 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
     )
+    folder_id: str | None = Field(
+        default=None,
+        description="ID of the credential folder this credential belongs to, if any",
+        examples=["cfld_1234567890"],
+    )
+
+
+class OnePasswordItemOverview(BaseModel):
+    """Response model for 1Password item metadata."""
+
+    item_id: str = Field(..., description="The 1Password item ID")
+    title: str = Field(..., description="The 1Password item title")
+    vault_id: str = Field(..., description="The ID of the vault containing the item")
+    vault_name: str = Field(..., description="The name of the vault containing the item")
+    category: str = Field(..., description="The 1Password item category")
+    url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+
+
+class OnePasswordItemsResponse(BaseModel):
+    """Response model for listing 1Password item metadata."""
+
+    configured: bool = Field(..., description="Whether a 1Password service account token is configured")
+    items: list[OnePasswordItemOverview] = Field(..., description="The available 1Password item metadata")
+
+
+class BitwardenItemOverview(BaseModel):
+    """Response model for Bitwarden item metadata."""
+
+    item_id: str = Field(..., description="The Bitwarden item ID")
+    title: str = Field(..., description="The Bitwarden item title")
+    collection_id: str | None = Field(
+        default=None,
+        description="The ID of a collection containing the item, if available",
+    )
+    credential_type: CredentialType = Field(..., description="The item's credential type")
+    url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+
+
+class BitwardenItemsResponse(BaseModel):
+    """Response model for listing Bitwarden item metadata."""
+
+    configured: bool = Field(..., description="Whether Bitwarden credentials are configured")
+    items: list[BitwardenItemOverview] = Field(..., description="The available Bitwarden item metadata")
 
 
 class Credential(BaseModel):
@@ -233,6 +326,10 @@ class Credential(BaseModel):
     save_browser_session_intent: bool | None = Field(
         default=False,
         description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
+    folder_id: str | None = Field(
+        default=None,
+        description="ID of the credential folder this credential belongs to, if any",
     )
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")

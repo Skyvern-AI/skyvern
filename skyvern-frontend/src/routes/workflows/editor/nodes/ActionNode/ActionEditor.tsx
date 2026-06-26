@@ -38,7 +38,7 @@ import {
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
 const navigationGoalTooltip =
-  "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify parameters to use.";
+  "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify inputs to use.";
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
 function ActionEditor({ blockId }: { blockId: string }) {
@@ -87,7 +87,7 @@ function ActionEditorBody({
           </div>
           {isFirstWorkflowBlock ? (
             <div className="flex justify-end text-xs text-slate-400">
-              Tip: Use the {"+"} button to add parameters!
+              Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
         </div>

@@ -22,6 +22,7 @@ export interface Thought {
     reasoning_token_count?: number;
     cached_token_count?: number;
     thought_cost?: number;
+    last_llm_model?: string;
     created_at: string;
     modified_at: string;
 }

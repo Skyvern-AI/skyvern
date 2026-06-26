@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_serializer
 
 class ArtifactType(StrEnum):
     RECORDING = "recording"
+    AUDIO = "audio"
+    SESSION_REPLAY = "session_replay"
     BROWSER_CONSOLE_LOG = "browser_console_log"
 
     SKYVERN_LOG = "skyvern_log"
@@ -110,3 +112,4 @@ class LogEntityType(StrEnum):
     WORKFLOW_RUN = "workflow_run"
     WORKFLOW_RUN_BLOCK = "workflow_run_block"
     TASK_V2 = "task_v2"
+    WORKFLOW_COPILOT_CHAT = "workflow_copilot_chat"

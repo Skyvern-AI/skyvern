@@ -108,6 +108,12 @@ class ScrapeType(StrEnum):
 SCRAPE_TYPE_ORDER = [ScrapeType.NORMAL, ScrapeType.NORMAL, ScrapeType.RELOAD]
 DEFAULT_MAX_TOKENS = 100000
 MAX_FILE_PARSE_INPUT_TOKENS = 256_000
+# Safety ceiling on how many pages of a scanned/image-only PDF are OCR'd via the vision-LLM
+# fallback. Each page is a separate LLM call, so this bounds cost; MAX_FILE_PARSE_INPUT_TOKENS
+# still bounds the concatenated text handed to downstream extraction.
+MAX_PDF_OCR_PAGES = 50
+# Max concurrent per-page OCR calls when transcribing a scanned PDF.
+PDF_OCR_PAGE_CONCURRENCY = 5
 MAX_IMAGE_MESSAGES = 10
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt

@@ -2,6 +2,7 @@ import {
   ExclamationTriangleIcon,
   LightningBoltIcon,
   MixerHorizontalIcon,
+  RocketIcon,
 } from "@radix-ui/react-icons";
 
 import {
@@ -37,9 +38,11 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
@@ -47,7 +50,7 @@ import {
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -65,6 +68,10 @@ import { useKeywordSearch } from "@/routes/workflows/hooks/useKeywordSearch";
 import { useParameterExpansion } from "@/routes/workflows/hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "@/routes/workflows/components/ParameterDisplayInline";
 import { HighlightText } from "@/routes/workflows/components/HighlightText";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
 
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
@@ -99,9 +106,17 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   return null;
 }
 
-function getRunNavigationPath(run: TaskRunListItem): string {
+function getRunNavigationPath(
+  run: TaskRunListItem,
+  studioEnabled: boolean,
+): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
+      // With the studio on, workflow runs open in its Run tab; otherwise they
+      // use the standalone run page (also the fallback when there is no wpid).
+      return studioEnabled && run.workflow_permanent_id
+        ? `/workflows/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
+        : `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV1:
@@ -115,6 +130,10 @@ function getRunNavigationPath(run: TaskRunListItem): string {
 }
 
 function RunHistory() {
+  const onboarding = useOnboardingStateOptional();
+  const isNewUser = onboarding?.isNewUser ?? false;
+  const onboardingState = onboarding?.state ?? null;
+  const onboardingFlag = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -137,6 +156,7 @@ function RunHistory() {
     search: effectiveSearch,
   });
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const { data: rawNextPageRuns } = useRunsQuery({
     page: page + 1,
@@ -173,28 +193,9 @@ function RunHistory() {
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
 
-  const { matchesParameter, isSearchActive } =
-    useKeywordSearch(debouncedSearch);
-  const {
-    expandedRows,
-    toggleExpanded: toggleParametersExpanded,
-    setAutoExpandedRows,
-  } = useParameterExpansion();
-
-  useEffect(() => {
-    if (!isSearchActive) {
-      setAutoExpandedRows([]);
-      return;
-    }
-
-    const workflowRunIds =
-      runs
-        ?.filter((run) => run.task_run_type === TaskRunType.WorkflowRun)
-        .map((run) => run.run_id)
-        .filter((id): id is string => Boolean(id)) ?? [];
-
-    setAutoExpandedRows(workflowRunIds);
-  }, [isSearchActive, runs, setAutoExpandedRows]);
+  const { matchesParameter } = useKeywordSearch(debouncedSearch);
+  const { expandedRows, toggleExpanded: toggleParametersExpanded } =
+    useParameterExpansion();
 
   function handleNavigate(event: React.MouseEvent, path: string) {
     if (event.ctrlKey || event.metaKey) {
@@ -238,23 +239,17 @@ function RunHistory() {
 
     // No runs found
     if (runs?.length === 0) {
-      return (
-        <TableRow>
-          <TableCell colSpan={6}>
-            <div className="text-center">No runs found</div>
-          </TableCell>
-        </TableRow>
-      );
+      return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
     }
 
-    return runs?.map((run) => {
+    return runs?.map((run, index) => {
       const executionTime = formatExecutionTime(
         run.started_at ?? run.created_at,
         run.finished_at,
       );
       const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
-      const navPath = getRunNavigationPath(run);
+      const navPath = getRunNavigationPath(run, studioEnabled);
       const triggerType = inferTriggerType(run);
 
       const titleContent =
@@ -288,6 +283,7 @@ function RunHistory() {
         <React.Fragment key={run.task_run_id}>
           <TableRow
             className="cursor-pointer"
+            data-hint={index === 0 ? "run-recording" : undefined}
             onClick={(event) => {
               handleNavigate(event, navPath);
             }}
@@ -327,18 +323,21 @@ function RunHistory() {
                       <TooltipTrigger asChild>
                         <Button
                           size="icon"
-                          variant="outline"
+                          variant="ghost"
                           onClick={(event) => {
                             event.stopPropagation();
                             toggleParametersExpanded(run.run_id);
                           }}
-                          className={cn(isExpanded && "text-blue-400")}
+                          className={cn(
+                            "text-muted-foreground hover:text-foreground",
+                            isExpanded && "text-blue-400",
+                          )}
                         >
                           <MixerHorizontalIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {isExpanded ? "Hide Parameters" : "Show Parameters"}
+                        {isExpanded ? "Hide Inputs" : "Show Inputs"}
                       </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>
@@ -374,135 +373,158 @@ function RunHistory() {
     setSearchParams(params, { replace: true });
   }
 
+  const hasActiveFilters =
+    statusFilters.length > 0 ||
+    !!debouncedSearch ||
+    !!workflowPermanentIdFilter;
+  const showOnboardingEmpty =
+    !isFetching &&
+    runs?.length === 0 &&
+    !hasActiveFilters &&
+    isNewUser &&
+    onboardingState?.first_run_at === null &&
+    isABVariant(onboardingFlag);
+
   return (
     <div className="space-y-4">
       <header>
         <h1 className="text-2xl">Run History</h1>
       </header>
-      {workflowPermanentIdFilter ? (
-        <div
-          className="flex items-center justify-between gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs"
-          data-testid="workflow-filter-banner"
-        >
-          <span className="truncate">
-            Filtering runs for agent{" "}
-            <span className="font-mono">{workflowPermanentIdFilter}</span>
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={clearWorkflowFilter}
-            className="h-auto py-1 text-xs"
-          >
-            Clear
-          </Button>
+      {showOnboardingEmpty ? (
+        <div className="rounded-lg border">
+          <OnboardingEmptyState
+            surface="runs"
+            icon={<RocketIcon className="h-6 w-6" />}
+            title="Your run history will appear here"
+            description="Every time you run a workflow, the result shows up on this page. Create your first workflow to get started."
+            primaryAction={{
+              label: "Create your first workflow",
+              onClick: () => navigate("/workflows"),
+            }}
+            secondaryAction={{
+              label: "Browse templates",
+              onClick: () => navigate("/workflows"),
+            }}
+          />
         </div>
-      ) : null}
-      <div className="flex items-center justify-between gap-4">
-        <TableSearchInput
-          value={search}
-          onChange={(value) => {
-            setSearch(value);
-            const params = new URLSearchParams(searchParams);
-            params.set("page", "1");
-            setSearchParams(params, { replace: true });
-          }}
-          placeholder={
-            workflowPermanentIdFilter
-              ? "Clear the agent filter above to search"
-              : "Search by run ID or parameter..."
-          }
-          disabled={!!workflowPermanentIdFilter}
-          className="w-48 lg:w-72"
-        />
-        <StatusFilterDropdown
-          values={statusFilters}
-          onChange={(filters) => {
-            const params = new URLSearchParams(searchParams);
-            if (filters.length === 0) {
-              params.delete("status");
-            } else {
-              params.set("status", filters.join(","));
-            }
-            params.set("page", "1");
-            setSearchParams(params, { replace: true });
-          }}
-        />
-      </div>
-      <div className="rounded-lg border">
-        <Table className="sm:table-fixed">
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
-            <TableRow>
-              <TableHead className="w-[20%] rounded-tl-lg text-neutral-600 dark:text-slate-400">
-                Run ID
-              </TableHead>
-              <TableHead className="w-[20%] text-neutral-600 dark:text-slate-400">
-                Detail
-              </TableHead>
-              <TableHead className="w-[16%] text-neutral-600 dark:text-slate-400">
-                Status
-              </TableHead>
-              <TableHead className="w-[27%] text-neutral-600 dark:text-slate-400">
-                Created At
-              </TableHead>
-              <TableHead className="w-[8%] text-neutral-600 dark:text-slate-400">
-                Duration
-              </TableHead>
-              <TableHead className="w-[8%] rounded-tr-lg text-neutral-600 dark:text-slate-400"></TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>{displayTableBody()}</TableBody>
-        </Table>
-        <div className="relative px-3 py-3">
-          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-neutral-600 dark:text-slate-400">
-              Items per page
-            </span>
-            <Select
-              value={String(itemsPerPage)}
-              onValueChange={(size) => {
+      ) : (
+        <>
+          {workflowPermanentIdFilter ? (
+            <div
+              className="flex items-center justify-between gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs"
+              data-testid="workflow-filter-banner"
+            >
+              <span className="truncate">
+                Filtering runs for workflow{" "}
+                <span className="font-mono">{workflowPermanentIdFilter}</span>
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={clearWorkflowFilter}
+                className="h-auto py-1 text-xs"
+              >
+                Clear
+              </Button>
+            </div>
+          ) : null}
+          <div className="flex items-center justify-between gap-4">
+            <TableSearchInput
+              value={search}
+              onChange={(value) => {
+                setSearch(value);
                 const params = new URLSearchParams(searchParams);
-                params.set("page_size", size);
                 params.set("page", "1");
                 setSearchParams(params, { replace: true });
               }}
-            >
-              <SelectTrigger className="w-[65px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="5">5</SelectItem>
-                <SelectItem value="10">10</SelectItem>
-                <SelectItem value="20">20</SelectItem>
-                <SelectItem value="50">50</SelectItem>
-              </SelectContent>
-            </Select>
+              placeholder={
+                workflowPermanentIdFilter
+                  ? "Clear the agent filter above to search"
+                  : "Search by run ID or input..."
+              }
+              disabled={!!workflowPermanentIdFilter}
+              className="w-48 lg:w-72"
+            />
+            <StatusFilterDropdown
+              values={statusFilters}
+              onChange={(filters) => {
+                const params = new URLSearchParams(searchParams);
+                if (filters.length === 0) {
+                  params.delete("status");
+                } else {
+                  params.set("status", filters.join(","));
+                }
+                params.set("page", "1");
+                setSearchParams(params, { replace: true });
+              }}
+            />
           </div>
-          <Pagination className="pt-0">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({
-                    "cursor-not-allowed opacity-50": page === 1,
-                  })}
-                  onClick={handlePreviousPage}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  className={cn({
-                    "cursor-not-allowed opacity-50": isNextDisabled,
-                  })}
-                  onClick={handleNextPage}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
-        </div>
-      </div>
+          <div className="overflow-hidden rounded-lg border border-border">
+            <Table className="sm:table-fixed">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[20%]">Run ID</TableHead>
+                  <TableHead className="w-[20%]">Detail</TableHead>
+                  <TableHead className="w-[16%]">Status</TableHead>
+                  <TableHead className="w-[27%]">Created At</TableHead>
+                  <TableHead className="w-[8%]">Duration</TableHead>
+                  <TableHead className="w-[8%]"></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>{displayTableBody()}</TableBody>
+            </Table>
+            <div className="relative px-3 py-3">
+              <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+                <span className="text-neutral-600 dark:text-slate-400">
+                  Items per page
+                </span>
+                <Select
+                  value={String(itemsPerPage)}
+                  onValueChange={(size) => {
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page_size", size);
+                    params.set("page", "1");
+                    setSearchParams(params, { replace: true });
+                  }}
+                >
+                  <SelectTrigger className="w-[65px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="5">5</SelectItem>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Pagination className="pt-0">
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      className={cn({
+                        "cursor-not-allowed opacity-50": page === 1,
+                      })}
+                      onClick={handlePreviousPage}
+                    />
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationLink>{page}</PaginationLink>
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationNext
+                      className={cn({
+                        "cursor-not-allowed opacity-50": isNextDisabled,
+                      })}
+                      onClick={handleNextPage}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -534,7 +556,7 @@ function WorkflowRunParametersInline({
       workflowRunId,
       "params-inline",
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -546,6 +568,7 @@ function WorkflowRunParametersInline({
       return client
         .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
           params,
+          signal,
         })
         .then((r) => r.data);
     },
@@ -568,7 +591,7 @@ function WorkflowRunParametersInline({
   if (!hasParameters && !hasExtraHeaders) {
     return (
       <div className="ml-8 py-4 text-sm text-neutral-600 dark:text-slate-400">
-        No parameters for this run
+        No inputs for this run
       </div>
     );
   }
@@ -594,7 +617,7 @@ function WorkflowRunParametersInline({
     <div className="space-y-4">
       {hasParameters && (
         <ParameterDisplayInline
-          title="Run Parameters"
+          title="Run Inputs"
           parameters={parameterItems}
           searchQuery={searchQuery}
           keywordMatchesParameter={keywordMatchesParameter}

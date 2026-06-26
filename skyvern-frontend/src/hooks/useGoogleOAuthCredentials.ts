@@ -10,6 +10,7 @@ import {
   GoogleOAuthCredentialResponse,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+export { GOOGLE_SHEETS_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 const BROADCAST_CHANNEL_NAME = "skyvern:google-oauth-credentials";
 
@@ -24,6 +25,76 @@ function broadcastCredentialsChanged() {
   credentialBroadcastChannel?.postMessage("invalidate");
 }
 
+export function normalizeGoogleOAuthScopes(
+  scopes: readonly string[] | string | null | undefined,
+): readonly string[] | undefined {
+  if (Array.isArray(scopes)) {
+    return scopes;
+  }
+  if (typeof scopes === "string") {
+    return scopes
+      .split(/[\s,]+/)
+      .map((scope) => scope.trim())
+      .filter(Boolean);
+  }
+  return undefined;
+}
+
+export function getGoogleOAuthCredentialScopesGranted(
+  credential: GoogleOAuthCredential,
+): readonly string[] {
+  return (
+    normalizeGoogleOAuthScopes(credential.scopes_granted) ??
+    normalizeGoogleOAuthScopes(credential.scopes) ??
+    []
+  );
+}
+
+export function getGoogleOAuthCredentialScopesRequested(
+  credential: GoogleOAuthCredential,
+): readonly string[] {
+  return normalizeGoogleOAuthScopes(credential.scopes_requested) ?? [];
+}
+
+export function isGoogleOAuthCredentialActive(
+  credential: GoogleOAuthCredential,
+): boolean {
+  if (credential.state) {
+    return credential.state === "active";
+  }
+  return credential.valid === true;
+}
+
+export function hasGoogleOAuthCredentialScopes(
+  credential: GoogleOAuthCredential,
+  requiredScopes: readonly string[],
+): boolean {
+  const granted = new Set(getGoogleOAuthCredentialScopesGranted(credential));
+  return requiredScopes.every((scope) => granted.has(scope));
+}
+
+export function matchesGoogleOAuthIntegrationScopes(
+  credential: GoogleOAuthCredential,
+  requiredScopes: readonly string[],
+): boolean {
+  const requested = getGoogleOAuthCredentialScopesRequested(credential);
+  if (requested.length > 0) {
+    const requestedSet = new Set(requested);
+    return requiredScopes.every((scope) => requestedSet.has(scope));
+  }
+  return hasGoogleOAuthCredentialScopes(credential, requiredScopes);
+}
+
+// Falls back to the first credential even when none are active, so a single
+// needs-reconnect account is still selected rather than left blank.
+export function getDefaultGoogleOAuthCredentialId(
+  credentials: GoogleOAuthCredential[],
+): string | undefined {
+  return (
+    credentials.find(isGoogleOAuthCredentialActive)?.id ?? credentials[0]?.id
+  );
+}
+
 type ApiError = { response?: { data?: { detail?: string } } } & Error;
 
 function extractApiErrorMessage(error: unknown, fallback: string): string {
@@ -31,7 +102,9 @@ function extractApiErrorMessage(error: unknown, fallback: string): string {
   return err?.response?.data?.detail || err?.message || fallback;
 }
 
-export function useGoogleOAuthCredentials() {
+export function useGoogleOAuthCredentials({
+  enabled = true,
+}: { enabled?: boolean } = {}) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -54,6 +127,7 @@ export function useGoogleOAuthCredentials() {
     error,
   } = useQuery<GoogleOAuthCredential[]>({
     queryKey: ["googleOAuthCredentials"],
+    enabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const response = await client.get("/google/oauth/credentials");

@@ -739,7 +739,6 @@ async def test_persist_scrape_artifacts_bundling_enabled(monkeypatch: pytest.Mon
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
     )
-    context.enable_speed_optimizations = True
     context.use_artifact_bundling = True
 
     await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
@@ -749,9 +748,9 @@ async def test_persist_scrape_artifacts_bundling_enabled(monkeypatch: pytest.Mon
     assert call_kwargs["html"] == b"<html></html>"
     assert "node-1" in call_kwargs["id_css_map"].decode()
     assert "node-1" in call_kwargs["id_frame_map"].decode()
-    assert call_kwargs["element_tree_in_prompt"] == b"<economy>"
-    economy_tree_mock.assert_called_once()
-    full_tree_mock.assert_not_called()
+    assert call_kwargs["element_tree_in_prompt"] == b"<full>"
+    full_tree_mock.assert_called_once()
+    economy_tree_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -771,7 +770,6 @@ async def test_persist_scrape_artifacts_bundling_disabled(monkeypatch: pytest.Mo
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
     )
-    context.enable_speed_optimizations = True
     context.use_artifact_bundling = False  # default — individual uploads
 
     await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
@@ -784,8 +782,8 @@ async def test_persist_scrape_artifacts_bundling_disabled(monkeypatch: pytest.Mo
     assert ArtifactType.VISIBLE_ELEMENTS_TREE in artifact_types
     assert ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED in artifact_types
     assert ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT in artifact_types
-    economy_tree_mock.assert_called_once()
-    full_tree_mock.assert_not_called()
+    full_tree_mock.assert_called_once()
+    economy_tree_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -814,7 +812,6 @@ async def test_persist_scrape_artifacts_bundling_disabled_logs_and_reraises_fail
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
     )
-    context.enable_speed_optimizations = True
     context.use_artifact_bundling = False
 
     with pytest.raises(RuntimeError, match="artifact upload failed"):
@@ -825,5 +822,5 @@ async def test_persist_scrape_artifacts_bundling_disabled_logs_and_reraises_fail
         "Failed to persist scrape artifact" in record.message and "visible_elements_id_css_map" in record.message
         for record in caplog.records
     )
-    economy_tree_mock.assert_called_once()
-    full_tree_mock.assert_not_called()
+    full_tree_mock.assert_called_once()
+    economy_tree_mock.assert_not_called()

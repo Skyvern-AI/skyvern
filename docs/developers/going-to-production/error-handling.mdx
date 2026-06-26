@@ -1,7 +1,7 @@
 ---
 title: Error Handling
 subtitle: Build systems that detect, classify, and recover from failures
-description: Detect, classify, and recover from task and workflow failures using run status, failure_reason, custom error_code_mapping, and validation blocks. Build programmatic error handling with retry logic and branching.
+description: Detect, classify, and recover from task and agent failures using run status, failure_reason, custom error_code_mapping, and validation blocks. Build programmatic error handling with retry logic and branching.
 slug: developers/going-to-production/error-handling
 keywords:
   - failure_reason
@@ -15,7 +15,7 @@ keywords:
   - timed_out
 ---
 
-Skyvern lets you make your workflows and tasks handle errors gracefully instead of failing silently.
+Skyvern lets you make your agents and tasks handle errors gracefully instead of failing silently.
 
 Every run returns a `status`. When it's not `completed`, you need to know what went wrong and respond programmatically. The flow is:
 
@@ -144,9 +144,9 @@ done
 ```
 </CodeGroup>
 
-### For workflows
+### For agents
 
-Same polling pattern works for workflow runs:
+Same polling pattern works for agent runs:
 
 <CodeGroup>
 ```python Python
@@ -272,7 +272,7 @@ fi
 ```
 </CodeGroup>
 
-### For workflows
+### For agents
 
 <CodeGroup>
 ```python Python
@@ -378,12 +378,12 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-### In workflows
+### In agents
 
 Add `error_code_mapping` to individual blocks (navigation, task, validation):
 
 <Note>
-The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual workflow definitions; JSON does not support comments.
+The JSON examples below include comments (`//`) for clarity. Remove comments before using in actual agent definitions; JSON does not support comments.
 </Note>
 
 <CodeGroup>
@@ -594,7 +594,7 @@ async function runWithErrorHandling(retries = 1) {
 
 ## Validation blocks as assertions
 
-Validation blocks are assertions that check conditions at critical points, like unit test assertions. If validation fails, the workflow terminates immediately with your error code instead of continuing and failing later with a confusing error.
+Validation blocks are assertions that check conditions at critical points, like unit test assertions. If validation fails, the agent terminates immediately with your error code instead of continuing and failing later with a confusing error.
 
 Use validation blocks after steps where you need to confirm success before proceeding:
 
@@ -664,10 +664,10 @@ blocks:
 | Parameter | Purpose |
 |-----------|---------|
 | `complete_criterion` | Condition that must be true to continue to the next block |
-| `terminate_criterion` | Condition that stops the workflow immediately |
+| `terminate_criterion` | Condition that stops the agent immediately |
 | `error_code_mapping` | Maps termination conditions to your error codes |
 
-If `verify_login` sees a login error, the workflow terminates with `output.error = "login_failed"`. Your Step 4 code handles it the same way as any other error code.
+If `verify_login` sees a login error, the agent terminates with `output.error = "login_failed"`. Your Step 4 code handles it the same way as any other error code.
 
 ---
 

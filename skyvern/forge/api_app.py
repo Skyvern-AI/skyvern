@@ -20,7 +20,8 @@ from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from starlette.requests import HTTPConnection, Request
+from fastapi.routing import APIRoute
+from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
@@ -44,7 +45,12 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     fingerprint_token,
     regenerate_local_api_key,
 )
+from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
+from skyvern.services.workflow_schedule_service import (
+    start_workflow_schedule_scheduler,
+    stop_workflow_schedule_scheduler,
+)
 
 LOG = structlog.get_logger()
 
@@ -93,6 +99,71 @@ def custom_openapi(app: FastAPI) -> dict:
     ]
     app.openapi_schema = openapi_schema
     return app.openapi_schema
+
+
+def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
+    """Expose every public ``/workflows`` route under ``/agents`` and hide the original from the schema.
+
+    An *agent* is the product-facing name for a workflow — same entity, same ``wpid_`` identifier. To
+    rebrand the public API surface to "agents" without breaking anyone, each in-schema ``/v1/...workflows...``
+    route gets an identical ``/agents`` sibling (same handler, params, response models, and ``x-fern-*``
+    metadata, so generated SDK method names are unchanged), and the original ``/workflows`` route is dropped
+    from the OpenAPI schema via ``include_in_schema=False``. The original route keeps responding, so
+    already-deployed SDKs, integrations, and the frontend continue to work unchanged.
+
+    Idempotent: routes already authored directly as ``/agents`` (with their ``/workflows`` form already
+    hidden) are skipped, as is any twin that already exists.
+    """
+
+    # Match the literal "workflows" path *segment* so substrings like "workflow_run_id" are left alone
+    # and future compound paths that merely contain "workflows" aren't accidentally rewritten.
+    def _to_agents_path(path: str) -> str:
+        return "/".join("agents" if segment == "workflows" else segment for segment in path.split("/"))
+
+    existing_routes = {
+        (existing.path, frozenset(existing.methods or ()))
+        for existing in fastapi_app.router.routes
+        if isinstance(existing, APIRoute)
+    }
+    for route in list(fastapi_app.router.routes):
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        agent_path = _to_agents_path(route.path)
+        if agent_path == route.path:
+            continue
+        if (agent_path, frozenset(route.methods or ())) in existing_routes:
+            continue
+        fastapi_app.router.add_api_route(
+            agent_path,
+            route.endpoint,
+            methods=list(route.methods or []),
+            response_model=route.response_model,
+            status_code=route.status_code,
+            tags=route.tags,
+            summary=route.summary,
+            description=route.description,
+            response_description=route.response_description,
+            responses=route.responses,
+            deprecated=route.deprecated,
+            # Pin the twin to the original route's operationId (route.unique_id already resolves to the
+            # explicit operation_id or FastAPI's generated one). Otherwise FastAPI would derive a fresh
+            # operationId from the /agents path, renaming the operation for OpenAPI-generated clients.
+            operation_id=route.operation_id or route.unique_id,
+            dependencies=route.dependencies,
+            response_class=route.response_class,
+            # Intentionally NOT copying `name`: a duplicate route name would make url_path_for(name)
+            # resolve to the hidden /workflows route. Let FastAPI auto-generate a distinct name.
+            callbacks=route.callbacks,
+            openapi_extra=route.openapi_extra,
+            response_model_include=route.response_model_include,
+            response_model_exclude=route.response_model_exclude,
+            response_model_by_alias=route.response_model_by_alias,
+            response_model_exclude_unset=route.response_model_exclude_unset,
+            response_model_exclude_defaults=route.response_model_exclude_defaults,
+            response_model_exclude_none=route.response_model_exclude_none,
+            include_in_schema=True,
+        )
+        route.include_in_schema = False
 
 
 async def _bootstrap_sqlite() -> None:
@@ -180,6 +251,10 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     if cleanup_task:
         LOG.info("Cleanup scheduler started")
 
+    workflow_schedule_task = start_workflow_schedule_scheduler()
+    if workflow_schedule_task:
+        LOG.info("Workflow schedule scheduler started")
+
     # Start MCP sub-application lifespan if mounted. Starlette Mount does NOT
     # forward lifespan events to sub-apps, so we must enter the MCP app's
     # lifespan here. This initializes the streamable-http session manager's
@@ -194,7 +269,9 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         yield
 
     # Stop cleanup scheduler
+    await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
+    await interpretation_registry.stop_all()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
@@ -283,6 +360,9 @@ def create_api_app() -> FastAPI:
         fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
 
+    # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
+    register_agent_route_aliases(fastapi_app)
+
     fastapi_app.openapi = lambda: custom_openapi(fastapi_app)
 
     fastapi_app.add_middleware(
@@ -311,10 +391,18 @@ def create_api_app() -> FastAPI:
             content={"detail": detail},
         )
 
+    @fastapi_app.exception_handler(ClientDisconnect)
+    async def handle_client_disconnect(request: Request, exc: ClientDisconnect) -> Response:
+        # Client closed the connection mid-request (e.g. while a route reads the body).
+        # There is no one to respond to, so return a quiet 499 instead of letting it
+        # fall through to the 500 handler and pollute error tracking.
+        return Response(status_code=499)
+
     @fastapi_app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
         LOG.exception("Unexpected error in agent server.", exc_info=exc)
-        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {exc}"})
+        # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
+        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {type(exc).__name__}"})
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:

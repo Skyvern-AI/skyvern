@@ -1,5 +1,10 @@
 import { ActionsApiResponse, RunEngine, Status } from "@/api/types";
-import { WorkflowBlock, WorkflowBlockType } from "./workflowTypes";
+import {
+  isTaskVariantBlock,
+  WorkflowBlock,
+  WorkflowBlockType,
+  WorkflowBlockTypes,
+} from "./workflowTypes";
 import { ActionItem } from "../workflowRun/WorkflowRunOverview";
 
 export const WorkflowRunTimelineItemTypes = {
@@ -165,11 +170,17 @@ export function findUnexecutedDefinedBlocks(
   definedBlocks: Array<WorkflowBlock>,
   timelineItems: Array<WorkflowRunTimelineItem>,
 ): Array<WorkflowBlock> {
+  // Walk the whole tree: defined blocks executed inside a conditional's
+  // branch appear as nested children, not roots, and must not be reported
+  // as unexecuted.
   const executedLabels = new Set<string>();
-  for (const item of timelineItems) {
+  const stack = [...timelineItems];
+  while (stack.length > 0) {
+    const item = stack.pop()!;
     if (isBlockItem(item) && item.block.label !== null) {
       executedLabels.add(item.block.label);
     }
+    stack.push(...item.children);
   }
   return definedBlocks.filter((block) => !executedLabels.has(block.label));
 }
@@ -219,6 +230,47 @@ export function hasNavigationGoal(
   item: unknown,
 ): item is { navigation_goal: unknown } {
   return item !== null && typeof item === "object" && "navigation_goal" in item;
+}
+
+type BlockExtractionDisplayFields = {
+  block_type: WorkflowBlockType;
+  status: Status | null;
+  output: unknown;
+};
+
+export function shouldShowExtractedInformation(
+  block: BlockExtractionDisplayFields,
+): boolean {
+  if (block.status !== Status.Completed) {
+    return false;
+  }
+  if (!hasExtractedInformation(block.output)) {
+    return false;
+  }
+  return (
+    isTaskVariantBlock(block) || block.block_type === WorkflowBlockTypes.Code
+  );
+}
+
+export function getExtractedInformationDisplayValue(
+  block: BlockExtractionDisplayFields,
+): unknown {
+  if (!hasExtractedInformation(block.output)) {
+    return null;
+  }
+  return block.output.extracted_information ?? null;
+}
+
+export function getBlockOutputDisplayValue(
+  block: BlockExtractionDisplayFields,
+): unknown {
+  if (
+    shouldShowExtractedInformation(block) &&
+    hasExtractedInformation(block.output)
+  ) {
+    return block.output.extracted_information;
+  }
+  return block.output;
 }
 
 // Branch evaluation types for conditional blocks

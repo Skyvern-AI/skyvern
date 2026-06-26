@@ -41,6 +41,7 @@ CREDENTIAL_ONEPASSWORD_PARAMETER_PREFIX = "opp"
 CREDENTIAL_AZURE_VAULT_PARAMETER_PREFIX = "azcp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
+CREDENTIAL_FOLDER_PREFIX = "cfld"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
@@ -73,10 +74,12 @@ WORKFLOW_TEMPLATE_PREFIX = "wt"
 ORGANIZATION_BILLING_PREFIX = "ob"
 WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
+WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX = "wccs"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
 TAG_EVENT_PREFIX = "tge"
 TAG_KEY_PREFIX = "tkey"
+TAG_VALUE_PREFIX = "tval"
 
 
 def generate_workflow_id() -> str:
@@ -249,6 +252,11 @@ def generate_folder_id() -> str:
     return f"{FOLDER_PREFIX}_{int_id}"
 
 
+def generate_credential_folder_id() -> str:
+    int_id = generate_id()
+    return f"{CREDENTIAL_FOLDER_PREFIX}_{int_id}"
+
+
 def generate_tag_event_id() -> str:
     int_id = generate_id()
     return f"{TAG_EVENT_PREFIX}_{int_id}"
@@ -257,6 +265,11 @@ def generate_tag_event_id() -> str:
 def generate_tag_key_id() -> str:
     int_id = generate_id()
     return f"{TAG_KEY_PREFIX}_{int_id}"
+
+
+def generate_tag_value_id() -> str:
+    int_id = generate_id()
+    return f"{TAG_VALUE_PREFIX}_{int_id}"
 
 
 def generate_google_oauth_credential_id() -> str:
@@ -302,6 +315,11 @@ def generate_workflow_copilot_chat_id() -> str:
 def generate_workflow_copilot_chat_message_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX}_{int_id}"
+
+
+def generate_workflow_copilot_completion_criteria_set_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX}_{int_id}"
 
 
 def generate_script_fallback_episode_id() -> str:

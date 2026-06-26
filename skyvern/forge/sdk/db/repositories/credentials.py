@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -86,6 +86,9 @@ class CredentialRepository(BaseRepository):
         page: int = 1,
         page_size: int = 10,
         vault_type: str | None = None,
+        credential_type: str | None = None,
+        search: str | None = None,
+        folder_id: str | None = None,
     ) -> list[Credential]:
         async with self.Session() as session:
             query = (
@@ -95,6 +98,23 @@ class CredentialRepository(BaseRepository):
             )
             if vault_type is not None:
                 query = query.filter(CredentialModel.vault_type == vault_type)
+            if credential_type is not None:
+                query = query.filter(CredentialModel.credential_type == credential_type)
+            if folder_id is not None:
+                query = query.filter(CredentialModel.folder_id == folder_id)
+            if search:
+                # Escape LIKE wildcards so a literal % or _ in the query narrows rather than broadens.
+                escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                search_pattern = f"%{escaped}%"
+                query = query.filter(
+                    or_(
+                        CredentialModel.name.ilike(search_pattern, escape="\\"),
+                        CredentialModel.username.ilike(search_pattern, escape="\\"),
+                        CredentialModel.secret_label.ilike(search_pattern, escape="\\"),
+                        CredentialModel.card_brand.ilike(search_pattern, escape="\\"),
+                        CredentialModel.card_last4.ilike(search_pattern, escape="\\"),
+                    )
+                )
             credentials = (
                 await session.scalars(
                     query.order_by(CredentialModel.created_at.desc()).offset((page - 1) * page_size).limit(page_size)

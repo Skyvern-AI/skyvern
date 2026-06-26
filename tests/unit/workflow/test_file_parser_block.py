@@ -7,9 +7,11 @@ token truncation, and error handling for DOCX files.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import docx
@@ -380,3 +382,159 @@ class TestExtractWithAiSerialization:
 
             _, kwargs = mock_load.call_args
             assert kwargs["extracted_text_content"] == "Hello\nWorld"
+
+
+@pytest.mark.asyncio
+class TestOcrPdfPages:
+    """Tests for the per-page vision-LLM OCR path for scanned PDFs (SKY-10960)."""
+
+    @staticmethod
+    def _patch_handler(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="prompt"),
+        )
+
+    async def test_each_page_transcribed_and_concatenated_in_order(self) -> None:
+        """One LLM call per page; every page is concatenated in page order with markers."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+        page_text = {
+            b"img-1": "Cover sheet",
+            b"img-2": "Demographics",
+            b"img-3": "Provider: JORDAN SAMPLE MD",
+        }
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": page_text[image]}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"img-1", b"img-2", b"img-3"])
+
+        # One call per page — the multi-page document is never sent as a single collapsed call.
+        assert handler.await_count == 3
+        for call in handler.await_args_list:
+            assert len(call.kwargs["screenshots"]) == 1
+        # Late-page content survives the single-call collapse.
+        assert "Provider: JORDAN SAMPLE MD" in result
+        assert "Cover sheet" in result and "Demographics" in result
+        assert result.index("--- Page 1 ---") < result.index("--- Page 2 ---") < result.index("--- Page 3 ---")
+
+    async def test_order_preserved_when_a_later_page_resolves_first(self) -> None:
+        """Output stays in page order even if an earlier page's call finishes last."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"slow-1":
+                await asyncio.sleep(0.05)
+                return {"extracted_text": "first page body"}
+            return {"extracted_text": "second page body"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"slow-1", b"fast-2"])
+
+        assert result.index("first page body") < result.index("second page body")
+
+    async def test_failed_page_is_skipped_not_fatal(self) -> None:
+        """A per-page OCR failure is logged and skipped; the other pages still extract."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"bad":
+                raise RuntimeError("vision model timeout")
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"good-1", b"bad", b"good-3"])
+
+        assert handler.await_count == 3
+        assert "text for good-1" in result and "text for good-3" in result
+        assert "--- Page 2 ---" not in result
+
+    async def test_all_pages_failed_raises(self) -> None:
+        """A total OCR outage (every page errors) propagates instead of returning empty text."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            raise RuntimeError("vision model outage")
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            with pytest.raises(RuntimeError, match="vision model outage"):
+                await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
+
+    async def test_empty_pages_contribute_nothing(self) -> None:
+        """Pages that OCR to empty text add neither a marker nor content."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": "" if image == b"blank" else "real content"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"blank", b"page-2"])
+
+        assert "--- Page 1 ---" not in result
+        assert "--- Page 2 ---" in result and "real content" in result
+
+    async def test_truncates_at_page_boundary_on_token_limit(self) -> None:
+        """Concatenation stops at a page boundary once the token budget is exceeded."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": f"content {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+            # Each page chunk counts as 10 tokens; a 15-token budget admits only the first page.
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+
+            result = await block._ocr_pdf_pages([b"page-1", b"page-2", b"page-3"])
+
+        assert "--- Page 1 ---" in result
+        assert "--- Page 2 ---" not in result and "--- Page 3 ---" not in result
+
+    async def test_parse_pdf_file_routes_empty_text_to_per_page_ocr(self) -> None:
+        """A scanned PDF (no extractable text layer) is routed through per-page OCR."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": f"page {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "")
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+                lambda *a, **kw: [b"A", b"B"],
+            )
+
+            result = await block._parse_pdf_file("/tmp/scan.pdf")
+
+        assert handler.await_count == 2
+        assert "page A" in result and "page B" in result

@@ -11,6 +11,7 @@ import { NodeBody } from "../../collapse/NodeBody";
 import { BuildModeOnly } from "../BuildModeOnly";
 import { CodeBlockEditor } from "./CodeBlockEditor";
 import { NodeHeader } from "../components/NodeHeader";
+import { getCodeBlockTitle } from "../types";
 import type { CodeBlockNode } from "./types";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
@@ -19,6 +20,10 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { data: workflowRun } = useWorkflowRunQuery();
   const recordingStore = useRecordingStore();
   const { open } = useCollapseContext();
+  const blockTitle = getCodeBlockTitle({
+    prompt: data.prompt,
+    steps: data.steps,
+  });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const thisBlockIsTargetted =
@@ -46,7 +51,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
       />
       <div
         className={cn(
-          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all motion-reduce:transition-none",
+          "transform-origin-center w-[30rem] space-y-4 rounded-xl bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
           open ? "shadow-md" : "shadow-sm",
           {
             "pointer-events-none": thisBlockIsPlaying,
@@ -63,6 +68,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
           totpIdentifier={null}
           totpUrl={null}
           type="code"
+          blockTitle={blockTitle}
         />
         <NodeBody>
           <BuildModeOnly>

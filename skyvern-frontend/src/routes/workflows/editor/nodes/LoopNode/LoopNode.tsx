@@ -16,6 +16,7 @@ import { cn } from "@/util/utils";
 
 import { AppNode } from "..";
 import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
+import { scheduleCollapseRelayout } from "../../collapse/scheduleCollapseRelayout";
 import { useCollapseContext } from "../../collapse/CollapseContext";
 import {
   isBlockCollapsedAt,
@@ -92,7 +93,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
       prevIsCollapsed.current = false;
       return;
     }
-    const wasCollapsed = prevIsCollapsed.current === true;
+    const previousIsCollapsed = prevIsCollapsed.current;
     prevIsCollapsed.current = isCollapsed;
     setNodes((prev) => {
       const collapsedSet = useNodeCollapseStore.getState().collapsed;
@@ -105,10 +106,13 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     // marginy even if debouncedLayoutForDimensions already ran with stale
     // data before the header's ResizeObserver had a chance to update
     // _headerHeight. The handler has a built-in 10ms delay that lets the
-    // ResizeObserver win the race.
-    if (wasCollapsed && !isCollapsed) {
-      window.dispatchEvent(new Event("loop-header-resized"));
-    }
+    // ResizeObserver win the race. Collapsing fires the same re-layout, but
+    // deferred two frames so React Flow has re-measured the shorter card.
+    return scheduleCollapseRelayout(
+      "loop-header-resized",
+      previousIsCollapsed,
+      isCollapsed,
+    );
   }, [id, isCollapsed, setNodes, workflowPermanentId]);
 
   const furthestDownChild: Node | null = children.reduce(
@@ -155,7 +159,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
         />
         <div
           className={cn(
-            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-all motion-reduce:transition-none",
+            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
             {
               "pointer-events-none": thisBlockIsPlaying,
               "bg-slate-950 outline outline-2 outline-slate-300":
@@ -206,7 +210,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
           <div
             ref={headerRef}
             className={cn(
-              "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all motion-reduce:transition-none",
+              "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
               open ? "shadow-md" : "shadow-sm",
               {
                 "pointer-events-none": thisBlockIsPlaying,

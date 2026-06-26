@@ -12,8 +12,10 @@ from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import run_tool
+from .lazy import SkyvernTyperGroup
 
 schedule_app = typer.Typer(
+    cls=SkyvernTyperGroup,
     help="Manage workflow schedules (list, create, update, enable/disable, delete).",
     no_args_is_help=True,
 )

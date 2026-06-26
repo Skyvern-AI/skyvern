@@ -87,3 +87,25 @@ def test_select_handles_non_utc_aware_modified_at() -> None:
     # 2026-01-01 05:30 EST == 10:30 UTC
     recs = [_rec("est", datetime(2026, 1, 1, 5, 30, tzinfo=est))]
     assert _select_recording_urls_in_window(recs, lower, upper) == ["est"]
+
+
+def test_select_unbounded_recovers_session_close_recording() -> None:
+    # Reproduces the persistent-session bug: the run window ends at 11:00 but the
+    # session's continuous recording is finalized/uploaded ~2h later at close, so the
+    # bounded window drops it while the unbounded fallback recovers it.
+    lower = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    upper = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+    recs = [_rec("session-close", datetime(2026, 1, 1, 13, 1, tzinfo=UTC))]
+    assert _select_recording_urls_in_window(recs, lower, upper) == []
+    assert _select_recording_urls_in_window(recs, lower) == ["session-close"]
+
+
+def test_select_unbounded_still_excludes_pre_run_recording() -> None:
+    # A recording finalized before the run started belongs to an earlier session-run and
+    # must stay excluded even without an upper bound.
+    lower = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    recs = [
+        _rec("earlier", datetime(2026, 1, 1, 9, 30, tzinfo=UTC)),
+        _rec("this-run", datetime(2026, 1, 1, 13, 1, tzinfo=UTC)),
+    ]
+    assert _select_recording_urls_in_window(recs, lower) == ["this-run"]

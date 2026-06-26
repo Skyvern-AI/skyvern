@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.agent import _ensure_unvalidated_proposal_affordance
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    _INTERNAL_TOOL_NAME_TOKENS,
+    _LOOP_PROGRESS_TOOLS,
+    CopilotToolBlockerSignal,
+    LoopBlockerEvidence,
+    assert_clean_user_facing_text,
+    loop_blocker_evidence_from_ctx,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
+from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
+from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _build_loop_blocker_signal, _tool_loop_error
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 
 _LEAK_TOKENS = ("safe_reason_code", "LOOP DETECTED:")
 
@@ -29,6 +44,22 @@ def _ctx(
     if consecutive_tool_tracker is not None:
         ctx.consecutive_tool_tracker = consecutive_tool_tracker
     return ctx
+
+
+def _current_page_challenge_evidence(*, observed_after_workflow_run: bool = True) -> dict[str, object]:
+    evidence: dict[str, object] = {
+        "current_url": "https://example.test/search",
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+    if observed_after_workflow_run:
+        evidence["observed_after_workflow_run"] = True
+    return evidence
 
 
 @pytest.mark.parametrize(
@@ -91,6 +122,9 @@ def test_native_dispatch_failed_step_loop_sets_signal_and_returns_payload() -> N
     # Renderer-side string is clean.
     for token in _LEAK_TOKENS:
         assert token not in ctx.blocker_signal.user_facing_reason
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
+    assert ctx.turn_halt.blocker_signal is ctx.blocker_signal
 
 
 def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
@@ -100,6 +134,59 @@ def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
     assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
     assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
     assert ctx.blocker_signal.cleared_by_tools == frozenset()
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
+
+
+def test_consecutive_evaluate_loop_with_loaded_results_uses_goal_aware_copy() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+        result_container_count=1,
+        table_result_container_count=1,
+    )
+    payload = _tool_loop_error(ctx, "evaluate", None)
+
+    assert payload is not None
+    assert payload.startswith("LOOP DETECTED: 'evaluate' has been called 3 times consecutively.")
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert "loaded results" in ctx.blocker_signal.user_facing_reason
+    assert "extracting the requested information" in ctx.blocker_signal.user_facing_reason
+    assert "retrying the same step" not in ctx.blocker_signal.user_facing_reason
+    assert dict(ctx.blocker_signal.extra) == {"loop_evidence_tiers": ["loaded_results"]}
+    assert_clean_user_facing_text(ctx.blocker_signal.user_facing_reason, blocked_tool="evaluate")
+
+
+def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["list_credentials", "list_credentials"])
+    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
+        result_container_count=1,
+        table_result_container_count=1,
+    )
+    payload = _tool_loop_error(ctx, "list_credentials", None)
+
+    assert payload is not None
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert "loaded results" not in ctx.blocker_signal.user_facing_reason
+    assert ctx.blocker_signal.user_facing_reason == (
+        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
+    )
+    assert dict(ctx.blocker_signal.extra) == {}
+
+
+def test_consecutive_evaluate_loop_without_composition_steer_uses_generic_copy() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    payload = _tool_loop_error(ctx, "evaluate", None)
+
+    assert payload is not None
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert ctx.blocker_signal.user_facing_reason == (
+        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
+    )
+    assert dict(ctx.blocker_signal.extra) == {}
+    assert_clean_user_facing_text(ctx.blocker_signal.user_facing_reason, blocked_tool="evaluate")
 
 
 def test_native_and_mcp_paths_produce_equivalent_loop_signal() -> None:
@@ -135,3 +222,430 @@ def test_native_and_mcp_paths_produce_equivalent_loop_signal() -> None:
     assert mcp_ctx.blocker_signal.recovery_hint == native_signal.recovery_hint
     assert mcp_ctx.blocker_signal.cleared_by_tools == native_signal.cleared_by_tools
     assert mcp_ctx.blocker_signal.blocked_tool == native_signal.blocked_tool
+
+
+_FULL_EVIDENCE_REASON = (
+    "Failed: The run completed but did not demonstrate the goal outcome(s): The credential information for the "
+    "requested person is checked on a public registry site with a search form and expandable result rows. "
+    "Add an end-state confirmation (an extraction or validation block) that observes the outcome, then re-run."
+)
+_FULL_EVIDENCE = LoopBlockerEvidence(
+    outcome_gate_reason=_FULL_EVIDENCE_REASON,
+    outcome_gate_workflow_run_id="wr_latest",
+    latest_workflow_run_id="wr_latest",
+    anti_bot_blocked=True,
+    has_draft=True,
+)
+_BRANCH_MESSAGES = {
+    "loop_detected_credential_or_parameter_misconfig": (
+        "LOOP DETECTED: 'update_and_run_blocks' has already failed 3 times with CREDENTIAL_ERROR; blocking attempt #4."
+    ),
+    "loop_detected_repeated_failed_step": (
+        "LOOP DETECTED: 'update_workflow' has already failed 3 consecutive times with these arguments; "
+        "blocking attempt #4."
+    ),
+    "loop_detected_consecutive_same_tool": "LOOP DETECTED: 'evaluate' has been called 3 times consecutively.",
+    "loop_detected_generic": "something unfamiliar happened",
+}
+_BRANCH_TEMPLATES = {
+    "loop_detected_credential_or_parameter_misconfig": (
+        "I couldn't run this with the current credential or parameter setup. Update them and ask me to try again."
+    ),
+    "loop_detected_repeated_failed_step": (
+        "I retried without making progress. Tell me what to change and I'll try a different approach."
+    ),
+    "loop_detected_consecutive_same_tool": (
+        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
+    ),
+    "loop_detected_generic": "I couldn't keep going on this turn. Tell me what to change and I'll try again.",
+}
+_FULL_TIER_BRANCHES = (
+    "loop_detected_repeated_failed_step",
+    "loop_detected_consecutive_same_tool",
+    "loop_detected_generic",
+)
+
+
+@pytest.mark.parametrize("reason_code", _FULL_TIER_BRANCHES)
+def test_full_evidence_composition_names_verdict_blocker_and_draft(reason_code: str) -> None:
+    signal = _build_loop_blocker_signal(_BRANCH_MESSAGES[reason_code], tool_name="evaluate", evidence=_FULL_EVIDENCE)
+    assert signal.internal_reason_code == reason_code
+    assert "did not demonstrate the goal outcome" in signal.user_facing_reason
+    assert "verification challenge" in signal.user_facing_reason
+    assert "Add an end-state confirmation" not in signal.user_facing_reason
+    assert "Failed:" not in signal.user_facing_reason
+    assert signal.preserves_workflow_draft is True
+    assert dict(signal.extra) == {"loop_evidence_tiers": ["verdict", "anti_bot", "draft"]}
+    assert signal.agent_steering_text == _BRANCH_MESSAGES[reason_code]
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool="evaluate")
+
+
+@pytest.mark.parametrize("reason_code", sorted(_BRANCH_MESSAGES))
+@pytest.mark.parametrize("evidence", [None, LoopBlockerEvidence()], ids=["none", "all_empty"])
+def test_no_recorded_state_keeps_templates_byte_identical(
+    reason_code: str, evidence: LoopBlockerEvidence | None
+) -> None:
+    message = _BRANCH_MESSAGES[reason_code]
+    baseline = _build_loop_blocker_signal(message, tool_name="update_and_run_blocks")
+    signal = _build_loop_blocker_signal(message, tool_name="update_and_run_blocks", evidence=evidence)
+    assert signal.user_facing_reason == _BRANCH_TEMPLATES[reason_code]
+    assert signal.user_facing_reason == baseline.user_facing_reason
+    assert signal.internal_reason_code == reason_code
+    assert signal.recovery_hint == baseline.recovery_hint
+    assert signal.agent_steering_text == message
+    assert signal.cleared_by_tools == frozenset()
+    assert signal.preserves_workflow_draft is False
+    assert dict(signal.extra) == {}
+
+
+def test_credential_branch_keeps_copy_and_gains_only_the_draft_flag() -> None:
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_credential_or_parameter_misconfig"],
+        tool_name="update_and_run_blocks",
+        evidence=_FULL_EVIDENCE,
+    )
+    assert signal.user_facing_reason == _BRANCH_TEMPLATES["loop_detected_credential_or_parameter_misconfig"]
+    assert signal.recovery_hint == "ask_user_clarifying"
+    assert signal.preserves_workflow_draft is True
+    assert dict(signal.extra) == {"loop_evidence_tiers": ["draft"]}
+
+
+@pytest.mark.parametrize(
+    "adversarial_reason",
+    [
+        "Run wr_123456789012345678 did not finish; outcome unknown.",
+        "update_and_run_blocks exhausted its retries against the search form.",
+        "do not retry this step; the form stayed blocked.",
+        "The run exceeded the per-tool-call budget while the search stayed disabled.",
+    ],
+)
+def test_adversarial_recorded_reason_drops_free_text_tier_without_raising(adversarial_reason: str) -> None:
+    evidence = LoopBlockerEvidence(outcome_gate_reason=adversarial_reason, anti_bot_blocked=True, has_draft=False)
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate", evidence=evidence
+    )
+    lowered = signal.user_facing_reason.lower()
+    for token in ("wr_", "update_and_run_blocks", "do not retry", "per-tool-call budget"):
+        assert token not in lowered
+    assert "verification challenge" in signal.user_facing_reason
+    assert dict(signal.extra) == {"loop_evidence_tiers": ["anti_bot"]}
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool="evaluate")
+
+
+@pytest.mark.parametrize(
+    "raw_error_reason",
+    [
+        (
+            "Failed to execute code block. Reason: TimeoutError: Timeout 30000ms exceeded. "
+            '=========================== logs =========================== "load" event fired '
+            "============================================================"
+        ),
+        "code block failed. failure reason: Failed to execute code block.",
+        "Traceback (most recent call last): ValueError: bad input",
+        "ElementNotFoundException: selector did not resolve",
+    ],
+)
+def test_raw_runtime_error_reason_drops_verdict_tier(raw_error_reason: str) -> None:
+    evidence = LoopBlockerEvidence(outcome_gate_reason=raw_error_reason, anti_bot_blocked=True, has_draft=True)
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate", evidence=evidence
+    )
+    for fragment in ("TimeoutError", "Failed to execute", "===", "Traceback", "Exception"):
+        assert fragment not in signal.user_facing_reason
+    assert "verification challenge" in signal.user_facing_reason
+    assert signal.preserves_workflow_draft is True
+    assert dict(signal.extra) == {"loop_evidence_tiers": ["anti_bot", "draft"]}
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool="evaluate")
+
+
+@pytest.mark.parametrize(
+    "recorded,latest_run_id,expected_tiers,expect_recorded_tier",
+    [
+        (
+            RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_new"),
+            "wr_new",
+            ["recorded_run_outcome", "draft"],
+            True,
+        ),
+        (None, None, ["draft"], False),
+        (
+            RecordedRunOutcome(verdict="not_demonstrated", reason_code="outcome_not_demonstrated"),
+            "wr_new",
+            ["draft"],
+            False,
+        ),
+    ],
+)
+def test_stale_outcome_gate_reason_only_keeps_matching_recorded_run(
+    recorded: RecordedRunOutcome | None,
+    latest_run_id: str | None,
+    expected_tiers: list[str],
+    expect_recorded_tier: bool,
+) -> None:
+    evidence = LoopBlockerEvidence(
+        outcome_gate_reason=(
+            "The run completed but did not demonstrate the goal outcome(s): stale criterion text from an older run."
+        ),
+        outcome_gate_workflow_run_id="wr_old",
+        recorded_run_outcome=recorded,
+        latest_workflow_run_id=latest_run_id,
+        has_draft=True,
+    )
+
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate", evidence=evidence
+    )
+
+    assert "stale criterion text" not in signal.user_facing_reason
+    assert ("latest run recorded workflow output" in signal.user_facing_reason) is expect_recorded_tier
+    assert dict(signal.extra) == {"loop_evidence_tiers": expected_tiers}
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool="evaluate")
+
+
+def test_evidence_verdict_sources_only_from_the_outcome_gate_field() -> None:
+    ctx = _ctx()
+    ctx.last_test_failure_reason = "Failed to execute code block. Reason: TimeoutError: Timeout 30000ms exceeded."
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    assert loop_blocker_evidence_from_ctx(ctx).outcome_gate_reason is None
+
+    gate_reason = "The run completed but did not demonstrate the goal outcome(s): the requested record is checked."
+    ctx.last_outcome_gate_reason = gate_reason
+    assert loop_blocker_evidence_from_ctx(ctx).outcome_gate_reason == gate_reason
+
+
+def test_blocked_tool_named_by_common_word_collides_safely() -> None:
+    evidence = LoopBlockerEvidence(
+        outcome_gate_reason=(
+            "The run completed but did not demonstrate the goal outcome(s): each result row is expanded with a click."
+        ),
+        anti_bot_blocked=True,
+        has_draft=True,
+    )
+    signal = _build_loop_blocker_signal(
+        "LOOP DETECTED: 'click' has been called 3 times consecutively.", tool_name="click", evidence=evidence
+    )
+    assert "click" not in signal.user_facing_reason.lower()
+    assert "verification challenge" in signal.user_facing_reason
+    assert signal.preserves_workflow_draft is True
+    assert dict(signal.extra) == {"loop_evidence_tiers": ["anti_bot", "draft"]}
+
+
+_LOOP_PRONE_TOOL_NAMES = sorted(
+    set(_LOOP_PROGRESS_TOOLS) | set(_INTERNAL_TOOL_NAME_TOKENS) | set(get_skyvern_mcp_alias_map())
+)
+
+
+@pytest.mark.parametrize("reason_code", sorted(_BRANCH_MESSAGES))
+@pytest.mark.parametrize("blocked_tool", _LOOP_PRONE_TOOL_NAMES)
+def test_fixed_tier_copy_is_clean_for_every_loop_prone_tool(blocked_tool: str, reason_code: str) -> None:
+    evidence = LoopBlockerEvidence(anti_bot_blocked=True, has_draft=True)
+    signal = _build_loop_blocker_signal(_BRANCH_MESSAGES[reason_code], tool_name=blocked_tool, evidence=evidence)
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool=blocked_tool)
+
+
+def test_native_and_mcp_paths_carry_equivalent_evidence_bearing_signals() -> None:
+    def _prepped_ctx() -> CopilotContext:
+        ctx = _ctx(consecutive_tool_tracker=["list_credentials", "list_credentials"])
+        ctx.last_outcome_gate_reason = (
+            "The run completed but did not demonstrate the goal outcome(s): the requested record is checked "
+            "on a public registry site with a search form and expandable result rows."
+        )
+        ctx.last_outcome_gate_workflow_run_id = "wr_latest"
+        ctx.last_run_blocks_workflow_run_id = "wr_latest"
+        ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+        ctx.has_staged_proposal = True
+        return ctx
+
+    native_ctx = _prepped_ctx()
+    native_payload = _tool_loop_error(native_ctx, "list_credentials", None)
+    assert native_payload is not None
+    native_signal = native_ctx.blocker_signal
+    assert isinstance(native_signal, CopilotToolBlockerSignal)
+
+    mcp_ctx = _prepped_ctx()
+    mcp_payload = _stash_and_emit_loop_blocker(mcp_ctx, native_signal.agent_steering_text, "list_credentials")
+    mcp_signal = mcp_ctx.blocker_signal
+    assert isinstance(mcp_signal, CopilotToolBlockerSignal)
+
+    assert mcp_payload == native_payload
+    assert mcp_signal.user_facing_reason == native_signal.user_facing_reason
+    assert "did not demonstrate the goal outcome" in mcp_signal.user_facing_reason
+    assert "verification challenge" in mcp_signal.user_facing_reason
+    assert native_signal.preserves_workflow_draft is True
+    assert mcp_signal.preserves_workflow_draft is True
+    assert dict(native_signal.extra) == {"loop_evidence_tiers": ["verdict", "anti_bot", "draft"]}
+    assert dict(mcp_signal.extra) == dict(native_signal.extra)
+    assert mcp_signal.internal_reason_code == native_signal.internal_reason_code
+    assert mcp_signal.agent_steering_text == native_signal.agent_steering_text
+    assert mcp_signal.recovery_hint == native_signal.recovery_hint
+    assert mcp_signal.blocked_tool == native_signal.blocked_tool
+
+
+def test_native_tool_loop_error_terminal_challenge_preempts_same_tool_loop() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = _current_page_challenge_evidence()
+
+    payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
+
+    assert payload is not None
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.blocked_tool == "evaluate"
+    assert signal.extra["evidence_source"] == "page_evidence"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def test_native_tool_loop_error_does_not_preempt_on_pre_attempt_challenge() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = _current_page_challenge_evidence(observed_after_workflow_run=False)
+
+    payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
+
+    assert payload is not None
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert signal.blocked_tool == "evaluate"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
+
+
+@pytest.mark.asyncio
+async def test_mcp_browser_tool_terminal_challenge_preempts_same_tool_loop() -> None:
+    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx.composition_page_evidence = _current_page_challenge_evidence()
+
+    class _UnexpectedClient:
+        async def call_tool(self, name: str, args: dict, raise_on_error: bool = False) -> object:
+            raise AssertionError("terminal challenge blocker should skip MCP execution")
+
+    server = SkyvernOverlayMCPServer(
+        transport=None,
+        overlays={"evaluate": SchemaOverlay(requires_browser=True)},
+        alias_map={},
+        allowlist=frozenset({"evaluate"}),
+        context_provider=lambda: ctx,
+    )
+    server._client = _UnexpectedClient()  # type: ignore[assignment]
+
+    result = await server.call_tool("evaluate", {"expression": "document.body.innerText"})
+
+    parsed = json.loads(result.content[0].text)
+    assert result.isError is True
+    assert parsed["ok"] is False
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.blocked_tool == "evaluate"
+    assert signal.extra["evidence_source"] == "mcp_page_evidence"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def test_tool_loop_error_entry_refreshes_stale_held_loop_signal() -> None:
+    ctx = _ctx()
+    stale = _build_loop_blocker_signal(_BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate")
+    ctx.blocker_signal = stale
+    ctx.last_outcome_gate_reason = (
+        "The run completed but did not demonstrate the goal outcome(s): the requested record is checked."
+    )
+    ctx.last_outcome_gate_workflow_run_id = "wr_latest"
+    ctx.last_run_blocks_workflow_run_id = "wr_latest"
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    ctx.staged_workflow_yaml = "blocks: []"
+
+    assert _tool_loop_error(ctx, "list_credentials", None) is None
+
+    refreshed = ctx.blocker_signal
+    assert isinstance(refreshed, CopilotToolBlockerSignal)
+    assert refreshed is not stale
+    assert "did not demonstrate the goal outcome" in refreshed.user_facing_reason
+    assert "verification challenge" in refreshed.user_facing_reason
+    assert refreshed.preserves_workflow_draft is True
+    assert refreshed.agent_steering_text == stale.agent_steering_text
+    assert refreshed.internal_reason_code == stale.internal_reason_code
+    assert refreshed.blocked_tool == stale.blocked_tool
+
+
+@pytest.mark.asyncio
+async def test_mcp_call_tool_entry_refreshes_stale_held_loop_signal() -> None:
+    ctx = _ctx()
+    stale = _build_loop_blocker_signal(_BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate")
+    ctx.blocker_signal = stale
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    ctx.has_staged_proposal = True
+
+    class _StubResult:
+        structured_content = {"ok": False, "error": "page state unchanged"}
+        is_error = False
+        content: list = []
+
+    class _StubClient:
+        async def call_tool(self, name: str, args: dict, raise_on_error: bool = False) -> _StubResult:
+            return _StubResult()
+
+    server = SkyvernOverlayMCPServer(
+        transport=None,
+        overlays={},
+        alias_map={},
+        allowlist=frozenset({"evaluate"}),
+        context_provider=lambda: ctx,
+    )
+    server._client = _StubClient()  # type: ignore[assignment]
+
+    await server.call_tool("evaluate", {})
+
+    refreshed = ctx.blocker_signal
+    assert isinstance(refreshed, CopilotToolBlockerSignal)
+    assert refreshed is not stale
+    assert "verification challenge" in refreshed.user_facing_reason
+    assert refreshed.preserves_workflow_draft is True
+
+
+def test_composed_loop_reply_passes_output_policy_allow_verdict() -> None:
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"],
+        tool_name="evaluate",
+        evidence=LoopBlockerEvidence(
+            outcome_gate_reason=_FULL_EVIDENCE_REASON,
+            outcome_gate_workflow_run_id="wr_latest",
+            latest_workflow_run_id="wr_latest",
+            anti_bot_blocked=True,
+            has_draft=False,
+        ),
+    )
+    verdict = evaluate_output_policy(
+        request_policy=None,
+        response_type="REPLY",
+        user_response=signal.user_facing_reason,
+        global_llm_context=None,
+        workflow_yaml=None,
+        has_workflow_proposal=False,
+        workflow_was_persisted=False,
+        workflow_attempted=False,
+        unvalidated=False,
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+    )
+    assert verdict.allowed, [code.value for code in verdict.reason_codes]
+
+
+def test_composed_loop_reply_with_draft_affordance_passes_output_policy() -> None:
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate", evidence=_FULL_EVIDENCE
+    )
+    reply = _ensure_unvalidated_proposal_affordance(signal.user_facing_reason)
+    verdict = evaluate_output_policy(
+        request_policy=None,
+        response_type="REPLY",
+        user_response=reply,
+        global_llm_context=None,
+        workflow_yaml="title: Example workflow\nblocks: []",
+        has_workflow_proposal=True,
+        workflow_was_persisted=False,
+        workflow_attempted=False,
+        unvalidated=True,
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+    )
+    assert verdict.allowed, [code.value for code in verdict.reason_codes]

@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from skyvern.config import settings
 
+
+class BlockAuthoringPolicy(StrEnum):
+    STANDARD = "standard"
+    CODE_ONLY_BROWSER = "code_only_browser"
+
+
+def normalize_block_authoring_policy(value: object) -> BlockAuthoringPolicy:
+    if isinstance(value, BlockAuthoringPolicy):
+        return value
+    if isinstance(value, str):
+        try:
+            return BlockAuthoringPolicy(value)
+        except ValueError:
+            return BlockAuthoringPolicy.STANDARD
+    return BlockAuthoringPolicy.STANDARD
+
+
+def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringPolicy:
+    return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
+
+
+def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:
+    return normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
-DEFAULT_MAX_TURNS = 25
+DEFAULT_MAX_TURNS = 35
 DEFAULT_TOKEN_BUDGET = 90_000
+SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD = 3
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
@@ -35,9 +62,10 @@ POST_NAVIGATE_NUDGE = (
 POST_INTERMEDIATE_SUCCESS_NUDGE = (
     "STOP — do NOT respond to the user yet. "
     "Your workflow only covers a subset of what the user asked for. "
-    "You MUST add the next block now: call update_and_run_blocks with the current "
-    "block chain. The tool preserves verified prefix state and reruns only the "
-    "invalidated frontier, so passing the full chain is cheap. "
+    "You MUST add the next block now: call update_and_run_blocks with the complete "
+    "workflow YAML, but pass only the next 1-2 unverified block labels when the "
+    "workflow has several page-changing stages. Keep later blocks in the YAML; "
+    "shrink only the block_labels test frontier. "
     "Only respond to the user when every distinct action they requested is covered "
     "by a workflow block, or you have clear evidence that continuing is infeasible."
 )
@@ -56,6 +84,20 @@ POST_FAILED_TEST_NUDGE = (
     "and the evidence strongly suggests the site cannot satisfy the request, "
     "respond explaining exactly what you tried and what blocked you.\n"
     "Do NOT resubmit the same workflow — you must change something substantive."
+)
+
+POST_FAILED_TEST_INSPECT_FIRST_NUDGE = (
+    "STOP — your last test run FAILED and the browser is still on the page it reached. "
+    "Do NOT respond to the user, and do NOT re-run a changed block goal blind.\n"
+    "1. Call get_run_results (pass the workflow_run_id) for the per-block failure_reason.\n"
+    '2. Then OBSERVE where it failed: call inspect_page_for_composition(target_url="current_page") '
+    "(or evaluate / get_browser_screenshot) on the reached page BEFORE changing anything. A failed "
+    "navigation/action often left the page in a state the block's goal did not expect — a popup or "
+    "overlay, a different layout, or an effect that already applied.\n"
+    "3. Use that observed evidence to decide HOW to change the workflow: keep the same block with a "
+    "corrected goal, swap to a different block type, or redesign the step. Do NOT guess a new goal "
+    "for the same block and re-run without first observing the page.\n"
+    "Do NOT resubmit the same workflow unchanged."
 )
 
 POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE = (
@@ -82,24 +124,6 @@ POST_SUSPICIOUS_SUCCESS_NUDGE = (
     "browser actually sees — do NOT just retry extraction with a different prompt.\n"
     "4. Fix the root cause — do NOT declare the workflow working based on "
     "status alone. Verify the actual extracted data answers the user's question."
-)
-
-POST_REPEATED_NULL_DATA_NUDGE = (
-    "STOP — you have now produced multiple consecutive test runs where "
-    "extraction/text_prompt blocks returned all-null or empty data. "
-    "Re-prompting the extractor is not working — the problem is almost "
-    "certainly NOT how the extraction goal is worded.\n"
-    "You MUST now do ONE of the following before another update_workflow call:\n"
-    "1. Call get_browser_screenshot on the workflow's browser session to see "
-    "exactly what page the workflow is actually loading (it may differ from "
-    "what you expect — e.g. a 'no results' fallback, cookie wall, or bot block).\n"
-    "2. Call evaluate with JavaScript that searches for the expected content "
-    "on the workflow's browser — confirm whether the data is even present.\n"
-    "3. If the page the workflow loads genuinely does not contain the data, "
-    "pivot to a different URL or source entirely — do NOT keep retrying "
-    "extraction against the same failing page.\n"
-    "Do NOT call update_and_run_blocks again until you have concrete evidence "
-    "about what the workflow browser is actually seeing."
 )
 
 POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE = (
@@ -175,22 +199,46 @@ POST_PER_TOOL_BUDGET_NUDGE = (
     "Do NOT retry the same chain. Do NOT change navigation_goal wording or "
     "selectors hoping it will run faster.\n"
     "1. Call get_run_results for the budgeted run. If it shows a navigation "
-    "block was canceled or failed, do NOT run that same label again unchanged; "
-    "split or replace it first.\n"
-    "2. Shrink the requested block_labels list to the first 1-2 unverified "
+    "block was canceled or failed, do NOT run that same label again unchanged.\n"
+    "2. If get_run_results includes a current_url, inspect the current page "
+    'before another workflow mutation with inspect_page_for_composition(target_url="current_page"). '
+    "Generic screenshot/evaluate reads can help answer the user, but they do not "
+    "satisfy the bounded page-evidence contract for authoring or mutating blocks. "
+    "If the requested answer or a no-results state is visible in bounded evidence, "
+    "answer from that evidence instead of rerunning the search.\n"
+    "3. If bounded evidence shows challenge_state.gates_submit_controls=true "
+    "and the requested answer or no-results state is not visible, do NOT retry "
+    "the same solve/wait/submit block. Treat the still-disabled submit/search "
+    "control as observed anti-bot blocker evidence and report that blocker, "
+    "unless you can make a materially different allowed attempt such as a "
+    "different proxy/location or entrypoint.\n"
+    "4. If inspection shows a real missing state change, split or replace the "
+    "oversized block and shrink the requested block_labels list to the first 1-2 unverified "
     "blocks. The verified-prefix optimization will replay any earlier blocks "
     "from cached state without re-running the browser, so passing a smaller "
     "frontier is cheap.\n"
-    "3. For page-state work, prefer a code or validation block to verify DOM "
-    "state, active chips, checked controls, field values, or URL deltas. Use a "
-    "navigation block only when missing state must be changed through the UI, "
-    "and keep it to one atomic action.\n"
-    "4. Test the smaller frontier. If it succeeds, extend by one block at a "
+    "5. For page-state work, inspect the live page evidence already gathered "
+    "before deciding what is missing. Do not add durable workflow blocks solely "
+    "to rediscover page shape; use navigation only when missing state must be "
+    "changed through the UI, and keep that block atomic.\n"
+    "6. Test the smaller frontier. If it succeeds, extend by one block at a "
     "time on subsequent calls.\n"
-    "5. If your workflow only has 1-2 blocks and one block is still hitting "
+    "7. If your workflow only has 1-2 blocks and one block is still hitting "
     "the budget, the single block is too ambitious — either narrow its scope, "
     "replace it with DOM/state verification plus smaller actions, or reply "
     "with a blocker explanation."
+)
+
+POST_PER_TOOL_BUDGET_STOP_NUDGE = (
+    "STOP — you have now hit the per-tool-call time budget MORE THAN ONCE on this goal, "
+    "including after you already shrank the frontier. The page is too heavy to finish a "
+    "page-changing block within one tool call, and each retry has LESS budget than the last — "
+    "running again will fail faster, not succeed.\n"
+    "Do NOT call update_and_run_blocks or run_blocks_and_collect_debug again, and do NOT "
+    "redesign the workflow hoping a different shape runs faster. Reply to the user now: keep "
+    "the verified prefix, name the block that could not finish within the time budget, and "
+    "state exactly what was and was not verified end-to-end. Do not repeat this message as the "
+    "user-facing answer."
 )
 
 POST_NO_WORKFLOW_DELIVERY_NUDGE = (
@@ -200,6 +248,22 @@ POST_NO_WORKFLOW_DELIVERY_NUDGE = (
     "workflow and test it, or respond with ASK_QUESTION if required input is "
     'missing. Do NOT say "Here\'s the workflow" until there is an actual '
     "workflow proposal behind the response."
+)
+
+POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE = (
+    "STOP — discover_workflow_entrypoint already resolved a candidate_url for this build turn, "
+    "but you have not inspected the resolved page or composed from it yet. Use the resolved "
+    "candidate_url as the goto_url entrypoint, inspect the page if needed, then call "
+    "update_and_run_blocks. Only ask a clarifying question after using the resolved page evidence "
+    "and only when a separate required non-URL input is still missing."
+)
+
+PRE_DISCOVERY_URL_QUESTION_NUDGE = (
+    "STOP — you are asking the user for an entry-point URL before resolving it yourself. "
+    "discover_workflow_entrypoint has not run this turn. Call "
+    "discover_workflow_entrypoint(site_or_url, intent_hint) to resolve the entrypoint from the "
+    "site the user named, then compose from the resolved page. Only ask for a URL if discovery "
+    "runs and cannot resolve a site."
 )
 
 PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
@@ -223,7 +287,7 @@ POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
 
 POST_ANTI_BOT_FAILED_TEST_NUDGE = (
     "STOP — your last test run failed due to an anti-bot/WAF block "
-    "(Access Denied, Cloudflare, Akamai, etc.).\n"
+    "(Access Denied, CAPTCHA, human-verification, or similar challenge evidence).\n"
     "IMPORTANT: An HTTP_REQUEST or navigation block from the SAME server IP "
     "will almost certainly receive the same block. Do NOT retry with:\n"
     "- A simple wait/delay block (timing does not fix IP bans)\n"
@@ -234,11 +298,17 @@ POST_ANTI_BOT_FAILED_TEST_NUDGE = (
     "do NOT use bare country codes like `US` — they are not valid "
     "ProxyLocation members).\n"
     "2. If you add anti-bot handling blocks, make them conditional on visible "
-    "challenge evidence (for example Cloudflare, Access Denied, CAPTCHA, or "
+    "challenge evidence (for example Access Denied, CAPTCHA, human-verification, or "
     "verify-you-are-human text). Do NOT assume every run starts on a challenge "
     "page; normal, unblocked runs should proceed directly to the requested task.\n"
-    "3. If still blocked, explain the specific anti-bot evidence observed "
-    "(for example Cloudflare, CAPTCHA, verify-you-are-human text, Access "
+    "3. If bounded page evidence says challenge_state.gates_submit_controls=true "
+    "or a submit/search control is still disabled after challenge resolution was "
+    "attempted. Do NOT retry the same challenge solve, blind wait, or disabled "
+    "submit click. Treat it as the current blocker unless you can make a "
+    "materially different allowed attempt such as a different proxy/location or "
+    "entrypoint.\n"
+    "4. If still blocked, explain the specific anti-bot evidence observed "
+    "(for example CAPTCHA, verify-you-are-human text, Access "
     "Denied, or a blank Just-a-moment page); describe exactly what you tried; "
     "and ask whether to try a different proxy/location, entry URL, or "
     "alternate source.\n"
@@ -258,16 +328,19 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_navigate": POST_NAVIGATE_NUDGE,
     "post_intermediate_success": POST_INTERMEDIATE_SUCCESS_NUDGE,
     "post_failed_test": POST_FAILED_TEST_NUDGE,
+    "post_failed_test_inspect_first": POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
     "post_suspicious_success": POST_SUSPICIOUS_SUCCESS_NUDGE,
-    "post_repeated_null_data": POST_REPEATED_NULL_DATA_NUDGE,
     "post_repeated_frontier_failure_warn": POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
     "post_repeated_frontier_failure_stop": POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     "post_parameter_binding_warn": POST_PARAMETER_BINDING_WARN_NUDGE,
     "post_non_retriable_nav_error_stop": POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
     "post_parameter_binding_stop": POST_PARAMETER_BINDING_STOP_NUDGE,
     "post_per_tool_budget": POST_PER_TOOL_BUDGET_NUDGE,
+    "post_per_tool_budget_stop": POST_PER_TOOL_BUDGET_STOP_NUDGE,
     "post_no_workflow_delivery": POST_NO_WORKFLOW_DELIVERY_NUDGE,
+    "post_discovery_entrypoint_url_question": POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
+    "pre_discovery_url_question": PRE_DISCOVERY_URL_QUESTION_NUDGE,
     "post_probable_site_block_stop_prefix": PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX,
     "post_probable_site_block_stop": POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     "post_anti_bot_failed_test": POST_ANTI_BOT_FAILED_TEST_NUDGE,
@@ -291,6 +364,9 @@ class CopilotConfig:
     security_rules: str = ""
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
+    requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

@@ -5,10 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _credential_id_misbinding_error_message,
     _credential_id_misbinding_findings,
+    _list_credentials,
     _update_workflow,
 )
 
@@ -363,10 +365,10 @@ async def test_update_workflow_rejects_credential_id_in_navigation_goal() -> Non
 
     with (
         patch(
-            "skyvern.forge.sdk.copilot.tools._credential_reference_validation_error",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._credential_reference_validation_error",
             new=AsyncMock(return_value=None),
         ),
-        patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         result = await _update_workflow({"workflow_yaml": submitted}, _ctx())
@@ -400,11 +402,11 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
 
     with (
         patch(
-            "skyvern.forge.sdk.copilot.tools._credential_reference_validation_error",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._credential_reference_validation_error",
             new=AsyncMock(return_value=None),
         ),
         patch(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             return_value=MagicMock(
                 title="Sign in",
                 description=None,
@@ -424,10 +426,11 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
             ),
         ),
         patch(
-            "skyvern.forge.sdk.copilot.tools.resolve_copilot_created_by_stamp", new=AsyncMock(return_value="copilot")
+            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
+            new=AsyncMock(return_value="copilot"),
         ),
-        patch("skyvern.forge.sdk.copilot.tools._record_workflow_proxy_location_span"),
-        patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"),
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         mock_app.DATABASE = MagicMock()
@@ -456,3 +459,60 @@ def test_error_message_groups_multiple_findings() -> None:
     assert "navigation_goal" in message
     assert "complete_criterion" in message
     assert message.count("cred_111") >= 1
+
+
+class _ListedCredential:
+    def __init__(self, credential_id: str, name: str, tested_url: str | None = None) -> None:
+        self.credential_id = credential_id
+        self.name = name
+        self.tested_url = tested_url
+        self.credential_type = "password"
+        self.username = None
+        self.totp_type = None
+        self.card_last4 = None
+        self.card_brand = None
+        self.secret_label = None
+
+
+def _ctx_with_policy() -> MagicMock:
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(credential_input_kind="none")
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_records_discovered_credentials_on_policy() -> None:
+    ctx = _ctx_with_policy()
+    listed = [_ListedCredential("cred_site_a", "Site A"), _ListedCredential("cred_site_b", "Site B")]
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.app.DATABASE.credentials.get_credentials", new=AsyncMock(return_value=listed)
+    ):
+        await _list_credentials({}, ctx)
+
+    assert [c.credential_id for c in ctx.request_policy.discovered_credentials] == ["cred_site_a", "cred_site_b"]
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_unions_across_pages_without_duplicates() -> None:
+    ctx = _ctx_with_policy()
+    ctx.request_policy.discovered_credentials = [_ListedCredential("cred_site_a", "Site A")]
+    listed = [_ListedCredential("cred_site_a", "Site A"), _ListedCredential("cred_site_b", "Site B")]
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.app.DATABASE.credentials.get_credentials", new=AsyncMock(return_value=listed)
+    ):
+        await _list_credentials({"page": 2}, ctx)
+
+    assert [c.credential_id for c in ctx.request_policy.discovered_credentials] == ["cred_site_a", "cred_site_b"]
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_without_request_policy_is_inert() -> None:
+    ctx = _ctx()
+    ctx.request_policy = None
+    listed = [_ListedCredential("cred_site_a", "Site A")]
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.app.DATABASE.credentials.get_credentials", new=AsyncMock(return_value=listed)
+    ):
+        result = await _list_credentials({}, ctx)
+
+    assert result["ok"] is True

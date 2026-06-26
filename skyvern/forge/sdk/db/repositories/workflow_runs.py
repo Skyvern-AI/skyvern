@@ -1,10 +1,24 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
+from typing import cast as typing_cast
 
 import structlog
-from sqlalchemy import Text, and_, cast, exists, func, literal, literal_column, or_, select, update
+from sqlalchemy import (
+    ColumnElement,
+    Label,
+    Text,
+    and_,
+    cast,
+    exists,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -12,6 +26,7 @@ from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 
@@ -47,7 +62,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
-from skyvern.schemas.runs import ProxyLocationInput, RunType
+from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
 
@@ -94,6 +109,29 @@ class WorkflowRunsRepository(BaseRepository):
         self._workflow_parameter_reader = workflow_parameter_reader
         self._dialect_name = dialect_name
 
+    @staticmethod
+    def _workflow_deleted_expr(
+        workflow_permanent_id_col: ColumnElement[str | None],
+        organization_id_col: ColumnElement[str],
+    ) -> Label[bool]:
+        active_workflow_exists = (
+            select(1)
+            .select_from(WorkflowModel)
+            .where(
+                and_(
+                    WorkflowModel.workflow_permanent_id == workflow_permanent_id_col,
+                    WorkflowModel.organization_id == organization_id_col,
+                    WorkflowModel.deleted_at.is_(None),
+                )
+            )
+            .correlate_except(WorkflowModel)
+            .exists()
+        )
+        return and_(
+            workflow_permanent_id_col.isnot(None),
+            ~active_workflow_exists,
+        ).label("workflow_deleted")
+
     @db_operation("get_running_workflow_runs_info_globally")
     async def get_running_workflow_runs_info_globally(
         self,
@@ -118,7 +156,7 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunStatus.running,
                 WorkflowRunStatus.paused,
             ]
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=stale_threshold_hours)
+            stale_cutoff = naive_utc_now() - timedelta(hours=stale_threshold_hours)
 
             # Count active workflow runs (recently updated)
             active_query = (
@@ -242,11 +280,11 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    workflow_run.queued_at = datetime.now(timezone.utc)
+                    workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
-                    workflow_run.started_at = datetime.now(timezone.utc)
+                    workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
-                    workflow_run.finished_at = datetime.now(timezone.utc)
+                    workflow_run.finished_at = naive_utc_now()
                 if failure_reason:
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
@@ -293,11 +331,11 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.failure_category = failure_category
                 # Explicit timestamp overrides (used when resetting workflow runs)
                 if started_at is not _UNSET:
-                    workflow_run.started_at = started_at
+                    workflow_run.started_at = to_naive_utc(typing_cast(datetime | None, started_at))
                 if queued_at is not _UNSET:
-                    workflow_run.queued_at = queued_at
+                    workflow_run.queued_at = to_naive_utc(typing_cast(datetime | None, queued_at))
                 if finished_at is not _UNSET:
-                    workflow_run.finished_at = finished_at
+                    workflow_run.finished_at = to_naive_utc(typing_cast(datetime | None, finished_at))
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
@@ -348,7 +386,7 @@ class WorkflowRunsRepository(BaseRepository):
         existing value via ``COALESCE``).
         """
         non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
-        now = datetime.now(timezone.utc)
+        now = naive_utc_now()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
             values["finished_at"] = now
@@ -377,6 +415,9 @@ class WorkflowRunsRepository(BaseRepository):
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).one()
             await save_workflow_run_logs(workflow_run_id)
+            # save_workflow_run_logs reuses this session and commits, expiring `refreshed`.
+            # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
+            await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
     @db_operation("bulk_update_workflow_runs")
@@ -541,17 +582,7 @@ class WorkflowRunsRepository(BaseRepository):
                 TaskRunModel.workflow_permanent_id,
                 WorkflowRunModel.workflow_permanent_id,
             )
-            # True iff this row's workflow_permanent_id has no active (deleted_at IS NULL) version.
-            workflow_deleted_expr = and_(
-                effective_wpid.isnot(None),
-                ~exists().where(
-                    and_(
-                        WorkflowModel.workflow_permanent_id == effective_wpid,
-                        WorkflowModel.organization_id == TaskRunModel.organization_id,
-                        WorkflowModel.deleted_at.is_(None),
-                    )
-                ),
-            ).label("workflow_deleted")
+            workflow_deleted_expr = self._workflow_deleted_expr(effective_wpid, TaskRunModel.organization_id)
             query = (
                 select(
                     TaskRunModel.task_run_id.label("task_run_id"),
@@ -593,14 +624,71 @@ class WorkflowRunsRepository(BaseRepository):
                         TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
                         TaskRunModel.run_id.icontains(search_key, autoescape=True),
                         effective_wpid.icontains(search_key, autoescape=True),
+                        # task_runs.searchable_text is only title+url, so agent inputs are matched via
+                        # workflow_run_parameters / extra_http_headers correlated on this run's run_id.
+                        *self._run_input_search_clauses(
+                            search_key,
+                            TaskRunModel.run_id,
+                            WorkflowRunModel.extra_http_headers,
+                        ),
                     )
                 )
 
             offset = (page - 1) * page_size
-            query = query.order_by(TaskRunModel.created_at.desc()).offset(offset).limit(page_size)
+            # Search merges task_runs and fallback workflow_runs before slicing, so each source fetches enough rows.
+            query_limit = min(page * page_size, MAX_SEARCH_FETCH_LIMIT) if search_key else page_size
+            query = query.order_by(TaskRunModel.created_at.desc()).limit(query_limit)
+            if not search_key:
+                query = query.offset(offset)
 
             result = await session.execute(query)
-            return [dict(row) for row in result.mappings().all()]
+            rows = [dict(row) for row in result.mappings().all()]
+
+            if search_key:
+                task_run_exists = (
+                    select(1)
+                    .select_from(TaskRunModel)
+                    .where(TaskRunModel.organization_id == WorkflowRunModel.organization_id)
+                    .where(TaskRunModel.run_id == WorkflowRunModel.workflow_run_id)
+                    .correlate_except(TaskRunModel)
+                    .exists()
+                )
+                fallback_query = (
+                    select(
+                        WorkflowRunModel.workflow_run_id.label("task_run_id"),
+                        WorkflowRunModel.workflow_run_id.label("run_id"),
+                        literal(RunType.workflow_run.value).label("task_run_type"),
+                        WorkflowRunModel.status.label("status"),
+                        WorkflowModel.title.label("title"),
+                        WorkflowRunModel.started_at.label("started_at"),
+                        WorkflowRunModel.finished_at.label("finished_at"),
+                        WorkflowRunModel.created_at.label("created_at"),
+                        WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                        WorkflowRunModel.script_run.label("script_run"),
+                        WorkflowModel.title.label("searchable_text"),
+                        self._workflow_deleted_expr(
+                            WorkflowRunModel.workflow_permanent_id,
+                            WorkflowRunModel.organization_id,
+                        ),
+                    )
+                    .select_from(WorkflowRunModel)
+                    .outerjoin(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                    .filter(WorkflowRunModel.organization_id == organization_id)
+                    .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                    .filter(WorkflowRunModel.debug_session_id.is_(None))
+                    .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                    .filter(~task_run_exists)
+                )
+                fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
+                if status:
+                    fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
+                fallback_result = await session.execute(fallback_query)
+                rows.extend(dict(row) for row in fallback_result.mappings().all())
+                rows.sort(key=lambda row: row["created_at"], reverse=True)
+                rows = rows[offset : offset + page_size]
+
+            return rows
 
     @read_retry()
     @db_operation("get_workflow_run", log_errors=False)
@@ -684,6 +772,71 @@ class WorkflowRunsRepository(BaseRepository):
             workflow_run = (await session.scalars(query)).first()
             return convert_to_workflow_run(workflow_run) if workflow_run else None
 
+    @db_operation("get_blocking_sequential_workflow_run")
+    async def get_blocking_sequential_workflow_run(self, workflow_run_id: str) -> WorkflowRun | None:
+        # Sequential-execution gate: returns the earliest-queued run that shares this run's
+        # sequential identity and is still in flight (queued/running/paused) and was queued
+        # before it, or None when this run is clear to start. A direct scan over all
+        # same-identity runs — not a walk of one depends_on chain — so it holds when the
+        # dependency graph fans out (forest) or a queued predecessor is canceled.
+        # Ordering uses queued_at, not created_at: it is stamped at enqueue (before Temporal
+        # submission) so it reflects submit order. The no-double-start guarantee rests on the
+        # strict total order over (queued_at, workflow_run_id) below, not on any lock.
+        async with self.Session() as session:
+            run = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).first()
+            if run is None:
+                return None
+
+            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
+            # > sequential_key > whole workflow. A debug-session run carries a browser_session_id
+            # but is excluded from the session lane (as at enqueue), so it serializes on its key.
+            query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
+            if run.browser_session_id and not run.debug_session_id:
+                query = query.filter_by(browser_session_id=run.browser_session_id)
+            elif run.browser_address:
+                query = query.filter_by(browser_address=run.browser_address)
+            elif run.sequential_key:
+                query = query.filter_by(
+                    workflow_permanent_id=run.workflow_permanent_id,
+                    sequential_key=run.sequential_key,
+                ).filter(WorkflowRunModel.browser_session_id.is_(None))
+            else:
+                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id).filter(
+                    WorkflowRunModel.browser_session_id.is_(None)
+                )
+
+            # Sequential runs are stamped queued_at before Temporal submission; the fallback
+            # only guards hand-created rows (e.g. tests) from comparing against None.
+            self_queued_at = run.queued_at if run.queued_at is not None else run.created_at
+
+            query = query.filter(
+                WorkflowRunModel.status.in_(
+                    [
+                        WorkflowRunStatus.queued,
+                        WorkflowRunStatus.running,
+                        WorkflowRunStatus.paused,
+                    ]
+                )
+            )
+            # Safe because a sequential run is always stamped queued_at (passes through queued)
+            # before it can reach running/paused, so this filter never hides a real blocker.
+            query = query.filter(WorkflowRunModel.queued_at.isnot(None))
+            query = query.filter(
+                or_(
+                    WorkflowRunModel.queued_at < self_queued_at,
+                    and_(
+                        WorkflowRunModel.queued_at == self_queued_at,
+                        WorkflowRunModel.workflow_run_id < run.workflow_run_id,
+                    ),
+                )
+            )
+            query = query.order_by(
+                WorkflowRunModel.queued_at.asc(),
+                WorkflowRunModel.workflow_run_id.asc(),
+            )
+            blocker = (await session.scalars(query)).first()
+            return convert_to_workflow_run(blocker) if blocker else None
+
     async def _get_last_workflow_run_by_filter(
         self,
         organization_id: str | None = None,
@@ -757,14 +910,17 @@ class WorkflowRunsRepository(BaseRepository):
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
     @staticmethod
-    def _apply_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
-        if not search_key:
-            return query
-        key_like = f"%{search_key}%"
-        # Match workflow_run_id directly
-        id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
-        # Match parameter key or description (only for non-deleted parameter definitions)
-        # Use EXISTS to avoid duplicate rows and to keep pagination correct
+    def _run_input_search_clauses(
+        search_key: str,
+        workflow_run_id_col: ColumnElement[Any],
+        extra_http_headers_col: ColumnElement[Any],
+    ) -> list[ColumnElement[bool]]:
+        """Clauses matching a run's agent inputs: workflow_run_parameters (key/description/value)
+        and extra_http_headers, correlated on the given workflow_run_id column. Self-contained
+        subqueries, so they OR into either the task_runs or workflow_runs search without adding an
+        implicit FROM."""
+        # Match parameter key or description (only for non-deleted parameter definitions).
+        # Use EXISTS to avoid duplicate rows and to keep pagination correct.
         param_key_desc_exists = exists(
             select(1)
             .select_from(WorkflowRunParameterModel)
@@ -772,28 +928,53 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowParameterModel,
                 WorkflowParameterModel.workflow_parameter_id == WorkflowRunParameterModel.workflow_parameter_id,
             )
-            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+            .where(WorkflowRunParameterModel.workflow_run_id == workflow_run_id_col)
             .where(WorkflowParameterModel.deleted_at.is_(None))
             .where(
                 or_(
-                    WorkflowParameterModel.key.ilike(key_like),
-                    WorkflowParameterModel.description.ilike(key_like),
+                    WorkflowParameterModel.key.icontains(search_key, autoescape=True),
+                    WorkflowParameterModel.description.icontains(search_key, autoescape=True),
                 )
             )
         )
-        # Match run parameter value directly (searches all values regardless of parameter definition status)
+        # Match run parameter value directly (searches all values regardless of parameter definition status).
         param_value_exists = exists(
             select(1)
             .select_from(WorkflowRunParameterModel)
-            .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-            .where(WorkflowRunParameterModel.value.ilike(key_like))
+            .where(WorkflowRunParameterModel.workflow_run_id == workflow_run_id_col)
+            .where(WorkflowRunParameterModel.value.icontains(search_key, autoescape=True))
         )
-        # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
+        # Match extra HTTP headers (cast JSON to text for search, skip NULLs).
         extra_headers_match = and_(
-            WorkflowRunModel.extra_http_headers.isnot(None),
-            func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+            extra_http_headers_col.isnot(None),
+            func.cast(extra_http_headers_col, Text()).icontains(search_key, autoescape=True),
         )
-        return query.where(or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match))
+        return [param_key_desc_exists, param_value_exists, extra_headers_match]
+
+    @staticmethod
+    def _apply_workflow_run_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
+        if not search_key:
+            return query
+        # Call only on WorkflowRunModel queries that already join WorkflowModel. The TaskRunModel query in
+        # get_all_runs_v2 uses its own filter so workflow-title search cannot add an implicit workflows FROM.
+        id_matches = WorkflowRunModel.workflow_run_id.icontains(search_key, autoescape=True)
+        workflow_title_matches = WorkflowModel.title.icontains(search_key, autoescape=True)
+        workflow_permanent_id_matches = WorkflowRunModel.workflow_permanent_id.icontains(
+            search_key,
+            autoescape=True,
+        )
+        return query.where(
+            or_(
+                id_matches,
+                workflow_title_matches,
+                workflow_permanent_id_matches,
+                *WorkflowRunsRepository._run_input_search_clauses(
+                    search_key,
+                    WorkflowRunModel.workflow_run_id,
+                    WorkflowRunModel.extra_http_headers,
+                ),
+            )
+        )
 
     def _apply_error_code_filter(self, query, error_code: str | None):  # type: ignore[no-untyped-def]
         if not error_code:
@@ -865,7 +1046,7 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
 
-            query = self._apply_search_key_filter(query, search_key)
+            query = self._apply_workflow_run_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)
 
             if status:
@@ -985,7 +1166,7 @@ class WorkflowRunsRepository(BaseRepository):
             )
             if exclude_child_runs:
                 query = query.filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-            query = self._apply_search_key_filter(query, search_key)
+            query = self._apply_workflow_run_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)
             if status:
                 query = query.filter(WorkflowRunModel.status.in_(status))

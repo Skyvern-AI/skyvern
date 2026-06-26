@@ -1,4 +1,7 @@
-import { DotsHorizontalIcon } from "@radix-ui/react-icons";
+import {
+  CounterClockwiseClockIcon,
+  DotsHorizontalIcon,
+} from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
 import { useParams } from "react-router-dom";
@@ -9,6 +12,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -19,21 +23,34 @@ import {
 } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useProductTourStore } from "@/store/ProductTourStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
 import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
+import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
+import { CodeSubmenu } from "./CodeSubmenu";
 
 export function EditorOverflowMenu() {
   const { workflowPermanentId } = useParams();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  const { data: workflowRun } = useWorkflowRunQuery();
   const isTemplate = workflow?.is_template ?? false;
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const requestTour = useProductTourStore((s) => s.requestTour);
   const onSave = useSaveWorkflow();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+
+  const toggleHistoryPanel = useToggleHistoryPanel();
+
+  const workflowRunIsRunningOrQueued = Boolean(
+    workflowRun && statusIsRunningOrQueued(workflowRun),
+  );
 
   const templateMutation = useMutation({
     mutationFn: async (newIsTemplate: boolean) => {
@@ -79,7 +96,7 @@ export function EditorOverflowMenu() {
           <TooltipTrigger asChild>
             <DropdownMenuTrigger asChild>
               <Button
-                disabled={disabled}
+                disabled={isRecording}
                 size="icon"
                 variant="tertiary"
                 className="size-10 min-w-[2.5rem]"
@@ -92,7 +109,18 @@ export function EditorOverflowMenu() {
           <TooltipContent>More actions</TooltipContent>
         </Tooltip>
       </TooltipProvider>
-      <DropdownMenuContent align="end">
+      <DropdownMenuContent align="end" className="min-w-[12rem]">
+        <CodeSubmenu />
+        {!workflowRunIsRunningOrQueued && (
+          <DropdownMenuItem
+            disabled={isRecording}
+            onSelect={() => toggleHistoryPanel()}
+          >
+            <CounterClockwiseClockIcon className="mr-2 size-4" />
+            Version history
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           disabled={disabled}
           onSelect={(event) => {
@@ -104,6 +132,11 @@ export function EditorOverflowMenu() {
           }}
         >
           {isTemplate ? "Remove from Templates" : "Save as Template"}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={requestTour}>
+          <span className="flex-1">Take a tour</span>
+          <kbd className="ml-4 text-xs text-slate-400">Shift+?</kbd>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

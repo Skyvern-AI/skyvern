@@ -15,6 +15,7 @@ vi.mock("./WorkflowRunHumanInteraction", () => ({
 }));
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
@@ -101,6 +102,65 @@ describe("WorkflowRunBlockDetail router", () => {
     ).toBeGreaterThanOrEqual(1);
   });
 
+  it("renders code block extracted information without the raw output wrapper", () => {
+    const block = buildBlock({
+      block_type: "code",
+      label: "collect_data",
+      output: {
+        extracted_information: {
+          account_status: "active",
+          reference_id: "ref_123",
+        },
+        raw_code_output: "debug payload",
+      },
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    expect(
+      screen.getByRole("tab", { name: "Extracted Information" }),
+    ).toBeDefined();
+    expect(screen.getByText("account_status")).toBeDefined();
+    expect(screen.getByText('"active"')).toBeDefined();
+    expect(screen.queryByText("raw_code_output")).toBeNull();
+    expect(screen.queryByText('"debug payload"')).toBeNull();
+  });
+
+  it("renders a string code block extraction without dropping it", () => {
+    const block = buildBlock({
+      block_type: "code",
+      label: "collect_summary",
+      output: {
+        extracted_information: "Order #1024 shipped on Tuesday",
+      },
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    expect(
+      screen.getByRole("tab", { name: "Extracted Information" }),
+    ).toBeDefined();
+    expect(screen.getByText('"Order #1024 shipped on Tuesday"')).toBeDefined();
+  });
+
+  it("keeps a null code block extraction visible in the detail panel", () => {
+    const block = buildBlock({
+      block_type: "code",
+      label: "collect_empty",
+      output: {
+        extracted_information: null,
+      },
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    const tab = screen.getByRole("tab", { name: "Extracted Information" });
+    expect(tab.hasAttribute("disabled")).toBe(false);
+    expect(tab.getAttribute("data-state")).toBe("active");
+    expect(screen.getByText("null")).toBeDefined();
+    expect(screen.queryByText("No block output.")).toBeNull();
+  });
+
   it("renders block inputs and searchable outputs inside the detail panel inspector", () => {
     const block = buildBlock({
       block_type: "http_request",
@@ -135,6 +195,55 @@ describe("WorkflowRunBlockDetail router", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Inputs" }));
     expect(screen.getByText("URL")).toBeDefined();
     expect(screen.getByText("https://example.test/report")).toBeDefined();
+  });
+
+  it("shows a diagnostics link in the inspector for any block with a task id", () => {
+    const block = buildBlock({
+      block_type: "file_download",
+      task_id: "tsk_123",
+    });
+
+    render(
+      <MemoryRouter>
+        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+      </MemoryRouter>,
+    );
+
+    const diagnosticsLink = screen.getByRole("link", {
+      name: /diagnostics/i,
+    });
+    expect(diagnosticsLink.getAttribute("href")).toBe(
+      "/tasks/tsk_123/diagnostics",
+    );
+  });
+
+  it("renders actions for a file_download block", () => {
+    const action: ActionsApiResponse = {
+      action_id: "act_download",
+      action_type: ActionTypes.Click,
+      status: Status.Completed,
+      task_id: null,
+      step_id: null,
+      step_order: null,
+      action_order: null,
+      reasoning: "Click the invoice download link",
+      description: null,
+      intention: null,
+      response: null,
+      text: null,
+      created_by: null,
+      confidence_float: 1,
+    };
+    const block = buildBlock({
+      block_type: "file_download",
+      label: "download_invoice",
+      actions: [action],
+    });
+
+    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+
+    expect(screen.getByText("Actions (1)")).toBeDefined();
+    expect(screen.getByText("Click the invoice download link")).toBeDefined();
   });
 
   it("renders the conditional detail (branch evaluation) for a conditional block", () => {

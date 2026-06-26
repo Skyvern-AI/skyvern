@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.db.tag_filters import workflow_tag_wpid_subqueries
 from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -102,6 +103,7 @@ class WorkflowsRepository(BaseRepository):
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         browser_profile_id: str | None = None,
+        browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -135,6 +137,7 @@ class WorkflowsRepository(BaseRepository):
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
@@ -379,6 +382,26 @@ class WorkflowsRepository(BaseRepository):
                 for workflow in workflows
             ]
 
+    @db_operation("get_existing_permanent_ids")
+    async def get_existing_permanent_ids(
+        self,
+        workflow_permanent_ids: list[str],
+        organization_id: str,
+    ) -> set[str]:
+        """Return the subset of ``workflow_permanent_ids`` that exist as
+        non-deleted workflows in the org, filtering out soft-deleted workflows."""
+        if not workflow_permanent_ids:
+            return set()
+        async with self.Session() as session:
+            stmt = (
+                select(WorkflowModel.workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                .where(WorkflowModel.deleted_at.is_(None))
+                .distinct()
+            )
+            return set((await session.execute(stmt)).scalars().all())
+
     @db_operation("get_workflows_by_organization_id")
     async def get_workflows_by_organization_id(
         self,
@@ -391,6 +414,7 @@ class WorkflowsRepository(BaseRepository):
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
+        workflow_tags: list[tuple[str | None, str | None]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -401,6 +425,19 @@ class WorkflowsRepository(BaseRepository):
           workflow parameter metadata (key, description, and default_value).
         - If `search_key` is not provided, no search filtering is applied.
         - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
+
+        Tag filtering (`workflow_tags`):
+        - A list of (key, value) terms in three shapes: exact ``(key, value)``,
+          group/key-only ``(key, None)``, and label/value-only ``(None, value)``.
+        - The filter is AND across distinct terms, with OR within a key for exact
+          terms sharing that key (so ``env:prod`` + ``env:staging`` is ``env IN
+          (prod, staging)``). One semi-join subquery is emitted per term group —
+          a normalized event row can't satisfy two different ``key=`` predicates
+          at once, so a single conjunctive subquery would match nothing.
+        - A value-only term matches that label across any/no group; a key-only
+          term matches any value within the group.
+        - Matches only the current value of each tag: superseded and soft-deleted
+          event rows are excluded, mirroring the active-tag read path.
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -449,6 +486,9 @@ class WorkflowsRepository(BaseRepository):
                 main_query = main_query.where(WorkflowModel.status.in_(statuses))
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
+            if workflow_tags:
+                for subquery in workflow_tag_wpid_subqueries(workflow_tags, organization_id):
+                    main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(subquery))
             if search_key:
                 search_like = f"%{search_key}%"
                 title_like = WorkflowModel.title.ilike(search_like)
@@ -606,19 +646,23 @@ class WorkflowsRepository(BaseRepository):
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
-        code_version: int | None = None,
+        code_version: int | None | object = _UNSET,
         status: str | None = None,
         import_error: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
+        totp_verification_url: str | None | object = _UNSET,
+        totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
+        adaptive_caching: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -643,8 +687,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_with = run_with
                 if cache_key is not None:
                     workflow.cache_key = cache_key
-                if code_version is not None:
-                    workflow.code_version = code_version
+                if code_version is not _UNSET:
+                    workflow.code_version = cast(int | None, code_version)
                 if status is not None:
                     workflow.status = status
                 if import_error is not None:
@@ -653,10 +697,16 @@ class WorkflowsRepository(BaseRepository):
                     workflow.proxy_location = serialize_proxy_location(cast(ProxyLocationInput, proxy_location))
                 if webhook_callback_url is not _UNSET:
                     workflow.webhook_callback_url = webhook_callback_url
+                if totp_verification_url is not _UNSET:
+                    workflow.totp_verification_url = cast(str | None, totp_verification_url)
+                if totp_identifier is not _UNSET:
+                    workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
                 if browser_profile_id is not _UNSET:
                     workflow.browser_profile_id = cast(str | None, browser_profile_id)
+                if browser_profile_key is not _UNSET:
+                    workflow.browser_profile_key = cast(str | None, browser_profile_key)
                 if model is not _UNSET:
                     workflow.model = model
                 if max_screenshot_scrolling_times is not _UNSET:
@@ -669,6 +719,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.cdp_connect_headers = cdp_connect_headers
                 if ai_fallback is not None:
                     workflow.ai_fallback = ai_fallback
+                if adaptive_caching is not _UNSET:
+                    workflow.adaptive_caching = cast(bool, adaptive_caching)
                 if run_sequentially is not None:
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
@@ -907,18 +959,23 @@ class WorkflowsRepository(BaseRepository):
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
+        code_version: int | None | object = _UNSET,
         status: str | None = None,
         import_error: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
+        totp_verification_url: str | None | object = _UNSET,
+        totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
+        adaptive_caching: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -979,6 +1036,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.run_with = run_with
             if cache_key is not None:
                 workflow.cache_key = cache_key
+            if code_version is not _UNSET:
+                workflow.code_version = cast(int | None, code_version)
             if status is not None:
                 workflow.status = status
             if import_error is not None:
@@ -987,10 +1046,16 @@ class WorkflowsRepository(BaseRepository):
                 workflow.proxy_location = serialize_proxy_location(cast(ProxyLocationInput, proxy_location))
             if webhook_callback_url is not _UNSET:
                 workflow.webhook_callback_url = webhook_callback_url
+            if totp_verification_url is not _UNSET:
+                workflow.totp_verification_url = cast(str | None, totp_verification_url)
+            if totp_identifier is not _UNSET:
+                workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
             if browser_profile_id is not _UNSET:
                 workflow.browser_profile_id = cast(str | None, browser_profile_id)
+            if browser_profile_key is not _UNSET:
+                workflow.browser_profile_key = cast(str | None, browser_profile_key)
             if model is not _UNSET:
                 workflow.model = model
             if max_screenshot_scrolling_times is not _UNSET:
@@ -1003,6 +1068,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.cdp_connect_headers = cdp_connect_headers
             if ai_fallback is not None:
                 workflow.ai_fallback = ai_fallback
+            if adaptive_caching is not _UNSET:
+                workflow.adaptive_caching = cast(bool, adaptive_caching)
             if run_sequentially is not None:
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:

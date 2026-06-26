@@ -3,6 +3,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1355,3 +1356,505 @@ async def test_handle_action_removes_download_listener_when_inner_action_raises(
                 )
 
     page.off.assert_called_once_with("download", download_callbacks["download"])
+
+
+@pytest.mark.asyncio
+async def test_handle_action_discards_xhr_staging_when_native_file_present(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+
+    callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
+
+    download = MagicMock()
+    download.suggested_filename = "report.pdf"
+    download.save_as = AsyncMock()
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+        staging = os.path.join(temp_root, "xhr_staging")
+        os.makedirs(staging)
+
+        async def mock_inner(*args, **kw):
+            with open(os.path.join(staging, "report.pdf"), "wb") as f:
+                f.write(b"xhr content")
+            callbacks["download"](download)
+            with open(os.path.join(primary_dir, "native-guid.pdf"), "wb") as f:
+                f.write(b"native content")
+            return [ActionSuccess()]
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        assert results[-1].download_triggered is True
+        assert results[-1].downloaded_files == ["native-guid.pdf"]
+        assert not os.path.exists(staging)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_uses_xhr_staging_fallback_when_no_native_file(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+
+    callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+        staging = os.path.join(temp_root, "xhr_staging")
+        os.makedirs(staging)
+
+        async def mock_inner(*args, **kw):
+            with open(os.path.join(staging, "report.pdf"), "wb") as f:
+                f.write(b"xhr-only content")
+            return [ActionSuccess()]
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        assert results[-1].download_triggered is True
+        assert results[-1].downloaded_files == ["report.pdf"]
+        assert os.path.isfile(os.path.join(primary_dir, "report.pdf"))
+        assert not os.path.exists(staging)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_moves_multiple_staged_xhr_files_as_fallback(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+
+    callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+        staging = os.path.join(temp_root, "xhr_staging")
+        os.makedirs(staging)
+
+        async def mock_inner(*args, **kw):
+            with open(os.path.join(staging, "file_a.pdf"), "wb") as f:
+                f.write(b"content a")
+            with open(os.path.join(staging, "file_b.zip"), "wb") as f:
+                f.write(b"content b")
+            return [ActionSuccess()]
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        assert results[-1].download_triggered is True
+        assert sorted(results[-1].downloaded_files) == ["file_a.pdf", "file_b.zip"]
+
+
+@pytest.mark.asyncio
+async def test_handle_action_cleans_staging_on_exception(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+
+    callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+        staging = os.path.join(temp_root, "xhr_staging")
+        os.makedirs(staging)
+
+        async def mock_inner(*args, **kw):
+            with open(os.path.join(staging, "orphan.pdf"), "wb") as f:
+                f.write(b"data")
+            raise RuntimeError("simulated crash")
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
+
+        assert not os.path.exists(staging)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_logs_warning_when_late_native_appears_after_xhr_fallback(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """When XHR fallback moves staged files and a late native file appears during
+    the settle wait, a warning log should be emitted for observability."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+
+    callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+        staging = os.path.join(temp_root, "xhr_staging")
+        os.makedirs(staging)
+
+        async def mock_inner(*args, **kw):
+            with open(os.path.join(staging, "report.zip"), "wb") as f:
+                f.write(b"xhr zip content")
+            return [ActionSuccess()]
+
+        async def mock_settle(**kw):
+            with open(os.path.join(primary_dir, "native-late.zip"), "wb") as f:
+                f.write(b"native zip content different")
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        log_warnings: list[tuple] = []
+        original_log = __import__("skyvern.webeye.actions.handler", fromlist=["LOG"]).LOG
+
+        def capture_warning(*args, **kwargs):
+            log_warnings.append((args, kwargs))
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(side_effect=mock_settle),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+            patch.object(original_log, "warning", side_effect=capture_warning),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        assert results[-1].download_triggered is True
+        assert sorted(results[-1].downloaded_files) == ["native-late.zip", "report.zip"]
+
+        race_warnings = [
+            (args, kwargs)
+            for args, kwargs in log_warnings
+            if args and "additional download files appeared" in str(args[0])
+        ]
+        assert len(race_warnings) == 1
+        _, kwargs = race_warnings[0]
+        assert kwargs["workflow_run_id"] == "wr-1"
+        assert kwargs["xhr_fallback_file_count"] == 1
+        assert kwargs["xhr_fallback_files"] == ["report.zip"]
+        assert kwargs["post_settle_extra_file_count"] == 1
+        assert kwargs["post_settle_extra_files"] == ["native-late.zip"]
+
+
+@pytest.mark.asyncio
+async def test_handle_action_adopted_session_lands_download_via_eager_save(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """On an adopted persistent session the run connection saves the download eagerly at event
+    time and the bytes land in the run dir."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr-1",
+        browser_session_id="bs-1",
+        download_timeout=30.0,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.url = "https://example.com/download"
+    page.context.browser = None
+    page.evaluate = AsyncMock()
+    page.expose_binding = AsyncMock()
+    download_callbacks: dict[str, Callable[[object], None]] = {}
+    page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="download-link",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    download = MagicMock()
+    download.suggested_filename = "report.pdf"
+    download.url = "https://example.com/presigned/report.pdf"
+
+    async def save_download(target_path: str | os.PathLike[str]) -> None:
+        with open(target_path, "wb") as f:
+            f.write(b"%PDF-1.4 report bytes")
+
+    download.save_as = AsyncMock(side_effect=save_download)
+
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        download_callbacks["download"](download)
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "bs-1")
+        os.makedirs(primary_dir)
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+        wait_for_downloads = AsyncMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=wait_for_downloads,
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        landed_files = sorted(os.listdir(primary_dir))
+
+    assert results[-1].download_triggered is True
+    assert action.download_triggered is True
+    assert len(landed_files) == 1 and landed_files[0].endswith("-report.pdf")
+    assert results[-1].downloaded_files == landed_files
+    download.save_as.assert_awaited_once()
+    # eager save wins; the url re-fetch is not needed when save_as succeeds
+    page.context.request.get.assert_not_called()
+    span_attrs = _download_wait_span_attrs(span_exporter)
+    assert span_attrs["download_event_fallback_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_handle_action_adopted_session_refetches_when_save_as_target_closed(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """When the worker tears the shared browser down and the run's save_as raises while the run
+    request context is still alive, the adopted-session path re-fetches the replayable url and the
+    bytes still land in the run dir."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr-1",
+        browser_session_id="bs-1",
+        download_timeout=30.0,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.url = "https://example.com/download"
+    page.context.browser = None
+    page.evaluate = AsyncMock()
+    page.expose_binding = AsyncMock()
+    download_callbacks: dict[str, Callable[[object], None]] = {}
+    page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
+
+    refetched_bytes = b"%PDF-1.4 refetched report bytes"
+    refetch_response = MagicMock()
+    refetch_response.status = 200
+    refetch_response.body = AsyncMock(return_value=refetched_bytes)
+    page.context.request.get = AsyncMock(return_value=refetch_response)
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="download-link",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    download = MagicMock()
+    download.suggested_filename = "report.pdf"
+    download.url = "https://example.com/presigned/report.pdf"
+    download.save_as = AsyncMock(side_effect=Exception("Target page, context or browser has been closed"))
+
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        download_callbacks["download"](download)
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "bs-1")
+        os.makedirs(primary_dir)
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+        wait_for_downloads = AsyncMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=wait_for_downloads,
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        landed = sorted(os.listdir(primary_dir))
+        landed_bytes = Path(primary_dir, landed[0]).read_bytes() if landed else b""
+
+    assert results[-1].download_triggered is True
+    assert action.download_triggered is True
+    assert len(landed) == 1 and landed[0].endswith("-report.pdf")
+    assert landed_bytes == refetched_bytes
+    assert results[-1].downloaded_files == landed
+    download.save_as.assert_awaited_once()
+    page.context.request.get.assert_awaited_once_with(download.url)
+    span_attrs = _download_wait_span_attrs(span_exporter)
+    assert span_attrs["download_event_fallback_used"] is True

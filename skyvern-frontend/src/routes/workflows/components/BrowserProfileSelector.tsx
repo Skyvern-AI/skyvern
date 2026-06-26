@@ -2,6 +2,11 @@ import { ChevronDownIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useDebounce } from "use-debounce";
 
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useBrowserProfileQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileQuery";
 import { cn, handleInfiniteScroll } from "@/util/utils";
@@ -28,18 +33,16 @@ function BrowserProfileSelector({
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch] = useDebounce(searchQuery, 300);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const isTyping = searchQuery !== debouncedSearch;
 
+  // Keep wheel events inside the list instead of letting React Flow zoom the
+  // canvas underneath the popover.
   useEffect(() => {
-    const el = dropdownRef.current;
+    const el = listRef.current;
     if (!el) return;
-    const handler = (e: WheelEvent) => {
-      e.stopPropagation();
-    };
-    el.addEventListener("wheel", handler, { passive: false });
+    const handler = (e: WheelEvent) => e.stopPropagation();
+    el.addEventListener("wheel", handler, { passive: true });
     return () => el.removeEventListener("wheel", handler);
   }, [open]);
 
@@ -88,15 +91,6 @@ function BrowserProfileSelector({
     }
   }, [open]);
 
-  const handleToggle = () => {
-    if (open) {
-      setOpen(false);
-    } else {
-      setOpen(true);
-      setTimeout(() => inputRef.current?.focus(), 0);
-    }
-  };
-
   const handleSelect = (profileId: string | null) => {
     onChange(profileId);
     setOpen(false);
@@ -132,140 +126,129 @@ function BrowserProfileSelector({
   }
 
   return (
-    <div
-      ref={containerRef}
-      className="nopan relative"
-      onBlur={(e) => {
-        if (!containerRef.current?.contains(e.relatedTarget as Node)) {
-          setOpen(false);
-        }
-      }}
-    >
-      <div
-        role="button"
-        tabIndex={0}
-        className={cn(
-          "flex w-full cursor-pointer items-center rounded-md border border-input bg-transparent text-sm shadow-sm",
-          triggerHeightClass,
-        )}
-        onClick={handleToggle}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            handleToggle();
-          }
-        }}
-      >
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
         <div
+          role="button"
+          tabIndex={0}
           className={cn(
-            "min-w-0 flex-1 truncate text-left",
-            triggerInnerPaddingClass,
+            "nopan flex w-full cursor-pointer items-center rounded-md border border-input bg-transparent text-sm shadow-sm",
+            triggerHeightClass,
           )}
-        >
-          {hasValue ? (
-            <span className="text-slate-200">{triggerLabel}</span>
-          ) : (
-            <span className="text-muted-foreground">{triggerLabel}</span>
-          )}
-        </div>
-        <div className="flex items-center pr-2">
-          <ChevronDownIcon
-            className={`size-4 text-slate-500 transition-transform ${open ? "rotate-180" : ""}`}
-          />
-        </div>
-      </div>
-
-      {open && (
-        <div
-          ref={dropdownRef}
-          className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-slate-600 bg-slate-800 shadow-lg"
-          onMouseDown={(e) => e.preventDefault()}
-        >
-          <div className="border-b border-slate-600 px-3 py-2">
-            <input
-              ref={inputRef}
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search browser profiles..."
-              className="w-full bg-transparent text-sm text-slate-200 placeholder:text-muted-foreground focus-visible:outline-none"
-            />
-          </div>
-          <div
-            className="max-h-[300px] overflow-y-auto"
-            onScroll={(e) =>
-              handleInfiniteScroll(
-                e,
-                fetchNextPage,
-                hasNextPage,
-                isFetchingNextPage,
-              )
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setOpen((prev) => !prev);
             }
+          }}
+        >
+          <div
+            className={cn(
+              "min-w-0 flex-1 truncate text-left",
+              triggerInnerPaddingClass,
+            )}
           >
-            <button
-              type="button"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => handleSelect(null)}
-              className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors hover:bg-slate-700 ${
-                !hasValue ? "bg-slate-700" : ""
-              }`}
-            >
-              <span className="text-slate-200">None</span>
-            </button>
-            {(isFetching || isTyping) && profiles.length === 0 ? (
-              <>
-                {Array.from({ length: 5 }).map((_, index) => (
-                  <div
-                    key={`skeleton-${index}`}
-                    className="flex w-full flex-col gap-1 px-3 py-2"
-                  >
-                    <Skeleton className="h-3.5 w-3/4" />
-                    <Skeleton className="h-3 w-1/2" />
-                  </div>
-                ))}
-              </>
-            ) : profiles.length === 0 ? (
-              <div className="px-3 py-3 text-xs text-slate-500">
-                {debouncedSearch
-                  ? `No browser profiles match "${debouncedSearch}".`
-                  : "No browser profiles found."}
-              </div>
+            {hasValue ? (
+              <span className="text-slate-200">{triggerLabel}</span>
             ) : (
-              <>
-                {profiles.map((profile) => {
-                  const isSelected = value === profile.browser_profile_id;
-                  return (
-                    <button
-                      key={profile.browser_profile_id}
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => handleSelect(profile.browser_profile_id)}
-                      className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-sm transition-colors hover:bg-slate-700 ${
-                        isSelected ? "bg-slate-700" : ""
-                      }`}
-                    >
-                      <span className="font-medium text-slate-200">
-                        {profile.name}
-                      </span>
-                      {profile.description && (
-                        <span className="truncate text-xs text-slate-400">
-                          {profile.description}
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-                {isFetchingNextPage && (
-                  <div className="flex items-center justify-center py-2">
-                    <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
-                  </div>
-                )}
-              </>
+              <span className="text-muted-foreground">{triggerLabel}</span>
             )}
           </div>
+          <div className="flex items-center pr-2">
+            <ChevronDownIcon
+              className={`size-4 text-slate-500 transition-transform ${open ? "rotate-180" : ""}`}
+            />
+          </div>
         </div>
-      )}
-    </div>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        sideOffset={4}
+        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-slate-600 bg-slate-800 p-0 shadow-lg"
+      >
+        <div className="border-b border-slate-600 px-3 py-2">
+          <input
+            autoFocus
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search browser profiles..."
+            className="w-full bg-transparent text-sm text-slate-200 placeholder:text-muted-foreground focus-visible:outline-none"
+          />
+        </div>
+        <div
+          ref={listRef}
+          className="max-h-[300px] overflow-y-auto"
+          onScroll={(e) =>
+            handleInfiniteScroll(
+              e,
+              fetchNextPage,
+              hasNextPage,
+              isFetchingNextPage,
+            )
+          }
+        >
+          <button
+            type="button"
+            onClick={() => handleSelect(null)}
+            className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors hover:bg-slate-700 ${
+              !hasValue ? "bg-slate-700" : ""
+            }`}
+          >
+            <span className="text-slate-200">None</span>
+          </button>
+          {(isFetching || isTyping) && profiles.length === 0 ? (
+            <>
+              {Array.from({ length: 5 }).map((_, index) => (
+                <div
+                  key={`skeleton-${index}`}
+                  className="flex w-full flex-col gap-1 px-3 py-2"
+                >
+                  <Skeleton className="h-3.5 w-3/4" />
+                  <Skeleton className="h-3 w-1/2" />
+                </div>
+              ))}
+            </>
+          ) : profiles.length === 0 ? (
+            <div className="px-3 py-3 text-xs text-slate-500">
+              {debouncedSearch
+                ? `No browser profiles match "${debouncedSearch}".`
+                : "No browser profiles found."}
+            </div>
+          ) : (
+            <>
+              {profiles.map((profile) => {
+                const isSelected = value === profile.browser_profile_id;
+                return (
+                  <button
+                    key={profile.browser_profile_id}
+                    type="button"
+                    onClick={() => handleSelect(profile.browser_profile_id)}
+                    className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-sm transition-colors hover:bg-slate-700 ${
+                      isSelected ? "bg-slate-700" : ""
+                    }`}
+                  >
+                    <span className="font-medium text-slate-200">
+                      {profile.name}
+                    </span>
+                    {profile.description && (
+                      <span className="truncate text-xs text-slate-400">
+                        {profile.description}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              {isFetchingNextPage && (
+                <div className="flex items-center justify-center py-2">
+                  <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 

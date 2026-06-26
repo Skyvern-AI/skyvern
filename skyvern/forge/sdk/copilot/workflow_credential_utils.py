@@ -20,11 +20,19 @@ def parse_workflow_yaml(workflow_yaml: str) -> Any:
 
 def url_origin(url: str) -> str | None:
     parsed = urlparse(url if "://" in url else f"https://{url}")
-    if not parsed.netloc:
+    if not parsed.netloc or not parsed.hostname:
         return None
+    host = parsed.hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
     # Keep scheme in the origin. http:// and https:// are different security
     # contexts, so crossing between them is treated as scope broadening.
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    return f"{parsed.scheme.lower()}://{netloc}"
 
 
 def credential_params(parameters: Any) -> dict[str, str]:

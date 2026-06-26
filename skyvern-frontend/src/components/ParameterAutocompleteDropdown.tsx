@@ -15,7 +15,7 @@ type Props = {
 };
 
 const CATEGORY_LABELS: Record<ParameterCategory, string> = {
-  parameter: "Parameters",
+  parameter: "Inputs",
   output: "Block Outputs",
   system: "System",
 };

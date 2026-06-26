@@ -56,7 +56,35 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         manager.get_browser_address.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_waits_for_address_in_non_cdp_mode(self) -> None:
+    async def test_checks_address_readiness_in_non_cdp_mode(self) -> None:
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+        )
+
+        manager = MagicMock()
+        manager.get_session = AsyncMock(return_value=session)
+        manager.get_browser_address_if_ready = AsyncMock(return_value="ws://remote:9222")
+        manager.get_browser_address = AsyncMock(
+            side_effect=AssertionError("must not enter blocking address wait"),
+        )
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            settings_mock.ENV = "local"
+            result = await verify_browser_session("bs_test", "o_test")
+
+        assert result is not None
+        assert result.browser_address == "ws://remote:9222"
+        manager.get_browser_address_if_ready.assert_awaited_once_with(session_id="bs_test", organization_id="o_test")
+        manager.get_browser_address.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blocks_until_address_ready_in_non_local_non_cdp_mode(self) -> None:
         session = _make_session(
             browser_address=None,
             status=PersistentBrowserSessionStatus.running,
@@ -65,6 +93,9 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         manager = MagicMock()
         manager.get_session = AsyncMock(return_value=session)
         manager.get_browser_address = AsyncMock(return_value="ws://remote:9222")
+        manager.get_browser_address_if_ready = AsyncMock(
+            side_effect=AssertionError("must not use non-blocking address check in production"),
+        )
 
         with (
             patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
@@ -72,11 +103,40 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         ):
             app_mock.PERSISTENT_SESSIONS_MANAGER = manager
             settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            settings_mock.ENV = "production"
             result = await verify_browser_session("bs_test", "o_test")
 
         assert result is not None
         assert result.browser_address == "ws://remote:9222"
-        manager.get_browser_address.assert_awaited_once()
+        manager.get_browser_address.assert_awaited_once_with(session_id="bs_test", organization_id="o_test")
+        manager.get_browser_address_if_ready.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_address_not_ready_in_non_cdp_mode(self) -> None:
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+        )
+
+        manager = MagicMock()
+        manager.get_session = AsyncMock(return_value=session)
+        manager.get_browser_address_if_ready = AsyncMock(return_value=None)
+        manager.get_browser_address = AsyncMock(
+            side_effect=AssertionError("must not enter blocking address wait"),
+        )
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            settings_mock.ENV = "local"
+            result = await verify_browser_session("bs_test", "o_test")
+
+        assert result is None
+        manager.get_browser_address_if_ready.assert_awaited_once_with(session_id="bs_test", organization_id="o_test")
+        manager.get_browser_address.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_uses_existing_address_without_polling(self) -> None:

@@ -29,6 +29,7 @@ const COLLAPSIBLE_NODE_TYPE_TO_BLOCK_TYPE: Record<string, WorkflowBlockType> = {
   workflowTrigger: "workflow_trigger",
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
+  pdfFill: "pdf_fill",
   loop: "for_loop",
   conditional: "conditional",
 };

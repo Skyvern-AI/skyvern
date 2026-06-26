@@ -11,14 +11,18 @@ export interface Artifact {
     artifact_type: Skyvern.ArtifactType;
     uri: string;
     bundle_key?: string;
+    checksum?: string;
+    file_size?: number;
     task_id?: string;
     step_id?: string;
     workflow_run_id?: string;
     workflow_run_block_id?: string;
     run_id?: string;
+    browser_session_id?: string;
     observer_cruise_id?: string;
     observer_thought_id?: string;
     ai_suggestion_id?: string;
     signed_url?: string;
+    archived?: boolean;
     organization_id: string;
 }

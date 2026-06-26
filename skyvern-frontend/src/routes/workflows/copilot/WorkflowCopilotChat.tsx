@@ -2,6 +2,7 @@ import {
   useState,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useCallback,
   memo,
@@ -9,14 +10,21 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
+import {
+  ReloadIcon,
+  Cross2Icon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CheckIcon,
+} from "@radix-ui/react-icons";
+import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
-import { cn } from "@/util/utils";
 import {
   WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
@@ -30,40 +38,225 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
+  WorkflowCopilotChatSummary,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
+  WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
+import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
-  shouldQueuePromptForLiveBrowser,
-  shouldWaitForLiveBrowser,
-} from "./browserReadiness";
+  QueuedPromptReason,
+  resolveDrainAction,
+  resolveSendAction,
+} from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
+import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
+import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import {
   EMPTY_NARRATIVE,
+  NarrativeEvent,
   TurnNarrativeState,
   applyNarrativeEvent,
+  hydrateHistoryNarrative,
+  parseUtcIsoMs,
 } from "./narrativeState";
+import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
+import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
+import { SpeechInputButton } from "@/components/SpeechInputButton";
+import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import { cn } from "@/util/utils";
+
+// Cap on retained per-turn snap-back snapshots. A typical session has a
+// handful of turns; this ceiling guards a runaway long-running chat.
+const MAX_TURN_SNAPSHOTS = 20;
+
+type ComposerDefaultVariant =
+  | "build"
+  | "build_code"
+  | "build_no_code"
+  | "ask"
+  | "ask_code";
+
+function normalizeComposerDefaultVariant(
+  variant: string | undefined,
+): ComposerDefaultVariant {
+  if (
+    variant === "ask" ||
+    variant === "ask_code" ||
+    variant === "build_code" ||
+    variant === "build_no_code"
+  ) {
+    return variant;
+  }
+  return "build";
+}
+
+function defaultVariantUsesCode(variant: ComposerDefaultVariant): boolean {
+  return variant === "build_code" || variant === "ask_code";
+}
+
+function defaultCodeBlockRequestOverride(
+  variant: string | undefined,
+): boolean | null {
+  if (variant === "build_code") {
+    return true;
+  }
+  if (variant === "build" || variant === "build_no_code") {
+    return false;
+  }
+  // Ask-only variants, including ask_code, do not send a build request override.
+  return null;
+}
+
+function formatElapsedSeconds(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// Ask's mark is a text dingbat; Build's is a color emoji that ModeGlyph flattens
+// to a tone-adaptive monochrome silhouette so both read flat on the dark UI.
+const ASK_GLYPH = "\u275D\uFE0E";
+const BUILD_GLYPH = "\uD83D\uDC09";
+
+function isPictographic(glyph: string): boolean {
+  try {
+    return /\p{Extended_Pictographic}/u.test(glyph);
+  } catch {
+    return false;
+  }
+}
+
+function ModeGlyph({
+  mode,
+  tone = "light",
+  glow = false,
+}: {
+  mode: "ask" | "build";
+  tone?: "light" | "dark";
+  glow?: boolean;
+}) {
+  const glyph = mode === "build" ? BUILD_GLYPH : ASK_GLYPH;
+  const filter = isPictographic(glyph)
+    ? tone === "dark"
+      ? "grayscale(1) brightness(0)"
+      : "grayscale(1) brightness(0) invert(1)"
+    : undefined;
+  return (
+    <span className="relative inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+      {glow ? (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-[-5px] rounded-full"
+          style={{
+            background:
+              "radial-gradient(circle, rgba(96,165,250,0.55) 0%, rgba(59,130,246,0.18) 45%, rgba(59,130,246,0) 72%)",
+          }}
+        />
+      ) : null}
+      <span
+        className={cn(
+          "relative",
+          mode === "build" ? "text-[16px]" : "text-[15px]",
+        )}
+        style={{ lineHeight: 1, filter }}
+      >
+        {glyph}
+      </span>
+    </span>
+  );
+}
+
+function ConvoAggregatePill({
+  messages,
+  isInFlight,
+}: {
+  messages: ChatMessage[];
+  isInFlight: boolean;
+}) {
+  const turnsWithNarrative = messages.filter(
+    (m) => m.sender === "ai" && m.narrative,
+  );
+  if (turnsWithNarrative.length < 2) return null;
+  let earliestMs: number | null = null;
+  let latestMs: number | null = null;
+  for (const m of turnsWithNarrative) {
+    const startMs = parseUtcIsoMs(m.narrative?.startedAt);
+    if (startMs !== null) {
+      earliestMs =
+        earliestMs === null ? startMs : Math.min(earliestMs, startMs);
+    }
+    const endMs =
+      parseUtcIsoMs(m.narrative?.endedAt) ?? parseUtcIsoMs(m.timestamp);
+    if (endMs !== null) {
+      latestMs = latestMs === null ? endMs : Math.max(latestMs, endMs);
+    }
+  }
+  const elapsedLabel =
+    earliestMs !== null && latestMs !== null && latestMs > earliestMs
+      ? formatElapsedSeconds(latestMs - earliestMs)
+      : null;
+  const anyError = turnsWithNarrative.some(
+    (m) => m.narrative?.terminal === "error",
+  );
+  const status = isInFlight ? "In flight" : anyError ? "Halted" : "Done";
+  const dotClass = isInFlight
+    ? "bg-blue-400"
+    : anyError
+      ? "bg-rose-400"
+      : "bg-emerald-400";
+  return (
+    <div className="flex justify-center pb-1">
+      <span className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/60 px-3 py-0.5 text-[11px] text-slate-300">
+        <span
+          aria-hidden="true"
+          className={`inline-block h-1.5 w-1.5 rounded-full ${dotClass}`}
+        />
+        {turnsWithNarrative.length} turns
+        {elapsedLabel ? ` · ${elapsedLabel} elapsed` : ""}
+        {" · "}
+        {status}
+      </span>
+    </div>
+  );
+}
 
 interface ChatMessage {
   id: string;
   sender: WorkflowCopilotChatSender;
   content: string;
   timestamp?: string;
+  // frozen narrative-bubble state captured at terminal RESPONSE
+  // so the per-block cards persist as the user scrolls back through past
+  // turns. Live in-flight narrative is rendered separately at the bottom.
+  narrative?: TurnNarrativeState;
 }
 
 type QueuedPrompt = {
   id: string;
   content: string;
+  reason: QueuedPromptReason;
+  audioBlob?: Blob | null;
 };
 
 type SendOptions = {
   queuedMessageId?: string;
   skipQueue?: boolean;
+  audioBlob?: Blob | null;
 };
 
 type WorkflowCopilotSsePayload =
@@ -75,6 +268,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotRunOutcomeUpdate
   | WorkflowCopilotTurnStartUpdate
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
@@ -97,29 +291,28 @@ interface MessageItemProps {
 }
 
 const MessageItem = memo(({ message, footer }: MessageItemProps) => {
+  if (message.sender === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="relative max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
+          <p className="whitespace-pre-wrap pr-12">{message.content}</p>
+          {message.timestamp ? (
+            <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-elevation1/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              {formatChatTimestamp(message.timestamp)}
+            </span>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
   return (
-    <div className="flex items-start gap-3">
-      <div
-        className={cn(
-          "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold",
-          message.sender === "ai"
-            ? "bg-neutral-950 text-white dark:bg-neutral-100 dark:text-neutral-950"
-            : "bg-neutral-200 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100",
-        )}
-      >
-        {message.sender === "ai" ? "AI" : "U"}
-      </div>
-      <div className="relative flex-1 rounded-lg bg-neutral-100 p-3 pr-12 dark:bg-neutral-900">
-        <p className="whitespace-pre-wrap pr-3 text-sm text-neutral-900 dark:text-neutral-100">
-          {message.content}
-        </p>
-        {footer ? <div className="mt-3 flex gap-2">{footer}</div> : null}
-        {message.timestamp ? (
-          <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] text-neutral-500 dark:bg-neutral-950/70 dark:text-neutral-500">
-            {formatChatTimestamp(message.timestamp)}
-          </span>
-        ) : null}
-      </div>
+    <div className="flex flex-col gap-2">
+      <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-slate-200">
+        {message.content}
+      </p>
+      {footer ? (
+        <div className="flex flex-wrap gap-2 pl-1">{footer}</div>
+      ) : null}
     </div>
   );
 });
@@ -134,6 +327,10 @@ interface WorkflowCopilotChatProps {
     workflow: WorkflowApiResponse,
     clearPending: () => void,
   ) => void;
+  // parent receives the block label when the user clicks a block
+  // card in the narrative bubble. The editor uses this to flash-highlight
+  // the matching canvas node.
+  onBlockSelect?: (blockLabel: string) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -143,6 +340,22 @@ interface WorkflowCopilotChatProps {
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
   onInitialMessageConsumed?: () => void;
+  // Render as a docked panel (no float/drag/resize) instead of a floating window.
+  docked?: boolean;
+  // Collapse the docked panel to a rail. Only used when `docked`.
+  onCollapse?: () => void;
+  // When docked, render into this element via a portal (keeps the component in
+  // its parent's React tree so canvas callbacks stay wired) instead of inline.
+  portalTarget?: HTMLElement | null;
+}
+
+// Snap-back state keyed by turn_id so rapid resubmits don't clobber a prior
+// turn's snapshot before its terminal frame lands. The snapshot captures
+// pre-submit canvas state (including unsaved local edits) so Reject / Cancel /
+// ERROR can revert exactly what the user submitted.
+interface TurnSnapshot {
+  snapshot: WorkflowApiResponse | null;
+  hadStagedDraft: boolean;
 }
 
 const AUTO_SEND_TIMEOUT_MS = 5000;
@@ -192,6 +405,7 @@ const constrainPosition = (
 export function WorkflowCopilotChat({
   onWorkflowUpdate,
   onReviewWorkflow,
+  onBlockSelect,
   isOpen = true,
   onClose,
   onMessageCountChange,
@@ -201,7 +415,65 @@ export function WorkflowCopilotChat({
   isLiveBrowserReady = false,
   initialMessage,
   onInitialMessageConsumed,
+  docked = false,
+  onCollapse,
+  portalTarget,
 }: WorkflowCopilotChatProps = {}) {
+  const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
+  const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
+  const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
+  const copilotV2Enabled = copilotV2Flag === true;
+  const codeBlockModeEnabled =
+    codeBlockModeFlag === true && codeBlockAccessFlag === true;
+  const defaultModeVariant = useFeatureFlagValue(
+    "WORKFLOW_COPILOT_DEFAULT_MODE",
+  );
+  // The variant configures the initial default only when both gating flags are on.
+  const effectiveDefaultVariant: ComposerDefaultVariant =
+    copilotV2Enabled && codeBlockModeEnabled
+      ? normalizeComposerDefaultVariant(defaultModeVariant)
+      : "build";
+  const [composerMode, setComposerMode] = useState<"ask" | "build">(() =>
+    effectiveDefaultVariant === "ask" || effectiveDefaultVariant === "ask_code"
+      ? "ask"
+      : "build",
+  );
+  const [codeWorkflow, setCodeWorkflow] = useState(() =>
+    defaultVariantUsesCode(effectiveDefaultVariant),
+  );
+  const [codeBlockRequestOverride, setCodeBlockRequestOverride] = useState<
+    boolean | null
+  >(() => defaultCodeBlockRequestOverride(defaultModeVariant));
+  // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
+  const composerSeededRef = useRef(false);
+  const flagsResolved =
+    copilotV2Flag !== undefined &&
+    codeBlockModeFlag !== undefined &&
+    codeBlockAccessFlag !== undefined;
+  useEffect(() => {
+    if (composerSeededRef.current || !flagsResolved) {
+      return;
+    }
+    composerSeededRef.current = true;
+    setComposerMode(
+      effectiveDefaultVariant === "ask" ||
+        effectiveDefaultVariant === "ask_code"
+        ? "ask"
+        : "build",
+    );
+    setCodeWorkflow(defaultVariantUsesCode(effectiveDefaultVariant));
+    setCodeBlockRequestOverride(
+      defaultCodeBlockRequestOverride(defaultModeVariant),
+    );
+  }, [flagsResolved, effectiveDefaultVariant, defaultModeVariant]);
+  // Build can never be active unless the V2 flag is on.
+  const isBuild = copilotV2Enabled && composerMode === "build";
+  const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
+  // "Build with code" is offered as a third mode in the dropdown rather than a
+  // separate toggle; the code state only renders on the button while in Build.
+  const codeOptionAvailable =
+    copilotV2Enabled && codeBlockModeEnabled && codeToggleAllowed;
+  const codeStateActive = isBuild && codeWorkflow && codeOptionAvailable;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -211,8 +483,31 @@ export function WorkflowCopilotChat({
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
     useState<TurnNarrativeState>(EMPTY_NARRATIVE);
+  // mirror of the latest narrative state so async SSE handlers
+  // closed over `handleSend`'s scope can read the live value instead of the
+  // stale closure capture from submit time.
+  const narrativeRef = useRef<TurnNarrativeState>(EMPTY_NARRATIVE);
+  useEffect(() => {
+    narrativeRef.current = narrative;
+  }, [narrative]);
+  const applyStoredNarrativeEvent = useCallback(
+    (event: NarrativeEvent, base?: TurnNarrativeState) => {
+      const next = applyNarrativeEvent(base ?? narrativeRef.current, event);
+      narrativeRef.current = next;
+      setNarrative(next);
+      return next;
+    },
+    [],
+  );
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
+  // Synchronous in-flight gate. State (isLoading) lags a render behind, so a
+  // rapid double-submit would run a stale closure and start a second stream;
+  // this ref is set before the first await and read at the top of handleSend.
+  const inFlightRef = useRef(false);
+  // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
+  // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
+  const queuedPromptRef = useRef<QueuedPrompt | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
   const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -225,6 +520,13 @@ export function WorkflowCopilotChat({
   // Mirrors workflowCopilotChatId for async handlers that would otherwise
   // close over a stale value across renders (e.g. clearProposedWorkflow).
   const workflowCopilotChatIdRef = useRef<string | null>(null);
+  const turnSnapshots = useRef<Map<string, TurnSnapshot>>(new Map());
+  // Snapshot captured at submit time. Moved into turnSnapshots once
+  // turn_start lands and we know the BE-assigned turn_id.
+  const pendingSubmitSnapshot = useRef<WorkflowApiResponse | null>(null);
+  // Most recent turn_id observed via turn_start; used by Reject and by
+  // legacy error frames that don't carry a turn_id.
+  const latestTurnId = useRef<string | null>(null);
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -264,11 +566,9 @@ export function WorkflowCopilotChat({
   });
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
-  const hasScrolledOnLoad = useRef(false);
   const hasAutoSentRef = useRef(false);
   const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
     requiresLiveBrowser,
@@ -288,31 +588,184 @@ export function WorkflowCopilotChat({
   // messages, and so auto-send has a synchronous "history loaded" gate.
   const historyLoadedForRef = useRef<string | null>(null);
 
-  const scrollToBottom = (behavior: ScrollBehavior) => {
-    messagesEndRef.current?.scrollIntoView({ behavior });
-  };
+  const followSignature = useMemo(
+    () =>
+      computeFollowSignature(
+        messages,
+        narrative,
+        isLoading,
+        isLoadingHistory,
+        queuedPrompt,
+        Boolean(proposedWorkflow),
+      ),
+    [
+      messages,
+      narrative,
+      isLoading,
+      isLoadingHistory,
+      queuedPrompt,
+      proposedWorkflow,
+    ],
+  );
+  const { scrollRef, isPinned, jumpToLatest, repin } =
+    useStickToBottom<HTMLDivElement>(followSignature, { enabled: isOpen });
 
   const adjustTextareaHeight = useCallback(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
 
+    if (!textarea.value) {
+      textarea.style.height = "40px";
+      textarea.style.overflowY = "hidden";
+      return;
+    }
+
     textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
+    const newHeight = Math.min(textarea.scrollHeight, 150);
+    textarea.style.height = `${newHeight}px`;
+    textarea.style.overflowY = newHeight >= 150 ? "auto" : "hidden";
   }, []);
 
   useEffect(() => {
     adjustTextareaHeight();
   }, [adjustTextareaHeight, inputValue]);
 
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  // Bind the observer when the textarea mounts (it can mount late); the width-only guard avoids a resize loop.
+  const setTextareaRef = useCallback(
+    (node: HTMLTextAreaElement | null) => {
+      textareaRef.current = node;
+      resizeObserverRef.current?.disconnect();
+      resizeObserverRef.current = null;
+      if (!node || typeof ResizeObserver === "undefined") return;
+      let lastWidth = node.clientWidth;
+      const observer = new ResizeObserver(() => {
+        if (node.clientWidth !== lastWidth) {
+          lastWidth = node.clientWidth;
+          adjustTextareaHeight();
+        }
+      });
+      observer.observe(node);
+      resizeObserverRef.current = observer;
+    },
+    [adjustTextareaHeight],
+  );
+
+  const {
+    isSupported: isSpeechSupported,
+    isListening: isSpeechListening,
+    isHearingSpeech: isSpeechHearing,
+    stop: stopSpeech,
+    toggle: toggleSpeech,
+    takeAudioBlob: takeSpeechAudioBlob,
+  } = useSpeechToTextField({
+    value: inputValue,
+    onChange: setInputValue,
+    enabled: isOpen && !queuedPrompt,
+  });
+
+  const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
+    queuedPromptRef.current = next;
+    setQueuedPrompt(next);
+  }, []);
+
   const handleNewChat = () => {
     setMessages([]);
-    setQueuedPrompt(null);
+    updateQueuedPrompt(null);
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
     setNarrative(EMPTY_NARRATIVE);
-    hasScrolledOnLoad.current = false;
+    turnSnapshots.current.clear();
+    pendingSubmitSnapshot.current = null;
+    latestTurnId.current = null;
+    repin();
   };
+
+  const applyHistoryResponse = useCallback(
+    (data: WorkflowCopilotChatHistoryResponse) => {
+      const historyMessages = data.chat_history.map((message, index) => ({
+        id: `${index}-${Date.now()}`,
+        sender: message.sender,
+        content: message.content,
+        timestamp: message.created_at,
+        narrative: (() => {
+          const hydrated = hydrateHistoryNarrative(
+            message.narrative_payload,
+            message.turn_outcome,
+          );
+          if (!hydrated) return undefined;
+          // Fall back to the legacy message body when the persisted payload
+          // predates terminal-text capture.
+          if (!hydrated.terminalMessage && message.content) {
+            return {
+              ...hydrated,
+              terminalMessage: message.content,
+              narrativeSummary: hydrated.narrativeSummary ?? message.content,
+            };
+          }
+          return hydrated;
+        })(),
+      }));
+      setMessages(historyMessages);
+      setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
+      setProposedWorkflow(data.proposed_workflow ?? null);
+      setAutoAccept(data.auto_accept ?? false);
+    },
+    // Only stable state setters are referenced, so the callback never needs to change.
+    [],
+  );
+
+  const loadChatInPlace = useCallback(
+    async (chatId: string) => {
+      if (!workflowPermanentId) return;
+      setIsLoadingHistory(true);
+      updateQueuedPrompt(null);
+      setNarrative(EMPTY_NARRATIVE);
+      turnSnapshots.current.clear();
+      pendingSubmitSnapshot.current = null;
+      latestTurnId.current = null;
+      repin();
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+          "/workflow/copilot/chat-history",
+          {
+            params: {
+              workflow_permanent_id: workflowPermanentId,
+              workflow_copilot_chat_id: chatId,
+            },
+          },
+        );
+        applyHistoryResponse(response.data);
+        // Mark history loaded for this workflow so the mount effect won't reload
+        // the latest chat over the one the user just selected.
+        historyLoadedForRef.current = workflowPermanentId;
+      } catch (error) {
+        console.error("Failed to load chat:", error);
+        toast({ title: "Failed to load chat", variant: "destructive" });
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    },
+    [
+      credentialGetter,
+      workflowPermanentId,
+      applyHistoryResponse,
+      updateQueuedPrompt,
+      repin,
+    ],
+  );
+
+  const handleSelectHistoryChat = useCallback(
+    (chat: WorkflowCopilotChatSummary) => {
+      if (chat.workflow_copilot_chat_id === workflowCopilotChatIdRef.current) {
+        return;
+      }
+      void loadChatInPlace(chat.workflow_copilot_chat_id);
+    },
+    [loadChatInPlace],
+  );
 
   const applyWorkflowUpdate = useCallback(
     (
@@ -410,6 +863,14 @@ export function WorkflowCopilotChat({
   };
 
   const handleRejectWorkflow = () => {
+    // The staged proposal was rendered onto the canvas mid-turn (via
+    // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
+    // canvas state captured client-side at submit time.
+    const turnId = latestTurnId.current;
+    const entry = turnId ? turnSnapshots.current.get(turnId) : null;
+    if (entry?.snapshot) {
+      applyWorkflowUpdate(entry.snapshot);
+    }
     setProposedWorkflow(null);
     void clearProposedWorkflow(false);
   };
@@ -434,6 +895,37 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(latestChatId);
     return latestChatId;
   };
+
+  const uploadDictationAudio = useCallback(
+    async (audioBlob: Blob): Promise<WorkflowCopilotAudioUploadResponse> => {
+      if (!workflowPermanentId) {
+        throw new Error("Missing workflow permanent ID for audio upload.");
+      }
+
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const formData = new FormData();
+      formData.append("workflow_permanent_id", workflowPermanentId);
+      const chatId = workflowCopilotChatIdRef.current?.trim();
+      if (chatId) {
+        formData.append("workflow_copilot_chat_id", chatId);
+      }
+      formData.append("file", audioBlob, `dictation-${Date.now()}.webm`);
+
+      const response = await client.post<WorkflowCopilotAudioUploadResponse>(
+        "/workflow/copilot/chat-audio",
+        formData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        },
+      );
+      setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+      workflowCopilotChatIdRef.current = response.data.workflow_copilot_chat_id;
+      return response.data;
+    },
+    [credentialGetter, workflowPermanentId],
+  );
 
   const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
     const clearProposalByChatId = async (chatId: string) => {
@@ -501,25 +993,9 @@ export function WorkflowCopilotChat({
   }, [messages.length, onMessageCountChange]);
 
   useEffect(() => {
-    if (!isOpen) {
-      hasScrolledOnLoad.current = false;
-      return;
-    }
-    if (isLoadingHistory) {
-      return;
-    }
-    if (!hasScrolledOnLoad.current) {
-      scrollToBottom("auto");
-      hasScrolledOnLoad.current = true;
-      return;
-    }
-    scrollToBottom("smooth");
-  }, [messages, isLoading, isLoadingHistory, isOpen]);
-
-  useEffect(() => {
     if (!workflowPermanentId) {
       setMessages([]);
-      setQueuedPrompt(null);
+      updateQueuedPrompt(null);
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
@@ -536,7 +1012,7 @@ export function WorkflowCopilotChat({
 
     const fetchHistory = async () => {
       setIsLoadingHistory(true);
-      hasScrolledOnLoad.current = false;
+      repin();
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.get<WorkflowCopilotChatHistoryResponse>(
@@ -548,18 +1024,7 @@ export function WorkflowCopilotChat({
 
         if (!isMounted) return;
 
-        const historyMessages = response.data.chat_history.map(
-          (message, index) => ({
-            id: `${index}-${Date.now()}`,
-            sender: message.sender,
-            content: message.content,
-            timestamp: message.created_at,
-          }),
-        );
-        setMessages(historyMessages);
-        setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
-        setProposedWorkflow(response.data.proposed_workflow ?? null);
-        setAutoAccept(response.data.auto_accept ?? false);
+        applyHistoryResponse(response.data);
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
@@ -575,7 +1040,13 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, workflowPermanentId]);
+  }, [
+    credentialGetter,
+    repin,
+    updateQueuedPrompt,
+    workflowPermanentId,
+    applyHistoryResponse,
+  ]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -633,7 +1104,9 @@ export function WorkflowCopilotChat({
       return;
     }
 
-    setQueuedPrompt(null);
+    updateQueuedPrompt(null);
+    // Discard the queued block-build's target so it can't leak into the next normal message.
+    blockBuildTargetLabelRef.current = null;
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -642,7 +1115,7 @@ export function WorkflowCopilotChat({
       textareaRef.current?.focus();
       adjustTextareaHeight();
     });
-  }, [adjustTextareaHeight, queuedPrompt]);
+  }, [adjustTextareaHeight, queuedPrompt, updateQueuedPrompt]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -664,15 +1137,27 @@ export function WorkflowCopilotChat({
     };
   }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
 
+  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
+  const blockBuildTargetLabelRef = useRef<string | null>(null);
+  // True only while a block-build turn is actually in flight (not a turn it queued behind).
+  const blockGenInFlightRef = useRef(false);
+
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
       const candidate = messageOverride ?? inputValue;
-      if (
-        !candidate.trim() ||
-        isLoading ||
-        (queuedPrompt && !options.queuedMessageId)
-      )
+      const isDrain = Boolean(options.queuedMessageId);
+      const action = resolveSendAction({
+        inFlight: inFlightRef.current,
+        hasQueuedPrompt: Boolean(queuedPromptRef.current),
+        requiresLiveBrowser,
+        isLiveBrowserReady,
+        candidate,
+        isDrain,
+        skipQueue: Boolean(options.skipQueue),
+      });
+      if (action === "noop") {
         return;
+      }
       if (!workflowPermanentId) {
         toast({
           title: "Missing agent",
@@ -681,36 +1166,52 @@ export function WorkflowCopilotChat({
         });
         return;
       }
-      if (
-        !options.skipQueue &&
-        shouldQueuePromptForLiveBrowser({
-          requiresLiveBrowser,
-          isLiveBrowserReady,
-          message: candidate,
-        })
-      ) {
-        const queued: QueuedPrompt = {
-          id: `${Date.now()}-queued`,
-          content: candidate,
-        };
 
-        setQueuedPrompt(queued);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: queued.id,
-            sender: "user",
-            content: queued.content,
-          },
-        ]);
+      let messageAudioBlob = options.audioBlob ?? null;
+      if (!messageAudioBlob && messageOverride === undefined) {
+        if (isSpeechListening) {
+          messageAudioBlob = await stopSpeech();
+        }
+        messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+
+      if (action === "queue_working" || action === "queue_live_browser") {
+        const reason: QueuedPromptReason =
+          action === "queue_working" ? "working" : "live_browser";
+        const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        updateQueuedPrompt({
+          id: queuedId,
+          content: candidate,
+          reason,
+          audioBlob: messageAudioBlob,
+        });
+        // First queue adds the user bubble; a re-queue (a working drain that
+        // then had to wait for the browser) reuses the existing bubble.
+        if (!options.queuedMessageId) {
+          setMessages((prev) => [
+            ...prev,
+            { id: queuedId, sender: "user", content: candidate },
+          ]);
+        }
         setProposedWorkflow(null);
         if (messageOverride === undefined) {
           setInputValue("");
         }
-        toast({
-          title: "Prompt queued",
-          description: "Copilot will start once the live browser connects.",
-        });
+        if (!options.queuedMessageId) {
+          toast(
+            reason === "working"
+              ? {
+                  title: "Message queued",
+                  description:
+                    "Copilot is finishing the current turn — it will send next.",
+                }
+              : {
+                  title: "Prompt queued",
+                  description:
+                    "Copilot will start once the live browser connects.",
+                },
+          );
+        }
         return;
       }
 
@@ -734,6 +1235,7 @@ export function WorkflowCopilotChat({
         setInputValue("");
       }
       setIsLoading(true);
+      inFlightRef.current = true;
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -743,6 +1245,8 @@ export function WorkflowCopilotChat({
         const saveData = getSaveData();
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
+        let chatIdForRequest = workflowCopilotChatId;
+        let audioArtifactId: string | null = null;
 
         if (!workflowId) {
           toast({
@@ -789,8 +1293,11 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
             max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+            max_elapsed_time_minutes:
+              saveData.settings.maxElapsedTimeMinutes ?? null,
             totp_verification_url: saveData.workflow.totp_verification_url,
             extra_http_headers: extraHttpHeaders,
             run_with: saveData.settings.runWith,
@@ -812,6 +1319,36 @@ export function WorkflowCopilotChat({
           };
 
           workflowYaml = convertToYAML(requestBody);
+
+          // Snapshot pre-submit canvas state (including unsaved local edits)
+          // so Reject / Cancel / ERROR can revert the canvas to exactly what
+          // the user submitted. ``saveData.workflow`` is the last-loaded
+          // canonical; overlay it with the live canvas blocks/parameters.
+          pendingSubmitSnapshot.current = {
+            ...saveData.workflow,
+            title: saveData.title,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
+            model: saveData.settings.model,
+            workflow_definition: {
+              ...saveData.workflow.workflow_definition,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+            },
+          } as WorkflowApiResponse;
+        }
+
+        if (messageAudioBlob) {
+          try {
+            const uploadResponse = await uploadDictationAudio(messageAudioBlob);
+            chatIdForRequest = uploadResponse.workflow_copilot_chat_id;
+            audioArtifactId = uploadResponse.audio_artifact_id;
+          } catch (error) {
+            console.warn("Failed to upload dictation audio:", error);
+          }
         }
 
         const handleProcessingUpdate = (
@@ -833,21 +1370,48 @@ export function WorkflowCopilotChat({
 
         const handleResponse = (
           response: WorkflowCopilotStreamResponseUpdate,
+          responseNarrative?: TurnNarrativeState,
         ) => {
           // Stream completed; a Cancel click after this point should no-op.
           pendingCancelToken.current = null;
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
+
+          // freeze the current narrative state into the AI message
+          // so per-block cards persist as the user scrolls past this turn.
+          // Read via narrativeRef because this callback was closed over at
+          // handleSend time (pre-turn_start), so the React state binding is
+          // stale here.
+          const liveNarrative = responseNarrative ?? narrativeRef.current;
+          const hasNarrativePayload =
+            response.narrative_payload !== null &&
+            typeof response.narrative_payload === "object";
+          const frozenNarrative: TurnNarrativeState | undefined =
+            responseNarrative ??
+            (liveNarrative.turnId !== null || hasNarrativePayload
+              ? applyNarrativeEvent(
+                  liveNarrative.turnId !== null
+                    ? liveNarrative
+                    : EMPTY_NARRATIVE,
+                  response,
+                )
+              : undefined);
 
           const aiMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
             content: response.message,
             timestamp: response.response_time,
+            narrative: frozenNarrative,
           };
 
           setMessages((prev) => [...prev, aiMessage]);
           const userCancelledThisTurn =
             cancelInFlightController.current === abortController;
+          const responseTurnId =
+            response.turn_id ?? latestTurnId.current ?? null;
+          const responseEntry = responseTurnId
+            ? (turnSnapshots.current.get(responseTurnId) ?? null)
+            : null;
           if (
             response.updated_workflow &&
             shouldAutoApplyWorkflowResponse(
@@ -857,68 +1421,143 @@ export function WorkflowCopilotChat({
             )
           ) {
             applyWorkflowUpdate(response.updated_workflow);
+          } else if (response.updated_workflow) {
+            setProposedWorkflow(response.updated_workflow);
+          } else if (
+            // Cancel/error terminal on a turn that produced staged content →
+            // snap canvas back to the pre-submit client snapshot.
+            (response.cancelled || frozenNarrative?.terminal === "error") &&
+            responseEntry?.hadStagedDraft &&
+            responseEntry?.snapshot
+          ) {
+            applyWorkflowUpdate(responseEntry.snapshot);
+            setProposedWorkflow(null);
           } else {
+            // Informational reply OR proposal pending review. For
+            // proposals, the Accept/Reject card is the user's next gate;
+            // canvas keeps the staged content until the user acts.
             setProposedWorkflow(response.updated_workflow ?? null);
           }
         };
 
-        const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+        const handleError = (
+          payload: WorkflowCopilotStreamErrorUpdate,
+          errorNarrative?: TurnNarrativeState,
+        ) => {
           pendingCancelToken.current = null;
+          const liveNarrative = errorNarrative ?? narrativeRef.current;
+          const frozenNarrative: TurnNarrativeState | undefined =
+            errorNarrative ??
+            (liveNarrative.turnId !== null
+              ? applyNarrativeEvent(liveNarrative, payload)
+              : undefined);
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
             content: payload.error,
+            narrative: frozenNarrative,
           };
           setMessages((prev) => [...prev, errorMessage]);
+          // Error on a turn that produced staged content → snap canvas
+          // back. Errors on no-draft turns leave the canvas alone.
+          const errorTurnId = payload.turn_id ?? latestTurnId.current ?? null;
+          const errorEntry = errorTurnId
+            ? (turnSnapshots.current.get(errorTurnId) ?? null)
+            : null;
+          if (errorEntry?.hadStagedDraft && errorEntry?.snapshot) {
+            applyWorkflowUpdate(errorEntry.snapshot);
+            setProposedWorkflow(null);
+          }
         };
 
         const client = await getSseClient(credentialGetter);
+        const targetBlockLabel = blockBuildTargetLabelRef.current;
+        blockBuildTargetLabelRef.current = null;
+        if (targetBlockLabel != null) {
+          blockGenInFlightRef.current = true;
+        }
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
             workflow_id: workflowId,
             workflow_permanent_id: workflowPermanentId,
-            workflow_copilot_chat_id: workflowCopilotChatId,
+            workflow_copilot_chat_id: chatIdForRequest,
             workflow_run_id: workflowRunId,
             browser_session_id: liveBrowserSessionId ?? null,
             message: messageContent,
+            audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
+            mode: copilotV2Enabled ? composerMode : null,
+            code_block:
+              isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
             cancel_token: cancelToken,
+            target_block_label: targetBlockLabel,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
               case "processing_update":
                 handleProcessingUpdate(payload);
                 return false;
-              // Legacy in-flight signals — the narrative bubble derives its
-              // state from turn_start/design_*/block_progress/workflow_draft
-              // instead, so these are intentionally dropped here.
+              case "condensing":
+                return false;
               case "tool_call":
               case "tool_result":
-              case "condensing":
               case "narration":
-                return false;
               case "block_progress":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+              case "run_outcome":
+                applyStoredNarrativeEvent(payload);
                 return false;
-              case "turn_start":
-                setNarrative(() =>
-                  applyNarrativeEvent(EMPTY_NARRATIVE, payload),
-                );
+              case "turn_start": {
+                // Move the pre-submit canvas snapshot into the per-turn
+                // map keyed by the BE-assigned turn_id; cap the map so a
+                // long-running chat does not retain every turn's snapshot.
+                const map = turnSnapshots.current;
+                map.set(payload.turn_id, {
+                  snapshot: pendingSubmitSnapshot.current,
+                  hadStagedDraft: false,
+                });
+                pendingSubmitSnapshot.current = null;
+                while (map.size > MAX_TURN_SNAPSHOTS) {
+                  const oldest = map.keys().next().value;
+                  if (oldest === undefined) break;
+                  map.delete(oldest);
+                }
+                latestTurnId.current = payload.turn_id;
+                applyStoredNarrativeEvent(payload, EMPTY_NARRATIVE);
                 return false;
+              }
               case "design_start":
               case "design_end":
-              case "workflow_draft":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                applyStoredNarrativeEvent(payload);
                 return false;
-              case "response":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
-                handleResponse(payload);
+              case "workflow_draft": {
+                // Render the staged workflow on the canvas mid-turn. Only
+                // mark the turn as having staged content if applyWorkflowUpdate
+                // succeeds — a swallowed update would otherwise trigger a
+                // spurious snap-back at terminal.
+                if (payload.workflow) {
+                  const applied = applyWorkflowUpdate(payload.workflow);
+                  if (applied) {
+                    const turnId = latestTurnId.current;
+                    if (turnId) {
+                      const entry = turnSnapshots.current.get(turnId);
+                      if (entry) entry.hadStagedDraft = true;
+                    }
+                  }
+                }
+                applyStoredNarrativeEvent(payload);
+                return false;
+              }
+              case "response": {
+                const frozenNarrative = applyStoredNarrativeEvent(payload);
+                handleResponse(payload, frozenNarrative);
                 return true;
-              case "error":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
-                handleError(payload);
+              }
+              case "error": {
+                const frozenNarrative = applyStoredNarrativeEvent(payload);
+                handleError(payload, frozenNarrative);
                 return true;
+              }
               default:
                 return false;
             }
@@ -936,9 +1575,13 @@ export function WorkflowCopilotChat({
           content: "Sorry, I encountered an error. Please try again.",
         };
         setMessages((prev) => [...prev, errorMessage]);
+        // A thrown stream never emits a terminal narrative event, so clear the
+        // bubble or its Working/elapsed indicator would tick forever.
+        setNarrative(EMPTY_NARRATIVE);
       } finally {
         if (streamingAbortController.current === abortController) {
           streamingAbortController.current = null;
+          inFlightRef.current = false;
         }
         if (cancelInFlightController.current === abortController) {
           cancelInFlightController.current = null;
@@ -953,21 +1596,118 @@ export function WorkflowCopilotChat({
       }
     },
     [
+      applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       autoAccept,
+      codeBlockModeEnabled,
+      codeBlockRequestOverride,
+      composerMode,
+      copilotV2Enabled,
       credentialGetter,
       getSaveData,
       inputValue,
+      isSpeechListening,
+      isBuild,
       isLiveBrowserReady,
-      isLoading,
       liveBrowserSessionId,
-      queuedPrompt,
       requiresLiveBrowser,
+      stopSpeech,
+      takeSpeechAudioBlob,
+      updateQueuedPrompt,
+      uploadDictationAudio,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
     ],
   );
+
+  // A code block's "Generate" button asks the copilot to (re)build that one block
+  // from its goal. Force build + code mode, then fire the send on the next tick.
+  const pendingBlockBuild = useCopilotActionStore(
+    (state) => state.pendingBuild,
+  );
+  const clearPendingBlockBuild = useCopilotActionStore(
+    (state) => state.clearPendingBuild,
+  );
+  const finishBlockGenerating = useCopilotActionStore(
+    (state) => state.finishGenerating,
+  );
+  const blockCancelNonce = useCopilotActionStore((state) => state.cancelNonce);
+  const blockBuildMessageRef = useRef<string | null>(null);
+  const [blockBuildArmNonce, setBlockBuildArmNonce] = useState(0);
+
+  useEffect(() => {
+    if (!pendingBlockBuild) {
+      return;
+    }
+    blockBuildMessageRef.current =
+      `Rebuild the "${pendingBlockBuild.blockLabel}" code block so it accomplishes ` +
+      `this goal, and update its code and steps accordingly: ${pendingBlockBuild.prompt}`;
+    blockBuildTargetLabelRef.current = pendingBlockBuild.blockLabel;
+    setComposerMode("build");
+    setCodeWorkflow(true);
+    setCodeBlockRequestOverride(true);
+    setBlockBuildArmNonce((nonce) => nonce + 1);
+    clearPendingBlockBuild();
+  }, [pendingBlockBuild, clearPendingBlockBuild]);
+
+  useEffect(() => {
+    if (blockBuildArmNonce === 0 || blockBuildMessageRef.current === null) {
+      return;
+    }
+    if (composerMode !== "build" || !codeWorkflow) {
+      return;
+    }
+    const message = blockBuildMessageRef.current;
+    blockBuildMessageRef.current = null;
+    // A prompt is already queued, so this send no-ops. Disarm the block target
+    // (else the queued drain inherits it) and clear the stuck generating state.
+    if (queuedPromptRef.current) {
+      blockBuildTargetLabelRef.current = null;
+      finishBlockGenerating();
+      return;
+    }
+    void handleSend(message);
+  }, [
+    blockBuildArmNonce,
+    composerMode,
+    codeWorkflow,
+    handleSend,
+    finishBlockGenerating,
+  ]);
+
+  const blockGenLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    if (
+      blockGenLoadingRef.current &&
+      !isLoading &&
+      blockGenInFlightRef.current
+    ) {
+      blockGenInFlightRef.current = false;
+      finishBlockGenerating();
+    }
+    blockGenLoadingRef.current = isLoading;
+  }, [isLoading, finishBlockGenerating]);
+
+  const blockCancelNonceRef = useRef(blockCancelNonce);
+  useEffect(() => {
+    if (blockCancelNonce !== blockCancelNonceRef.current) {
+      blockCancelNonceRef.current = blockCancelNonce;
+      const queued = queuedPromptRef.current;
+      // A queued block build hasn't streamed yet, so cancelSend would no-op and
+      // let it drain later. Drop it (and its bubble), leaving any unrelated
+      // in-flight turn untouched.
+      if (queued && blockBuildTargetLabelRef.current != null) {
+        blockBuildTargetLabelRef.current = null;
+        updateQueuedPrompt(null);
+        setMessages((prev) =>
+          prev.filter((message) => message.id !== queued.id),
+        );
+        return;
+      }
+      void cancelSend();
+    }
+  }, [blockCancelNonce, cancelSend, updateQueuedPrompt]);
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -977,24 +1717,28 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
-    // Drain only when the browser is actually ready (non-null session id from
-    // the parent). If requiresLiveBrowser flips to false without a session
-    // (rate-limit, pane hidden), the queue stays so user intent isn't sent
-    // with browser_session_id=null.
-    if (
-      !queuedPrompt ||
-      !liveBrowserSessionId ||
-      isLoading ||
-      !workflowPermanentId
-    ) {
+    // isLoading (reactive state) is the in-flight signal here so the effect
+    // re-runs when a turn ends; handleSend uses the synchronous ref instead.
+    const drainAction = resolveDrainAction({
+      queuedReason: queuedPrompt?.reason ?? null,
+      inFlight: isLoading,
+      hasLiveBrowserSession: Boolean(liveBrowserSessionId),
+      hasWorkflowPermanentId: Boolean(workflowPermanentId),
+    });
+    if (!queuedPrompt || drainAction === "wait") {
       return;
     }
 
     const promptToSend = queuedPrompt;
-    setQueuedPrompt(null);
+    // Clear before re-entering handleSend so a 'send' resolution leaves no
+    // stale queued prompt for the effect to re-drain in a loop. A working
+    // prompt that still needs the browser re-queues under the same id and
+    // drains via the live_browser path once the session arrives.
+    updateQueuedPrompt(null);
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
-      skipQueue: true,
+      skipQueue: drainAction === "drain_skip_queue",
+      audioBlob: promptToSend.audioBlob,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
@@ -1003,6 +1747,7 @@ export function WorkflowCopilotChat({
     isLoading,
     liveBrowserSessionId,
     queuedPrompt,
+    updateQueuedPrompt,
     workflowPermanentId,
   ]);
 
@@ -1226,238 +1971,550 @@ export function WorkflowCopilotChat({
     return null;
   }
 
-  const inputDisabled = isLoading || Boolean(queuedPrompt);
+  // Input stays usable while Copilot works; only a parked queued prompt
+  // disables it (the message is already captured).
+  const inputDisabled = Boolean(queuedPrompt);
   const queuedPromptWaitingStatus =
-    "Prompt queued. Waiting for live browser...";
+    queuedPrompt?.reason === "working"
+      ? "Queued — sends when this turn finishes."
+      : "Prompt queued. Waiting for live browser...";
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
-    : isWaitingForLiveBrowser
-      ? "Live browser is starting. Send now to queue your prompt."
-      : null;
+    : isLoading
+      ? "Copilot is working — message will queue…"
+      : isWaitingForLiveBrowser
+        ? "Live browser is starting. Send now to queue your prompt."
+        : null;
+  const inputStatusText = isSpeechListening
+    ? browserStatusText
+      ? `Listening… · ${browserStatusText}`
+      : "Listening…"
+    : browserStatusText;
 
-  return (
+  const content = (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-neutral-200 bg-white text-neutral-900 shadow-2xl dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100"
-      style={{
-        left: `${position.x}px`,
-        top: `${position.y}px`,
-        width: `${size.width}px`,
-        height: `${size.height}px`,
-      }}
+      className={
+        docked
+          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
+      }
+      style={
+        docked
+          ? undefined
+          : {
+              left: `${position.x}px`,
+              top: `${position.y}px`,
+              width: `${size.width}px`,
+              height: `${size.height}px`,
+            }
+      }
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-neutral-200 px-4 py-2 dark:border-neutral-800"
-        onMouseDown={handleMouseDown}
+        className={
+          "flex items-center justify-between border-b border-border px-4" +
+          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+        }
+        onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-          Agent Copilot (Beta)
-        </h3>
         <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-foreground">
+            {docked ? "Copilot" : "Agent Copilot (Beta)"}
+          </h3>
+          {docked ? (
+            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+              Beta
+            </span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <WorkflowCopilotHistory
+            workflowPermanentId={workflowPermanentId}
+            currentChatId={workflowCopilotChatId}
+            onSelect={handleSelectHistoryChat}
+            disabled={isLoading || isLoadingHistory}
+          />
           <button
             type="button"
             onClick={handleNewChat}
             onMouseDown={(e) => e.stopPropagation()}
-            className="rounded border border-neutral-300 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+            className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             New chat
           </button>
-          <div className="h-2 w-2 rounded-full bg-green-500"></div>
-          <span className="text-xs text-neutral-500 dark:text-neutral-400">
-            Active
-          </span>
-          <button
-            type="button"
-            onClick={() => onClose?.()}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-900 dark:hover:text-neutral-100"
-            title="Close"
-          >
-            <Cross2Icon className="h-4 w-4" />
-          </button>
+          <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
+          <span className="text-xs text-muted-foreground">Active</span>
+          {docked ? (
+            onCollapse ? (
+              <button
+                type="button"
+                onClick={onCollapse}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Collapse Copilot"
+              >
+                <ChevronRightIcon className="h-4 w-4" />
+              </button>
+            ) : null
+          ) : (
+            <button
+              type="button"
+              onClick={() => onClose?.()}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              title="Close"
+            >
+              <Cross2Icon className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4">
-        <div className="space-y-3">
-          {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-            <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300">
-              <p className="font-semibold text-neutral-900 dark:text-neutral-100">
-                Start a new chat
-              </p>
-              <p className="mt-2 text-neutral-500 dark:text-neutral-400">
-                Ask the copilot to draft or edit your agent. Provide a goal, the
-                target site, and any credentials it should use.
-              </p>
-              <p className="mt-2 text-neutral-500 dark:text-neutral-400">
-                Example: "Build an agent to find the top post on hackernews
-                today"
-              </p>
-            </div>
-          ) : null}
-          {messages.map((message, index) => {
-            const isLastMessage = index === messages.length - 1;
-            const showProposedPanel = isLastMessage && proposedWorkflow;
-            const showQueuedFooter =
-              isQueuedPromptWaiting && message.id === queuedPrompt?.id;
-            return (
-              <MessageItem
-                key={message.id}
-                message={message}
-                footer={
-                  showQueuedFooter ? (
-                    <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
-                      <ReloadIcon className="h-3 w-3 animate-spin" />
-                      <span>{queuedPromptWaitingStatus}</span>
-                    </div>
-                  ) : showProposedPanel ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                        className="rounded border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-900 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:hover:bg-neutral-900"
-                      >
-                        Review
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                        className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
-                      >
-                        Accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleAcceptWorkflow(proposedWorkflow, true)
+      <div className="relative min-h-0 flex-1">
+        <div ref={scrollRef} className="h-full overflow-y-auto p-4">
+          <div className="space-y-3">
+            {!isLoadingHistory && messages.length === 0 && !isLoading ? (
+              <div className="rounded-lg border border-border bg-slate-elevation2 p-4 text-sm text-muted-foreground">
+                <p className="font-semibold text-foreground">
+                  Start a new chat
+                </p>
+                <p className="mt-2 text-muted-foreground">
+                  Ask the copilot to draft or edit your agent. Provide a goal,
+                  the target site, and any credentials it should use.
+                </p>
+                <p className="mt-2 text-muted-foreground">
+                  Example: "Build an agent to find the top post on hackernews
+                  today"
+                </p>
+              </div>
+            ) : null}
+            <ConvoAggregatePill
+              messages={messages}
+              isInFlight={
+                isLoading ||
+                (narrative.turnId !== null && narrative.terminal === null)
+              }
+            />
+            {messages.map((message, index) => {
+              const isLastMessage = index === messages.length - 1;
+              const showQueuedFooter =
+                isQueuedPromptWaiting && message.id === queuedPrompt?.id;
+              // Per-message frozen narrative. When an AI message carries a
+              // frozen narrative, render the narrative card stack in place
+              // of the legacy text bubble so the per-block cards survive
+              // subsequent turns. The Accept/Reject controls render only on
+              // the latest message AND while the proposal is pending review.
+              if (message.sender === "ai" && message.narrative) {
+                const showProposalActions =
+                  isLastMessage && Boolean(proposedWorkflow);
+                return (
+                  <div
+                    key={message.id}
+                    className="flex flex-col gap-2"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <NarrativeView
+                      turn={message.narrative}
+                      onBlockSelect={onBlockSelect}
+                    />
+                    {showProposalActions && proposedWorkflow ? (
+                      <div className="flex flex-wrap gap-2 pl-1">
+                        <button
+                          type="button"
+                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
+                        >
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleAcceptWorkflow(proposedWorkflow, true)
+                          }
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
+                        >
+                          Always accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRejectWorkflow}
+                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : null}
+                    {docked && shouldShowDiffCard(message.narrative) ? (
+                      <DiffCard turn={message.narrative} />
+                    ) : null}
+                    {docked &&
+                    isLastMessage &&
+                    shouldShowFixCard(message.narrative) ? (
+                      <FixCard
+                        turn={message.narrative}
+                        onFix={() =>
+                          handleSend(
+                            "The last run failed — diagnose the failure and fix it, then re-run.",
+                          )
                         }
-                        className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
-                      >
-                        Always accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleRejectWorkflow}
-                        className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
-                      >
-                        Reject
-                      </button>
-                    </>
-                  ) : null
-                }
-              />
-            );
-          })}
-          {narrative.turnId !== null && (
-            <div
-              className="flex items-start gap-3"
-              role="status"
-              aria-live="polite"
-            >
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
-                AI
+                      />
+                    ) : null}
+                  </div>
+                );
+              }
+              const showProposedPanel = isLastMessage && proposedWorkflow;
+              return (
+                <MessageItem
+                  key={message.id}
+                  message={message}
+                  footer={
+                    showQueuedFooter ? (
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <ReloadIcon className="h-3 w-3 animate-spin" />
+                        <span>{queuedPromptWaitingStatus}</span>
+                      </div>
+                    ) : showProposedPanel ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
+                        >
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleAcceptWorkflow(proposedWorkflow, true)
+                          }
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
+                        >
+                          Always accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRejectWorkflow}
+                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Reject
+                        </button>
+                      </>
+                    ) : null
+                  }
+                />
+              );
+            })}
+            {/*
+            Bottom in-flight narrative bubble. Suppressed once the terminal
+            RESPONSE has frozen the narrative into the latest AI message —
+            otherwise the same turn would render twice.
+          */}
+            {narrative.turnId !== null && narrative.terminal === null && (
+              <div
+                className="flex flex-col gap-2"
+                role="status"
+                aria-live="polite"
+              >
+                <NarrativeView turn={narrative} onBlockSelect={onBlockSelect} />
               </div>
-              <div className="flex-1 rounded-lg bg-slate-800 p-3">
-                <NarrativeView turn={narrative} />
-              </div>
-            </div>
-          )}
-          <div ref={messagesEndRef} />
+            )}
+          </div>
         </div>
+        {!isPinned ? (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-slate-elevation3 px-3 py-1 text-xs text-foreground shadow-md hover:bg-slate-elevation4"
+          >
+            <ChevronDownIcon className="h-3 w-3" />
+            Jump to latest
+          </button>
+        ) : null}
       </div>
 
       {/* Input */}
-      <div className="border-t border-neutral-200 p-3 dark:border-neutral-800">
-        {browserStatusText ? (
-          <div className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
-            {browserStatusText}
+      <div className="border-t border-border p-3">
+        {inputStatusText ? (
+          <div
+            className="mb-2 text-xs text-muted-foreground"
+            aria-live="polite"
+          >
+            {inputStatusText}
           </div>
         ) : null}
         <div className="flex items-end gap-2">
+          <SpeechInputButton
+            isSupported={isSpeechSupported}
+            isListening={isSpeechListening}
+            isHearingSpeech={isSpeechHearing}
+            disabled={inputDisabled}
+            onToggle={toggleSpeech}
+            className="h-10 w-10 rounded-lg"
+          />
           <textarea
-            ref={textareaRef}
+            ref={setTextareaRef}
             placeholder={
               queuedPrompt
                 ? "Prompt queued..."
-                : isWaitingForLiveBrowser
-                  ? "Type a prompt to queue..."
-                  : "Type your message... (Shift+Enter for new line)"
+                : isLoading
+                  ? "Type a message to queue for the next turn…"
+                  : isWaitingForLiveBrowser
+                    ? "Type a prompt to queue..."
+                    : "Message Skyvern Copilot…"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="flex-1 resize-none rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 placeholder-neutral-400 focus:border-neutral-700 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:placeholder-neutral-500 dark:focus:border-neutral-400"
+            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
-              minHeight: "38px",
+              minHeight: "40px",
               maxHeight: "150px",
-              overflow: "auto",
+              overflowY: "hidden",
             }}
           />
-          {isLoading || Boolean(queuedPrompt) ? (
+          {isLoading && queuedPrompt ? (
+            <>
+              <button
+                onClick={cancelQueuedPrompt}
+                title="Edit queued message"
+                className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              >
+                Edit queued
+              </button>
+              <button
+                onClick={cancelSend}
+                title="Cancel run"
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              >
+                Cancel run
+              </button>
+            </>
+          ) : isLoading ? (
+            <>
+              <button
+                onClick={() => handleSend()}
+                title="Queue for the next turn"
+                className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              >
+                Queue
+              </button>
+              <button
+                onClick={cancelSend}
+                title="Cancel run"
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              >
+                Cancel run
+              </button>
+            </>
+          ) : queuedPrompt ? (
             <button
-              onClick={isLoading ? cancelSend : cancelQueuedPrompt}
-              title={isLoading ? "Stop Copilot" : "Edit queued prompt"}
-              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+              onClick={cancelQueuedPrompt}
+              title="Edit queued prompt"
+              className="flex h-10 items-center justify-center rounded-lg bg-destructive px-4 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
             >
               Cancel
             </button>
-          ) : (
+          ) : !copilotV2Enabled ? (
             <button
               onClick={() => handleSend()}
-              className="rounded-md bg-neutral-950 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-950 dark:hover:bg-neutral-300"
+              className="flex h-10 items-center justify-center rounded-lg bg-cta px-4 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
             >
               Send
             </button>
+          ) : (
+            <div className="flex items-stretch">
+              <button
+                onClick={() => handleSend()}
+                className="flex h-10 items-center gap-2 rounded-l-lg bg-cta px-3 py-1.5 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <ModeGlyph
+                  mode={isBuild ? "build" : "ask"}
+                  tone="dark"
+                  glow={codeStateActive}
+                />
+                {codeStateActive ? (
+                  <span className="flex flex-col items-start">
+                    <span className="text-sm font-medium leading-tight">
+                      Build
+                    </span>
+                    <span className="text-[10px] font-medium leading-tight text-cta-foreground/70">
+                      with code
+                    </span>
+                  </span>
+                ) : (
+                  <span>{isBuild ? "Build" : "Ask"}</span>
+                )}
+              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="Switch mode"
+                    aria-label="Switch mode"
+                    className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ChevronDownIcon className="h-3.5 w-3.5" />
+                  </button>
+                </DropdownMenuTrigger>
+                {/* onCloseAutoFocus: don't return focus to the caret on close,
+                    so its focus ring doesn't linger after a click. */}
+                <DropdownMenuContent
+                  side="top"
+                  align="end"
+                  className="w-[272px] p-1.5"
+                  onCloseAutoFocus={(event) => event.preventDefault()}
+                >
+                  <DropdownMenuItem
+                    aria-label="Ask"
+                    onSelect={() => {
+                      setComposerMode("ask");
+                      setCodeWorkflow(false);
+                      setCodeBlockRequestOverride(null);
+                    }}
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      !isBuild && "bg-accent",
+                    )}
+                  >
+                    <ModeGlyph mode="ask" />
+                    <span className="flex flex-1 flex-col">
+                      <span className="text-sm font-medium">Ask</span>
+                      <span className="text-xs leading-snug text-muted-foreground">
+                        Answer questions and make quick workflow edits.
+                      </span>
+                    </span>
+                    {!isBuild ? (
+                      <CheckIcon className="h-4 w-4 text-sky-400" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    aria-label="Build"
+                    onSelect={() => {
+                      setComposerMode("build");
+                      setCodeWorkflow(false);
+                      setCodeBlockRequestOverride(false);
+                    }}
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      isBuild && !codeWorkflow && "bg-accent",
+                    )}
+                  >
+                    <ModeGlyph mode="build" />
+                    <span className="flex flex-1 flex-col">
+                      <span className="text-sm font-medium">Build</span>
+                      <span className="text-xs leading-snug text-muted-foreground">
+                        Navigates the site to design your workflow, then tests
+                        that it works.
+                      </span>
+                    </span>
+                    {isBuild && !codeWorkflow ? (
+                      <CheckIcon className="h-4 w-4 text-sky-400" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  {codeOptionAvailable ? (
+                    <DropdownMenuItem
+                      aria-label="Build workflow as code"
+                      onSelect={() => {
+                        setComposerMode("build");
+                        setCodeWorkflow(true);
+                        setCodeBlockRequestOverride(true);
+                      }}
+                      className={cn(
+                        "flex items-start gap-2.5",
+                        isBuild && codeWorkflow && "bg-accent",
+                      )}
+                    >
+                      <ModeGlyph mode="build" glow />
+                      <span className="flex flex-1 flex-col">
+                        <span className="text-sm font-medium">
+                          Build workflow as code
+                        </span>
+                        <span className="text-xs leading-snug text-muted-foreground">
+                          Build the workflow as code. Faster and more flexible,
+                          but may need extra detail to handle every edge case.
+                        </span>
+                      </span>
+                      {isBuild && codeWorkflow ? (
+                        <CheckIcon className="h-4 w-4 text-sky-400" />
+                      ) : null}
+                    </DropdownMenuItem>
+                  ) : null}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           )}
         </div>
       </div>
 
       {/* Resize Handles */}
-      {/* Corners */}
-      <div
-        className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "se")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
-        title="Resize"
-      />
-      <div
-        className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
-        title="Resize"
-      />
-      <div
-        className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
-        title="Resize"
-      />
-      {/* Edges */}
-      <div
-        className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "n")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "s")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "w")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "e")}
-        title="Resize"
-      />
+      {!docked && (
+        <>
+          {/* Corners */}
+          <div
+            className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "se")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
+            title="Resize"
+          />
+          <div
+            className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
+            title="Resize"
+          />
+          <div
+            className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
+            title="Resize"
+          />
+          {/* Edges */}
+          <div
+            className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "n")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "s")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "w")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "e")}
+            title="Resize"
+          />
+        </>
+      )}
     </div>
   );
+
+  if (docked) {
+    return portalTarget ? createPortal(content, portalTarget) : null;
+  }
+  return content;
 }

@@ -1,5 +1,9 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
-import { WorkflowBlockType, WorkflowModel } from "./workflowTypes";
+import {
+  CodeBlockStep,
+  WorkflowBlockType,
+  WorkflowModel,
+} from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
@@ -8,11 +12,13 @@ export type WorkflowCreateYAMLRequest = {
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model?: WorkflowModel | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
+  max_elapsed_time_minutes?: number | null;
   extra_http_headers?: Record<string, string> | null;
   cdp_connect_headers?: Record<string, string> | null;
   status?: string | null;
@@ -150,7 +156,8 @@ export type BlockYAML =
   | PrintPageBlockYAML
   | WorkflowTriggerBlockYAML
   | GoogleSheetsReadBlockYAML
-  | GoogleSheetsWriteBlockYAML;
+  | GoogleSheetsWriteBlockYAML
+  | PdfFillBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -308,6 +315,8 @@ export type CodeBlockYAML = BlockYAMLBase & {
   block_type: "code";
   code: string;
   parameter_keys?: Array<string> | null;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
 };
 
 export type TextPromptBlockYAML = BlockYAMLBase & {
@@ -462,5 +471,14 @@ export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type PdfFillBlockYAML = BlockYAMLBase & {
+  block_type: "pdf_fill";
+  file_url: string;
+  prompt: string;
+  payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key?: string | null;
   parameter_keys?: Array<string> | null;
 };

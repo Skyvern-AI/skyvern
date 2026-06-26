@@ -15,13 +15,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
-    NULL_DATA_STREAK_ESCALATE_AT,
-    POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
+    CopilotGoalSatisfied,
     _check_enforcement,
-    _needs_repeated_null_data_nudge,
     _needs_suspicious_success_nudge,
     _prune_input_list,
     _summarize_tool_output,
@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_meaningful_extracted_data,
     _record_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
@@ -60,9 +61,12 @@ class _Ctx:
         self.last_failure_category_top = None
         self.failed_test_nudge_count = 0
         self.explore_without_workflow_nudge_count = 0
-        self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
+        self.verified_terminal_proposal_ready = False
+        self.completion_verification_result = None
+        self.last_artifact_health_blocker_reason = None
+        self.latest_diagnosis_repair_contract = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +123,7 @@ def test_unrecoverable_browser_session_error_stops_after_second_failure() -> Non
         _maybe_raise_unrecoverable_tool_error,
     )
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
     output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
 
     _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
@@ -243,6 +247,26 @@ _EXTRACTION_ENVELOPE_CASES: list[tuple[str, dict[str, Any], bool]] = [
     ("empty_payload_trace_repro", {}, True),
     ("real_extraction", {"extracted_information": [{"price": "260.48"}]}, False),
     (
+        "nested_code_output_record",
+        {
+            "extracted_information": [],
+            "extract_record_status_info_output": {
+                "entity_found": True,
+                "entity_name": "Jordan Example",
+                "record_number": "1234567890",
+                "items": [
+                    {
+                        "item_name": "Sample Practice",
+                        "address": "100 Main St, Example City, ST 12345",
+                        "status": "Active",
+                    }
+                ],
+                "overall_status": "Active",
+            },
+        },
+        False,
+    ),
+    (
         "download_only_files",
         {"downloaded_files": [{"url": "https://example.com/a.pdf", "checksum": "abc123"}]},
         False,
@@ -293,15 +317,13 @@ def test_analyze_text_prompt_all_null_is_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_ctx_for_record() -> Any:
+def _fresh_ctx_for_record() -> SimpleNamespace:
     """SimpleNamespace shaped for _record_run_blocks_result + update_repeated_failure_state.
 
     Uses getattr-with-default-compatible defaults so the function under test
     populates the interesting fields without tripping AttributeError on the
     downstream update_repeated_failure_state call.
     """
-    from types import SimpleNamespace
-
     return SimpleNamespace(
         last_test_ok=True,
         last_test_failure_reason=None,
@@ -309,14 +331,18 @@ def _fresh_ctx_for_record() -> Any:
         last_test_anti_bot=None,
         last_failure_category_top=None,
         last_test_non_retriable_nav_error=None,
-        null_data_streak_count=0,
         failed_test_nudge_count=0,
         last_failed_workflow_yaml=None,
+        last_good_workflow=None,
+        last_good_workflow_yaml=None,
         non_retriable_nav_error_last_emitted_signature=None,
         workflow_yaml=None,
         last_workflow=None,
+        last_workflow_yaml=None,
         last_frontier_start_label=None,
         last_executed_block_labels=[],
+        last_full_workflow_test_ok=False,
+        last_unverified_block_labels=[],
         last_failure_signature=None,
         last_frontier_fingerprint=None,
         repeated_failure_streak_count=0,
@@ -325,6 +351,7 @@ def _fresh_ctx_for_record() -> Any:
         last_action_sequence_fingerprint=None,
         repeated_action_fingerprint_streak_count=0,
         copilot_total_timeout_exceeded=False,
+        workflow_verification_evidence=WorkflowVerificationEvidence(),
     )
 
 
@@ -339,6 +366,210 @@ def test_record_run_blocks_result_flips_last_test_ok_on_empty_extraction_envelop
     assert ctx.last_test_ok is None
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_test_failure_reason is not None
+
+
+def test_record_run_blocks_result_does_not_promote_partial_frontier_to_full_workflow() -> None:
+    from types import SimpleNamespace
+
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="open"), SimpleNamespace(label="extract")])
+    )
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open"]
+
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_partial",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": ["open"],
+            "blocks": [{"label": "open", "status": "completed"}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_unverified_block_labels == ["extract"]
+    assert ctx.last_good_workflow is None
+    assert "unverified workflow blocks remain" in (ctx.last_test_failure_reason or "")
+
+
+def test_record_run_blocks_result_promotes_when_verified_prefix_covers_workflow() -> None:
+    from types import SimpleNamespace
+
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="open"), SimpleNamespace(label="extract")])
+    )
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.last_unverified_block_labels = ["stale_extract"]
+
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_full",
+            "requested_block_labels": ["extract"],
+            "executed_block_labels": ["extract"],
+            "blocks": [{"label": "extract", "status": "completed", "extracted_data": {"value": "ok"}}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_unverified_block_labels == []
+    assert ctx.last_good_workflow is ctx.last_workflow
+    assert ctx.last_good_workflow_yaml == ctx.last_workflow_yaml
+
+
+def test_record_run_blocks_result_promotes_structured_record_top_level_output_to_terminal_proposal() -> None:
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(label="open_search_search"),
+                SimpleNamespace(label="search_and_open_record_details"),
+                SimpleNamespace(label="extract_record_status_record"),
+            ]
+        )
+    )
+    ctx.last_workflow_yaml = "title: Record lookup"
+    ctx.verified_prefix_labels = ["open_search_search"]
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structured_record",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_record_status_record"],
+            "blocks": [
+                {
+                    "label": "extract_record_status_record",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {"extracted_information": []},
+                }
+            ],
+            "output": {
+                "search_and_open_record_details_output": {
+                    "found": True,
+                    "entity_name": "Jordan Example",
+                    "opened_record_details": True,
+                    "evidence_text": "Opened Details page for the selected record.",
+                },
+                "extract_record_status_record_output": {
+                    "found": True,
+                    "entity_name": "Jordan Example",
+                    "record_number": "1234567890",
+                    "items": [
+                        {
+                            "item_label": "Sample Practice",
+                            "address": "100 Main St, Example City, ST 12345",
+                            "status": "Active",
+                        }
+                    ],
+                    "overall_status": "Active",
+                    "evidence_text": "Opened Details page; read Overview/Affiliations items and More Details identifier.",
+                },
+                "extracted_information": [],
+            },
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[
+            "fallback_record_identity",
+            "fallback_record_identifier",
+            "fallback_record_groups",
+            "fallback_record_status",
+        ],
+        verdicts=[
+            CriterionVerdict(criterion_id=cid, state="satisfied", reason_code="evidence_confirms")
+            for cid in (
+                "fallback_record_identity",
+                "fallback_record_identifier",
+                "fallback_record_groups",
+                "fallback_record_status",
+            )
+        ],
+    )
+
+    _record_run_blocks_result(ctx, result, completion_verification=verification)
+
+    assert ctx.verified_terminal_proposal_ready is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+
+
+def test_record_run_blocks_result_resets_stale_verified_terminal_proposal_latch() -> None:
+    ctx = _fresh_ctx_for_record()
+    ctx.verified_terminal_proposal_ready = True
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_unverified",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "blocks": [],
+            "output": {},
+        },
+    }
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.verified_terminal_proposal_ready is False
+
+
+def test_enforcement_stops_after_verified_terminal_proposal() -> None:
+    ctx = _Ctx()
+    ctx.verified_terminal_proposal_ready = True
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    ctx.last_test_suspicious_success = True
+
+    with pytest.raises(CopilotGoalSatisfied):
+        _check_enforcement(ctx)
+
+
+def test_verified_outcome_out_orders_same_turn_involuntary_blocker() -> None:
+    ctx = _Ctx()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+    involuntary = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="repeated failed step",
+        user_facing_reason="I'm stuck retrying the same step.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_and_run_blocks",
+        extra={},
+    )
+    ctx.turn_halt = None
+    ctx.blocker_signal = involuntary
+    ctx.latest_tool_blocker_signal = involuntary
+
+    with pytest.raises(CopilotGoalSatisfied):
+        _check_enforcement(ctx)
+
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
 
 
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:
@@ -374,47 +605,21 @@ def test_record_run_blocks_result_sets_last_test_ok_none_on_watchdog_cancel_at_t
 
 
 # ---------------------------------------------------------------------------
-# Repeated null-data escalation
+# Suspicious-success nudge
 # ---------------------------------------------------------------------------
 
 
 def test_suspicious_success_fires_when_flag_set() -> None:
     ctx = _Ctx()
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 1
     assert _needs_suspicious_success_nudge(ctx) is True
-    assert _needs_repeated_null_data_nudge(ctx) is False
 
 
-def test_repeated_null_data_fires_at_threshold() -> None:
+def test_check_enforcement_returns_suspicious_nudge_when_flag_set() -> None:
     ctx = _Ctx()
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = NULL_DATA_STREAK_ESCALATE_AT
-    assert _needs_repeated_null_data_nudge(ctx) is True
-
-
-def test_check_enforcement_returns_repeated_nudge_at_threshold() -> None:
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = NULL_DATA_STREAK_ESCALATE_AT
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_REPEATED_NULL_DATA_NUDGE
-
-
-def test_check_enforcement_returns_regular_suspicious_nudge_below_threshold() -> None:
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 1
     nudge = _check_enforcement(ctx)
     assert nudge == POST_SUSPICIOUS_SUCCESS_NUDGE
-
-
-def test_repeated_null_data_requires_suspicious_flag() -> None:
-    # If the current test wasn't a suspicious success, don't fire even with a high streak.
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = False
-    ctx.null_data_streak_count = 99
-    assert _needs_repeated_null_data_nudge(ctx) is False
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,13 @@ export default {
           DEFAULT: "hsl(var(--success))",
           foreground: "hsl(var(--success-foreground))",
         },
+        badge: {
+          success: "hsl(var(--badge-success))",
+          warning: "hsl(var(--badge-warning))",
+          destructive: "hsl(var(--badge-destructive))",
+          terminated: "hsl(var(--badge-terminated))",
+          neutral: "hsl(var(--badge-neutral))",
+        },
         muted: {
           DEFAULT: "hsl(var(--muted))",
           foreground: "hsl(var(--muted-foreground))",
@@ -84,6 +91,11 @@ export default {
           cta: "hsl(var(--brand-cta))",
           "cta-foreground": "hsl(var(--brand-cta-foreground))",
         },
+        studio: {
+          accent: "hsl(var(--studio-accent))",
+          "accent-foreground": "hsl(var(--studio-accent-foreground))",
+          "accent-2": "hsl(var(--studio-accent-2))",
+        },
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -96,6 +108,9 @@ export default {
         "card-hover": "var(--shadow-card-hover)",
         elevated: "var(--shadow-elevated)",
         popover: "var(--shadow-popover)",
+      },
+      transitionTimingFunction: {
+        sidebar: "cubic-bezier(0.32, 0.72, 0, 1)",
       },
       keyframes: {
         "accordion-down": {

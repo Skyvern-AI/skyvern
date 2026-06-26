@@ -7,6 +7,13 @@ import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
+import {
+  STREAM_MAX_RECONNECT_ATTEMPTS,
+  STREAM_RECONNECT_DELAY_MS,
+  isTerminalStreamStatus,
+  shouldReconnectStream,
+} from "./BrowserSessionStream.utils";
+import { useSettingsStore } from "@/store/SettingsStore";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -19,37 +26,45 @@ type StreamMessage = {
 };
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
-  title: "Starting local browser stream",
-  detail:
-    "Opening the stream WebSocket and waiting for the first browser frame.",
+  title: "Waking up your local browser",
+  detail: "Opening the stream and waiting for the first frame...",
+  pending: true,
 };
+
+function diagnosticForReconnectExhausted(): StreamDiagnostic {
+  return {
+    title: "Stream connection dropped",
+    detail: "The browser stream disconnected and could not reconnect.",
+    hint: "Refresh the editor or create a new browser session.",
+  };
+}
 
 function diagnosticForStatus(status: string): StreamDiagnostic {
   switch (status) {
     case "not_found":
       return {
-        title: "Browser session not found",
-        detail:
-          "The backend could not find this browser session for the current organization.",
-        hint: "Refresh the page or create a new browser session.",
+        title: "We've misplaced this browser session",
+        detail: "The backend can't find it for your org.",
+        hint: "Refresh the page or spin up a fresh browser session.",
       };
     case "timeout":
       return {
-        title: "Timed out waiting for browser state",
+        title: "The browser's gone strangely quiet",
         detail:
-          "The stream connected, but the backend did not find an active page to screencast.",
+          "The stream connected, but no active page showed up to screencast.",
         hint: "Check backend logs for browser launch errors and verify BROWSER_STREAMING_MODE=cdp.",
       };
     case "completed":
     case "failed":
       return {
-        title: "Browser session is no longer live",
-        detail: `The browser session status is ${status}.`,
+        title: "This browser session has wandered off",
+        detail: `It's no longer live — status: ${status}.`,
       };
     default:
       return {
         title: "Waiting for browser frames",
         detail: `The stream is connected and the session status is ${status}.`,
+        pending: true,
       };
   }
 }
@@ -57,21 +72,21 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
 function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
   if (event.code === 4001 || event.reason === "use-vnc-streaming") {
     return {
-      title: "Backend is using VNC streaming",
+      title: "Backend wants to use VNC streaming",
       detail:
-        "The UI tried local browser streaming, but the backend closed the stream with use-vnc-streaming.",
+        "The UI tried local browser streaming, but the backend asked for VNC instead.",
       hint: "Check BROWSER_STREAMING_MODE on the backend and the runtime config response.",
     };
   }
   if (event.code === 1006) {
     return {
-      title: "Stream connection dropped",
+      title: "The connection slipped away",
       detail: "The browser stream WebSocket closed before sending a frame.",
       hint: "Check that the API server is running and reachable from the UI.",
     };
   }
   return {
-    title: "Stream connection closed",
+    title: "The stream packed up and left",
     detail: `WebSocket closed with code ${event.code}${event.reason ? ` (${event.reason})` : ""}.`,
   };
 }
@@ -80,14 +95,18 @@ interface Props {
   browserSessionId: string;
   interactive?: boolean;
   showControlButtons?: boolean;
+  centered?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onUrlChange?: (url: string) => void;
 }
 
 function BrowserSessionStream({
   browserSessionId,
   interactive = false,
   showControlButtons = false,
+  centered = false,
   onReadyChange,
+  onUrlChange,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
@@ -97,11 +116,19 @@ function BrowserSessionStream({
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const credentialGetter = useCredentialGetter();
+  const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
   const hasFrameRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const terminalStatusSeenRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const inputWsUrl = interactive
+  // The CDP input socket must be wired whenever the stream can be controlled,
+  // whether by default interaction or via the take-control button.
+  const controllable = interactive || showControlButtons;
+
+  const inputWsUrl = controllable
     ? `${newWssBaseUrl}/stream/cdp_input/browser_session/${browserSessionId}`
     : null;
 
@@ -113,7 +140,7 @@ function BrowserSessionStream({
     handlers,
   } = useCdpInput({
     inputWsUrl,
-    interactive,
+    interactive: controllable,
     viewportWidth,
     viewportHeight,
   });
@@ -127,8 +154,17 @@ function BrowserSessionStream({
     setCurrentUrl("");
     setDiagnostic(STARTING_DIAGNOSTIC);
     hasFrameRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    terminalStatusSeenRef.current = false;
 
-    async function run() {
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    async function connect() {
       const credentialParam = await getCredentialParam(credentialGetter);
       if (cancelled) {
         return;
@@ -143,8 +179,9 @@ function BrowserSessionStream({
 
       socketRef.current.addEventListener("open", () => {
         setDiagnostic({
-          title: "Connected to stream",
-          detail: "Waiting for the backend to attach to the browser page.",
+          title: "Hooked up to the stream",
+          detail: "Just waiting for the backend to hand us a browser.",
+          pending: true,
         });
       });
 
@@ -153,6 +190,7 @@ function BrowserSessionStream({
           const message: StreamMessage = JSON.parse(event.data);
           if (message.screenshot) {
             hasFrameRef.current = true;
+            reconnectAttemptsRef.current = 0;
             setStreamImgSrc(message.screenshot);
           }
           if (message.format) {
@@ -170,41 +208,75 @@ function BrowserSessionStream({
           if (!message.screenshot && message.status) {
             setDiagnostic(diagnosticForStatus(message.status));
           }
-          if (
-            message.status === "completed" ||
-            message.status === "failed" ||
-            message.status === "timeout"
-          ) {
+          if (isTerminalStreamStatus(message.status)) {
+            terminalStatusSeenRef.current = true;
             socketRef.current?.close();
           }
         } catch (e) {
           console.error("Failed to parse message", e);
           setDiagnostic({
-            title: "Unexpected stream message",
-            detail: "The browser stream sent a message the UI could not parse.",
+            title: "The stream said something funny",
+            detail: "The browser sent a message the UI couldn't parse.",
           });
         }
       });
 
       socketRef.current.addEventListener("error", () => {
         setDiagnostic({
-          title: "Stream WebSocket error",
-          detail:
-            "The browser stream connection hit a network or server error.",
+          title: "The stream hit a snag",
+          detail: "The connection ran into a network or server error.",
         });
       });
 
       socketRef.current.addEventListener("close", (event) => {
-        if (!cancelled && !hasFrameRef.current) {
+        if (
+          !cancelled &&
+          !hasFrameRef.current &&
+          !terminalStatusSeenRef.current
+        ) {
           setDiagnostic(diagnosticForClose(event));
         }
         socketRef.current = null;
+
+        const canReconnect =
+          !cancelled &&
+          shouldReconnectStream({
+            closeCode: event.code,
+            closeReason: event.reason,
+            terminalStatusSeen: terminalStatusSeenRef.current,
+            reconnectAttempts: reconnectAttemptsRef.current,
+          });
+
+        if (canReconnect) {
+          reconnectAttemptsRef.current += 1;
+          if (!hasFrameRef.current) {
+            setDiagnostic({
+              ...diagnosticForClose(event),
+              hint: `Reconnecting in ${STREAM_RECONNECT_DELAY_MS / 1000}s (${reconnectAttemptsRef.current}/${STREAM_MAX_RECONNECT_ATTEMPTS}).`,
+            });
+          }
+          clearReconnectTimer();
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            void connect();
+          }, STREAM_RECONNECT_DELAY_MS);
+        } else if (
+          !cancelled &&
+          !terminalStatusSeenRef.current &&
+          hasFrameRef.current &&
+          reconnectAttemptsRef.current >= STREAM_MAX_RECONNECT_ATTEMPTS
+        ) {
+          hasFrameRef.current = false;
+          setStreamImgSrc("");
+          setDiagnostic(diagnosticForReconnectExhausted());
+        }
       });
     }
-    run();
+    void connect();
 
     return () => {
       cancelled = true;
+      clearReconnectTimer();
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
@@ -215,9 +287,14 @@ function BrowserSessionStream({
   const isReady = streamImgSrc.length > 0;
 
   useEffect(() => {
+    onUrlChange?.(currentUrl);
+  }, [currentUrl, onUrlChange]);
+
+  useEffect(() => {
     // browserSessionId intentionally not a dep: re-firing on prop change
     // before isReady resets would spuriously report (true, newSessionId).
     onReadyChange?.(isReady, isReady ? browserSessionId : null);
+    // Zustand store setters are stable; omit browserSessionId from deps on purpose.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, onReadyChange]);
 
@@ -227,12 +304,19 @@ function BrowserSessionStream({
     };
   }, [onReadyChange]);
 
+  useEffect(() => {
+    settingsStore.setIsUsingABrowser(isReady);
+    settingsStore.setBrowserSessionId(isReady ? browserSessionId : null);
+    // Zustand store setters are stable; only sync when stream readiness changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, browserSessionId]);
+
   if (isReady) {
     return (
       <InteractiveStreamView
         streamImgSrc={streamImgSrc}
         streamFormat={streamFormat}
-        interactive={interactive}
+        interactive={controllable}
         userIsControlling={userIsControlling}
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
@@ -240,6 +324,7 @@ function BrowserSessionStream({
         showControlButtons={showControlButtons}
         handlers={handlers}
         currentUrl={currentUrl}
+        centered={centered}
       />
     );
   }

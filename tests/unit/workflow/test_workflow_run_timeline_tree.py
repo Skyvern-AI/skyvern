@@ -129,6 +129,27 @@ async def test_timeline_attaches_actions_to_conditional_blocks(mock_db: AsyncMoc
 
 
 @pytest.mark.asyncio
+async def test_timeline_attaches_actions_to_code_blocks(mock_db: AsyncMock) -> None:
+    """A code block's task actions render through the standard task_id path, like any task block."""
+    base = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+    code_block = _block(
+        "wrb_code",
+        created_at=base,
+        block_type=BlockType.CODE,
+        task_id="tsk_code",
+    )
+    action = ExtractAction(action_id="act_code", task_id="tsk_code")
+    mock_db.return_value = [code_block]
+    app.DATABASE.tasks.get_tasks_actions.return_value = [action]
+
+    service = WorkflowService()
+    timeline = await service.get_workflow_run_timeline(workflow_run_id="wr_test", organization_id="o_test")
+
+    assert timeline[0].block is not None
+    assert timeline[0].block.actions == [action]
+
+
+@pytest.mark.asyncio
 async def test_timeline_empty_run_returns_empty_list(mock_db: AsyncMock) -> None:
     """No blocks → empty timeline."""
     service = WorkflowService()

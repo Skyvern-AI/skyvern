@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field, field_serializer, field_validator, model_
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -441,6 +442,7 @@ class BlockType(StrEnum):
     WORKFLOW_TRIGGER = "workflow_trigger"
     GOOGLE_SHEETS_READ = "google_sheets_read"
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
+    PDF_FILL = "pdf_fill"
 
 
 class AIFallbackMode(StrEnum):
@@ -795,6 +797,15 @@ class ConditionalBlockYAML(BlockYAML):
         return self
 
 
+class CodeBlockStepYAML(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    # str (not ActionType) so this module does not import skyvern.webeye; the converter coerces to the enum.
+    action_type: str = "null_action"
+    line_start: int | None = None
+    line_end: int | None = None
+
+
 class CodeBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -804,6 +815,18 @@ class CodeBlockYAML(BlockYAML):
 
     code: str
     parameter_keys: list[str] | None = None
+    prompt: str | None = None
+    steps: list[CodeBlockStepYAML] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_parameters_field(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "parameters" in data:
+            raise ValueError(
+                "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
+                "(a list of workflow parameter names) to inject parameters into the code block."
+            )
+        return data
 
 
 class TextPromptBlockYAML(BlockYAML):
@@ -1005,6 +1028,7 @@ class LoginBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    skip_saved_profile: bool = False
 
 
 class WaitBlockYAML(BlockYAML):
@@ -1090,6 +1114,49 @@ class PrintPageBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class PdfFillBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.PDF_FILL] = BlockType.PDF_FILL  # type: ignore
+    file_url: str
+    prompt: str
+    payload: dict[str, Any] | list | str | None = None
+    llm_key: str | None = None
+    parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def normalize_llm_selection(self) -> "PdfFillBlockYAML":
+        raw_llm_key = self.llm_key.strip() if self.llm_key else None
+
+        if self.model:
+            self.llm_key = None
+            return self
+
+        if not raw_llm_key:
+            self.llm_key = None
+            return self
+
+        if _has_jinja_syntax(raw_llm_key):
+            self.llm_key = raw_llm_key
+            return self
+
+        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+        if model_name:
+            self.model = {"model_name": model_name}
+            self.llm_key = None
+            return self
+
+        if raw_llm_key in LLMConfigRegistry.get_model_names():
+            self.llm_key = raw_llm_key
+            return self
+
+        LOG.warning(
+            "Unrecognized pdf fill llm_key; defaulting to Skyvern Optimized/default model path",
+            label=self.label,
+            llm_key=raw_llm_key,
+        )
+        self.llm_key = None
+        return self
+
+
 class WorkflowTriggerBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WORKFLOW_TRIGGER] = BlockType.WORKFLOW_TRIGGER  # type: ignore
 
@@ -1169,6 +1236,7 @@ BLOCK_YAML_SUBCLASSES = (
     | HttpRequestBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
+    | PdfFillBlockYAML
     | WorkflowTriggerBlockYAML
     | GoogleSheetsReadBlockYAML
     | GoogleSheetsWriteBlockYAML
@@ -1176,8 +1244,17 @@ BLOCK_YAML_SUBCLASSES = (
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
 
+def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASSES]) -> bool:
+    """Whether top-level routing requires version 2: a conditional block or explicit next_block_label.
+
+    Loop interiors are not inspected - `version` describes only top-level routing, and loop bodies are
+    graph-built independently by Block._build_loop_graph regardless of the workflow version.
+    """
+    return any(isinstance(block, ConditionalBlockYAML) or block.next_block_label is not None for block in blocks)
+
+
 class WorkflowDefinitionYAML(BaseModel):
-    version: int = 1
+    version: int | None = None
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
@@ -1202,6 +1279,15 @@ class WorkflowDefinitionYAML(BaseModel):
                 f"Available labels: {', '.join(labels) if labels else '(none)'}"
             )
 
+        has_v2_graph_constructs = workflow_definition_has_v2_graph_constructs(self.blocks)
+        if self.version is None:
+            self.version = 2 if has_v2_graph_constructs else 1
+        elif self.version < 2 and has_v2_graph_constructs:
+            raise ValueError(
+                "workflow_definition.version must be 2 or greater when using conditional blocks "
+                "or explicit next_block_label routing."
+            )
+
         return self
 
 
@@ -1214,11 +1300,12 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_identifier: str | None = None
     persist_browser_session: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     max_screenshot_scrolls: int | None = None
-    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
@@ -1241,6 +1328,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_profile_key", mode="before")
+    @classmethod
+    def _normalize_browser_profile_key(cls, v: str | None) -> str | None:
+        return validate_browser_profile_key(v)
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:

@@ -19,12 +19,14 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _repeated_frontier_failure_nudge,
 )
 from skyvern.forge.sdk.copilot.tools import (
+    _challenge_http_request_reject_message,
     _detect_probable_site_block_wall,
     _detect_timing_only_challenge_wait_blocks,
     _record_run_blocks_result,
     _timing_only_challenge_wait_reject_message,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 
 _SCRAPE_WALL_REASON = (
     "Skyvern failed to load the website. The page may have navigated "
@@ -351,14 +353,18 @@ def test_stop_nudge_uses_different_proxy_advice_when_effective_proxy_is_active()
     ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
     ctx.effective_workflow_proxy_location = "RESIDENTIAL"
 
-    nudge = _check_enforcement(ctx)
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        _check_enforcement(ctx)
 
-    assert nudge is not None
-    assert "configure a proxy" not in nudge.lower()
-    assert "different proxy location" in nudge.lower()
-    assert "US-CA" in nudge
-    assert "US-NY" in nudge
-    assert "residential/ISP" in nudge
+    halt = exc_info.value.halt
+    assert halt.kind == TurnHaltKind.PROBABLE_SITE_BLOCK
+    assert halt.blocker_signal is ctx.blocker_signal
+    user_facing = halt.blocker_signal.user_facing_reason
+    assert "configure a proxy" not in user_facing.lower()
+    assert "different proxy location" in user_facing.lower()
+    assert "US-CA" in user_facing
+    assert "US-NY" in user_facing
+    assert "residential/ISP" in user_facing
 
 
 def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
@@ -366,10 +372,11 @@ def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
     ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
     ctx.effective_workflow_proxy_location = "NONE"
 
-    nudge = _check_enforcement(ctx)
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        _check_enforcement(ctx)
 
-    assert nudge is not None
-    assert "configure a proxy" in nudge.lower()
+    assert exc_info.value.halt.kind == TurnHaltKind.PROBABLE_SITE_BLOCK
+    assert "configure a proxy" in exc_info.value.halt.blocker_signal.user_facing_reason.lower()
 
 
 def test_detects_challenge_named_wait_block() -> None:
@@ -421,3 +428,52 @@ def test_allows_conditional_challenge_action_after_block_evidence() -> None:
     ctx.last_test_anti_bot = "challenge page detected"
 
     assert _timing_only_challenge_wait_reject_message(ctx, _CONDITIONAL_ACTION_WORKFLOW) is None
+
+
+def test_rejects_new_http_request_after_observed_challenge_evidence() -> None:
+    existing_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_lookup
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+    submitted_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_lookup
+      block_type: goto_url
+      url: https://example.com/registry/search
+    - label: submit_lookup
+      block_type: http_request
+      method: POST
+      url: https://example.com/registry/search?s=1
+"""
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["human-verification"],
+        "challenge_controls": [{"selector": "#human-verification"}],
+    }
+    ctx.workflow_yaml = existing_yaml
+
+    message = _challenge_http_request_reject_message(ctx, submitted_yaml, ctx.workflow_yaml)
+
+    assert message is not None
+    assert "submit_lookup" in message
+    assert "raw http_request blocks are not allowed" in message
+
+
+def test_allows_existing_http_request_when_challenge_evidence_is_added_later() -> None:
+    existing_yaml = """
+workflow_definition:
+  blocks:
+    - label: submit_lookup
+      block_type: http_request
+      method: POST
+      url: https://example.com/search
+"""
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {"anti_bot_indicators": ["human-verification"]}
+    ctx.workflow_yaml = existing_yaml
+
+    assert _challenge_http_request_reject_message(ctx, existing_yaml, ctx.workflow_yaml) is None

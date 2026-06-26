@@ -46,6 +46,14 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "./studioNavigation";
+import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
+import { isActivationRun } from "@/util/onboarding/rolloutGating";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { parseHeaderJson } from "@/util/secretHeaders";
 
@@ -61,6 +69,10 @@ import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
+import {
+  parseJsonWorkflowParameterValue,
+  validateJsonWorkflowParameterValue,
+} from "./utils";
 
 /**
  * Recursively finds all login blocks that don't have any credential parameters selected.
@@ -136,12 +148,7 @@ function parseValuesForWorkflowRun(
         (parameter) => parameter.key === key,
       );
       if (parameter?.workflow_parameter_type === "json") {
-        try {
-          return [key, JSON.parse(value as string)];
-        } catch {
-          console.error("Invalid JSON"); // this should never happen, it should fall to form error
-          return [key, value];
-        }
+        return [key, parseJsonWorkflowParameterValue(value)];
       }
       // can improve this via the type system maybe
       if (
@@ -318,6 +325,7 @@ function RunWorkflowForm({
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -328,6 +336,14 @@ function RunWorkflowForm({
     [workflow],
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
+  const onboarding = useOnboardingStateOptional();
+  const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
+  const onboardingLoading = onboarding != null && onboarding.isLoading;
+  // Gate on the rollout arm so a 0% rollout / rollback restores the
+  // pre-onboarding login-block alert instead of the credential prompt.
+  const isActivation = isActivationRun(onboardingFlagVariant, onboarding);
+  const showDestructiveLoginAlert =
+    hasLoginBlockValidationError && !isActivation && !onboardingLoading;
 
   const blockingParameterTypes = new Set([
     "boolean",
@@ -387,11 +403,19 @@ function RunWorkflowForm({
       queryClient.invalidateQueries({
         queryKey: ["runs"],
       });
-      navigate(
-        env.useNewRunsUrl
-          ? `/runs/${response.data.workflow_run_id}`
-          : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
-      );
+      if (studioEnabled) {
+        // Land in the studio shell with the Run tab live.
+        useStudioShellStore.getState().setTab("run");
+        navigate(
+          `/workflows/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
+        );
+      } else {
+        navigate(
+          env.useNewRunsUrl
+            ? `/runs/${response.data.workflow_run_id}`
+            : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+        );
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -570,7 +594,7 @@ function RunWorkflowForm({
         <header className="flex items-end justify-between gap-4">
           <div className="space-y-5">
             <h1 className="text-3xl">
-              Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
+              Inputs{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
             <h2 className="text-lg text-slate-400">
               Fill the placeholder values that you have linked throughout your
@@ -623,7 +647,14 @@ function RunWorkflowForm({
           </div>
         </header>
 
-        {hasLoginBlockValidationError && (
+        {hasLoginBlockValidationError && isActivation && (
+          <CredentialSetupPrompt
+            workflowPermanentId={workflowPermanentId}
+            blocksMissingCredentials={loginBlocksWithoutCredentials}
+          />
+        )}
+
+        {showDestructiveLoginAlert && (
           <Alert variant="destructive">
             <ExclamationTriangleIcon className="h-4 w-4" />
             <AlertTitle>Cannot run agent</AlertTitle>
@@ -639,7 +670,7 @@ function RunWorkflowForm({
               </ul>
               <p className="mt-2">
                 <Link
-                  to={`/workflows/${workflowPermanentId}/build`}
+                  to={workflowEditorPath(workflowPermanentId, studioEnabled)}
                   className="underline hover:no-underline"
                 >
                   Go to the editor
@@ -652,7 +683,7 @@ function RunWorkflowForm({
 
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
-            <h1 className="text-lg">Input Parameters</h1>
+            <h1 className="text-lg">Inputs</h1>
           </header>
           {workflowParameters?.map((parameter) => {
             return (
@@ -663,22 +694,7 @@ function RunWorkflowForm({
                 rules={{
                   validate: (value) => {
                     if (parameter.workflow_parameter_type === "json") {
-                      if (value === null || value === undefined) {
-                        return "This field is required";
-                      }
-                      if (typeof value === "string") {
-                        const trimmed = value.trim();
-                        if (trimmed === "") {
-                          return "This field is required";
-                        }
-                        try {
-                          JSON.parse(trimmed);
-                          return true;
-                        } catch (e) {
-                          return "Invalid JSON";
-                        }
-                      }
-                      return;
+                      return validateJsonWorkflowParameterValue(value);
                     }
 
                     // Boolean parameters are required - show error and block submission
@@ -790,7 +806,7 @@ function RunWorkflowForm({
             );
           })}
           {workflowParameters.length === 0 && (
-            <div>This agent doesn't have any input parameters</div>
+            <div>This agent doesn't have any inputs</div>
           )}
         </div>
 

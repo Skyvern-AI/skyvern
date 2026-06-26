@@ -1,7 +1,7 @@
 ---
 title: Browser Sessions
-subtitle: Persist live browser state across multiple tasks and workflows
-description: Create and manage live browser sessions that persist cookies, local storage, and page state between task or workflow runs. Use sessions for back-to-back tasks, human-in-the-loop approval, and real-time agents.
+subtitle: Persist live browser state across multiple tasks and agents
+description: Create and manage live browser sessions that persist cookies, local storage, and page state between task or agent runs. Use sessions for back-to-back tasks, human-in-the-loop approval, and real-time agents.
 slug: developers/optimization/browser-sessions
 keywords:
   - create_browser_session
@@ -14,7 +14,7 @@ keywords:
   - real-time agent
 ---
 
-A **Browser Session** is a live browser instance that persists cookies, local storage, and page state between task or workflow runs. Think of it as keeping a browser tab open. Use sessions when you need back-to-back tasks to share state, human-in-the-loop approval, or real-time agents.
+A **Browser Session** is a live browser instance that persists cookies, local storage, and page state between task or agent runs. Think of it as keeping a browser tab open. Use sessions when you need back-to-back tasks to share state, human-in-the-loop approval, or real-time agents.
 
 ---
 
@@ -86,6 +86,7 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 | `proxy_location` | string | Geographic proxy location (Cloud only). See [Proxy & Geolocation](/developers/going-to-production/proxy-geolocation) for available options |
 | `browser_type` | string | Browser type: `chrome` or `msedge` |
 | `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
+| `generate_browser_profile` | boolean | REST API only for now — not yet accepted by the SDK methods. Save the session's browser profile (cookies, localStorage, session files) when the session ends, so it can be turned into a reusable [browser profile](/developers/optimization/browser-profiles). Default: `false`. See [Save a session's profile](#save-a-sessions-profile) |
 
 **Example response:**
 
@@ -242,9 +243,9 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions/$SESSION_ID/close" 
 
 ---
 
-## Run workflows with a session
+## Run agents with a session
 
-Pass `browser_session_id` to `run_workflow` to execute a workflow in an existing session. This is useful when you need to run a predefined workflow but want it to continue from your current browser state.
+Pass `browser_session_id` to `run_workflow` to execute an agent in an existing session. This is useful when you need to run a predefined agent but want it to continue from your current browser state.
 
 <CodeGroup>
 ```python Python
@@ -364,6 +365,43 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions/$SESSION_ID/close" 
 <Note>
 You cannot use both `browser_session_id` and `browser_profile_id` in the same request. Choose one or the other.
 </Note>
+
+---
+
+## Save a session's profile
+
+By default, a browser session does **not** save its browser profile when it ends. To capture the session's state (cookies, localStorage, session files) for reuse, opt in with `generate_browser_profile`. Python and TypeScript SDK support for this flag is rolling out; until your SDK version includes it, call the REST API directly (the Python SDK can also pass it via `request_options` with `additional_body_parameters={"generate_browser_profile": True}`).
+
+```bash
+curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "timeout": 60,
+    "generate_browser_profile": true
+  }'
+```
+
+You can also toggle the flag on a live session. The value is read when the session ends, so the update takes effect as long as the session is still open. Updating a session that has already closed returns a `409` error.
+
+```bash
+curl -X PATCH "https://api.skyvern.com/v1/browser_sessions/pbs_abc123" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"generate_browser_profile": true}'
+```
+
+To confirm the setting on an existing session, fetch it with `GET /v1/browser_sessions/{browser_session_id}` — the response includes `generate_browser_profile`.
+
+Once the session closes and its profile finishes uploading, turn it into a reusable profile with [`create_browser_profile`](/developers/optimization/browser-profiles#from-a-browser-session).
+
+<Note>
+Sessions started from a saved profile (`browser_profile_id`) always save their profile when they end, regardless of this flag. This does not update the original profile — to keep the refreshed login state, create a new profile from the closed session and use the new profile's ID in future runs.
+</Note>
+
+<Warning>
+**Behavior change:** sessions previously saved their profile automatically. Creating a browser profile from a closed session now fails with a `400` error unless the session had `generate_browser_profile` enabled or was started from a profile — retrying does not help. Update API scripts and integrations that create profiles from closed sessions; n8n users may need updated Skyvern nodes. Creating profiles from workflow runs (`persist_browser_session`) is unaffected.
+</Warning>
 
 ---
 
@@ -581,9 +619,9 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
 ```
 </CodeGroup>
 
-### Use workflows for predetermined sequences
+### Use agents for predetermined sequences
 
-If your steps don't need pauses between them, a workflow runs them in a single browser instance without the overhead of creating and managing a session. Each task in a session incurs its own startup cost, while workflow blocks share one browser.
+If your steps don't need pauses between them, an agent runs them in a single browser instance without the overhead of creating and managing a session. Each task in a session incurs its own startup cost, while agent blocks share one browser.
 
 <CodeGroup>
 ```python Python
@@ -691,10 +729,10 @@ Skyvern also offers [Browser Profiles](/developers/optimization/browser-profiles
 | **Lifetime** | Minutes to hours | Days to months |
 | **State** | Current page, cookies, open connections | Cookies, storage, session files |
 | **Billing** | Charged while open | No cost when not in use |
-| **Best for** | Back-to-back tasks, human-in-the-loop, real-time agents | Repeated logins, scheduled workflows, shared auth state |
+| **Best for** | Back-to-back tasks, human-in-the-loop, real-time agents | Repeated logins, scheduled agents, shared auth state |
 
 <Tip>
-You can create a [Browser Profile](/developers/optimization/browser-profiles) from a completed session to save its authenticated state for future reuse.
+You can create a [Browser Profile](/developers/optimization/browser-profiles) from a completed session to save its authenticated state for future reuse. The session must have [`generate_browser_profile` enabled](#save-a-sessions-profile) or have been started from a profile.
 </Tip>
 
 ---

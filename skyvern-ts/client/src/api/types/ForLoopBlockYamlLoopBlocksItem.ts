@@ -5,6 +5,7 @@ import type * as Skyvern from "../index.js";
 export type ForLoopBlockYamlLoopBlocksItem =
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Task
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.ForLoop
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.WhileLoop
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Code
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.TextPrompt
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.DownloadToS3
@@ -26,7 +27,9 @@ export type ForLoopBlockYamlLoopBlocksItem =
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.HttpRequest
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Conditional
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.PrintPage
-    | Skyvern.ForLoopBlockYamlLoopBlocksItem.WorkflowTrigger;
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.WorkflowTrigger
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.GoogleSheetsRead
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.GoogleSheetsWrite;
 
 export namespace ForLoopBlockYamlLoopBlocksItem {
     export interface Task extends Skyvern.TaskBlockYaml {
@@ -35,6 +38,10 @@ export namespace ForLoopBlockYamlLoopBlocksItem {
 
     export interface ForLoop extends Skyvern.ForLoopBlockYaml {
         block_type: "for_loop";
+    }
+
+    export interface WhileLoop extends Skyvern.WhileLoopBlockYaml {
+        block_type: "while_loop";
     }
 
     export interface Code extends Skyvern.CodeBlockYaml {
@@ -123,5 +130,13 @@ export namespace ForLoopBlockYamlLoopBlocksItem {
 
     export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlockYaml {
         block_type: "workflow_trigger";
+    }
+
+    export interface GoogleSheetsRead extends Skyvern.GoogleSheetsReadBlockYaml {
+        block_type: "google_sheets_read";
+    }
+
+    export interface GoogleSheetsWrite extends Skyvern.GoogleSheetsWriteBlockYaml {
+        block_type: "google_sheets_write";
     }
 }

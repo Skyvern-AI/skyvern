@@ -28,17 +28,17 @@ import structlog
 from jinja2 import Environment, FileSystemLoader
 
 from skyvern.constants import SKYVERN_DIR
+from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
 
-NON_VISION_CONTEXT_HEADER = "Non-vision page context and accessibility tree:"
 
-
-def _with_non_vision_context(prompt: str, template: str, kwargs: dict[str, Any]) -> str:
-    non_vision_page_context = kwargs.get("non_vision_page_context")
-    if not non_vision_page_context or template.endswith("-static") or NON_VISION_CONTEXT_HEADER in prompt:
-        return prompt
-    return f"{prompt.rstrip()}\n\n{NON_VISION_CONTEXT_HEADER}\n```json\n{non_vision_page_context}\n```"
+def _untrusted_filter(value: Any, escape_quotes: bool = False) -> str:
+    # Coerce to a plain str so dict/list values do not crash NFKC and so
+    # Markup subclasses do not carry safe-html semantics into prompts.
+    if value is None:
+        return ""
+    return escape_code_fences(str(value), escape_quotes=escape_quotes)
 
 
 class PromptEngine:
@@ -67,6 +67,7 @@ class PromptEngine:
             self.model = self.get_closest_match(self.model, model_names)
 
             self.env = Environment(loader=FileSystemLoader(models_dir))
+            self.env.filters["untrusted"] = _untrusted_filter
         except Exception:
             LOG.error("Error initializing PromptEngine.", model=model, exc_info=True)
             raise
@@ -109,7 +110,7 @@ class PromptEngine:
         try:
             template = "/".join([self.model, template])
             jinja_template = self.env.get_template(f"{template}.j2")
-            return _with_non_vision_context(jinja_template.render(**kwargs), template, kwargs)
+            return jinja_template.render(**kwargs)
         except Exception:
             LOG.error(
                 "Failed to load prompt.",
@@ -132,7 +133,7 @@ class PromptEngine:
         """
         try:
             jinja_template = self.env.from_string(template)
-            return _with_non_vision_context(jinja_template.render(**kwargs), template, kwargs)
+            return jinja_template.render(**kwargs)
         except Exception:
             LOG.error(
                 "Failed to load prompt from string.",

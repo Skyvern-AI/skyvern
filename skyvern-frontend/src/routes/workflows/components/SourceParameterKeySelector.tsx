@@ -28,7 +28,7 @@ function SourceParameterKeySelector({ value, onChange }: Props) {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger>
-        <SelectValue placeholder="Select a parameter" />
+        <SelectValue placeholder="Select an input" />
       </SelectTrigger>
       <SelectContent>
         {[...contextParameterKeys, ...outputParameterKeys].map(

@@ -1,37 +1,131 @@
+import { type ReactNode } from "react";
+
+import {
+  CheckCircledIcon,
+  CircleBackslashIcon,
+  CircleIcon,
+  ClockIcon,
+  CrossCircledIcon,
+  MinusCircledIcon,
+  PauseIcon,
+  StopwatchIcon,
+  UpdateIcon,
+} from "@radix-ui/react-icons";
+
 import { Status } from "@/api/types";
-import { Badge } from "./ui/badge";
 import { cn } from "@/util/utils";
+
+import { TerminatedIcon } from "./terminatedVisual";
+import { Badge } from "./ui/badge";
+
+type StatusVariant =
+  | "success"
+  | "warning"
+  | "destructive"
+  | "terminated"
+  | "secondary";
+
+type PillTone =
+  | "success"
+  | "danger"
+  | "terminated"
+  | "running"
+  | "queued"
+  | "neutral";
+
+const toneToVariant: Record<PillTone, StatusVariant> = {
+  success: "success",
+  danger: "destructive",
+  terminated: "terminated",
+  running: "warning",
+  queued: "warning",
+  neutral: "secondary",
+};
+
+type PillProps = {
+  tone: PillTone;
+  className?: string;
+  children: ReactNode;
+};
+
+function Pill({ tone, className, children }: PillProps) {
+  return (
+    <Badge variant={toneToVariant[tone]} className={className}>
+      {children}
+    </Badge>
+  );
+}
 
 type Props = {
   className?: string;
   status: Status | "pending";
 };
 
+function variantForStatus(status: Status | "pending"): StatusVariant {
+  switch (status) {
+    case Status.Completed:
+      return "success";
+    case Status.Failed:
+    case Status.Canceled:
+    case Status.TimedOut:
+      return "destructive";
+    case Status.Terminated:
+      return "terminated";
+    case Status.Running:
+    case Status.Queued:
+    case "pending":
+      return "warning";
+    case Status.Created:
+    default:
+      return "secondary";
+  }
+}
+
+function iconForStatus(status: Status | "pending") {
+  const cls = "h-3.5 w-3.5 shrink-0";
+  switch (status) {
+    case Status.Completed:
+      return <CheckCircledIcon className={cls} />;
+    case Status.Running:
+      return <UpdateIcon className={cls} />;
+    case Status.Queued:
+    case "pending":
+      return <ClockIcon className={cls} />;
+    case Status.Failed:
+      return <CrossCircledIcon className={cls} />;
+    case Status.Canceled:
+      return <CircleBackslashIcon className={cls} />;
+    case Status.TimedOut:
+      return <StopwatchIcon className={cls} />;
+    case Status.Terminated:
+      return <TerminatedIcon className={cls} />;
+    case Status.Skipped:
+      return <MinusCircledIcon className={cls} />;
+    case Status.Paused:
+      return <PauseIcon className={cls} />;
+    case Status.Created:
+    default:
+      return <CircleIcon className={cls} />;
+  }
+}
+
 function StatusBadge({ className, status }: Props) {
   const statusText = status === "timed_out" ? "timed out" : status;
 
   return (
     <Badge
-      className={cn("flex h-7 w-24 justify-center", className, {
-        "border-green-900/20 bg-green-900/10 text-green-800 hover:bg-green-900/15 dark:border-transparent dark:bg-green-900 dark:text-green-50 dark:hover:bg-green-900/80":
-          status === Status.Completed,
-        "border-orange-900/20 bg-orange-900/10 text-orange-800 hover:bg-orange-900/15 dark:border-transparent dark:bg-orange-900 dark:text-orange-50 dark:hover:bg-orange-900/80":
-          status === Status.Terminated,
-        "border-gray-900/20 bg-gray-900/10 text-gray-800 hover:bg-gray-900/15 dark:border-transparent dark:bg-gray-900 dark:text-gray-50 dark:hover:bg-gray-900/80":
-          status === Status.Created,
-        "border-red-900/20 bg-red-900/10 text-red-800 hover:bg-red-900/15 dark:border-transparent dark:bg-red-900 dark:text-red-50 dark:hover:bg-red-900/80":
-          status === Status.Failed ||
-          status === Status.Canceled ||
-          status === Status.TimedOut,
-        "bg-yellow-900 text-yellow-50 hover:bg-yellow-900/80":
-          status === Status.Running ||
-          status === Status.Queued ||
-          status === "pending",
-      })}
+      variant={variantForStatus(status)}
+      className={cn(
+        "justify-center gap-1.5 px-1.5 capitalize md:w-28 md:justify-start md:px-2.5",
+        className,
+      )}
+      title={statusText}
     >
-      {statusText}
+      {iconForStatus(status)}
+      <span className="sr-only md:not-sr-only">{statusText}</span>
     </Badge>
   );
 }
 
-export { StatusBadge };
+export { StatusBadge, Pill };
+export type { PillTone };

@@ -34,9 +34,20 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useSearchParams } from "react-router-dom";
-import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
+import {
+  Link,
+  Navigate,
+  Outlet,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
+import {
+  statusIsAFailureType,
+  statusIsCancellable,
+  statusIsFinalized,
+} from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
+import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
 import { WorkflowRunBlockDetail } from "./workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
@@ -61,6 +72,14 @@ import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowR
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
+import { useRunsQuery } from "@/hooks/useRunsQuery";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
+import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecoveryGuidance";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
+import { isFirstFailedRunRecoveryEligible } from "@/util/onboarding/rolloutGating";
 
 function WorkflowRunRightColumn({
   activeItem,
@@ -135,6 +154,9 @@ function WorkflowRun() {
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
+  const onboarding = useOnboardingStateOptional();
 
   const {
     data: workflowRun,
@@ -142,6 +164,8 @@ function WorkflowRun() {
     isFetched,
     error,
   } = useWorkflowRunWithWorkflowQuery();
+
+  useRefreshOnboardingOnRunCompletion(workflowRun);
 
   const status = (error as AxiosError | undefined)?.response?.status;
   const workflow = workflowRun?.workflow;
@@ -301,6 +325,52 @@ function WorkflowRun() {
     finallyBlockLabel &&
     finallyBlockInTimeline;
 
+  // Gate the first-failed-run guidance. first_run_at is stamped on any first
+  // terminal run, so derive "first run" from the runs list and assert this run
+  // is that single run.
+  const isFailureRun = workflowRun
+    ? statusIsAFailureType({ status: workflowRun.status })
+    : false;
+  const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
+  // Gate on the rollout arm so a 0% rollout / rollback hides the recovery surface.
+  const firstFailedRunGateEnabled = isFirstFailedRunRecoveryEligible({
+    flagVariant: onboardingFlagVariant,
+    isNewUser: onboarding?.isNewUser === true,
+    isFailureRun,
+    hasFailureReason: Boolean(workflowRun?.failure_reason),
+  });
+  const { data: recentRuns } = useRunsQuery({
+    page: 1,
+    pageSize: 2,
+    enabled: firstFailedRunGateEnabled,
+  });
+  const showFirstFailedRunRecovery =
+    firstFailedRunGateEnabled &&
+    recentRuns?.length === 1 &&
+    recentRuns[0]?.run_id === workflowRun?.workflow_run_id;
+
+  const handleFirstFailedRunRetry = useCallback(() => {
+    navigate(`/workflows/${workflowPermanentId}/run`, {
+      state: {
+        data: workflowRun?.parameters ?? {},
+        proxyLocation,
+        webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
+        maxScreenshotScrolls,
+        runWith: workflowRun?.run_with ?? "agent",
+        browserProfileId: workflowRun?.browser_profile_id ?? null,
+      },
+    });
+  }, [
+    navigate,
+    workflowPermanentId,
+    proxyLocation,
+    maxScreenshotScrolls,
+    workflowRun?.parameters,
+    workflowRun?.webhook_callback_url,
+    workflowRun?.run_with,
+    workflowRun?.browser_profile_id,
+  ]);
+
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div className="space-y-2 rounded-md border border-red-600 bg-error-light p-4">
       <div className="flex items-center gap-2">
@@ -309,6 +379,14 @@ function WorkflowRun() {
       </div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
+      {showFirstFailedRunRecovery && (
+        <FirstRunRecoveryGuidance
+          surface="runs"
+          failureCategory={workflowRun.failure_category?.[0]?.category ?? null}
+          workflowPermanentId={workflowPermanentId}
+          onRetry={handleFirstFailedRunRetry}
+        />
+      )}
       {shouldShowFinallyNote && (
         <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-200">
           <span className="font-medium">Note:</span>
@@ -451,6 +529,25 @@ function WorkflowRun() {
     return <Status404 />;
   }
 
+  // With the preview on, route legacy run links into the studio Run tab
+  // (preserving the selected item); flag-off keeps this legacy run view.
+  if (studioEnabled && !isEmbedded && workflowRunId && workflowPermanentId) {
+    const studioParams = new URLSearchParams();
+    studioParams.set("wr", workflowRunId);
+    if (active) {
+      studioParams.set("active", active);
+    }
+    if (iterationParam) {
+      studioParams.set("iteration", iterationParam);
+    }
+    return (
+      <Navigate
+        to={`/workflows/${workflowPermanentId}/studio?${studioParams.toString()}`}
+        replace
+      />
+    );
+  }
+
   return (
     <div className="space-y-8">
       {!isEmbedded && (
@@ -557,7 +654,10 @@ function WorkflowRun() {
                 />
                 <Button asChild variant="secondary">
                   <Link
-                    to={`/workflows/${workflowPermanentId}/build`}
+                    to={workflowEditorPath(
+                      workflowPermanentId ?? "",
+                      studioEnabled,
+                    )}
                     data-testid="workflow-open-editor-link"
                   >
                     <Pencil2Icon className="mr-2 h-4 w-4" />

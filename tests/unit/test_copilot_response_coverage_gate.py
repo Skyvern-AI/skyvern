@@ -16,9 +16,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES,
     MAX_FORMAT_NUDGES,
     MAX_INTERMEDIATE_NUDGES,
     MAX_NO_WORKFLOW_NUDGES,
+    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
     POST_FORMAT_NUDGE,
     POST_INTERMEDIATE_SUCCESS_NUDGE,
     POST_NO_WORKFLOW_DELIVERY_NUDGE,
@@ -41,8 +43,14 @@ class _Ctx:
         self.coverage_nudge_count = 0
         self.format_nudge_count = 0
         self.no_workflow_nudge_count = 0
+        self.discovery_entrypoint_url_question_nudge_count = 0
         self.user_message = ""
         self.request_policy = None
+        self.resolved_discovery_entrypoint_url = None
+        self.resolved_discovery_failure_reason = None
+        self.resolved_discovery_entrypoint_inspection_baseline = 0
+        self.page_inspection_calls_this_turn = 0
+        self.composition_page_evidence = None
         self.last_update_block_count = None
         self.last_test_ok = None
         self.last_test_failure_reason = None
@@ -50,9 +58,10 @@ class _Ctx:
         self.last_test_anti_bot = None
         self.failed_test_nudge_count = 0
         self.explore_without_workflow_nudge_count = 0
-        self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
+        self.last_artifact_health_blocker_reason = None
+        self.completion_verification_result = None
 
 
 @dataclass
@@ -109,6 +118,15 @@ def test_reply_after_success_with_request_policy_completion_contract_passes_thro
     assert ctx.coverage_nudge_count == 0
 
 
+def test_reply_after_success_with_unknown_fallback_contract_passes_through() -> None:
+    ctx = _post_success_ctx("Go to https://example.com/contact. Fill out the contact form and submit it.")
+    ctx.request_policy = SimpleNamespace(completion_contract_status="unknown")
+    parsed = {"type": "REPLY", "user_response": "I created and tested the workflow."}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
+    assert ctx.coverage_nudge_count == 0
+
+
 def test_coverage_nudge_respects_counter_cap() -> None:
     ctx = _post_success_ctx("go to X and download Y")
     parsed = {"type": "REPLY", "user_response": "one block draft"}
@@ -118,11 +136,100 @@ def test_coverage_nudge_respects_counter_cap() -> None:
     assert _response_coverage_nudge(ctx, parsed) is None
 
 
-def test_ask_question_always_passes_through_even_with_coverage_gap() -> None:
+def test_ask_question_passes_through_even_with_coverage_gap() -> None:
     ctx = _post_success_ctx("go to site and download file")
     parsed = {"type": "ASK_QUESTION", "user_response": "Which file do you mean?"}
     assert _response_coverage_nudge(ctx, parsed) is None
     assert ctx.coverage_nudge_count == 0
+
+
+def test_ask_question_before_acting_on_discovery_candidate_fires_nudge() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    parsed = {
+        "type": "ASK_QUESTION",
+        "user_response": "Which file should I download?",
+    }
+
+    nudge = _response_coverage_nudge(ctx, parsed)
+
+    assert nudge is not None
+    assert nudge.startswith(POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE)
+    assert "https://example.com/" in nudge
+    assert ctx.discovery_entrypoint_url_question_nudge_count == 1
+
+
+def test_ask_question_after_discovery_failure_still_passes_through() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    ctx.resolved_discovery_failure_reason = "could_not_resolve_site_name"
+    parsed = {"type": "ASK_QUESTION", "user_response": "Which URL should I use?"}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
+
+
+def test_ask_question_before_acting_on_discovery_candidate_caps_nudges() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    parsed = {"type": "ASK_QUESTION", "user_response": "Which file should I download?"}
+
+    for expected_count in range(1, MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES + 1):
+        assert _response_coverage_nudge(ctx, parsed) is not None
+        assert ctx.discovery_entrypoint_url_question_nudge_count == expected_count
+    assert _response_coverage_nudge(ctx, parsed) is None
+    assert ctx.discovery_entrypoint_url_question_nudge_count == MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES
+
+
+def test_ask_question_after_page_inspection_of_discovery_candidate_passes_through() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    ctx.page_inspection_calls_this_turn = 1
+    ctx.composition_page_evidence = {
+        "source_tool": "inspect_page_for_composition",
+        "inspected_url": "https://example.com/",
+        "current_url": "https://example.com/",
+    }
+    parsed = {"type": "ASK_QUESTION", "user_response": "Which account should I use?"}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
+
+
+def test_ask_question_after_unrelated_page_inspection_of_discovery_candidate_still_fires_nudge() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    ctx.page_inspection_calls_this_turn = 1
+    ctx.composition_page_evidence = {
+        "source_tool": "inspect_page_for_composition",
+        "inspected_url": "https://other.example/",
+        "current_url": "https://other.example/",
+    }
+    parsed = {"type": "ASK_QUESTION", "user_response": "Which account should I use?"}
+
+    assert _response_coverage_nudge(ctx, parsed) is not None
+
+
+def test_ask_question_after_stale_candidate_page_inspection_still_fires_nudge() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    ctx.resolved_discovery_entrypoint_inspection_baseline = 1
+    ctx.page_inspection_calls_this_turn = 1
+    ctx.composition_page_evidence = {
+        "source_tool": "inspect_page_for_composition",
+        "inspected_url": "https://example.com/",
+        "current_url": "https://example.com/",
+    }
+    parsed = {"type": "ASK_QUESTION", "user_response": "Which account should I use?"}
+
+    assert _response_coverage_nudge(ctx, parsed) is not None
+
+
+def test_ask_question_after_mutating_from_discovery_candidate_passes_through() -> None:
+    ctx = _Ctx()
+    ctx.resolved_discovery_entrypoint_url = "https://example.com/"
+    ctx.update_workflow_called = True
+    parsed = {"type": "ASK_QUESTION", "user_response": "Which account should I use?"}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
 
 
 def test_reply_without_coverage_gap_passes_through() -> None:

@@ -3,11 +3,20 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -51,6 +60,8 @@ from skyvern.schemas.run_enums import (  # noqa: F401
 )
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
+
+MAX_SEARCH_FETCH_LIMIT = 1000
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
@@ -208,8 +219,16 @@ class TaskRunRequest(BaseModel):
 
 
 class WorkflowRunRequest(BaseModel):
+    # An agent *is* a workflow, so `agent_id` and `workflow_id` carry the same `wpid_` value. `agent_id`
+    # is listed first so the public request schema advertises the agent-named field, while `workflow_id`
+    # stays accepted for backwards compatibility. `populate_by_name` keeps internal
+    # `WorkflowRunRequest(workflow_id=...)` construction working alongside the aliases.
+    model_config = ConfigDict(populate_by_name=True)
+
     workflow_id: str = Field(
-        description="ID of the workflow to run. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+        validation_alias=AliasChoices("agent_id", "workflow_id"),
+        description="ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.",
+        examples=["wpid_123"],
     )
     parameters: dict[str, Any] | None = Field(default=None, description="Parameters to pass to the workflow")
     title: str | None = Field(default=None, description="The title for this workflow run")
@@ -247,8 +266,12 @@ class WorkflowRunRequest(BaseModel):
     max_elapsed_time_minutes: int | None = Field(
         default=None,
         ge=1,
-        le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
-        description="Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.",
+        le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+        description=(
+            "Timeout this workflow run after the configured elapsed runtime in minutes. "
+            f"When omitted, the platform default is {WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES} minutes. "
+            f"The maximum configurable value is {WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES} minutes."
+        ),
     )
     extra_http_headers: dict[str, str] | None = Field(
         default=None,
@@ -462,6 +485,10 @@ class WorkflowRunResponse(BaseRunResponse):
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
+    # NOTE: no top-level `agent_id` here on purpose. This model has no reliable permanent-id field
+    # (only `run_request.workflow_id`, which is absent on some reads and is a version id on the
+    # login/download paths), so a computed alias would echo null/wrong values. The reliable agent_id
+    # alias lives on WorkflowRunResponseBase / Workflow / RunWorkflowResponse instead.
 
 
 RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discriminator="run_type")]

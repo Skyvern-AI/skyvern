@@ -21,6 +21,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { useCallback, useMemo, useState } from "react";
 import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "../ui/button";
@@ -45,6 +46,7 @@ function WorkflowDataSchemaInputGroup({
   helpTooltip,
 }: Props) {
   const credentialGetter = useCredentialGetter();
+  const scopeReadOnly = useWorkflowScopeReadOnly();
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
   const [pendingSchema, setPendingSchema] = useState<string | null>(null);
@@ -99,6 +101,7 @@ function WorkflowDataSchemaInputGroup({
           </div>
           <Checkbox
             checked={value !== "null"}
+            disabled={scopeReadOnly}
             onCheckedChange={(checked) => {
               if (!checked) {
                 resetAIState();
@@ -109,7 +112,7 @@ function WorkflowDataSchemaInputGroup({
             }}
           />
         </div>
-        {value !== "null" && !generateWithAIActive && (
+        {value !== "null" && !generateWithAIActive && !scopeReadOnly && (
           <Button
             variant="tertiary"
             className="h-7 text-xs"
@@ -177,6 +180,7 @@ function WorkflowDataSchemaInputGroup({
               language="json"
               value={value}
               onChange={onChange}
+              readOnly={scopeReadOnly}
               className="nopan"
               fontSize={8}
             />

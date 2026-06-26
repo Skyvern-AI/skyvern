@@ -31,6 +31,37 @@ function basicLocalTimeFormat(time: string): string {
   return `${dateString} at ${timeString}`;
 }
 
+const compactDateFormat = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+});
+const compactDateWithYearFormat = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
+const compactTimeFormat = new Intl.DateTimeFormat(undefined, {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+function compactLocalDateTime(time: string): string {
+  time = normalizeUtcTimestamp(time);
+
+  const date = new Date(time);
+  if (isNaN(date.getTime())) {
+    return "";
+  }
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+
+  const dateString = (
+    sameYear ? compactDateFormat : compactDateWithYearFormat
+  ).format(date);
+  const timeString = compactTimeFormat.format(date);
+
+  return `${dateString}, ${timeString}`;
+}
+
 function basicTimeFormat(time: string): string {
   const date = new Date(time);
   const dateString = date.toLocaleDateString("en-US", {
@@ -103,7 +134,9 @@ function formatExecutionTime(
 }
 
 export {
+  normalizeUtcTimestamp,
   basicLocalTimeFormat,
+  compactLocalDateTime,
   basicTimeFormat,
   timeFormatWithShortDate,
   localTimeFormatWithShortDate,

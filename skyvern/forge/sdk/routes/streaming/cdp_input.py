@@ -25,6 +25,7 @@ from skyvern.forge.sdk.routes.streaming.registries import (
 from skyvern.forge.sdk.routes.streaming.screencast import wait_for_browser_state
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
 
@@ -37,6 +38,7 @@ _MAX_KEY_LEN = 32
 _MAX_CODE_LEN = 32
 _MODIFIER_MASK = 0xF
 _MAX_VK_CODE = 0xFE
+ACTIVE_PAGE_INPUT_REFRESH_INTERVAL = 0.5
 
 
 @dataclasses.dataclass
@@ -51,6 +53,63 @@ class CdpInputChannel:
 
     async def close(self) -> None:
         del_cdp_input_channel(self.client_id)
+
+
+class ActivePageCdpInputSession:
+    def __init__(
+        self,
+        browser_state: BrowserState,
+        log_id_key: str,
+        log_id_value: str,
+        refresh_interval: float = ACTIVE_PAGE_INPUT_REFRESH_INTERVAL,
+    ) -> None:
+        self.browser_state = browser_state
+        self.log_id_key = log_id_key
+        self.log_id_value = log_id_value
+        self.refresh_interval = refresh_interval
+        self.cdp_session: CDPSession | None = None
+        self.page: object | None = None
+        self.next_refresh_at = 0.0
+        self.page_resolution_failed = False
+
+    async def get_session(self, *, force_refresh: bool = False) -> CDPSession | None:
+        now = time.monotonic()
+        if not force_refresh and now < self.next_refresh_at:
+            return None if self.page_resolution_failed else self.cdp_session
+
+        page = await self.browser_state.get_working_page()
+        if page is None:
+            self.page_resolution_failed = True
+            self.next_refresh_at = now + self.refresh_interval
+            return None
+
+        self.page_resolution_failed = False
+        self.next_refresh_at = now + self.refresh_interval
+        if self.cdp_session is not None and page is self.page:
+            return self.cdp_session
+
+        await self.close()
+        session = await page.context.new_cdp_session(page)  # type: ignore[attr-defined]
+        self.cdp_session = session
+        self.page = page
+        LOG.info(
+            "CDP input rebound to active page",
+            **{self.log_id_key: self.log_id_value},
+            url=getattr(page, "url", ""),
+        )
+        return session
+
+    async def close(self) -> None:
+        if self.cdp_session is None:
+            self.page = None
+            return
+        session = self.cdp_session
+        self.cdp_session = None
+        self.page = None
+        try:
+            await session.detach()
+        except Exception:
+            pass
 
 
 def _validated_modifiers(msg: dict) -> int:
@@ -199,11 +258,12 @@ async def _dispatch_event(
 async def _run_input_loop(
     websocket: WebSocket,
     channel: CdpInputChannel,
-    cdp_session: CDPSession,
+    input_session: ActivePageCdpInputSession,
     log_id_key: str,
     log_id_value: str,
 ) -> None:
     dropped_log_count = 0
+    no_active_page_log_count = 0
     while True:
         try:
             raw = await websocket.receive_text()
@@ -236,6 +296,24 @@ async def _run_input_loop(
                     kind=kind,
                 )
                 dropped_log_count += 1
+            continue
+
+        try:
+            cdp_session = await input_session.get_session()
+        except Exception:
+            LOG.warning(
+                "CDP input: failed to resolve active page; closing input channel",
+                **{log_id_key: log_id_value},
+                kind=kind,
+                exc_info=True,
+            )
+            await websocket.close(code=4411, reason="active_page_resolution_failed")
+            break
+
+        if cdp_session is None:
+            if no_active_page_log_count < 5:
+                LOG.info("CDP input: no active page; event skipped", **{log_id_key: log_id_value}, kind=kind)
+                no_active_page_log_count += 1
             continue
 
         try:
@@ -275,6 +353,7 @@ async def cdp_input_stream(
     )
 
     cdp_session: CDPSession | None = None
+    input_session: ActivePageCdpInputSession | None = None
     try:
         deadline = time.monotonic() + 120
         while True:
@@ -308,13 +387,18 @@ async def cdp_input_stream(
             await websocket.close(code=4410, reason="no_working_page")
             return
 
-        cdp_session = await page.context.new_cdp_session(page)
+        input_session = ActivePageCdpInputSession(browser_state, "workflow_run_id", workflow_run_id)
+        cdp_session = await input_session.get_session(force_refresh=True)
+        if cdp_session is None:
+            LOG.warning("CDP input: no working page", workflow_run_id=workflow_run_id)
+            await websocket.close(code=4410, reason="no_working_page")
+            return
         stream_ref_inc(workflow_run_id)
 
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, cdp_session, "workflow_run_id", workflow_run_id)
+        await _run_input_loop(websocket, channel, input_session, "workflow_run_id", workflow_run_id)
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", workflow_run_id=workflow_run_id)
@@ -327,10 +411,8 @@ async def cdp_input_stream(
     finally:
         if cdp_session is not None:
             await stream_ref_dec(workflow_run_id)
-            try:
-                await cdp_session.detach()
-            except Exception:
-                pass
+        if input_session is not None:
+            await input_session.close()
         await channel.close()
         LOG.info("CDP input channel closed", workflow_run_id=workflow_run_id, client_id=client_id)
 
@@ -358,7 +440,7 @@ async def cdp_input_browser_session_stream(
         websocket=websocket,
     )
 
-    cdp_session: CDPSession | None = None
+    input_session: ActivePageCdpInputSession | None = None
     try:
         session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
             session_id=browser_session_id,
@@ -373,7 +455,11 @@ async def cdp_input_browser_session_stream(
             await websocket.close(code=4404, reason="browser_session_finalized")
             return
 
-        browser_state = await wait_for_browser_state(browser_session_id, "browser_session")
+        browser_state = await wait_for_browser_state(
+            browser_session_id,
+            "browser_session",
+            organization_id=organization_id,
+        )
         if browser_state is None:
             LOG.warning("CDP input: timed out waiting for browser state", browser_session_id=browser_session_id)
             await websocket.close(code=4408, reason="browser_state_timeout")
@@ -385,12 +471,16 @@ async def cdp_input_browser_session_stream(
             await websocket.close(code=4410, reason="no_working_page")
             return
 
-        cdp_session = await page.context.new_cdp_session(page)
+        input_session = ActivePageCdpInputSession(browser_state, "browser_session_id", browser_session_id)
+        if await input_session.get_session(force_refresh=True) is None:
+            LOG.warning("CDP input: no working page", browser_session_id=browser_session_id)
+            await websocket.close(code=4410, reason="no_working_page")
+            return
 
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, cdp_session, "browser_session_id", browser_session_id)
+        await _run_input_loop(websocket, channel, input_session, "browser_session_id", browser_session_id)
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", browser_session_id=browser_session_id)
@@ -401,10 +491,7 @@ async def cdp_input_browser_session_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", browser_session_id=browser_session_id, exc_info=True)
     finally:
-        if cdp_session is not None:
-            try:
-                await cdp_session.detach()
-            except Exception:
-                pass
+        if input_session is not None:
+            await input_session.close()
         await channel.close()
         LOG.info("CDP input channel closed", browser_session_id=browser_session_id, client_id=client_id)

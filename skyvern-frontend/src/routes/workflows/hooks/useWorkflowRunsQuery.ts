@@ -3,6 +3,11 @@ import { Status, WorkflowRunApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
+import {
+  getActiveOrgQueryKeyScope,
+  getOrgScopedQueryKey,
+  useActiveOrgId,
+} from "@/store/ActiveOrgContext";
 
 type QueryReturnType = Array<WorkflowRunApiResponse>;
 type UseQueryOptions = Omit<
@@ -28,17 +33,22 @@ function useWorkflowRunsQuery({
 }: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
 
   return useQuery<Array<WorkflowRunApiResponse>>({
-    queryKey: [
-      "workflowRuns",
-      { statusFilters },
-      workflowPermanentId,
-      page,
-      pageSize,
-      search,
-    ],
-    queryFn: async () => {
+    queryKey: getOrgScopedQueryKey(
+      [
+        "workflowRuns",
+        { statusFilters },
+        workflowPermanentId,
+        page,
+        pageSize,
+        search,
+      ],
+      activeOrgQueryKeyScope,
+    ),
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -63,6 +73,7 @@ function useWorkflowRunsQuery({
       return client
         .get(`/workflows/${workflowPermanentId}/runs`, {
           params,
+          signal,
         })
         .then((response) => response.data);
     },

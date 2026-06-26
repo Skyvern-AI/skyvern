@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "skyvern-ui.fullname" . }}
+  labels:
+    {{- include "skyvern-ui.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "skyvern-ui.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: artifact
+      port: {{ .Values.service.artifactPort }}
+      targetPort: artifact
+      protocol: TCP

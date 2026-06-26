@@ -1,3 +1,6 @@
+import { cleanup } from "@testing-library/react";
+import { afterEach } from "vitest";
+
 type StorageRecord = Record<string, string>;
 
 const createMemoryStorage = (): Storage => {
@@ -45,3 +48,24 @@ if (localStorageNeedsShim) {
     value: storage,
   });
 }
+
+// Radix focus primitives create CustomEvent via the global constructor, then
+// dispatch on jsdom elements. Keep those constructors from the same realm.
+if (typeof window !== "undefined") {
+  Object.defineProperty(globalThis, "Event", {
+    configurable: true,
+    value: window.Event,
+  });
+  Object.defineProperty(globalThis, "CustomEvent", {
+    configurable: true,
+    value: window.CustomEvent,
+  });
+}
+
+// Radix FocusScope schedules a setTimeout(..., 0) on unmount that dispatches a
+// CustomEvent. Flush it within the test's realm (cleanup then one macrotask) so
+// it can't fire during teardown against a swapped realm and red the run.
+afterEach(async () => {
+  cleanup();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});

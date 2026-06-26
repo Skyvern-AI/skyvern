@@ -14,6 +14,7 @@ from skyvern.forge.sdk.routes.streaming.channels import message as message_modul
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, LocalExecutionChannel
 from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageChannel,
+    MessageInBeginExfiltration,
     MessageInClearAllData,
     MessageInClearCookies,
     MessageInClearHistory,
@@ -21,12 +22,16 @@ from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageInGoBack,
     MessageInGoForward,
     MessageInNavigate,
+    MessageInRecordingRearmCapture,
     MessageInReload,
     MessageInTakeScreenshot,
     MessageKind,
+    MessageOutRecordingInterpretationUpdate,
     loop_stream_messages,
+    message_to_dict,
     reify_channel_message,
 )
+from skyvern.services.browser_recording.types import ActionKind, RecordingDraftStep
 
 
 class TestReifyChannelMessage:
@@ -85,6 +90,53 @@ class TestReifyChannelMessage:
     def test_unknown_kind_raises(self) -> None:
         with pytest.raises(ValueError):
             reify_channel_message({"kind": "totally-not-a-real-kind"})
+
+    def test_begin_exfiltration_carries_live_interpretation_context(self) -> None:
+        msg = reify_channel_message(
+            {
+                "kind": "begin-exfiltration",
+                "workflow_permanent_id": "wpid_123",
+                "live_interpretation_enabled": True,
+            }
+        )
+
+        assert isinstance(msg, MessageInBeginExfiltration)
+        assert msg.workflow_permanent_id == "wpid_123"
+        assert msg.live_interpretation_enabled is True
+
+    def test_recording_rearm_capture(self) -> None:
+        assert isinstance(
+            reify_channel_message({"kind": "recording-rearm-capture"}),
+            MessageInRecordingRearmCapture,
+        )
+
+
+class TestMessageSerialization:
+    def test_recording_interpretation_update_serializes_pydantic_steps(self) -> None:
+        message = MessageOutRecordingInterpretationUpdate(
+            interpretation_session_id="session-abc",
+            session_revision=2,
+            pending=False,
+            finalized=True,
+            steps=[
+                RecordingDraftStep(
+                    step_id="step-1",
+                    action_kind=ActionKind.CLICK,
+                    block_type="action",
+                    label="click_submit",
+                    title="Click submit",
+                    navigation_goal="Click submit",
+                )
+            ],
+        )
+
+        serialized = message_to_dict(message)
+
+        assert serialized["kind"] == "recording-interpretation-update"
+        assert serialized["interpretation_session_id"] == "session-abc"
+        assert serialized["session_revision"] == 2
+        assert serialized["finalized"] is True
+        assert serialized["steps"][0]["action_kind"] == "click"
 
 
 class TestExecutionChannelHelpers:
@@ -189,7 +241,7 @@ class TestLocalExecutionChannel:
         result = await channel.evaluate_js("() => 'hello'")
 
         assert result == "hello"
-        page.evaluate.assert_awaited_once_with("() => 'hello'", None)
+        page.evaluate.assert_awaited_once_with("() => 'hello'")
 
     @pytest.mark.asyncio
     async def test_evaluate_js_forwards_arg(self) -> None:

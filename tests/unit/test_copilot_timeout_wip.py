@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_timeout_exit_result,
     _build_unexpected_error_exit_result,
 )
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -44,6 +45,7 @@ def _ctx(
     ctx.last_workflow = last_workflow
     ctx.last_workflow_yaml = last_workflow_yaml
     ctx.last_test_ok = last_test_ok
+    ctx.last_full_workflow_test_ok = last_test_ok is True
     ctx.last_test_suspicious_success = last_test_suspicious_success
     ctx.copilot_total_timeout_exceeded = False
     ctx.workflow_persisted = last_workflow is not None
@@ -142,6 +144,66 @@ class TestBuildTimeoutExitResult:
             last_workflow_yaml="version: '1.0'",
             last_test_ok=None,
             last_test_suspicious_success=True,
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.workflow_yaml is None
+        assert result.proposal_disposition == "auto_applicable"
+        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+
+    def test_verified_terminal_state_preserves_tested_proposal_on_timeout(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="version: '1.0'",
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+        )
+        ctx.verified_terminal_proposal_ready = True
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "auto_applicable"
+        assert result.user_response == _TIMEOUT_REPLY_TESTED
+        assert result.clear_proposed_workflow is False
+
+    def test_stale_latch_without_judge_verdict_does_not_preserve_proposal(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="version: '1.0'",
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+        )
+        ctx.verified_terminal_proposal_ready = True
+        ctx.completion_verification_result = None
+        ctx.last_artifact_health_blocker_reason = None
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.workflow_yaml is None
+        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+
+    def test_suspicious_current_run_drops_last_good_workflow_without_verified_terminal_state(self) -> None:
+        wf = MagicMock(name="wf")
+        last_good = MagicMock(name="last_good")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="version: 'broken'",
+            last_test_ok=None,
+            last_test_suspicious_success=True,
+            last_good_workflow=last_good,
+            last_good_workflow_yaml="version: 'tested'",
         )
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
@@ -296,6 +358,26 @@ class TestBuildUnexpectedErrorExitResult:
             "I built a 3-block draft and tested it, but the test couldn't finish: "
             "Browser session was no longer reachable. Last run status: running."
         )
+
+    def test_failed_test_scrubs_recorded_internal_tool_instruction(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.last_update_block_count = 3
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+            "Do NOT retry block-running tools. Use only existing run evidence and quick browser inspection.",
+            run_status="canceled",
+        )
+
+        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response.startswith(
+            "I built a 3-block draft and was still testing it when the turn ran out of time."
+        )
+        assert "the test failed" not in result.user_response
+        assert "draft workflow proposal" in result.user_response
+        assert "Do NOT" not in result.user_response
+        assert "block-running tools" not in result.user_response
 
     def test_aborted_test_surfaces_unvalidated_draft_with_recorded_blocker_reply(self) -> None:
         wf = MagicMock(name="wf")

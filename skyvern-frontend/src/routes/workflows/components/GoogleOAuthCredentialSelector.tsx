@@ -10,7 +10,12 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { useGoogleOAuthCredentials } from "@/hooks/useGoogleOAuthCredentials";
+import {
+  GOOGLE_SHEETS_REQUIRED_SCOPES,
+  getDefaultGoogleOAuthCredentialId,
+  hasGoogleOAuthCredentialScopes,
+  useGoogleOAuthCredentials,
+} from "@/hooks/useGoogleOAuthCredentials";
 import { PlusIcon } from "@radix-ui/react-icons";
 
 type Props = {
@@ -27,8 +32,15 @@ function GoogleOAuthCredentialSelector({
   value,
   onChange,
 }: Readonly<Props>) {
-  const { credentials, isLoading, isFetching } = useGoogleOAuthCredentials();
+  const {
+    credentials: allCredentials,
+    isLoading,
+    isFetching,
+  } = useGoogleOAuthCredentials();
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const credentials = allCredentials.filter((credential) =>
+    hasGoogleOAuthCredentialScopes(credential, GOOGLE_SHEETS_REQUIRED_SCOPES),
+  );
 
   // Keep latest callback without forcing effect re-runs.
   const onChangeRef = useRef(onChange);
@@ -40,8 +52,7 @@ function GoogleOAuthCredentialSelector({
 
   const hasCredentials = credentials.length > 0;
   const isKnownCredential = credentials.some((c) => c.id === value);
-  const firstValidId =
-    credentials.find((c) => c.valid)?.id ?? credentials[0]?.id;
+  const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
   const needsAutoFill = !value;
 
   useEffect(() => {

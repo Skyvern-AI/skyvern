@@ -7,7 +7,7 @@ export const shouldAutoApplyWorkflowResponse = (
 ) => {
   return Boolean(
     response.updated_workflow &&
-    autoAccept &&
+    (autoAccept || response.workflow_applied === true) &&
     response.proposal_disposition === "auto_applicable" &&
     !response.cancelled &&
     !userCancelledThisTurn,

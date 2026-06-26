@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_script_block_id, generate_script_file_id
 from skyvern.forge.sdk.db.models import (
@@ -40,6 +41,20 @@ from skyvern.schemas.scripts import (
 )
 
 LOG = structlog.get_logger()
+
+# Cap the size of any single ``IN (...)`` clause so batched lookups stay index-friendly
+# and well under the driver's bind-parameter ceiling even for wpids with many cached scripts.
+_SCRIPT_IN_CLAUSE_CHUNK_SIZE = 500
+
+
+def _dedup_into_chunks(ids: list[str], chunk_size: int = _SCRIPT_IN_CLAUSE_CHUNK_SIZE) -> list[list[str]]:
+    """Order-preserving dedup, split so no single ``IN (...)`` clause exceeds the bind-param ceiling.
+
+    ``dict.fromkeys`` (not ``set()``) is used so the input order is preserved, which keeps query
+    plans and logs stable. Empty input yields ``[]``.
+    """
+    unique_ids = list(dict.fromkeys(ids))
+    return [unique_ids[start : start + chunk_size] for start in range(0, len(unique_ids), chunk_size)]
 
 
 def _script_status_value(status: ScriptStatus | str) -> str:
@@ -122,7 +137,7 @@ class ScriptsRepository(BaseRepository):
             # Subquery to get the latest version of each script
             latest_versions_subquery = (
                 select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
-                .filter_by(organization_id=organization_id)
+                .filter(ScriptModel.organization_id == organization_id)
                 .filter(ScriptModel.deleted_at.is_(None))
                 .group_by(ScriptModel.script_id)
                 .subquery()
@@ -138,7 +153,7 @@ class ScriptsRepository(BaseRepository):
                         ScriptModel.version == latest_versions_subquery.c.latest_version,
                     ),
                 )
-                .filter_by(organization_id=organization_id)
+                .filter(ScriptModel.organization_id == organization_id)
                 .filter(ScriptModel.deleted_at.is_(None))
                 .order_by(ScriptModel.created_at.desc())
                 .limit(page_size)
@@ -172,6 +187,49 @@ class ScriptsRepository(BaseRepository):
             if script := (await session.scalars(get_script_query)).first():
                 return convert_to_script(script)
             return None
+
+    @db_operation("get_latest_scripts_by_ids")
+    async def get_latest_scripts_by_ids(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, Script]:
+        """Batch variant of ``get_script``: latest non-deleted version per script_id, keyed by script_id.
+
+        Served by the ``uc_org_script_version`` index on (organization_id, script_id, version).
+        """
+        result: dict[str, Script] = {}
+        chunks = _dedup_into_chunks(script_ids)
+        if not chunks:
+            return result
+
+        # One session spans all chunks: each chunk query reuses a single pooled connection
+        # rather than checking one out per chunk.
+        async with self.Session() as session:
+            for chunk in chunks:
+                latest_versions_subquery = (
+                    select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
+                    .filter(ScriptModel.organization_id == organization_id)
+                    .filter(ScriptModel.script_id.in_(chunk))
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .group_by(ScriptModel.script_id)
+                    .subquery()
+                )
+                query = (
+                    select(ScriptModel)
+                    .join(
+                        latest_versions_subquery,
+                        and_(
+                            ScriptModel.script_id == latest_versions_subquery.c.script_id,
+                            ScriptModel.version == latest_versions_subquery.c.latest_version,
+                        ),
+                    )
+                    .filter(ScriptModel.organization_id == organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                )
+                for record in (await session.scalars(query)).all():
+                    result[record.script_id] = convert_to_script(record)
+        return result
 
     @db_operation("get_script_revision")
     async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
@@ -257,7 +315,7 @@ class ScriptsRepository(BaseRepository):
                 update(ScriptModel)
                 .filter_by(script_revision_id=script_revision_id)
                 .filter_by(organization_id=organization_id)
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
             await session.commit()
 
@@ -278,7 +336,7 @@ class ScriptsRepository(BaseRepository):
     ) -> ScriptFile:
         """Create a script file. Idempotent on (script_revision_id, file_path)."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             stmt = (
                 insert(ScriptFileModel)
                 .values(
@@ -343,7 +401,7 @@ class ScriptsRepository(BaseRepository):
     ) -> ScriptBlock:
         """Create a script block. Idempotent on (script_revision_id, script_block_label)."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             stmt = (
                 insert(ScriptBlockModel)
                 .values(
@@ -414,7 +472,7 @@ class ScriptsRepository(BaseRepository):
         calling this method.
         """
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             insert_values = {
                 "script_block_id": generate_script_block_id(),
                 "script_revision_id": script_revision_id,
@@ -643,6 +701,38 @@ class ScriptsRepository(BaseRepository):
             ).all()
             return [convert_to_script_block(record) for record in records]
 
+    @db_operation("get_script_blocks_by_script_revision_ids")
+    async def get_script_blocks_by_script_revision_ids(
+        self,
+        organization_id: str,
+        script_revision_ids: list[str],
+    ) -> dict[str, list[ScriptBlock]]:
+        """Batch variant: script blocks for each script_revision_id, keyed by revision id.
+
+        Served by the btree index on ``script_blocks.script_revision_id``. Revision ids with no
+        blocks are simply absent from the result; callers use ``.get(revision_id, [])``.
+        """
+        result: dict[str, list[ScriptBlock]] = {}
+        chunks = _dedup_into_chunks(script_revision_ids)
+        if not chunks:
+            return result
+
+        # One session spans all chunks: each chunk query reuses a single pooled connection
+        # rather than checking one out per chunk.
+        async with self.Session() as session:
+            for chunk in chunks:
+                records = (
+                    await session.scalars(
+                        select(ScriptBlockModel)
+                        .filter(ScriptBlockModel.script_revision_id.in_(chunk))
+                        .filter(ScriptBlockModel.organization_id == organization_id)
+                        .order_by(ScriptBlockModel.created_at.asc())
+                    )
+                ).all()
+                for record in records:
+                    result.setdefault(record.script_revision_id, []).append(convert_to_script_block(record))
+        return result
+
     @db_operation("create_workflow_script")
     async def create_workflow_script(
         self,
@@ -691,7 +781,7 @@ class ScriptsRepository(BaseRepository):
     ) -> WorkflowScriptUpsertResult:
         """Create/update an active workflow-script mapping with sticky-pin semantics."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             status_value = status.value if isinstance(status, ScriptStatus) else status
             existing_rows = (
                 await session.scalars(
@@ -951,7 +1041,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
 
             result = await session.execute(stmt)
@@ -979,7 +1069,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
             result = await session.execute(stmt)
             await session.commit()
@@ -1050,7 +1140,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
 
             if statuses:
@@ -1286,7 +1376,7 @@ class ScriptsRepository(BaseRepository):
                 )
                 .values(
                     is_pinned=True,
-                    pinned_at=datetime.now(timezone.utc),
+                    pinned_at=naive_utc_now(),
                     pinned_by=pinned_by,
                 )
             )
@@ -1444,7 +1534,7 @@ class ScriptsRepository(BaseRepository):
             values["new_script_revision_id"] = new_script_revision_id
         if not values:
             return
-        values["modified_at"] = datetime.now(timezone.utc)
+        values["modified_at"] = naive_utc_now()
         async with self.Session() as session:
             await session.execute(
                 update(ScriptFallbackEpisodeModel)
@@ -1600,7 +1690,7 @@ class ScriptsRepository(BaseRepository):
                         new_script_revision_id, ScriptFallbackEpisodeModel.new_script_revision_id
                     ),
                     reviewer_version=func.coalesce(reviewer_version, ScriptFallbackEpisodeModel.reviewer_version),
-                    modified_at=datetime.now(timezone.utc),
+                    modified_at=naive_utc_now(),
                 )
             )
             await session.commit()
@@ -1690,7 +1780,7 @@ class ScriptsRepository(BaseRepository):
         branch_key: str,
     ) -> None:
         """Record a classify branch hit, upserting the hit count and last_hit_at."""
-        now = datetime.now(timezone.utc)
+        now = naive_utc_now()
         async with self.Session() as session:
             stmt = insert(ScriptBranchHitModel).values(
                 organization_id=organization_id,
@@ -1725,7 +1815,7 @@ class ScriptsRepository(BaseRepository):
         limit: int = 200,
     ) -> list[ScriptBranchHit]:
         """Get branches that haven't been accessed in stale_days days."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+        cutoff = naive_utc_now() - timedelta(days=stale_days)
         async with self.Session() as session:
             query = (
                 select(ScriptBranchHitModel)

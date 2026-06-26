@@ -59,6 +59,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   file_upload: "fileUpload",
   goto_url: "url",
   http_request: "http_request",
+  pdf_fill: "pdfFill",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
 };
@@ -139,8 +140,10 @@ function getWorkflowElements(version: WorkflowVersion) {
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
     browserProfileId: version.browser_profile_id ?? null,
+    browserProfileKey: version.browser_profile_key ?? null,
     model: version.model,
     maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
+    maxElapsedTimeMinutes: version.max_elapsed_time_minutes ?? null,
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,

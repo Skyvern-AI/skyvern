@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react()],
   test: {
     passWithNoTests: true,
+    exclude: ["node_modules/**"],
     // Tests that transitively import the editor (e.g. workflowEditorUtils via
     // its `./nodes` barrel) touch zustand stores that read localStorage at
     // module load — run all tests under jsdom so those imports resolve. The

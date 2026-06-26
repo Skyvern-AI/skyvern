@@ -63,6 +63,8 @@ async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.RECORDING: "webm",
+    ArtifactType.AUDIO: "webm",
+    ArtifactType.SESSION_REPLAY: "mp4",
     ArtifactType.BROWSER_CONSOLE_LOG: "log",
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",
@@ -197,6 +199,10 @@ class BaseStorage(ABC):
     @abstractmethod
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve a browser profile to a temporary directory."""
+
+    @abstractmethod
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a stored browser profile. Best-effort: a missing object is not an error."""
 
     @abstractmethod
     async def list_downloaded_files_in_browser_session(

@@ -1,8 +1,10 @@
 """Helpers for capping prompt inputs before templating.
 
 Separate from prompt_engine.py so per-field caps can be applied at the call
-boundary without reaching into the element-tree truncation logic. Reuses
-skyvern.utils.token_counter.count_tokens for consistent measurement.
+boundary without reaching into the element-tree truncation logic. Token-based
+caps reuse skyvern.utils.token_counter.count_tokens for consistent measurement;
+hot-path caps (see truncate_page_html_for_summary) slice by characters instead
+to stay off tiktoken.
 """
 
 from __future__ import annotations
@@ -19,6 +21,13 @@ LOG = structlog.get_logger()
 PREVIOUS_EXTRACTED_INFO_MAX_TOKENS = 20_000
 EXTRACTION_SCHEMA_MAX_TOKENS = 10_000
 EXTRACTION_GOAL_MAX_TOKENS = 150_000
+
+# ~150k chars ≈ ~37k tokens; char-based for the hot path (see truncate_page_html_for_summary).
+# A small head keeps page identity; the rest of the budget goes to the body tail, where the
+# failing element usually lives (the raw <head> is low-signal).
+SUMMARY_PAGE_HTML_MAX_CHARS = 150_000
+SUMMARY_HTML_HEAD_CHARS = 10_000
+_SUMMARY_HTML_TRUNCATION_MARKER = "\n<!-- [truncated by Skyvern: page HTML exceeded the failure-summary budget] -->"
 
 
 def _crop_string(value: str, max_tokens: int) -> str:
@@ -96,6 +105,26 @@ def truncate_previous_extracted_information(
             max_tokens=max_tokens,
         )
     return result
+
+
+def truncate_page_html_for_summary(
+    html: str,
+    max_chars: int = SUMMARY_PAGE_HTML_MAX_CHARS,
+) -> str:
+    # Char-based, not token-based: this fires on every max-retry step (high volume in
+    # retry storms) on 1M+ token HTML, so running tiktoken on the full string is too costly here.
+    if not html or len(html) <= max_chars:
+        return html
+    head_chars = min(SUMMARY_HTML_HEAD_CHARS, max_chars)
+    tail_chars = max_chars - head_chars
+    LOG.debug(
+        "Truncated page_html for failure summary",
+        before_chars=len(html),
+        max_chars=max_chars,
+    )
+    if tail_chars <= 0:
+        return html[:head_chars] + _SUMMARY_HTML_TRUNCATION_MARKER
+    return html[:head_chars] + _SUMMARY_HTML_TRUNCATION_MARKER + html[-tail_chars:]
 
 
 def truncate_extraction_schema(

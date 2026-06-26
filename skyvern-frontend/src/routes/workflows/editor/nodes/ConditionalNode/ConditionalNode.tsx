@@ -13,6 +13,7 @@ import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { AppNode } from "..";
 import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
+import { scheduleCollapseRelayout } from "../../collapse/scheduleCollapseRelayout";
 import { useCollapseContext } from "../../collapse/CollapseContext";
 import {
   isBlockCollapsedAt,
@@ -104,7 +105,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
       prevIsCollapsed.current = false;
       return;
     }
-    const wasCollapsed = prevIsCollapsed.current === true;
+    const previousIsCollapsed = prevIsCollapsed.current;
     prevIsCollapsed.current = isCollapsed;
     setNodes((prev) => {
       const collapsedSet = useNodeCollapseStore.getState().collapsed;
@@ -113,9 +114,11 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         isBlockCollapsedAt(collapsedSet, wpid, label),
       );
     });
-    if (wasCollapsed && !isCollapsed) {
-      window.dispatchEvent(new Event("conditional-header-resized"));
-    }
+    return scheduleCollapseRelayout(
+      "conditional-header-resized",
+      previousIsCollapsed,
+      isCollapsed,
+    );
   }, [id, isCollapsed, setNodes, workflowPermanentId]);
 
   if (!node) {
@@ -134,7 +137,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         />
         <div
           className={cn(
-            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-all motion-reduce:transition-none",
+            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
             data.comparisonColor,
           )}
         >
@@ -176,7 +179,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
           <div
             ref={headerRef}
             className={cn(
-              "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all motion-reduce:transition-none",
+              "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
               open ? "shadow-md" : "shadow-sm",
               data.comparisonColor,
             )}

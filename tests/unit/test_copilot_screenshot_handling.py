@@ -9,19 +9,19 @@ import pytest
 
 
 def _install_mock_database(monkeypatch: pytest.MonkeyPatch, mock_db: Any) -> None:
-    """Replace `skyvern.forge.sdk.copilot.tools.app` with a stub whose
+    """Replace `skyvern.forge.sdk.copilot.tools.run_execution.app` with a stub whose
     DATABASE attribute is the provided mock.
 
     `app` is an AppHolder that raises RuntimeError on attribute access until
     start_forge_app() runs, so monkeypatching `app.DATABASE` directly fails at
     resolve-time in uninitialized test environments.
     """
-    import skyvern.forge.sdk.copilot.tools as tools_module
+    import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
     class _AppStub:
         DATABASE = mock_db
 
-    monkeypatch.setattr(tools_module, "app", _AppStub())
+    monkeypatch.setattr(run_execution_module, "app", _AppStub())
 
 
 class TestIsValidPngBase64:

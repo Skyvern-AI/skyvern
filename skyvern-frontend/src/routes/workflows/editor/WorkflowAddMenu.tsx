@@ -18,6 +18,7 @@ type WorkflowAddMenuProps = {
   onAdd: () => void;
   onRecord: () => void;
   onUploadSOP: () => void;
+  onPinnedChange?: (pinned: boolean) => void;
 };
 
 function WorkflowAddMenu({
@@ -32,6 +33,7 @@ function WorkflowAddMenu({
   onAdd,
   onRecord,
   onUploadSOP,
+  onPinnedChange,
 }: WorkflowAddMenuProps) {
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
@@ -101,6 +103,7 @@ function WorkflowAddMenu({
       gap={gap}
       rotateText={rotateText}
       layout="vertical"
+      onPinnedChange={onPinnedChange}
     >
       {children}
     </RadialMenu>

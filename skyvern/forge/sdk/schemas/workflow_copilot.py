@@ -1,10 +1,11 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType
+from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -18,6 +19,27 @@ class WorkflowCopilotChat(BaseModel):
     auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
     created_at: datetime = Field(..., description="When the chat was created")
     modified_at: datetime = Field(..., description="When the chat was last modified")
+
+
+class WorkflowCopilotCompletionCriteriaSet(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    completion_criteria_set_id: str
+    organization_id: str
+    workflow_copilot_chat_id: str
+    goal_epoch: int
+    status: str
+    criteria: list[dict]
+    source_turn_id: str | None = None
+    source_goal_text: str | None = None
+    consecutive_all_no_evidence: int = 0
+    tripwire_fired: bool = False
+    last_fully_satisfied_workflow_yaml: str | None = None
+    superseded_by_set_id: str | None = None
+    superseded_at: datetime | None = None
+    supersede_reason: str | None = None
+    created_at: datetime
+    modified_at: datetime
 
 
 class WorkflowCopilotChatSender(StrEnum):
@@ -47,8 +69,13 @@ class WorkflowCopilotChatMessage(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="ID of the parent workflow copilot chat")
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    audio_artifact_id: str | None = Field(None, description="Artifact ID for audio captured during dictation")
     global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
+    )
     created_at: datetime = Field(..., description="When the message was created")
     modified_at: datetime = Field(..., description="When the message was last modified")
 
@@ -63,12 +90,29 @@ class WorkflowCopilotChatRequest(BaseModel):
         description="Optional persistent browser session ID to reuse instead of creating a new one.",
     )
     message: str = Field(..., description="The message that user sends")
+    audio_artifact_id: str | None = Field(
+        None,
+        description="Artifact ID for audio captured while dictating this message.",
+    )
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    mode: Literal["ask", "build"] | None = Field(
+        None, description="Per-request copilot path selector; None falls back to feature flags."
+    )
+    code_block: bool | None = Field(
+        None, description="Per-request code-block authoring; honored only on the build/v2 path."
+    )
     cancel_token: str | None = Field(
         None,
         description=(
             "Client-generated UUID. POST it to /workflow/copilot/cancel to hard-cancel this turn. "
             "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
+        ),
+    )
+    target_block_label: str | None = Field(
+        None,
+        description=(
+            "When set, the copilot regenerates only this code block from its goal and leaves every "
+            "other block unchanged. Used by the block-level Generate action."
         ),
     )
 
@@ -93,7 +137,12 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    audio_artifact_id: str | None = Field(None, description="Artifact ID for captured dictation audio")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
+    )
     created_at: datetime = Field(..., description="When the message was created")
 
 
@@ -102,6 +151,22 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+
+
+class WorkflowCopilotChatSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID the chat belongs to")
+    workflow_title: str | None = Field(None, description="Title of the workflow the chat belongs to")
+    title: str = Field(..., description="Single-line preview derived from the chat's first message")
+    created_at: datetime = Field(..., description="When the chat was created")
+    modified_at: datetime = Field(..., description="When the chat was last modified")
+
+
+class WorkflowCopilotAudioUploadResponse(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="Chat ID the audio artifact is associated with")
+    audio_artifact_id: str = Field(..., description="Stored audio artifact ID")
 
 
 class WorkflowCopilotStreamMessageType(StrEnum):
@@ -113,6 +178,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     CONDENSING = "condensing"
     NARRATION = "narration"
     BLOCK_PROGRESS = "block_progress"
+    RUN_OUTCOME = "run_outcome"
     TURN_START = "turn_start"
     DESIGN_START = "design_start"
     DESIGN_END = "design_end"
@@ -144,6 +210,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
     )
+    workflow_applied: bool = Field(
+        False,
+        description="True when the backend already committed this terminal workflow proposal.",
+    )
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
@@ -159,6 +229,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     narrative_summary: str | None = Field(
         None,
         description="One-line accomplishment summary for the turn. Optional; the frontend falls back to the response message when absent.",
+    )
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
     )
 
 
@@ -180,6 +254,10 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
     tool_name: str = Field(..., description="Name of the tool being called")
+    display_label: str | None = Field(
+        None,
+        description="Product-safe label for rendering the tool call in user-visible activity surfaces",
+    )
     tool_input: dict = Field(default_factory=dict, description="Sanitized tool input (no secrets)")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
@@ -239,6 +317,28 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
+class WorkflowCopilotRunOutcomeUpdate(BaseModel):
+    # Emitted once as an "evaluating" hold when an ok run enters adjudication and
+    # once with the final recorded verdict; rows render success from this, not raw status.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.RUN_OUTCOME, description="Message type"
+    )
+    workflow_run_id: str = Field(..., description="Workflow run the verdict applies to")
+    workflow_run_block_ids: list[str] = Field(
+        default_factory=list, description="Run-block ids of the adjudicated run; match the FE per-row keys"
+    )
+    block_labels: list[str] = Field(
+        default_factory=list, description="Block labels of the adjudicated run; key the persisted narrative payload"
+    )
+    verdict: RunOutcomeVerdict = Field(..., description="Recorded outcome verdict for the run")
+    reason_code: RunOutcomeReasonCode | None = Field(
+        None, description="Machine-readable cause for a not_demonstrated verdict"
+    )
+    display_reason: str | None = Field(None, description="Short product-safe reason for user-facing rendering")
+    iteration: int = Field(..., description="Agent loop iteration number")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
 class WorkflowCopilotTurnStartUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TURN_START, description="Message type"
@@ -247,6 +347,10 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
     turn_index: int = Field(..., description="Zero-based ordinal of this turn within the chat")
     mode: WorkflowCopilotTurnMode = Field(..., description="TurnIntent mode for this turn")
     timestamp: datetime = Field(..., description="Server timestamp")
+    prior_block_count: int | None = Field(
+        None,
+        description="Block count of the canonical workflow at turn entry; drives the FE edit-vs-build chip.",
+    )
 
 
 class WorkflowCopilotDesignStartUpdate(BaseModel):
@@ -264,10 +368,6 @@ class WorkflowCopilotDesignEndUpdate(BaseModel):
 
 
 class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
-    # Summary-only payload. The staged/persisted workflow definition is
-    # transported elsewhere (terminal `updated_workflow` on RESPONSE, or
-    # the chat's `proposed_workflow` field); this event signals only that a
-    # draft was produced and what shape it has.
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.WORKFLOW_DRAFT, description="Message type"
     )
@@ -275,6 +375,10 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
     block_labels: list[str] = Field(default_factory=list, description="Ordered block labels in the drafted workflow")
     summary: str | None = Field(None, description="Optional one-line description; populated by a follow-up PR")
     timestamp: datetime = Field(..., description="Server timestamp")
+    workflow: dict | None = Field(
+        None,
+        description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
+    )
 
 
 class WorkflowYAMLConversionRequest(BaseModel):

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
@@ -21,7 +22,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _extract_url_from_nav_error,
     _maybe_raise_non_retriable_nav,
     _needs_failed_test_nudge,
-    _needs_repeated_null_data_nudge,
     _needs_suspicious_success_nudge,
     _non_retriable_nav_error_nudge,
     _repeated_frontier_failure_nudge,
@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_workflow_update_result,
     _tool_loop_error,
 )
+from skyvern.schemas.runs import ProxyLocation
 
 _DNS_FAILURE_REASON = (
     "Failed to navigate to url https://www.example.invalid/path. Error message: net::ERR_NAME_NOT_RESOLVED"
@@ -182,6 +183,36 @@ def test_workflow_update_clears_non_retriable_flag_and_signature_latch() -> None
     # Consistency check: the other per-test fields are also reset (pre-existing behavior).
     assert ctx.last_test_ok is None
     assert ctx.last_test_failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("rollout_enabled", "workflow_proxy_location", "expected_proxy_location"),
+    [
+        (False, None, ProxyLocation.RESIDENTIAL),
+        (True, None, ProxyLocation.NONE),
+        (False, ProxyLocation.RESIDENTIAL_GB, ProxyLocation.RESIDENTIAL_GB),
+        (False, ProxyLocation.NONE, ProxyLocation.NONE),
+    ],
+)
+def test_workflow_update_records_runtime_proxy_default(
+    monkeypatch: pytest.MonkeyPatch,
+    rollout_enabled: bool,
+    workflow_proxy_location: ProxyLocation | None,
+    expected_proxy_location: ProxyLocation,
+) -> None:
+    monkeypatch.setattr(settings, "RUNTIME_PROXY_DEFAULT_NONE_ENABLED", rollout_enabled)
+    ctx = _fresh_context()
+
+    _record_workflow_update_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {"block_count": 1},
+            "_workflow": SimpleNamespace(workflow_id="wf_new", proxy_location=workflow_proxy_location),
+        },
+    )
+
+    assert ctx.effective_workflow_proxy_location == expected_proxy_location
 
 
 def test_workflow_update_does_not_clear_flag_on_failed_update() -> None:
@@ -355,14 +386,6 @@ def test_needs_suspicious_success_nudge_suppressed_when_flag_set() -> None:
     assert _needs_suspicious_success_nudge(ctx) is False
 
 
-def test_needs_repeated_null_data_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 5
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_repeated_null_data_nudge(ctx) is False
-
-
 def test_repeated_frontier_failure_nudge_suppressed_when_flag_set() -> None:
     ctx = _fresh_context()
     ctx.repeated_failure_streak_count = 5
@@ -460,18 +483,16 @@ def test_all_competing_branches_silent_after_latch() -> None:
     # Reproduce the full steady state after the one-shot stop nudge has
     # latched: ctx has a non-retriable error, last_test_ok=False,
     # test_after_update_done=True, and all counters are set such that the
-    # other branches would normally fire. Assert all four helpers are silent.
+    # other branches would normally fire. Assert each helper is silent.
     ctx = _fresh_context()
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 5
     ctx.repeated_failure_streak_count = 5
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
 
     assert _needs_failed_test_nudge(ctx) is False
     assert _needs_suspicious_success_nudge(ctx) is False
-    assert _needs_repeated_null_data_nudge(ctx) is False
     assert _repeated_frontier_failure_nudge(ctx) is None
 
 

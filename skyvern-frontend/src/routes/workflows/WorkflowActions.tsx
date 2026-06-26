@@ -30,6 +30,7 @@ import {
   CopyIcon,
   DotsHorizontalIcon,
   DownloadIcon,
+  MixerHorizontalIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -43,6 +44,9 @@ import { WorkflowApiResponse } from "./types/workflowTypes";
 type Props = {
   workflow: WorkflowApiResponse;
   onSuccessfullyDeleted?: () => void;
+  hasParameters?: boolean;
+  parametersExpanded?: boolean;
+  onToggleParameters?: () => void;
 };
 
 function downloadFile(fileName: string, contents: string) {
@@ -61,7 +65,13 @@ function downloadFile(fileName: string, contents: string) {
   document.body.removeChild(element);
 }
 
-function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
+function WorkflowActions({
+  workflow,
+  onSuccessfullyDeleted,
+  hasParameters,
+  parametersExpanded,
+  onToggleParameters,
+}: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -147,11 +157,32 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
     <Dialog>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button size="icon" variant="outline">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="text-muted-foreground hover:text-foreground"
+          >
             <DotsHorizontalIcon className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
+          {onToggleParameters ? (
+            <>
+              <DropdownMenuItem
+                onSelect={() => onToggleParameters()}
+                disabled={!hasParameters}
+                className="p-2"
+              >
+                <MixerHorizontalIcon className="mr-2 h-4 w-4" />
+                {hasParameters
+                  ? parametersExpanded
+                    ? "Hide parameters"
+                    : "Show parameters"
+                  : "No parameters"}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          ) : null}
           <DropdownMenuItem
             onSelect={() => {
               if (!workflow) {

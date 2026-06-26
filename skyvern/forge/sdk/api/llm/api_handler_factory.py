@@ -13,7 +13,7 @@ from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from opentelemetry import trace as otel_trace
 from pydantic import BaseModel
@@ -43,8 +43,9 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import LLMVisionMode, SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -55,12 +56,19 @@ from skyvern.schemas.llm import (
     LLMRouterConfig,
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
+from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
 
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
 configure_litellm_transport()
 
 LOG = structlog.get_logger()
+
+# Vertex returns this trafficType for flex-tier calls. litellm (through 1.88.1 and
+# main) neither maps it nor applies tier pricing in completion_cost, so flex bills at
+# standard; we halve it at the cost sites (flex = 50% of standard, Google Vertex SKU).
+_VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
+_VERTEX_FLEX_COST_MULTIPLIER = 0.5
 
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
@@ -82,6 +90,17 @@ EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
 
 
+def _set_llm_context_attrs(
+    span: otel_trace.Span,
+    *,
+    screenshots: list[bytes] | None,
+    is_speculative_step: bool,
+) -> None:
+    span.set_attribute("screenshots_included", bool(screenshots))
+    span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
+    span.set_attribute("speculative", bool(is_speculative_step))
+
+
 def _enrich_llm_span(
     span: otel_trace.Span,
     *,
@@ -93,6 +112,9 @@ def _enrich_llm_span(
     cached_tokens: int = 0,
     latency_ms: int,
     llm_cost: float = 0.0,
+    image_tokens: int = 0,
+    image_cost: float = 0.0,
+    image_count: int = 0,
 ) -> None:
     """Set canonical attributes + emit llm.request.completed event on an LLM span.
 
@@ -109,6 +131,9 @@ def _enrich_llm_span(
     span.set_attribute("status", "ok")
     span.set_attribute("cache_hit", bool(cached_tokens))
     span.set_attribute("llm_cost", llm_cost)
+    span.set_attribute("image_tokens", image_tokens)
+    span.set_attribute("image_cost", image_cost)
+    span.set_attribute("image_count", image_count)
     # Gen AI OTEL semantic conventions — enables auto-dashboards in providers
     # that support the spec (Logfire, SigNoz gen_ai module).
     # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
@@ -131,6 +156,9 @@ def _enrich_llm_span(
             "cached_tokens": cached_tokens,
             "latency_ms": latency_ms,
             "llm_cost": llm_cost,
+            "image_tokens": image_tokens,
+            "image_cost": image_cost,
+            "image_count": image_count,
             "prompt_name": prompt_name,
         },
     )
@@ -202,20 +230,50 @@ def _llm_screenshots_enabled_metric(
     return True
 
 
-def _llm_vision_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
+def _image_metrics_for_call(
+    screenshots: list[bytes] | None, model: str | None, response: Any = None
+) -> tuple[int, int, float, str | None]:
+    """(image_count, image_tokens, image_cost, source) for the screenshots sent in one call.
+
+    Prefers the provider's billed image tokens (Gemini/Vertex report them) and falls back
+    to the deterministic estimator. Best-effort: failures degrade to zeros.
+    """
+    if not screenshots or not settings.LLM_IMAGE_COST_TRACKING_ENABLED:
+        return 0, 0, 0.0, None
+    try:
+        billed_tokens = provider_image_tokens(response)
+        if billed_tokens is not None:
+            image_tokens, source = billed_tokens, "provider"
+        else:
+            image_tokens, source = estimate_image_tokens(screenshots, model or ""), "estimate"
+        image_cost = estimate_image_cost(image_tokens, model or "")
+        return len(screenshots), image_tokens, image_cost, source
+    except Exception:
+        LOG.debug("Failed to compute image token cost", exc_info=True)
+        return len(screenshots), 0, 0.0, None
+
+
+def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
     if context is None:
         return {
-            "llm_vision_mode": LLMVisionMode.CONTROL.value,
-            "llm_vision_fallback_active": False,
-            "llm_accessibility_context_enabled": False,
+            "enrich_tree_mode": EnrichTreeMode.CONTROL.value,
+            "enrich_tree_fallback_active": False,
+            "enriched_tree_enabled": False,
         }
 
+    retry_index = step.retry_index if step else None
     return {
-        "llm_vision_mode": context.effective_llm_vision_mode().value,
-        "llm_vision_fallback_active": context.llm_vision_fallback_active(
-            retry_index=step.retry_index if step else None
-        ),
-        "llm_accessibility_context_enabled": context.llm_accessibility_context_enabled(),
+        "enrich_tree_mode": context.enrich_tree_mode.value,
+        "enrich_tree_fallback_active": context.enrich_tree_fallback_active(retry_index=retry_index),
+        "enriched_tree_enabled": context.enriched_tree_enabled(),
+    }
+
+
+def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) -> dict[str, Any]:
+    assigned = context.slim_output_variant_assigned if context else None
+    return {
+        "prompt_schema_variant": effective_prompt_schema_variant(assigned, prompt_name),
+        "prompt_schema_variant_assigned": assigned,
     }
 
 
@@ -463,6 +521,53 @@ class LLMAPIHandlerFactory:
         return input_tokens, output_tokens, reasoning_tokens, cached_tokens
 
     @staticmethod
+    def _extract_reported_usage_cost(response: ModelResponse | CustomStreamWrapper) -> float | None:
+        """Return provider-reported cost from response.usage.cost when present."""
+        if not hasattr(response, "usage") or not response.usage:
+            return None
+
+        usage = response.usage
+        cost = getattr(usage, "cost", None)
+        if cost is None and isinstance(usage, dict):
+            cost = usage.get("cost")
+        if cost is None:
+            return None
+
+        try:
+            cost_value = float(cost)
+        except (TypeError, ValueError):
+            return None
+
+        return cost_value if cost_value >= 0 else None
+
+    @staticmethod
+    def _openrouter_model_name(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> str | None:
+        """Return the OpenRouter model id when the handler routes through OpenRouter."""
+        if llm_key.startswith("openrouter/"):
+            return llm_key
+        if isinstance(llm_config, LLMConfig) and llm_config.model_name.startswith("openrouter/"):
+            return llm_config.model_name
+        return None
+
+    @staticmethod
+    def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
+        """litellm completion cost, with the Vertex Gemini flex tier billed at 50%.
+
+        Flex is 50% of standard, but litellm reports both at the standard rate, so the
+        discount is applied here. Internal cost tracking only — never customer-facing.
+        """
+        try:
+            cost = litellm.completion_cost(completion_response=response)
+        except Exception as e:
+            LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
+            return 0.0
+        hidden_params = getattr(response, "_hidden_params", None)
+        provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
+        if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
+            return cost * _VERTEX_FLEX_COST_MULTIPLIER
+        return cost
+
+    @staticmethod
     def _apply_thinking_budget_optimization(
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
@@ -543,10 +648,16 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def requires_adaptive_thinking(model_name: str | None) -> bool:
-        # Claude Opus 4.7 rejects `thinking.type=enabled` and requires
+        # Newer direct Anthropic models reject `thinking.type=enabled` and require
         # `thinking.type=adaptive` + `output_config.effort`. Bedrock's translator
         # does not yet accept the new shape, so gate to direct Anthropic.
-        return model_name == "anthropic/claude-opus-4-7"
+        return model_name in {
+            "anthropic/claude-opus-4-7",
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-fable-5",
+            "anthropic-claude-opus-4-8",
+            "anthropic-claude-fable-5",
+        }
 
     @staticmethod
     def _apply_anthropic_thinking_optimization(
@@ -554,8 +665,9 @@ class LLMAPIHandlerFactory:
     ) -> None:
         """Apply thinking optimization for Anthropic/Claude models."""
         model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+        check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
-        if LLMAPIHandlerFactory.requires_adaptive_thinking(model_label):
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(check_model):
             parameters["thinking"] = {"type": "adaptive"}
             parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
             LOG.debug(
@@ -683,7 +795,8 @@ class LLMAPIHandlerFactory:
         check_model = model_label
         if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
             try:
-                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
+                primary_model = llm_config.model_list[0]  # type: ignore[attr-defined]
+                check_model = primary_model.litellm_params.get("model") or primary_model.model_name or model_label
             except Exception:
                 check_model = model_label
         return check_model
@@ -1001,6 +1114,7 @@ class LLMAPIHandlerFactory:
                             )
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -1113,12 +1227,15 @@ class LLMAPIHandlerFactory:
                         )
 
                         if prompt_stripped:
-                            LOG.info("Stripped static prompt from cached request to avoid double-billing")
+                            LOG.info(
+                                "Stripped static prompt from cached request to avoid double-billing", sampling=True
+                            )
                         else:
                             LOG.warning("Could not find static prompt to strip from cached request")
 
                     LOG.info(
                         "Adding Vertex AI cache reference to primary Gemini request",
+                        sampling=True,
                         prompt_name=prompt_name,
                         primary_model=main_model_group,
                         fallback_model=llm_config.fallback_model_group,
@@ -1185,6 +1302,7 @@ class LLMAPIHandlerFactory:
                         if not LLMAPIHandlerFactory._models_equivalent(response_model, main_model_group):
                             LOG.info(
                                 "LLM router fallback succeeded",
+                                sampling=True,
                                 llm_key=llm_key,
                                 prompt_name=prompt_name,
                                 primary_model=main_model_group,
@@ -1263,9 +1381,12 @@ class LLMAPIHandlerFactory:
                     )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except CancelledError:
+                    # A cancellation here means the run is being stopped (elapsed-time timeout / user
+                    # cancel) or a speculative step was intentionally cancelled. Either way it must
+                    # propagate so the stop actually halts the run; never convert it to a provider error.
                     _duration = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "cancelled")
                     if is_speculative_step:
-                        _llm_span.set_attribute("status", "cancelled")
                         LOG.debug(
                             "LLM request cancelled (speculative step)",
                             llm_key=llm_key,
@@ -1273,17 +1394,15 @@ class LLMAPIHandlerFactory:
                             prompt_name=prompt_name,
                             duration_seconds=_duration,
                         )
-                        raise
                     else:
-                        _llm_span.set_attribute("status", "error")
-                        LOG.error(
-                            "LLM request got cancelled",
+                        LOG.warning(
+                            "LLM request cancelled",
                             llm_key=llm_key,
                             model=main_model_group,
                             prompt_name=prompt_name,
                             duration_seconds=_duration,
                         )
-                        raise LLMProviderError(llm_key) from None
+                    raise
                 except litellm.exceptions.RateLimitError as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "rate_limited")
@@ -1326,12 +1445,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -1434,6 +1549,9 @@ class LLMAPIHandlerFactory:
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
                 duration_seconds = time.perf_counter() - start_time
+                image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                    screenshots, model_used or main_model_group, response
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1451,9 +1569,14 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    image_count=image_count if image_count > 0 else None,
+                    image_tokens=image_tokens if image_tokens > 0 else None,
+                    image_cost=image_cost if image_cost > 0 else None,
+                    image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
-                    **_llm_vision_log_fields(context, step),
+                    **_slim_log_fields(context, prompt_name),
+                    **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -1467,6 +1590,9 @@ class LLMAPIHandlerFactory:
                     cached_tokens=int(cached_tokens or 0),
                     latency_ms=int(duration_seconds * 1000),
                     llm_cost=float(llm_cost or 0.0),
+                    image_tokens=int(image_tokens or 0),
+                    image_cost=float(image_cost or 0.0),
+                    image_count=int(image_count or 0),
                 )
 
                 if step and is_speculative_step:
@@ -1535,8 +1661,10 @@ class LLMAPIHandlerFactory:
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
-        # For OpenRouter models, use LLMCaller which has native OpenRouter support
-        if llm_key.startswith("openrouter/"):
+        # For OpenRouter models, use LLMCaller which has native OpenRouter support.
+        # Registry keys (e.g. OPENROUTER_DEEPSEEK_V4_FLASH) also route here when their
+        # model_name is openrouter/* so usage.cost is tracked in get_call_stats.
+        if LLMAPIHandlerFactory._openrouter_model_name(llm_key, llm_config):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
@@ -1667,6 +1795,7 @@ class LLMAPIHandlerFactory:
 
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 model_name = llm_config.model_name
 
@@ -1778,7 +1907,7 @@ class LLMAPIHandlerFactory:
                     )
 
                     if prompt_stripped:
-                        LOG.info("Stripped static prompt from cached request to avoid double-billing")
+                        LOG.info("Stripped static prompt from cached request to avoid double-billing", sampling=True)
                     else:
                         LOG.warning("Could not find static prompt to strip from cached request")
 
@@ -1811,11 +1940,12 @@ class LLMAPIHandlerFactory:
                     )
                     raise SkyvernContextWindowExceededError(model=model_name, prompt_name=prompt_name) from e
                 except CancelledError:
-                    # Speculative steps are intentionally cancelled when goal verification completes first,
-                    # so we log at debug level. Non-speculative cancellations are unexpected errors.
+                    # A cancellation here means the run is being stopped (elapsed-time timeout / user
+                    # cancel) or a speculative step was intentionally cancelled. Either way it must
+                    # propagate so the stop actually halts the run; never convert it to a provider error.
                     t_llm_cancelled = time.perf_counter()
+                    _llm_span.set_attribute("status", "cancelled")
                     if is_speculative_step:
-                        _llm_span.set_attribute("status", "cancelled")
                         LOG.debug(
                             "LLM request cancelled (speculative step)",
                             llm_key=llm_key,
@@ -1823,17 +1953,15 @@ class LLMAPIHandlerFactory:
                             prompt_name=prompt_name,
                             duration=t_llm_cancelled - t_llm_request,
                         )
-                        raise
                     else:
-                        _llm_span.set_attribute("status", "error")
-                        LOG.error(
-                            "LLM request got cancelled",
+                        LOG.warning(
+                            "LLM request cancelled",
                             llm_key=llm_key,
                             model=model_name,
                             prompt_name=prompt_name,
                             duration=t_llm_cancelled - t_llm_request,
                         )
-                        raise LLMProviderError(llm_key) from None
+                    raise
                 except litellm.exceptions.RateLimitError as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "rate_limited")
@@ -1876,12 +2004,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -1976,6 +2100,9 @@ class LLMAPIHandlerFactory:
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
                 duration_seconds = time.perf_counter() - start_time
+                image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                    screenshots, actual_model or llm_config.model_name, response
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1993,9 +2120,14 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    image_count=image_count if image_count > 0 else None,
+                    image_tokens=image_tokens if image_tokens > 0 else None,
+                    image_cost=image_cost if image_cost > 0 else None,
+                    image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
-                    **_llm_vision_log_fields(context, step),
+                    **_slim_log_fields(context, prompt_name),
+                    **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2013,6 +2145,9 @@ class LLMAPIHandlerFactory:
                     cached_tokens=int(cached_tokens or 0),
                     latency_ms=int(duration_seconds * 1000),
                     llm_cost=float(llm_cost or 0.0),
+                    image_tokens=int(image_tokens or 0),
+                    image_cost=float(image_cost or 0.0),
+                    image_count=int(image_count or 0),
                 )
 
                 if step and is_speculative_step:
@@ -2157,11 +2292,14 @@ class LLMCaller:
             self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
         self.openai_client = None
-        if self.llm_key.startswith("openrouter/"):
-            self.llm_key = self.llm_key.replace("openrouter/", "")
+        openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
+        # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
+        if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
+            self.llm_key = openrouter_model_name.replace("openrouter/", "")
+            litellm_params = self.llm_config.litellm_params or {}
             self.openai_client = AsyncOpenAI(
-                api_key=settings.OPENROUTER_API_KEY,
-                base_url=settings.OPENROUTER_API_BASE,
+                api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
+                base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
@@ -2204,7 +2342,8 @@ class LLMCaller:
         start_time = time.perf_counter()
         _llm_span = otel_trace.get_current_span()
         _llm_span.set_attribute("llm_key", self.llm_key)
-        _llm_span.set_attribute("llm_model", self.llm_config.model_name)
+        openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.original_llm_key, self.llm_config)
+        _llm_span.set_attribute("llm_model", openrouter_model_name or self.llm_config.model_name)
         _llm_span.set_attribute("prompt_name", prompt_name or "<unknown>")
         # handler_type distinguishes the three LLM entry points that share
         # the skyvern.llm.request span name. Dashboards filter on this attr.
@@ -2305,6 +2444,7 @@ class LLMCaller:
 
             screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
             llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
+            _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2325,7 +2465,7 @@ class LLMCaller:
                     message_pattern=message_pattern,
                 )
             llm_request_payload = {
-                "model": self.llm_config.model_name,
+                "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
                 # we're not using active_parameters here because it may contain sensitive information
                 **parameters,
@@ -2359,9 +2499,6 @@ class LLMCaller:
                     self.message_history = messages
             # Error paths only set status=error, not token/cost attrs via
             # _enrich_llm_span — no response object exists so there's nothing to report.
-            except litellm.exceptions.APIError as e:
-                _llm_span.set_attribute("status", "error")
-                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
                 _llm_span.set_attribute("status", "context_exceeded")
                 LOG.exception(
@@ -2370,32 +2507,41 @@ class LLMCaller:
                     model=self.llm_config.model_name,
                 )
                 raise SkyvernContextWindowExceededError(model=self.llm_config.model_name) from e
+            except litellm.exceptions.RateLimitError as e:
+                _llm_span.set_attribute("status", "rate_limited")
+                LOG.warning("LLM request rate limited", llm_key=self.llm_key)
+                raise LLMProviderError(self.llm_key, cause=e) from e
+            except litellm.exceptions.APIError as e:
+                _llm_span.set_attribute("status", "error")
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except CancelledError:
-                # Speculative steps are intentionally cancelled when goal verification returns completed,
-                # so we log at debug level. Non-speculative cancellations are unexpected errors.
+                # A cancellation here means the run is being stopped (elapsed-time timeout / user
+                # cancel) or a speculative step was intentionally cancelled. Either way it must
+                # propagate so the stop actually halts the run; never convert it to a provider error.
                 t_llm_cancelled = time.perf_counter()
+                _llm_span.set_attribute("status", "cancelled")
                 if is_speculative_step:
-                    _llm_span.set_attribute("status", "cancelled")
                     LOG.debug(
                         "LLM request cancelled (speculative step)",
                         llm_key=self.llm_key,
                         model=self.llm_config.model_name,
                         duration=t_llm_cancelled - t_llm_request,
                     )
-                    raise
                 else:
-                    _llm_span.set_attribute("status", "error")
-                    LOG.error(
-                        "LLM request got cancelled",
+                    LOG.warning(
+                        "LLM request cancelled",
                         llm_key=self.llm_key,
                         model=self.llm_config.model_name,
                         duration=t_llm_cancelled - t_llm_request,
                     )
-                    raise LLMProviderError(self.llm_key) from None
-            except litellm.exceptions.RateLimitError as e:
+                raise
+            except RateLimitError as e:
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key, cause=e) from e
+            except APIError as e:
+                _llm_span.set_attribute("status", "error")
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
@@ -2451,6 +2597,9 @@ class LLMCaller:
             )
             # Track LLM API handler duration, token counts, and cost
             duration_seconds = time.perf_counter() - start_time
+            image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                screenshots, actual_model or self.llm_config.model_name, response
+            )
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=self.llm_key,
@@ -2470,8 +2619,13 @@ class LLMCaller:
                 else None,
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+                image_count=image_count if image_count > 0 else None,
+                image_tokens=image_tokens if image_tokens > 0 else None,
+                image_cost=image_cost if image_cost > 0 else None,
+                image_tokens_source=image_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
-                **_llm_vision_log_fields(context, step),
+                **_slim_log_fields(context, prompt_name),
+                **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
             )
 
@@ -2487,6 +2641,9 @@ class LLMCaller:
                 cached_tokens=int(call_stats.cached_tokens or 0),
                 latency_ms=int(duration_seconds * 1000),
                 llm_cost=float(call_stats.llm_cost or 0.0),
+                image_tokens=int(image_tokens or 0),
+                image_cost=float(image_cost or 0.0),
+                image_count=int(image_count or 0),
             )
 
             # Raw response is used for CUA engine LLM calls.
@@ -2610,6 +2767,10 @@ class LLMCaller:
                 openai_params["max_tokens"] = active_parameters["max_tokens"]
             if "temperature" in active_parameters:
                 openai_params["temperature"] = active_parameters["temperature"]
+            if active_parameters.get("service_tier"):
+                openai_params["service_tier"] = active_parameters["service_tier"]
+            if active_parameters.get("reasoning_effort"):
+                openai_params["reasoning_effort"] = active_parameters["reasoning_effort"]
 
             completion = await self.openai_client.chat.completions.create(
                 model=self.llm_key,
@@ -2788,8 +2949,6 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
-        if self.original_llm_key.startswith("openrouter/"):
-            return empty_call_stats
 
         # Handle OPENAI_COMPATIBLE provider GitHub Copilot
         if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
@@ -2830,14 +2989,22 @@ class LLMCaller:
                 reasoning_tokens=0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
-            try:
-                llm_cost = litellm.completion_cost(completion_response=response)
-            except Exception as e:
-                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                llm_cost = 0
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
                 response
             )
+            llm_cost = 0.0
+            if LLMAPIHandlerFactory._openrouter_model_name(self.original_llm_key, self.llm_config):
+                reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
+                if reported_cost is not None:
+                    llm_cost = reported_cost
+                else:
+                    LOG.warning(
+                        "OpenRouter response missing usage.cost; cost will be reported as 0",
+                        llm_key=self.original_llm_key,
+                        response_id=getattr(response, "id", None),
+                    )
+            else:
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,

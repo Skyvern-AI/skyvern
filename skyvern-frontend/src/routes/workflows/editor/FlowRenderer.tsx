@@ -44,11 +44,19 @@ import {
   useNodesInitialized,
   useReactFlow,
   NodeChange,
+  NodeDimensionChange,
   EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { nanoid } from "nanoid";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useDebouncedCallback } from "use-debounce";
 import { useBlocker, useParams } from "react-router-dom";
 import {
@@ -116,9 +124,15 @@ import {
   upgradeWorkflowDefinitionToVersionTwo,
   getWorkflowErrors,
 } from "./workflowEditorUtils";
+import {
+  createDimensionConvergenceState,
+  processDimensionChanges,
+  resetDimensionConvergence,
+} from "./dimensionConvergence";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
+import { useResolveDefaultGoogleSheetsCredential } from "./hooks/useResolveDefaultGoogleSheetsCredential";
 import { SortableBlockScope } from "./sortable/SortableBlockScope";
 import {
   TOP_LEVEL_SCOPE,
@@ -152,7 +166,6 @@ import { PoliteDndLiveRegionPolicy } from "./sortable/dragLiveRegionPolicy";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
-import { BlockSidebarMigrationPopover } from "./panels/BlockSidebarMigrationPopover";
 
 // Grace period after nodesInitialized before we start tracking changes.
 // Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
@@ -381,6 +394,12 @@ type Props = {
   onLayoutPhaseChange?: (
     phase: "pre-layout" | "initial-load" | "ready",
   ) => void;
+  // Width of a left-side panel (the studio Copilot column) the canvas sits right
+  // of; the chain shifts left by half of it to read as page-centered, not pane.
+  centerOffsetX?: number;
+  // Embedded in the studio shell: aligns the block-config sidebar's top/bottom
+  // edges with the Copilot column instead of the legacy header offsets.
+  embedded?: boolean;
 };
 
 function FlowRenderer({
@@ -404,6 +423,8 @@ function FlowRenderer({
   captureHistoryImmediately,
   onAddNode,
   onLayoutPhaseChange,
+  centerOffsetX = 0,
+  embedded = false,
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
@@ -459,13 +480,25 @@ function FlowRenderer({
         maxZoom: options?.maxZoom ?? 1,
         duration,
       });
+      // fitView centers on the editor pane (right of the Copilot panel); once it
+      // settles, nudge left by half the panel so it reads as page-centered.
+      if (centerOffsetX > 0) {
+        window.setTimeout(() => {
+          const vp = reactFlowInstance.getViewport();
+          reactFlowInstance.setViewport({
+            x: vp.x - centerOffsetX / 2,
+            y: vp.y,
+            zoom: vp.zoom,
+          });
+        }, duration + 10);
+      }
       // Small safety buffer so a frame near the tail of the animation cannot
       // re-enter `constrainPan` before the final viewport lands.
       window.setTimeout(() => {
         fitViewInProgressRef.current = false;
       }, duration + 50);
     },
-    [reactFlowInstance],
+    [reactFlowInstance, centerOffsetX],
   );
 
   // Keep a ref so the keyboard handler can pick up the latest closure without
@@ -473,6 +506,23 @@ function FlowRenderer({
   // listener on every reactFlowInstance identity change).
   const runFitViewRef = useRef(runFitView);
   runFitViewRef.current = runFitView;
+
+  // React Flow's viewport is in canvas coords, so a Copilot collapse/expand would
+  // jump the chain by the width delta — counter-translate to keep blocks put.
+  const prevCenterOffsetRef = useRef(centerOffsetX);
+  useLayoutEffect(() => {
+    const delta = centerOffsetX - prevCenterOffsetRef.current;
+    prevCenterOffsetRef.current = centerOffsetX;
+    if (delta === 0) {
+      return;
+    }
+    const viewport = reactFlowInstance.getViewport();
+    reactFlowInstance.setViewport({
+      x: viewport.x - delta,
+      y: viewport.y,
+      zoom: viewport.zoom,
+    });
+  }, [centerOffsetX, reactFlowInstance]);
 
   // Canvas zoom + fit-view keyboard shortcuts. Gated to non-read-only
   // canvases for the same reason as the Escape handler above. Skip when
@@ -555,6 +605,13 @@ function FlowRenderer({
 
   // Track if we're currently in a layout operation to prevent infinite loops
   const isLayoutingRef = useRef(false);
+
+  // Bounds the dimension->layout feedback cycle (React error #185) when a
+  // ResizeObserver oscillation re-arms layout faster than the rAF guard resets.
+  const dimensionConvergenceRef = useRef(createDimensionConvergenceState());
+
+  // Ensures the targeted-block status-row relayout runs once per focus.
+  const lastLaidOutTargetLabelRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -658,18 +715,32 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
 
-  // Re-layout when the targetted block changes to account for the status row
+  // Re-layout when the targeted block changes to account for the status row
   // that appears when a block is being debugged
   useEffect(() => {
-    if (nodesInitialized && targettedBlockLabel) {
+    // Clear the focus marker when focus is removed (e.g. navigating from
+    // /:run/:label/build back to /build) so re-focusing the same label later
+    // still triggers the status-row relayout and budget reset.
+    if (!targettedBlockLabel) {
+      lastLaidOutTargetLabelRef.current = undefined;
+      return;
+    }
+    if (
+      nodesInitialized &&
+      lastLaidOutTargetLabelRef.current !== targettedBlockLabel
+    ) {
+      // A new focus is a genuine change, so re-arm the convergence budget that
+      // the previous block's status-row resize may have exhausted.
+      lastLaidOutTargetLabelRef.current = targettedBlockLabel;
+      resetDimensionConvergence(dimensionConvergenceRef.current);
       doLayout(nodes, edges);
     }
-    // Re-layout only when the targetted (debugged) block label changes.
+    // Re-layout only when the targeted (debugged) block label changes.
     // nodes/edges/doLayout intentionally omitted: a normal edit already
     // triggers its own layout pass, and re-running here would fight the
     // user's interactive position changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targettedBlockLabel]);
+  }, [targettedBlockLabel, nodesInitialized]);
 
   // Re-layout when a loop node's header height changes (e.g., data schema toggled)
   useEffect(() => {
@@ -1460,6 +1531,7 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
   useAutoGenerateWorkflowTitle(nodes, edges, readOnly);
+  useResolveDefaultGoogleSheetsCredential(nodes, readOnly);
 
   useEffect(() => {
     doLayout(nodes, edges);
@@ -1487,6 +1559,42 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyApplyTrigger]);
 
+  // Fit once, when first visible (non-zero) and measured — a hidden mount fits at
+  // zero size; once-only so returning to the editor preserves the user's pan/zoom.
+  const hasInitialFitRef = useRef(false);
+  useEffect(() => {
+    // Studio-only: the legacy canvas keeps React Flow's own mount fit and must
+    // not be auto-fit here. centerOffsetX is > 0 only in the studio shell.
+    if (centerOffsetX <= 0) {
+      return;
+    }
+    if (hasInitialFitRef.current) {
+      return;
+    }
+    const el = editorElementRef.current;
+    if (!el) {
+      return;
+    }
+    let observer: ResizeObserver | null = null;
+    const tryFit = () => {
+      if (hasInitialFitRef.current) {
+        return;
+      }
+      const visible =
+        (editorElementRef.current?.getBoundingClientRect().width ?? 0) > 0;
+      if (!visible || !nodesInitialized) {
+        return;
+      }
+      hasInitialFitRef.current = true;
+      runFitView({ duration: 0 });
+      observer?.disconnect();
+    };
+    observer = new ResizeObserver(tryFit);
+    observer.observe(el);
+    tryFit();
+    return () => observer?.disconnect();
+  }, [runFitView, nodesInitialized, centerOffsetX]);
+
   const zoomLock = 1 as const;
   const yLockMax = 140 as const;
 
@@ -1512,7 +1620,9 @@ function FlowRenderer({
     const idealWidth = hasHttpBlock ? 580 : hasLoopBlock ? 498 : 475;
     const split = (width - idealWidth) / 2;
 
-    return Math.max(24, split);
+    // Shift left by half the left panel so the locked position matches the
+    // page-centered fit (see runFitView).
+    return Math.max(24, split - centerOffsetX / 2);
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
@@ -1570,6 +1680,7 @@ function FlowRenderer({
   return (
     <WorkflowScopeContext.Provider value={workflowScopeValue}>
       <div
+        data-tour="editor-canvas"
         className={cn("workflow-editor-shell relative h-full w-full", {
           "react-flow--pre-layout": layoutPhase === "pre-layout",
           "react-flow--initial-load":
@@ -1690,41 +1801,40 @@ function FlowRenderer({
                 nodes={nodes}
                 edges={edges}
                 onNodesChange={(changes) => {
+                  // User drag-drop. `dragging === false` fires once at the end
+                  // of a drag gesture. Programmatic position updates (mount-time
+                  // layout, setNodes from node components) leave `dragging`
+                  // undefined, so this filter doesn't falsely trip for them.
+                  const hasStructuralChange = changes.some(
+                    (change) =>
+                      change.type === "add" ||
+                      change.type === "remove" ||
+                      change.type === "replace" ||
+                      (change.type === "position" && change.dragging === false),
+                  );
+
+                  // A genuine structural edit re-arms the convergence budget so
+                  // a real resize that follows isn't starved by a prior loop.
+                  if (hasStructuralChange) {
+                    resetDimensionConvergence(dimensionConvergenceRef.current);
+                  }
+
                   const dimensionChanges = changes.filter(
-                    (change) => change.type === "dimensions",
+                    (change): change is NodeDimensionChange =>
+                      change.type === "dimensions",
                   );
 
                   // Only process dimension changes if we're not already in a layout operation
                   // This prevents infinite loops (React error #185) during copy-paste
                   if (dimensionChanges.length > 0 && !isLayoutingRef.current) {
-                    const tempNodes = [...nodes];
-                    let hasActualChanges = false;
-
-                    dimensionChanges.forEach((change) => {
-                      const node = tempNodes.find(
-                        (node) => node.id === change.id,
+                    const { nodes: tempNodes, shouldLayout } =
+                      processDimensionChanges(
+                        nodes,
+                        dimensionChanges,
+                        dimensionConvergenceRef.current,
                       );
-                      if (node) {
-                        const newWidth = change.dimensions?.width;
-                        const newHeight = change.dimensions?.height;
 
-                        // Only update if dimensions actually changed
-                        if (
-                          node.measured?.width !== newWidth ||
-                          node.measured?.height !== newHeight
-                        ) {
-                          hasActualChanges = true;
-                          node.measured = {
-                            ...node.measured,
-                            width: newWidth,
-                            height: newHeight,
-                          };
-                        }
-                      }
-                    });
-
-                    // Only trigger layout if there were actual dimension changes
-                    if (hasActualChanges) {
+                    if (shouldLayout) {
                       debouncedLayoutForDimensions(tempNodes, edges);
                     }
                   }
@@ -1738,20 +1848,7 @@ function FlowRenderer({
                     !readOnly &&
                     !isInitialLoadRef.current &&
                     internalUpdateCount === 0 &&
-                    changes.some((change) => {
-                      return (
-                        change.type === "add" ||
-                        change.type === "remove" ||
-                        change.type === "replace" ||
-                        // User drag-drop. `dragging === false` fires once at the
-                        // end of a drag gesture. Programmatic position updates
-                        // (mount-time layout, setNodes from node components)
-                        // leave `dragging` undefined, so this filter doesn't
-                        // falsely trip for them.
-                        (change.type === "position" &&
-                          change.dragging === false)
-                      );
-                    })
+                    hasStructuralChange
                   ) {
                     workflowChangesStore.setHasChanges(true);
                   }
@@ -1860,8 +1957,16 @@ function FlowRenderer({
             entirely in read-only mode so comparison canvases never
             expose the editable block form.
           */}
-            {!readOnly && <BlockConfigSidebar onAddNode={onAddNode} />}
-            {!readOnly && <BlockSidebarMigrationPopover />}
+            {!readOnly && (
+              <BlockConfigSidebar onAddNode={onAddNode} embedded={embedded} />
+            )}
+            {!readOnly && (
+              <div
+                data-tour="sidebar-region"
+                className="pointer-events-none absolute bottom-6 right-6 top-8"
+                style={{ width: 320 }}
+              />
+            )}
             <DragOverlay dropAnimation={null}>
               {(() => {
                 if (!activeDragId) return null;

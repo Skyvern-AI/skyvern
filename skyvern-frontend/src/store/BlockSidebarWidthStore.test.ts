@@ -20,6 +20,9 @@ describe("BlockSidebarWidthStore", () => {
     expect(useBlockSidebarWidthStore.getState().width).toBe(
       BLOCK_SIDEBAR_WIDTH_DEFAULT,
     );
+    expect(useBlockSidebarWidthStore.getState().renderedWidth).toBe(
+      BLOCK_SIDEBAR_WIDTH_DEFAULT,
+    );
   });
 
   test("setWidth clamps to [MIN, MAX]", () => {
@@ -43,11 +46,23 @@ describe("BlockSidebarWidthStore", () => {
     expect(JSON.parse(raw!)).toMatchObject({ state: { width: 420 } });
   });
 
+  test("setRenderedWidth tracks the measured width without persisting it", () => {
+    useBlockSidebarWidthStore.getState().setRenderedWidth(452);
+
+    expect(useBlockSidebarWidthStore.getState().renderedWidth).toBe(452);
+    const raw = localStorage.getItem(BLOCK_SIDEBAR_WIDTH_STORAGE_KEY);
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!).state).not.toHaveProperty("renderedWidth");
+  });
+
   test("reset returns width to default and clears persistence", () => {
     const store = useBlockSidebarWidthStore.getState();
     store.setWidth(420);
     store.reset();
     expect(useBlockSidebarWidthStore.getState().width).toBe(
+      BLOCK_SIDEBAR_WIDTH_DEFAULT,
+    );
+    expect(useBlockSidebarWidthStore.getState().renderedWidth).toBe(
       BLOCK_SIDEBAR_WIDTH_DEFAULT,
     );
   });

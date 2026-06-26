@@ -1,12 +1,80 @@
+import { useMemo } from "react";
+import type { Extension } from "@uiw/react-codemirror";
+
+import { ActionsApiResponse, Status } from "@/api/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import type { WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
+import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
+import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
+import type {
+  CodeBlockStep,
+  WorkflowParameter,
+} from "@/routes/workflows/types/workflowTypes";
 
 type Props = {
   code: string;
   parameters?: Array<WorkflowParameter>;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
+  blockStatus?: Status | null;
+  failureReason?: string | null;
+  actions?: Array<ActionsApiResponse> | null;
 };
 
-function CodeBlockParameters({ code, parameters }: Props) {
+function getActionCodeLine(action: ActionsApiResponse): number | null {
+  const output = action.output;
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const codeLine = (output as Record<string, unknown>).code_line;
+  return typeof codeLine === "number" ? codeLine : null;
+}
+
+function formatStepLines(step: CodeBlockStep): string {
+  if (step.line_start == null) {
+    return "";
+  }
+  if (step.line_end == null || step.line_end === step.line_start) {
+    return `L${step.line_start}`;
+  }
+  return `L${step.line_start}-${step.line_end}`;
+}
+
+function CodeBlockParameters({
+  code,
+  parameters,
+  prompt,
+  steps,
+  blockStatus,
+  failureReason,
+  actions,
+}: Props) {
+  // Actions arrive newest-first, so the first failed action carrying a code
+  // line is the one that stopped the run.
+  const failingAction =
+    blockStatus === Status.Failed
+      ? (actions ?? []).find(
+          (action) =>
+            action.status === Status.Failed &&
+            getActionCodeLine(action) !== null,
+        )
+      : undefined;
+  const failingLine = failingAction ? getActionCodeLine(failingAction) : null;
+  const failingReason = failureReason ?? failingAction?.response ?? null;
+  const codeExtensions = useMemo<Array<Extension>>(() => {
+    if (failingLine == null) {
+      return jinjaHighlight;
+    }
+    const failingLineExtensions = lineHighlight([
+      { from: failingLine, to: failingLine, variant: "error" },
+    ]);
+    return [
+      ...jinjaHighlight,
+      ...(Array.isArray(failingLineExtensions)
+        ? failingLineExtensions
+        : [failingLineExtensions]),
+    ];
+  }, [failingLine]);
+
   return (
     <div className="space-y-4">
       <div className="flex gap-16">
@@ -16,19 +84,74 @@ function CodeBlockParameters({ code, parameters }: Props) {
             The Python snippet executed for this block
           </h2>
         </div>
-        <CodeEditor
-          className="w-full"
-          language="python"
-          value={code}
-          readOnly
-          minHeight="160px"
-          maxHeight="400px"
-        />
+        <div className="flex w-full min-w-0 flex-col gap-2">
+          {failingLine !== null && (
+            <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs leading-relaxed text-destructive">
+              {`Failed at line ${failingLine}${failingReason ? `: ${failingReason}` : ""}`}
+            </div>
+          )}
+          <CodeEditor
+            className="w-full"
+            language="python"
+            value={code}
+            readOnly
+            lineWrap={false}
+            minHeight="160px"
+            maxHeight="400px"
+            extraExtensions={codeExtensions}
+          />
+        </div>
       </div>
+      {prompt ? (
+        <div className="flex gap-16">
+          <div className="w-80">
+            <h1 className="text-lg">Goal</h1>
+            <h2 className="text-base text-slate-400">
+              What this block is meant to accomplish
+            </h2>
+          </div>
+          <div className="flex w-full min-w-0 items-start text-sm text-slate-200">
+            {prompt}
+          </div>
+        </div>
+      ) : null}
+      {steps && steps.length > 0 ? (
+        <div className="flex gap-16">
+          <div className="w-80">
+            <h1 className="text-lg">Steps</h1>
+            <h2 className="text-base text-slate-400">
+              Plain-language outline of the code
+            </h2>
+          </div>
+          <ol className="flex w-full min-w-0 flex-col gap-1">
+            {steps.map((step, index) => (
+              <li
+                key={index}
+                className="flex items-center gap-2 rounded border border-slate-700/40 bg-slate-elevation3 px-2.5 py-1.5 text-xs"
+              >
+                <span className="w-5 shrink-0 tabular-nums text-slate-500">
+                  {index + 1}.
+                </span>
+                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-400">
+                  {step.action_type}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-slate-300">
+                  {step.title ?? step.description}
+                </span>
+                {step.line_start != null ? (
+                  <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                    {formatStepLines(step)}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
       {parameters && parameters.length > 0 ? (
         <div className="flex gap-16">
           <div className="w-80">
-            <h1 className="text-lg">Parameters</h1>
+            <h1 className="text-lg">Inputs</h1>
             <h2 className="text-base text-slate-400">
               Inputs passed to this code block
             </h2>

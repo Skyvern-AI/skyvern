@@ -9,6 +9,7 @@ export type ProposalDisposition =
   | "auto_applicable"
   | "review_untested"
   | "review_tested";
+export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
@@ -23,6 +24,7 @@ export interface WorkflowCopilotChatMessage {
   workflow_copilot_chat_id: string;
   sender: WorkflowCopilotChatSender;
   content: string;
+  audio_artifact_id?: string | null;
   global_llm_context: string | null;
   created_at: string;
   modified_at: string;
@@ -35,8 +37,12 @@ export interface WorkflowCopilotChatRequest {
   workflow_run_id?: string | null;
   browser_session_id?: string | null;
   message: string;
+  audio_artifact_id?: string | null;
   workflow_yaml: string;
+  mode?: "ask" | "build" | null;
+  code_block?: boolean | null;
   cancel_token?: string;
+  target_block_label?: string | null;
 }
 
 export interface WorkflowCopilotCancelRequest {
@@ -46,7 +52,12 @@ export interface WorkflowCopilotCancelRequest {
 export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
+  audio_artifact_id?: string | null;
   created_at: string;
+  // Typed turn outcome persisted on assistant rows; optional so the FE
+  // tolerates an older backend that does not serve it.
+  turn_outcome?: { response_kind?: string | null } | null;
+  narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotChatHistoryResponse {
@@ -54,6 +65,16 @@ export interface WorkflowCopilotChatHistoryResponse {
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
   auto_accept?: boolean | null;
+}
+
+export interface WorkflowCopilotChatSummary {
+  workflow_copilot_chat_id: string;
+  workflow_permanent_id: string;
+  // Returned by the API; not rendered since the list is already scoped to one workflow.
+  workflow_title?: string | null;
+  title: string;
+  created_at: string;
+  modified_at: string;
 }
 
 export interface WorkflowCopilotClearProposedWorkflowRequest {
@@ -66,6 +87,11 @@ export interface WorkflowCopilotApplyProposedWorkflowRequest {
   auto_accept: boolean;
 }
 
+export interface WorkflowCopilotAudioUploadResponse {
+  workflow_copilot_chat_id: string;
+  audio_artifact_id: string;
+}
+
 export type WorkflowCopilotStreamMessageType =
   | "processing_update"
   | "response"
@@ -75,6 +101,7 @@ export type WorkflowCopilotStreamMessageType =
   | "condensing"
   | "narration"
   | "block_progress"
+  | "run_outcome"
   | "turn_start"
   | "design_start"
   | "design_end"
@@ -92,13 +119,16 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
+  response_type?: CopilotResponseType;
   proposal_disposition: ProposalDisposition;
+  workflow_applied?: boolean;
   // Cancel forces explicit review.
   cancelled?: boolean;
   // Optional so the FE tolerates an older backend that does not emit the
   // turn-narrative envelope.
   turn_id?: string | null;
   narrative_summary?: string | null;
+  narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
@@ -114,6 +144,10 @@ export interface WorkflowCopilotTurnStartUpdate {
   turn_index: number;
   mode: string;
   timestamp: string;
+  // Block count of the canonical workflow at turn entry. Drives the FE's
+  // edit-vs-build chip; the snap-back source is captured client-side at
+  // submit time so unsaved local canvas edits survive.
+  prior_block_count?: number | null;
 }
 
 export interface WorkflowCopilotDesignStartUpdate {
@@ -135,11 +169,13 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   block_labels: string[];
   summary: string | null;
   timestamp: string;
+  workflow?: WorkflowApiResponse | null;
 }
 
 export interface WorkflowCopilotToolCallUpdate {
   type: "tool_call";
   tool_name: string;
+  display_label?: string | null;
   tool_input: Record<string, unknown>;
   iteration: number;
   tool_call_id: string;
@@ -173,6 +209,24 @@ export interface WorkflowCopilotBlockProgressUpdate {
   block_label: string;
   block_type: string;
   status: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export type WorkflowCopilotRunOutcomeVerdict =
+  | "evaluating"
+  | "demonstrated"
+  | "not_demonstrated"
+  | "not_evaluated";
+
+export interface WorkflowCopilotRunOutcomeUpdate {
+  type: "run_outcome";
+  workflow_run_id: string;
+  workflow_run_block_ids: string[];
+  block_labels: string[];
+  verdict: WorkflowCopilotRunOutcomeVerdict;
+  reason_code?: string | null;
+  display_reason?: string | null;
   iteration: number;
   timestamp: string;
 }

@@ -12,6 +12,7 @@ Mirrors the SKY-8861 download artifact pipeline in
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
@@ -20,6 +21,7 @@ import pytest
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.webeye.video_utils import PreparedRecordingUpload
 
 _DUMMY_KEYRING_JSON = '{"current_kid": "k1", "keys": {"k1": {"secret": "0000000000000000000000000000000000000000000000000000000000000000"}}}'
 
@@ -44,6 +46,28 @@ def _make_recording_artifact(
     return Artifact(
         artifact_id=artifact_id,
         artifact_type=ArtifactType.RECORDING,
+        uri=uri,
+        organization_id="o_1",
+        browser_session_id=browser_session_id,
+        checksum=checksum,
+        file_size=file_size,
+        created_at=created_at,
+        modified_at=created_at,
+    )
+
+
+def _make_session_replay_artifact(
+    artifact_id: str,
+    uri: str,
+    *,
+    browser_session_id: str = "pbs_1",
+    checksum: str | None = "sha-replay",
+    file_size: int | None = 1024,
+    created_at: str = "2026-04-26T00:00:00Z",
+) -> Artifact:
+    return Artifact(
+        artifact_id=artifact_id,
+        artifact_type=ArtifactType.SESSION_REPLAY,
         uri=uri,
         organization_id="o_1",
         browser_session_id=browser_session_id,
@@ -137,6 +161,74 @@ async def test_create_browser_session_recording_artifact_is_idempotent():
     mock_db_create.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_create_browser_session_replay_artifact_inserts_session_replay_row():
+    manager = ArtifactManager()
+    find_existing = AsyncMock(return_value=None)
+    mock_db_create = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.create_artifact",
+            mock_db_create,
+        ),
+    ):
+        artifact_id = await manager.create_browser_session_replay_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri="s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/session_replays/2026-04-26/replay.mp4",
+            filename="replay.mp4",
+            checksum="sha-replay",
+            file_size=8192,
+        )
+
+    assert artifact_id.startswith("a_")
+    mock_db_create.assert_awaited_once()
+    _, kwargs = mock_db_create.call_args
+    assert kwargs["artifact_type"] == ArtifactType.SESSION_REPLAY
+    assert kwargs["browser_session_id"] == "pbs_1"
+    assert kwargs["organization_id"] == "o_1"
+    assert kwargs["checksum"] == "sha-replay"
+    assert kwargs["file_size"] == 8192
+    assert kwargs.get("run_id") is None
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_replay_artifact_is_idempotent():
+    manager = ArtifactManager()
+    existing = _make_session_replay_artifact(
+        "a_existing",
+        "s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/session_replays/2026-04-26/replay.mp4",
+    )
+    find_existing = AsyncMock(return_value=existing)
+    mock_db_create = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.create_artifact",
+            mock_db_create,
+        ),
+    ):
+        artifact_id = await manager.create_browser_session_replay_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri=existing.uri,
+            filename="replay.mp4",
+            checksum="sha-replay",
+        )
+
+    assert artifact_id == "a_existing"
+    mock_db_create.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Storage write site — sync_browser_session_file(artifact_type="videos")
 # ---------------------------------------------------------------------------
@@ -150,12 +242,20 @@ async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
     storage.async_client.upload_file_from_path = AsyncMock()
     recording_file = tmp_path / "recording.webm"
     recording_file.write_bytes(b"fake-video")
+    compressed_file = tmp_path / "recording.compressed.mp4"
+    compressed_file.write_bytes(b"compressed-video")
 
     mock_create = AsyncMock(return_value="a_new")
     mock_artifact_manager = MagicMock()
     mock_artifact_manager.create_browser_session_recording_artifact = mock_create
 
+    @asynccontextmanager
+    async def fake_prepare_recording_for_upload(path: str):
+        assert path == str(recording_file)
+        yield PreparedRecordingUpload(path=str(compressed_file), file_extension="mp4")
+
     with (
+        patch("skyvern.forge.sdk.artifact.storage.s3.prepare_recording_for_upload", fake_prepare_recording_for_upload),
         patch.object(storage, "_get_storage_class_for_org", new=AsyncMock(return_value=MagicMock())),
         patch("skyvern.forge.sdk.artifact.storage.s3.calculate_sha256_for_file", return_value="sha-r"),
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as app_module,
@@ -170,18 +270,22 @@ async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
             date="2026-04-26",
         )
 
+    storage.async_client.upload_file_from_path.assert_awaited_once()
+    assert storage.async_client.upload_file_from_path.call_args.args[0].endswith("/recording.mp4")
+    assert storage.async_client.upload_file_from_path.call_args.args[1] == str(compressed_file)
     mock_create.assert_awaited_once()
     _, kwargs = mock_create.call_args
     assert kwargs["organization_id"] == "o_1"
     assert kwargs["browser_session_id"] == "pbs_1"
-    assert kwargs["filename"] == "recording.webm"
+    assert kwargs["filename"] == "recording.mp4"
     assert kwargs["checksum"] == "sha-r"
-    assert kwargs["file_size"] == recording_file.stat().st_size
+    assert kwargs["file_size"] == compressed_file.stat().st_size
     assert kwargs["uri"].startswith("s3://") and "/browser_sessions/pbs_1/videos/" in kwargs["uri"]
+    assert kwargs["uri"].endswith("/recording.mp4")
 
 
 @pytest.mark.asyncio
-async def test_sync_browser_session_file_recording_failure_propagates():
+async def test_sync_browser_session_file_recording_failure_propagates(tmp_path):
     """Contract: ``sync_browser_session_file(artifact_type="videos")``
     raises when the artifact-row insert fails. The exception propagates to
     the caller; ``DefaultPersistentSessionsManager.close_session`` is
@@ -195,12 +299,20 @@ async def test_sync_browser_session_file_recording_failure_propagates():
     storage = S3Storage()
     storage.async_client = MagicMock()
     storage.async_client.upload_file_from_path = AsyncMock()
+    recording_file = tmp_path / "recording.webm"
+    recording_file.write_bytes(b"fake-video")
 
     mock_create = AsyncMock(side_effect=RuntimeError("DB unreachable"))
     mock_artifact_manager = MagicMock()
     mock_artifact_manager.create_browser_session_recording_artifact = mock_create
 
+    @asynccontextmanager
+    async def fake_prepare_recording_for_upload(path: str):
+        assert path == str(recording_file)
+        yield PreparedRecordingUpload(path=str(recording_file), file_extension="webm")
+
     with (
+        patch("skyvern.forge.sdk.artifact.storage.s3.prepare_recording_for_upload", fake_prepare_recording_for_upload),
         patch.object(storage, "_get_storage_class_for_org", new=AsyncMock(return_value=MagicMock())),
         patch("skyvern.forge.sdk.artifact.storage.s3.calculate_sha256_for_file", return_value="sha-r"),
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as app_module,
@@ -211,7 +323,7 @@ async def test_sync_browser_session_file_recording_failure_propagates():
                 organization_id="o_1",
                 browser_session_id="pbs_1",
                 artifact_type="videos",
-                local_file_path="/tmp/recording.webm",
+                local_file_path=str(recording_file),
                 remote_path="recording.webm",
             )
 

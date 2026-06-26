@@ -20,13 +20,34 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
 from skyvern.forge.failure_classifier import classify_from_failure_reason
-from skyvern.forge.sdk.copilot.blocker_signal import maybe_clear_blocker_signal_on_tool_success
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    clear_blocker_signal_for_reason_codes,
+    maybe_clear_blocker_signal_on_tool_success,
+)
 
 MAX_CONSECUTIVE_SAME_TOOL = 3
 MAX_REPEATED_FAILED_STEP = 3
 LOOP_DETECTED_MARKER = "LOOP DETECTED:"
 ARGUMENT_INSENSITIVE_FAILURE_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES = frozenset({"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"})
+RECONCILIATION_PROGRESS_TOOL_NAMES = frozenset(
+    {
+        "click",
+        "evaluate",
+        "get_browser_screenshot",
+        "inspect_page_for_composition",
+        "press_key",
+        "run_blocks_and_collect_debug",
+        "scroll",
+        "select_option",
+        "type_text",
+        "update_and_run_blocks",
+        "update_workflow",
+    }
+)
+RECONCILIATION_REQUIRES_INPUT_REASON_CODES = frozenset({"tool_error_pending_reconciliation_requires_input"})
+WORKFLOW_PERSISTENCE_TOOL_NAMES = frozenset({"update_workflow", "update_and_run_blocks"})
+WORKFLOW_RUN_CREATION_TOOL_NAMES = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
 def detect_tool_loop(
@@ -51,6 +72,42 @@ def detect_tool_loop(
         tracker.append(tool_name)
 
     return None
+
+
+def record_consecutive_tool_result_boundary(tracker: list[str], tool_name: str) -> None:
+    if tracker and tracker[-1] == tool_name:
+        return
+    tracker.clear()
+    tracker.append(tool_name)
+
+
+def _result_records_workflow_progress(tool_name: str, result: Mapping[str, Any]) -> bool:
+    if result.get("ok") is True and "_workflow" in result:
+        return True
+
+    data = result.get("data")
+    if not isinstance(data, Mapping):
+        return False
+
+    if tool_name in WORKFLOW_PERSISTENCE_TOOL_NAMES and data.get("workflow_updated") is True:
+        return True
+
+    workflow_run_id = data.get("workflow_run_id")
+    return tool_name in WORKFLOW_RUN_CREATION_TOOL_NAMES and isinstance(workflow_run_id, str) and bool(workflow_run_id)
+
+
+def record_consecutive_tool_result_boundary_for_ctx(
+    ctx: Any,
+    tool_name: str,
+    result: Mapping[str, Any],
+) -> None:
+    tracker = getattr(ctx, "consecutive_tool_tracker", None)
+    if not isinstance(tracker, list):
+        return
+    if _result_records_workflow_progress(tool_name, result):
+        tracker.clear()
+        return
+    record_consecutive_tool_result_boundary(tracker, tool_name)
 
 
 def _normalize_step_argument(value: Any) -> Any:
@@ -228,9 +285,17 @@ def record_tool_step_result_for_ctx(
     tracker = _ctx_failed_step_tracker(ctx)
     if tracker is not None:
         record_tool_step_result(tracker, tool_name, arguments, result)
+    record_consecutive_tool_result_boundary_for_ctx(ctx, tool_name, result)
     # Strict ``is True`` check: a malformed result dict missing ``ok`` entirely
     # must not be treated as success and accidentally clear a blocker signal.
     if result.get("ok") is True:
+        if (
+            getattr(ctx, "pending_reconciliation_requires_user_input", False)
+            and tool_name in RECONCILIATION_PROGRESS_TOOL_NAMES
+        ):
+            ctx.pending_reconciliation_requires_user_input = False
+            ctx.pending_reconciliation_run_id = None
+            clear_blocker_signal_for_reason_codes(ctx, RECONCILIATION_REQUIRES_INPUT_REASON_CODES)
         maybe_clear_blocker_signal_on_tool_success(ctx, tool_name)
 
 

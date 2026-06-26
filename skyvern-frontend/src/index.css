@@ -15,9 +15,9 @@
 
     --primary: 0 0% 7%;
     --primary-foreground: 0 0% 98%;
-    --cta: 234 52% 56%;
-    --cta-hover: 234 52% 48%;
-    --cta-foreground: 0 0% 100%;
+    --cta: 0 0% 7%;
+    --cta-hover: 0 0% 14%;
+    --cta-foreground: 0 0% 98%;
 
     --secondary: 0 0% 96%;
     --secondary-foreground: 0 0% 7%;
@@ -41,11 +41,23 @@
     --success: 142.1 76.2% 36.3%; /* green-600 */
     --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
 
+    /* status badge chips: light tint / deep fill; text always uses --foreground (dark in light, light in dark) */
+    --badge-success: 141 78.9% 85.1%;
+    --badge-warning: 48 96.6% 76.7%;
+    --badge-destructive: 352.7 96.1% 90%;
+    --badge-terminated: 32.1 97.7% 83.1%;
+    --badge-neutral: 214.3 31.8% 91.4%;
+
     --border: 0 0% 88%;
     --input: 0 0% 88%;
     --ring: 0 0% 9%;
 
     --radius: 0.5rem;
+
+    /* studio editor brand accent (#6d6cf6) — opt-in via `studio-accent` utilities, scoped to the workflow studio */
+    --studio-accent: 244.8 84.4% 60%;
+    --studio-accent-foreground: 0 0% 100%;
+    --studio-accent-2: 244.5 100% 71.4%;
 
     --slate-elevation-1: 0 0% 98%;
     --slate-elevation-2: 0 0% 96%;
@@ -66,9 +78,9 @@
 
     --primary: 210 40% 98%;
     --primary-foreground: 222.2 47.4% 11.2%;
-    --cta: 234 56% 60%;
-    --cta-hover: 234 56% 52%;
-    --cta-foreground: 0 0% 100%;
+    --cta: 210 40% 98%;
+    --cta-hover: 210 40% 92%;
+    --cta-foreground: 222.2 47.4% 11.2%;
 
     --secondary: 217.2 32.6% 17.5%;
     --secondary-foreground: 210 40% 98%;
@@ -91,6 +103,12 @@
 
     --success: 142.1 76.2% 36.3%; /* green-600 */
     --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
+
+    --badge-success: 143.8 61.2% 20.2%;
+    --badge-warning: 42 85% 30%;
+    --badge-destructive: 0 62.8% 30.6%;
+    --badge-terminated: 15 79.1% 33.7%;
+    --badge-neutral: 215.3 25% 26.7%;
 
     --border: 215.3 25% 26.7%;
     --input: 215.3 25% 26.7%;

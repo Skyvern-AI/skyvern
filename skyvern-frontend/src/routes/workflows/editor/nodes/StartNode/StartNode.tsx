@@ -31,6 +31,7 @@ interface StartSettings {
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
   browserProfileId: string | null;
+  browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
@@ -66,6 +67,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         : false,
       browserProfileId: data.withWorkflowSettings
         ? data.browserProfileId
+        : null,
+      browserProfileKey: data.withWorkflowSettings
+        ? data.browserProfileKey
         : null,
       model: data.withWorkflowSettings ? data.model : null,
       maxScreenshotScrollingTimes: data.withWorkflowSettings
@@ -147,7 +151,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
             <div className="relative">
               <header className="mb-6 mt-2">Start</header>
               <Separator />
-              <BuildModeOnly>
+              <BuildModeOnly renderInReadOnlyComparison={false}>
                 <Accordion
                   type="single"
                   collapsible

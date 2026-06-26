@@ -7,6 +7,11 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { Parameter } from "../types/workflowTypes";
 import { getOrderedRunParameters } from "../utils";
+import {
+  getActiveOrgQueryKeyScope,
+  getOrgScopedQueryKey,
+  useActiveOrgId,
+} from "@/store/ActiveOrgContext";
 
 type Props = {
   open: boolean;
@@ -24,9 +29,14 @@ export function RunParametersDialog({
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   const { data: run } = useQuery<WorkflowRunStatusApiResponse>({
-    queryKey: ["workflowRun", workflowPermanentId, workflowRunId, "dialog"],
-    queryFn: async () => {
+    queryKey: getOrgScopedQueryKey(
+      ["workflowRun", workflowPermanentId, workflowRunId, "dialog"],
+      activeOrgQueryKeyScope,
+    ),
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -38,6 +48,7 @@ export function RunParametersDialog({
       return client
         .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
           params,
+          signal,
         })
         .then((r) => r.data);
     },
@@ -78,8 +89,8 @@ export function RunParametersDialog({
     <ParametersDialogBase
       open={open}
       onOpenChange={onOpenChange}
-      title="Run Parameters"
-      sectionLabel="Input parameters for this run"
+      title="Run Inputs"
+      sectionLabel="Inputs for this run"
       items={items}
     />
   );

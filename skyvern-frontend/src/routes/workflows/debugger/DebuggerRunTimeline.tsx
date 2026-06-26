@@ -1,9 +1,13 @@
+import { useMemo } from "react";
+
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
+import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
   countActionsInTimeline,
   isBlockItem,
@@ -37,6 +41,15 @@ function DebuggerRunTimeline({
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
+
+  const { data: workflowRunWithWorkflow } = useWorkflowRunWithWorkflowQuery();
+  const codeStepsByLabel = useMemo(
+    () =>
+      buildCodeStepsByLabel(
+        workflowRunWithWorkflow?.workflow?.workflow_definition?.blocks ?? [],
+      ),
+    [workflowRunWithWorkflow],
+  );
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return <Skeleton className="h-full w-full" />;
@@ -101,6 +114,7 @@ function DebuggerRunTimeline({
                       subItems={timelineItem.children}
                       activeItem={activeItem}
                       block={timelineItem.block}
+                      codeStepsByLabel={codeStepsByLabel}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
                       onThoughtClick={onObserverThoughtCardSelected}

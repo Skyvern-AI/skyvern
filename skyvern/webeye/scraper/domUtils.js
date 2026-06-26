@@ -451,7 +451,12 @@ function isHoverOnlyElement(element) {
 
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
-function isElementVisible(element) {
+function isElementVisible(element, seen) {
+  // Break the option/checkbox→parent ↔ display:contents→child recursion cycle
+  // that would otherwise overflow the call stack.
+  if (seen && seen.has(element)) {
+    return false;
+  }
   const tagLower = element.tagName.toLowerCase();
 
   // Web Component libraries often hide native form inputs inside shadow DOM
@@ -464,7 +469,22 @@ function isElementVisible(element) {
     !element.disabled
   ) {
     if (tagLower !== "input" || element.type !== "hidden") {
-      return true;
+      // Skip force-visible when the dropdown host/trigger is closed.
+      const host = element.getRootNode().host;
+      const hostClosed = host && host.getAttribute("aria-expanded") === "false";
+      if (!hostClosed) {
+        // Only suppress combobox/filter inputs whose sibling trigger is closed —
+        // regular text inputs next to an unrelated closed element stay visible.
+        const isFilter = element.getAttribute("role") === "combobox";
+        const prevSibling = element.previousElementSibling;
+        const siblingClosed =
+          isFilter &&
+          prevSibling &&
+          prevSibling.getAttribute("aria-expanded") === "false";
+        if (!siblingClosed) {
+          return true;
+        }
+      }
     }
   }
 
@@ -474,8 +494,14 @@ function isElementVisible(element) {
     tagLower === "option" ||
     (tagLower === "input" &&
       (element.type === "radio" || element.type === "checkbox"))
-  )
-    return element.parentElement && isElementVisible(element.parentElement);
+  ) {
+    if (!element.parentElement) {
+      return false;
+    }
+    const pathSeen = seen ? new Set(seen) : new Set();
+    pathSeen.add(element);
+    return isElementVisible(element.parentElement, pathSeen);
+  }
 
   const className = element.className ? element.className.toString() : "";
   if (
@@ -490,10 +516,13 @@ function isElementVisible(element) {
   if (!style) return true;
   if (style.display === "contents") {
     // display:contents is not rendered itself, but its child nodes are.
+    const pathSeen = seen ? new Set(seen) : new Set();
+    pathSeen.add(element);
+    // pathSeen is shared across siblings; safe because each recursion copies it.
     for (let child = element.firstChild; child; child = child.nextSibling) {
       if (
         child.nodeType === 1 /* Node.ELEMENT_NODE */ &&
-        isElementVisible(child)
+        isElementVisible(child, pathSeen)
       )
         return true;
       if (child.nodeType === 3 /* Node.TEXT_NODE */ && isVisibleTextNode(child))
@@ -506,6 +535,16 @@ function isElementVisible(element) {
   if (rect.width <= 0 || rect.height <= 0) {
     // Check if this element might be visible on hover before marking as invisible
     if (isHoverOnlyElement(element)) {
+      return true;
+    }
+    // Icon buttons using ::before/::after pseudo-content may have zero rect
+    // when positioned outside their parent. Only bypass if cursor:pointer is own, not inherited.
+    if (
+      style.cursor === "pointer" &&
+      hasBeforeOrAfterPseudoContent(element) &&
+      (!element.parentElement ||
+        getElementComputedStyle(element.parentElement)?.cursor !== "pointer")
+    ) {
       return true;
     }
     return false;
@@ -802,7 +841,13 @@ function isDOMNodeRepresentDiv(element) {
 
 function isHoverPointerElement(element, hoverStylesMap) {
   const tagName = element.tagName.toLowerCase();
-  const elementClassName = element.className.toString();
+  // SVG className is an SVGAnimatedString; read .baseVal so class matching works
+  // for SVG targets (its toString() is "[object SVGAnimatedString]", not the classes).
+  const rawClassName = element.className;
+  const elementClassName =
+    typeof rawClassName === "string"
+      ? rawClassName
+      : (rawClassName?.baseVal ?? "");
   const elementCursor = getElementComputedStyle(element)?.cursor;
   if (elementCursor === "pointer") {
     return true;
@@ -1161,7 +1206,7 @@ const isDropdownButton = (element) => {
 
 const isSelect2Dropdown = (element) => {
   const tagName = element.tagName.toLowerCase();
-  const className = element.className.toString();
+  const className = element.className?.toString() ?? "";
   const role = element.getAttribute("role")
     ? element.getAttribute("role").toLowerCase()
     : "";
@@ -1180,14 +1225,14 @@ const isSelect2Dropdown = (element) => {
 const isSelect2MultiChoice = (element) => {
   return (
     element.tagName.toLowerCase() === "input" &&
-    element.className.toString().includes("select2-input")
+    (element.className?.toString() ?? "").includes("select2-input")
   );
 };
 
 const isReactSelectDropdown = (element) => {
   return (
     element.tagName.toLowerCase() === "input" &&
-    element.className.toString().includes("select__input") &&
+    (element.className?.toString() ?? "").includes("select__input") &&
     element.getAttribute("role") === "combobox"
   );
 };
@@ -1388,7 +1433,7 @@ const checkRequiredFromStyle = (element) => {
 };
 
 function checkDisabledFromStyle(element) {
-  const className = element.className.toString().toLowerCase();
+  const className = (element.className?.toString() ?? "").toLowerCase();
   if (className.includes("react-datepicker__day--disabled")) {
     return true;
   }
@@ -1424,29 +1469,28 @@ function getElementText(element) {
     return element.data.trim();
   }
 
-  const childNodes = element.childNodes;
-  const childNodesLength = childNodes.length;
-
-  // If no child nodes, return empty string directly
-  if (childNodesLength === 0) {
-    return "";
-  }
+  // Web components can render values as bare text nodes directly in an open
+  // shadow root; the Element walker only recurses shadow Element children, so
+  // fold those text nodes here. Direct children only — no <slot>, since
+  // slotted content lives in light DOM.
+  const sources = element.shadowRoot
+    ? [element.childNodes, element.shadowRoot.childNodes]
+    : [element.childNodes];
 
   const visibleText = [];
-  let hasText = false;
-
-  for (let i = 0; i < childNodesLength; i++) {
-    const node = childNodes[i];
-    if (node.nodeType === Node.TEXT_NODE) {
-      const nodeText = node.data.trim();
-      if (nodeText.length > 0) {
-        visibleText.push(nodeText);
-        hasText = true;
+  for (const childNodes of sources) {
+    for (let i = 0; i < childNodes.length; i++) {
+      const node = childNodes[i];
+      if (node.nodeType === Node.TEXT_NODE) {
+        const nodeText = node.data.trim();
+        if (nodeText.length > 0) {
+          visibleText.push(nodeText);
+        }
       }
     }
   }
 
-  return hasText ? visibleText.join(";") : "";
+  return visibleText.length > 0 ? visibleText.join(";") : "";
 }
 
 function getSelectOptions(element) {
@@ -1529,6 +1573,84 @@ async function uniqueId() {
   return result;
 }
 
+const ENRICHED_ELEMENT_TEXT_LIMIT = 120;
+
+function truncateEnrichedText(value) {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > ENRICHED_ELEMENT_TEXT_LIMIT
+    ? text.slice(0, ENRICHED_ELEMENT_TEXT_LIMIT) + "..."
+    : text;
+}
+
+function textFromElementIds(ids) {
+  if (!ids) {
+    return "";
+  }
+  return ids
+    .split(/\s+/)
+    .map((id) => {
+      const ref = document.getElementById(id);
+      return ref ? ref.innerText || ref.textContent || "" : "";
+    })
+    .join(" ");
+}
+
+function resolveErrorText(element) {
+  const errMsgId = element.getAttribute("aria-errormessage");
+  if (errMsgId) {
+    const text = truncateEnrichedText(textFromElementIds(errMsgId));
+    if (text) {
+      return text;
+    }
+  }
+  const describedBy = element.getAttribute("aria-describedby");
+  if (describedBy) {
+    return truncateEnrichedText(textFromElementIds(describedBy));
+  }
+  return "";
+}
+
+function enrichValidationState(attrs, element, elementTagNameLower) {
+  if (window.GlobalEnableEnrichedElementTree !== true) {
+    return;
+  }
+
+  if (attrs["aria-invalid"] !== undefined) {
+    const ariaInvalid = attrs["aria-invalid"];
+    if (
+      ariaInvalid === false ||
+      (typeof ariaInvalid === "string" && ariaInvalid.toLowerCase() === "false")
+    ) {
+      delete attrs["aria-invalid"];
+    } else if (
+      ariaInvalid === true ||
+      (typeof ariaInvalid === "string" &&
+        ["true", "grammar", "spelling"].includes(ariaInvalid.toLowerCase()))
+    ) {
+      attrs["aria-invalid"] = true;
+      attrs["invalid"] = true;
+    }
+  }
+
+  if (element.validity && element.validity.valid === false) {
+    attrs["invalid"] = true;
+    if (element.type !== "password") {
+      const validationMessage = truncateEnrichedText(element.validationMessage);
+      if (validationMessage) {
+        attrs["validationMessage"] = validationMessage;
+      }
+    }
+  }
+
+  const errorText = resolveErrorText(element);
+  if (errorText) {
+    attrs["errorText"] = errorText;
+  }
+}
+
 async function buildElementObject(
   frame,
   element,
@@ -1553,7 +1675,9 @@ async function buildElementObject(
         attr.name === "readonly" ||
         attr.name === "aria-readonly" ||
         attr.name === "disabled" ||
-        attr.name === "aria-disabled"
+        attr.name === "aria-disabled" ||
+        attr.name === "aria-invalid" ||
+        attr.name === "aria-expanded"
       ) {
         if (attrValue && attrValue.toLowerCase() === "false") {
           attrValue = false;
@@ -1636,6 +1760,8 @@ async function buildElementObject(
       attrs["value"] = element.value;
     }
   }
+
+  enrichValidationState(attrs, element, elementTagNameLower);
 
   let elementObj = {
     id: element_id,
@@ -2021,6 +2147,9 @@ async function buildElementTree(
   return [elements, resultArray];
 }
 
+// DEPRECATED: visual bounding box overlay is no longer rendered during scraping.
+// This helper is retained briefly for backwards compatibility and is scheduled
+// for removal; new call sites must not be added.
 function drawBoundingBoxes(elements) {
   // draw a red border around the elements
   DomUtils.clearVisibleClientRectCache();
@@ -2034,6 +2163,9 @@ function drawBoundingBoxes(elements) {
   DomUtils.clearVisibleClientRectCache();
 }
 
+// DEPRECATED: visual bounding box overlay is no longer rendered during scraping.
+// This helper is retained briefly for backwards compatibility and is scheduled
+// for removal; new call sites must not be added.
 async function buildElementsAndDrawBoundingBoxes(
   frame = "main.frame",
   frame_index = undefined,
@@ -2274,10 +2406,16 @@ function addHintMarkersToPage(hintMarkers) {
   document.documentElement.appendChild(parent);
 }
 
+// DEPRECATED: visual bounding box overlay is no longer rendered during scraping.
+// This helper is retained briefly for backwards compatibility and is scheduled
+// for removal; new call sites must not be added.
 function removeBoundingBoxes() {
   var hintMarkerContainer = document.querySelector("#boundingBoxContainer");
-  if (hintMarkerContainer) {
-    hintMarkerContainer.remove();
+  // Avoid Element.prototype.remove(): pages that polyfill it Prototype.js-style
+  // expect a static `remove(element)` signature and crash when called as
+  // `el.remove()` with no arg. removeChild is DOM 1 and never polyfilled.
+  if (hintMarkerContainer && hintMarkerContainer.parentNode) {
+    hintMarkerContainer.parentNode.removeChild(hintMarkerContainer);
   }
 }
 
@@ -2296,7 +2434,12 @@ async function safeScrollToTop(
   frame = "main.frame",
   frame_index = undefined,
 ) {
-  removeBoundingBoxes();
+  // The overlay path is deprecated. Skyvern only touches the marker container
+  // it has previously inserted; ``draw_boxes=false`` callers must not mutate
+  // the target page (e.g. an unrelated page-owned ``#boundingBoxContainer``).
+  if (draw_boxes) {
+    removeBoundingBoxes();
+  }
   safeWindowScroll(0, 0);
   if (draw_boxes) {
     await buildElementsAndDrawBoundingBoxes(frame, frame_index);
@@ -2325,9 +2468,12 @@ async function scrollToNextPage(
   frame_index = undefined,
   need_overlap = true,
 ) {
-  // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
-  // return true if there is a next page, false otherwise
-  removeBoundingBoxes();
+  // The overlay path is deprecated. Skyvern only touches the marker container
+  // it has previously inserted; ``draw_boxes=false`` callers must not mutate
+  // the target page (e.g. an unrelated page-owned ``#boundingBoxContainer``).
+  if (draw_boxes) {
+    removeBoundingBoxes();
+  }
   window.scrollBy({
     left: 0,
     top: need_overlap ? window.innerHeight - 200 : window.innerHeight,
@@ -2611,6 +2757,10 @@ if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
 
+if (window.globalParsedElementCounter === undefined) {
+  window.globalParsedElementCounter = new SafeCounter();
+}
+
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
   return (
@@ -2853,8 +3003,10 @@ async function stopGlobalIncrementalObserver() {
 async function getIncrementElements(wait_until_finished = true) {
   if (wait_until_finished) {
     while (
+      window.globalParsedElementCounter &&
+      window.globalOneTimeIncrementElements &&
       (await window.globalParsedElementCounter.get()) <
-      window.globalOneTimeIncrementElements.length
+        window.globalOneTimeIncrementElements.length
     ) {
       await asyncSleepFor(100);
     }

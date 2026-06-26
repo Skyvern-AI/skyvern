@@ -89,18 +89,33 @@ export function findBranchContextForInsertion(
         return undefined;
       }
 
+      // A conditional we are inserting INTO contributes its own active branch,
+      // not its membership in a parent conditional. A nested conditional node
+      // carries both: its conditionalNodeId/conditionalBranchId point at the
+      // outer conditional, while branchContextFromConditionalNode reads its own
+      // active branch. Check the container context first so the inner branch
+      // wins and the inserted block is not orphaned under the outer conditional
+      // (SKY-10460).
+      const treatAsContainer = includeStartingConditional || !isStartingNode;
+      if (treatAsContainer) {
+        const conditionalBranchContext = branchContextFromConditionalNode(node);
+        if (conditionalBranchContext) {
+          return conditionalBranchContext;
+        }
+      }
+
+      // A loop is a container boundary: its children carry no conditional
+      // metadata, so stepping into a loop must not inherit its branch
+      // membership, else the inserted block drops out of the loop scope (SKY-10719).
+      if (treatAsContainer && node.type === "loop") {
+        return undefined;
+      }
+
       const nodeBranchContext = branchContextFromNodeData(
         node.data as Partial<NodeBaseData> | undefined,
       );
       if (nodeBranchContext) {
         return nodeBranchContext;
-      }
-
-      const conditionalBranchContext =
-        (includeStartingConditional || !isStartingNode) &&
-        branchContextFromConditionalNode(node);
-      if (conditionalBranchContext) {
-        return conditionalBranchContext;
       }
 
       isStartingNode = false;

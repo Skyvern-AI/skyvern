@@ -26,6 +26,7 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _release_cdp_port
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -198,6 +199,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     def watch_session_pool(self) -> None:
         """No-op in OSS: browsers run in-process, no external pool to monitor."""
 
+    def can_probe_registered_browser_state(self) -> bool:
+        return True
+
     async def begin_session(
         self,
         *,
@@ -242,6 +246,31 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         return address
 
+    async def get_browser_address_if_ready(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        timeout: float = 0.0,
+        poll_interval: float = 0.25,
+    ) -> str | None:
+        browser_session = await self.database.browser_sessions.get_persistent_browser_session(
+            session_id, organization_id
+        )
+        if browser_session is None or is_final_status(browser_session.status):
+            return None
+        if browser_session.browser_address:
+            return browser_session.browser_address
+        if timeout <= 0:
+            return None
+        return await wait_on_persistent_browser_address(
+            self.database,
+            session_id,
+            organization_id,
+            timeout=max(1, int(timeout)),
+            poll_interval=poll_interval,
+        )
+
     async def get_session_by_runnable_id(
         self, runnable_id: str, organization_id: str
     ) -> PersistentBrowserSession | None:
@@ -279,6 +308,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
+        generate_browser_profile: bool = False,
+        wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         LOG.info(
@@ -294,6 +325,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             extensions=extensions,
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
+            generate_browser_profile=generate_browser_profile,
         )
 
         # Launch the browser immediately for standalone sessions so the
@@ -429,23 +461,70 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             # Export session profile before closing (so it can be used to create browser profiles)
             browser_artifacts = browser_session.browser_state.browser_artifacts
             if browser_artifacts and browser_artifacts.browser_session_dir:
+                # Snapshot session cookies before store_browser_profile copies the dir; the later
+                # close() persist runs after this export, too late to land in the archive. The
+                # snapshot stays unconditional even when the export is skipped so the sidecar is
+                # ready if the session opted in.
+                await persist_session_cookies(
+                    browser_session.browser_state.browser_context, browser_artifacts.browser_session_dir
+                )
+                # Re-read the persisted row so an update-while-alive opt-in toggle is honored.
+                # Isolated and fail-open: a lookup error must neither block the close cleanup below
+                # nor drop an opted-in / profile-reuse session's profile, so skip only on a confirmed
+                # opted-out row.
+                should_export = True
                 try:
-                    await app.STORAGE.store_browser_profile(
-                        organization_id=organization_id,
-                        profile_id=browser_session_id,
-                        directory=browser_artifacts.browser_session_dir,
+                    persisted_session = await self.database.browser_sessions.get_persistent_browser_session(
+                        browser_session_id, organization_id
                     )
-                    LOG.info(
-                        "Exported browser session profile",
-                        browser_session_id=browser_session_id,
-                        organization_id=organization_id,
-                    )
+                    should_export = persisted_session is None or persisted_session.should_export_profile()
                 except Exception:
-                    LOG.exception(
-                        "Failed to export browser session profile",
+                    LOG.warning(
+                        "Failed to read browser session opt-in flag; exporting profile to be safe",
+                        browser_session_id=browser_session_id,
+                        organization_id=organization_id,
+                        exc_info=True,
+                    )
+                if should_export:
+                    try:
+                        await app.STORAGE.store_browser_profile(
+                            organization_id=organization_id,
+                            profile_id=browser_session_id,
+                            directory=browser_artifacts.browser_session_dir,
+                        )
+                        LOG.info(
+                            "Exported browser session profile",
+                            browser_session_id=browser_session_id,
+                            organization_id=organization_id,
+                        )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to export browser session profile",
+                            browser_session_id=browser_session_id,
+                            organization_id=organization_id,
+                        )
+                else:
+                    LOG.info(
+                        "Skipping browser profile export; session did not opt into profile generation",
                         browser_session_id=browser_session_id,
                         organization_id=organization_id,
                     )
+
+            try:
+                await browser_session.browser_state.close()
+            except TargetClosedError:
+                LOG.info(
+                    "Browser context already closed",
+                    organization_id=organization_id,
+                    session_id=browser_session_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Error while closing browser session",
+                    organization_id=organization_id,
+                    session_id=browser_session_id,
+                    exc_info=True,
+                )
 
             if browser_artifacts and browser_artifacts.video_artifacts:
                 for video_artifact in browser_artifacts.video_artifacts:
@@ -473,22 +552,6 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             self._browser_sessions.pop(browser_session_id, None)
             if browser_session.cdp_port is not None:
                 _release_cdp_port(browser_session.cdp_port)
-
-            try:
-                await browser_session.browser_state.close()
-            except TargetClosedError:
-                LOG.info(
-                    "Browser context already closed",
-                    organization_id=organization_id,
-                    session_id=browser_session_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Error while closing browser session",
-                    organization_id=organization_id,
-                    session_id=browser_session_id,
-                    exc_info=True,
-                )
         else:
             LOG.info(
                 "Browser session not found in memory, marking as deleted in database",

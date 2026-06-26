@@ -87,3 +87,12 @@ def test_workflow_credential_inputs_unbound_branch_teaches_reply_framing() -> No
     assert "I applied your requested change. I couldn't test the modified workflow" in rendered
     assert "add them via the Credentials UI" in rendered
     assert 'data.skip_reason="workflow_credential_inputs_unbound"' in rendered
+
+
+def test_prompt_treats_conditional_zero_results_as_terminal_evidence() -> None:
+    rendered = _render_agent_prompt()
+
+    assert 'The user requested result handling conditionally (for example: "if any"' in rendered
+    assert "Treat the no-results path as a valid terminal workflow state" in rendered
+    assert "do not ask for a corrected value" in rendered
+    assert "Set `goal_reached: true` only if the workflow reached the searched/filtered state" in rendered

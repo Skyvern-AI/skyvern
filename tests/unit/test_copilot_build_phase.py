@@ -43,10 +43,16 @@ def _ti(mode: TurnIntentMode) -> TurnIntent:
         (TurnIntentMode.DIAGNOSE, "the run failed", "the run failed", "", BuildPhase.COMPOSING),
         (TurnIntentMode.CLARIFY, "anything", "anything", "", BuildPhase.COMPOSING),
         (TurnIntentMode.REFUSE, "anything", "anything", "", BuildPhase.COMPOSING),
-        # BUILD with URL in latest user_message -> COMPOSING.
+        # BUILD with a URL -> COMPOSING (entrypoint known; scout there, then author).
         (TurnIntentMode.BUILD, "go to https://example.com/login", "", "", BuildPhase.COMPOSING),
         # BUILD with URL only in rewritten agent message (request-policy continuation) -> COMPOSING.
-        (TurnIntentMode.BUILD, "and download it", "earlier: go to https://example.com/file", "", BuildPhase.COMPOSING),
+        (
+            TurnIntentMode.BUILD,
+            "and download it",
+            "earlier: go to https://example.com/file",
+            "",
+            BuildPhase.COMPOSING,
+        ),
         # BUILD with no URL anywhere -> INITIAL.
         (TurnIntentMode.BUILD, "go to example", "go to example", "", BuildPhase.INITIAL),
         # DRAFT_ONLY behaves like BUILD for phase init.
@@ -78,7 +84,9 @@ def test_initial_build_phase_returns_expected(
     assert initial_build_phase(_ti(mode), user_message, agent_message, workflow_yaml) == expected
 
 
-def test_initial_build_phase_yaml_goto_url_unlocks_composing() -> None:
+def test_initial_build_phase_lone_goto_url_enters_composing() -> None:
+    # A lone entrypoint goto_url carries a URL signal -> COMPOSING, where the agent
+    # scouts the page and authors (page-acting blocks stay evidence-gated).
     yaml_text = """
 title: T
 workflow_definition:
@@ -92,6 +100,42 @@ workflow_definition:
         initial_build_phase(_ti(TurnIntentMode.BUILD), "do that thing", "do that thing", yaml_text)
         == BuildPhase.COMPOSING
     )
+
+
+def test_initial_build_phase_existing_composition_stays_composing() -> None:
+    # A draft that already composes a page-acting block resolves to COMPOSING on a
+    # later "run it" / edit turn.
+    yaml_text = """
+title: T
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open
+      url: https://example.com/page
+    - block_type: navigation
+      label: act
+      navigation_goal: do the thing
+"""
+    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "run it", "run it", yaml_text) == BuildPhase.COMPOSING
+
+
+def test_initial_build_phase_goto_url_plus_action_is_composition() -> None:
+    # A goto_url + a no-url action turn resolves to COMPOSING, with block-runs and
+    # browser tools available.
+    yaml_text = """
+title: T
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open
+      url: https://example.com/page
+    - block_type: action
+      label: click_it
+      navigation_goal: click the button
+"""
+    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "run it", "run it", yaml_text) == BuildPhase.COMPOSING
 
 
 def test_initial_build_phase_yaml_with_empty_url_does_not_unlock() -> None:
@@ -233,6 +277,10 @@ def test_phase_sets_are_disjoint() -> None:
         ("update_workflow", BuildPhase.COMPOSING, False),
         ("update_and_run_blocks", BuildPhase.INITIAL, True),
         ("run_blocks_and_collect_debug", BuildPhase.DISCOVERING, True),
+        # COMPOSING: browser primitives AND block-runs are available so the agent
+        # scouts with the fast browser tools and validates with block-runs.
+        ("update_and_run_blocks", BuildPhase.COMPOSING, False),
+        ("run_blocks_and_collect_debug", BuildPhase.COMPOSING, False),
         # Unknown tool name -> no error.
         ("list_credentials", BuildPhase.INITIAL, False),
         ("list_credentials", BuildPhase.COMPOSING, False),
@@ -270,14 +318,14 @@ def test_phase_tool_error_returns_none_when_phase_attr_missing() -> None:
             BuildPhase.INITIAL,
             "build_phase_browser_blocked_pre_compose",
             "ask_user_clarifying",
-            frozenset(),
+            frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
         ),
         (
             "update_workflow",
             BuildPhase.INITIAL,
             "build_phase_mutation_blocked_pre_compose",
             "ask_user_clarifying",
-            frozenset(),
+            frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
         ),
     ],
 )

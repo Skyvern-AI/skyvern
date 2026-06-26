@@ -4,7 +4,8 @@ MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing comma
 
 Reply in the following JSON format:
 {
-    "thought": str, // A string to describe how you double-check the information to ensure the accuracy.
+{%- if slim_output not in ('safe', 'terse') %}
+    "thought": str, // A string to describe how you double-check the information to ensure the accuracy.{% endif %}
     "field": str, // Which field is this action intended to fill out?
     "is_required": bool, // True if this is a required field, otherwise false.
     "is_search_bar": bool, // True if the element to take the action is a search bar, otherwise false.

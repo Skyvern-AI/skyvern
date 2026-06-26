@@ -28,7 +28,7 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { ToastAction } from "@radix-ui/react-toast";
+import { ToastAction } from "@/components/ui/toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
@@ -162,10 +162,8 @@ function CreateNewTaskForm({ initialValues }: Props) {
           description:
             "You don't have enough credits to run this task. Go to billing to see your credit balance.",
           action: (
-            <ToastAction altText="Go to Billing">
-              <Button asChild>
-                <Link to="billing">Go to Billing</Link>
-              </Button>
+            <ToastAction altText="Go to Billing" asChild>
+              <Link to="billing">Go to Billing</Link>
             </ToastAction>
           ),
         });
@@ -183,10 +181,8 @@ function CreateNewTaskForm({ initialValues }: Props) {
         title: "Task Created",
         description: `${response.data.task_id} created successfully.`,
         action: (
-          <ToastAction altText="View">
-            <Button asChild>
-              <Link to={`/tasks/${response.data.task_id}`}>View</Link>
-            </Button>
+          <ToastAction altText="View" asChild>
+            <Link to={`/tasks/${response.data.task_id}`}>View</Link>
           </ToastAction>
         ),
       });

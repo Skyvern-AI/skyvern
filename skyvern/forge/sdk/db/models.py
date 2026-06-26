@@ -34,6 +34,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_browser_profile_id,
+    generate_credential_folder_id,
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
+    generate_tag_value_id,
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
@@ -61,6 +63,7 @@ from skyvern.forge.sdk.db.id import (
     generate_totp_code_id,
     generate_workflow_copilot_chat_id,
     generate_workflow_copilot_chat_message_id,
+    generate_workflow_copilot_completion_criteria_set_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -308,10 +311,13 @@ class WorkflowTagEventModel(Base):
     """Append-only event log for workflow tags.
 
     Every state change writes a new row. SET events carry value; DELETE
-    events have value=NULL and carry their own attribution. Supersession
-    sets superseded_at on the previously-current row so the partial unique
-    index keeps exactly one active SET per (org, wpid, key). superseded_at
-    means "no longer current but still historical fact"; deleted_at follows
+    events carry their own attribution (and a value only for standalone-label
+    deletes, which are identified by value). A tag is a label (value, always
+    present) with an optional group (key): grouped labels are identified by
+    key, standalone labels by value. Two partial unique indexes keep exactly
+    one active SET per (org, wpid, key) for grouped labels and per
+    (org, wpid, value) for standalone labels. superseded_at means "no longer
+    current but still historical fact"; deleted_at follows
     the same soft-delete convention as SoftDeleteMixin (via a manual column)
     and is separate.
 
@@ -342,14 +348,36 @@ class WorkflowTagEventModel(Base):
             postgresql_include=["workflow_permanent_id"],
             postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
         ),
-        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        # Powers the value-only ("filter by label") term, which matches a value
+        # across any/no group.
         Index(
-            "workflow_tag_events_active_set_unique",
+            "workflow_tag_events_org_value_active_idx",
+            "organization_id",
+            "value",
+            postgresql_include=["workflow_permanent_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        # One active SET per group (key) on a workflow = one-label-per-group.
+        Index(
+            "workflow_tag_events_active_grouped_unique",
             "organization_id",
             "workflow_permanent_id",
             "key",
             unique=True,
-            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+        ),
+        # A standalone label (no group) is identified by its value, so it gets
+        # its own one-active-SET-per-value uniqueness.
+        Index(
+            "workflow_tag_events_active_label_unique",
+            "organization_id",
+            "workflow_permanent_id",
+            "value",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
         ),
         CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
         CheckConstraint(
@@ -360,13 +388,16 @@ class WorkflowTagEventModel(Base):
             "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
             name="ck_workflow_tag_events_caller_type",
         ),
-        CheckConstraint("event_type != 'delete' OR value IS NULL", name="ck_workflow_tag_events_delete_null_value"),
+        # SET rows require a value; DELETE rows carry a value (standalone-label
+        # delete) or null (grouped delete, identified by key).
+        CheckConstraint("event_type != 'set' OR value IS NOT NULL", name="ck_workflow_tag_events_set_has_value"),
     )
 
     tag_event_id = Column(String, primary_key=True, default=generate_tag_event_id)
     workflow_permanent_id = Column(String, nullable=False)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
-    key = Column(String, nullable=False)
+    # Nullable: null = standalone label (group-less); non-null = grouped label.
+    key = Column(String, nullable=True)
     value = Column(String, nullable=True)
     event_type = Column(String, nullable=False)
     set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -398,6 +429,7 @@ class TagKeyModel(Base):
             "key",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
         ),
     )
 
@@ -405,6 +437,40 @@ class TagKeyModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class TagValueModel(Base):
+    """Org-scoped registry of the color for each grouped tag ``(key, value)``, auto-registered
+    on first SET (random palette unless supplied). Partial-UNIQUE on (org, key, value)
+    WHERE deleted_at IS NULL mirrors TagKeyModel; standalone labels (no key) are not colored."""
+
+    __tablename__ = "tag_values"
+    __table_args__ = (
+        Index(
+            "ix_tag_values_org_key_value_active",
+            "organization_id",
+            "key",
+            "value",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    tag_value_id = Column(String, primary_key=True, default=generate_tag_value_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(String, nullable=False)
+    color = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -448,6 +514,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     browser_profile_id = Column(String, nullable=True)
+    browser_profile_key = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
@@ -542,6 +609,13 @@ class WorkflowRunModel(Base):
             "modified_at",
             "created_at",
             postgresql_where=text("status IN ('created', 'queued', 'running', 'paused')"),
+        ),
+        Index(
+            "ix_workflow_runs_sequential_key_lookup",
+            "workflow_permanent_id",
+            "sequential_key",
+            "queued_at",
+            postgresql_where=text("status IN ('queued', 'running', 'paused') AND browser_session_id IS NULL"),
         ),
     )
 
@@ -999,6 +1073,10 @@ class WorkflowRunBlockModel(Base):
     # column on `WorkflowRunModel` but at block granularity.
     script_run = Column(JSON, nullable=True)
 
+    # Scalar mirror of output["downloaded_files"] length: the JSON output column is
+    # not CDC-mirrored, so download success would not otherwise be queryable.
+    downloaded_file_count = Column(Integer, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -1113,6 +1191,8 @@ class PersistentBrowserSessionModel(Base):
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
+    generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
@@ -1227,8 +1307,31 @@ class OrganizationBitwardenCollectionModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class CredentialFolderModel(Base):
+    __tablename__ = "credential_folders"
+    __table_args__ = (
+        Index("credential_folder_organization_id_idx", "organization_id"),
+        Index("credential_folder_organization_title_idx", "organization_id", "title"),
+    )
+
+    folder_id = Column(String, primary_key=True, default=generate_credential_folder_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class CredentialModel(Base):
     __tablename__ = "credentials"
+    __table_args__ = (Index("credential_folder_id_idx", "folder_id"),)
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
@@ -1247,6 +1350,7 @@ class CredentialModel(Base):
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
+    folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1407,6 +1511,7 @@ class ScriptBlockModel(Base):
 
 class WorkflowCopilotChatModel(Base):
     __tablename__ = "workflow_copilot_chats"
+    __table_args__ = (Index("wcc_org_created_at_index", "organization_id", "created_at"),)
 
     workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
     organization_id = Column(String, nullable=False)
@@ -1425,6 +1530,7 @@ class WorkflowCopilotChatModel(Base):
 
 class WorkflowCopilotChatMessageModel(Base):
     __tablename__ = "workflow_copilot_chat_messages"
+    __table_args__ = (Index("wccm_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
 
     workflow_copilot_chat_message_id = Column(
         String, primary_key=True, default=generate_workflow_copilot_chat_message_id
@@ -1433,8 +1539,40 @@ class WorkflowCopilotChatMessageModel(Base):
     organization_id = Column(String, nullable=False)
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
+    audio_artifact_id = Column(String, nullable=True)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
+    narrative_payload = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class WorkflowCopilotCompletionCriteriaSetModel(Base):
+    __tablename__ = "workflow_copilot_completion_criteria_sets"
+    __table_args__ = (Index("wcccs_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
+
+    completion_criteria_set_id = Column(
+        String, primary_key=True, default=generate_workflow_copilot_completion_criteria_set_id
+    )
+    organization_id = Column(String, nullable=False)
+    workflow_copilot_chat_id = Column(String, nullable=False)
+    goal_epoch = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    criteria = Column(JSON, nullable=False)
+    source_turn_id = Column(String, nullable=True)
+    source_goal_text = Column(UnicodeText, nullable=True)
+    consecutive_all_no_evidence = Column(Integer, nullable=False, default=0)
+    tripwire_fired = Column(Boolean, nullable=False, default=False)
+    last_fully_satisfied_workflow_yaml = Column(UnicodeText, nullable=True)
+    superseded_by_set_id = Column(String, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+    supersede_reason = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

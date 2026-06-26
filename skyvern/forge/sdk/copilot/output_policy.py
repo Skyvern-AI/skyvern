@@ -5,24 +5,51 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
 
+from skyvern.forge.sdk.copilot.blocker_signal import contains_internal_machinery_leak
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
 from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     looks_like_workflow_yaml_in_chat,
 )
-from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy, contains_email_password_pair
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    contains_email_password_pair,
+)
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_params,
     parse_workflow_yaml,
     url_origin,
     workflow_blocks,
+    workflow_credential_ids_from_parsed,
     workflow_credential_origins_from_parsed,
 )
 
 WORKFLOW_PRESENT_SENTINEL = object()
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
+# RHS of a secret-keyword assignment that references a bound value instead of carrying one:
+# a `parameters`-rooted lookup (quoted-key subscript / .get / attribute), or an attribute
+# chain ending in a credential field (`cred.password` / `await cred.otp()`), optionally wrapped in str(...).
+# `totp` remains allowed for backward compatibility with old synthesized code;
+# new Code-block OTP flows should use `await cred.otp()`.
+# Fully anchored — only closing punctuation may follow, so a literal appended to a
+# reference (`cred.password+"hunter2"`) or a dotted literal (a JWT) never passes.
+_SANCTIONED_SECRET_REFERENCE_RE = re.compile(
+    r"^(?:str\()?"
+    r"(?:parameters(?:\[(?:'[^']*'|\"[^\"]*\")\]|\.get\((?:'[^']*'|\"[^\"]*\")\)|(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.(?:username|password|totp)"
+    r"|(?:await\s+)?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.otp\(\))"
+    r"[)\]\},;.'\"]*$"
+)
+# The RHS can be a multi-token expression such as `await login_credentials.otp()`.
+# Callers pass the single line containing the match, so this is not expected to
+# consume across embedded newlines.
+_SECRET_ASSIGNMENT_RHS_RE = re.compile(r"[:=]\s*(.+)\s*$")
 _UNVALIDATED_PROPOSAL_AFFORDANCE_RE = re.compile(
     r"\baccept\b(?=[\s\S]{0,120}\bsav(?:e|ed|ing)\b)(?=[\s\S]{0,160}\b(?:reject|discard)\b)",
     re.IGNORECASE,
@@ -42,6 +69,10 @@ _INTERNAL_TOOL_INSTRUCTION_MARKERS = (
 )
 _INTERNAL_TOOL_RETRY_PHRASES = ("do not retry", "do not re-invoke")
 _INTERNAL_TOOL_RETRY_CONTEXT_MARKERS = (
+    "block running tool",
+    "block running tools",
+    "block-running tool",
+    "block-running tools",
     "get_run_results",
     "update_and_run_blocks",
     "tool call",
@@ -82,6 +113,57 @@ _INFORMATIONAL_TAXONOMY_TERM_THRESHOLD = 3
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _IDENTIFIER_DELIMITERS = frozenset({"`", '"', "'"})
 
+_INTERNAL_CLASSIFIER_VOCAB_PHRASES = ("turnintent classified this turn as",)
+_INTERNAL_CLASSIFIER_REASON_CODE_LABEL_RE = re.compile(r"\bsafe_reason_code\s*[:=]")
+_INTERNAL_CLASSIFIER_REASON_CODE_PREFIXES = (
+    "turn_intent_",
+    "request_policy_",
+    "build_phase_",
+)
+_INTERNAL_CLASSIFIER_DELIMITED_NAMES = frozenset({"turnintent", "requestpolicy"})
+
+_INTERNAL_TOOL_PARAPHRASE_PHRASES = ("nudge turn", "nudge-turn")
+_INTERNAL_COPILOT_SENTINEL_PREFIX = "[copilot:"
+_LOOP_DETECTED_MARKER = "loop detected"
+
+_SELF_PRESCRIPTIVE_FIXED_PHRASE = "send me a normal instruction like"
+_SELF_PRESCRIPTIVE_IMPERATIVE_VERBS = frozenset({"send", "reply", "type", "respond"})
+_SELF_PRESCRIPTIVE_POLITE_PREFIXES = frozenset({"please", "kindly", "just", "now"})
+# Apostrophes inside contractions (`you'd`, `I'll`, `won't`) are not quote openers;
+# treat the single-quote characters as exemplar openers only at word boundaries.
+_SELF_PRESCRIPTIVE_UNCONDITIONAL_QUOTES = frozenset('"“”')
+_SELF_PRESCRIPTIVE_BOUNDARY_QUOTES = frozenset("'‘’")
+_SELF_PRESCRIPTIVE_QUOTED_WINDOW = 60
+_SELF_PRESCRIPTIVE_CONTINUATION_WINDOW = 120
+_SELF_PRESCRIPTIVE_POSITION_TERMINATORS = frozenset({"\n", ";", ".", "!", "?"})
+_SELF_PRESCRIPTIVE_POSITION_COORDINATORS = (", ", "and ", "or ")
+# Continuation cues distinguish chat-direction prescription ("type X to continue", "send X
+# next and I'll keep going") from imperative docs prose ("type X in the field", "send X
+# as JSON"). The fixed phrase above still fires without a cue; this guard only applies
+# to the looser verb+quoted-exemplar heuristic.
+_SELF_PRESCRIPTIVE_CONTINUATION_RE = re.compile(
+    r"\b(?:"
+    r"next|then|instead|keep going"
+    r"|to (?:continue|proceed|stop|abort|cancel|resume|retry)"
+    r"|and (?:i|we|you)['‘’]ll"
+    r")\b",
+    re.IGNORECASE,
+)
+_OUTPUT_FIELD_CONFIRMATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:confirm|verify|approve|check|tell me|let me know)\b"
+    r"(?=[\s\S]{0,180}\b(?:output|record|schema|field|fields)\b)"
+    r"(?=[\s\S]{0,220}\b(?:field|fields|schema|record)\b)"
+    r"|\b(?:which|what)\s+fields\s+should\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Response types whose `user_response` is rendered verbatim as the agent's final
+# message — REPLY and REPLACE_WORKFLOW. ASK_QUESTION is excluded because legitimate
+# clarifications ("Reply 'yes' to proceed") would false-positive the residual detectors.
+_USER_VISIBLE_REPLY_TYPES: frozenset[str] = frozenset({"REPLY", "REPLACE_WORKFLOW"})
+
 
 @dataclass(frozen=True)
 class ResponseScaffoldingNormalization:
@@ -111,7 +193,10 @@ class OutputPolicyReason(StrEnum):
     INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
     INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
+    INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
+    SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
     WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
+    AVOIDABLE_OUTPUT_FIELD_CONFIRMATION = "avoidable_output_field_confirmation"
 
 
 @dataclass
@@ -144,6 +229,7 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
+        OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION,
     }
 )
 
@@ -256,6 +342,7 @@ def build_output_policy_diagnostics(
     return {
         "raw_output_kind": raw_verdict.output_kind.value,
         "final_output_kind": final_output_kind.value,
+        "raw_reason_codes": [reason.value for reason in raw_verdict.reason_codes],
         "hard_block_reason_codes": [reason.value for reason in hard_block_reason_codes],
         "soft_rewrite_reason_codes": [reason.value for reason in soft_rewrite_reason_codes],
         "raw_would_have_failed": raw_would_have_failed,
@@ -334,14 +421,27 @@ def evaluate_output_policy(
         and not _has_unvalidated_affordance(user_response)
     ):
         verdict.add(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
-    if _contains_internal_block_taxonomy_leak(user_response, output_kind):
+    if _contains_internal_block_taxonomy_leak(user_response, output_kind, response_type):
         verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+    if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_classifier_vocab_leak(user_response):
+        verdict.add(OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK)
+    if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_self_prescriptive_phrase(user_response):
+        verdict.add(OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK)
     if response_type in ("REPLY", "ASK_QUESTION") and looks_like_workflow_yaml_in_chat(user_response):
         verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
         if request_policy.user_response_policy == "ask_clarification" and response_type != "ASK_QUESTION":
             verdict.add(OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS)
+        if (
+            response_type == "ASK_QUESTION"
+            and request_policy.user_response_policy != "ask_clarification"
+            and _request_policy_has_present_completion_contract(request_policy)
+            and not has_workflow_proposal
+            and not workflow_attempted
+            and _asks_to_confirm_output_fields(user_response)
+        ):
+            verdict.add(OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION)
         _apply_credential_policy(verdict, request_policy, values, workflow_yaml)
 
     if output_kind == CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL and not workflow_was_persisted:
@@ -352,9 +452,26 @@ def evaluate_output_policy(
     return verdict
 
 
+def _request_policy_has_present_completion_contract(request_policy: RequestPolicy) -> bool:
+    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def _asks_to_confirm_output_fields(user_response: str | None) -> bool:
+    if not isinstance(user_response, str) or not user_response.strip():
+        return False
+    return bool(_OUTPUT_FIELD_CONFIRMATION_RE.search(user_response[:500]))
+
+
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
-    return f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
+    message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
+    if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
+        message += (
+            " For saved credentials, bind a credential_id workflow parameter and reference fields as "
+            "`<key>.username`, `<key>.password`, or `await <key>.otp()` for one-time codes; do not split, "
+            "concatenate, or obfuscate literal secrets in workflow code or YAML."
+        )
+    return message
 
 
 def _contains_raw_secret(value: Any) -> bool:
@@ -363,14 +480,38 @@ def _contains_raw_secret(value: Any) -> bool:
             return True
         for pattern in RAW_SECRET_PATTERNS:
             for match in pattern.finditer(text):
-                if not any(marker in match.group(0) for marker in _PLACEHOLDER_MARKERS):
-                    return True
+                matched = match.group(0)
+                if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
+                    continue
+                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and (
+                    _is_sanctioned_secret_reference(matched)
+                    or _is_sanctioned_secret_reference(_line_containing_match(text, match))
+                ):
+                    continue
+                return True
     return False
+
+
+def _line_containing_match(text: str, match: re.Match[str]) -> str:
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(text)
+    return text[line_start:line_end]
+
+
+def _is_sanctioned_secret_reference(matched: str) -> bool:
+    rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(matched)
+    if rhs_match is None:
+        return False
+    return bool(_SANCTIONED_SECRET_REFERENCE_RE.match(rhs_match.group(1)))
 
 
 def _contains_internal_tool_instruction(user_response: str | None) -> bool:
     if not isinstance(user_response, str):
         return False
+    if contains_internal_machinery_leak(user_response):
+        return True
     normalized = " ".join(user_response.lower().translate(_INTERNAL_TOOL_INSTRUCTION_TRANSLATION).split())
     if any(marker in normalized for marker in _INTERNAL_TOOL_INSTRUCTION_MARKERS):
         return True
@@ -409,15 +550,27 @@ def _has_unvalidated_affordance(user_response: str | None) -> bool:
 def _contains_internal_block_taxonomy_leak(
     user_response: str | None,
     output_kind: CopilotOutputKind,
+    response_type: str,
 ) -> bool:
     if not user_response:
         return False
     if _contains_deprecated_block_identifier(user_response):
         return True
+    if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response):
+        return True
     if output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER:
         return False
     taxonomy_terms = _internal_block_taxonomy_terms(user_response)
     return len(taxonomy_terms) >= _INFORMATIONAL_TAXONOMY_TERM_THRESHOLD
+
+
+def _contains_internal_tool_vocab_leak(user_response: str) -> bool:
+    lower = user_response.lower()
+    if _LOOP_DETECTED_MARKER in lower:
+        return True
+    if _INTERNAL_COPILOT_SENTINEL_PREFIX in lower:
+        return True
+    return any(phrase in lower for phrase in _INTERNAL_TOOL_PARAPHRASE_PHRASES)
 
 
 def _contains_deprecated_block_identifier(text: str) -> bool:
@@ -463,6 +616,110 @@ def _is_delimited_identifier(text: str, start: int, end: int) -> bool:
     return left == text[end] and left in _IDENTIFIER_DELIMITERS
 
 
+def _contains_internal_classifier_vocab_leak(user_response: str | None) -> bool:
+    if not isinstance(user_response, str) or not user_response:
+        return False
+    lower = user_response.lower()
+    if any(phrase in lower for phrase in _INTERNAL_CLASSIFIER_VOCAB_PHRASES):
+        return True
+    if _INTERNAL_CLASSIFIER_REASON_CODE_LABEL_RE.search(lower):
+        return True
+    for match in _IDENTIFIER_TOKEN_RE.finditer(user_response):
+        token = match.group(0)
+        lowered = token.lower()
+        if "_" in token and any(lowered.startswith(prefix) for prefix in _INTERNAL_CLASSIFIER_REASON_CODE_PREFIXES):
+            return True
+        # CamelCase classifier names are internal vocabulary even without backticks;
+        # the lowercase forms (`turn intent`, `request policy`) remain natural prose.
+        if token in {"TurnIntent", "RequestPolicy"}:
+            return True
+        if lowered in _INTERNAL_CLASSIFIER_DELIMITED_NAMES and _is_delimited_identifier(
+            user_response, match.start(), match.end()
+        ):
+            return True
+    return False
+
+
+def _contains_self_prescriptive_phrase(user_response: str | None) -> bool:
+    if not isinstance(user_response, str) or not user_response:
+        return False
+    lower = user_response.lower()
+    if _SELF_PRESCRIPTIVE_FIXED_PHRASE in lower:
+        return True
+    for match in _IDENTIFIER_TOKEN_RE.finditer(user_response):
+        verb = match.group(0).lower()
+        if verb not in _SELF_PRESCRIPTIVE_IMPERATIVE_VERBS:
+            continue
+        if not _is_imperative_position(user_response, match.start()):
+            continue
+        window_end = min(len(user_response), match.end() + _SELF_PRESCRIPTIVE_QUOTED_WINDOW)
+        if not _contains_quoted_exemplar(user_response, match.end(), window_end):
+            continue
+        cue_end = min(len(user_response), match.end() + _SELF_PRESCRIPTIVE_CONTINUATION_WINDOW)
+        if _SELF_PRESCRIPTIVE_CONTINUATION_RE.search(user_response, match.end(), cue_end):
+            return True
+    return False
+
+
+def _contains_quoted_exemplar(text: str, window_start: int, window_end: int) -> bool:
+    for index in range(window_start, window_end):
+        char = text[index]
+        if char in _SELF_PRESCRIPTIVE_UNCONDITIONAL_QUOTES:
+            return True
+        if char in _SELF_PRESCRIPTIVE_BOUNDARY_QUOTES and not _is_embedded_apostrophe(text, index):
+            return True
+    return False
+
+
+def _is_embedded_apostrophe(text: str, index: int) -> bool:
+    if index == 0:
+        return False
+    return text[index - 1].isalnum()
+
+
+def _is_imperative_position(text: str, verb_start: int) -> bool:
+    return _is_position_at_sentence_start(text, verb_start) or _is_position_after_polite_prefix(text, verb_start)
+
+
+def _is_position_at_sentence_start(text: str, index: int) -> bool:
+    if index == 0:
+        return True
+    # Walk past intra-clause whitespace (spaces, tabs, leading newlines) so terminators
+    # followed by whitespace still count as sentence boundaries.
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] in (" ", "\t"):
+        cursor -= 1
+    if cursor < 0:
+        return True
+    char = text[cursor]
+    if char in _SELF_PRESCRIPTIVE_POSITION_TERMINATORS:
+        return True
+    lower = text.lower()
+    for coordinator in _SELF_PRESCRIPTIVE_POSITION_COORDINATORS:
+        start = index - len(coordinator)
+        if start >= 0 and lower[start:index] == coordinator:
+            return True
+    return False
+
+
+def _is_position_after_polite_prefix(text: str, verb_start: int) -> bool:
+    if verb_start == 0:
+        return False
+    cursor = verb_start - 1
+    while cursor > 0 and text[cursor] == " ":
+        cursor -= 1
+    word_end = cursor + 1
+    word_start = word_end
+    while word_start > 0 and text[word_start - 1].isalpha():
+        word_start -= 1
+    if word_start == word_end:
+        return False
+    prefix = text[word_start:word_end].lower()
+    if prefix not in _SELF_PRESCRIPTIVE_POLITE_PREFIXES:
+        return False
+    return _is_position_at_sentence_start(text, word_start)
+
+
 def _apply_credential_policy(
     verdict: OutputPolicyVerdict,
     request_policy: RequestPolicy,
@@ -477,7 +734,10 @@ def _apply_credential_policy(
 
     approved_ids = _approved_credential_ids(request_policy)
     allowed_unresolved_ids = _allowed_unresolved_credential_ids(request_policy)
-    allowed_ids = approved_ids | allowed_unresolved_ids | _existing_workflow_credential_ids(request_policy)
+    bound_approved_ids = _bound_approved_credential_ids(request_policy, workflow_yaml)
+    allowed_ids = (
+        approved_ids | allowed_unresolved_ids | bound_approved_ids | _existing_workflow_credential_ids(request_policy)
+    )
     if any(credential_id not in allowed_ids for credential_id in found_ids):
         verdict.add(OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
 
@@ -497,6 +757,19 @@ def _approved_credential_ids(request_policy: RequestPolicy) -> set[str]:
         for credential in request_policy.resolved_credentials
         if isinstance(getattr(credential, "credential_id", None), str)
     }
+
+
+def _bound_approved_credential_ids(request_policy: RequestPolicy, workflow_yaml: str | None) -> set[str]:
+    # Requiring binding keeps a discovered ID leaked into a non-credential field
+    # caught by misbinding rather than approved here.
+    discovered = {credential.credential_id for credential in request_policy.discovered_credentials}
+    discovered = {cid for cid in discovered if cid.startswith("cred_")}
+    if not discovered or not workflow_yaml:
+        return set()
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return set()
+    return discovered & workflow_credential_ids_from_parsed(parsed)
 
 
 def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str]:
@@ -579,7 +852,7 @@ def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request
 
 def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]]:
     origins: dict[str, set[str]] = {}
-    for credential in request_policy.resolved_credentials:
+    for credential in [*request_policy.resolved_credentials, *request_policy.discovered_credentials]:
         credential_id = getattr(credential, "credential_id", None)
         tested_url = getattr(credential, "tested_url", None)
         if isinstance(credential_id, str) and isinstance(tested_url, str):

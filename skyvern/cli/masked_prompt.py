@@ -111,7 +111,7 @@ def _read_masked_tty_unix(output: TextIO, *, mask: str) -> str:
 
     input_file = sys.stdin
     fd = input_file.fileno()
-    old_settings = termios.tcgetattr(fd)
+    old_settings = termios.tcgetattr(fd)  # type: ignore[attr-defined]
     wrote_newline = False
 
     def write(text: str) -> None:
@@ -122,7 +122,7 @@ def _read_masked_tty_unix(output: TextIO, *, mask: str) -> str:
         output.flush()
 
     try:
-        tty.setcbreak(fd)
+        tty.setcbreak(fd)  # type: ignore[attr-defined]
         try:
             return _read_masked_line(lambda: input_file.read(1), write, mask=mask)
         except (EOFError, KeyboardInterrupt):
@@ -130,13 +130,13 @@ def _read_masked_tty_unix(output: TextIO, *, mask: str) -> str:
                 write("\n")
             raise
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[attr-defined]
 
 
 def _read_masked_tty_windows(output: TextIO, *, mask: str) -> str:
     import msvcrt
 
-    get_wide_char: Callable[[], str] = getattr(msvcrt, "getwch")
+    get_wide_char: Callable[[], str] = msvcrt.getwch  # type: ignore[attr-defined]
 
     def read_char() -> str:
         char = get_wide_char()

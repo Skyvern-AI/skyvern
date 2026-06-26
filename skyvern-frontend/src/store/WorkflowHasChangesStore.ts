@@ -181,8 +181,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         webhook_callback_url: saveData.settings.webhookCallbackUrl,
         persist_browser_session: saveData.settings.persistBrowserSession,
         browser_profile_id: saveData.settings.browserProfileId,
+        browser_profile_key: saveData.settings.browserProfileKey,
         model: saveData.settings.model,
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+        max_elapsed_time_minutes:
+          saveData.settings.maxElapsedTimeMinutes ?? null,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
         cdp_connect_headers: cdpConnectHeaders,

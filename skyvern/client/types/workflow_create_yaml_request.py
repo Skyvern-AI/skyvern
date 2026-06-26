@@ -19,11 +19,15 @@ class WorkflowCreateYamlRequest(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     persist_browser_session: typing.Optional[bool] = None
+    browser_profile_id: typing.Optional[str] = None
+    browser_profile_key: typing.Optional[str] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     workflow_definition: WorkflowDefinitionYaml
     is_saved_task: typing.Optional[bool] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    max_elapsed_time_minutes: typing.Optional[int] = None
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     status: typing.Optional[WorkflowStatus] = None
     run_with: typing.Optional[str] = None
     ai_fallback: typing.Optional[bool] = None
@@ -46,5 +50,6 @@ class WorkflowCreateYamlRequest(UniversalBaseModel):
 
 
 from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
+from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
 
 update_forward_refs(WorkflowCreateYamlRequest)

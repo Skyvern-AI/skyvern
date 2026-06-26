@@ -14,6 +14,32 @@
   @apply bg-slate-elevation3;
 }
 
+@keyframes skBlockHighlightFlash {
+  0%,
+  60% {
+    box-shadow:
+      0 0 0 2px var(--skyvern-gold, #facc15),
+      0 0 24px rgba(234, 179, 8, 0.45);
+  }
+  100% {
+    box-shadow: none;
+  }
+}
+
+/* Class set by Workspace's onBlockSelect (COPILOT_BLOCK_HIGHLIGHT_CLASS).
+   Deliberately not `.selected` — that flag also tracks the editor's sidebar
+   selection, so keying off it flashed on every normal node click. */
+.react-flow__node.sk-copilot-block-highlight
+  > div
+  > .rounded-lg.transition-shadow,
+.react-flow__node.sk-copilot-block-highlight
+  > div
+  > div
+  > .rounded-lg.transition-shadow {
+  animation: skBlockHighlightFlash 1.4s ease-out forwards;
+  border-radius: 8px;
+}
+
 /* Smooth transitions for node position and size changes */
 .react-flow__node {
   transition: transform 0.2s ease-out;

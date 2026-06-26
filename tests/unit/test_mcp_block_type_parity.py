@@ -96,18 +96,11 @@ class BlockDriftEntry:
 # runbook to resync, then remove the entry here.
 _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
     BlockDriftEntry(
-        block_type="google_sheets_read",
-        ticket="SKY-9227",
-        owner="@wintonzheng",
-        added_at=date(2026, 4, 23),
-        notes="Clears with `google_sheets_write` at the next Fern SDK regeneration.",
-    ),
-    BlockDriftEntry(
-        block_type="google_sheets_write",
-        ticket="SKY-9227",
-        owner="@wintonzheng",
-        added_at=date(2026, 4, 23),
-        notes="Clears with `google_sheets_read` at the next Fern SDK regeneration.",
+        block_type="pdf_fill",
+        ticket="SKY-10944",
+        owner="@suchintan",
+        added_at=date(2026, 6, 11),
+        notes="Fern SDK regen happens via CI post-deploy",
     ),
 )
 

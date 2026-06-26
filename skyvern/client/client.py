@@ -14,6 +14,8 @@ from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
+from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
+from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
@@ -29,20 +31,21 @@ from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.run_status import RunStatus
+from .types.run_webhook_replay_response import RunWebhookReplayResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
-from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
+from .types.skyvern_schemas_credential_type_credential_type import SkyvernSchemasCredentialTypeCredentialType
 from .types.task_run_list_item import TaskRunListItem
-from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
-from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
+from .types.task_run_request_input_data_extraction_schema import TaskRunRequestInputDataExtractionSchema
+from .types.task_run_request_input_proxy_location import TaskRunRequestInputProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
 from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run import WorkflowRun
-from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
+from .types.workflow_run_request_input_proxy_location import WorkflowRunRequestInputProxyLocation
 from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_status import WorkflowRunStatus
 from .types.workflow_run_timeline import WorkflowRunTimeline
@@ -52,6 +55,8 @@ if typing.TYPE_CHECKING:
     from .artifacts.client import ArtifactsClient, AsyncArtifactsClient
     from .schedules.client import AsyncSchedulesClient, SchedulesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
+    from .server.client import AsyncServerClient, ServerClient
+    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -123,6 +128,8 @@ class Skyvern:
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[ArtifactsClient] = None
+        self._server: typing.Optional[ServerClient] = None
+        self._workflows: typing.Optional[WorkflowsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
         self._schedules: typing.Optional[SchedulesClient] = None
 
@@ -145,8 +152,8 @@ class Skyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
-        data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestInputProxyLocation] = OMIT,
+        data_extraction_schema: typing.Optional[TaskRunRequestInputDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
@@ -155,6 +162,7 @@ class Skyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
@@ -184,7 +192,7 @@ class Skyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -200,6 +208,7 @@ class Skyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -216,9 +225,11 @@ class Skyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
-        data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
+        data_extraction_schema : typing.Optional[TaskRunRequestInputDataExtractionSchema]
 
             The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
 
@@ -252,6 +263,9 @@ class Skyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
 
         publish_workflow : typing.Optional[bool]
             Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
@@ -304,6 +318,7 @@ class Skyvern:
             browser_session_id=browser_session_id,
             model=model,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             publish_workflow=publish_workflow,
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
@@ -322,7 +337,7 @@ class Skyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestInputProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -331,10 +346,11 @@ class Skyvern:
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
         run_with: typing.Optional[str] = OMIT,
-        run_metadata: typing.Optional[typing.Dict[str, str]] = OMIT,
+        run_metadata: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -357,7 +373,7 @@ class Skyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -373,6 +389,7 @@ class Skyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -389,6 +406,8 @@ class Skyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
@@ -412,10 +431,13 @@ class Skyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
 
         browser_address : typing.Optional[str]
             The CDP address for the workflow run.
@@ -426,7 +448,7 @@ class Skyvern:
         run_with : typing.Optional[str]
             Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
-        run_metadata : typing.Optional[typing.Dict[str, str]]
+        run_metadata : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             String key/value metadata to attach to this workflow run for analytics tag filtering.
 
         request_options : typing.Optional[RequestOptions]
@@ -467,57 +489,11 @@ class Skyvern:
             max_screenshot_scrolls=max_screenshot_scrolls,
             max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
             run_metadata=run_metadata,
-            request_options=request_options,
-        )
-        return _response.data
-
-    def retry_workflow_run(
-        self,
-        workflow_run_id: str,
-        *,
-        max_steps_override: typing.Optional[int] = None,
-        user_agent: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunResponse:
-        """
-        Retry a workflow run using the original run parameters.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            The id of the workflow run to retry.
-
-        max_steps_override : typing.Optional[int]
-
-        user_agent : typing.Optional[str]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        WorkflowRunResponse
-            Successfully retried workflow run
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.retry_workflow_run(
-            workflow_run_id="wr_123",
-        )
-        """
-        _response = self._raw_client.retry_workflow_run(
-            workflow_run_id,
-            max_steps_override=max_steps_override,
-            user_agent=user_agent,
             request_options=request_options,
         )
         return _response.data
@@ -584,6 +560,39 @@ class Skyvern:
         )
         """
         _response = self._raw_client.cancel_run(run_id, request_options=request_options)
+        return _response.data
+
+    def bulk_cancel_runs(
+        self, *, run_ids: typing.Sequence[str], request_options: typing.Optional[RequestOptions] = None
+    ) -> BulkCancelRunsResponse:
+        """
+        Cancel multiple runs (tasks or workflows) in a single request
+
+        Parameters
+        ----------
+        run_ids : typing.Sequence[str]
+            List of run IDs to cancel
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BulkCancelRunsResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.bulk_cancel_runs(
+            run_ids=["run_ids"],
+        )
+        """
+        _response = self._raw_client.bulk_cancel_runs(run_ids=run_ids, request_options=request_options)
         return _response.data
 
     def get_workflows(
@@ -1108,7 +1117,7 @@ class Skyvern:
         *,
         request: typing.Optional[RetryRunWebhookRequest] = None,
         request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.Optional[typing.Any]:
+    ) -> RunWebhookReplayResponse:
         """
         Retry sending the webhook for a run
 
@@ -1124,7 +1133,7 @@ class Skyvern:
 
         Returns
         -------
-        typing.Optional[typing.Any]
+        RunWebhookReplayResponse
             Successful Response
 
         Examples
@@ -1173,6 +1182,55 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successfully retried workflow run
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.retry_workflow_run(
+            workflow_run_id="wr_123",
+            max_steps_override=1,
+            user_agent="x-user-agent",
+        )
+        """
+        _response = self._raw_client.retry_workflow_run(
+            workflow_run_id,
+            max_steps_override=max_steps_override,
+            user_agent=user_agent,
+            request_options=request_options,
+        )
         return _response.data
 
     def get_runs_v2(
@@ -1325,10 +1383,19 @@ class Skyvern:
         """
         List runs for a specific workflow.
 
+        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+        ### search_key
+
+        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+        ### error_code
+
+        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
         Parameters
         ----------
         workflow_id : str
-            Workflow permanent ID. Workflow ID starts with `wpid_`.
 
         page : typing.Optional[int]
             Page number for pagination.
@@ -1340,10 +1407,10 @@ class Skyvern:
             Filter by one or more run statuses.
 
         search_key : typing.Optional[str]
-            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
 
         error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array.
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1352,6 +1419,21 @@ class Skyvern:
         -------
         typing.List[WorkflowRun]
             Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_runs_by_id(
+            workflow_id="workflow_id",
+            page=1,
+            page_size=1,
+            search_key="search_key",
+            error_code="error_code",
+        )
         """
         _response = self._raw_client.get_workflow_runs_by_id(
             workflow_id,
@@ -1477,15 +1559,28 @@ class Skyvern:
         return _response.data
 
     def list_browser_profiles(
-        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        include_deleted: typing.Optional[bool] = None,
+        search_key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[BrowserProfile]:
         """
         Get all browser profiles for the organization
 
         Parameters
         ----------
+        page : typing.Optional[int]
+
+        page_size : typing.Optional[int]
+
         include_deleted : typing.Optional[bool]
             Include deleted browser profiles
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1503,11 +1598,18 @@ class Skyvern:
             api_key="YOUR_API_KEY",
         )
         client.list_browser_profiles(
+            page=1,
+            page_size=1,
             include_deleted=True,
+            search_key="search_key",
         )
         """
         _response = self._raw_client.list_browser_profiles(
-            include_deleted=include_deleted, request_options=request_options
+            page=page,
+            page_size=page_size,
+            include_deleted=include_deleted,
+            search_key=search_key,
+            request_options=request_options,
         )
         return _response.data
 
@@ -1521,7 +1623,7 @@ class Skyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -1532,10 +1634,10 @@ class Skyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1630,6 +1732,52 @@ class Skyvern:
         _response = self._raw_client.delete_browser_profile(profile_id, request_options=request_options)
         return _response.data
 
+    def update_browser_profile(
+        self,
+        profile_id: str,
+        *,
+        name: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserProfile:
+        """
+        Update a browser profile's name and/or description
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to update. browser_profile_id starts with `bp_`
+
+        name : typing.Optional[str]
+            New name for the browser profile
+
+        description : typing.Optional[str]
+            New description for the browser profile
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserProfile
+            Successfully updated browser profile
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_browser_profile(
+            profile_id="bp_123456",
+        )
+        """
+        _response = self._raw_client.update_browser_profile(
+            profile_id, name=name, description=description, request_options=request_options
+        )
+        return _response.data
+
     def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.List[BrowserSessionResponse]:
@@ -1662,7 +1810,7 @@ class Skyvern:
         self,
         *,
         timeout: typing.Optional[int] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -1676,7 +1824,7 @@ class Skyvern:
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -1692,6 +1840,7 @@ class Skyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -1708,6 +1857,9 @@ class Skyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
@@ -2124,7 +2276,8 @@ class Skyvern:
     def login(
         self,
         *,
-        credential_type: SkyvernSchemasRunBlocksCredentialType,
+        credential_type: SkyvernSchemasCredentialTypeCredentialType,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -2134,6 +2287,7 @@ class Skyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
@@ -2152,8 +2306,10 @@ class Skyvern:
 
         Parameters
         ----------
-        credential_type : SkyvernSchemasRunBlocksCredentialType
+        credential_type : SkyvernSchemasCredentialTypeCredentialType
             Where to get the credential from
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -2181,6 +2337,9 @@ class Skyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -2231,11 +2390,13 @@ class Skyvern:
             api_key="YOUR_API_KEY",
         )
         client.login(
+            user_agent="x-user-agent",
             credential_type="skyvern",
         )
         """
         _response = self._raw_client.login(
             credential_type=credential_type,
+            user_agent=user_agent,
             url=url,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
@@ -2245,6 +2406,7 @@ class Skyvern:
             browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             prompt=prompt,
             credential_id=credential_id,
@@ -2264,6 +2426,7 @@ class Skyvern:
         self,
         *,
         navigation_goal: str,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -2273,6 +2436,7 @@ class Skyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
@@ -2286,6 +2450,8 @@ class Skyvern:
         ----------
         navigation_goal : str
             Instructions for navigating to and downloading the file
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -2313,6 +2479,9 @@ class Skyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -2342,11 +2511,13 @@ class Skyvern:
             api_key="YOUR_API_KEY",
         )
         client.download_files(
+            user_agent="x-user-agent",
             navigation_goal="navigation_goal",
         )
         """
         _response = self._raw_client.download_files(
             navigation_goal=navigation_goal,
+            user_agent=user_agent,
             url=url,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
@@ -2356,6 +2527,7 @@ class Skyvern:
             browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             download_suffix=download_suffix,
             download_timeout=download_timeout,
@@ -2595,6 +2767,22 @@ class Skyvern:
         return self._artifacts
 
     @property
+    def server(self):
+        if self._server is None:
+            from .server.client import ServerClient  # noqa: E402
+
+            self._server = ServerClient(client_wrapper=self._client_wrapper)
+        return self._server
+
+    @property
+    def workflows(self):
+        if self._workflows is None:
+            from .workflows.client import WorkflowsClient  # noqa: E402
+
+            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
+        return self._workflows
+
+    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -2678,6 +2866,8 @@ class AsyncSkyvern:
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[AsyncArtifactsClient] = None
+        self._server: typing.Optional[AsyncServerClient] = None
+        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
         self._schedules: typing.Optional[AsyncSchedulesClient] = None
 
@@ -2700,8 +2890,8 @@ class AsyncSkyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
-        data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestInputProxyLocation] = OMIT,
+        data_extraction_schema: typing.Optional[TaskRunRequestInputDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
@@ -2710,6 +2900,7 @@ class AsyncSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
@@ -2739,7 +2930,7 @@ class AsyncSkyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -2755,6 +2946,7 @@ class AsyncSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -2771,9 +2963,11 @@ class AsyncSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
-        data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
+        data_extraction_schema : typing.Optional[TaskRunRequestInputDataExtractionSchema]
 
             The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
 
@@ -2807,6 +3001,9 @@ class AsyncSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
 
         publish_workflow : typing.Optional[bool]
             Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
@@ -2867,6 +3064,7 @@ class AsyncSkyvern:
             browser_session_id=browser_session_id,
             model=model,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             publish_workflow=publish_workflow,
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
@@ -2885,7 +3083,7 @@ class AsyncSkyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestInputProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -2894,10 +3092,11 @@ class AsyncSkyvern:
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
         run_with: typing.Optional[str] = OMIT,
-        run_metadata: typing.Optional[typing.Dict[str, str]] = OMIT,
+        run_metadata: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -2920,7 +3119,7 @@ class AsyncSkyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -2936,6 +3135,7 @@ class AsyncSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -2952,6 +3152,8 @@ class AsyncSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
@@ -2975,10 +3177,13 @@ class AsyncSkyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
 
         browser_address : typing.Optional[str]
             The CDP address for the workflow run.
@@ -2989,7 +3194,7 @@ class AsyncSkyvern:
         run_with : typing.Optional[str]
             Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
-        run_metadata : typing.Optional[typing.Dict[str, str]]
+        run_metadata : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             String key/value metadata to attach to this workflow run for analytics tag filtering.
 
         request_options : typing.Optional[RequestOptions]
@@ -3038,65 +3243,11 @@ class AsyncSkyvern:
             max_screenshot_scrolls=max_screenshot_scrolls,
             max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
             run_metadata=run_metadata,
-            request_options=request_options,
-        )
-        return _response.data
-
-    async def retry_workflow_run(
-        self,
-        workflow_run_id: str,
-        *,
-        max_steps_override: typing.Optional[int] = None,
-        user_agent: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunResponse:
-        """
-        Retry a workflow run using the original run parameters.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            The id of the workflow run to retry.
-
-        max_steps_override : typing.Optional[int]
-
-        user_agent : typing.Optional[str]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        WorkflowRunResponse
-            Successfully retried workflow run
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.retry_workflow_run(
-                workflow_run_id="wr_123",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.retry_workflow_run(
-            workflow_run_id,
-            max_steps_override=max_steps_override,
-            user_agent=user_agent,
             request_options=request_options,
         )
         return _response.data
@@ -3179,6 +3330,47 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.cancel_run(run_id, request_options=request_options)
+        return _response.data
+
+    async def bulk_cancel_runs(
+        self, *, run_ids: typing.Sequence[str], request_options: typing.Optional[RequestOptions] = None
+    ) -> BulkCancelRunsResponse:
+        """
+        Cancel multiple runs (tasks or workflows) in a single request
+
+        Parameters
+        ----------
+        run_ids : typing.Sequence[str]
+            List of run IDs to cancel
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BulkCancelRunsResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.bulk_cancel_runs(
+                run_ids=["run_ids"],
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.bulk_cancel_runs(run_ids=run_ids, request_options=request_options)
         return _response.data
 
     async def get_workflows(
@@ -3791,7 +3983,7 @@ class AsyncSkyvern:
         *,
         request: typing.Optional[RetryRunWebhookRequest] = None,
         request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.Optional[typing.Any]:
+    ) -> RunWebhookReplayResponse:
         """
         Retry sending the webhook for a run
 
@@ -3807,7 +3999,7 @@ class AsyncSkyvern:
 
         Returns
         -------
-        typing.Optional[typing.Any]
+        RunWebhookReplayResponse
             Successful Response
 
         Examples
@@ -3872,6 +4064,63 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
+        return _response.data
+
+    async def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successfully retried workflow run
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.retry_workflow_run(
+                workflow_run_id="wr_123",
+                max_steps_override=1,
+                user_agent="x-user-agent",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.retry_workflow_run(
+            workflow_run_id,
+            max_steps_override=max_steps_override,
+            user_agent=user_agent,
+            request_options=request_options,
+        )
         return _response.data
 
     async def get_runs_v2(
@@ -4040,10 +4289,19 @@ class AsyncSkyvern:
         """
         List runs for a specific workflow.
 
+        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+        ### search_key
+
+        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+        ### error_code
+
+        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
         Parameters
         ----------
         workflow_id : str
-            Workflow permanent ID. Workflow ID starts with `wpid_`.
 
         page : typing.Optional[int]
             Page number for pagination.
@@ -4055,10 +4313,10 @@ class AsyncSkyvern:
             Filter by one or more run statuses.
 
         search_key : typing.Optional[str]
-            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
 
         error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array.
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4067,6 +4325,29 @@ class AsyncSkyvern:
         -------
         typing.List[WorkflowRun]
             Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_runs_by_id(
+                workflow_id="workflow_id",
+                page=1,
+                page_size=1,
+                search_key="search_key",
+                error_code="error_code",
+            )
+
+
+        asyncio.run(main())
         """
         _response = await self._raw_client.get_workflow_runs_by_id(
             workflow_id,
@@ -4218,15 +4499,28 @@ class AsyncSkyvern:
         return _response.data
 
     async def list_browser_profiles(
-        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        include_deleted: typing.Optional[bool] = None,
+        search_key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[BrowserProfile]:
         """
         Get all browser profiles for the organization
 
         Parameters
         ----------
+        page : typing.Optional[int]
+
+        page_size : typing.Optional[int]
+
         include_deleted : typing.Optional[bool]
             Include deleted browser profiles
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4249,14 +4543,21 @@ class AsyncSkyvern:
 
         async def main() -> None:
             await client.list_browser_profiles(
+                page=1,
+                page_size=1,
                 include_deleted=True,
+                search_key="search_key",
             )
 
 
         asyncio.run(main())
         """
         _response = await self._raw_client.list_browser_profiles(
-            include_deleted=include_deleted, request_options=request_options
+            page=page,
+            page_size=page_size,
+            include_deleted=include_deleted,
+            search_key=search_key,
+            request_options=request_options,
         )
         return _response.data
 
@@ -4270,7 +4571,7 @@ class AsyncSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -4281,10 +4582,10 @@ class AsyncSkyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4403,6 +4704,60 @@ class AsyncSkyvern:
         _response = await self._raw_client.delete_browser_profile(profile_id, request_options=request_options)
         return _response.data
 
+    async def update_browser_profile(
+        self,
+        profile_id: str,
+        *,
+        name: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserProfile:
+        """
+        Update a browser profile's name and/or description
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to update. browser_profile_id starts with `bp_`
+
+        name : typing.Optional[str]
+            New name for the browser profile
+
+        description : typing.Optional[str]
+            New description for the browser profile
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserProfile
+            Successfully updated browser profile
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_browser_profile(
+                profile_id="bp_123456",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_browser_profile(
+            profile_id, name=name, description=description, request_options=request_options
+        )
+        return _response.data
+
     async def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.List[BrowserSessionResponse]:
@@ -4443,7 +4798,7 @@ class AsyncSkyvern:
         self,
         *,
         timeout: typing.Optional[int] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -4457,7 +4812,7 @@ class AsyncSkyvern:
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -4473,6 +4828,7 @@ class AsyncSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -4489,6 +4845,9 @@ class AsyncSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
@@ -4979,7 +5338,8 @@ class AsyncSkyvern:
     async def login(
         self,
         *,
-        credential_type: SkyvernSchemasRunBlocksCredentialType,
+        credential_type: SkyvernSchemasCredentialTypeCredentialType,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -4989,6 +5349,7 @@ class AsyncSkyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
@@ -5007,8 +5368,10 @@ class AsyncSkyvern:
 
         Parameters
         ----------
-        credential_type : SkyvernSchemasRunBlocksCredentialType
+        credential_type : SkyvernSchemasCredentialTypeCredentialType
             Where to get the credential from
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -5036,6 +5399,9 @@ class AsyncSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -5091,6 +5457,7 @@ class AsyncSkyvern:
 
         async def main() -> None:
             await client.login(
+                user_agent="x-user-agent",
                 credential_type="skyvern",
             )
 
@@ -5099,6 +5466,7 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.login(
             credential_type=credential_type,
+            user_agent=user_agent,
             url=url,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
@@ -5108,6 +5476,7 @@ class AsyncSkyvern:
             browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             prompt=prompt,
             credential_id=credential_id,
@@ -5127,6 +5496,7 @@ class AsyncSkyvern:
         self,
         *,
         navigation_goal: str,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -5136,6 +5506,7 @@ class AsyncSkyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
@@ -5149,6 +5520,8 @@ class AsyncSkyvern:
         ----------
         navigation_goal : str
             Instructions for navigating to and downloading the file
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -5176,6 +5549,9 @@ class AsyncSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -5210,6 +5586,7 @@ class AsyncSkyvern:
 
         async def main() -> None:
             await client.download_files(
+                user_agent="x-user-agent",
                 navigation_goal="navigation_goal",
             )
 
@@ -5218,6 +5595,7 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.download_files(
             navigation_goal=navigation_goal,
+            user_agent=user_agent,
             url=url,
             webhook_url=webhook_url,
             proxy_location=proxy_location,
@@ -5227,6 +5605,7 @@ class AsyncSkyvern:
             browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             download_suffix=download_suffix,
             download_timeout=download_timeout,
@@ -5504,6 +5883,22 @@ class AsyncSkyvern:
 
             self._artifacts = AsyncArtifactsClient(client_wrapper=self._client_wrapper)
         return self._artifacts
+
+    @property
+    def server(self):
+        if self._server is None:
+            from .server.client import AsyncServerClient  # noqa: E402
+
+            self._server = AsyncServerClient(client_wrapper=self._client_wrapper)
+        return self._server
+
+    @property
+    def workflows(self):
+        if self._workflows is None:
+            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
+
+            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
+        return self._workflows
 
     @property
     def scripts(self):

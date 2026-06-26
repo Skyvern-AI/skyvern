@@ -98,6 +98,22 @@ Important Rules:
 - Set next_block_label to null to mark the end of a flow
 - continue_on_failure allows graceful error handling
 
+** CHOOSING A BLOCK (use the most specific block that fits the step) **
+
+The interaction blocks differ by how specifically you describe the step — from a general goal down to a single named action:
+
+- navigation — the general, goal-level block. State the outcome you want as a navigation_goal (e.g. "search for {{ query }} and open the first result") and the agent works out and performs the actions to get there. Use it when the step is best expressed as where you want to end up, stated as intent — never as a click-by-click script.
+- action — one specific UI action you name directly: a single click, type, or select on the current page (e.g. "click the Add to Cart button"). If you can name the exact action, prefer action over navigation.
+- login — authentication. Handles stored credentials and 2FA/TOTP. Whenever the step is logging in, this is the right block; do NOT hand-build a navigation login or avoid login to save steps. When the active block authoring policy makes the login block unavailable, bind the saved credential as a credential_id workflow parameter on the replacement block instead — never inline secret values.
+- file_download — the step's purpose is to download a file (detects when the download completes).
+- extraction — capturing structured data, validated against data_schema.
+
+For non-interaction steps, use the purpose-built block directly: goto_url (load a known URL), wait, conditional, for_loop/while_loop, http_request, file_url_parser, file_upload, send_email, text_prompt.
+
+Rule of thumb: if you can name the exact action or purpose, use the specific block; fall back to navigation only when the step is genuinely a goal the agent must work out itself. The specific block also carries the right semantics (login handles 2FA, file_download detects completion, extraction enforces a schema) and runs tighter — a loose navigation_goal re-runs the full browser agent (scrape -> plan -> act) for every step it takes, so it is the block most likely to exhaust the per-tool-call run budget on a heavy page.
+
+goto_url vs reaching a page by action: a goto_url replaces a navigation step whose only job was to reach a page you can already name — but only for a stable, reusable URL. Never freeze a session-bound search-results, filter, or cart URL into a goto_url entrypoint; it can encode session-only state and will not replay. Reach those pages via the action that produces them.
+
 ** NAVIGATION BLOCK (navigation) **
 
 Purpose: Take actions on a page to achieve a focused goal — fill a form, click through a multi-step flow, prepare the page before an extraction.

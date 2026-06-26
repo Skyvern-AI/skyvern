@@ -1,3 +1,6 @@
+import { useState } from "react";
+
+import { ArrowTopRightIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -7,6 +10,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -44,7 +48,11 @@ function LoginEditor({ blockId }: { blockId: string }) {
   if (!nodeSlice || nodeSlice.type !== "login") {
     return null;
   }
-  return <LoginEditorBody blockId={blockId} data={nodeSlice.data} />;
+  // Key by blockId: the sidebar reuses one LoginEditorBody instance across
+  // same-type blocks; remounting resets local disclosure state.
+  return (
+    <LoginEditorBody key={blockId} blockId={blockId} data={nodeSlice.data} />
+  );
 }
 
 function LoginEditorBody({
@@ -69,6 +77,15 @@ function LoginEditorBody({
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
   );
+  const hasTotpValues = Boolean(
+    data.totpIdentifier?.trim() || data.totpVerificationUrl?.trim(),
+  );
+  const credentialHasTotp = Boolean(credentialTotpIdentifier);
+  const [twoFactorRequested, setTwoFactorRequested] = useState(
+    () => hasTotpValues,
+  );
+  const showTwoFactorFields = twoFactorRequested || hasTotpValues;
+  const showCredentialTotpSummary = credentialHasTotp && !showTwoFactorFields;
 
   return (
     <div data-testid="login-block-form" className="space-y-4">
@@ -80,7 +97,7 @@ function LoginEditorBody({
           </div>
           {isFirstWorkflowBlock ? (
             <div className="flex justify-end text-xs text-slate-400">
-              Tip: Use the {"+"} button to add parameters!
+              Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
         </div>
@@ -135,45 +152,97 @@ function LoginEditorBody({
             }}
           />
         </div>
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">2FA Identifier</Label>
-            <HelpTooltip content={helpTooltips["login"]["totpIdentifier"]} />
+        {showTwoFactorFields ? (
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">2FA Identifier</Label>
+                <HelpTooltip
+                  content={helpTooltips["login"]["totpIdentifier"]}
+                />
+              </div>
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ totpIdentifier: value })}
+                value={data.totpIdentifier ?? ""}
+                placeholder={
+                  !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                    ? `${credentialTotpIdentifier} (from credential)`
+                    : placeholders["login"]["totpIdentifier"]
+                }
+                className="nopan text-xs"
+              />
+              {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
+                <p className="text-xs text-slate-500">
+                  Leave empty to use the credential's value.
+                </p>
+              ) : null}
+            </div>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">
+                  2FA Verification URL
+                </Label>
+                <HelpTooltip
+                  content={helpTooltips["login"]["totpVerificationUrl"]}
+                />
+              </div>
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ totpVerificationUrl: value })}
+                value={data.totpVerificationUrl ?? ""}
+                placeholder={placeholders["login"]["totpVerificationUrl"]}
+                className="nopan text-xs"
+              />
+            </div>
+            {!hasTotpValues ? (
+              <button
+                type="button"
+                onClick={() => setTwoFactorRequested(false)}
+                className="text-xs text-slate-400 transition-colors hover:text-slate-200"
+              >
+                Cancel
+              </button>
+            ) : null}
           </div>
-          <WorkflowBlockInputTextarea
-            nodeId={blockId}
-            onChange={(value) => update({ totpIdentifier: value })}
-            value={data.totpIdentifier ?? ""}
-            placeholder={
-              !data.totpIdentifier?.trim() && credentialTotpIdentifier
-                ? `${credentialTotpIdentifier} (from credential)`
-                : placeholders["login"]["totpIdentifier"]
-            }
-            className="nopan text-xs"
-          />
-          {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-            <p className="text-xs text-slate-500">
-              Leave empty to use the credential's value.
-            </p>
-          ) : null}
-        </div>
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">
-              2FA Verification URL
-            </Label>
-            <HelpTooltip
-              content={helpTooltips["login"]["totpVerificationUrl"]}
-            />
+        ) : showCredentialTotpSummary ? (
+          <div className="flex items-center justify-between gap-2">
+            <a
+              href="/credentials?tab=twoFactor"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="min-w-0 break-words text-xs text-slate-400 transition-colors hover:text-slate-200"
+            >
+              Skyvern is waiting for 2FA codes with this identifier:{" "}
+              <span className="font-mono text-slate-300">
+                {credentialTotpIdentifier}
+              </span>
+              <ArrowTopRightIcon className="ml-0.5 inline size-3 align-text-bottom" />
+            </a>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 shrink-0 px-2 text-xs"
+              disabled={!editable}
+              onClick={() => setTwoFactorRequested(true)}
+            >
+              Override
+            </Button>
           </div>
-          <WorkflowBlockInputTextarea
-            nodeId={blockId}
-            onChange={(value) => update({ totpVerificationUrl: value })}
-            value={data.totpVerificationUrl ?? ""}
-            placeholder={placeholders["login"]["totpVerificationUrl"]}
-            className="nopan text-xs"
-          />
-        </div>
+        ) : (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            disabled={!editable}
+            onClick={() => setTwoFactorRequested(true)}
+          >
+            <PlusIcon className="mr-1 h-3 w-3" />
+            Add two-factor authentication
+          </Button>
+        )}
       </div>
       <Separator />
       <Accordion type="single" collapsible>

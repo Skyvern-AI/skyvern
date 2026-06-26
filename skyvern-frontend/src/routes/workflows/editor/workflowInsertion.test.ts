@@ -101,7 +101,9 @@ describe("findBranchContextForInsertion", () => {
     ).toEqual(branch);
   });
 
-  it("climbs to a parent loop when an empty nested loop inserts from its start node", () => {
+  it("does not inherit branch context when inserting into a loop nested in a conditional (from its start node)", () => {
+    // SKY-10719: a loop is a container boundary; an insert inside it must not
+    // inherit the loop's own membership in the outer conditional.
     expect(
       findBranchContextForInsertion(
         [
@@ -126,6 +128,78 @@ describe("findBranchContextForInsertion", () => {
         ],
         "start",
         "loop",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("does not inherit branch context when inserting between two blocks inside a loop nested in a conditional", () => {
+    // SKY-10719: walking up from a loop child reaches the loop, whose branch
+    // membership belongs to the loop, not to blocks inside it.
+    expect(
+      findBranchContextForInsertion(
+        [
+          {
+            id: "conditional-node",
+            type: "conditional",
+            data: {
+              activeBranchId: "branch-a",
+              branches: [{ id: "branch-a" }, { id: "branch-b" }],
+              label: "conditional",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "loop",
+            parentId: "conditional-node",
+            type: "loop",
+            data: {
+              conditionalBranchId: "branch-a",
+              conditionalLabel: "conditional",
+              conditionalMergeLabel: null,
+              conditionalNodeId: "conditional-node",
+              label: "block_loop",
+            },
+          },
+          { id: "block-8", parentId: "loop", type: "codeBlock", data: {} },
+          { id: "block-14", parentId: "loop", type: "codeBlock", data: {} },
+        ],
+        "block-8",
+        "loop",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("still inherits branch context when inserting a sibling after a loop inside a conditional", () => {
+    // The loop's own membership is correct when the loop itself is the insertion
+    // point; the boundary only applies when stepping INTO the loop from a child.
+    expect(
+      findBranchContextForInsertion(
+        [
+          {
+            id: "conditional-node",
+            type: "conditional",
+            data: {
+              activeBranchId: "branch-a",
+              branches: [{ id: "branch-a" }],
+              label: "conditional",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "loop",
+            parentId: "conditional-node",
+            type: "loop",
+            data: {
+              conditionalBranchId: "branch-a",
+              conditionalLabel: "conditional",
+              conditionalMergeLabel: null,
+              conditionalNodeId: "conditional-node",
+              label: "block_loop",
+            },
+          },
+        ],
+        "loop",
+        "conditional-node",
       ),
     ).toEqual(branch);
   });
@@ -195,5 +269,60 @@ describe("findBranchContextForInsertion", () => {
         "conditional-node",
       ),
     ).toEqual(branch);
+  });
+
+  it("uses the inner conditional's active branch when inserting into a nested conditional", () => {
+    // SKY-10460: a conditional nested inside another conditional carries its
+    // own membership metadata (conditionalNodeId/conditionalBranchId pointing
+    // at the OUTER conditional). Inserting into the inner conditional's empty
+    // branch starts from its START node and walks up to the inner conditional;
+    // the context must be the inner conditional's active branch, not its
+    // membership in the outer conditional, or the inserted block is orphaned.
+    expect(
+      findBranchContextForInsertion(
+        [
+          {
+            id: "outer-conditional",
+            type: "conditional",
+            data: {
+              activeBranchId: "outer-branch-a",
+              branches: [{ id: "outer-branch-a" }, { id: "outer-branch-b" }],
+              label: "outer",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "inner-conditional",
+            parentId: "outer-conditional",
+            type: "conditional",
+            data: {
+              // Membership in the OUTER conditional.
+              conditionalNodeId: "outer-conditional",
+              conditionalBranchId: "outer-branch-a",
+              conditionalLabel: "outer",
+              conditionalMergeLabel: null,
+              // The inner conditional's own branch state.
+              activeBranchId: "inner-branch-a",
+              branches: [{ id: "inner-branch-a" }, { id: "inner-branch-b" }],
+              label: "inner",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "inner-start",
+            parentId: "inner-conditional",
+            type: "start",
+            data: {},
+          },
+        ],
+        "inner-start",
+        "inner-conditional",
+      ),
+    ).toEqual({
+      branchId: "inner-branch-a",
+      conditionalLabel: "inner",
+      conditionalNodeId: "inner-conditional",
+      mergeLabel: null,
+    });
   });
 });

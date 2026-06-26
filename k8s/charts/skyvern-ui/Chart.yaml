@@ -1,0 +1,14 @@
+apiVersion: v2
+name: skyvern-ui
+description: Skyvern UI — prebuilt frontend bundle served with runtime env injection
+type: application
+# Chart version — bump on chart changes.
+version: 0.1.0
+# Default Skyvern UI image version this chart targets.
+appVersion: "v1.0.42"
+home: https://www.skyvern.com
+sources:
+  - https://github.com/Skyvern-AI/skyvern
+maintainers:
+  - name: Skyvern
+    url: https://www.skyvern.com

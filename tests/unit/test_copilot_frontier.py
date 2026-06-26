@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
@@ -23,11 +24,16 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     summarize_tool_result,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import (
     _find_invalidated_labels,
+    _frontier_run_size_error,
+    _invalidate_verified_state_on_edit,
     _plan_frontier,
+    _record_workflow_update_result,
     _referenced_output_labels,
 )
+from skyvern.forge.sdk.copilot.tools import frontier as frontier_module
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
 
 
@@ -44,6 +50,8 @@ class _FakeBlock:
 
         self.block_type = _BT(block_type)
         self._config = config or {}
+        for key, value in self._config.items():
+            setattr(self, key, value)
 
     def model_dump(self, mode: str = "json", exclude_none: bool = True) -> dict[str, Any]:
         return {
@@ -54,8 +62,12 @@ class _FakeBlock:
 
 
 class _FakeParameter:
-    def __init__(self, key: str) -> None:
+    def __init__(self, key: str, default_value: object = None) -> None:
         self.key = key
+        self.default_value = default_value
+
+    def model_dump(self, mode: str = "json") -> dict[str, Any]:
+        return {"key": self.key, "default_value": self.default_value}
 
 
 class _FakeDefinition:
@@ -68,16 +80,45 @@ class _FakeWorkflow:
     def __init__(self, definition: _FakeDefinition) -> None:
         self.workflow_definition = definition
 
+    def model_copy(self, *, deep: bool = False) -> _FakeWorkflow:
+        return copy.deepcopy(self) if deep else _FakeWorkflow(self.workflow_definition)
+
 
 class _FakeStream:
     async def is_disconnected(self) -> bool:
         return False
 
-    async def send(self, event: Any) -> None:
+    async def send(self, event: object) -> None:
         return None
 
 
-def _make_ctx(**kwargs: Any) -> CopilotContext:
+class _FakePage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class _FakeBrowserState:
+    def __init__(self, page: _FakePage | None) -> None:
+        self._page = page
+
+    async def get_working_page(self) -> _FakePage | None:
+        return self._page
+
+
+class _FakePersistentSessionsManager:
+    def __init__(self, browser_state: _FakeBrowserState | None) -> None:
+        self._browser_state = browser_state
+
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
+        return self._browser_state
+
+
+class _FakeFailingPersistentSessionsManager:
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
+        raise RuntimeError("browser state unavailable")
+
+
+def _make_ctx(**kwargs: object) -> CopilotContext:
     defaults: dict[str, Any] = dict(
         organization_id="org",
         workflow_id="wf_id",
@@ -134,6 +175,461 @@ def test_plan_frontier_append_after_success_runs_only_appended() -> None:
     labels, _seed, frontier = _plan_frontier(ctx, ["a", "b", "c"], old, new)
     assert labels == ["c"]
     assert frontier == "c"
+
+
+def test_plan_frontier_append_walks_back_when_workflow_prefix_is_not_verified() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"prompt": "Fill search fields"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"prompt": "Fill updated search fields"}),
+            _FakeBlock("submit_search", "navigation", {"prompt": "Click Search"}),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_block_outputs = {"open": "opened"}
+
+    labels, seed, frontier = _plan_frontier(ctx, ["submit_search"], old, new)
+
+    assert labels == ["open", "set_search", "submit_search"]
+    assert seed == {}
+    assert frontier == "open"
+
+
+def test_plan_frontier_unchanged_workflow_continues_from_first_unverified_label() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open", "set_search", "submit_search", "extract"],
+        definition,
+        definition,
+    )
+
+    assert labels == ["submit_search", "extract"]
+    assert seed == {}
+    assert frontier == "submit_search"
+
+
+def test_plan_frontier_verified_only_request_advances_to_next_unverified_workflow_label() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open", "set_search"],
+        definition,
+        definition,
+    )
+
+    assert labels == ["submit_search"]
+    assert seed == {}
+    assert frontier == "submit_search"
+
+
+def test_plan_frontier_suffix_only_request_seeds_prior_browser_state_outputs() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("search", "navigation"),
+            _FakeBlock("expand", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "search"]
+    ctx.verified_block_outputs = {
+        "open": {"current_url": "https://example.com/search"},
+        "search": {"current_url": "https://example.com/search/results"},
+    }
+
+    labels, seed, frontier = _plan_frontier(ctx, ["expand"], definition, definition)
+
+    assert labels == ["expand"]
+    assert seed == {
+        "open": {"current_url": "https://example.com/search"},
+        "search": {"current_url": "https://example.com/search/results"},
+    }
+    assert frontier == "expand"
+
+
+def test_runtime_frontier_anchor_keeps_url_empty_to_preserve_live_state() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search", "extract"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url == "https://example.com/search"
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_fills_blank_browser_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("about:blank"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search", "extract"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is not workflow
+    assert seeded.workflow_definition.blocks[1].url == "https://example.com/search"
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_fills_when_browser_state_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeFailingPersistentSessionsManager(),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is not workflow
+    assert seeded.workflow_definition.blocks[1].url == "https://example.com/search"
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_preserves_attached_live_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("https://example.com/search/results"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_url", ["start_url", "{{ start_url }}", "example.com"])
+async def test_runtime_frontier_starter_url_seed_preserves_runtime_resolved_url(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_url: str,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": explicit_url}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("about:blank"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is workflow
+    assert workflow.workflow_definition.blocks[1].url == explicit_url
+
+
+def test_runtime_frontier_anchor_requires_verified_prefix() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+def test_runtime_frontier_anchor_does_not_override_explicit_block_url() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": "https://example.com/explicit"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url == "https://example.com/explicit"
+
+
+def test_runtime_frontier_anchor_clears_same_page_url_to_preserve_state() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"url": None}),
+            _FakeBlock("submit_search", "navigation", {"url": "https://example.com/search"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["submit_search"],
+        frontier_start_label="submit_search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url == "https://example.com/search"
+    assert anchored is not workflow
+    assert anchored.workflow_definition.blocks[2].url is None
+    assert workflow.workflow_definition.blocks[2].url == "https://example.com/search"
+
+
+def test_runtime_frontier_anchor_does_not_clear_same_page_goto_url() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("refresh", "goto_url", {"url": "https://example.com/search"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["refresh"],
+        frontier_start_label="refresh",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url == "https://example.com/search"
+
+
+def test_frontier_run_size_error_limits_long_page_changing_frontier() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+            _FakeBlock("expand_results", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+
+    error = _frontier_run_size_error(
+        ctx,
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        definition,
+    )
+
+    assert error is not None
+    assert "Keep the same complete workflow YAML" in error
+    assert "['open', 'set_search']" in error
+    assert "Do not remove later blocks" in error
+
+
+def test_frontier_run_size_result_steers_to_smaller_saved_frontier() -> None:
+    result = tools._frontier_run_size_result(
+        "frontier too long",
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+    )
+
+    data = result["data"]
+    assert result["ok"] is False
+    assert data["workflow_run_skipped"] is True
+    assert data["suggested_block_labels"] == ["open", "set_search"]
+    assert data["deferred_block_labels"] == ["submit_search", "expand_results", "extract"]
+    assert data["control_signal"] == {
+        "kind": "intermediate_success",
+        "user_facing_summary": data["user_facing_summary"],
+        "next_tool": "run_blocks_and_collect_debug",
+        "next_block_labels": ["open", "set_search"],
+        "preserve_workflow_yaml": True,
+    }
+
+
+def test_frontier_run_size_error_allows_tool_expanded_runtime_anchor() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+        ]
+    )
+    ctx = _make_ctx()
+
+    assert (
+        _frontier_run_size_error(
+            ctx,
+            ["submit_search"],
+            ["open", "set_search", "submit_search"],
+            definition,
+        )
+        is None
+    )
+
+
+def test_frontier_run_size_error_allows_small_or_single_action_frontiers() -> None:
+    single_action_definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("search", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    long_read_definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("extract_a", "extraction"),
+            _FakeBlock("extract_b", "extraction"),
+            _FakeBlock("extract_c", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+
+    assert _frontier_run_size_error(ctx, ["open", "search"], ["open", "search"], single_action_definition) is None
+    assert (
+        _frontier_run_size_error(
+            ctx,
+            ["open", "search", "extract"],
+            ["open", "search", "extract"],
+            single_action_definition,
+        )
+        is None
+    )
+    assert (
+        _frontier_run_size_error(
+            ctx,
+            ["open", "extract_a", "extract_b", "extract_c"],
+            ["open", "extract_a", "extract_b", "extract_c"],
+            long_read_definition,
+        )
+        is None
+    )
 
 
 def test_plan_frontier_edit_walks_back_to_upstream_navigation_anchor() -> None:
@@ -194,12 +690,10 @@ def test_plan_frontier_cold_start_no_old_definition_uses_first_requested() -> No
 
 
 def test_plan_frontier_ambiguous_diff_falls_back_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.copilot import tools
-
-    def _blow_up(*args: Any, **kwargs: Any) -> set[str]:
+    def _blow_up(*args: object, **kwargs: object) -> set[str]:
         raise RuntimeError("parse failure in diff")
 
-    monkeypatch.setattr(tools, "_find_invalidated_labels", _blow_up)
+    monkeypatch.setattr(frontier_module, "_find_invalidated_labels", _blow_up)
 
     old = _FakeDefinition([_FakeBlock("a", "navigation")])
     new = _FakeDefinition([_FakeBlock("a", "navigation")])
@@ -324,7 +818,10 @@ def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:
     )
 
     assert labels == ["summarize_article"]
-    assert seed == {"extract_article_info": {"extracted_information": {"abstract": "Prior output"}}}
+    assert seed == {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
     assert frontier == "summarize_article"
 
 
@@ -671,7 +1168,7 @@ def test_plan_frontier_append_only_with_workflow_param_does_not_fall_back() -> N
     labels, seed, frontier = _plan_frontier(ctx, ["open_page", "search"], old, new)
 
     assert labels == ["search"]
-    assert seed == {}
+    assert seed == {"open_page": "nav_ok"}
     assert frontier == "search"
 
 
@@ -955,6 +1452,430 @@ def test_yaml_diff_invalidation_drops_edited_label_and_downstream() -> None:
     ctx.verified_prefix_labels = [label for label in ctx.verified_prefix_labels if label not in invalidated]
     assert ctx.verified_prefix_labels == ["a"]
     assert ctx.verified_block_outputs == {"a": "nav"}
+
+
+# --------------------------------------------------------------------------- #
+# Edit-time verified-state invalidation                                        #
+# --------------------------------------------------------------------------- #
+
+
+def _wf_def(*specs: tuple[str, str, dict[str, Any]], params: list[_FakeParameter] | None = None) -> _FakeDefinition:
+    return _FakeDefinition(
+        [_FakeBlock(label, block_type, config) for label, block_type, config in specs],
+        parameters=params,
+    )
+
+
+def _seed_verified(ctx: CopilotContext, labels: list[str], *, current_url: str | None, full: bool) -> None:
+    ctx.verified_prefix_labels = list(labels)
+    ctx.verified_block_outputs = {label: {"output": label} for label in labels}
+    ctx.verified_prefix_current_url = current_url
+    ctx.last_full_workflow_test_ok = full
+    evidence = ctx.workflow_verification_evidence
+    evidence.block_verified = list(labels)
+    evidence.full_workflow_verified = full
+    evidence.live_page_state_verified = True
+    evidence.verified_from_current_browser_state = True
+    evidence.current_url_observed_after_workflow_run = True
+    evidence.current_url_may_encode_runtime_state = True
+
+
+def test_edit_invalidates_verified_goal_block_on_split_path() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+        ("extract", "extraction", {"prompt": "grab results"}),
+    )
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+        ("extract", "extraction", {"prompt": "grab DIFFERENT results"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open", "search", "extract"], current_url="https://example.com/results", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == ["open", "search"]
+    assert "extract" not in ctx.verified_block_outputs
+    assert ctx.workflow_verification_evidence.block_verified == ["open", "search"]
+    assert ctx.verified_prefix_current_url is None
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.workflow_verification_evidence.live_page_state_verified is False
+    assert ctx.workflow_verification_evidence.verified_from_current_browser_state is False
+
+    # Split path: run_blocks passes old==new; the pruned prefix makes the edited
+    # block the frontier again instead of reusing it as verified.
+    labels, _seed, frontier = _plan_frontier(ctx, ["open", "search", "extract"], new, new)
+    assert frontier == "extract"
+    assert "extract" in labels
+
+
+def test_append_only_edit_keeps_prefix_but_drops_end_to_end_claim() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+    )
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+        ("extract", "extraction", {"prompt": "grab results"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open", "search"], current_url="https://example.com/after", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    # Append-after-success optimization stays intact.
+    assert ctx.verified_prefix_labels == ["open", "search"]
+    assert set(ctx.verified_block_outputs) == {"open", "search"}
+    assert ctx.workflow_verification_evidence.block_verified == ["open", "search"]
+    assert ctx.verified_prefix_current_url == "https://example.com/after"
+    # But the workflow is no longer verified end to end.
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+
+def test_remove_trailing_block_clears_full_workflow_evidence() -> None:
+    prior = _wf_def(
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("b", "navigation", {"prompt": "b"}),
+        ("c", "extraction", {"prompt": "c"}),
+    )
+    new = _wf_def(
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("b", "navigation", {"prompt": "b"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["a", "b", "c"], current_url="https://example.com/c", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert "c" not in ctx.verified_prefix_labels
+    assert "c" not in ctx.verified_block_outputs
+    assert "c" not in ctx.workflow_verification_evidence.block_verified
+    assert ctx.verified_prefix_current_url is None
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+
+def test_no_op_resave_preserves_verified_state() -> None:
+    specs = (
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("b", "navigation", {"prompt": "b"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["a", "b"], current_url="https://example.com/b", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, _wf_def(*specs), _wf_def(*specs))
+
+    assert ctx.verified_prefix_labels == ["a", "b"]
+    assert ctx.verified_prefix_current_url == "https://example.com/b"
+    assert ctx.workflow_verification_evidence.full_workflow_verified is True
+    assert ctx.last_full_workflow_test_ok is True
+
+
+def test_no_op_resave_preserves_block_verified_only_end_to_end_claim() -> None:
+    specs = (
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("b", "navigation", {"prompt": "b"}),
+    )
+    ctx = _make_ctx()
+    evidence = ctx.workflow_verification_evidence
+    evidence.block_verified = ["a", "b"]
+    evidence.full_workflow_verified = True
+    ctx.last_full_workflow_test_ok = True
+
+    _invalidate_verified_state_on_edit(ctx, _wf_def(*specs), _wf_def(*specs))
+
+    assert evidence.full_workflow_verified is True
+    assert ctx.last_full_workflow_test_ok is True
+
+
+def test_missing_new_definition_with_trust_fails_closed() -> None:
+    specs = (
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("b", "navigation", {"prompt": "b"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["a", "b"], current_url="https://example.com/b", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, _wf_def(*specs), None)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.block_verified == []
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+
+
+def test_edit_unverified_upstream_invalidates_downstream_verified() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+        ("extract", "extraction", {"prompt": "extract"}),
+    )
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search CHANGED"}),
+        ("extract", "extraction", {"prompt": "extract"}),
+    )
+    ctx = _make_ctx()
+    # Non-contiguous verified state: open + extract verified, search NOT verified.
+    ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.verified_block_outputs = {"open": 1, "extract": 3}
+    ctx.workflow_verification_evidence.block_verified = ["open", "extract"]
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert "extract" not in ctx.verified_prefix_labels
+    assert "extract" not in ctx.workflow_verification_evidence.block_verified
+    assert "open" in ctx.verified_prefix_labels
+
+
+def test_chokepoint_uses_passed_prior_when_last_workflow_absent() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "extract"}),
+    )
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "extract CHANGED"}),
+    )
+    ctx = _make_ctx()
+    # Saved workflow verified via run_blocks without ever populating last_workflow.
+    ctx.last_workflow = None
+    ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.verified_block_outputs = {"open": 1, "extract": 2}
+    ctx.workflow_verification_evidence.block_verified = ["open", "extract"]
+
+    _record_workflow_update_result(ctx, {"ok": True, "_workflow": _FakeWorkflow(new)}, prior)
+
+    assert ctx.last_workflow is not None
+    assert "extract" not in ctx.verified_prefix_labels
+    assert "extract" not in ctx.verified_block_outputs
+    assert "extract" in tools._unverified_current_workflow_labels(ctx)
+
+
+def test_workflow_update_clears_terminal_run_evidence() -> None:
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "extract CHANGED"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_old"
+    ctx.last_successful_run_blocks_workflow_run_id = "wr_old"
+    ctx.last_run_blocks_block_ids = ["wrb_old"]
+    ctx.last_run_blocks_block_labels = ["extract"]
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")
+    ctx.last_run_outcome_block_labels = ["extract"]
+    ctx.last_outcome_gate_reason = "The prior run did not demonstrate the goal."
+    ctx.last_outcome_gate_workflow_run_id = "wr_old"
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    ctx.completion_verification_result = object()  # type: ignore[assignment]
+    ctx.outcome_verification_trace_snapshot = {"old": True}
+
+    _record_workflow_update_result(ctx, {"ok": True, "_workflow": _FakeWorkflow(new)}, None)
+
+    assert ctx.last_run_blocks_workflow_run_id is None
+    assert ctx.last_successful_run_blocks_workflow_run_id is None
+    assert ctx.last_run_blocks_block_ids == []
+    assert ctx.last_run_blocks_block_labels == []
+    assert ctx.last_run_outcome is None
+    assert ctx.last_run_outcome_block_labels == []
+    assert ctx.last_outcome_gate_reason is None
+    assert ctx.last_outcome_gate_workflow_run_id is None
+    assert ctx.last_test_anti_bot is None
+    assert ctx.completion_verification_result is None
+    assert ctx.outcome_verification_trace_snapshot == {}
+
+
+def test_unavailable_prior_with_trust_fails_closed() -> None:
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "extract"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open", "extract"], current_url="https://example.com/x", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, None, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.block_verified == []
+    assert ctx.verified_prefix_current_url is None
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+
+def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _wf_def(("a", "goto_url", {"url": "https://example.com"}))
+    new = _wf_def(("a", "goto_url", {"url": "https://example.com/2"}))
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["a"], current_url="https://example.com", full=True)
+
+    def _boom(*_args: object, **_kwargs: object) -> set[str]:
+        raise RuntimeError("differ blew up")
+
+    monkeypatch.setattr(frontier_module, "_find_invalidated_labels", _boom)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.block_verified == []
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.verified_prefix_current_url is None
+
+
+def test_fused_and_split_leave_identical_verified_state() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+        ("extract", "extraction", {"prompt": "extract"}),
+    )
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("search", "navigation", {"prompt": "search"}),
+        ("extract", "extraction", {"prompt": "extract CHANGED"}),
+    )
+
+    def _build() -> CopilotContext:
+        c = _make_ctx()
+        _seed_verified(c, ["open", "search", "extract"], current_url="https://example.com/results", full=True)
+        return c
+
+    split_ctx = _build()
+    _invalidate_verified_state_on_edit(split_ctx, prior, new)
+    fused_ctx = _build()
+    _invalidate_verified_state_on_edit(fused_ctx, prior, new)
+
+    assert split_ctx.verified_prefix_labels == fused_ctx.verified_prefix_labels == ["open", "search"]
+    assert split_ctx.verified_block_outputs == fused_ctx.verified_block_outputs
+    assert (
+        split_ctx.workflow_verification_evidence.block_verified
+        == fused_ctx.workflow_verification_evidence.block_verified
+        == ["open", "search"]
+    )
+
+    # Neither the split seam (new, new) nor the fused seam (prior, new) reuses the
+    # edited block as verified.
+    split_labels, _s, _sf = _plan_frontier(split_ctx, ["open", "search", "extract"], new, new)
+    fused_labels, _f, _ff = _plan_frontier(fused_ctx, ["open", "search", "extract"], prior, new)
+    assert "extract" in split_labels
+    assert "extract" in fused_labels
+
+
+def test_parameter_value_change_resets_verified_trust() -> None:
+    prior = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        ("extract", "extraction", {"prompt": "grab"}),
+        params=[_FakeParameter("term", "cats")],
+    )
+    new = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        ("extract", "extraction", {"prompt": "grab"}),
+        params=[_FakeParameter("term", "dogs")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["search", "extract"], current_url="https://example.com/r", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.block_verified == []
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+
+def test_parameter_addition_resets_verified_trust() -> None:
+    # A block can reference a parameter by template without a config edit, so an
+    # added key may alter behavior the block-diff alone won't catch — fail closed.
+    prior = _wf_def(
+        ("search", "navigation", {"prompt": "search"}),
+        params=[_FakeParameter("term", "cats")],
+    )
+    new = _wf_def(
+        ("search", "navigation", {"prompt": "search"}),
+        params=[_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["search"], current_url="https://example.com/s", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.block_verified == []
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+
+def test_parameter_removal_resets_verified_trust() -> None:
+    prior = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        ("extract", "extraction", {"prompt": "grab"}),
+        params=[_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
+    )
+    new = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        ("extract", "extraction", {"prompt": "grab"}),
+        params=[_FakeParameter("term", "cats")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["search", "extract"], current_url="https://example.com/r", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.block_verified == []
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+
+def test_parameter_reorder_keeps_verified_trust() -> None:
+    # Parameters are referenced by key, so pure reordering changes no behavior.
+    prior = _wf_def(
+        ("search", "navigation", {"prompt": "search"}),
+        params=[_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
+    )
+    new = _wf_def(
+        ("search", "navigation", {"prompt": "search"}),
+        params=[_FakeParameter("limit", 10), _FakeParameter("term", "cats")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["search"], current_url="https://example.com/s", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == ["search"]
+    assert ctx.workflow_verification_evidence.full_workflow_verified is True
+    assert ctx.last_full_workflow_test_ok is True
+
+
+def test_reorder_resets_verified_trust() -> None:
+    prior = _wf_def(
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("b", "navigation", {"prompt": "b"}),
+    )
+    new = _wf_def(
+        ("b", "navigation", {"prompt": "b"}),
+        ("a", "goto_url", {"url": "https://example.com"}),
+        ("c", "extraction", {"prompt": "c"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["a", "b"], current_url="https://example.com/b", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.verified_block_outputs == {}
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
 
 
 if __name__ == "__main__":

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { ParametersState } from "../types";
 import {
+  detectInitialBitwardenManualEntry,
   detectInitialCredentialDataType,
   detectInitialCredentialSource,
   detectInitialParameterTypeSelection,
   header,
 } from "./WorkflowParameterEditPanel.helpers";
+import { validateBitwardenLoginCredential } from "./util";
 
 type Parameter = ParametersState[number];
 
@@ -78,7 +80,7 @@ describe("detectInitialParameterTypeSelection", () => {
     expect(detectInitialParameterTypeSelection(undefined)).toBeNull();
   });
 
-  it("returns the dataType for workflow input parameters", () => {
+  it("returns the dataType for workflow inputs", () => {
     expect(detectInitialParameterTypeSelection(workflowString)).toBe("string");
     expect(detectInitialParameterTypeSelection(workflowInteger)).toBe(
       "integer",
@@ -112,17 +114,17 @@ describe("detectInitialParameterTypeSelection", () => {
 });
 
 describe("header", () => {
-  it("uses 'Add Parameter' as the unified add-mode title", () => {
-    expect(header("workflow", false)).toBe("Add Parameter");
+  it("uses 'Add Input' as the unified add-mode title", () => {
+    expect(header("workflow", false)).toBe("Add Input");
   });
 
-  it("uses 'Edit Input Parameter' when editing any non-context parameter", () => {
-    expect(header("workflow", true)).toBe("Edit Input Parameter");
+  it("uses 'Edit Input' when editing any non-context parameter", () => {
+    expect(header("workflow", true)).toBe("Edit Input");
   });
 
   it("preserves dedicated context titles for the context entry-point type", () => {
-    expect(header("context", false)).toBe("Add Context Parameter");
-    expect(header("context", true)).toBe("Edit Context Parameter");
+    expect(header("context", false)).toBe("Add Context Input");
+    expect(header("context", true)).toBe("Edit Context Input");
   });
 });
 
@@ -182,5 +184,72 @@ describe("detectInitialCredentialSource", () => {
     expect(detectInitialCredentialSource(azureCredential, true)).toBe(
       "azurevault",
     );
+  });
+});
+
+describe("validateBitwardenLoginCredential", () => {
+  it("requires a collection or item reference", () => {
+    expect(validateBitwardenLoginCredential(null, null, null)).toBe(
+      "Collection ID or Item ID is required",
+    );
+  });
+
+  it("allows picker-selected items with collection IDs and no URL lookup key", () => {
+    expect(
+      validateBitwardenLoginCredential("collection-id", "item-id", null),
+    ).toBeNull();
+  });
+
+  it("still requires URL lookup key for collection-only login credentials", () => {
+    expect(validateBitwardenLoginCredential("collection-id", null, null)).toBe(
+      "URL Input Key is required when collection ID is used",
+    );
+  });
+
+  it("allows item-only login credentials", () => {
+    expect(validateBitwardenLoginCredential(null, "item-id", null)).toBeNull();
+  });
+});
+
+describe("detectInitialBitwardenManualEntry", () => {
+  it("keeps picker-selected password items with collection IDs in picker mode", () => {
+    expect(detectInitialBitwardenManualEntry(bitwardenLogin)).toBe(false);
+  });
+
+  it("uses manual entry for URL-based Bitwarden password lookup", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...bitwardenLogin,
+        itemId: null,
+        urlParameterKey: "url",
+      }),
+    ).toBe(true);
+  });
+
+  it("uses manual entry for templated Bitwarden password item IDs", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...bitwardenLogin,
+        itemId: "{{ item_id }}",
+      }),
+    ).toBe(true);
+  });
+
+  it("uses manual entry for templated Bitwarden password collection IDs", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...bitwardenLogin,
+        collectionId: "{{ collection_id }}",
+      }),
+    ).toBe(true);
+  });
+
+  it("uses manual entry for templated Bitwarden credit-card IDs", () => {
+    expect(
+      detectInitialBitwardenManualEntry({
+        ...creditCardCredential,
+        collectionId: "{{ collection_id }}",
+      }),
+    ).toBe(true);
   });
 });

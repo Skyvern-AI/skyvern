@@ -20,6 +20,8 @@ from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
+from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
+from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
@@ -35,20 +37,21 @@ from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.run_status import RunStatus
+from .types.run_webhook_replay_response import RunWebhookReplayResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
-from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
+from .types.skyvern_schemas_credential_type_credential_type import SkyvernSchemasCredentialTypeCredentialType
 from .types.task_run_list_item import TaskRunListItem
-from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
-from .types.task_run_request_proxy_location import TaskRunRequestProxyLocation
+from .types.task_run_request_input_data_extraction_schema import TaskRunRequestInputDataExtractionSchema
+from .types.task_run_request_input_proxy_location import TaskRunRequestInputProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
 from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run import WorkflowRun
-from .types.workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
+from .types.workflow_run_request_input_proxy_location import WorkflowRunRequestInputProxyLocation
 from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_status import WorkflowRunStatus
 from .types.workflow_run_timeline import WorkflowRunTimeline
@@ -70,8 +73,8 @@ class RawSkyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
-        data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestInputProxyLocation] = OMIT,
+        data_extraction_schema: typing.Optional[TaskRunRequestInputDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
@@ -80,6 +83,7 @@ class RawSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
@@ -109,7 +113,7 @@ class RawSkyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -125,6 +129,7 @@ class RawSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -141,9 +146,11 @@ class RawSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
-        data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
+        data_extraction_schema : typing.Optional[TaskRunRequestInputDataExtractionSchema]
 
             The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
 
@@ -178,6 +185,9 @@ class RawSkyvern:
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
 
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
+
         publish_workflow : typing.Optional[bool]
             Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
 
@@ -210,10 +220,12 @@ class RawSkyvern:
                 "engine": engine,
                 "title": title,
                 "proxy_location": convert_and_respect_annotation_metadata(
-                    object_=proxy_location, annotation=TaskRunRequestProxyLocation, direction="write"
+                    object_=proxy_location, annotation=TaskRunRequestInputProxyLocation, direction="write"
                 ),
                 "data_extraction_schema": convert_and_respect_annotation_metadata(
-                    object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
+                    object_=data_extraction_schema,
+                    annotation=TaskRunRequestInputDataExtractionSchema,
+                    direction="write",
                 ),
                 "error_code_mapping": error_code_mapping,
                 "max_steps": max_steps,
@@ -223,6 +235,7 @@ class RawSkyvern:
                 "browser_session_id": browser_session_id,
                 "model": model,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
@@ -282,7 +295,7 @@ class RawSkyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestInputProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -291,10 +304,11 @@ class RawSkyvern:
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
         run_with: typing.Optional[str] = OMIT,
-        run_metadata: typing.Optional[typing.Dict[str, str]] = OMIT,
+        run_metadata: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[WorkflowRunResponse]:
         """
@@ -317,7 +331,7 @@ class RawSkyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -333,6 +347,7 @@ class RawSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -349,6 +364,8 @@ class RawSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
@@ -372,10 +389,13 @@ class RawSkyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
 
         browser_address : typing.Optional[str]
             The CDP address for the workflow run.
@@ -386,7 +406,7 @@ class RawSkyvern:
         run_with : typing.Optional[str]
             Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
-        run_metadata : typing.Optional[typing.Dict[str, str]]
+        run_metadata : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             String key/value metadata to attach to this workflow run for analytics tag filtering.
 
         request_options : typing.Optional[RequestOptions]
@@ -408,7 +428,7 @@ class RawSkyvern:
                 "parameters": parameters,
                 "title": title,
                 "proxy_location": convert_and_respect_annotation_metadata(
-                    object_=proxy_location, annotation=WorkflowRunRequestProxyLocation, direction="write"
+                    object_=proxy_location, annotation=WorkflowRunRequestInputProxyLocation, direction="write"
                 ),
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
@@ -418,6 +438,7 @@ class RawSkyvern:
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "max_elapsed_time_minutes": max_elapsed_time_minutes,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "browser_address": browser_address,
                 "ai_fallback": ai_fallback,
                 "run_with": run_with,
@@ -443,92 +464,6 @@ class RawSkyvern:
                 return HttpResponse(response=_response, data=_data)
             if _response.status_code == 400:
                 raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def retry_workflow_run(
-        self,
-        workflow_run_id: str,
-        *,
-        max_steps_override: typing.Optional[int] = None,
-        user_agent: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[WorkflowRunResponse]:
-        """
-        Retry a workflow run using the original run parameters.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            The id of the workflow run to retry.
-
-        max_steps_override : typing.Optional[int]
-
-        user_agent : typing.Optional[str]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[WorkflowRunResponse]
-            Successfully retried workflow run
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry",
-            method="POST",
-            headers={
-                "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
-                "x-user-agent": str(user_agent) if user_agent is not None else None,
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    WorkflowRunResponse,
-                    parse_obj_as(
-                        type_=WorkflowRunResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
                     headers=dict(_response.headers),
                     body=typing.cast(
                         typing.Optional[typing.Any],
@@ -647,6 +582,63 @@ class RawSkyvern:
                     typing.Optional[typing.Any],
                     parse_obj_as(
                         type_=typing.Optional[typing.Any],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def bulk_cancel_runs(
+        self, *, run_ids: typing.Sequence[str], request_options: typing.Optional[RequestOptions] = None
+    ) -> HttpResponse[BulkCancelRunsResponse]:
+        """
+        Cancel multiple runs (tasks or workflows) in a single request
+
+        Parameters
+        ----------
+        run_ids : typing.Sequence[str]
+            List of run IDs to cancel
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[BulkCancelRunsResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/runs/cancel",
+            method="POST",
+            json={
+                "run_ids": run_ids,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BulkCancelRunsResponse,
+                    parse_obj_as(
+                        type_=BulkCancelRunsResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -1470,7 +1462,7 @@ class RawSkyvern:
         *,
         request: typing.Optional[RetryRunWebhookRequest] = None,
         request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[typing.Optional[typing.Any]]:
+    ) -> HttpResponse[RunWebhookReplayResponse]:
         """
         Retry sending the webhook for a run
 
@@ -1486,7 +1478,7 @@ class RawSkyvern:
 
         Returns
         -------
-        HttpResponse[typing.Optional[typing.Any]]
+        HttpResponse[RunWebhookReplayResponse]
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -1502,13 +1494,11 @@ class RawSkyvern:
             omit=OMIT,
         )
         try:
-            if _response is None or not _response.text.strip():
-                return HttpResponse(response=_response, data=None)
             if 200 <= _response.status_code < 300:
                 _data = typing.cast(
-                    typing.Optional[typing.Any],
+                    RunWebhookReplayResponse,
                     parse_obj_as(
-                        type_=typing.Optional[typing.Any],  # type: ignore
+                        type_=RunWebhookReplayResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -1559,6 +1549,91 @@ class RawSkyvern:
                     typing.List[WorkflowRunTimeline],
                     parse_obj_as(
                         type_=typing.List[WorkflowRunTimeline],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[WorkflowRunResponse]:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[WorkflowRunResponse]
+            Successfully retried workflow run
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry",
+            method="POST",
+            headers={
+                "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -1784,10 +1859,19 @@ class RawSkyvern:
         """
         List runs for a specific workflow.
 
+        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+        ### search_key
+
+        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+        ### error_code
+
+        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
         Parameters
         ----------
         workflow_id : str
-            Workflow permanent ID. Workflow ID starts with `wpid_`.
 
         page : typing.Optional[int]
             Page number for pagination.
@@ -1799,10 +1883,10 @@ class RawSkyvern:
             Filter by one or more run statuses.
 
         search_key : typing.Optional[str]
-            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
 
         error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array.
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2022,15 +2106,28 @@ class RawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     def list_browser_profiles(
-        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        include_deleted: typing.Optional[bool] = None,
+        search_key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[BrowserProfile]]:
         """
         Get all browser profiles for the organization
 
         Parameters
         ----------
+        page : typing.Optional[int]
+
+        page_size : typing.Optional[int]
+
         include_deleted : typing.Optional[bool]
             Include deleted browser profiles
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2044,7 +2141,10 @@ class RawSkyvern:
             "v1/browser_profiles",
             method="GET",
             params={
+                "page": page,
+                "page_size": page_size,
                 "include_deleted": include_deleted,
+                "search_key": search_key,
             },
             request_options=request_options,
         )
@@ -2084,7 +2184,7 @@ class RawSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[BrowserProfile]:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -2095,10 +2195,10 @@ class RawSkyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2285,6 +2385,97 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def update_browser_profile(
+        self,
+        profile_id: str,
+        *,
+        name: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[BrowserProfile]:
+        """
+        Update a browser profile's name and/or description
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to update. browser_profile_id starts with `bp_`
+
+        name : typing.Optional[str]
+            New name for the browser profile
+
+        description : typing.Optional[str]
+            New description for the browser profile
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[BrowserProfile]
+            Successfully updated browser profile
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/browser_profiles/{jsonable_encoder(profile_id)}",
+            method="PATCH",
+            json={
+                "name": name,
+                "description": description,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BrowserProfile,
+                    parse_obj_as(
+                        type_=BrowserProfile,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 409:
+                raise ConflictError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> HttpResponse[typing.List[BrowserSessionResponse]]:
@@ -2347,7 +2538,7 @@ class RawSkyvern:
         self,
         *,
         timeout: typing.Optional[int] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -2361,7 +2552,7 @@ class RawSkyvern:
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -2377,6 +2568,7 @@ class RawSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -2393,6 +2585,9 @@ class RawSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
@@ -2416,7 +2611,9 @@ class RawSkyvern:
             method="POST",
             json={
                 "timeout": timeout,
-                "proxy_location": proxy_location,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
+                ),
                 "extensions": extensions,
                 "browser_type": browser_type,
                 "browser_profile_id": browser_profile_id,
@@ -3024,7 +3221,8 @@ class RawSkyvern:
     def login(
         self,
         *,
-        credential_type: SkyvernSchemasRunBlocksCredentialType,
+        credential_type: SkyvernSchemasCredentialTypeCredentialType,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -3034,6 +3232,7 @@ class RawSkyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
@@ -3052,8 +3251,10 @@ class RawSkyvern:
 
         Parameters
         ----------
-        credential_type : SkyvernSchemasRunBlocksCredentialType
+        credential_type : SkyvernSchemasCredentialTypeCredentialType
             Where to get the credential from
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -3081,6 +3282,9 @@ class RawSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -3136,6 +3340,7 @@ class RawSkyvern:
                 "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
                 "credential_type": credential_type,
                 "prompt": prompt,
@@ -3151,6 +3356,7 @@ class RawSkyvern:
             },
             headers={
                 "content-type": "application/json",
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -3185,6 +3391,7 @@ class RawSkyvern:
         self,
         *,
         navigation_goal: str,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -3194,6 +3401,7 @@ class RawSkyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
@@ -3207,6 +3415,8 @@ class RawSkyvern:
         ----------
         navigation_goal : str
             Instructions for navigating to and downloading the file
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -3234,6 +3444,9 @@ class RawSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -3268,6 +3481,7 @@ class RawSkyvern:
                 "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
                 "navigation_goal": navigation_goal,
                 "download_suffix": download_suffix,
@@ -3276,6 +3490,7 @@ class RawSkyvern:
             },
             headers={
                 "content-type": "application/json",
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -3650,8 +3865,8 @@ class AsyncRawSkyvern:
         url: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[TaskRunRequestProxyLocation] = OMIT,
-        data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
+        proxy_location: typing.Optional[TaskRunRequestInputProxyLocation] = OMIT,
+        data_extraction_schema: typing.Optional[TaskRunRequestInputDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_steps: typing.Optional[int] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
@@ -3660,6 +3875,7 @@ class AsyncRawSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
@@ -3689,7 +3905,7 @@ class AsyncRawSkyvern:
         title : typing.Optional[str]
             The title for the task
 
-        proxy_location : typing.Optional[TaskRunRequestProxyLocation]
+        proxy_location : typing.Optional[TaskRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -3705,6 +3921,7 @@ class AsyncRawSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -3721,9 +3938,11 @@ class AsyncRawSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
-        data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
+        data_extraction_schema : typing.Optional[TaskRunRequestInputDataExtractionSchema]
 
             The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
 
@@ -3758,6 +3977,9 @@ class AsyncRawSkyvern:
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
 
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
+
         publish_workflow : typing.Optional[bool]
             Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
 
@@ -3790,10 +4012,12 @@ class AsyncRawSkyvern:
                 "engine": engine,
                 "title": title,
                 "proxy_location": convert_and_respect_annotation_metadata(
-                    object_=proxy_location, annotation=TaskRunRequestProxyLocation, direction="write"
+                    object_=proxy_location, annotation=TaskRunRequestInputProxyLocation, direction="write"
                 ),
                 "data_extraction_schema": convert_and_respect_annotation_metadata(
-                    object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
+                    object_=data_extraction_schema,
+                    annotation=TaskRunRequestInputDataExtractionSchema,
+                    direction="write",
                 ),
                 "error_code_mapping": error_code_mapping,
                 "max_steps": max_steps,
@@ -3803,6 +4027,7 @@ class AsyncRawSkyvern:
                 "browser_session_id": browser_session_id,
                 "model": model,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
@@ -3862,7 +4087,7 @@ class AsyncRawSkyvern:
         user_agent: typing.Optional[str] = None,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         title: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = OMIT,
+        proxy_location: typing.Optional[WorkflowRunRequestInputProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
@@ -3871,10 +4096,11 @@ class AsyncRawSkyvern:
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
         run_with: typing.Optional[str] = OMIT,
-        run_metadata: typing.Optional[typing.Dict[str, str]] = OMIT,
+        run_metadata: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[WorkflowRunResponse]:
         """
@@ -3897,7 +4123,7 @@ class AsyncRawSkyvern:
         title : typing.Optional[str]
             The title for this workflow run
 
-        proxy_location : typing.Optional[WorkflowRunRequestProxyLocation]
+        proxy_location : typing.Optional[WorkflowRunRequestInputProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -3913,6 +4139,7 @@ class AsyncRawSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -3929,6 +4156,8 @@ class AsyncRawSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
 
         webhook_url : typing.Optional[str]
@@ -3952,10 +4181,13 @@ class AsyncRawSkyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
 
         browser_address : typing.Optional[str]
             The CDP address for the workflow run.
@@ -3966,7 +4198,7 @@ class AsyncRawSkyvern:
         run_with : typing.Optional[str]
             Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
-        run_metadata : typing.Optional[typing.Dict[str, str]]
+        run_metadata : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             String key/value metadata to attach to this workflow run for analytics tag filtering.
 
         request_options : typing.Optional[RequestOptions]
@@ -3988,7 +4220,7 @@ class AsyncRawSkyvern:
                 "parameters": parameters,
                 "title": title,
                 "proxy_location": convert_and_respect_annotation_metadata(
-                    object_=proxy_location, annotation=WorkflowRunRequestProxyLocation, direction="write"
+                    object_=proxy_location, annotation=WorkflowRunRequestInputProxyLocation, direction="write"
                 ),
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
@@ -3998,6 +4230,7 @@ class AsyncRawSkyvern:
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "max_elapsed_time_minutes": max_elapsed_time_minutes,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "browser_address": browser_address,
                 "ai_fallback": ai_fallback,
                 "run_with": run_with,
@@ -4023,92 +4256,6 @@ class AsyncRawSkyvern:
                 return AsyncHttpResponse(response=_response, data=_data)
             if _response.status_code == 400:
                 raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def retry_workflow_run(
-        self,
-        workflow_run_id: str,
-        *,
-        max_steps_override: typing.Optional[int] = None,
-        user_agent: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[WorkflowRunResponse]:
-        """
-        Retry a workflow run using the original run parameters.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            The id of the workflow run to retry.
-
-        max_steps_override : typing.Optional[int]
-
-        user_agent : typing.Optional[str]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[WorkflowRunResponse]
-            Successfully retried workflow run
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry",
-            method="POST",
-            headers={
-                "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
-                "x-user-agent": str(user_agent) if user_agent is not None else None,
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    WorkflowRunResponse,
-                    parse_obj_as(
-                        type_=WorkflowRunResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
                     headers=dict(_response.headers),
                     body=typing.cast(
                         typing.Optional[typing.Any],
@@ -4227,6 +4374,63 @@ class AsyncRawSkyvern:
                     typing.Optional[typing.Any],
                     parse_obj_as(
                         type_=typing.Optional[typing.Any],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def bulk_cancel_runs(
+        self, *, run_ids: typing.Sequence[str], request_options: typing.Optional[RequestOptions] = None
+    ) -> AsyncHttpResponse[BulkCancelRunsResponse]:
+        """
+        Cancel multiple runs (tasks or workflows) in a single request
+
+        Parameters
+        ----------
+        run_ids : typing.Sequence[str]
+            List of run IDs to cancel
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[BulkCancelRunsResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/runs/cancel",
+            method="POST",
+            json={
+                "run_ids": run_ids,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BulkCancelRunsResponse,
+                    parse_obj_as(
+                        type_=BulkCancelRunsResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -5050,7 +5254,7 @@ class AsyncRawSkyvern:
         *,
         request: typing.Optional[RetryRunWebhookRequest] = None,
         request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[typing.Optional[typing.Any]]:
+    ) -> AsyncHttpResponse[RunWebhookReplayResponse]:
         """
         Retry sending the webhook for a run
 
@@ -5066,7 +5270,7 @@ class AsyncRawSkyvern:
 
         Returns
         -------
-        AsyncHttpResponse[typing.Optional[typing.Any]]
+        AsyncHttpResponse[RunWebhookReplayResponse]
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
@@ -5082,13 +5286,11 @@ class AsyncRawSkyvern:
             omit=OMIT,
         )
         try:
-            if _response is None or not _response.text.strip():
-                return AsyncHttpResponse(response=_response, data=None)
             if 200 <= _response.status_code < 300:
                 _data = typing.cast(
-                    typing.Optional[typing.Any],
+                    RunWebhookReplayResponse,
                     parse_obj_as(
-                        type_=typing.Optional[typing.Any],  # type: ignore
+                        type_=RunWebhookReplayResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -5139,6 +5341,91 @@ class AsyncRawSkyvern:
                     typing.List[WorkflowRunTimeline],
                     parse_obj_as(
                         type_=typing.List[WorkflowRunTimeline],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[WorkflowRunResponse]:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[WorkflowRunResponse]
+            Successfully retried workflow run
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry",
+            method="POST",
+            headers={
+                "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -5364,10 +5651,19 @@ class AsyncRawSkyvern:
         """
         List runs for a specific workflow.
 
+        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+        ### search_key
+
+        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+        ### error_code
+
+        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
         Parameters
         ----------
         workflow_id : str
-            Workflow permanent ID. Workflow ID starts with `wpid_`.
 
         page : typing.Optional[int]
             Page number for pagination.
@@ -5379,10 +5675,10 @@ class AsyncRawSkyvern:
             Filter by one or more run statuses.
 
         search_key : typing.Optional[str]
-            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
 
         error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array.
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5602,15 +5898,28 @@ class AsyncRawSkyvern:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
     async def list_browser_profiles(
-        self, *, include_deleted: typing.Optional[bool] = None, request_options: typing.Optional[RequestOptions] = None
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        include_deleted: typing.Optional[bool] = None,
+        search_key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[BrowserProfile]]:
         """
         Get all browser profiles for the organization
 
         Parameters
         ----------
+        page : typing.Optional[int]
+
+        page_size : typing.Optional[int]
+
         include_deleted : typing.Optional[bool]
             Include deleted browser profiles
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5624,7 +5933,10 @@ class AsyncRawSkyvern:
             "v1/browser_profiles",
             method="GET",
             params={
+                "page": page,
+                "page_size": page_size,
                 "include_deleted": include_deleted,
+                "search_key": search_key,
             },
             request_options=request_options,
         )
@@ -5664,7 +5976,7 @@ class AsyncRawSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[BrowserProfile]:
         """
-        Create a browser profile from a persistent browser session or workflow run.
+        Create a blank browser profile, or create one from a persistent browser session or workflow run.
 
         Parameters
         ----------
@@ -5675,10 +5987,10 @@ class AsyncRawSkyvern:
             Optional profile description
 
         browser_session_id : typing.Optional[str]
-            Persistent browser session to convert into a profile
+            Persistent browser session to convert into a profile. Omit for a blank profile.
 
         workflow_run_id : typing.Optional[str]
-            Workflow run whose persisted session should be captured
+            Workflow run whose persisted session should be captured. Omit for a blank profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5865,6 +6177,97 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    async def update_browser_profile(
+        self,
+        profile_id: str,
+        *,
+        name: typing.Optional[str] = OMIT,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[BrowserProfile]:
+        """
+        Update a browser profile's name and/or description
+
+        Parameters
+        ----------
+        profile_id : str
+            The ID of the browser profile to update. browser_profile_id starts with `bp_`
+
+        name : typing.Optional[str]
+            New name for the browser profile
+
+        description : typing.Optional[str]
+            New description for the browser profile
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[BrowserProfile]
+            Successfully updated browser profile
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/browser_profiles/{jsonable_encoder(profile_id)}",
+            method="PATCH",
+            json={
+                "name": name,
+                "description": description,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    BrowserProfile,
+                    parse_obj_as(
+                        type_=BrowserProfile,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 409:
+                raise ConflictError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     async def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> AsyncHttpResponse[typing.List[BrowserSessionResponse]]:
@@ -5927,7 +6330,7 @@ class AsyncRawSkyvern:
         self,
         *,
         timeout: typing.Optional[int] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -5941,7 +6344,7 @@ class AsyncRawSkyvern:
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
-        proxy_location : typing.Optional[ProxyLocation]
+        proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
             Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
 
@@ -5957,6 +6360,7 @@ class AsyncRawSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_PH: Philippines
             - RESIDENTIAL_KR: South Korea
+            - RESIDENTIAL_SA: Saudi Arabia
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
             - RESIDENTIAL_AU: Australia
@@ -5973,6 +6377,9 @@ class AsyncRawSkyvern:
             - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
             - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
             - NONE: No proxy
+
+            For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
+             Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
@@ -5996,7 +6403,9 @@ class AsyncRawSkyvern:
             method="POST",
             json={
                 "timeout": timeout,
-                "proxy_location": proxy_location,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
+                ),
                 "extensions": extensions,
                 "browser_type": browser_type,
                 "browser_profile_id": browser_profile_id,
@@ -6604,7 +7013,8 @@ class AsyncRawSkyvern:
     async def login(
         self,
         *,
-        credential_type: SkyvernSchemasRunBlocksCredentialType,
+        credential_type: SkyvernSchemasCredentialTypeCredentialType,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -6614,6 +7024,7 @@ class AsyncRawSkyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         prompt: typing.Optional[str] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
@@ -6632,8 +7043,10 @@ class AsyncRawSkyvern:
 
         Parameters
         ----------
-        credential_type : SkyvernSchemasRunBlocksCredentialType
+        credential_type : SkyvernSchemasCredentialTypeCredentialType
             Where to get the credential from
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -6661,6 +7074,9 @@ class AsyncRawSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -6716,6 +7132,7 @@ class AsyncRawSkyvern:
                 "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
                 "credential_type": credential_type,
                 "prompt": prompt,
@@ -6731,6 +7148,7 @@ class AsyncRawSkyvern:
             },
             headers={
                 "content-type": "application/json",
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -6765,6 +7183,7 @@ class AsyncRawSkyvern:
         self,
         *,
         navigation_goal: str,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -6774,6 +7193,7 @@ class AsyncRawSkyvern:
         browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         download_suffix: typing.Optional[str] = OMIT,
         download_timeout: typing.Optional[float] = OMIT,
@@ -6787,6 +7207,8 @@ class AsyncRawSkyvern:
         ----------
         navigation_goal : str
             Instructions for navigating to and downloading the file
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             Website URL
@@ -6814,6 +7236,9 @@ class AsyncRawSkyvern:
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
+
+        cdp_connect_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
 
         max_screenshot_scrolling_times : typing.Optional[int]
             Maximum number of times to scroll for screenshots
@@ -6848,6 +7273,7 @@ class AsyncRawSkyvern:
                 "browser_profile_id": browser_profile_id,
                 "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
+                "cdp_connect_headers": cdp_connect_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
                 "navigation_goal": navigation_goal,
                 "download_suffix": download_suffix,
@@ -6856,6 +7282,7 @@ class AsyncRawSkyvern:
             },
             headers={
                 "content-type": "application/json",
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,

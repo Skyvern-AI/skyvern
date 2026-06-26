@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from skyvern.utils.url_validators import collapse_duplicate_www_prefix
 
 
 class TaskGenerationBase(BaseModel):
@@ -19,6 +21,13 @@ class TaskGenerationBase(BaseModel):
     llm_prompt: str | None = None
     llm_response: str | None = None
     suggested_title: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def normalize_url(cls, url: str | None) -> str | None:
+        if not url:
+            return url
+        return collapse_duplicate_www_prefix(url)
 
 
 class TaskGeneration(TaskGenerationBase):

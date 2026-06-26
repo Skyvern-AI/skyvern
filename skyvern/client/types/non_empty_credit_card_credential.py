@@ -41,6 +41,26 @@ class NonEmptyCreditCardCredential(UniversalBaseModel):
     The name of the card holder (must not be empty)
     """
 
+    billing_address: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
+    """
+    Optional billing address associated with the card
+    """
+
+    billing_email: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional billing email address
+    """
+
+    billing_phone: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional billing phone number
+    """
+
+    metadata: typing.Optional[typing.Dict[str, str]] = pydantic.Field(default=None)
+    """
+    Optional additional credit card metadata fields
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:

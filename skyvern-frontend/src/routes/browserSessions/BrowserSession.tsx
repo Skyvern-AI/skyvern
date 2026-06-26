@@ -32,7 +32,9 @@ import {
   type StreamMode,
 } from "@/routes/streaming/StreamDiagnostics";
 
+import { getBrowserSessionRefetchIntervalMs } from "./browserSessionQueryUtils";
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
+import { BrowserSessionOccupiedBy } from "./BrowserSessionOccupiedBy";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
@@ -72,16 +74,16 @@ function BrowserSession() {
       return response.data;
     },
     refetchInterval: (query) =>
-      query.state.data?.status === "running" ? 5000 : false,
+      getBrowserSessionRefetchIntervalMs(query.state.data),
   });
 
   const browserSession = query.data;
-  const streamMode: StreamMode = browserSession?.vnc_streaming_supported
-    ? vncFailed
-      ? "fallback"
-      : "vnc"
-    : isCdpMode
-      ? "cdp"
+  const streamMode: StreamMode = isCdpMode
+    ? "cdp"
+    : browserSession?.vnc_streaming_supported
+      ? vncFailed
+        ? "fallback"
+        : "vnc"
       : "unavailable";
 
   const closeBrowserSessionMutation = useCloseBrowserSessionMutation({
@@ -156,6 +158,11 @@ function BrowserSession() {
                     />
                   </div>
                 )}
+                {browserSession.runnable_id && (
+                  <BrowserSessionOccupiedBy
+                    runnableId={browserSession.runnable_id}
+                  />
+                )}
               </div>
             )}
           </div>
@@ -228,23 +235,22 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
-            {/* VNC streaming */}
-            {browserSession.vnc_streaming_supported && !vncFailed && (
-              <BrowserStream
+            {isCdpMode && browserSessionId && (
+              <BrowserSessionStream
                 browserSessionId={browserSessionId}
-                interactive={false}
+                interactive={true}
                 showControlButtons={true}
-                isVisible={activeTab === "stream"}
-                onClose={() => setVncFailed(true)}
               />
             )}
-            {isCdpMode &&
-              browserSessionId &&
-              (!browserSession.vnc_streaming_supported || vncFailed) && (
-                <BrowserSessionStream
+            {!isCdpMode &&
+              browserSession.vnc_streaming_supported &&
+              !vncFailed && (
+                <BrowserStream
                   browserSessionId={browserSessionId}
-                  interactive={true}
+                  interactive={false}
                   showControlButtons={true}
+                  isVisible={activeTab === "stream"}
+                  onClose={() => setVncFailed(true)}
                 />
               )}
           </div>

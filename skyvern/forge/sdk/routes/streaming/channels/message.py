@@ -19,6 +19,7 @@ import typing as t
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedError
 
@@ -39,6 +40,8 @@ from skyvern.forge.sdk.routes.streaming.verify import (
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
 from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.services.browser_recording.session_registry import interpretation_registry
+from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
 
 LOG = structlog.get_logger()
 
@@ -64,6 +67,10 @@ class MessageKind(enum.StrEnum):
     GO_FORWARD = "go-forward"
     NAVIGATE = "navigate"
     RELOAD = "reload"
+    RECORDING_CAPTURE_PAUSE = "recording-capture-pause"
+    RECORDING_CAPTURE_RESUME = "recording-capture-resume"
+    RECORDING_REARM_CAPTURE = "recording-rearm-capture"
+    RECORDING_INTERPRETATION_UPDATE = "recording-interpretation-update"
     SCREENSHOT = "screenshot"
     TAKE_CONTROL = "take-control"
     TAKE_SCREENSHOT = "take-screenshot"
@@ -106,6 +113,10 @@ MessageKinds = t.Literal[
     MessageKind.GO_FORWARD,
     MessageKind.NAVIGATE,
     MessageKind.RELOAD,
+    MessageKind.RECORDING_CAPTURE_PAUSE,
+    MessageKind.RECORDING_CAPTURE_RESUME,
+    MessageKind.RECORDING_REARM_CAPTURE,
+    MessageKind.RECORDING_INTERPRETATION_UPDATE,
     MessageKind.SCREENSHOT,
     MessageKind.TAKE_CONTROL,
     MessageKind.TAKE_SCREENSHOT,
@@ -120,11 +131,28 @@ class Message:
 @dataclasses.dataclass
 class MessageInBeginExfiltration(Message):
     kind: t.Literal[MessageKind.BEGIN_EXFILTRATION] = MessageKind.BEGIN_EXFILTRATION
+    workflow_permanent_id: str | None = None
+    live_interpretation_enabled: bool = False
 
 
 @dataclasses.dataclass
 class MessageInEndExfiltration(Message):
     kind: t.Literal[MessageKind.END_EXFILTRATION] = MessageKind.END_EXFILTRATION
+
+
+@dataclasses.dataclass
+class MessageInRecordingCapturePause(Message):
+    kind: t.Literal[MessageKind.RECORDING_CAPTURE_PAUSE] = MessageKind.RECORDING_CAPTURE_PAUSE
+
+
+@dataclasses.dataclass
+class MessageInRecordingCaptureResume(Message):
+    kind: t.Literal[MessageKind.RECORDING_CAPTURE_RESUME] = MessageKind.RECORDING_CAPTURE_RESUME
+
+
+@dataclasses.dataclass
+class MessageInRecordingRearmCapture(Message):
+    kind: t.Literal[MessageKind.RECORDING_REARM_CAPTURE] = MessageKind.RECORDING_REARM_CAPTURE
 
 
 @dataclasses.dataclass
@@ -235,6 +263,16 @@ class MessageOutExfiltratedEvent(Message):
 
 
 @dataclasses.dataclass
+class MessageOutRecordingInterpretationUpdate(Message):
+    kind: t.Literal[MessageKind.RECORDING_INTERPRETATION_UPDATE] = MessageKind.RECORDING_INTERPRETATION_UPDATE
+    interpretation_session_id: str = ""
+    session_revision: int = 0
+    steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
+    pending: bool = False
+    finalized: bool = False
+
+
+@dataclasses.dataclass
 class MessageOutTabInfo(Message):
     kind: t.Literal[MessageKind.BROWSER_TABS] = MessageKind.BROWSER_TABS
     tabs: list[TabInfo] = dataclasses.field(default_factory=list)
@@ -254,6 +292,9 @@ MessageIn = (
     | MessageInGoBack
     | MessageInGoForward
     | MessageInNavigate
+    | MessageInRecordingCapturePause
+    | MessageInRecordingCaptureResume
+    | MessageInRecordingRearmCapture
     | MessageInReload
     | MessageInTakeControl
     | MessageInTakeScreenshot
@@ -261,7 +302,12 @@ MessageIn = (
 
 
 MessageOut = (
-    MessageOutBrowserUrl | MessageOutError | MessageOutExfiltratedEvent | MessageOutScreenshot | MessageOutTabInfo
+    MessageOutBrowserUrl
+    | MessageOutError
+    | MessageOutExfiltratedEvent
+    | MessageOutRecordingInterpretationUpdate
+    | MessageOutScreenshot
+    | MessageOutTabInfo
 )
 
 
@@ -276,7 +322,11 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             text = data.get("text") or ""
             return MessageInAskForClipboardResponse(text=text)
         case MessageKind.BEGIN_EXFILTRATION:
-            return MessageInBeginExfiltration()
+            workflow_permanent_id = data.get("workflow_permanent_id")
+            return MessageInBeginExfiltration(
+                workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
+                live_interpretation_enabled=bool(data.get("live_interpretation_enabled") or False),
+            )
         case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
         case MessageKind.CLEAR_ALL_DATA:
@@ -292,6 +342,12 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInClipboardPaste(text=text)
         case MessageKind.END_EXFILTRATION:
             return MessageInEndExfiltration()
+        case MessageKind.RECORDING_CAPTURE_PAUSE:
+            return MessageInRecordingCapturePause()
+        case MessageKind.RECORDING_CAPTURE_RESUME:
+            return MessageInRecordingCaptureResume()
+        case MessageKind.RECORDING_REARM_CAPTURE:
+            return MessageInRecordingRearmCapture()
         case MessageKind.GET_BROWSER_URL:
             return MessageInGetBrowserUrl()
         case MessageKind.GO_BACK:
@@ -320,9 +376,15 @@ def message_to_dict(message: MessageOut) -> dict:
     def convert_value(obj: t.Any) -> t.Any:
         if isinstance(obj, enum.Enum):
             return obj.value
+        if isinstance(obj, BaseModel):
+            return obj.model_dump(mode="json")
+        if isinstance(obj, list):
+            return [convert_value(item) for item in obj]
+        if isinstance(obj, dict):
+            return {key: convert_value(value) for key, value in obj.items()}
         return obj
 
-    return dataclasses.asdict(message, dict_factory=lambda x: {k: convert_value(v) for k, v in x})
+    return {key: convert_value(value) for key, value in dataclasses.asdict(message).items()}
 
 
 @dataclasses.dataclass
@@ -506,6 +568,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
     class_name = message_channel.class_name
     exfiltration_channel: ExfiltrationChannel | None = None
+    live_interpretation_browser_session_id: str | None = None
 
     async def send(message: MessageOut) -> None:
         if message_channel.websocket.client_state != WebSocketState.CONNECTED:
@@ -523,6 +586,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     async def handle_data(data: dict | MessageOut) -> None:
         nonlocal class_name
         nonlocal exfiltration_channel
+        nonlocal live_interpretation_browser_session_id
         message: ChannelMessage
 
         if isinstance(data, MessageOut):
@@ -573,12 +637,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await send_error(message.kind, "Failed to paste into browser.")
 
             case MessageKind.BEGIN_EXFILTRATION:
-                if exfiltration_channel is not None:
-                    LOG.error(
-                        "MessageChannel: cannot begin exfiltration: already active.", message_channel=message_channel
-                    )
-                    return
-
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
@@ -588,6 +646,48 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         **message_channel.identity,
                     )
                     return
+
+                browser_session_id = (
+                    message_channel.browser_session.persistent_browser_session_id
+                    if message_channel.browser_session
+                    else None
+                )
+
+                def on_interpretation_update(update: RecordingInterpretationUpdate) -> None:
+                    message_channel.send_nowait(
+                        messages=[
+                            MessageOutRecordingInterpretationUpdate(
+                                interpretation_session_id=update.interpretation_session_id,
+                                session_revision=update.session_revision,
+                                steps=update.steps,
+                                pending=update.pending,
+                                finalized=update.finalized,
+                            )
+                        ]
+                    )
+
+                def ensure_live_interpretation() -> None:
+                    nonlocal live_interpretation_browser_session_id
+
+                    if not (
+                        browser_session_id and message.workflow_permanent_id and message.live_interpretation_enabled
+                    ):
+                        return
+
+                    interpretation_registry.start_session(
+                        browser_session_id=browser_session_id,
+                        organization_id=message_channel.organization_id,
+                        workflow_permanent_id=message.workflow_permanent_id,
+                        on_update=on_interpretation_update,
+                    )
+                    live_interpretation_browser_session_id = browser_session_id
+
+                if exfiltration_channel is not None:
+                    ensure_live_interpretation()
+                    await exfiltration_channel.rearm_all_pages()
+                    return
+
+                ensure_live_interpretation()
 
                 def on_event(events: list[ExfiltratedEvent]) -> None:
                     for event in events:
@@ -600,6 +700,9 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         )
 
                         message_channel.send_nowait(messages=[message_out_exfiltrated_event])
+
+                    if live_interpretation_browser_session_id:
+                        interpretation_registry.ingest_events(live_interpretation_browser_session_id, events)
 
                 exfiltration_channel = await ExfiltrationChannel(
                     on_event=on_event,
@@ -701,11 +804,33 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 await exfiltration_channel.stop()
 
                 exfiltration_channel = None
+                if live_interpretation_browser_session_id:
+                    await interpretation_registry.stop_session(live_interpretation_browser_session_id)
+                    live_interpretation_browser_session_id = None
+
+            case MessageKind.RECORDING_CAPTURE_PAUSE:
+                if exfiltration_channel is not None:
+                    exfiltration_channel.pause_capture()
+                if live_interpretation_browser_session_id:
+                    interpretation_registry.pause_capture(live_interpretation_browser_session_id)
+
+            case MessageKind.RECORDING_CAPTURE_RESUME:
+                if exfiltration_channel is not None:
+                    exfiltration_channel.resume_capture()
+                if live_interpretation_browser_session_id:
+                    interpretation_registry.resume_capture(live_interpretation_browser_session_id)
+
+            case MessageKind.RECORDING_REARM_CAPTURE:
+                if exfiltration_channel is not None:
+                    await exfiltration_channel.rearm_all_pages()
 
             case MessageKind.ERROR:
                 await send(message)
 
             case MessageKind.EXFILTRATED_EVENT:
+                await send(message)
+
+            case MessageKind.RECORDING_INTERPRETATION_UPDATE:
                 await send(message)
 
             case MessageKind.GET_BROWSER_URL:
@@ -853,6 +978,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         LOG.exception(f"{class_name} An exception occurred in loop message channel stream.", **message_channel.identity)
     finally:
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
+        if exfiltration_channel is not None:
+            await exfiltration_channel.stop()
+        # Live interpretation is torn down only on explicit end-exfiltration so a
+        # disconnect→reconnect can resume the same in-flight recording session.
         await message_channel.close(reason="loop-channel-closed")
 
 

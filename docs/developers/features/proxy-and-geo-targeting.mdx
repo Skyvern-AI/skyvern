@@ -26,7 +26,7 @@ For services that require a stable IP across a session, `RESIDENTIAL_ISP` provid
 
 ## How it's applied
 
-**Per task:** pass `proxy_location` in the run request. **Per workflow:** set a default on the workflow and override on any individual run. **Per session:** lock a proxy to a [browser session](/developers/optimization/browser-sessions) so every operation in that session shares the same IP.
+**Per task:** pass `proxy_location` in the run request. **Per agent:** set a default on the agent and override on any individual run. **Per session:** lock a proxy to a [browser session](/developers/optimization/browser-sessions) so every operation in that session shares the same IP.
 
 ## When to use it
 

@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator
 
+from skyvern.config import settings
+
 
 class ProxyLocation(StrEnum):
     RESIDENTIAL = "RESIDENTIAL"
@@ -207,7 +209,16 @@ class GeoTarget(BaseModel):
         return v
 
 
-ProxyLocationInput = ProxyLocation | GeoTarget | dict[str, Any] | None
+ResolvedProxyLocationInput = ProxyLocation | GeoTarget | dict[str, Any]
+ProxyLocationInput = ResolvedProxyLocationInput | None
+
+
+def runtime_proxy_location(proxy_location: ProxyLocationInput) -> ResolvedProxyLocationInput:
+    if proxy_location is None:
+        if not settings.RUNTIME_PROXY_DEFAULT_NONE_ENABLED:
+            return ProxyLocation.RESIDENTIAL
+        return ProxyLocation.NONE
+    return proxy_location
 
 
 def proxy_location_to_request(proxy_location: ProxyLocationInput) -> ProxyLocation | dict[str, Any] | None:

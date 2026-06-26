@@ -21,7 +21,12 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
-from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics
+from skyvern.webeye.cdp_connection import (
+    connect_over_cdp_with_diagnostics,
+    is_local_pbs_cdp_url,
+    resolve_local_pbs_cdp_url,
+)
+from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
@@ -77,6 +82,8 @@ class CdpChannel:
         else:
             url = settings.BROWSER_REMOTE_DEBUGGING_URL
 
+        url = resolve_local_pbs_cdp_url(url)
+
         self.url = url
 
         LOG.info(f"{self.class_name} connecting to CDP", **self.identity)
@@ -85,13 +92,12 @@ class CdpChannel:
 
         self.pw = pw
 
-        headers = (
-            {
-                "x-api-key": self.vnc_channel.x_api_key,
-            }
-            if self.vnc_channel.x_api_key
-            else None
-        )
+        headers: dict[str, str] | None = None
+        if self.vnc_channel.x_api_key:
+            headers = {"x-api-key": self.vnc_channel.x_api_key}
+        if self.vnc_channel.browser_session and is_local_pbs_cdp_url(url):
+            headers = headers or {}
+            headers["X-Session-Id"] = self.vnc_channel.browser_session.persistent_browser_session_id
 
         def on_close() -> None:
             LOG.warning(
@@ -100,7 +106,7 @@ class CdpChannel:
             close_task = asyncio.create_task(self.close())
             close_task.add_done_callback(lambda _: asyncio.create_task(self.connect()))  # TODO: avoid blind reconnect
 
-        self.browser = await connect_over_cdp_with_diagnostics(pw, url, headers=headers)
+        self.browser = await connect_over_cdp_with_diagnostics(pw, url, headers=headers if headers else None)
         self.browser.on("disconnected", on_close)
 
         await self.apply_download_behavior(self.browser)
@@ -180,7 +186,7 @@ class CdpChannel:
         LOG.info(f"{self.class_name} evaluating js", expression=expression[:100], **self.identity)
 
         try:
-            result = await self.page.evaluate(expression, arg)
+            result = await evaluate_in_main_world(self.page, expression, arg)
             LOG.info(f"{self.class_name} evaluated js successfully", **self.identity)
             return result
         except Exception:
