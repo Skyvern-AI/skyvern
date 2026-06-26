@@ -667,6 +667,26 @@ class AgentFunction:
     workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the API process should run the built-in local scheduler loop."""
 
+    def build_proxy_session_extra_http_headers(self, proxy_session_id: str | None) -> dict[str, str] | None:
+        return None
+
+    def has_proxy_session_extra_http_headers(self, extra_http_headers: dict[str, str] | None) -> bool:
+        return False
+
+    def merge_proxy_session_extra_http_headers(
+        self,
+        extra_http_headers: dict[str, str] | None,
+        proxy_session_id: str | None,
+    ) -> dict[str, str] | None:
+        proxy_session_headers = self.build_proxy_session_extra_http_headers(proxy_session_id)
+        if not proxy_session_headers:
+            return extra_http_headers
+
+        headers = dict(extra_http_headers or {})
+        for key, value in proxy_session_headers.items():
+            headers.setdefault(key, value)
+        return headers
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 

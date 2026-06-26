@@ -34,7 +34,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Any
 
 import pyotp
 import structlog
@@ -121,6 +121,9 @@ from skyvern.schemas.credential_folders import (
     CredentialFolderUpdate,
     UpdateCredentialFolderRequest,
 )
+from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
+from skyvern.schemas.proxy_pinning import redact_proxy_session_id
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     LoginBlockYAML,
@@ -516,42 +519,7 @@ async def create_credential(
         # Early resyncing the Bitwarden vault
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
 
-    if data.credential_type == CredentialType.PASSWORD:
-        credential_response = PasswordCredentialResponse(
-            username=data.credential.username,
-            totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
-            totp_identifier=data.credential.totp_identifier if hasattr(data.credential, "totp_identifier") else None,
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=data.credential_type,
-            name=data.name,
-            vault_type=credential.vault_type,
-        )
-    elif data.credential_type == CredentialType.CREDIT_CARD:
-        credential_response = CreditCardCredentialResponse(
-            last_four=data.credential.card_number[-4:],
-            brand=data.credential.card_brand,
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=data.credential_type,
-            name=data.name,
-            vault_type=credential.vault_type,
-        )
-    elif data.credential_type == CredentialType.SECRET:
-        credential_response = SecretCredentialResponse(secret_label=data.credential.secret_label)
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=data.credential_type,
-            name=data.name,
-            vault_type=credential.vault_type,
-        )
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
+    return _convert_to_response(credential)
 
 
 LOGIN_TEST_PROMPT = (
@@ -675,17 +643,26 @@ async def rename_credential(
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    update_kwargs: dict = {
+    update_kwargs: dict[str, Any] = {
         "credential_id": credential_id,
         "organization_id": current_org.organization_id,
-        "name": data.name,
     }
+    if "name" in data.model_fields_set:
+        update_kwargs["name"] = data.name
     if data.tested_url is not None:
         update_kwargs["tested_url"] = data.tested_url
     if data.user_context is not None:
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
         update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
+    _apply_proxy_pin_update(
+        update_kwargs,
+        proxy_location_was_set="proxy_location" in data.model_fields_set,
+        proxy_location=data.proxy_location,
+        proxy_session_id_was_set="proxy_session_id" in data.model_fields_set,
+        proxy_session_id=data.proxy_session_id,
+        rotate_proxy_session_id=data.rotate_proxy_session_id,
+    )
     updated = await app.DATABASE.credentials.update_credential(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
@@ -745,6 +722,19 @@ async def test_login(
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
 
     credential_id = credential.credential_id
+    if "proxy_location" in data.model_fields_set or "proxy_session_id" in data.model_fields_set:
+        update_kwargs: dict[str, Any] = {
+            "credential_id": credential_id,
+            "organization_id": organization_id,
+        }
+        _apply_proxy_pin_update(
+            update_kwargs,
+            proxy_location_was_set="proxy_location" in data.model_fields_set,
+            proxy_location=data.proxy_location,
+            proxy_session_id_was_set="proxy_session_id" in data.model_fields_set,
+            proxy_session_id=data.proxy_session_id,
+        )
+        credential = await app.DATABASE.credentials.update_credential(**update_kwargs)
 
     LOG.info(
         "Testing login with inline credentials",
@@ -798,7 +788,16 @@ async def test_login(
             request=workflow_create_request,
         )
 
-        run_request = WorkflowRequestBody()
+        credential_proxy_session_id = getattr(credential, "proxy_session_id", None)
+        if credential_proxy_session_id:
+            run_request = WorkflowRequestBody(
+                proxy_location=getattr(credential, "proxy_location", None) or ProxyLocation.RESIDENTIAL_ISP,
+                extra_http_headers=app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(
+                    credential_proxy_session_id
+                ),
+            )
+        else:
+            run_request = WorkflowRequestBody()
 
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -984,7 +983,15 @@ async def test_credential(
         # Boot fresh (don't seed the saved profile): a reused profile is loaded read-only and the
         # refreshed session would never persist. A fresh login persists via the normal session path,
         # which the saver then writes onto existing_browser_profile_id.
-        run_request = WorkflowRequestBody()
+        if credential.proxy_session_id:
+            run_request = WorkflowRequestBody(
+                proxy_location=credential.proxy_location or ProxyLocation.RESIDENTIAL_ISP,
+                extra_http_headers=app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(
+                    credential.proxy_session_id
+                ),
+            )
+        else:
+            run_request = WorkflowRequestBody()
 
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -1396,7 +1403,16 @@ async def _create_browser_profile_after_workflow(
 
             # Re-save overwrites the existing profile in place so references to its id keep
             # working; a first-time save (or a since-deleted profile) creates a new one.
+            credential = await app.DATABASE.credentials.get_credential(
+                credential_id=credential_id,
+                organization_id=organization_id,
+            )
+            proxy_location = credential.proxy_location if credential else None
+            proxy_session_id = credential.proxy_session_id if credential else None
+            credential_has_proxy_pin = proxy_session_id is not None
+
             target_profile_id = existing_browser_profile_id
+            existing_profile = None
             reused_existing = False
             if target_profile_id:
                 existing_profile = await app.DATABASE.browser_sessions.get_browser_profile(
@@ -1407,13 +1423,33 @@ async def _create_browser_profile_after_workflow(
                 if not reused_existing:
                     target_profile_id = None
 
+            should_update_existing_profile_pin = False
             if not target_profile_id:
                 profile = await app.DATABASE.browser_sessions.create_browser_profile(
                     organization_id=organization_id,
                     name=f"Profile - {credential_name} ({credential_id})",
                     description=f"Browser profile from credential test for {credential_name}",
+                    proxy_location=proxy_location,
+                    proxy_session_id=proxy_session_id,
                 )
                 target_profile_id = profile.browser_profile_id
+            else:
+                should_update_existing_profile_pin = credential_has_proxy_pin
+                existing_profile_proxy_session_id = getattr(existing_profile, "proxy_session_id", None)
+                if (
+                    existing_profile_proxy_session_id
+                    and proxy_session_id
+                    and existing_profile_proxy_session_id != proxy_session_id
+                ):
+                    should_update_existing_profile_pin = False
+                    LOG.warning(
+                        "Skipping credential proxy pin mirror because linked browser profile already has a different pin",
+                        credential_id=credential_id,
+                        browser_profile_id=target_profile_id,
+                        organization_id=organization_id,
+                        credential_proxy_session_id=redact_proxy_session_id(proxy_session_id),
+                        browser_profile_proxy_session_id=redact_proxy_session_id(existing_profile_proxy_session_id),
+                    )
 
             # Overwrites in place when reusing an existing id.
             await app.STORAGE.store_browser_profile(
@@ -1422,6 +1458,13 @@ async def _create_browser_profile_after_workflow(
                 directory=session_dir,
             )
             if reused_existing:
+                if should_update_existing_profile_pin:
+                    await app.DATABASE.browser_sessions.update_browser_profile(
+                        profile_id=target_profile_id,
+                        organization_id=organization_id,
+                        proxy_location=proxy_location,
+                        proxy_session_id=proxy_session_id,
+                    )
                 # Bump modified_at so the status poll can tell this run's re-save actually landed.
                 await app.DATABASE.browser_sessions.touch_browser_profile(
                     profile_id=target_profile_id,
@@ -2778,6 +2821,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
             folder_id=credential.folder_id,
+            proxy_location=credential.proxy_location,
+            proxy_session_id=credential.proxy_session_id,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -2795,6 +2840,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
             folder_id=credential.folder_id,
+            proxy_location=credential.proxy_location,
+            proxy_session_id=credential.proxy_session_id,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -2809,6 +2856,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
             folder_id=credential.folder_id,
+            proxy_location=credential.proxy_location,
+            proxy_session_id=credential.proxy_session_id,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")

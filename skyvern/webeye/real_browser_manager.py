@@ -23,6 +23,15 @@ from skyvern.webeye.video_utils import finalize_webm
 LOG = structlog.get_logger()
 
 
+def _merge_proxy_session_headers(
+    extra_http_headers: dict[str, str] | None,
+    proxy_session_id: str | None,
+) -> dict[str, str] | None:
+    if not proxy_session_id:
+        return extra_http_headers
+    return app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(extra_http_headers, proxy_session_id)
+
+
 class RealBrowserManager(BrowserManager):
     def __init__(self) -> None:
         self.pages: dict[str, BrowserState] = {}
@@ -120,20 +129,23 @@ class RealBrowserManager(BrowserManager):
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
 
+        proxy_location = task.proxy_location
+        extra_http_headers = task.extra_http_headers
         if browser_state is None:
             LOG.info("Creating browser state for task", task_id=task.task_id)
-            proxy_location = task.proxy_location
             if browser_session_id and task.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
-                if session and session.proxy_location is not None:
-                    proxy_location = session.proxy_location
+                if session:
+                    if session.proxy_location is not None:
+                        proxy_location = session.proxy_location
+                    extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=task.url,
                 task_id=task.task_id,
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
-                extra_http_headers=task.extra_http_headers,
+                extra_http_headers=extra_http_headers,
                 cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
             )
@@ -152,11 +164,11 @@ class RealBrowserManager(BrowserManager):
         # This will make sure browser_state.page is not None.
         await browser_state.get_or_create_page(
             url=task.url,
-            proxy_location=task.proxy_location,
+            proxy_location=proxy_location,
             task_id=task.task_id,
             workflow_permanent_id=task.workflow_permanent_id,
             organization_id=task.organization_id,
-            extra_http_headers=task.extra_http_headers,
+            extra_http_headers=extra_http_headers,
             cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
         )
@@ -235,26 +247,29 @@ class RealBrowserManager(BrowserManager):
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
+        proxy_location = workflow_run.proxy_location
+        extra_http_headers = workflow_run.extra_http_headers
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
                 sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            proxy_location = workflow_run.proxy_location
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
                     browser_session_id, workflow_run.organization_id
                 )
-                if session and session.proxy_location is not None:
-                    proxy_location = session.proxy_location
+                if session:
+                    if session.proxy_location is not None:
+                        proxy_location = session.proxy_location
+                    extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 organization_id=workflow_run.organization_id,
-                extra_http_headers=workflow_run.extra_http_headers,
+                extra_http_headers=extra_http_headers,
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
@@ -281,11 +296,11 @@ class RealBrowserManager(BrowserManager):
         # script) performs the first goto itself, avoiding a redundant page load.
         await browser_state.get_or_create_page(
             url=url if navigate else None,
-            proxy_location=workflow_run.proxy_location,
+            proxy_location=proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,
             organization_id=workflow_run.organization_id,
-            extra_http_headers=workflow_run.extra_http_headers,
+            extra_http_headers=extra_http_headers,
             cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
