@@ -373,7 +373,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
   });
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col gap-4">
+    <div className="flex h-full min-h-0 w-full min-w-0 flex-col gap-4">
       <div className="relative">
         <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
           <MagnifyingGlassIcon className="size-5" />

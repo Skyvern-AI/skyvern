@@ -20,6 +20,8 @@ import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import { WorkflowApiResponse } from "../../types/workflowTypes";
 import { WorkflowActions } from "../../WorkflowActions";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
@@ -72,6 +74,8 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     handleIconClick,
   } = useWorkflowsListContext();
   const studioEnabled = useWorkflowStudioEnabled();
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
 
   const parameterItems = (workflow.workflow_definition?.parameters ?? [])
     .filter((p) => p.parameter_type !== "output")
@@ -186,7 +190,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                 </TooltipProvider>
               )}
             </div>
-            {workflowTags && workflowTags.length > 0 ? (
+            {taggingEnabled && workflowTags && workflowTags.length > 0 ? (
               <TagChipList
                 tags={workflowTags}
                 descriptions={tagDescriptions}
@@ -251,14 +255,16 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     <TooltipContent>Assign to Folder</TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
-                <WorkflowTagEditor
-                  workflowPermanentId={workflow.workflow_permanent_id}
-                  tags={workflowTags ?? []}
-                  tagKeys={tagKeys}
-                  labelSuggestions={labelSuggestions}
-                  valueSuggestionsByKey={valueSuggestionsByKey}
-                  colorMap={tagColors}
-                />
+                {taggingEnabled ? (
+                  <WorkflowTagEditor
+                    workflowPermanentId={workflow.workflow_permanent_id}
+                    tags={workflowTags ?? []}
+                    tagKeys={tagKeys}
+                    labelSuggestions={labelSuggestions}
+                    valueSuggestionsByKey={valueSuggestionsByKey}
+                    colorMap={tagColors}
+                  />
+                ) : null}
               </>
             )}
             <TooltipProvider>
