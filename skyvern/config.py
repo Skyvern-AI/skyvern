@@ -792,6 +792,15 @@ class Settings(BaseSettings):
                 "label": "Anthropic Claude Fable 5",
             }
 
+        try:
+            from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415
+                get_custom_llm_model_mappings,
+            )
+
+            mapping.update(get_custom_llm_model_mappings())
+        except Exception:
+            LOG.warning("Failed to load custom LLM model mappings", exc_info=True)
+
         return mapping
 
     def model_post_init(self, __context: Any) -> None:  # type: ignore[override]

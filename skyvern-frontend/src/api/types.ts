@@ -454,6 +454,47 @@ export interface CustomCredentialServiceConfigResponse {
   token: CustomCredentialServiceOrganizationAuthToken;
 }
 
+export type CustomLLMProvider = "openai_compatible" | "ollama" | "openrouter";
+
+export interface CustomLLMConfig {
+  display_name: string;
+  provider: CustomLLMProvider;
+  model_name: string;
+  api_base?: string | null;
+  api_key?: string | null;
+  api_version?: string | null;
+  supports_vision: boolean;
+  add_assistant_prefix: boolean;
+  max_completion_tokens?: number | null;
+  temperature?: number | null;
+  reasoning_effort?: string | null;
+}
+
+export interface CustomLLM {
+  id: string;
+  organization_id: string;
+  config: CustomLLMConfig;
+  created_at: string;
+  modified_at: string;
+  valid: boolean;
+}
+
+export interface CustomLLMListResponse {
+  custom_llms: CustomLLM[];
+}
+
+export interface CustomLLMResponse {
+  custom_llm: CustomLLM;
+}
+
+export interface CustomLLMCreateRequest {
+  config: CustomLLMConfig;
+}
+
+export interface CustomLLMUpdateRequest {
+  config: CustomLLMConfig;
+}
+
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",

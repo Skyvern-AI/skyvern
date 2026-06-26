@@ -10,6 +10,7 @@ from fastapi import BackgroundTasks, HTTPException
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 
@@ -90,6 +91,59 @@ async def test_get_runs_v2_rejects_search_page_beyond_fetch_cap(monkeypatch: pyt
     assert exc_info.value.status_code == 400
     assert str(MAX_SEARCH_FETCH_LIMIT) in exc_info.value.detail
     mock_workflow_runs.get_all_runs_v2.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_task_v2_passes_selected_model_to_initializer(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected_model = {"model_name": "custom/oat_custom_1"}
+    created_at = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    task_v2 = SimpleNamespace(
+        observer_cruise_id="tsk_v2_123",
+        url="https://example.com",
+        model=selected_model,
+        model_dump=lambda by_alias=True: {
+            "task_id": "tsk_v2_123",
+            "url": "https://example.com",
+            "model": selected_model,
+            "created_at": created_at.isoformat(),
+        },
+    )
+
+    mock_rate_limiter = SimpleNamespace(rate_limit_submit_run=AsyncMock())
+    mock_permission_checker = SimpleNamespace(check=AsyncMock())
+    executor = SimpleNamespace(execute_task_v2=AsyncMock())
+    initialize_task_v2 = AsyncMock(return_value=task_v2)
+
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(app_instance, "RATE_LIMITER", mock_rate_limiter, raising=False)
+    monkeypatch.setattr(
+        agent_protocol.PermissionCheckerFactory,
+        "get_instance",
+        lambda: mock_permission_checker,
+    )
+    monkeypatch.setattr(agent_protocol.AsyncExecutorFactory, "get_executor", lambda: executor)
+    monkeypatch.setattr(agent_protocol.task_v2_service, "initialize_task_v2", initialize_task_v2)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    response = await agent_protocol.run_task_v2(
+        request=SimpleNamespace(),
+        background_tasks=BackgroundTasks(),
+        data=TaskV2Request(
+            user_prompt="Use the selected custom model",
+            url="https://example.com",
+            model=selected_model,
+            workflow_system_prompt="Stay terse.",
+            run_with="agent",
+        ),
+        organization=SimpleNamespace(organization_id="org_123"),
+    )
+
+    initialize_task_v2.assert_awaited_once()
+    assert initialize_task_v2.await_args.kwargs["model"] == selected_model
+    assert initialize_task_v2.await_args.kwargs["workflow_system_prompt"] == "Stay terse."
+    assert initialize_task_v2.await_args.kwargs["run_with"] == "agent"
+    executor.execute_task_v2.assert_awaited_once()
+    assert response["model"] == selected_model
 
 
 @pytest.mark.asyncio

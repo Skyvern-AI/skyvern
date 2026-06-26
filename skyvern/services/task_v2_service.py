@@ -96,6 +96,10 @@ NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS = 2000
 NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS = 10 * NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS
 
 
+def _get_task_v2_llm_api_handler(task_v2: TaskV2) -> Any:
+    return LLMAPIHandlerFactory.get_override_llm_api_handler(task_v2.llm_key, default=app.LLM_API_HANDLER)
+
+
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
     return {
         "type": "object",
@@ -157,7 +161,7 @@ async def _summarize_max_steps_failure_reason(
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
-        json_response = await app.LLM_API_HANDLER(
+        json_response = await _get_task_v2_llm_api_handler(task_v2)(
             prompt=prompt,
             screenshots=screenshots,
             prompt_name="task_v2_summarize-max-steps-reason",
@@ -403,7 +407,7 @@ async def initialize_task_v2_metadata(
         current_browser_url=current_browser_url or "about:blank",
         user_url=user_url,
     )
-    metadata_response = await app.LLM_API_HANDLER(
+    metadata_response = await _get_task_v2_llm_api_handler(task_v2)(
         prompt=metadata_prompt,
         thought=thought,
         prompt_name="task_v2_generate_metadata",
@@ -869,9 +873,7 @@ async def run_task_v2_helper(
                 thought_type=ThoughtType.plan,
                 thought_scenario=ThoughtScenario.generate_plan,
             )
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task_v2.llm_key, default=app.LLM_API_HANDLER
-            )
+            llm_api_handler = _get_task_v2_llm_api_handler(task_v2)
             task_v2_response = await llm_api_handler(
                 prompt=task_v2_prompt,
                 screenshots=scraped_page.screenshots,
@@ -1149,7 +1151,7 @@ async def run_task_v2_helper(
                 thought_type=ThoughtType.user_goal_check,
                 thought_scenario=ThoughtScenario.user_goal_check,
             )
-            completion_resp = await app.LLM_API_HANDLER(
+            completion_resp = await _get_task_v2_llm_api_handler(task_v2)(
                 prompt=task_v2_completion_prompt,
                 screenshots=completion_screenshots,
                 thought=thought,
@@ -1547,7 +1549,7 @@ async def _generate_loop_task(
         thought_type=ThoughtType.internal_plan,
         thought_scenario=ThoughtScenario.generate_task_in_loop,
     )
-    task_in_loop_metadata_response = await app.LLM_API_HANDLER(
+    task_in_loop_metadata_response = await _get_task_v2_llm_api_handler(task_v2)(
         task_in_loop_metadata_prompt,
         screenshots=scraped_page.screenshots,
         thought=thought_task_in_loop,
@@ -1654,7 +1656,7 @@ async def _generate_extraction_task(
     generate_extraction_task_response: dict[str, Any] | None = None
     for attempt in range(max_retries):
         try:
-            generate_extraction_task_response = await app.LLM_API_HANDLER(
+            generate_extraction_task_response = await _get_task_v2_llm_api_handler(task_v2)(
                 generate_extraction_task_prompt,
                 task_v2=task_v2,
                 prompt_name="task_v2_generate_extraction_task",
@@ -2179,7 +2181,7 @@ async def _generate_task_v2_deliverable(
         is_partial=is_partial,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
-    task_v2_summary_resp = await app.LLM_API_HANDLER(
+    task_v2_summary_resp = await _get_task_v2_llm_api_handler(task_v2)(
         prompt=task_v2_summary_prompt,
         screenshots=screenshots,
         thought=thought,

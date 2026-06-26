@@ -2205,7 +2205,7 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         params: dict[str, Any] = {}
-        if not llm_config.model_name.startswith("ollama/"):
+        if not llm_config.model_name.startswith(("ollama/", "ollama_chat/")):
             # OLLAMA does not support max_completion_tokens
             if llm_config.max_completion_tokens is not None:
                 params["max_completion_tokens"] = llm_config.max_completion_tokens
@@ -2295,9 +2295,10 @@ class LLMCaller:
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         if openrouter_model_name:
             self.llm_key = openrouter_model_name.replace("openrouter/", "")
+            litellm_params = self.llm_config.litellm_params if isinstance(self.llm_config, LLMConfig) else None
             self.openai_client = AsyncOpenAI(
-                api_key=settings.OPENROUTER_API_KEY,
-                base_url=settings.OPENROUTER_API_BASE,
+                api_key=(litellm_params or {}).get("api_key") or settings.OPENROUTER_API_KEY,
+                base_url=(litellm_params or {}).get("api_base") or settings.OPENROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():

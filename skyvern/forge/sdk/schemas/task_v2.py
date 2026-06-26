@@ -215,6 +215,7 @@ class TaskV2Request(BaseModel):
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
+    model: dict[str, Any] | None = Field(default=None, description="The LLM model configuration for this task.")
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None

@@ -443,6 +443,7 @@ async def run_task(
                 browser_session_id=run_request.browser_session_id,
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
+                model=task_v2.model,
                 publish_workflow=run_request.publish_workflow,
                 max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
@@ -4599,11 +4600,14 @@ async def run_task_v2(
             create_task_run=True,
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
+            workflow_system_prompt=data.workflow_system_prompt,
+            model=data.model,
             max_screenshot_scrolling_times=data.max_screenshot_scrolls,
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
             cdp_connect_headers=data.cdp_connect_headers,
             browser_address=data.browser_address,
+            run_with=data.run_with,
             trigger_type=legacy_v2_trigger_type,
         )
     except MissingBrowserAddressError as e:
