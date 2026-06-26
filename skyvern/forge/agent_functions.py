@@ -708,12 +708,14 @@ class AgentFunction:
         workflow_run_context: "WorkflowRunContext",
         organization_id: str | None,
         block_label: str | None,
+        browser_session_id: str | None,
     ) -> bool:
         """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
 
         Gating lives here, at the block-execution call site, rather than inside
         execute_code_block_override so the override only runs the runner. OSS has no
-        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED.
+        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
+        only routes runs that have a browser session for the runner to broker against.
         """
         return False
 

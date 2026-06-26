@@ -44,6 +44,7 @@ import {
   useNodesInitialized,
   useReactFlow,
   NodeChange,
+  NodeDimensionChange,
   EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -123,6 +124,11 @@ import {
   upgradeWorkflowDefinitionToVersionTwo,
   getWorkflowErrors,
 } from "./workflowEditorUtils";
+import {
+  createDimensionConvergenceState,
+  processDimensionChanges,
+  resetDimensionConvergence,
+} from "./dimensionConvergence";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
@@ -600,6 +606,13 @@ function FlowRenderer({
   // Track if we're currently in a layout operation to prevent infinite loops
   const isLayoutingRef = useRef(false);
 
+  // Bounds the dimension->layout feedback cycle (React error #185) when a
+  // ResizeObserver oscillation re-arms layout faster than the rAF guard resets.
+  const dimensionConvergenceRef = useRef(createDimensionConvergenceState());
+
+  // Ensures the targeted-block status-row relayout runs once per focus.
+  const lastLaidOutTargetLabelRef = useRef<string | undefined>(undefined);
+
   useEffect(() => {
     if (nodesInitialized) {
       setShouldConstrainPan(true);
@@ -702,18 +715,32 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
 
-  // Re-layout when the targetted block changes to account for the status row
+  // Re-layout when the targeted block changes to account for the status row
   // that appears when a block is being debugged
   useEffect(() => {
-    if (nodesInitialized && targettedBlockLabel) {
+    // Clear the focus marker when focus is removed (e.g. navigating from
+    // /:run/:label/build back to /build) so re-focusing the same label later
+    // still triggers the status-row relayout and budget reset.
+    if (!targettedBlockLabel) {
+      lastLaidOutTargetLabelRef.current = undefined;
+      return;
+    }
+    if (
+      nodesInitialized &&
+      lastLaidOutTargetLabelRef.current !== targettedBlockLabel
+    ) {
+      // A new focus is a genuine change, so re-arm the convergence budget that
+      // the previous block's status-row resize may have exhausted.
+      lastLaidOutTargetLabelRef.current = targettedBlockLabel;
+      resetDimensionConvergence(dimensionConvergenceRef.current);
       doLayout(nodes, edges);
     }
-    // Re-layout only when the targetted (debugged) block label changes.
+    // Re-layout only when the targeted (debugged) block label changes.
     // nodes/edges/doLayout intentionally omitted: a normal edit already
     // triggers its own layout pass, and re-running here would fight the
     // user's interactive position changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targettedBlockLabel]);
+  }, [targettedBlockLabel, nodesInitialized]);
 
   // Re-layout when a loop node's header height changes (e.g., data schema toggled)
   useEffect(() => {
@@ -1774,41 +1801,40 @@ function FlowRenderer({
                 nodes={nodes}
                 edges={edges}
                 onNodesChange={(changes) => {
+                  // User drag-drop. `dragging === false` fires once at the end
+                  // of a drag gesture. Programmatic position updates (mount-time
+                  // layout, setNodes from node components) leave `dragging`
+                  // undefined, so this filter doesn't falsely trip for them.
+                  const hasStructuralChange = changes.some(
+                    (change) =>
+                      change.type === "add" ||
+                      change.type === "remove" ||
+                      change.type === "replace" ||
+                      (change.type === "position" && change.dragging === false),
+                  );
+
+                  // A genuine structural edit re-arms the convergence budget so
+                  // a real resize that follows isn't starved by a prior loop.
+                  if (hasStructuralChange) {
+                    resetDimensionConvergence(dimensionConvergenceRef.current);
+                  }
+
                   const dimensionChanges = changes.filter(
-                    (change) => change.type === "dimensions",
+                    (change): change is NodeDimensionChange =>
+                      change.type === "dimensions",
                   );
 
                   // Only process dimension changes if we're not already in a layout operation
                   // This prevents infinite loops (React error #185) during copy-paste
                   if (dimensionChanges.length > 0 && !isLayoutingRef.current) {
-                    const tempNodes = [...nodes];
-                    let hasActualChanges = false;
-
-                    dimensionChanges.forEach((change) => {
-                      const node = tempNodes.find(
-                        (node) => node.id === change.id,
+                    const { nodes: tempNodes, shouldLayout } =
+                      processDimensionChanges(
+                        nodes,
+                        dimensionChanges,
+                        dimensionConvergenceRef.current,
                       );
-                      if (node) {
-                        const newWidth = change.dimensions?.width;
-                        const newHeight = change.dimensions?.height;
 
-                        // Only update if dimensions actually changed
-                        if (
-                          node.measured?.width !== newWidth ||
-                          node.measured?.height !== newHeight
-                        ) {
-                          hasActualChanges = true;
-                          node.measured = {
-                            ...node.measured,
-                            width: newWidth,
-                            height: newHeight,
-                          };
-                        }
-                      }
-                    });
-
-                    // Only trigger layout if there were actual dimension changes
-                    if (hasActualChanges) {
+                    if (shouldLayout) {
                       debouncedLayoutForDimensions(tempNodes, edges);
                     }
                   }
@@ -1822,20 +1848,7 @@ function FlowRenderer({
                     !readOnly &&
                     !isInitialLoadRef.current &&
                     internalUpdateCount === 0 &&
-                    changes.some((change) => {
-                      return (
-                        change.type === "add" ||
-                        change.type === "remove" ||
-                        change.type === "replace" ||
-                        // User drag-drop. `dragging === false` fires once at the
-                        // end of a drag gesture. Programmatic position updates
-                        // (mount-time layout, setNodes from node components)
-                        // leave `dragging` undefined, so this filter doesn't
-                        // falsely trip for them.
-                        (change.type === "position" &&
-                          change.dragging === false)
-                      );
-                    })
+                    hasStructuralChange
                   ) {
                     workflowChangesStore.setHasChanges(true);
                   }

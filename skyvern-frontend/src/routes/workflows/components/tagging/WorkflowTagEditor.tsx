@@ -1,5 +1,10 @@
 import * as React from "react";
-import { PlusIcon, ReloadIcon, TokensIcon } from "@radix-ui/react-icons";
+import {
+  ChevronRightIcon,
+  PlusIcon,
+  ReloadIcon,
+  TokensIcon,
+} from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -36,13 +41,122 @@ import {
 } from "../../types/tagTypes";
 import { useApplyWorkflowTagsMutation } from "../../hooks/useWorkflowTagMutations";
 import {
+  paletteDotClass,
   randomPaletteColor,
   tagColorFor,
   type PaletteColorName,
   type TagColorMap,
 } from "../../types/tagColors";
+import { cn } from "@/util/utils";
 import { TagChip } from "./TagChip";
 import { TagColorSwatchPicker } from "./TagColorSwatchPicker";
+
+const MICRO_LABEL = "text-[10px] font-medium uppercase tracking-wider";
+
+// One half of the tag anatomy: a captioned cell that reads "filled" (the part
+// the entry actually creates) or "empty" (the part it leaves blank), so the
+// group/value split is visible structure rather than prose.
+function AnatomyCell({
+  part,
+  value,
+  placeholder,
+  dotClass,
+}: {
+  part: string;
+  value: string | null;
+  placeholder: string;
+  dotClass?: string;
+}) {
+  const filled = value !== null && value !== "";
+  return (
+    <div className="min-w-0 flex-1 space-y-1">
+      <div className={cn(MICRO_LABEL, "text-muted-foreground")}>{part}</div>
+      <div
+        className={cn(
+          "flex h-7 items-center gap-1.5 rounded-md border px-2 text-sm",
+          filled
+            ? "bg-secondary text-secondary-foreground"
+            : "border-dashed text-muted-foreground",
+        )}
+      >
+        {dotClass ? (
+          <span
+            aria-hidden="true"
+            className={cn("h-2 w-2 shrink-0 rounded-full", dotClass)}
+          />
+        ) : null}
+        <span className="truncate">{filled ? value : placeholder}</span>
+      </div>
+    </div>
+  );
+}
+
+// Live anatomy of the tag the current input will create: a Label|Group mode
+// strip plus the two labeled halves (group filled + colored vs. an empty "no
+// group" slot), so a value-only label and a grouped one are unmistakable.
+function TagCreatePreview({
+  groupName,
+  labelValue,
+  isGroupMode,
+  colorDotClass,
+}: {
+  groupName: string | null;
+  labelValue: string | null;
+  isGroupMode: boolean;
+  colorDotClass: string;
+}) {
+  return (
+    <div className="space-y-2.5">
+      {/* Visual reinforcement only — the mode is conveyed in text by the
+          anatomy cells below, so hide the decorative segments from SR. */}
+      <div
+        aria-hidden="true"
+        className="inline-flex rounded-md bg-muted p-0.5 text-[11px] font-medium"
+      >
+        <span
+          className={cn(
+            "rounded px-2 py-0.5",
+            isGroupMode
+              ? "text-muted-foreground"
+              : "bg-background text-foreground shadow-sm",
+          )}
+        >
+          Label
+        </span>
+        <span
+          className={cn(
+            "rounded px-2 py-0.5",
+            isGroupMode
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground",
+          )}
+        >
+          Group
+        </span>
+      </div>
+      <div className="flex items-end gap-1.5">
+        <AnatomyCell
+          part="Group"
+          value={isGroupMode ? groupName : null}
+          placeholder="no group"
+          dotClass={isGroupMode ? colorDotClass : ""}
+        />
+        <ChevronRightIcon
+          aria-hidden="true"
+          className={cn(
+            "mb-1.5 h-4 w-4 shrink-0",
+            isGroupMode ? "text-muted-foreground" : "text-muted-foreground/40",
+          )}
+        />
+        <AnatomyCell
+          part="Label"
+          value={labelValue}
+          placeholder="type a label"
+        />
+      </div>
+    </div>
+  );
+}
 
 type Props = {
   workflowPermanentId: string;
@@ -183,6 +297,10 @@ function WorkflowTagEditor({
   // group; otherwise suggest groups (to start a grouped tag) and labels.
   const { typedKey, typedValuePartial } = parseTypedTagQuery(trimmedQuery);
 
+  // A group key can be present before the value completes the candidate, so the
+  // mode follows the typed key, not only a finished candidate.
+  const isGroupMode = isGroupedCandidate || typedKey !== null;
+
   const groupSuggestions =
     typedKey === null
       ? tagKeys
@@ -264,17 +382,31 @@ function WorkflowTagEditor({
               }
             }}
           />
-          {showAdd && isGroupedCandidate ? (
-            <div className="border-b px-3 py-2">
-              <div className="mb-1.5 text-xs text-muted-foreground">Color</div>
-              <TagColorSwatchPicker
-                value={selectedColor}
-                onChange={setSelectedColor}
+          {candidate !== null || typedKey !== null ? (
+            <div className="space-y-3 border-b px-3 py-3">
+              <TagCreatePreview
+                groupName={candidate?.key ?? typedKey}
+                labelValue={candidate?.value ?? null}
+                isGroupMode={isGroupMode}
+                colorDotClass={paletteDotClass(selectedColor)}
               />
+              {isGroupMode ? (
+                <div className="space-y-1.5">
+                  <div className={cn(MICRO_LABEL, "text-muted-foreground")}>
+                    Color
+                  </div>
+                  <TagColorSwatchPicker
+                    value={selectedColor}
+                    onChange={setSelectedColor}
+                  />
+                </div>
+              ) : null}
             </div>
           ) : null}
           <CommandList>
-            <CommandEmpty>Type a label or group:label.</CommandEmpty>
+            <CommandEmpty>
+              Type a label, or group:label to file it under a group.
+            </CommandEmpty>
             {showAdd && candidate ? (
               <CommandGroup>
                 <CommandItem
@@ -291,11 +423,13 @@ function WorkflowTagEditor({
                   ) : (
                     <PlusIcon className="mr-2 h-4 w-4" />
                   )}
-                  Add “
-                  {candidate.key !== null
-                    ? `${candidate.key}: ${candidate.value}`
-                    : candidate.value}
-                  ”
+                  {isGroupedCandidate ? (
+                    <>
+                      Add “{candidate.value}” to {candidate.key}
+                    </>
+                  ) : (
+                    <>Add label “{candidate.value}”</>
+                  )}
                 </CommandItem>
               </CommandGroup>
             ) : null}
