@@ -15,6 +15,7 @@ import {
   ReaderIcon,
   ReloadIcon,
   Share1Icon,
+  TokensIcon,
 } from "@radix-ui/react-icons";
 
 import { BagIcon } from "@/components/icons/BagIcon";
@@ -267,6 +268,11 @@ function SideNav({ collapsed }: Props = {}) {
           label: "General",
           to: "/settings",
           icon: <GearIcon className="size-3.5" />,
+        },
+        {
+          label: "Labels",
+          to: "/settings/labels",
+          icon: <TokensIcon className="size-3.5" />,
         },
       ],
     },

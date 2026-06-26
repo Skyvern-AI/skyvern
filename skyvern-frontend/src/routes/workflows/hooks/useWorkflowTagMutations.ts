@@ -3,7 +3,13 @@ import { isAxiosError } from "axios";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
-import type { TagApplyRequest, TagKey, TagsResponse } from "../types/tagTypes";
+import type {
+  TagApplyRequest,
+  TagKey,
+  TagsResponse,
+  TagValue,
+} from "../types/tagTypes";
+import type { PaletteColorName } from "../types/tagColors";
 
 // Tag writes put validation/conflict reasons in the FastAPI `detail` (422 cap/regex,
 // 409 concurrent write), so prefer it over the generic axios message.
@@ -118,8 +124,112 @@ function useDeleteTagKeyMutation() {
   });
 }
 
+// Grouped-label management lives on the (key, value) registry. Every route
+// carries the value in the BODY (so a value containing "/" can't break the path),
+// and delete is a DELETE-with-body — axios sends it via the `data` option.
+
+function useRenameTagValueMutation() {
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      key,
+      value,
+      newValue,
+    }: {
+      key: string;
+      value: string;
+      newValue: string;
+    }) => {
+      const client = await getClient(credentialGetter);
+      return client
+        .patch<TagValue>(`/tag-values/${encodeURIComponent(key)}/rename`, {
+          value,
+          new_value: newValue,
+        })
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      // Rename rewrites the value on every workflow carrying it, so refresh the
+      // registry, batch tags, and the (tag-filterable) workflows list.
+      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow-tags"] });
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+    },
+    // No global onError toast: the caller surfaces 409 (name-in-use) inline.
+  });
+}
+
+function useRecolorTagValueMutation() {
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      key,
+      value,
+      color,
+    }: {
+      key: string;
+      value: string;
+      color: PaletteColorName;
+    }) => {
+      const client = await getClient(credentialGetter);
+      return client
+        .patch<TagValue>(`/tag-values/${encodeURIComponent(key)}`, {
+          value,
+          color,
+        })
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
+    },
+    onError: (error: unknown) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to recolor label",
+        description: tagErrorMessage(error),
+      });
+    },
+  });
+}
+
+function useDeleteTagValueMutation() {
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ key, value }: { key: string; value: string }) => {
+      const client = await getClient(credentialGetter);
+      return client
+        .delete(`/tag-values/${encodeURIComponent(key)}`, { data: { value } })
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      // Cascade delete removes the label from every workflow; refresh the
+      // registry, batch tags, and the (tag-filterable) workflows list.
+      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow-tags"] });
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+    },
+    onError: (error: unknown) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to delete label",
+        description: tagErrorMessage(error),
+      });
+    },
+  });
+}
+
 export {
+  tagErrorMessage,
   useApplyWorkflowTagsMutation,
   useUpdateTagKeyMutation,
   useDeleteTagKeyMutation,
+  useRenameTagValueMutation,
+  useRecolorTagValueMutation,
+  useDeleteTagValueMutation,
 };

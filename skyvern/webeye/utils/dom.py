@@ -856,16 +856,18 @@ class SkyvernElement:
         try:
             return await self.move_mouse_to(page, timeout=timeout)
         except NoElementBoudingBox:
-            LOG.warning(
+            LOG.info(
                 "Failed to move mouse to the element - NoElementBoudingBox",
+                sampling=True,
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,
                 exc_info=True,
             )
         except ElementOutOfCurrentViewport:
-            LOG.warning(
+            LOG.info(
                 "Failed to move mouse to the element - ElementOutOfCurrentViewport",
+                sampling=True,
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,
