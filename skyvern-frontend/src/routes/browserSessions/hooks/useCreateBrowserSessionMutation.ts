@@ -19,12 +19,14 @@ function useCreateBrowserSessionMutation() {
   return useMutation({
     mutationFn: async ({
       proxyLocation = null,
+      proxySessionId = null,
       timeout = null,
       extensions = [],
       browserType = null,
       generateBrowserProfile = false,
     }: {
       proxyLocation: ProxyLocation | null;
+      proxySessionId?: string | null;
       timeout: number | null;
       extensions?: BrowserSessionExtension[];
       browserType?: BrowserSessionType | null;
@@ -35,6 +37,7 @@ function useCreateBrowserSessionMutation() {
         "/browser_sessions",
         {
           proxy_location: proxyLocation,
+          proxy_session_id: proxySessionId,
           timeout,
           extensions,
           browser_type: browserType,

@@ -24,11 +24,13 @@ import {
   type CreditCardBillingAddress,
   type CreditCardCredential,
   type CredentialApiResponse,
+  PINNED_RESIDENTIAL_ISP_PROXY_LOCATION,
   isPasswordCredential,
   isCreditCardCredential,
   isSecretCredential,
   type TestCredentialStatusResponse,
   type TestLoginResponse,
+  type ProxyLocation,
 } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -191,6 +193,19 @@ type Props = {
   ) => void;
 };
 
+type ProxyPinPayload = {
+  proxy_location: ProxyLocation | null;
+  proxy_session_id?: string | null;
+  rotate_proxy_session_id?: boolean;
+};
+
+function formatProxyIdentity(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  return `${value.slice(0, 3)}...${value.slice(-2)}`;
+}
+
 function CredentialsModal({
   onCredentialCreated,
   isOpen: controlledIsOpen,
@@ -246,6 +261,11 @@ function CredentialsModal({
   const [testAndSave, setTestAndSave] = useState(false);
   const [testUrl, setTestUrl] = useState("");
   const [userContext, setUserContext] = useState("");
+  const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
+  const [rotateProxyPin, setRotateProxyPin] = useState(false);
+  const existingProxyIdentity = formatProxyIdentity(
+    editingCredential?.proxy_session_id,
+  );
   const [testStatus, setTestStatus] = useState<
     "idle" | "testing" | "completed" | "failed" | "profile_failed"
   >("idle");
@@ -269,6 +289,30 @@ function CredentialsModal({
   // Guards against in-flight poll responses updating state after cancel/close
   const pollCancelledRef = useRef(false);
 
+  const getProxyPinPayload = useCallback((): ProxyPinPayload => {
+    if (!pinResidentialIspProxy) {
+      return {
+        proxy_location: null,
+        proxy_session_id: null,
+      };
+    }
+    return {
+      proxy_location: PINNED_RESIDENTIAL_ISP_PROXY_LOCATION,
+      ...(rotateProxyPin ? { rotate_proxy_session_id: true } : {}),
+    };
+  }, [pinResidentialIspProxy, rotateProxyPin]);
+
+  const hasProxyPinChanges = useCallback(() => {
+    if (!editingCredential) {
+      return pinResidentialIspProxy;
+    }
+    const existingPinEnabled = Boolean(editingCredential.proxy_session_id);
+    return (
+      pinResidentialIspProxy !== existingPinEnabled ||
+      (pinResidentialIspProxy && rotateProxyPin)
+    );
+  }, [editingCredential, pinResidentialIspProxy, rotateProxyPin]);
+
   // Captures save intent before mutation fires — testAndSave/testUrl may be
   // reset by the time onSuccess runs, so we snapshot them here.
   const saveIntentRef = useRef<{
@@ -277,12 +321,18 @@ function CredentialsModal({
     testUrl: string;
     userContext: string;
     name: string;
+    proxyLocation: ProxyLocation | null;
+    proxySessionId?: string | null;
+    proxyPinChanged: boolean;
   }>({
     shouldTestAfterSave: false,
     saveBrowserSessionIntent: false,
     testUrl: "",
     userContext: "",
     name: "",
+    proxyLocation: null,
+    proxySessionId: null,
+    proxyPinChanged: false,
   });
 
   // Cleanup polling on unmount
@@ -319,6 +369,8 @@ function CredentialsModal({
     passwordCredentialValues.totp_type,
     passwordCredentialValues.totp_identifier,
     testUrl,
+    pinResidentialIspProxy,
+    rotateProxyPin,
   ]);
 
   const formInitializedRef = useRef(false);
@@ -352,6 +404,8 @@ function CredentialsModal({
       if (editingCredential.user_context) {
         setUserContext(editingCredential.user_context);
       }
+      setPinResidentialIspProxy(Boolean(editingCredential.proxy_session_id));
+      setRotateProxyPin(false);
       if (isPasswordCredential(cred)) {
         setPasswordCredentialValues({
           name: editingCredential.name,
@@ -419,12 +473,17 @@ function CredentialsModal({
     pollErrorCountRef.current = 0;
     pollCancelledRef.current = false;
     setUserContext("");
+    setPinResidentialIspProxy(false);
+    setRotateProxyPin(false);
     saveIntentRef.current = {
       shouldTestAfterSave: false,
       saveBrowserSessionIntent: false,
       testUrl: "",
       userContext: "",
       name: "",
+      proxyLocation: null,
+      proxySessionId: null,
+      proxyPinChanged: false,
     };
     if (pollIntervalRef.current) {
       clearTimeout(pollIntervalRef.current);
@@ -561,6 +620,7 @@ function CredentialsModal({
   const startTest = useCallback(async () => {
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
+      const proxyPinPayload = getProxyPinPayload();
       const response = await client.post<TestLoginResponse>(
         `/credentials/test-login`,
         {
@@ -572,6 +632,7 @@ function CredentialsModal({
           totp_identifier:
             passwordCredentialValues.totp_identifier.trim() || null,
           user_context: userContext.trim() || null,
+          ...proxyPinPayload,
         },
       );
       const data = response.data;
@@ -619,6 +680,7 @@ function CredentialsModal({
     passwordCredentialValues,
     userContext,
     pollTestStatus,
+    getProxyPinPayload,
   ]);
 
   const createCredentialMutation = useMutation({
@@ -783,15 +845,23 @@ function CredentialsModal({
       tested_url,
       user_context,
       save_browser_session_intent,
+      proxy_location,
+      proxy_session_id,
+      rotate_proxy_session_id,
     }: {
       id: string;
       name: string;
       tested_url?: string;
       user_context?: string | null;
       save_browser_session_intent?: boolean;
+      proxy_location?: ProxyLocation | null;
+      proxy_session_id?: string | null;
+      rotate_proxy_session_id?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const body: Record<string, string | boolean | null> = { name };
+      const body: Record<string, string | boolean | ProxyLocation | null> = {
+        name,
+      };
       if (tested_url) {
         body.tested_url = tested_url;
       }
@@ -800,6 +870,15 @@ function CredentialsModal({
       }
       if (save_browser_session_intent !== undefined) {
         body.save_browser_session_intent = save_browser_session_intent;
+      }
+      if (proxy_location !== undefined) {
+        body.proxy_location = proxy_location;
+      }
+      if (proxy_session_id !== undefined) {
+        body.proxy_session_id = proxy_session_id;
+      }
+      if (rotate_proxy_session_id !== undefined) {
+        body.rotate_proxy_session_id = rotate_proxy_session_id;
       }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
@@ -834,20 +913,6 @@ function CredentialsModal({
     ? updateCredentialMutation
     : createCredentialMutation;
 
-  const handleRenameOnly = (name: string) => {
-    if (!editingCredential) return;
-    // Skip the API call if the name hasn't actually changed
-    if (name === editingCredential.name) {
-      reset();
-      setIsOpen(false);
-      return;
-    }
-    renameCredentialMutation.mutate({
-      id: editingCredential.credential_id,
-      name,
-    });
-  };
-
   const handleSave = () => {
     const name =
       type === CredentialModalTypes.PASSWORD
@@ -864,16 +929,25 @@ function CredentialsModal({
       return;
     }
 
+    const proxyPinPayload = getProxyPinPayload();
+    const proxyPinChanged = hasProxyPinChanges();
+    const credentialSaveProxyPinPayload =
+      !isEditMode || proxyPinChanged ? proxyPinPayload : {};
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
-      if (!editingGroups.name && !editingGroups.values) {
+      if (!editingGroups.name && !editingGroups.values && !proxyPinChanged) {
         // Nothing was edited — close silently
         reset();
         setIsOpen(false);
         return;
       }
-      if (editingGroups.name && !editingGroups.values) {
-        handleRenameOnly(name);
+      if (!editingGroups.values) {
+        renameCredentialMutation.mutate({
+          id: editingCredential.credential_id,
+          name,
+          ...(proxyPinChanged ? proxyPinPayload : {}),
+        });
         return;
       }
     }
@@ -906,6 +980,7 @@ function CredentialsModal({
           tested_url: url || undefined,
           user_context: ctx || null,
           save_browser_session_intent: true,
+          ...proxyPinPayload,
         });
         return;
       }
@@ -928,6 +1003,9 @@ function CredentialsModal({
         testUrl: testUrl.trim(),
         userContext: userContext.trim(),
         name,
+        proxyLocation: proxyPinPayload.proxy_location,
+        proxySessionId: proxyPinPayload.proxy_session_id,
+        proxyPinChanged,
       };
 
       activeMutation.mutate({
@@ -941,6 +1019,7 @@ function CredentialsModal({
           totp_identifier: totpIdentifier === "" ? null : totpIdentifier,
         },
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
+        ...credentialSaveProxyPinPayload,
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
       const cardNumber = creditCardCredentialValues.cardNumber.trim();
@@ -1016,11 +1095,22 @@ function CredentialsModal({
         ...(billingPhone ? { billing_phone: billingPhone } : {}),
         ...(metadata ? { metadata } : {}),
       };
+      saveIntentRef.current = {
+        shouldTestAfterSave: false,
+        saveBrowserSessionIntent: false,
+        testUrl: "",
+        userContext: "",
+        name,
+        proxyLocation: proxyPinPayload.proxy_location,
+        proxySessionId: proxyPinPayload.proxy_session_id,
+        proxyPinChanged,
+      };
       activeMutation.mutate({
         name,
         credential_type: "credit_card",
         credential: credentialPayload,
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
+        ...credentialSaveProxyPinPayload,
       });
     } else if (type === CredentialModalTypes.SECRET) {
       const secretValue = secretCredentialValues.secretValue.trim();
@@ -1035,6 +1125,16 @@ function CredentialsModal({
         return;
       }
 
+      saveIntentRef.current = {
+        shouldTestAfterSave: false,
+        saveBrowserSessionIntent: false,
+        testUrl: "",
+        userContext: "",
+        name,
+        proxyLocation: proxyPinPayload.proxy_location,
+        proxySessionId: proxyPinPayload.proxy_session_id,
+        proxyPinChanged,
+      };
       activeMutation.mutate({
         name,
         credential_type: "secret",
@@ -1043,6 +1143,7 @@ function CredentialsModal({
           secret_label: secretLabel === "" ? null : secretLabel,
         },
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
+        ...credentialSaveProxyPinPayload,
       });
     }
   };
@@ -1096,6 +1197,66 @@ function CredentialsModal({
   const authenticatorKeyError = shouldValidateAuthenticatorKey
     ? getAuthenticatorKeyError(passwordCredentialValues)
     : null;
+
+  const proxyPinContent = (
+    <div className="space-y-3 border-t border-slate-700 pt-4">
+      <div className="flex items-start gap-3">
+        <Checkbox
+          id="pin-residential-isp-proxy"
+          checked={pinResidentialIspProxy}
+          onCheckedChange={(checked) =>
+            setPinResidentialIspProxy(checked === true)
+          }
+          disabled={isTestInProgress}
+          className="mt-0.5"
+        />
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <Label
+              htmlFor="pin-residential-isp-proxy"
+              className="cursor-pointer text-sm font-medium"
+            >
+              Use a consistent IP address
+            </Label>
+            <HelpTooltip content="Routes this credential through the same residential IP each time to reduce account security prompts caused by changing IPs." />
+          </div>
+          <p className="text-xs leading-5 text-muted-foreground">
+            Helps avoid extra 2FA, captchas, or temporary locks caused by
+            signing in from a new location.
+          </p>
+          {pinResidentialIspProxy && existingProxyIdentity && (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-300">
+                Consistent IP active: identity {existingProxyIdentity}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setRotateProxyPin(true)}
+                  disabled={isTestInProgress || rotateProxyPin}
+                >
+                  Rotate IP identity
+                </Button>
+                {rotateProxyPin && (
+                  <span className="text-xs text-slate-300">
+                    A new IP identity will be created when you save.
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+          {pinResidentialIspProxy && !existingProxyIdentity && (
+            <p className="text-xs text-slate-300">
+              Skyvern will create an IP identity for this credential when you
+              save.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
@@ -1386,6 +1547,7 @@ function CredentialsModal({
           </Alert>
         )}
         {credentialContent}
+        {proxyPinContent}
 
         <DialogFooter>
           <div className="flex w-full items-center justify-end gap-2">
