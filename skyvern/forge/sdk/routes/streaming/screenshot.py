@@ -380,6 +380,8 @@ async def _run_local_screencast(
             entity_id=entity_id,
             entity_type=entity_type,
             check_finalized=check_finalized,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
         )
 
         final_status = await get_current_status()
