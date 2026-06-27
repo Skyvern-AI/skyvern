@@ -45,7 +45,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal
+from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal, reset_no_progress_interaction_count
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -2396,6 +2396,8 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     copilot_ctx.verified_criteria_high_water = high_water | current
     copilot_ctx.verified_prefix_high_water_len = max(prefix_high, prefix_len)
     copilot_ctx.verified_full_pass_consumed = full_pass
+    if progressed:
+        reset_no_progress_interaction_count(copilot_ctx)
 
     signature = _repair_non_convergence_signature(contract)
     if signature is None or progressed:

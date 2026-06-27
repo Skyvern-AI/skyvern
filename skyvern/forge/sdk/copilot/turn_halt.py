@@ -42,6 +42,7 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "loop_detected_generic",
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
+        "loop_detected_no_forward_progress_interaction",
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
