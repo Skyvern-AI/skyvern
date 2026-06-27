@@ -5965,6 +5965,21 @@ class FileParserBlock(Block):
             )
             raise
 
+    async def _resolve_file_parser_handler(
+        self, prompt_type: str, distinct_id: str | None, organization_id: str | None
+    ) -> LLMAPIHandler:
+        """Resolve the default handler for a file-parser prompt type.
+
+        Honors the LLM_CONFIG_BY_PROMPT_TYPE PostHog flag (keyed by prompt type) so the
+        OCR and extraction models can be set without a deploy; falls back to the primary
+        handler. A block-level override_llm_key still takes precedence at the call site.
+        """
+        if distinct_id:
+            posthog_handler = await get_llm_handler_for_prompt_type(prompt_type, distinct_id, organization_id)
+            if posthog_handler:
+                return posthog_handler
+        return app.LLM_API_HANDLER
+
     async def _ocr_pdf_pages(
         self,
         page_images: list[bytes],
@@ -5979,8 +5994,11 @@ class FileParserBlock(Block):
         truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
         """
         llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+        default_handler = await self._resolve_file_parser_handler(
+            "extract-text-from-image", workflow_run_block_id, organization_id
+        )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=app.LLM_API_HANDLER
+            self.override_llm_key, default=default_handler
         )
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
@@ -6051,8 +6069,11 @@ class FileParserBlock(Block):
                 image_bytes = f.read()
 
             llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            default_handler = await self._resolve_file_parser_handler(
+                "extract-text-from-image", workflow_run_block_id, organization_id
+            )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                self.override_llm_key, default=app.LLM_API_HANDLER
+                self.override_llm_key, default=default_handler
             )
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
@@ -6169,7 +6190,10 @@ class FileParserBlock(Block):
         )
 
         llm_key = self.override_llm_key
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+        default_handler = await self._resolve_file_parser_handler(
+            "extract-information-from-file-text", workflow_run_block_id, organization_id
+        )
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
 
         llm_response = await llm_api_handler(
             prompt=llm_prompt,
