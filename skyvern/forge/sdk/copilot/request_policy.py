@@ -157,6 +157,10 @@ _FALLBACK_FLOOR_CREDENTIAL_OUTCOME = "The credentialed step authenticates and re
 
 CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
+CriterionKind = Literal["outcome", "terminal_action"]
+TerminalActionFamily = Literal["request", "application", "form", "order"]
+_CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action"})
+_TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 
 _OUTPUT_INTENT_RE = re.compile(
     r"\b(?:read|capture|extract|output|return|returns|returned|include|includes|including|"
@@ -205,6 +209,8 @@ class CompletionCriterion:
     # YAML; "run": an end state only a run can evidence. Invalid input coerces to "run".
     level: CriterionLevel = "run"
     output_path: str | None = None
+    kind: CriterionKind = "outcome"
+    terminal_action_family: TerminalActionFamily | None = None
 
 
 @dataclass
@@ -486,6 +492,18 @@ def _coerce_raw_secret_handling(value: Any) -> RawSecretHandling:
     return "none"
 
 
+def _coerce_criterion_kind(value: Any) -> CriterionKind:
+    if isinstance(value, str) and value in _CRITERION_KINDS:
+        return cast(CriterionKind, value)
+    return "outcome"
+
+
+def _coerce_terminal_action_family(value: Any, kind: CriterionKind) -> TerminalActionFamily | None:
+    if kind == "terminal_action" and isinstance(value, str) and value in _TERMINAL_ACTION_FAMILIES:
+        return cast(TerminalActionFamily, value)
+    return None
+
+
 def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
         raw = parse_final_response(raw)
@@ -590,6 +608,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             continue
         seen.add(key)
         level_raw = item.get("level")
+        kind = _coerce_criterion_kind(item.get("kind"))
         criteria.append(
             CompletionCriterion(
                 id=f"c{len(criteria)}",
@@ -602,6 +621,8 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
                 else "run",
                 output_path=output_path,
+                kind=kind,
+                terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
             )
         )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
@@ -947,6 +968,8 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
+            "kind": criterion.kind,
+            "terminal_action_family": criterion.terminal_action_family,
         }
         if criterion.contingent_on:
             item["contingent_on"] = criterion.contingent_on

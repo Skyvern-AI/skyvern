@@ -9,7 +9,7 @@ stays at the route/repository seam; everything here is side-effect free.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -17,6 +17,8 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    CriterionKind,
+    TerminalActionFamily,
     _normalize_contingent_antecedent_output_path,
     is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
@@ -31,6 +33,8 @@ CRITERIA_SET_STATUS_ACTIVE = "active"
 CRITERIA_SET_STATUS_SUPERSEDED = "superseded"
 TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
+_CRITERION_KINDS = ("outcome", "terminal_action")
+_TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
 
 
 @dataclass(frozen=True)
@@ -117,6 +121,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
             "output_path": criterion.output_path,
+            "kind": criterion.kind,
+            "terminal_action_family": criterion.terminal_action_family,
         }
         for criterion in criteria
     ]
@@ -139,6 +145,12 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
         )
+        kind_raw = item.get("kind")
+        kind = kind_raw if isinstance(kind_raw, str) and kind_raw in _CRITERION_KINDS else "outcome"
+        family_raw = item.get("terminal_action_family")
+        terminal_action_family = (
+            family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
+        )
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
@@ -151,6 +163,8 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
                 output_path=output_path.strip() if isinstance(output_path, str) and output_path.strip() else None,
+                kind=cast(CriterionKind, kind),
+                terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
             )
         )
     return tuple(criteria)
