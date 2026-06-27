@@ -21,8 +21,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
     grade_record_semantic_consistency,
+    grade_registered_download_criteria,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    is_registered_download_completion_criterion,
+    registered_download_completion_criterion,
     structural_unfired_contingent_criterion_ids,
     summarize_unsatisfied_outcomes,
     verdict_missing_evidence,
@@ -31,7 +34,14 @@ from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    DOWNLOAD_KIND_ATTRIBUTE,
+    DOWNLOAD_KIND_EXTENSION,
+    DOWNLOAD_KIND_REGISTERED,
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    ReachedDownloadTarget,
+    derive_from_block_outputs,
+)
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -55,9 +65,82 @@ from .blockers import (
 
 LOG = structlog.get_logger()
 
+_TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+
+
+def _completion_request_policy(copilot_ctx: Any) -> Any | None:
+    try:
+        return copilot_ctx.request_policy
+    except AttributeError:
+        return None
+
+
+def _is_typed_download_target(value: object) -> bool:
+    if isinstance(value, ReachedDownloadTarget):
+        return value.download_kind in _TYPED_DOWNLOAD_KINDS
+    if not isinstance(value, dict):
+        return False
+    download_kind = value.get("download_kind")
+    return isinstance(download_kind, str) and download_kind in _TYPED_DOWNLOAD_KINDS
+
+
+def _ctx_reached_download_target(copilot_ctx: Any) -> object | None:
+    try:
+        return copilot_ctx.reached_download_target
+    except AttributeError:
+        return None
+
+
+def _result_data(result: dict[str, Any]) -> dict[str, Any]:
+    data = result.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _result_block_outputs_by_label(result: dict[str, Any]) -> dict[str, Any]:
+    data = _result_data(result)
+    blocks = data.get("blocks")
+    block_outputs: dict[str, Any] = {}
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            output = block.get("extracted_data")
+            if isinstance(label, str) and isinstance(output, dict):
+                block_outputs[label] = output
+    # Signal detection reads raw download keys; evidence snapshots normalize/redact payloads before grading.
+    for registered in _registered_output_parameter_payloads(data):
+        label = registered.get("output_parameter_key") or registered.get("block_label")
+        value = registered.get("value")
+        if isinstance(label, str) and isinstance(value, dict):
+            block_outputs[label] = value
+    return block_outputs
+
+
+def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool:
+    return derive_from_block_outputs(_result_block_outputs_by_label(result)) is not None
+
+
+def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool:
+    if _is_typed_download_target(_ctx_reached_download_target(copilot_ctx)):
+        return True
+    if _is_typed_download_target(_result_data(result).get("reached_download_target")):
+        return True
+    return _result_has_registered_download_block_output(result)
+
+
+def _reconcile_download_completion_criterion(
+    copilot_ctx: Any, result: dict[str, Any], criteria: list[CompletionCriterion]
+) -> list[CompletionCriterion]:
+    if any(is_registered_download_completion_criterion(criterion) for criterion in criteria):
+        return criteria
+    if not _has_typed_download_signal(copilot_ctx, result):
+        return criteria
+    return [*criteria, registered_download_completion_criterion()]
+
 
 def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
-    policy = getattr(copilot_ctx, "request_policy", None)
+    policy = _completion_request_policy(copilot_ctx)
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
     return policy.graded_completion_criteria() if policy is not None else []
@@ -499,7 +582,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         block_outputs[output_key] = output_value
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
-        registered_output_value = registered.get("value")
+        registered_output_value = _completion_evidence_payload(registered.get("value"))
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
@@ -692,6 +775,8 @@ def _deterministic_run_verification_result(
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_registered_download_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in semantic_verdicts:
         deterministic_by_id[verdict.criterion_id] = verdict
 
@@ -738,6 +823,7 @@ async def _maybe_run_completion_verification(
     ):
         return None
     criteria = _completion_verification_criteria(copilot_ctx)
+    criteria = _reconcile_download_completion_criterion(copilot_ctx, result, criteria)
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
     contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)

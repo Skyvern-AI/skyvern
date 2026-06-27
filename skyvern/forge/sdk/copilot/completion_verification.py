@@ -42,6 +42,12 @@ _REASON_CODES = frozenset({"evidence_confirms", "no_evidence", "evidence_contrad
 _CONTINGENT_ABSTENTION_REASON_CODES = frozenset(
     {"unknown", "no_evidence", "evidence_contradicts", "missing_exact_field", "unproducible"}
 )
+REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
+_REGISTERED_DOWNLOAD_COUNT_KEYS = (
+    "downloaded_file_count",
+    "downloaded_file_url_count",
+    "downloaded_file_artifact_count",
+)
 _PAGE_EVIDENCE_KEYS = (
     "current_url",
     "page_title",
@@ -248,6 +254,61 @@ class RunEvidenceSnapshot:
 
 _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
 _MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
+_MISSING_REGISTERED_DOWNLOAD_EVIDENCE = "run output did not include a non-empty registered browser download"
+
+
+def registered_download_completion_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        outcome="A browser download is registered with a non-empty downloaded file surface.",
+    )
+
+
+def is_registered_download_completion_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+
+
+def _is_positive_download_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _registered_download_evidence_label(snapshot: RunEvidenceSnapshot) -> str | None:
+    for label, payload in snapshot.block_outputs.items():
+        if not isinstance(payload, dict) or payload.get("download_registered") is not True:
+            continue
+        if any(_is_positive_download_count(payload.get(key)) for key in _REGISTERED_DOWNLOAD_COUNT_KEYS):
+            return str(label)
+    return None
+
+
+def grade_registered_download_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    registered_criteria = [
+        criterion for criterion in criteria if is_registered_download_completion_criterion(criterion)
+    ]
+    if not registered_criteria:
+        return []
+    label = _registered_download_evidence_label(snapshot)
+    if label is not None:
+        return [
+            CriterionVerdict(
+                criterion_id=criterion.id,
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref=f"block_outputs:{label}",
+            )
+            for criterion in registered_criteria
+        ]
+    return [
+        CriterionVerdict(
+            criterion_id=criterion.id,
+            state="unsatisfied",
+            reason_code="no_evidence",
+            missing_evidence=_MISSING_REGISTERED_DOWNLOAD_EVIDENCE,
+        )
+        for criterion in registered_criteria
+    ]
 
 
 def _clean_optional_text(value: Any, *, max_chars: int) -> str | None:
