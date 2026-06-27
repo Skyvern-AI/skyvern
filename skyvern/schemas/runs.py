@@ -177,6 +177,10 @@ class TaskRunRequest(BaseModel):
         description="The CDP address for the task.",
         examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
+    llm_api_key: str | None = Field(
+        default=None,
+        description="Optional LLM API key to use for this task run instead of the server default.",
+    )
     run_with: str | None = Field(
         default=None,
         description="Whether to run the task with agent or code. Null means use the default.",
@@ -294,6 +298,10 @@ class WorkflowRunRequest(BaseModel):
     ai_fallback: bool | None = Field(
         default=None,
         description="Whether to fallback to AI if the workflow run fails.",
+    )
+    llm_api_key: str | None = Field(
+        default=None,
+        description="Optional LLM API key to use for this workflow run instead of the server default.",
     )
     run_with: str | None = Field(
         default=None,

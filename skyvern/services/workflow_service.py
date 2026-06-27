@@ -31,6 +31,7 @@ async def prepare_workflow(
     workflow_run_id: str | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     copilot_session_id: str | None = None,
+    llm_api_key: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -55,6 +56,7 @@ async def prepare_workflow(
         workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         copilot_session_id=copilot_session_id,
+        llm_api_key=llm_api_key,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
@@ -88,6 +90,7 @@ async def run_workflow(
     version: int | None = None,
     max_steps: int | None = None,
     api_key: str | None = None,
+    llm_api_key: str | None = None,
     request_id: str | None = None,
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
@@ -110,6 +113,7 @@ async def run_workflow(
         trigger_type=trigger_type,
         workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+        llm_api_key=llm_api_key,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(

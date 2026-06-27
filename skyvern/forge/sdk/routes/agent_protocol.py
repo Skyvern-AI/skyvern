@@ -335,6 +335,7 @@ async def run_task(
             engine=run_request.engine,
             x_max_steps_override=run_request.max_steps,
             x_api_key=x_api_key,
+            llm_api_key=run_request.llm_api_key,
             request=request,
             background_tasks=background_tasks,
         )
@@ -532,6 +533,7 @@ async def run_workflow(
             version=None,
             max_steps=x_max_steps_override,
             api_key=x_api_key,
+            llm_api_key=workflow_run_request.llm_api_key,
             request_id=request_id,
             request=request,
             background_tasks=background_tasks,
@@ -2989,6 +2991,7 @@ async def run_task_v1(
         organization=current_org,
         x_max_steps_override=x_max_steps_override,
         x_api_key=x_api_key,
+        llm_api_key=task.llm_api_key,
         request=request,
         background_tasks=background_tasks,
     )

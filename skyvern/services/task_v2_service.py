@@ -519,6 +519,7 @@ async def run_task_v2(
         run_id=current_run_id,
         request_id=request_id,
         browser_session_id=browser_session_id,
+        llm_api_key=parent_context.llm_api_key if parent_context else None,
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,

@@ -82,6 +82,7 @@ async def run_task(
     engine: RunEngine = RunEngine.skyvern_v1,
     x_max_steps_override: int | None = None,
     x_api_key: str | None = None,
+    llm_api_key: str | None = None,
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
 ) -> Task:
@@ -120,6 +121,7 @@ async def run_task(
         max_steps_override=x_max_steps_override,
         browser_session_id=task.browser_session_id,
         api_key=x_api_key,
+        llm_api_key=llm_api_key,
     )
     return created_task
 
