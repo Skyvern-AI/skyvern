@@ -504,6 +504,104 @@ class TestBuildSafeVars:
 
 
 # ---------------------------------------------------------------------------
+# _extract_assigned_names — variable name extraction tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractAssignedNames:
+    def test_simple_assignment(self) -> None:
+        assert CodeBlock._extract_assigned_names("x = 1") == {"x"}
+
+    def test_multiple_assignment(self) -> None:
+        names = CodeBlock._extract_assigned_names("a = b = 1")
+        assert names == {"a", "b"}
+
+    def test_tuple_unpacking(self) -> None:
+        names = CodeBlock._extract_assigned_names("a, b = 1, 2")
+        assert names == {"a", "b"}
+
+    def test_annotated_assignment(self) -> None:
+        names = CodeBlock._extract_assigned_names("x: int = 1")
+        assert names == {"x"}
+
+    def test_augmented_assignment(self) -> None:
+        names = CodeBlock._extract_assigned_names("x = 1\nx += 1")
+        assert names == {"x"}
+
+    def test_for_loop(self) -> None:
+        names = CodeBlock._extract_assigned_names("for i in range(10):\n    pass")
+        assert names == {"i"}
+
+    def test_with_statement(self) -> None:
+        names = CodeBlock._extract_assigned_names("with open('f') as f:\n    pass")
+        assert names == {"f"}
+
+    def test_except_handler(self) -> None:
+        names = CodeBlock._extract_assigned_names("try:\n    x = 1\nexcept Exception as e:\n    pass")
+        assert "e" in names
+
+    def test_walrus_operator(self) -> None:
+        names = CodeBlock._extract_assigned_names("if (x := get()):\n    pass")
+        assert "x" in names
+
+    def test_nested_function_skips_inner_vars(self) -> None:
+        names = CodeBlock._extract_assigned_names("def inner():\n    y = 1\nx = 2")
+        assert "x" in names
+        assert "y" not in names
+
+    def test_nested_class_skips_inner_vars(self) -> None:
+        names = CodeBlock._extract_assigned_names("class C:\n    x = 1\ny = 2")
+        assert "y" in names
+        assert "x" not in names
+
+    def test_no_assignments(self) -> None:
+        assert CodeBlock._extract_assigned_names("await sleep(0)") == set()
+
+    def test_list_comprehension_does_not_leak(self) -> None:
+        names = CodeBlock._extract_assigned_names("x = [i for i in range(10)]")
+        assert "x" in names
+        assert "i" not in names
+
+
+class TestBuildCaptureReturnCode:
+    def test_empty_vars_returns_empty_dict(self) -> None:
+        code = CodeBlock._build_capture_return_code(set())
+        assert "return {}" in code
+        assert "__captured" not in code
+
+    def test_single_var_uses_try_except(self) -> None:
+        code = CodeBlock._build_capture_return_code({"x"})
+        assert "__captured" in code
+        assert "try:" in code
+        assert "except NameError:" in code
+        assert "'x'" in code
+
+    def test_multiple_vars(self) -> None:
+        code = CodeBlock._build_capture_return_code({"a", "b"})
+        assert code.count("try:") == 2
+        assert "'a'" in code
+        assert "'b'" in code
+
+    def test_generated_code_is_executable(self) -> None:
+        var_names = {"x", "y"}
+        capture_code = CodeBlock._build_capture_return_code(var_names)
+        exec(f"async def dummy():\n    x = 1\n    y = 2\n    {capture_code}")
+        import asyncio
+        result = asyncio.run(eval("dummy()"))
+        assert result == {"x": 1, "y": 2}
+
+    def test_generated_code_handles_conditional_var(self) -> None:
+        var_names = {"x", "y"}
+        capture_code = CodeBlock._build_capture_return_code(var_names)
+        # y is never assigned, should be silently omitted
+        exec(f"async def dummy():\n    x = 1\n    {capture_code}")
+        import asyncio
+        result = asyncio.run(eval("dummy()"))
+        assert result == {"x": 1}
+        assert "y" not in result
+
+
+# ---------------------------------------------------------------------------
 # SKY-002 PoC regression — exact exploit payload must be rejected
 # ---------------------------------------------------------------------------
 
@@ -615,13 +713,16 @@ class TestGenerateAsyncUserFunctionIntegration:
                     if key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__"):
                         parameter_defaults[key] = value
         default_args = ", ".join(f"{key}=__param_defaults[{key!r}]" for key in parameter_defaults)
+        # Use AST-based variable capture (same as CodeBlock.generate_async_user_function)
+        # to avoid injecting locals() into the sandbox.
+        assigned_names = CodeBlock._extract_assigned_names(code)
+        capture_return = CodeBlock._build_capture_return_code(assigned_names)
         full_code = f"""
 async def wrapper({default_args}):
 {indented}
-    return __capture_locals()
+{textwrap.indent(capture_return, "    ")}
 """
         safe_vars["page"] = page
-        safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
         exec(full_code, safe_vars, runtime_variables)
         user_function = runtime_variables["wrapper"]
@@ -865,15 +966,23 @@ async def wrapper({default_args}):
         result = await fn()
         assert result == ["x", "x"]
 
-    def test_wrapper_uses_capture_locals_not_locals(self) -> None:
-        """Regression: the wrapper template must use __capture_locals(), not return locals()."""
+    def test_wrapper_avoids_locals_and_capture_locals(self) -> None:
+        """Regression: the wrapper template must NEVER use locals() or __capture_locals.
+
+        Using locals() is a well-known Python sandbox-escape vector. The wrapper must
+        use explicit AST-derived variable capture instead.
+        """
         import textwrap
 
         code = "x = 1"
+        assigned_names = CodeBlock._extract_assigned_names(code)
+        assert assigned_names == {"x"}
+        capture_return = CodeBlock._build_capture_return_code(assigned_names)
         indented = textwrap.indent(code, "    ")
-        full_code = f"\nasync def wrapper():\n{indented}\n    return __capture_locals()\n"
-        assert "__capture_locals()" in full_code
-        assert "return locals()" not in full_code
+        full_code = f"\nasync def wrapper():\n{indented}\n    {capture_return}\n"
+        assert "locals" not in full_code
+        assert "__capture_locals" not in full_code
+        assert "x" in full_code
 
 
 # ---------------------------------------------------------------------------
