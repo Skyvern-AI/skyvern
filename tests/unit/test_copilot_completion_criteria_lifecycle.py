@@ -260,6 +260,19 @@ def test_criteria_json_round_trip_preserves_level_and_flags() -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
 
 
+def test_criteria_json_round_trip_preserves_terminal_action_fields() -> None:
+    criteria = (
+        CompletionCriterion(
+            id="c0",
+            outcome="a commercial water service request is started",
+            kind="terminal_action",
+            terminal_action_family="request",
+        ),
+    )
+
+    assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
 def test_criteria_from_json_coerces_invalid_level_to_run() -> None:
     (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", "level": "bogus"}])
     assert criterion.level == "run"
@@ -546,6 +559,63 @@ def test_parse_completion_criteria_tolerates_unhashable_level() -> None:
         ]
     )
     assert [c.level for c in parsed] == ["run", "run"]
+
+
+def test_parse_completion_criteria_tolerates_unhashable_terminal_action_fields() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": ["terminal_action"],
+                "terminal_action_family": ["request"],
+            },
+            {
+                "outcome": "a permit application is submitted",
+                "kind": "terminal_action",
+                "terminal_action_family": ["application"],
+            },
+        ]
+    )
+
+    assert [c.kind for c in parsed] == ["outcome", "terminal_action"]
+    assert [c.terminal_action_family for c in parsed] == [None, None]
+
+
+def test_parse_completion_criteria_preserves_typed_terminal_action_fields() -> None:
+    (criterion,) = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": "terminal_action",
+                "terminal_action_family": "request",
+            }
+        ]
+    )
+
+    assert criterion.kind == "terminal_action"
+    assert criterion.terminal_action_family == "request"
+
+
+def test_parse_completion_criteria_defaults_invalid_terminal_action_fields() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": "terminal_action",
+                "terminal_action_family": "invoice",
+            },
+            {
+                "outcome": "the item is in the cart",
+                "kind": "done",
+                "terminal_action_family": "request",
+            },
+        ]
+    )
+
+    assert parsed[0].kind == "terminal_action"
+    assert parsed[0].terminal_action_family is None
+    assert parsed[1].kind == "outcome"
+    assert parsed[1].terminal_action_family is None
 
 
 def test_definition_grading_unknown_when_no_deterministic_check_applies() -> None:

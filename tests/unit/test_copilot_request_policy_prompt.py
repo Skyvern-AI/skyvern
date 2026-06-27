@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
+    _render_active_criteria_for_prompt,
     contains_email_password_pair,
     is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 
 def _render(**overrides: str) -> str:
+    active_completion_criteria = overrides.get("active_completion_criteria", "")
     return prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=overrides.get("user_message", ""),
@@ -35,6 +37,8 @@ def _render(**overrides: str) -> str:
         latest_assistant_turn=overrides.get("latest_assistant_turn", "(none)"),
         retained_history=overrides.get("retained_history", "(none)"),
         global_llm_context=overrides.get("global_llm_context", ""),
+        raw_secret_present=overrides.get("raw_secret_present", "false"),
+        active_completion_criteria=active_completion_criteria,
     )
 
 
@@ -79,6 +83,32 @@ class TestRequestPolicyPromptStructure:
         assert "raw_secret_evidence" in rendered
         assert "verbatim substring of the LATEST user message" in rendered
         assert "Do not cite a token that appears only in prior turns" in rendered
+
+    def test_completion_criteria_schema_includes_typed_terminal_action_fields(self) -> None:
+        rendered = _render()
+        assert (
+            "{outcome, contingent_on, contingent_antecedent_output_path, "
+            "implicit, method_mandated, level, kind, terminal_action_family}"
+        ) in rendered
+        assert "kind=outcome|terminal_action" in rendered
+        assert "terminal_action_family=request|application|form|order|null" in rendered
+
+    def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="a commercial water service request is started",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"kind": "terminal_action"' in rendered
+        assert '"terminal_action_family": "request"' in rendered
 
 
 class TestRawSecretBackstop:

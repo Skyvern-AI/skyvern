@@ -416,6 +416,8 @@ def test_active_criteria_rendering_includes_contingent_on() -> None:
             "implicit": False,
             "method_mandated": False,
             "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
             "contingent_on": "the provider site blocks online submission",
         }
     ]
@@ -439,6 +441,8 @@ def test_active_criteria_rendering_includes_contingent_antecedent_output_path() 
             "implicit": False,
             "method_mandated": False,
             "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
             "contingent_on": "the provider site blocks online submission",
             "contingent_antecedent_output_path": "output.blocker",
         }

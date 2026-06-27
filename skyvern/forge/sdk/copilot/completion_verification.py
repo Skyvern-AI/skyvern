@@ -25,6 +25,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    TerminalActionFamily,
     is_fallback_floor_base_criterion,
     redact_raw_secrets_for_prompt,
 )
@@ -852,19 +853,7 @@ _TERMINAL_ARTIFACT_KEY_TOKENS = (
     (("reference", "number"), "reference"),
     (("reference", "id"), "reference"),
 )
-_TERMINAL_CRITERION_VERBS = frozenset({"submit", "submitted", "submission", "place", "placed"})
-_TERMINAL_CRITERION_ABSTAIN_TOKENS = frozenset(
-    {
-        "lookup",
-        "looked",
-        "retrieve",
-        "retrieved",
-        "retrieval",
-        "return",
-        "returned",
-        "status",
-    }
-)
+_GENERIC_TERMINAL_SUCCESS_LEAF_TOKENS = frozenset({"submit", "submitted", "submission", "place", "placed"})
 _NEGATIVE_GUARD_TOKENS = frozenset({"blocker", "error", "failure", "failed", "challenge"})
 _NEGATIVE_TERMINAL_STATUS_VALUES = frozenset(
     {
@@ -882,13 +871,14 @@ _NEGATIVE_TERMINAL_STATUS_VALUES = frozenset(
         "unable",
     }
 )
-_TERMINAL_RECORD_FAMILY_ARTIFACTS = {
+_TERMINAL_RECORD_FAMILIES: tuple[TerminalActionFamily, ...] = ("request", "application", "form", "order")
+_TERMINAL_RECORD_FAMILY_ARTIFACTS: dict[TerminalActionFamily, frozenset[str]] = {
     "request": frozenset({"confirmation", "reference", "request", "submission"}),
     "application": frozenset({"application", "confirmation", "reference", "submission"}),
     "form": frozenset({"confirmation", "reference", "submission"}),
     "order": frozenset({"order", "receipt"}),
 }
-_TERMINAL_RECORD_FAMILY_ACTIONS = {
+_TERMINAL_RECORD_FAMILY_ACTIONS: dict[TerminalActionFamily, frozenset[str]] = {
     "request": frozenset({"request", "submission"}),
     "application": frozenset({"application", "submission"}),
     "form": frozenset({"form", "submission"}),
@@ -901,9 +891,9 @@ def grade_terminal_goal_record_criteria(
 ) -> list[CriterionVerdict]:
     verdicts: list[CriterionVerdict] = []
     eligible_criteria = [
-        (criterion, family)
+        criterion
         for criterion in criteria
-        if (family := _terminal_goal_criterion_family(criterion.outcome)) is not None
+        if criterion.kind == "terminal_action" and criterion.terminal_action_family in _TERMINAL_RECORD_FAMILY_ARTIFACTS
     ]
     if not eligible_criteria:
         return []
@@ -911,8 +901,9 @@ def grade_terminal_goal_record_criteria(
         record = _structured_record_payload(payload)
         if record is None:
             continue
-        for criterion, family in eligible_criteria:
-            if _terminal_goal_record_confirmed(record, family):
+        for criterion in eligible_criteria:
+            family = criterion.terminal_action_family
+            if family is not None and _terminal_goal_record_confirmed(record, family):
                 verdicts.append(
                     CriterionVerdict(
                         criterion_id=criterion.id,
@@ -951,29 +942,12 @@ def _fallback_floor_reached_end_state_evidence_ref(snapshot: RunEvidenceSnapshot
         record = _structured_record_payload(payload)
         if record is None:
             continue
-        if any(_terminal_goal_record_confirmed(record, family) for family in _TERMINAL_RECORD_FAMILY_ARTIFACTS):
+        if any(_terminal_goal_record_confirmed(record, family) for family in _TERMINAL_RECORD_FAMILIES):
             return f"block_outputs:{label}"
     return None
 
 
-def _terminal_goal_criterion_family(outcome: str) -> str | None:
-    if _extract_present_value_literals(outcome):
-        return None
-    tokens = set(_status_word_tokens(outcome))
-    if tokens & _TERMINAL_CRITERION_ABSTAIN_TOKENS:
-        return None
-    if not tokens & _TERMINAL_CRITERION_VERBS:
-        return None
-    families = [family for family in ("request", "application", "form", "order") if family in tokens]
-    if len(families) != 1:
-        return None
-    family = families[0]
-    if family == "order" and "placed" not in tokens:
-        return None
-    return family
-
-
-def _terminal_goal_record_confirmed(record: dict[str, Any], family: str) -> bool:
+def _terminal_goal_record_confirmed(record: dict[str, Any], family: TerminalActionFamily) -> bool:
     if _terminal_goal_record_has_negative_guard(record):
         return False
     if _structured_record_contradiction(record):
@@ -1016,7 +990,7 @@ def _terminal_goal_record_has_generic_success_claim(record: dict[str, Any]) -> b
     for key, value in _walk_record_scalars(record):
         leaf_tokens = _record_key_leaf_tokens(key)
         if value is True and _terminal_action_family_for_key(key) is None and leaf_tokens:
-            if leaf_tokens[-1] in _TERMINAL_CRITERION_VERBS:
+            if leaf_tokens[-1] in _GENERIC_TERMINAL_SUCCESS_LEAF_TOKENS:
                 return True
         if leaf_tokens in generic_success_keys and value is True:
             return True
@@ -1044,7 +1018,7 @@ def _terminal_goal_record_has_negative_guard(record: dict[str, Any]) -> bool:
     return False
 
 
-def _terminal_goal_record_has_artifact_for_family(record: dict[str, Any], family: str) -> bool:
+def _terminal_goal_record_has_artifact_for_family(record: dict[str, Any], family: TerminalActionFamily) -> bool:
     allowed_artifacts = _TERMINAL_RECORD_FAMILY_ARTIFACTS[family]
     for key, value in _walk_record_scalars(record):
         if isinstance(value, bool) or not _is_meaningful_record_value(value):
