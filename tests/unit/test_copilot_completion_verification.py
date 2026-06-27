@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _verified_workflow_or_none,
 )
 from skyvern.forge.sdk.copilot.completion_verification import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionVerificationResult,
     CriterionVerdict,
     RunEvidenceSnapshot,
@@ -26,8 +27,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_definition_criteria,
     grade_present_value_criteria,
     grade_record_semantic_consistency,
+    grade_registered_download_criteria,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    registered_download_completion_criterion,
+    run_plane_all_no_evidence,
     structural_unfired_contingent_criterion_ids,
     structured_record_has_goal_content,
     structured_record_has_identity,
@@ -48,6 +52,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
@@ -74,7 +79,10 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_visible_result_after_completion_verification,
     _watchdog_exit_allows_terminal_promotion,
 )
-from skyvern.forge.sdk.copilot.tools.completion import _artifact_health_blocker_from_result
+from skyvern.forge.sdk.copilot.tools.completion import (
+    _artifact_health_blocker_from_result,
+    _reconcile_download_completion_criterion,
+)
 
 
 def _criterion(
@@ -3592,6 +3600,303 @@ def test_snapshot_summarizes_registered_download_outputs() -> None:
         "downloaded_file_names": ["apexbiz_100245_2026-05.pdf"],
     }
     assert "apexbiz_100245_2026-05.pdf" in rendered
+    assert "RecordingLocator" not in rendered and "Download" not in rendered and "secret" not in rendered
+
+
+def _download_result(output: dict[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_download",
+            "overall_status": "completed",
+            "executed_block_labels": ["download_document"],
+            "current_url": "https://example.test/documents",
+            "blocks": [
+                {
+                    "label": "download_document",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": output,
+                }
+            ],
+        },
+    }
+
+
+def _registered_download_output_parameter_result(value: dict[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_download",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "current_url": "https://example.test/documents",
+            "blocks": [],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_download",
+                    "output_parameter_key": "download_document_output",
+                    "block_label": "download_document",
+                    "block_type": "CODE",
+                    "value": value,
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_registered_non_empty_injects_and_verifies_without_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download_document",
+        )
+    ]
+    assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_download_registered_output_parameter_injects_and_verifies_without_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered output-parameter download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _registered_download_output_parameter_result(
+            {
+                "downloaded_files": [{"filename": "document.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download_document_output",
+        )
+    ]
+    assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_download_typed_affordance_injects_and_fails_without_registered_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("missing registered download evidence must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/statement.pdf"]',
+        affordance_text="Download",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="unsatisfied",
+            reason_code="no_evidence",
+            missing_evidence="run output did not include a non-empty registered browser download",
+        )
+    ]
+    assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_definition_only_non_download_remains_no_gradeable_run_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("definition-only criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="definition_inputs",
+                outcome="The workflow accepts the account number as a reusable input.",
+                level="definition",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.criterion_ids == ["definition_inputs"]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id="definition_inputs",
+            state="unknown",
+            reason_code="definition_parameters_absent",
+        )
+    ]
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID not in [
+        criterion.id for criterion in ctx.request_policy.completion_criteria
+    ]
+
+
+def test_download_reconciliation_is_idempotent_when_criterion_exists() -> None:
+    ctx = _run_ctx()
+    criterion = registered_download_completion_criterion()
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    criteria = [criterion]
+
+    reconciled = _reconcile_download_completion_criterion(
+        ctx,
+        {"ok": True, "data": {"reached_download_target": {"download_kind": "extension"}}},
+        criteria,
+    )
+
+    assert reconciled is criteria
+    assert [existing.id for existing in ctx.request_policy.completion_criteria] == [
+        REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+    ]
+
+
+def test_download_reconciliation_does_not_mutate_request_policy() -> None:
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    reconciled = _reconcile_download_completion_criterion(
+        ctx,
+        {"ok": True, "data": {"reached_download_target": {"download_kind": "extension"}}},
+        [],
+    )
+
+    assert [criterion.id for criterion in reconciled] == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert ctx.request_policy.completion_criteria == []
+
+
+def test_download_grader_requires_non_empty_registered_surface() -> None:
+    criteria = [registered_download_completion_criterion()]
+
+    missing = grade_registered_download_criteria(
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"download_document": {"download_registered": True}}),
+    )
+    present = grade_registered_download_criteria(
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "download_document": {
+                    "download_registered": True,
+                    "downloaded_file_count": 0,
+                    "downloaded_file_url_count": 1,
+                    "downloaded_file_artifact_count": 0,
+                }
+            }
+        ),
+    )
+
+    assert missing == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="unsatisfied",
+            reason_code="no_evidence",
+            missing_evidence="run output did not include a non-empty registered browser download",
+        )
+    ]
+    assert (
+        run_plane_all_no_evidence(
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=[REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID],
+                verdicts=missing,
+            )
+        )
+        is True
+    )
+    assert present == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download_document",
+        )
+    ]
+
+
+def test_snapshot_normalizes_registered_download_output_parameter_values() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+
+    snapshot = _build_run_evidence_snapshot(
+        ctx,
+        _registered_download_output_parameter_result(
+            {
+                "page": "<RecordingLocator>",
+                "download": "<Download>",
+                "downloaded_file_name": "document.pdf",
+                "downloaded_files": [{"filename": "document.pdf"}],
+                "downloaded_file_urls": ["https://example.test/downloads/document.pdf?token=secret"],
+                "downloaded_file_artifact_ids": ["artifact_1"],
+            }
+        ),
+    )
+    rendered = snapshot.render_prompt_block()
+
+    assert snapshot.block_outputs["download_document_output"] == {
+        "download_registered": True,
+        "downloaded_file_count": 1,
+        "downloaded_file_url_count": 1,
+        "downloaded_file_artifact_count": 1,
+        "downloaded_file_names": ["document.pdf"],
+    }
     assert "RecordingLocator" not in rendered and "Download" not in rendered and "secret" not in rendered
 
 
