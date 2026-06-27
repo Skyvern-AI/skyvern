@@ -85,12 +85,14 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_profiles" \
 
 **Parameters:**
 
-| Parameter            | Type   | Description                           |
-|----------------------|--------|---------------------------------------|
-| `name`               | string | Required unique display name          |
-| `description`        | string | Optional profile description          |
-| `browser_session_id` | string | Omit for a blank profile              |
-| `workflow_run_id`    | string | Omit for a blank profile              |
+| Parameter            | Type   | Description                                                                                                                  |
+|----------------------|--------|------------------------------------------------------------------------------------------------------------------------------|
+| `name`               | string | Required unique display name                                                                                                 |
+| `description`        | string | Optional profile description                                                                                                 |
+| `browser_session_id` | string | Omit for a blank profile                                                                                                     |
+| `workflow_run_id`    | string | Omit for a blank profile                                                                                                     |
+| `proxy_location`     | string \| object | Optional pinned proxy location for the profile's residential ISP identity (e.g. `RESIDENTIAL_ISP`, or a `GeoTarget` object) |
+| `proxy_session_id`   | string | Optional advanced reuse key for the profile's pinned proxy identity                                                          |
 
 ### From an agent run
 
@@ -819,6 +821,57 @@ This walkthrough demonstrates the full profile lifecycle: create an agent that s
 <Tip>
 In a real scenario, step 1 would be a login agent that authenticates with a site. The saved profile then lets all future agents skip the login step entirely.
 </Tip>
+
+---
+
+## Pin a proxy identity
+
+A browser profile can carry a pinned residential ISP proxy identity so that every run reusing the profile reaches the target site from the same IP and locale. Pinning is opt-in and uses two fields:
+
+- `proxy_location` — set to `RESIDENTIAL_ISP` (or a `GeoTarget` object) to opt the profile into a static ISP identity.
+- `proxy_session_id` — opaque Skyvern-managed sticky-session key. Omit it to let Skyvern generate one automatically when `proxy_location` is `RESIDENTIAL_ISP`.
+
+When a run uses a profile that has a pinned proxy, Skyvern routes traffic through the same residential ISP identity the profile was last associated with, even if the run request does not set `proxy_location`.
+
+### Set a pin at create time
+
+<CodeGroup>
+```python Python
+profile = await client.create_browser_profile(
+    name="prod-salesforce-admin",
+    description="Pinned residential ISP identity",
+    proxy_location="RESIDENTIAL_ISP",
+)
+```
+
+```bash cURL
+curl -s -X POST "https://api.skyvern.com/v1/browser_profiles" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "prod-salesforce-admin",
+    "description": "Pinned residential ISP identity",
+    "proxy_location": "RESIDENTIAL_ISP"
+  }'
+```
+</CodeGroup>
+
+### Rotate the pinned identity
+
+Update the profile with `rotate_proxy_session_id: true` to ask Skyvern to mint a fresh sticky-session id while keeping the same `proxy_location`. Use this when the existing IP gets flagged or when you want to start a new identity for the same profile.
+
+```bash cURL
+curl -s -X PATCH "https://api.skyvern.com/v1/browser_profiles/$PROFILE_ID" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "rotate_proxy_session_id": true }'
+```
+
+To clear the pin entirely, set `proxy_location` to `null` in the same update call.
+
+<Note>
+`proxy_session_id` is only valid alongside `RESIDENTIAL_ISP`. Requests that supply `proxy_session_id` with any other `proxy_location` are rejected with a 400.
+</Note>
 
 ---
 

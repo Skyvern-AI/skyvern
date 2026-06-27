@@ -9999,6 +9999,12 @@
             ],
             "title": "Proxy Session Id",
             "description": "Optional advanced reuse key for this credential's pinned proxy identity."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
+            "default": false
           }
         },
         "type": "object",
@@ -21581,6 +21587,12 @@
             ],
             "title": "Proxy Session Id",
             "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id for this profile.",
+            "default": false
           }
         },
         "type": "object",
