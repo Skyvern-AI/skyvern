@@ -67,6 +67,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     parse_final_response,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, request_policy_has_present_completion_contract
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -86,6 +87,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -176,6 +178,13 @@ _PROGRESS_NARRATION_PATTERNS = [
     re.compile(r"\bi\s+will\s+(?:now\s+)?proceed\b", re.IGNORECASE),
     re.compile(r"\bi\s+have\s+not\s+yet\b", re.IGNORECASE),
 ]
+
+PRESENT_COMPLETION_CONTRACT_ASK_RETRY = (
+    "The final ASK_QUESTION is not an allowed terminal response for this turn: the request already has a typed "
+    "completion contract / completion criteria and no separate required clarification is active. Continue authoring "
+    "the workflow from the existing contract, then run/test it before responding. Only ask the user if a separate "
+    "required input is missing under RequestPolicy or TurnIntent."
+)
 
 
 def _is_progress_narration(user_response: Any) -> bool:
@@ -844,6 +853,63 @@ def _completion_contract_unknown_due_to_policy_fallback(ctx: Any) -> bool:
     return _request_completion_contract_status(ctx) == "unknown"
 
 
+_AUTHORING_TURN_INTENT_MODES = frozenset({TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY})
+
+
+def _turn_intent_can_author_without_user_input(turn_intent: Any) -> bool:
+    if not isinstance(turn_intent, TurnIntent):
+        return False
+    if turn_intent.mode not in _AUTHORING_TURN_INTENT_MODES:
+        return False
+    if turn_intent.authority.requires_user_input:
+        return False
+    return turn_intent.authority.may_update_workflow
+
+
+def _has_current_turn_update_or_test_marker(ctx: Any) -> bool:
+    if bool(getattr(ctx, "update_workflow_called", False)):
+        return True
+    if bool(getattr(ctx, "test_after_update_done", False)):
+        return True
+    if getattr(ctx, "last_update_block_count", None) is not None:
+        return True
+    if getattr(ctx, "last_test_ok", None) is not None:
+        return True
+    for field_name in (
+        "last_run_blocks_workflow_run_id",
+        "last_successful_run_blocks_workflow_run_id",
+        "last_outcome_gate_workflow_run_id",
+    ):
+        marker = getattr(ctx, field_name, None)
+        if isinstance(marker, str) and marker.strip():
+            return True
+    return False
+
+
+def _present_completion_contract_ask_retry(ctx: Any, parsed: dict[str, Any]) -> str | None:
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    request_policy = getattr(ctx, "request_policy", None)
+    if not isinstance(request_policy, RequestPolicy):
+        return None
+    if not request_policy_has_present_completion_contract(request_policy):
+        return None
+    if request_policy.user_response_policy == "ask_clarification":
+        return None
+    if request_policy.clarification_reason not in (None, "none"):
+        return None
+    if not _turn_intent_can_author_without_user_input(getattr(ctx, "turn_intent", None)):
+        return None
+    if _has_current_turn_update_or_test_marker(ctx):
+        return None
+    LOG.info(
+        "copilot.present_completion_contract_ask_retry",
+        reason_code="present_completion_contract_ask_internal_retry",
+        turn_intent_mode=getattr(getattr(ctx, "turn_intent", None), "mode", None),
+    )
+    return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
 def _nudge(config: CopilotConfig | None, key: str) -> str:
     if config is None:
         return DEFAULT_ENFORCEMENT_NUDGES[key]
@@ -980,6 +1046,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
     discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
     if discovery_entrypoint_nudge is not None:
         return discovery_entrypoint_nudge
+
+    present_contract_retry = _present_completion_contract_ask_retry(ctx, parsed)
+    if present_contract_retry is not None:
+        return present_contract_retry
 
     if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
         return None

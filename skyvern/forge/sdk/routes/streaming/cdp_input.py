@@ -22,7 +22,7 @@ from skyvern.forge.sdk.routes.streaming.registries import (
     stream_ref_dec,
     stream_ref_inc,
 )
-from skyvern.forge.sdk.routes.streaming.screencast import wait_for_browser_state
+from skyvern.forge.sdk.routes.streaming.screencast import _resolve_working_page, wait_for_browser_state
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.webeye.browser_state import BrowserState
@@ -59,13 +59,19 @@ class ActivePageCdpInputSession:
     def __init__(
         self,
         browser_state: BrowserState,
-        log_id_key: str,
-        log_id_value: str,
+        entity_id: str,
+        entity_type: str,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
         refresh_interval: float = ACTIVE_PAGE_INPUT_REFRESH_INTERVAL,
     ) -> None:
         self.browser_state = browser_state
-        self.log_id_key = log_id_key
-        self.log_id_value = log_id_value
+        self.entity_id = entity_id
+        self.entity_type = entity_type
+        self.workflow_run_id = workflow_run_id
+        self.organization_id = organization_id
+        self.log_id_key = f"{entity_type}_id"
+        self.log_id_value = entity_id
         self.refresh_interval = refresh_interval
         self.cdp_session: CDPSession | None = None
         self.page: object | None = None
@@ -77,7 +83,14 @@ class ActivePageCdpInputSession:
         if not force_refresh and now < self.next_refresh_at:
             return None if self.page_resolution_failed else self.cdp_session
 
-        page = await self.browser_state.get_working_page()
+        page = await _resolve_working_page(
+            self.browser_state,
+            self.entity_id,
+            self.entity_type,
+            self.workflow_run_id,
+            self.organization_id,
+            fall_back_to_captured=self.cdp_session is None,
+        )
         if page is None:
             self.page_resolution_failed = True
             self.next_refresh_at = now + self.refresh_interval
@@ -381,13 +394,7 @@ async def cdp_input_stream(
             await websocket.close(code=4408, reason="browser_state_timeout")
             return
 
-        page = await browser_state.get_working_page()
-        if page is None:
-            LOG.warning("CDP input: no working page", workflow_run_id=workflow_run_id)
-            await websocket.close(code=4410, reason="no_working_page")
-            return
-
-        input_session = ActivePageCdpInputSession(browser_state, "workflow_run_id", workflow_run_id)
+        input_session = ActivePageCdpInputSession(browser_state, workflow_run_id, "workflow_run")
         cdp_session = await input_session.get_session(force_refresh=True)
         if cdp_session is None:
             LOG.warning("CDP input: no working page", workflow_run_id=workflow_run_id)
@@ -465,13 +472,9 @@ async def cdp_input_browser_session_stream(
             await websocket.close(code=4408, reason="browser_state_timeout")
             return
 
-        page = await browser_state.get_working_page()
-        if page is None:
-            LOG.warning("CDP input: no working page", browser_session_id=browser_session_id)
-            await websocket.close(code=4410, reason="no_working_page")
-            return
-
-        input_session = ActivePageCdpInputSession(browser_state, "browser_session_id", browser_session_id)
+        input_session = ActivePageCdpInputSession(
+            browser_state, browser_session_id, "browser_session", organization_id=organization_id
+        )
         if await input_session.get_session(force_refresh=True) is None:
             LOG.warning("CDP input: no working page", browser_session_id=browser_session_id)
             await websocket.close(code=4410, reason="no_working_page")
