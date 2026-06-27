@@ -303,6 +303,12 @@ class RequestPolicy:
         return "\n".join(lines)
 
 
+def request_policy_has_present_completion_contract(request_policy: RequestPolicy | None) -> bool:
+    if request_policy is None:
+        return False
+    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
 _TRANSCRIPT_TOTAL_CHAR_BUDGET = 2048
 TRANSCRIPT_ANCHOR_CHAR_CAP = 512
 _TRANSCRIPT_RETAINED_MIN_CHARS = 512
