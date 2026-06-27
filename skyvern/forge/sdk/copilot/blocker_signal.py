@@ -391,6 +391,10 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
         "I kept rewriting the generated code, but the safety checks rejected each version.",
         "Tell me what to change and I'll try a different approach.",
     ),
+    "loop_detected_no_forward_progress_interaction": (
+        "I couldn't get past this step.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
 }
 _LOOP_ANTI_BOT_BLOCKER_COPY = "The site's verification challenge was still keeping the submit/search control disabled."
 _LOOP_RESULT_COMPOSITION_BLOCKER_COPY = (

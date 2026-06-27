@@ -16,6 +16,7 @@ from agents.run import Runner
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
     compose_loop_blocker_user_facing_reason,
     loop_blocker_evidence_from_ctx,
     stash_blocker_signal,
@@ -83,6 +84,7 @@ from skyvern.forge.sdk.copilot.terminal_predicates import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
+    blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
@@ -142,6 +144,9 @@ MAX_CODE_AUTHORING_GUARDRAIL_REJECTS = 4
 # higher bound, which must stay above MAX_CODE_AUTHORING_GUARDRAIL_REJECTS so the
 # non-credential backstop and the low-count credential deferral are untouched.
 MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS = 8
+# Far under the SDK max-turns cap so the halt arrives first.
+MAX_NO_PROGRESS_INTERACTION_ATTEMPTS = 4
+_NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -373,6 +378,54 @@ def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBloc
         internal_reason_code="credential_priority_authoring_churn",
         blocked_tool="update_workflow",
     )
+
+
+def no_forward_progress_interaction_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "consecutive_no_progress_interaction_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "loop_detected_no_forward_progress_interaction", evidence, blocked_tool="click"
+    )
+    agent_steering = (
+        f"Clicking has not advanced the page across {count} attempts; "
+        "stop trying new selectors and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="loop_detected_no_forward_progress_interaction",
+        blocked_tool="click",
+    )
+
+
+def _needs_no_progress_interaction_halt(ctx: Any) -> bool:
+    return _get_int(ctx, "consecutive_no_progress_interaction_count") >= MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+
+
+def reset_no_progress_interaction_count(ctx: Any) -> None:
+    if _get_int(ctx, "consecutive_no_progress_interaction_count") == 0:
+        return
+    ctx.consecutive_no_progress_interaction_count = 0
+    clear_tool_blocker_signals_for_reason_codes(ctx, _NO_PROGRESS_INTERACTION_REASON_CODES)
+    LOG.info("copilot_no_progress_interaction_reset")
+
+
+def register_no_progress_interaction_click(ctx: Any, *, outcome: str) -> None:
+    count = _get_int(ctx, "consecutive_no_progress_interaction_count") + 1
+    ctx.consecutive_no_progress_interaction_count = count
+    LOG.info("copilot_no_progress_interaction_click", outcome=outcome, count=count)
+    if count < MAX_NO_PROGRESS_INTERACTION_ATTEMPTS:
+        return
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    signal = no_forward_progress_interaction_stop_signal(ctx)
+    stash_blocker_signal(ctx, signal)
+    ctx.blocker_signal = signal
 
 
 def _needs_code_authoring_churn_halt(ctx: Any) -> bool:
@@ -1419,6 +1472,11 @@ def _check_enforcement(
         if churn_signal is not None:
             stash_blocker_signal(ctx, churn_signal)
             stash_turn_halt_from_blocker_signal(ctx, churn_signal, source="enforcement_backstop")
+            raise_if_turn_halt(ctx)
+        if _needs_no_progress_interaction_halt(ctx):
+            no_progress_signal = no_forward_progress_interaction_stop_signal(ctx)
+            stash_blocker_signal(ctx, no_progress_signal)
+            stash_turn_halt_from_blocker_signal(ctx, no_progress_signal, source="enforcement_backstop")
             raise_if_turn_halt(ctx)
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
