@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classify_request,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
+    request_policy_has_present_completion_contract,
 )
 
 
@@ -94,6 +95,27 @@ def _requested_output_subset(policy: RequestPolicy, requested_output_paths: set[
         and not criterion.method_mandated
         and criterion.output_path in requested_output_paths
     ]
+
+
+def test_present_completion_contract_helper_accepts_present_status() -> None:
+    policy = RequestPolicy(completion_contract_status="present")
+
+    assert request_policy_has_present_completion_contract(policy) is True
+
+
+def test_present_completion_contract_helper_accepts_criteria_backed_policy() -> None:
+    policy = RequestPolicy(
+        completion_contract_status="absent",
+        completion_criteria=[CompletionCriterion(id="record_id", outcome="The returned record includes an id.")],
+    )
+
+    assert request_policy_has_present_completion_contract(policy) is True
+
+
+def test_present_completion_contract_helper_rejects_absent_policy() -> None:
+    policy = RequestPolicy(completion_contract_status="absent", completion_criteria=[])
+
+    assert request_policy_has_present_completion_contract(policy) is False
 
 
 @pytest.mark.asyncio

@@ -1807,7 +1807,7 @@ class TestTranslateToAgentResultGating:
                 completion_criteria=[
                     CompletionCriterion(id="provider", outcome="The returned record identifies the provider."),
                 ],
-            )
+            ),
         )
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which saved credential should I use?"})
 
