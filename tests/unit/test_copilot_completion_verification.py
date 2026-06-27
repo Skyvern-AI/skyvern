@@ -93,6 +93,8 @@ def _criterion(
     output_path: str | None = None,
     contingent_on: str | None = None,
     contingent_antecedent_output_path: str | None = None,
+    kind: str = "outcome",
+    terminal_action_family: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -101,6 +103,8 @@ def _criterion(
         output_path=output_path,
         contingent_on=contingent_on,
         contingent_antecedent_output_path=contingent_antecedent_output_path,
+        kind=kind,
+        terminal_action_family=terminal_action_family,
     )
 
 
@@ -769,7 +773,15 @@ def test_terminal_goal_record_satisfies_flat_submit_payload() -> None:
     snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": _terminal_goal_payload()})
 
     verdicts = grade_terminal_goal_record_criteria(
-        [_criterion("c0", "a commercial water service request is submitted")], snapshot
+        [
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
     )
 
     assert verdicts == [
@@ -787,10 +799,131 @@ def test_terminal_goal_record_accepts_family_artifact_without_self_asserted_bool
     snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": payload})
 
     verdicts = grade_terminal_goal_record_criteria(
-        [_criterion("c0", "a commercial water service request is submitted")], snapshot
+        [
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
     )
 
     assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+def test_terminal_goal_record_accepts_started_request_when_typed_with_artifact() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": _terminal_goal_payload()})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [
+            _criterion(
+                "c0",
+                "a commercial water service request is started",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
+    )
+
+    assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+def test_terminal_goal_record_accepts_typed_create_or_verify_with_identifier() -> None:
+    payload = _terminal_goal_payload(
+        submitted=None,
+        confirmation_number=None,
+        request_id="QC-2002-DEMO",
+        submission_result="already_present",
+    )
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [
+            _criterion(
+                "c0",
+                "the service request is created or verified",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
+    )
+
+    assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+def test_terminal_goal_record_submission_result_is_not_credit_source() -> None:
+    payload = _terminal_goal_payload(
+        submitted=None,
+        confirmation_number=None,
+        request_id=None,
+        submission_result="already_present",
+    )
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "the service request is created or verified",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_terminal_goal_record_requires_typed_terminal_action_family() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": _terminal_goal_payload()})
+
+    assert grade_terminal_goal_record_criteria([_criterion("c0", "a request is submitted")], snapshot) == []
+    assert (
+        grade_terminal_goal_record_criteria(
+            [_criterion("c1", "a request is submitted", kind="terminal_action")], snapshot
+        )
+        == []
+    )
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c2",
+                    "a request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="invoice",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_terminal_goal_record_self_asserted_boolean_without_identifier_remains_uncredited() -> None:
+    payload = _terminal_goal_payload(submitted=True, confirmation_number=None)
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -808,57 +941,87 @@ def test_terminal_goal_record_rejects_ordinary_identifiers(payload: dict[str, An
 
     assert (
         grade_terminal_goal_record_criteria(
-            [_criterion("c0", "a commercial water service request is submitted")], snapshot
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
         )
         == []
     )
 
 
 @pytest.mark.parametrize(
-    ("payload", "outcome"),
+    ("payload", "outcome", "family"),
     [
         (
             _terminal_goal_payload(confirmation_number="WTR-1842-DEMO"),
             "a commercial water service request is submitted",
+            "request",
         ),
-        (_terminal_goal_payload(order_placed=True, submitted=None, order_number="ORD-1842"), "an order is placed"),
+        (
+            _terminal_goal_payload(order_placed=True, submitted=None, order_number="ORD-1842"),
+            "an order is placed",
+            "order",
+        ),
         (
             _terminal_goal_payload(application_submitted=True, submitted=None, application_id="APP-1842"),
             "an application is submitted",
+            "application",
         ),
         (
             _terminal_goal_payload(form_submitted=True, submitted=None, submission_id="SUB-1842"),
             "the form is submitted",
+            "form",
         ),
         (
             _terminal_goal_payload(request_submitted=True, submitted=None, request_id="REQ-1842"),
             "a service request is submitted",
+            "request",
         ),
     ],
 )
-def test_terminal_goal_record_accepts_narrow_terminal_artifacts(payload: dict[str, Any], outcome: str) -> None:
+def test_terminal_goal_record_accepts_narrow_terminal_artifacts(
+    payload: dict[str, Any], outcome: str, family: str
+) -> None:
     snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
 
-    verdicts = grade_terminal_goal_record_criteria([_criterion("c0", outcome)], snapshot)
+    verdicts = grade_terminal_goal_record_criteria(
+        [_criterion("c0", outcome, kind="terminal_action", terminal_action_family=family)], snapshot
+    )
 
     assert _satisfied_criterion_ids(verdicts) == {"c0"}
 
 
 @pytest.mark.parametrize(
-    ("payload", "outcome"),
+    ("payload", "outcome", "family"),
     [
-        (_terminal_goal_payload(), "an order is placed"),
-        (_terminal_goal_payload(order_placed=True, submitted=None, order_number="ORD-1842"), "a request is submitted"),
+        (_terminal_goal_payload(), "an order is placed", "order"),
+        (
+            _terminal_goal_payload(order_placed=True, submitted=None, order_number="ORD-1842"),
+            "a request is submitted",
+            "request",
+        ),
         (
             _terminal_goal_payload(application_submitted=True, submitted=None, application_id="APP-1842"),
             "an order is placed",
+            "order",
         ),
     ],
 )
-def test_terminal_goal_record_rejects_mismatched_families(payload: dict[str, Any], outcome: str) -> None:
+def test_terminal_goal_record_rejects_mismatched_families(payload: dict[str, Any], outcome: str, family: str) -> None:
     snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
 
-    assert grade_terminal_goal_record_criteria([_criterion("c0", outcome)], snapshot) == []
+    assert (
+        grade_terminal_goal_record_criteria(
+            [_criterion("c0", outcome, kind="terminal_action", terminal_action_family=family)], snapshot
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -873,7 +1036,20 @@ def test_terminal_goal_record_rejects_mismatched_families(payload: dict[str, Any
 def test_terminal_goal_record_rejects_generic_success_synonyms(payload: dict[str, Any]) -> None:
     snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
 
-    assert grade_terminal_goal_record_criteria([_criterion("c0", "a request is submitted")], snapshot) == []
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -914,7 +1090,15 @@ def test_terminal_goal_record_negative_guards_abstain(payload: dict[str, Any]) -
 
     assert (
         grade_terminal_goal_record_criteria(
-            [_criterion("c0", "a commercial water service request is submitted")], snapshot
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
         )
         == []
     )
@@ -928,7 +1112,15 @@ def test_terminal_goal_record_rejects_negated_or_temporal_action_keys(key: str) 
 
     assert (
         grade_terminal_goal_record_criteria(
-            [_criterion("c0", "a commercial water service request is submitted")], snapshot
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
         )
         == []
     )
@@ -2288,7 +2480,14 @@ async def test_page_observation_verification_does_not_apply_terminal_goal_record
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(
-        completion_criteria=[_criterion("c0", "a commercial water service request is submitted")]
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
     )
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
@@ -2507,7 +2706,12 @@ async def test_mixed_completion_verification_preserves_structural_unfired_contin
     _set_workflow_labels(ctx, "submit_water_request")
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            _criterion("c0", "a commercial water service request is submitted"),
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
             _criterion(
                 "c1",
                 "A provider blocker is reported to the user.",
@@ -3290,7 +3494,14 @@ async def test_maybe_run_completion_verification_terminal_goal_bypasses_judge(
     ctx = _run_ctx()
     _set_workflow_labels(ctx, "submit_water_request")
     ctx.request_policy = RequestPolicy(
-        completion_criteria=[_criterion("c0", "a commercial water service request is submitted")]
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
     )
 
     verification = await _maybe_run_completion_verification(ctx, _terminal_goal_output_result(), time.monotonic())
@@ -3312,7 +3523,14 @@ async def test_maybe_run_completion_verification_terminal_goal_without_boolean_b
     ctx = _run_ctx()
     _set_workflow_labels(ctx, "submit_water_request")
     ctx.request_policy = RequestPolicy(
-        completion_criteria=[_criterion("c0", "a commercial water service request is submitted")]
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
     )
 
     verification = await _maybe_run_completion_verification(
@@ -3346,6 +3564,55 @@ async def test_maybe_run_completion_verification_fallback_floor_uses_recorded_te
     assert verification.is_fully_satisfied() is True
     assert verification.to_trace_data()["criterion_count"] == 1
     assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run_output_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered terminal-action evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c1",
+                "a commercial water service request is started",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_terminal_goal",
+            "overall_status": "completed",
+            "executed_block_labels": ["submit_water_request"],
+            "current_url": "https://example.test/confirmation",
+            "blocks": [],
+            "workflow_run_output_parameters": [
+                {
+                    "workflow_run_id": "wr_terminal_goal",
+                    "output_parameter_id": "op_terminal",
+                    "output_parameter_key": "submit_water_request_output",
+                    "block_label": "submit_water_request",
+                    "block_type": "CODE",
+                    "value": _terminal_goal_payload(),
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].criterion_id == "c1"
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request_output"
 
 
 @pytest.mark.asyncio
@@ -3447,7 +3714,12 @@ async def test_maybe_run_completion_verification_mixed_terminal_goal_upgrades_ju
     _set_workflow_labels(ctx, "submit_water_request")
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            _criterion("c0", "a commercial water service request is submitted"),
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
             _criterion("c1", "the selected start date is reported"),
         ]
     )
