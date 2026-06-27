@@ -533,6 +533,23 @@ def test_turn_halt_exit_renders_code_authoring_churn_reason() -> None:
     assert "update_workflow" not in result.user_response
 
 
+def test_turn_halt_exit_renders_no_forward_progress_interaction_reason() -> None:
+    ctx = _ctx()
+    signal = _signal(
+        kind="loop_detected",
+        user_facing="I couldn't get past this step. Tell me what to change and I'll try a different approach.",
+        internal_reason_code="loop_detected_no_forward_progress_interaction",
+        blocked_tool="click",
+    )
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert "couldn't get past this step" in result.user_response
+    assert "click" not in result.user_response
+
+
 def test_turn_halt_exit_keeps_credential_scout_reply_through_refresh_with_draft() -> None:
     ctx = _ctx()
     ctx.last_workflow_yaml = "title: Draft\nworkflow_definition:\n  blocks: []\n"
