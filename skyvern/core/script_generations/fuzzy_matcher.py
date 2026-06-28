@@ -74,6 +74,8 @@ def match_option(candidate: str, options: list[str], *, min_substring_len: int =
     if len(candidate_stem) >= min_substring_len:
         for i, opt in enumerate(options):
             opt_stem = _normalize(opt).rstrip("s")
+            if len(opt_stem) < min_substring_len:
+                continue
             if candidate_stem in opt_stem or opt_stem in candidate_stem:
                 return i
 
