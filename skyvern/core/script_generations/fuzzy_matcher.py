@@ -97,3 +97,35 @@ def match_option(candidate: str, options: list[str], *, min_substring_len: int =
         return best_overlap_idx
 
     return None
+
+
+def match_option_exact_or_stem(candidate: str, options: list[str], *, min_stem_len: int = 3) -> int | None:
+    """Find an exact or singular/plural stem option match.
+
+    This deliberately excludes substring and word-overlap matches. Returning
+    None is the safe fallback signal for option matches that need the LLM path.
+    """
+    if not candidate or not options:
+        return None
+
+    candidate_norm = _normalize(candidate)
+    exact_matches = [i for i, opt in enumerate(options) if _normalize(opt) == candidate_norm]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        return None
+
+    # Simple trailing-s stripping is intentionally precision-first; min_stem_len keeps non-linguistic stems safe.
+    candidate_stem = candidate_norm.rstrip("s")
+    if len(candidate_stem) < min_stem_len:
+        return None
+
+    stem_matches = [
+        i
+        for i, opt in enumerate(options)
+        if len(opt_stem := _normalize(opt).rstrip("s")) >= min_stem_len and opt_stem == candidate_stem
+    ]
+    if len(stem_matches) == 1:
+        return stem_matches[0]
+
+    return None
