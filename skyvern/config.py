@@ -178,6 +178,14 @@ class Settings(BaseSettings):
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
     COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
+    # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
+    COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
+    COPILOT_CLICK_SETTLE_DELAY_SECONDS: float = 0.6
+    COPILOT_CLICK_SETTLE_DEADLINE_SECONDS: float = 3.5
+    # Kill switch for the clickable-controls grounding channel: when off, composition evidence omits the
+    # clickable_controls key entirely, reverting both the re-perception attach and the evaluate steer.
+    COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED: bool = True
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False

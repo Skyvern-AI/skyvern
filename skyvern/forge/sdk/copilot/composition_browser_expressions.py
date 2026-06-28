@@ -8,6 +8,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _ANTI_BOT_PATTERNS,
     _ANTI_BOT_SCAN_BYTES,
     _MAX_CHALLENGE_CONTROLS,
+    _MAX_CLICKABLE_CONTROLS,
     _MAX_FIELDS_PER_FORM,
     _MAX_FORMS,
     _MAX_MODAL_DISMISS_CONTROLS,
@@ -100,6 +101,13 @@ def scout_accessible_role_name_expression(css_selector: str) -> str:
     )
 
 
+# Live count of elements a CSS selector resolves to right now. An invalid selector returns -1 so the
+# caller can tell "matched nothing" (0) apart from "could not evaluate" (-1).
+def selector_match_count_expression(css_selector: str) -> str:
+    sel = json.dumps(css_selector)
+    return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
+
+
 COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
     "(() => {"
     "  const body = document.body; if (!body) return [];"
@@ -164,6 +172,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
     f"const MAX_SELECT_OPTIONS={int(_MAX_SELECT_OPTIONS)};"
     f"const MAX_CHALLENGE_CONTROLS={int(_MAX_CHALLENGE_CONTROLS)};"
+    f"const MAX_CLICKABLE_CONTROLS={int(_MAX_CLICKABLE_CONTROLS)};"
     f"const MAX_MODAL_OVERLAYS={int(_MAX_MODAL_OVERLAYS)};"
     f"const MAX_MODAL_DISMISS_CONTROLS={int(_MAX_MODAL_DISMISS_CONTROLS)};"
     f"const MAX_PAGE_OBSTRUCTIONS={int(_MAX_PAGE_OBSTRUCTIONS)};"
@@ -330,6 +339,43 @@ for (const link of document.querySelectorAll('a[href]')) {
   navTargets.push(entry);
 }
 
+const clickableSelector = (el) => {
+  const tag = (el.tagName || '*').toLowerCase();
+  const id = attr(el, 'id'); if (id) return '#' + id;
+  const da = attr(el, 'data-action'); if (da) return tag + '[data-action="' + cssAttr(da) + '"]';
+  const al = attr(el, 'aria-label'); if (al) return tag + '[aria-label="' + cssAttr(al) + '"]';
+  const name = attr(el, 'name'); const value = attr(el, 'value');
+  if (name && value) return tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]';
+  const cs = classSelector(classesFor(el));
+  if (cs) return tag + cs;
+  return '';
+};
+const clickableText = (el) => nodeText(el) || attr(el, 'aria-label') || attr(el, 'value') || attr(el, 'title');
+const usedClickableSelectors = new Set();
+for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.selector) usedClickableSelectors.add(sc.selector);
+for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
+const clickableControls = [];
+const seenClickableText = new Set();
+for (const el of document.querySelectorAll('button,[role="button"],[data-action]')) {
+  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+  const tag = (el.tagName || '').toLowerCase();
+  if (SKIP_TAGS.has(tag)) continue;
+  if (el.closest && el.closest('form')) continue;
+  const text = clickableText(el);
+  const selector = clickableSelector(el);
+  let unique = false;
+  if (selector) { try { unique = document.querySelectorAll(selector).length === 1; } catch (e) { unique = false; } }
+  if (selector && unique && !usedClickableSelectors.has(selector)) {
+    clickableControls.push({ text: text, selector: selector, tag: tag });
+    usedClickableSelectors.add(selector);
+    if (text) seenClickableText.add(text);
+    continue;
+  }
+  if (!text || seenClickableText.has(text)) continue;
+  clickableControls.push({ text: text, tag: tag });
+  seenClickableText.add(text);
+}
+
 const resultContainers = [];
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
@@ -437,6 +483,7 @@ return JSON.stringify({
   forms: forms,
   navigation_targets: navTargets,
   result_containers: resultContainers,
+  clickable_controls: clickableControls,
   challenge_controls: challengeControls,
   modal_overlays: modalOverlays,
   visual_obstruction_candidates: visualObstructionCandidates,

@@ -366,9 +366,10 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
             if criterion.contingent_antecedent_output_path
             else ""
         )
+        deliverable_kind = f" [deliverable_kind={criterion.deliverable_kind}]" if criterion.deliverable_kind else ""
         output_path = f" [required_output_path={criterion.output_path}]" if criterion.output_path else ""
         parts.append(
-            f"- {criterion.id}: {criterion.outcome}{contingent_on}{antecedent_output_path}{output_path}{flags}"
+            f"- {criterion.id}: {criterion.outcome}{contingent_on}{antecedent_output_path}{deliverable_kind}{output_path}{flags}"
         )
     return "\n".join(parts)
 

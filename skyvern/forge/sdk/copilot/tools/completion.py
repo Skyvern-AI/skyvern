@@ -66,6 +66,7 @@ from .blockers import (
 LOG = structlog.get_logger()
 
 _TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
 
 def _completion_request_policy(copilot_ctx: Any) -> Any | None:
@@ -121,6 +122,15 @@ def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool
     return derive_from_block_outputs(_result_block_outputs_by_label(result)) is not None
 
 
+def _registered_download_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.output_path is not None
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+    )
+
+
 def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool:
     if _is_typed_download_target(_ctx_reached_download_target(copilot_ctx)):
         return True
@@ -132,11 +142,17 @@ def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool
 def _reconcile_download_completion_criterion(
     copilot_ctx: Any, result: dict[str, Any], criteria: list[CompletionCriterion]
 ) -> list[CompletionCriterion]:
-    if any(is_registered_download_completion_criterion(criterion) for criterion in criteria):
-        return criteria
+    has_registered_download_evidence = _result_has_registered_download_block_output(result)
+    reconciled = (
+        [criterion for criterion in criteria if not _registered_download_requested_output_criterion(criterion)]
+        if has_registered_download_evidence
+        else criteria
+    )
+    if any(is_registered_download_completion_criterion(criterion) for criterion in reconciled):
+        return reconciled
     if not _has_typed_download_signal(copilot_ctx, result):
-        return criteria
-    return [*criteria, registered_download_completion_criterion()]
+        return reconciled
+    return [*reconciled, registered_download_completion_criterion()]
 
 
 def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
