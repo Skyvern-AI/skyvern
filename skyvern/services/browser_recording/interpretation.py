@@ -13,6 +13,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
+from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels import exfiltration as streaming_exfiltration
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEventSource
 from skyvern.services.browser_recording.service import (
@@ -39,6 +40,10 @@ LOG = structlog.get_logger(__name__)
 
 INTERPRETATION_DEBOUNCE_SECONDS = 0.4
 INTERPRETATION_MAX_WAIT_SECONDS = 2.0
+# events_to_actions is pure CPU and runs on the event loop; log when a single pass
+# is slow enough to risk starving the raw-event/WebSocket path so we can decide
+# whether to offload it to a thread.
+EVENTS_TO_ACTIONS_SLOW_MS = 50.0
 SIGNIFICANT_CONSOLE_EVENT_TYPES = {
     "blur",
     "change",
@@ -258,6 +263,7 @@ class RecordingInterpretationSession:
         self._debounce_task: asyncio.Task[None] | None = None
         self._pending_since: float | None = None
         self._enrichment_tasks: set[asyncio.Task[None]] = set()
+        self._enrichment_semaphore = asyncio.Semaphore(settings.RECORDING_ENRICHMENT_MAX_CONCURRENCY)
         self._interpret_lock = asyncio.Lock()
         self._action_machines: list[sm.StateMachine] = [
             sm.Click(),
@@ -291,6 +297,14 @@ class RecordingInterpretationSession:
             return
 
         self.events.extend(reified_events)
+
+        # Async materialization (e.g. console json_value round-trips) can append
+        # events out of true order under load. Re-sort only the not-yet-interpreted
+        # tail by capture order; never touch the processed prefix, whose emitted
+        # actions are tracked by index. sorted() is stable, so legacy events without
+        # a capture_seq (-1) keep their arrival order.
+        tail_start = self._processed_event_count
+        self.events[tail_start:] = sorted(self.events[tail_start:], key=lambda event: event.capture_seq)
 
         if not any(event_should_trigger_interpretation(event) for event in reified_events):
             return
@@ -350,11 +364,21 @@ class RecordingInterpretationSession:
 
             if self._processed_event_count < len(self.events):
                 new_events = self.events[self._processed_event_count :]
+                started_at = time.perf_counter()
                 self._all_actions = processor.events_to_actions(
                     new_events,
                     machines=self._action_machines,
                     initial_actions=self._all_actions,
                 )
+                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                if elapsed_ms >= EVENTS_TO_ACTIONS_SLOW_MS:
+                    LOG.warning(
+                        "Slow events_to_actions pass blocked the event loop",
+                        browser_session_id=self.browser_session_id,
+                        elapsed_ms=round(elapsed_ms, 1),
+                        new_event_count=len(new_events),
+                        total_action_count=len(self._all_actions),
+                    )
                 self._processed_event_count = len(self.events)
 
             new_actions = self._all_actions[self.emitted_action_count :]
@@ -444,7 +468,8 @@ class RecordingInterpretationSession:
         enriched: RecordingDraftStep | None = None
 
         try:
-            block = await processor.create_action_block(action)
+            async with self._enrichment_semaphore:
+                block = await processor.create_action_block(action)
             enriched = _draft_step_from_block(
                 browser_session_id=self.browser_session_id,
                 action_index=action_index,

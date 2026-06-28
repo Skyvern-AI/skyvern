@@ -274,6 +274,10 @@ class Settings(BaseSettings):
     # set both to record at an explicit resolution.
     BROWSER_RECORDING_WIDTH: int | None = None
     BROWSER_RECORDING_HEIGHT: int | None = None
+    # Max concurrent LLM enrichment calls per live browser-recording interpretation
+    # session. Bounds the per-action enrichment fan-out so a burst of interactions
+    # can't flood the event loop with simultaneous LLM requests.
+    RECORDING_ENRICHMENT_MAX_CONCURRENCY: int = 4
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
