@@ -10,16 +10,21 @@ import copy
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
 )
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
+)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _consume_pending_browser_interaction_observation,
@@ -71,6 +76,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         pending_browser_interaction_observation=None,
         pending_scout_typed_value=None,
         pending_scout_role_name=None,
+        pending_scout_click_selector=None,
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],
@@ -427,4 +433,306 @@ class TestNoProgressInteractionAccounting:
         )
 
         assert consumed is True
+        assert ctx.consecutive_no_progress_interaction_count == 0
+
+
+def _standalone_controls_payload() -> dict[str, Any]:
+    return {
+        "page_title": "Account Information",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "clickable_controls": [
+            {"selector": "#biz-tile", "text": "Business"},
+            {"selector": 'div[data-action="selectAddress"]', "text": "2468 Peach Orchard Ct"},
+        ],
+    }
+
+
+def _ungroundable_payload() -> dict[str, Any]:
+    return {"page_title": "Loading", "forms": []}
+
+
+class TestNonAdvancingClickReperception:
+    @pytest.mark.asyncio
+    async def test_hollow_click_attaches_grounded_targets_without_touching_outcome(self) -> None:
+        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.consecutive_no_progress_interaction_count == 1
+        selectors = {target.get("selector") for target in result["data"]["actionable_targets"]}
+        assert "#biz-tile" in selectors
+        assert 'div[data-action="selectAddress"]' in selectors
+
+    @pytest.mark.asyncio
+    async def test_failed_click_attaches_grounded_targets(self) -> None:
+        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 5000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        assert ctx.consecutive_no_progress_interaction_count == 1
+        selectors = {target.get("selector") for target in result["data"]["actionable_targets"]}
+        assert "#biz-tile" in selectors
+
+    @pytest.mark.asyncio
+    async def test_ungroundable_non_advancing_click_attaches_no_targets(self) -> None:
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.consecutive_no_progress_interaction_count == 1
+        assert "actionable_targets" not in result["data"]
+
+    @pytest.mark.asyncio
+    async def test_empty_url_attaches_no_targets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def no_url(_raw: dict[str, Any], _ctx: AgentContext) -> tuple[str, str]:
+            return "", ""
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_url_title", no_url)
+        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 5000ms exceeded"},
+            {"browser_context": {}},
+            ctx,
+        )
+
+        assert ctx.consecutive_no_progress_interaction_count == 1
+        assert "actionable_targets" not in (result.get("data") or {})
+
+    @pytest.mark.asyncio
+    async def test_attached_click_does_not_attach_reperception_targets(self) -> None:
+        ctx = _np_ctx(server=_server_returning(_bounded_extractor_payload()))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert "actionable_targets" not in result["data"]
+
+    @pytest.mark.asyncio
+    async def test_ungroundable_churn_still_halts_at_max_without_reset(self) -> None:
+        ctx = AgentContext(
+            organization_id="o_1",
+            workflow_id="w_1",
+            workflow_permanent_id="wpid_1",
+            workflow_yaml="",
+            browser_session_id="pbs_1",
+            stream=MagicMock(),
+        )
+        ctx.discovery_mcp_server = _server_returning(_ungroundable_payload())
+
+        for expected in range(1, MAX_NO_PROGRESS_INTERACTION_ATTEMPTS + 1):
+            result = await _run_click(ctx)
+            assert "actionable_targets" not in result["data"]
+            assert ctx.consecutive_no_progress_interaction_count == expected
+
+        assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+        assert ctx.blocker_signal is not None
+
+
+def _sequenced_evidence(parses: list[dict[str, Any] | None]) -> Any:
+    calls = {"n": 0}
+
+    async def fake(_ctx: Any, *, inspected_url: str, current_url: str, timeout_seconds: float) -> dict[str, Any] | None:
+        index = calls["n"]
+        calls["n"] += 1
+        return parses[index] if index < len(parses) else parses[-1]
+
+    fake.calls = calls  # type: ignore[attr-defined]
+    return fake
+
+
+def _live_match(count: int | None) -> Any:
+    async def fake(_ctx: Any, _selector: str | None, *, timeout_seconds: float | None = None) -> int | None:
+        return count
+
+    return fake
+
+
+class TestPreconditionGatedClickSettle:
+    @pytest.mark.asyncio
+    async def test_settle_attaches_grounded_targets_and_steer_after_pending_ajax(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(
+            tools_module.mcp_hooks,
+            "_composition_get_structured_evidence",
+            _sequenced_evidence([None, None, _standalone_controls_payload()]),
+        )
+        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(1))
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 10000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        data = result["data"]
+        selectors = {target.get("selector") for target in data["actionable_targets"]}
+        assert "#biz-tile" in selectors
+        assert data["next_action"] == "click"
+        assert data["next_action_reason"]
+        assert ctx.consecutive_no_progress_interaction_count == 1
+        assert ctx.last_scout_act_observe_outcome is None
+
+    @pytest.mark.asyncio
+    async def test_zero_match_invented_selector_skips_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        evidence = _sequenced_evidence([None, _standalone_controls_payload()])
+        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(0))
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+        ctx.pending_scout_click_selector = "button[data-action='invented']"
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 10000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        assert "actionable_targets" not in (result.get("data") or {})
+        assert evidence.calls["n"] == 1
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_settle_is_bounded_and_attaches_nothing_when_never_populates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_MAX_PROBES", 3)
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DEADLINE_SECONDS", 5.0)
+        evidence = _sequenced_evidence([None])
+        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(1))
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 10000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        assert "actionable_targets" not in (result.get("data") or {})
+        assert evidence.calls["n"] == 4
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unreadable_selector_skips_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        evidence = _sequenced_evidence([None, _standalone_controls_payload()])
+        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(None))
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 10000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        assert "actionable_targets" not in (result.get("data") or {})
+        assert evidence.calls["n"] == 1
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_expired_deadline_runs_no_warrants_or_extractor_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_MAX_PROBES", 5)
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DEADLINE_SECONDS", 0.0)
+        evidence = _sequenced_evidence([None, _standalone_controls_payload()])
+        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
+        live = _counting_live_match(1)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", live)
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "Timeout 10000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        assert "actionable_targets" not in (result.get("data") or {})
+        assert evidence.calls["n"] == 1
+        assert live.calls["n"] == 0
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+
+def _counting_live_match(count: int | None) -> Any:
+    calls = {"n": 0}
+
+    async def fake(_ctx: Any, _selector: str | None, *, timeout_seconds: float | None = None) -> int | None:
+        calls["n"] += 1
+        return count
+
+    fake.calls = calls  # type: ignore[attr-defined]
+    return fake
+
+
+class TestClickReperceptionHardening:
+    @pytest.mark.asyncio
+    async def test_ok_hollow_empty_packet_falls_through_to_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(
+            tools_module.mcp_hooks,
+            "_composition_get_structured_evidence",
+            _sequenced_evidence([None, _standalone_controls_payload()]),
+        )
+        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(1))
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        data = result["data"]
+        selectors = {target.get("selector") for target in data["actionable_targets"]}
+        assert "#biz-tile" in selectors
+        assert data["next_action"] == "click"
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_attach_exception_is_swallowed_and_increment_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("attach blew up")
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_attach_reperception_targets_on_non_advancing_click", boom)
+        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+
+        result = await _run_click(ctx)
+
+        assert result["ok"] is True
+        assert ctx.consecutive_no_progress_interaction_count == 1
+        assert "actionable_targets" not in result["data"]
+
+    @pytest.mark.asyncio
+    async def test_channel_off_attaches_nothing_and_counter_climbs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED", False)
+        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert "actionable_targets" not in result["data"]
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_channel_off_leaves_bounded_steer_intact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED", False)
+        ctx = _np_ctx(server=_server_returning(_bounded_extractor_payload()), counter=2)
+
+        await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
         assert ctx.consecutive_no_progress_interaction_count == 0
