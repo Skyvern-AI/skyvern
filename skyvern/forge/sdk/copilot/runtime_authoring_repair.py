@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, TypeGuard
 
+import structlog
+
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
@@ -10,6 +12,8 @@ from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDE
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
+
+LOG = structlog.get_logger()
 
 _RUNTIME_AUTHORING_REASON_CODE = "runtime_block_failure"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
@@ -74,6 +78,58 @@ def _runtime_summary_list(value: Any, keys: tuple[str, ...]) -> list[str]:
         if summary:
             summaries.append(summary)
     return summaries
+
+
+def _runtime_form_summaries(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    summaries: list[str] = []
+    for form in value:
+        if not isinstance(form, dict):
+            continue
+        for field in form.get("fields") or []:
+            summary = _runtime_summary_entry(field, ("label", "selector"))
+            if summary:
+                summaries.append(summary)
+        for control in form.get("submit_controls") or []:
+            summary = _runtime_summary_entry(control, ("text", "selector", "disabled"))
+            if summary:
+                summaries.append(summary)
+    return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
+
+
+def _runtime_result_summaries(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    summaries: list[str] = []
+    for container in value:
+        if not isinstance(container, dict):
+            continue
+        primary = _runtime_summary_entry(container, ("selector", "text_excerpt", "row_selector"))
+        if primary:
+            summaries.append(primary)
+        for toggle in container.get("expand_toggle_candidates") or []:
+            summary = _bounded_runtime_text(toggle, 80)
+            if summary:
+                summaries.append(summary)
+        for row in container.get("sample_rows") or []:
+            summary = _bounded_runtime_text(row, 80)
+            if summary:
+                summaries.append(summary)
+                break
+    return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
+
+
+def post_run_inspection_cleanly_matches(evidence: Any, run_id: Any) -> bool:
+    return (
+        isinstance(evidence, dict)
+        and evidence.get("source_tool") == _INSPECT_PAGE_SOURCE_TOOL
+        and evidence.get("observed_after_workflow_run") is True
+        and isinstance(run_id, str)
+        and bool(run_id)
+        and evidence.get("workflow_run_id") == run_id
+        and has_bounded_page_schema(evidence)
+    )
 
 
 def _post_run_terminal_page_evidence(evidence: dict[str, Any]) -> bool:
@@ -279,10 +335,10 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
             "current_title_present": isinstance(page_title, str) and bool(page_title.strip()),
             "page_evidence_source": _bounded_runtime_text(evidence.get("source_tool"), 80) or None,
             "observed_after_workflow_run": True,
-            "page_form_summaries": _runtime_summary_list(evidence.get("forms"), ("label", "selector")),
-            "page_result_summaries": _runtime_summary_list(evidence.get("result_containers"), ("label", "text")),
+            "page_form_summaries": _runtime_form_summaries(evidence.get("forms")),
+            "page_result_summaries": _runtime_result_summaries(evidence.get("result_containers")),
             "page_action_summaries": _runtime_summary_list(
-                evidence.get("navigation_targets"), ("label", "selector", "disabled")
+                evidence.get("navigation_targets"), ("text", "selector", "disabled")
             ),
             "page_challenge_summaries": _runtime_summary_list(
                 evidence.get("challenge_controls"), ("text", "selector", "disabled")
@@ -315,4 +371,12 @@ def inject_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, 
             return
         repair_context = pending
         copilot_ctx.last_code_authoring_repair_context = repair_context
+    LOG.info(
+        "Injected runtime authoring repair context",
+        observed_after_workflow_run=repair_context.observed_after_workflow_run,
+        workflow_run_id=repair_context.workflow_run_id,
+        page_form_summary_count=len(repair_context.page_form_summaries),
+        page_result_summary_count=len(repair_context.page_result_summaries),
+        page_action_summary_count=len(repair_context.page_action_summaries),
+    )
     data["authoring_repair_context"] = repair_context.model_dump(mode="json")

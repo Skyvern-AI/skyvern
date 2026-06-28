@@ -281,8 +281,8 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
                 "current_url": current_url,
                 "page_title": "Search",
                 "source_tool": "inspect_page_for_composition",
-                "forms": [{"label": "Search", "selector": "#search"}],
-                "result_containers": [{"label": "No results", "text": "No matching records"}],
+                "forms": [{"fields": [{"label": "Search", "selector": "#search"}], "submit_controls": []}],
+                "result_containers": [{"selector": "#results", "text_excerpt": "No matching records"}],
                 "navigation_targets": [],
                 "challenge_controls": [],
             },
@@ -312,7 +312,7 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
     assert ctx.pending_code_authoring_runtime_repair_context is None
     assert ctx.last_code_authoring_repair_context is not None
     assert ctx.last_code_authoring_repair_context.current_origin == "https://example.test"
-    assert ctx.last_code_authoring_repair_context.page_result_summaries == ["No results No matching records"]
+    assert ctx.last_code_authoring_repair_context.page_result_summaries == ["#results No matching records"]
     assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
-    assert "page_results: No results No matching records" in prompt
+    assert "page_results: #results No matching records" in prompt
     assert "case=secret" not in ctx.last_code_authoring_repair_context.model_dump_json()
