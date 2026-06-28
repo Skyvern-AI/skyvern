@@ -58,6 +58,13 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "raw_secret_handling",
     "clarification_reason",
 }
+_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
+    {
+        "output.downloaded_files",
+        "output.downloaded_file_urls",
+        "output.downloaded_file_artifact_ids",
+    }
+)
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -203,6 +210,7 @@ class CompletionCriterion:
     outcome: str
     contingent_on: str | None = None
     contingent_antecedent_output_path: str | None = None
+    deliverable_kind: Literal["registered_download"] | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -583,7 +591,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     if not isinstance(raw, list):
         return []
     criteria: list[CompletionCriterion] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -605,10 +613,12 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
         )
+        deliverable_kind = _normalize_deliverable_kind(item.get("deliverable_kind"))
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
             output_path or normalized_criterion_outcome_key(outcome),
+            deliverable_kind or "",
         )
         if key in seen:
             continue
@@ -621,6 +631,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 outcome=outcome,
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
+                deliverable_kind=deliverable_kind,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=cast(CriterionLevel, level_raw)
@@ -641,6 +652,10 @@ def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
         return None
     path = raw.strip()
     return path if _CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE.fullmatch(path) else None
+
+
+def _normalize_deliverable_kind(raw: Any) -> Literal["registered_download"] | None:
+    return "registered_download" if raw == "registered_download" else None
 
 
 def normalized_criterion_outcome_key(outcome: str) -> str:
@@ -924,17 +939,28 @@ def _apply_requested_output_completion_criteria(
     if not requested_output_paths:
         return
 
-    contingent_metadata_by_output_path: dict[str, tuple[str | None, str | None]] = {}
+    metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
     for criterion in policy.completion_criteria:
         if criterion.level == "definition" or criterion.method_mandated:
             continue
-        if not criterion.contingent_on and not criterion.contingent_antecedent_output_path:
+        if (
+            not criterion.contingent_on
+            and not criterion.contingent_antecedent_output_path
+            and not criterion.deliverable_kind
+        ):
             continue
         for field_name, output_path, _field_label in requested_specs:
             if criterion.output_path == output_path or _criterion_text_covers_requested_output(criterion, field_name):
-                contingent_metadata_by_output_path.setdefault(
+                deliverable_kind = (
+                    criterion.deliverable_kind if output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
+                )
+                metadata_by_output_path.setdefault(
                     output_path,
-                    (criterion.contingent_on, criterion.contingent_antecedent_output_path),
+                    (
+                        criterion.contingent_on,
+                        criterion.contingent_antecedent_output_path,
+                        deliverable_kind,
+                    ),
                 )
 
     preserved_criteria = [
@@ -953,8 +979,9 @@ def _apply_requested_output_completion_criteria(
             outcome=f"The returned record includes {field_label}.",
             level="run",
             output_path=output_path,
-            contingent_on=contingent_metadata_by_output_path.get(output_path, (None, None))[0],
-            contingent_antecedent_output_path=contingent_metadata_by_output_path.get(output_path, (None, None))[1],
+            contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
+            contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
+            deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
         )
         for _field_name, output_path, field_label in requested_specs
     ]
@@ -981,6 +1008,8 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["contingent_on"] = criterion.contingent_on
         if criterion.contingent_antecedent_output_path:
             item["contingent_antecedent_output_path"] = criterion.contingent_antecedent_output_path
+        if criterion.deliverable_kind:
+            item["deliverable_kind"] = criterion.deliverable_kind
         if criterion.output_path:
             item["output_path"] = criterion.output_path
         rendered.append(item)

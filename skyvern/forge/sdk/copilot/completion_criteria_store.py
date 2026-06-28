@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CriterionKind,
     TerminalActionFamily,
     _normalize_contingent_antecedent_output_path,
+    _normalize_deliverable_kind,
     is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
@@ -117,6 +118,7 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "outcome": criterion.outcome,
             "contingent_on": criterion.contingent_on,
             "contingent_antecedent_output_path": criterion.contingent_antecedent_output_path,
+            "deliverable_kind": criterion.deliverable_kind,
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
@@ -159,6 +161,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 if isinstance(contingent_on, str) and contingent_on.strip()
                 else None,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
+                deliverable_kind=_normalize_deliverable_kind(item.get("deliverable_kind")),
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
@@ -173,13 +176,16 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
+    deliverable_kind_key = criterion.deliverable_kind or ""
     if criterion.output_path:
         return (
             f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1fdeliverable_kind:{deliverable_kind_key}"
             f"\x1foutput_path:{criterion.output_path}"
         )
     return (
         f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+        f"\x1fdeliverable_kind:{deliverable_kind_key}"
         f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
     )
 
