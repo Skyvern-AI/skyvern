@@ -4113,6 +4113,13 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        LOG.info(
+            "CodeBlock runner selection at block",
+            use_codeblock_runner=use_codeblock_runner,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=self.label,
+        )
         if use_codeblock_runner:
             secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
                 block=self,
@@ -4123,6 +4130,13 @@ async def wrapper({default_args}):
                 workflow_run_context=workflow_run_context,
                 parameter_values=parameter_values,
                 credential_parameter_keys=credential_parameter_keys,
+            )
+            LOG.info(
+                "Secure CodeBlock override returned",
+                override_returned_none=secure_code_block_result is None,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
             )
             if secure_code_block_result is not None:
                 return secure_code_block_result
