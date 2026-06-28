@@ -62,6 +62,7 @@ def _criterion(
     method_mandated: bool = False,
     contingent_on: str | None = None,
     contingent_antecedent_output_path: str | None = None,
+    deliverable_kind: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -71,6 +72,7 @@ def _criterion(
         method_mandated=method_mandated,
         contingent_on=contingent_on,
         contingent_antecedent_output_path=contingent_antecedent_output_path,
+        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
     )
 
 
@@ -421,6 +423,99 @@ def test_classifier_parse_preserves_contingent_antecedent_output_path_without_in
     assert criteria[3].contingent_antecedent_output_path is None
 
 
+def test_classifier_parse_preserves_only_registered_download_deliverable_kind() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested download is returned.",
+                "deliverable_kind": "registered_download",
+            },
+            {
+                "outcome": "Unknown deliverable is ignored.",
+                "deliverable_kind": "download",
+            },
+            {
+                "outcome": "Absent deliverable stays empty.",
+            },
+        ]
+    )
+
+    assert [criterion.deliverable_kind for criterion in criteria] == ["registered_download", None, None]
+
+
+def test_requested_output_canonicalization_drops_marker_for_output_id() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with output id.",
+        aliases={"output id": "output.output_id"},
+    )
+
+    criteria = _requested_output_subset(policy, {"output.output_id"})
+    assert len(criteria) == 1
+    assert criteria[0].id == "__copilot_requested_output__output_output_id"
+    assert criteria[0].deliverable_kind is None
+
+
+def test_requested_output_canonicalization_drops_marker_for_npi() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes NPI.",
+                "output_path": "output.npi",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+    assert parsed[0].deliverable_kind == "registered_download"
+    policy = RequestPolicy(completion_criteria=parsed)
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with NPI.",
+        aliases={"NPI": "output.npi"},
+    )
+
+    criteria = _requested_output_subset(policy, {"output.npi"})
+    assert len(criteria) == 1
+    assert criteria[0].id == "__copilot_requested_output__output_npi"
+    assert criteria[0].deliverable_kind is None
+
+
+def test_requested_output_canonicalization_preserves_marker_for_approved_download_path() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record includes download artifact.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with download artifact.",
+        aliases={"download artifact": "output.downloaded_file_artifact_ids"},
+    )
+
+    criteria = _requested_output_subset(policy, {"output.downloaded_file_artifact_ids"})
+    assert len(criteria) == 1
+    assert criteria[0].id == "__copilot_requested_output__output_downloaded_file_artifact_ids"
+    assert criteria[0].deliverable_kind == "registered_download"
+
+
 def test_active_criteria_rendering_includes_contingent_on() -> None:
     rendered = _render_active_criteria_for_prompt(
         [
@@ -467,6 +562,32 @@ def test_active_criteria_rendering_includes_contingent_antecedent_output_path() 
             "terminal_action_family": None,
             "contingent_on": "the provider site blocks online submission",
             "contingent_antecedent_output_path": "output.blocker",
+        }
+    ]
+
+
+def test_active_criteria_rendering_includes_deliverable_kind() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The requested download is returned.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "The requested download is returned.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
+            "deliverable_kind": "registered_download",
+            "output_path": "output.output_id",
         }
     ]
 
