@@ -68,12 +68,15 @@ def make_console_event(
 
     params = {**default_params, **params}
 
+    # params.timestamp is the client clock (Date.now(), ms); the outer event
+    # timestamp is the server clock (time.time(), seconds). Mirror production so
+    # the Wait machine's client/server offset is ~0 for zero-skew fixtures.
     return ExfiltratedConsoleEvent(
         kind="exfiltrated-event",
         source="console",
         event_name="user_interaction",
         params=params,
-        timestamp=timestamp,
+        timestamp=timestamp / 1000.0,
     )
 
 
@@ -607,6 +610,56 @@ def test_collapse_consecutive_waits_merges_durations() -> None:
     assert isinstance(wait_action, ActionWait)
     # 5500ms + 5500ms busy spans summed into a single wait.
     assert wait_action.duration_ms == 11000
+
+
+def make_skewed_console_event(
+    event_type: str,
+    target: dict[str, t.Any],
+    client_ms: float,
+    server_skew_seconds: float,
+) -> ExfiltratedConsoleEvent:
+    """A console event whose server clock is offset from the client clock."""
+    params: dict[str, t.Any] = {
+        "type": event_type,
+        "target": target,
+        "timestamp": client_ms,
+        "url": "https://example.com",
+        "activeElement": {"tagName": "BUTTON"},
+        "window": {"height": 800, "width": 1200, "scrollX": 0, "scrollY": 0},
+        "mousePosition": {"xp": 0.5, "yp": 0.5},
+    }
+    return ExfiltratedConsoleEvent(
+        kind="exfiltrated-event",
+        source="console",
+        event_name="user_interaction",
+        params=params,
+        timestamp=client_ms / 1000.0 + server_skew_seconds,
+    )
+
+
+def test_wait_offset_projection_cancels_client_server_clock_skew() -> None:
+    # Server clock runs 60s ahead of the client clock. The Wait machine must
+    # project the server-stamped CDP activity back into the client clock so the
+    # busy span is measured correctly; otherwise the activity falls outside the
+    # client-clock gap and the (real) wait is wrongly suppressed.
+    skew = 60.0
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        make_skewed_console_event("click", target, client_ms=1000.0, server_skew_seconds=skew),
+        # real activity at client 4s/7s -> server-stamped 64s/67s
+        make_cdp_event("net:activity", timestamp_seconds=4.0 + skew, params={"count": 12}),
+        make_cdp_event("net:activity", timestamp_seconds=7.0 + skew, params={"count": 3}),
+        make_skewed_console_event("focus", target, client_ms=9000.0, server_skew_seconds=skew),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
+    wait_action = actions[1]
+    assert isinstance(wait_action, ActionWait)
+    assert wait_action.duration_ms == 6000
 
 
 def test_wait_ignores_activity_outside_the_idle_gap() -> None:
