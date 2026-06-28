@@ -1567,6 +1567,290 @@
         "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
+    "/v1/tag-values": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List tag values",
+        "description": "List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
+        "operationId": "list_tag_values_v1_tag_values_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TagValue"
+                  },
+                  "title": "Response List Tag Values V1 Tag Values Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_tag_values"
+      }
+    },
+    "/v1/tag-values/{key}": {
+      "patch": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Update tag value color",
+        "description": "Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.",
+        "operationId": "update_tag_value_v1_tag_values__key__patch",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully recolored tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValue"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "422": {
+            "description": "Invalid palette color"
+          }
+        },
+        "x-fern-sdk-method-name": "update_tag_value"
+      },
+      "delete": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Delete tag value",
+        "description": "Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.",
+        "operationId": "delete_tag_value_v1_tag_values__key__delete",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueDelete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValueDeleteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_tag_value"
+      }
+    },
+    "/v1/tag-values/{key}/rename": {
+      "patch": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Rename tag value",
+        "description": "Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
+        "operationId": "rename_tag_value_v1_tag_values__key__rename_patch",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueRename"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully renamed tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValueRenameResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "409": {
+            "description": "Target value already exists for this key"
+          },
+          "422": {
+            "description": "Invalid value"
+          }
+        },
+        "x-fern-sdk-method-name": "rename_tag_value"
+      }
+    },
     "/v1/workflow-tags": {
       "get": {
         "tags": [
@@ -2259,7 +2543,7 @@
           "Browser Profiles"
         ],
         "summary": "Create a browser profile",
-        "description": "Create a browser profile from a persistent browser session or workflow run.",
+        "description": "Create a blank browser profile, or create one from a persistent browser session or workflow run.",
         "operationId": "create_browser_profile_v1_browser_profiles_post",
         "parameters": [
           {
@@ -2303,7 +2587,7 @@
             }
           },
           "400": {
-            "description": "Invalid request - missing source or source not found"
+            "description": "Invalid request - source not found or source archive unavailable"
           },
           "409": {
             "description": "Browser profile name already exists"
@@ -2325,11 +2609,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a blank browser profile for future runs\nblank_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"Fresh Profile\",\n)\nprint(blank_profile)\n\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
               }
             ]
           }
@@ -8356,6 +8640,35 @@
             ],
             "title": "Source Browser Type"
           },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -9447,16 +9760,49 @@
           "browser_session_id": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               },
               {
                 "type": "null"
               }
             ],
             "title": "Browser Session Id",
-            "description": "Persistent browser session to convert into a profile"
+            "description": "Persistent browser session to convert into a profile. Omit for a blank profile."
           },
           "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id",
+            "description": "Workflow run whose persisted session should be captured. Omit for a blank profile."
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -9465,8 +9811,8 @@
                 "type": "null"
               }
             ],
-            "title": "Workflow Run Id",
-            "description": "Workflow run whose persisted session should be captured"
+            "title": "Proxy Session Id",
+            "description": "Explicit sticky-session id for this profile's pinned proxy identity."
           }
         },
         "type": "object",
@@ -9510,6 +9856,18 @@
             ],
             "title": "Proxy Location",
             "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}, or a custom proxy URL dict for self-hosted deployments: {\"url\": \"http://user:password@proxy.example.com:8080\"}"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions."
           },
           "extensions": {
             "anyOf": [
@@ -9610,6 +9968,37 @@
               "azure_vault",
               "bitwarden"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Optional advanced reuse key for this credential's pinned proxy identity."
           }
         },
         "type": "object",
@@ -9954,6 +10343,37 @@
             "examples": [
               "cfld_1234567890"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location used for the credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
           }
         },
         "type": "object",
@@ -12027,7 +12447,7 @@
           "continue_on_empty": {
             "type": "boolean",
             "title": "Continue On Empty",
-            "description": "When the run download directory has no files, fail the block (False, default) instead of reporting success. Set True to allow an empty upload (success with no files uploaded).",
+            "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
             "default": false
           }
         },
@@ -18355,6 +18775,21 @@
             "type": "array",
             "title": "Tags To Delete",
             "description": "Tags to soft-delete. List of {key?, value?} targets."
+          },
+          "colors": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Colors",
+            "description": "Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color."
           }
         },
         "type": "object",
@@ -18644,6 +19079,146 @@
         ],
         "title": "TagResponse",
         "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row).\n``key`` is null for a standalone label."
+      },
+      "TagValue": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "color": {
+            "type": "string",
+            "title": "Color"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "description": "Number of non-deleted workflows currently carrying this (key, value) label.",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "color"
+        ],
+        "title": "TagValue",
+        "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
+      },
+      "TagValueDelete": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) under the key to soft-delete."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "TagValueDelete",
+        "description": "Body for ``DELETE /v1/tag-values/{key}``. The value rides in the body, not the\npath, so values containing ``/`` stay addressable."
+      },
+      "TagValueDeleteResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "removed_from_workflow_count": {
+            "type": "integer",
+            "title": "Removed From Workflow Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "removed_from_workflow_count"
+        ],
+        "title": "TagValueDeleteResponse",
+        "description": "Response for ``DELETE /v1/tag-values/{key}``."
+      },
+      "TagValueRename": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Current tag value (label) under the key to rename."
+          },
+          "new_value": {
+            "type": "string",
+            "title": "New Value",
+            "description": "New tag value (label) to rename it to."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "new_value"
+        ],
+        "title": "TagValueRename",
+        "description": "Body for ``PATCH /v1/tag-values/{key}/rename``. Both the current and the new\nvalue ride in the body so values containing ``/`` stay addressable."
+      },
+      "TagValueRenameResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "color": {
+            "type": "string",
+            "title": "Color"
+          },
+          "renamed_workflow_count": {
+            "type": "integer",
+            "title": "Renamed Workflow Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "color",
+          "renamed_workflow_count"
+        ],
+        "title": "TagValueRenameResponse",
+        "description": "Response for ``PATCH /v1/tag-values/{key}/rename``: the renamed label with its\ncarried-over color and the number of workflows re-tagged."
+      },
+      "TagValueUpdate": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) under the key to recolor."
+          },
+          "color": {
+            "type": "string",
+            "title": "Color",
+            "description": "Palette color name to assign to this (key, value)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "color"
+        ],
+        "title": "TagValueUpdate",
+        "description": "Body for ``PATCH /v1/tag-values/{key}``. The value rides in the body, not the\npath, so values containing ``/`` stay addressable."
       },
       "TagsResponse": {
         "properties": {
@@ -20975,6 +21550,37 @@
             ],
             "title": "Description",
             "description": "New description for the browser profile"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
           }
         },
         "type": "object",
@@ -22819,6 +23425,17 @@
             ],
             "title": "Browser Profile Id"
           },
+          "browser_profile_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key"
+          },
           "model": {
             "anyOf": [
               {
@@ -23120,6 +23737,17 @@
               }
             ],
             "title": "Browser Profile Id"
+          },
+          "browser_profile_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key"
           },
           "model": {
             "anyOf": [
@@ -23513,9 +24141,15 @@
       "WorkflowDefinitionYAML": {
         "properties": {
           "version": {
-            "type": "integer",
-            "title": "Version",
-            "default": 1
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
           },
           "parameters": {
             "items": {

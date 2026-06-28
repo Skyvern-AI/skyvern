@@ -1,0 +1,194 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { BrowserStream } from "./BrowserStream";
+
+const mocks = vi.hoisted(() => {
+  type RfbListener = (event: { detail?: unknown }) => void;
+
+  const rfbInstances: Array<{
+    clipboardPasteFrom: ReturnType<typeof vi.fn>;
+    sendKey: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
+  }> = [];
+  const apiGet = vi.fn(async () => ({
+    data: {
+      browser_session_id: "pbs_test",
+      status: "running",
+      browser_address: "ws://browser.test",
+      started_at: "2026-01-01T00:00:00Z",
+      completed_at: null,
+    },
+  }));
+
+  class MockRFB {
+    scaleViewport = false;
+    clipboardPasteFrom = vi.fn();
+    sendKey = vi.fn();
+    disconnect = vi.fn();
+
+    private listeners: Record<string, RfbListener[]> = {};
+
+    constructor(target: HTMLElement) {
+      rfbInstances.push(this);
+      target.appendChild(document.createElement("canvas"));
+      queueMicrotask(() => this.emit("connect"));
+    }
+
+    addEventListener(type: string, listener: RfbListener) {
+      this.listeners[type] = [...(this.listeners[type] ?? []), listener];
+    }
+
+    removeEventListener(type: string, listener: RfbListener) {
+      this.listeners[type] = (this.listeners[type] ?? []).filter(
+        (candidate) => candidate !== listener,
+      );
+    }
+
+    private emit(type: string, detail?: unknown) {
+      for (const listener of this.listeners[type] ?? []) {
+        listener({ detail });
+      }
+    }
+  }
+
+  class MockWebSocket {
+    onopen: ((event: Event) => void) | null = null;
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onclose: ((event: CloseEvent) => void) | null = null;
+    send = vi.fn();
+    close = vi.fn();
+
+    constructor() {
+      queueMicrotask(() => this.onopen?.(new Event("open")));
+    }
+  }
+
+  const settingsStore = {
+    setBrowserSessionId: vi.fn(),
+    setIsUsingABrowser: vi.fn(),
+  };
+
+  const recordingStore = {
+    add: vi.fn(),
+    compressedChunks: [],
+    getEventCount: vi.fn(() => 0),
+    getSecondsRecording: vi.fn(() => 0),
+    isRecording: false,
+    pendingEvents: [],
+    reset: vi.fn(),
+    setIsRecording: vi.fn(),
+  };
+
+  return {
+    MockRFB,
+    MockWebSocket,
+    apiGet,
+    rfbInstances,
+    recordingStore,
+    settingsStore,
+  };
+});
+
+vi.mock("@novnc/novnc/lib/rfb.js", () => ({
+  default: mocks.MockRFB,
+}));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: vi.fn(async () => ({ get: mocks.apiGet })),
+}));
+
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => async () => null,
+}));
+
+vi.mock("@/store/useClientIdStore", () => ({
+  useClientIdStore: (selector: (state: { clientId: string }) => unknown) =>
+    selector({ clientId: "client-test" }),
+}));
+
+vi.mock("@/store/SettingsStore", () => ({
+  useSettingsStore: () => mocks.settingsStore,
+}));
+
+vi.mock("@/store/useRecordingStore", () => ({
+  useRecordingStore: () => mocks.recordingStore,
+}));
+
+function renderBrowserStream() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+      },
+    },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <BrowserStream
+        browserSessionId="pbs_test"
+        interactive={false}
+        showControlButtons={true}
+      />
+    </QueryClientProvider>,
+  );
+}
+
+describe("BrowserStream", () => {
+  beforeEach(() => {
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: mocks.MockWebSocket,
+    });
+    Object.defineProperty(window, "WebSocket", {
+      configurable: true,
+      value: mocks.MockWebSocket,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: vi.fn(async () => "https://example.test"),
+      },
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    mocks.rfbInstances.length = 0;
+  });
+
+  it("supports VNC paste after taking control of a browser session stream", async () => {
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole("button", {
+      name: /take control/i,
+    });
+    const stream = container.querySelector(".browser-stream");
+
+    expect(stream).toBeInstanceOf(HTMLElement);
+    expect(mocks.rfbInstances).toHaveLength(1);
+
+    fireEvent.keyDown(stream!, { ctrlKey: true, key: "v" });
+    expect(mocks.rfbInstances[0]?.clipboardPasteFrom).not.toHaveBeenCalled();
+
+    fireEvent.click(takeControlButton);
+    fireEvent.keyDown(stream!, { ctrlKey: true, key: "v" });
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances[0]?.clipboardPasteFrom).toHaveBeenCalledWith(
+        "https://example.test",
+      );
+    });
+    await waitFor(() => {
+      expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(4);
+    });
+  });
+});

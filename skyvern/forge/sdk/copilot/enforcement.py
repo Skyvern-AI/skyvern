@@ -16,6 +16,7 @@ from agents.run import Runner
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
     compose_loop_blocker_user_facing_reason,
     loop_blocker_evidence_from_ctx,
     stash_blocker_signal,
@@ -45,7 +46,6 @@ from skyvern.forge.sdk.copilot.config import (
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
-    POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     POST_UPDATE_NUDGE,
     PRE_DISCOVERY_URL_QUESTION_NUDGE,
@@ -68,6 +68,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     parse_final_response,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, request_policy_has_present_completion_contract
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -83,10 +84,12 @@ from skyvern.forge.sdk.copilot.terminal_predicates import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
+    blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -114,9 +117,6 @@ MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
 # longer willing to re-run extraction.
 MAX_SUSPICIOUS_SUCCESS_NUDGES = 2
-# Escalate after this many consecutive all-null extraction runs so the agent
-# inspects browser state instead of re-prompting the extractor.
-NULL_DATA_STREAK_ESCALATE_AT = 2
 # Streak levels for repeated-failure (same frontier + same failure signature).
 REPEATED_FRONTIER_STREAK_ESCALATE_AT = 2
 REPEATED_FRONTIER_STREAK_STOP_AT = 3
@@ -144,6 +144,9 @@ MAX_CODE_AUTHORING_GUARDRAIL_REJECTS = 4
 # higher bound, which must stay above MAX_CODE_AUTHORING_GUARDRAIL_REJECTS so the
 # non-credential backstop and the low-count credential deferral are untouched.
 MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS = 8
+# Far under the SDK max-turns cap so the halt arrives first.
+MAX_NO_PROGRESS_INTERACTION_ATTEMPTS = 4
+_NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -180,6 +183,13 @@ _PROGRESS_NARRATION_PATTERNS = [
     re.compile(r"\bi\s+will\s+(?:now\s+)?proceed\b", re.IGNORECASE),
     re.compile(r"\bi\s+have\s+not\s+yet\b", re.IGNORECASE),
 ]
+
+PRESENT_COMPLETION_CONTRACT_ASK_RETRY = (
+    "The final ASK_QUESTION is not an allowed terminal response for this turn: the request already has a typed "
+    "completion contract / completion criteria and no separate required clarification is active. Continue authoring "
+    "the workflow from the existing contract, then run/test it before responding. Only ask the user if a separate "
+    "required input is missing under RequestPolicy or TurnIntent."
+)
 
 
 def _is_progress_narration(user_response: Any) -> bool:
@@ -368,6 +378,54 @@ def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBloc
         internal_reason_code="credential_priority_authoring_churn",
         blocked_tool="update_workflow",
     )
+
+
+def no_forward_progress_interaction_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "consecutive_no_progress_interaction_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "loop_detected_no_forward_progress_interaction", evidence, blocked_tool="click"
+    )
+    agent_steering = (
+        f"Clicking has not advanced the page across {count} attempts; "
+        "stop trying new selectors and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="loop_detected_no_forward_progress_interaction",
+        blocked_tool="click",
+    )
+
+
+def _needs_no_progress_interaction_halt(ctx: Any) -> bool:
+    return _get_int(ctx, "consecutive_no_progress_interaction_count") >= MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+
+
+def reset_no_progress_interaction_count(ctx: Any) -> None:
+    if _get_int(ctx, "consecutive_no_progress_interaction_count") == 0:
+        return
+    ctx.consecutive_no_progress_interaction_count = 0
+    clear_tool_blocker_signals_for_reason_codes(ctx, _NO_PROGRESS_INTERACTION_REASON_CODES)
+    LOG.info("copilot_no_progress_interaction_reset")
+
+
+def register_no_progress_interaction_click(ctx: Any, *, outcome: str) -> None:
+    count = _get_int(ctx, "consecutive_no_progress_interaction_count") + 1
+    ctx.consecutive_no_progress_interaction_count = count
+    LOG.info("copilot_no_progress_interaction_click", outcome=outcome, count=count)
+    if count < MAX_NO_PROGRESS_INTERACTION_ATTEMPTS:
+        return
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    signal = no_forward_progress_interaction_stop_signal(ctx)
+    stash_blocker_signal(ctx, signal)
+    ctx.blocker_signal = signal
 
 
 def _needs_code_authoring_churn_halt(ctx: Any) -> bool:
@@ -848,6 +906,63 @@ def _completion_contract_unknown_due_to_policy_fallback(ctx: Any) -> bool:
     return _request_completion_contract_status(ctx) == "unknown"
 
 
+_AUTHORING_TURN_INTENT_MODES = frozenset({TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY})
+
+
+def _turn_intent_can_author_without_user_input(turn_intent: Any) -> bool:
+    if not isinstance(turn_intent, TurnIntent):
+        return False
+    if turn_intent.mode not in _AUTHORING_TURN_INTENT_MODES:
+        return False
+    if turn_intent.authority.requires_user_input:
+        return False
+    return turn_intent.authority.may_update_workflow
+
+
+def _has_current_turn_update_or_test_marker(ctx: Any) -> bool:
+    if bool(getattr(ctx, "update_workflow_called", False)):
+        return True
+    if bool(getattr(ctx, "test_after_update_done", False)):
+        return True
+    if getattr(ctx, "last_update_block_count", None) is not None:
+        return True
+    if getattr(ctx, "last_test_ok", None) is not None:
+        return True
+    for field_name in (
+        "last_run_blocks_workflow_run_id",
+        "last_successful_run_blocks_workflow_run_id",
+        "last_outcome_gate_workflow_run_id",
+    ):
+        marker = getattr(ctx, field_name, None)
+        if isinstance(marker, str) and marker.strip():
+            return True
+    return False
+
+
+def _present_completion_contract_ask_retry(ctx: Any, parsed: dict[str, Any]) -> str | None:
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    request_policy = getattr(ctx, "request_policy", None)
+    if not isinstance(request_policy, RequestPolicy):
+        return None
+    if not request_policy_has_present_completion_contract(request_policy):
+        return None
+    if request_policy.user_response_policy == "ask_clarification":
+        return None
+    if request_policy.clarification_reason not in (None, "none"):
+        return None
+    if not _turn_intent_can_author_without_user_input(getattr(ctx, "turn_intent", None)):
+        return None
+    if _has_current_turn_update_or_test_marker(ctx):
+        return None
+    LOG.info(
+        "copilot.present_completion_contract_ask_retry",
+        reason_code="present_completion_contract_ask_internal_retry",
+        turn_intent_mode=getattr(getattr(ctx, "turn_intent", None), "mode", None),
+    )
+    return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
 def _nudge(config: CopilotConfig | None, key: str) -> str:
     if config is None:
         return DEFAULT_ENFORCEMENT_NUDGES[key]
@@ -984,6 +1099,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
     discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
     if discovery_entrypoint_nudge is not None:
         return discovery_entrypoint_nudge
+
+    present_contract_retry = _present_completion_contract_ask_retry(ctx, parsed)
+    if present_contract_retry is not None:
+        return present_contract_retry
 
     if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
         return None
@@ -1171,17 +1290,6 @@ def _needs_probable_site_block_stop_nudge(ctx: Any) -> bool:
     return _get_int(ctx, "probable_site_block_stop_nudge_count") < MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
 
 
-def _needs_repeated_null_data_nudge(ctx: Any) -> bool:
-    """Return True when suspicious-success has happened enough times to escalate."""
-    # Same as above: non-retriable nav state never belongs on this branch.
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return False
-    if not getattr(ctx, "last_test_suspicious_success", False):
-        return False
-    streak = getattr(ctx, "null_data_streak_count", 0)
-    return streak >= NULL_DATA_STREAK_ESCALATE_AT
-
-
 def _get_int(ctx: Any, name: str, default: int = 0) -> int:
     value = getattr(ctx, name, default)
     return value if isinstance(value, int) else default
@@ -1334,9 +1442,6 @@ def _check_enforcement(
     # Do NOT clear last_test_suspicious_success here. tools._record_run_blocks_result
     # resets it on every new run; if the agent ignores the nudge and answers
     # without rerunning, we want _check_enforcement to re-emit the nudge.
-    if _needs_repeated_null_data_nudge(ctx):
-        return _nudge(config, "post_repeated_null_data")
-
     if _needs_suspicious_success_nudge(ctx):
         ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
         return _nudge(config, "post_suspicious_success")
@@ -1367,6 +1472,11 @@ def _check_enforcement(
         if churn_signal is not None:
             stash_blocker_signal(ctx, churn_signal)
             stash_turn_halt_from_blocker_signal(ctx, churn_signal, source="enforcement_backstop")
+            raise_if_turn_halt(ctx)
+        if _needs_no_progress_interaction_halt(ctx):
+            no_progress_signal = no_forward_progress_interaction_stop_signal(ctx)
+            stash_blocker_signal(ctx, no_progress_signal)
+            stash_turn_halt_from_blocker_signal(ctx, no_progress_signal, source="enforcement_backstop")
             raise_if_turn_halt(ctx)
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
@@ -1657,7 +1767,6 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_NAVIGATE_NUDGE: "post_navigate",
     POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE: "explore_without_workflow",
     POST_SUSPICIOUS_SUCCESS_NUDGE: "suspicious_success",
-    POST_REPEATED_NULL_DATA_NUDGE: "repeated_null_data",
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE: "repeated_frontier_failure_warn",
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE: "repeated_frontier_failure_stop",
     POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE: "non_retriable_nav_error_stop",
@@ -1681,7 +1790,6 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_navigate": "post_navigate",
     "post_explore_without_workflow": "explore_without_workflow",
     "post_suspicious_success": "suspicious_success",
-    "post_repeated_null_data": "repeated_null_data",
     "post_repeated_frontier_failure_warn": "repeated_frontier_failure_warn",
     "post_repeated_frontier_failure_stop": "repeated_frontier_failure_stop",
     "post_non_retriable_nav_error_stop": "non_retriable_nav_error_stop",

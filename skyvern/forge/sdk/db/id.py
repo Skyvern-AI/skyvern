@@ -79,6 +79,7 @@ SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
 TAG_EVENT_PREFIX = "tge"
 TAG_KEY_PREFIX = "tkey"
+TAG_VALUE_PREFIX = "tval"
 
 
 def generate_workflow_id() -> str:
@@ -264,6 +265,11 @@ def generate_tag_event_id() -> str:
 def generate_tag_key_id() -> str:
     int_id = generate_id()
     return f"{TAG_KEY_PREFIX}_{int_id}"
+
+
+def generate_tag_value_id() -> str:
+    int_id = generate_id()
+    return f"{TAG_VALUE_PREFIX}_{int_id}"
 
 
 def generate_google_oauth_credential_id() -> str:

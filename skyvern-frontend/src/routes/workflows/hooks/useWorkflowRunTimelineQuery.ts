@@ -17,15 +17,16 @@ import {
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-function useWorkflowRunTimelineQuery() {
-  const workflowRunId = useFirstParam("workflowRunId", "runId");
+function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   const queryClient = useQueryClient();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflowRun, dataUpdatedAt } =
-    useWorkflowRunWithWorkflowQuery();
+    useWorkflowRunWithWorkflowQuery(options);
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
 

@@ -20,7 +20,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    register_no_progress_interaction_click,
+    reset_no_progress_interaction_count,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
 )
@@ -90,6 +94,7 @@ def _consume_pending_browser_interaction_observation(
             current_url=current_url,
         )
         return False
+    reset_no_progress_interaction_count(ctx)
     return True
 
 
@@ -349,6 +354,7 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
     except Exception:
         parsed = None
         outcome = "error"
+    ctx.last_scout_act_observe_outcome = outcome
     LOG.info(
         "copilot_scout_act_observe",
         outcome=outcome,
@@ -389,6 +395,21 @@ async def _register_scout_interaction_observation(
             _clear_pending_browser_interaction_observation(ctx)
     step = _append_flow_evidence(ctx, evidence, reached_via="interaction")
     return step, page_evidence
+
+
+def account_no_progress_interaction_click(ctx: AgentContext, result: dict[str, Any]) -> None:
+    """Climb or reset the no-forward-progress counter from a click's outcome: a failed click or hollow
+    observe is no progress, an attached observe is progress, a capture timeout/error is neutral."""
+    if not result.get("ok"):
+        register_no_progress_interaction_click(ctx, outcome="click_failed")
+        return
+    outcome = ctx.last_scout_act_observe_outcome
+    if outcome == "attached":
+        reset_no_progress_interaction_count(ctx)
+    elif outcome == "hollow":
+        register_no_progress_interaction_click(ctx, outcome="hollow")
+    else:
+        LOG.info("copilot_no_progress_interaction_neutral", outcome=outcome)
 
 
 _PAGE_SUMMARY_TEXT_CAP = 80

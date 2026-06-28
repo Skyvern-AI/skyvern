@@ -43,6 +43,8 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
 import { Fragment, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "./studioNavigation";
 import { usePinScriptMutation } from "./hooks/usePinScriptMutation";
 import { useScriptVersionsQuery } from "./hooks/useScriptVersionsQuery";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
@@ -479,6 +481,7 @@ function ScriptRow({
 function WorkflowScriptsPage() {
   const { workflowPermanentId } = useParams();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -529,7 +532,9 @@ function WorkflowScriptsPage() {
             />
           )}
           <Button asChild variant="secondary">
-            <Link to={`/workflows/${workflowPermanentId}/build`}>
+            <Link
+              to={workflowEditorPath(workflowPermanentId ?? "", studioEnabled)}
+            >
               <Pencil2Icon className="mr-2 size-4" />
               Edit
             </Link>

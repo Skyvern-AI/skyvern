@@ -281,6 +281,11 @@ class CDPDownloadInterceptor:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         LOG.info("CDP download interceptor download dir set", download_dir=download_dir)
 
+    def is_monitoring_browser_downloads(self) -> bool:
+        """True while the monitor owns the context's setDownloadBehavior binding ({deny, eventsEnabled:True},
+        saving over HTTP), so re-sending allow/downloadPath would disable it on remote CDP."""
+        return self._browser_session is not None
+
     def _resolve_save_path(self, filename: str = "", content_type: str = "") -> tuple[Path, str]:
         """Generate a unique save path under _output_dir.
 

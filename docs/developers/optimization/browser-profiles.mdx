@@ -24,6 +24,8 @@ Profiles are ideal when you:
 
 ## How profiles work
 
+You can create a blank profile with only `name` and optional `description`, then pass that profile to future agent runs. Blank profiles are seeded from the configured default browser profile directory when available, with a minimal loadable profile skeleton as a fallback.
+
 When an agent runs with `persist_browser_session=true`, Skyvern archives the browser state (cookies, storage, session files) after the run completes. This archiving happens asynchronously in the background. Once the archive is ready, you can create a profile from it, then pass that profile to future agent runs to restore the saved state.
 
 For [browser sessions](/developers/optimization/browser-sessions), profile saving is opt-in: a session archives its state when it ends only if it has `generate_browser_profile` enabled or was started from a saved profile. See [Save a session's profile](/developers/optimization/browser-sessions#save-a-sessions-profile).
@@ -32,13 +34,71 @@ For [browser sessions](/developers/optimization/browser-sessions), profile savin
 
 ## Create a Browser Profile
 
+Create a blank profile when you want a reusable profile ID before any browsing has happened. Create a sourced profile when you want to capture cookies, localStorage, and session files from a workflow run or browser session.
+
+### Blank profile
+
+<CodeGroup>
+```python Python
+import asyncio
+from skyvern import Skyvern
+
+async def main():
+    client = Skyvern(api_key="YOUR_API_KEY")
+
+    profile = await client.create_browser_profile(
+        name="fresh-profile",
+        description="Blank profile for future runs",
+    )
+    print(f"Profile created: {profile.browser_profile_id}")
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+async function main() {
+  const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+  const profile = await client.createBrowserProfile({
+    name: "fresh-profile",
+    description: "Blank profile for future runs",
+  });
+
+  console.log(`Profile created: ${profile.browser_profile_id}`);
+}
+
+main();
+```
+
+```bash cURL
+curl -s -X POST "https://api.skyvern.com/v1/browser_profiles" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "fresh-profile",
+    "description": "Blank profile for future runs"
+  }'
+```
+</CodeGroup>
+
+**Parameters:**
+
+| Parameter            | Type   | Description                           |
+|----------------------|--------|---------------------------------------|
+| `name`               | string | Required unique display name          |
+| `description`        | string | Optional profile description          |
+| `browser_session_id` | string | Omit for a blank profile              |
+| `workflow_run_id`    | string | Omit for a blank profile              |
+
+### From an agent run
+
 Create an agent with `persist_browser_session=true` in the agent definition, run it, wait for completion, then create a profile from the run. Session archiving happens asynchronously, so add brief retry logic when creating the profile.
 
 <Note>
 `persist_browser_session` must be set when **creating the agent**, not when running it. It is an agent definition property, not a runtime parameter.
 </Note>
-
-### From an agent run
 
 <CodeGroup>
 ```python Python

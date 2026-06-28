@@ -20,6 +20,10 @@ class PersistentSessionsManager(Protocol):
         """Initialize monitoring of the session pool."""
         ...
 
+    def start_reaper(self) -> None:
+        """Start the periodic reaper that closes idle/expired sessions."""
+        ...
+
     def can_probe_registered_browser_state(self) -> bool: ...
 
     async def begin_session(
@@ -80,6 +84,7 @@ class PersistentSessionsManager(Protocol):
         timeout_minutes: int | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        proxy_session_id: str | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,

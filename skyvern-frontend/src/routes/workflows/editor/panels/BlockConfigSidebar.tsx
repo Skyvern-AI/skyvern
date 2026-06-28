@@ -297,9 +297,15 @@ function BlockLibrarySidebarBody({
 
 type BlockConfigSidebarProps = {
   onAddNode?: (props: AddNodeProps) => void;
+  // In the studio shell the panel's top/bottom edges align with the Copilot
+  // column's py-3 inset rather than the legacy editor's header offsets.
+  embedded?: boolean;
 };
 
-function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
+function BlockConfigSidebar({
+  onAddNode,
+  embedded = false,
+}: BlockConfigSidebarProps) {
   const resizableRef = useRef<Resizable | null>(null);
   const [editorShellMetrics, setEditorShellMetrics] = useState(() => ({
     gutterPx: getBlockSidebarGutterPx(null),
@@ -441,9 +447,9 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
       }}
       style={{
         position: "absolute",
-        top: mode === "build" ? "7rem" : "2rem",
+        top: embedded ? "0.75rem" : mode === "build" ? "7rem" : "2rem",
         right: "1.5rem",
-        bottom: "1.5rem",
+        bottom: embedded ? "0.75rem" : "1.5rem",
       }}
       className={cn(
         "z-30 flex flex-col",

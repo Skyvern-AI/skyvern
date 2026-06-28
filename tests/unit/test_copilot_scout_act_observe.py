@@ -23,6 +23,8 @@ from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _consume_pending_browser_interaction_observation,
+    _mark_pending_browser_interaction_observation,
+    account_no_progress_interaction_click,
 )
 
 _SOURCE_URL = "https://example.com/product"
@@ -348,3 +350,81 @@ class TestActObserveToolGate:
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+
+
+def _np_ctx(*, server: Any = None, counter: int = 0) -> SimpleNamespace:
+    ctx = _ctx(server=server)
+    ctx.consecutive_no_progress_interaction_count = counter
+    ctx.last_scout_act_observe_outcome = None
+    ctx.blocker_signal = None
+    return ctx
+
+
+class TestNoProgressInteractionAccounting:
+    @pytest.mark.asyncio
+    async def test_hollow_click_increments_counter(self) -> None:
+        ctx = _np_ctx(server=_server_returning({"page_title": "Loading", "forms": []}))
+
+        await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_attached_click_resets_counter(self) -> None:
+        ctx = _np_ctx(server=_server_returning(_bounded_extractor_payload()), counter=2)
+
+        await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert ctx.consecutive_no_progress_interaction_count == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_click_increments_counter(self) -> None:
+        ctx = _np_ctx()
+
+        await _click_post_hook(
+            {"ok": False, "error": "Timeout 5000ms exceeded"},
+            {"browser_context": {"url": _LANDING_URL}},
+            ctx,
+        )
+
+        assert ctx.consecutive_no_progress_interaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_capture_timeout_observe_is_neutral(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
+
+        async def slow_extract(*_args: object, **_kwargs: object) -> dict[str, Any]:
+            await asyncio.sleep(0.25)
+            return {"ok": True, "data": {"result": _bounded_extractor_payload()}}
+
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(side_effect=slow_extract)
+        ctx = _np_ctx(server=server, counter=2)
+
+        await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "timeout"
+        assert ctx.consecutive_no_progress_interaction_count == 2
+
+    def test_neutral_outcome_does_not_touch_counter(self) -> None:
+        ctx = _np_ctx(counter=2)
+        ctx.last_scout_act_observe_outcome = None
+
+        account_no_progress_interaction_click(ctx, {"ok": True, "data": {"selector": "#x"}})
+
+        assert ctx.consecutive_no_progress_interaction_count == 2
+
+    def test_delayed_credit_via_consume_resets_counter(self) -> None:
+        ctx = _np_ctx(counter=3)
+        _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=_LANDING_URL)
+
+        consumed = _consume_pending_browser_interaction_observation(
+            ctx,
+            current_url=_LANDING_URL,
+            evidence={**_bounded_extractor_payload(), "current_url": _LANDING_URL},
+        )
+
+        assert consumed is True
+        assert ctx.consecutive_no_progress_interaction_count == 0

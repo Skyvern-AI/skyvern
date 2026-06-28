@@ -8,6 +8,9 @@ function useSidebarHidden({ hideBrowserSessions = false }: Options = {}) {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
   const workflowEditMatch = useMatch("/workflows/:workflowPermanentId/edit");
+  const workflowStudioMatch = useMatch(
+    "/workflows/:workflowPermanentId/studio",
+  );
   const workflowBuildMatch = useMatch("/workflows/:workflowPermanentId/build");
   const workflowBlockBuildMatch = useMatch(
     "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/build",
@@ -23,6 +26,7 @@ function useSidebarHidden({ hideBrowserSessions = false }: Options = {}) {
 
   return Boolean(
     workflowEditMatch ||
+    workflowStudioMatch ||
     workflowBuildMatch ||
     workflowBlockBuildMatch ||
     workflowDebugMatch ||

@@ -1837,7 +1837,6 @@ workflow_definition:
     monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
     monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-    monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
     monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["open_results"], {}, "open_results"))
     monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)

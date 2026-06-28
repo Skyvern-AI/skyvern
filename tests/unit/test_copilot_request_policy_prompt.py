@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
+    _render_active_criteria_for_prompt,
     contains_email_password_pair,
     is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 
 def _render(**overrides: str) -> str:
+    active_completion_criteria = overrides.get("active_completion_criteria", "")
     return prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=overrides.get("user_message", ""),
@@ -35,6 +37,8 @@ def _render(**overrides: str) -> str:
         latest_assistant_turn=overrides.get("latest_assistant_turn", "(none)"),
         retained_history=overrides.get("retained_history", "(none)"),
         global_llm_context=overrides.get("global_llm_context", ""),
+        raw_secret_present=overrides.get("raw_secret_present", "false"),
+        active_completion_criteria=active_completion_criteria,
     )
 
 
@@ -79,6 +83,32 @@ class TestRequestPolicyPromptStructure:
         assert "raw_secret_evidence" in rendered
         assert "verbatim substring of the LATEST user message" in rendered
         assert "Do not cite a token that appears only in prior turns" in rendered
+
+    def test_completion_criteria_schema_includes_typed_terminal_action_fields(self) -> None:
+        rendered = _render()
+        assert (
+            "{outcome, contingent_on, contingent_antecedent_output_path, "
+            "implicit, method_mandated, level, kind, terminal_action_family}"
+        ) in rendered
+        assert "kind=outcome|terminal_action" in rendered
+        assert "terminal_action_family=request|application|form|order|null" in rendered
+
+    def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="a commercial water service request is started",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"kind": "terminal_action"' in rendered
+        assert '"terminal_action_family": "request"' in rendered
 
 
 class TestRawSecretBackstop:
@@ -371,7 +401,7 @@ class TestActiveCriteriaPromptAnchor:
 
 class TestClassifierFallbackCompletionCriteria:
     @pytest.mark.parametrize(
-        ("user_message", "expect_criteria"),
+        ("user_message", "expected_status", "expected_output_paths"),
         [
             (
                 (
@@ -380,7 +410,8 @@ class TestClassifierFallbackCompletionCriteria:
                     "and the result should come out as a record with the entity name, identifier, items, "
                     "and an overall status."
                 ),
-                True,
+                "present",
+                {"output.identifier", "output.location_status", "output.name", "output.overall_status"},
             ),
             (
                 (
@@ -388,20 +419,29 @@ class TestClassifierFallbackCompletionCriteria:
                     "the entity name, identifier 1234567890, items, per-location status, overall status, and "
                     "no-results behavior."
                 ),
-                True,
+                "present",
+                {"output.name", "output.identifier", "output.per_location_status", "output.overall_status"},
             ),
-            ("Extract the user's name, id, address, and status from the portal.", False),
-            ("Open https://example.com and click the pricing link.", False),
+            (
+                "Extract the user's name, id, address, and status from the portal.",
+                "present",
+                {"output.user_name", "output.id", "output.address", "output.status"},
+            ),
+            ("Open https://example.com and click the pricing link.", "present", set()),
             # Substring matches ("read" in "already", "name" in "filename", "id" in "decided")
             # must not satisfy the whole-word gate.
-            ("I already decided the filename and reviewed the status of locations.", False),
+            ("I already decided the filename and reviewed the status of locations.", "present", set()),
             # Generic structural group term ("entries") satisfies the group gate.
-            ("Return a record with the entity name, identifier 1234567890, status, and the grouped entries.", True),
+            (
+                "Return a record with the entity name, identifier 1234567890, status, and the grouped entries.",
+                "present",
+                {"output.name", "output.identifier", "output.status"},
+            ),
         ],
     )
     @pytest.mark.asyncio
     async def test_classifier_fallback_structured_record_criteria(
-        self, user_message: str, expect_criteria: bool
+        self, user_message: str, expected_status: str, expected_output_paths: set[str]
     ) -> None:
         policy = await _classify_request(
             user_message=user_message,
@@ -412,22 +452,21 @@ class TestClassifierFallbackCompletionCriteria:
         )
 
         assert policy.classifier_status == "fallback"
-        assert policy.completion_contract_status == ("present" if expect_criteria else "unknown")
-        if not expect_criteria:
+        assert policy.completion_contract_status == expected_status
+        if expected_status == "unknown":
             assert policy.completion_criteria
             assert all(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
             return
 
-        assert not any(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
-        assert [criterion.id for criterion in policy.completion_criteria] == [
-            "fallback_record_identity",
-            "fallback_record_identifier",
-            "fallback_record_groups",
-            "fallback_record_status",
-        ]
+        assert {
+            criterion.output_path for criterion in policy.completion_criteria if criterion.output_path
+        } == expected_output_paths
+        assert policy.graded_completion_criteria()
         assert policy.requires_user_clarification is False
         assert policy.user_response_policy == "proceed"
-        assert all(criterion.implicit for criterion in policy.completion_criteria)
+        assert all(
+            criterion.implicit for criterion in policy.completion_criteria if criterion.id.startswith("fallback_")
+        )
         assert all(criterion.level == "run" for criterion in policy.completion_criteria)
 
     def test_classifier_fallback_logs_synthesized_structured_record_criteria(

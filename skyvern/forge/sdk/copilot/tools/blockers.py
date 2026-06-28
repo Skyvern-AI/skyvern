@@ -1224,12 +1224,19 @@ def _iter_goal_value_path_values(value: Any, path_parts: list[str]) -> list[Any]
 
 def _code_output_goal_paths_have_content(value: Any, goal_value_paths: list[str]) -> bool:
     for path in goal_value_paths:
-        values = _iter_goal_value_path_values(value, _normalize_goal_value_path(path))
+        path_parts = _normalize_goal_value_path(path)
+        values = _iter_goal_value_path_values(value, path_parts)
         if not values and _goal_value_path_targets_registered_download(path):
             values = _registered_download_output_values(value)
-        if not any(_code_output_has_goal_content(item) for item in values):
+        if not any(_code_output_goal_path_value_has_content(item) for item in values):
             return False
     return True
+
+
+def _code_output_goal_path_value_has_content(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    return _code_output_has_goal_content(value)
 
 
 def _goal_value_path_targets_registered_download(path: str) -> bool:

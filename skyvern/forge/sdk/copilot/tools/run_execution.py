@@ -34,16 +34,18 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
+    CriterionVerdict,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    _AUTHORING_REPAIR_CATEGORY,
     DiagnosisRepairContract,
     RepairLoopState,
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal
+from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal, reset_no_progress_interaction_count
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -81,6 +83,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ensure_browser_session,
 )
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    clear_runtime_authoring_repair_context,
+    inject_runtime_authoring_repair_context,
+    record_pending_runtime_authoring_repair_context,
+)
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
@@ -1821,6 +1829,29 @@ def _terminal_challenge_evidence(
     return None
 
 
+def _terminal_challenge_completion_verification(
+    completion_verification: CompletionVerificationResult | None, reason: str
+) -> CompletionVerificationResult | None:
+    if completion_verification is None or completion_verification.status != "evaluated":
+        return completion_verification
+    criterion_ids = list(completion_verification.criterion_ids)
+    if not criterion_ids:
+        return completion_verification
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=criterion_ids,
+        verdicts=[
+            CriterionVerdict(
+                criterion_id=criterion_id,
+                state="unsatisfied",
+                reason_code=TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+                missing_evidence=reason,
+            )
+            for criterion_id in criterion_ids
+        ],
+    )
+
+
 # Generic failure-reason template emitted by the shared agent when the
 # browser-side scraper catches ScrapingFailed / NoElementFound. Matching on
 # the template (not the shared classifier) lets the copilot notice a repeated
@@ -1977,6 +2008,7 @@ def _record_run_blocks_result(
     copilot_ctx.post_run_page_observation_workflow_run_id = None
     copilot_ctx.post_run_page_observation_after_failed_test = False
     copilot_ctx.post_run_current_page_inspection_workflow_run_id = None
+    record_pending_runtime_authoring_repair_context(copilot_ctx, result)
 
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
@@ -2045,8 +2077,17 @@ def _record_run_blocks_result(
             stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
 
     if terminal_challenge is not None:
+        clear_runtime_authoring_repair_context(copilot_ctx)
         # A structured challenge is the more actionable terminal blocker when
         # artifact-health evidence and challenge evidence appear in the same run.
+        blocked_verification = _terminal_challenge_completion_verification(
+            completion_verification, terminal_challenge.reason
+        )
+        if blocked_verification is not completion_verification:
+            completion_verification = blocked_verification
+            copilot_ctx.completion_verification_result = blocked_verification
+            record_completion_verification(copilot_ctx, blocked_verification)
+            _record_adjudication_on_turn_state(copilot_ctx, blocked_verification)
         _mark_page_inspected(copilot_ctx)
         result["ok"] = False
         result.setdefault("error", terminal_challenge.reason)
@@ -2078,12 +2119,15 @@ def _record_run_blocks_result(
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
+        completion_verification_evaluated = (
+            completion_verification is not None and completion_verification.status == "evaluated"
+        )
         completion_fully_satisfied = (
             completion_verification is not None
             and completion_verification.status == "evaluated"
             and completion_verification.is_fully_satisfied()
         )
-        if structured_blocker:
+        if structured_blocker and not completion_fully_satisfied:
             # Terminal anti-bot blockers are handled before run_ok; this branch
             # remains for non-challenge structured blockers that still make a
             # completed run suspicious.
@@ -2114,12 +2158,10 @@ def _record_run_blocks_result(
             copilot_ctx.verified_terminal_proposal_ready = True
             copilot_ctx.last_test_suspicious_success = False
             copilot_ctx.last_test_failure_reason = None
-            copilot_ctx.null_data_streak_count = 0
             copilot_ctx.suspicious_success_nudge_count = 0
-        if empty_data_blocks and not completion_fully_satisfied:
+        if empty_data_blocks and not completion_verification_evaluated:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
-            copilot_ctx.null_data_streak_count = getattr(copilot_ctx, "null_data_streak_count", 0) + 1
             copilot_ctx.last_test_failure_reason = (
                 "All blocks completed but data-producing blocks "
                 "produced no meaningful output "
@@ -2157,7 +2199,6 @@ def _record_run_blocks_result(
                     data.setdefault("failure_reason", outcome_unverified_reason)
         else:
             copilot_ctx.failed_test_nudge_count = 0
-            copilot_ctx.null_data_streak_count = 0
             copilot_ctx.probable_site_block_streak_count = 0
             copilot_ctx.last_failed_workflow_yaml = None
             # Real success: clear the signature latch so a subsequent bad URL in
@@ -2179,6 +2220,21 @@ def _record_run_blocks_result(
                 "The last run verified only the current browser frontier; unverified workflow blocks remain: "
                 + ", ".join(unverified[:8])
             )
+        update_repeated_failure_state(copilot_ctx, result)
+        _update_verification_evidence_from_run_result(copilot_ctx, result)
+        return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
+
+    if outcome_fully_verified(copilot_ctx):
+        copilot_ctx.last_test_suspicious_success = False
+        copilot_ctx.last_test_failure_reason = None
+        copilot_ctx.suspicious_success_nudge_count = 0
+        copilot_ctx.failed_test_nudge_count = 0
+        copilot_ctx.probable_site_block_streak_count = 0
+        copilot_ctx.last_failed_workflow_yaml = None
+        copilot_ctx.last_full_workflow_test_ok = True
+        copilot_ctx.last_unverified_block_labels = []
+        copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+        copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
         return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
@@ -2301,12 +2357,13 @@ async def _verify_and_record_run_blocks_result(
 
 
 def _repair_non_convergence_signature(contract: DiagnosisRepairContract) -> str | None:
-    """A constant streak token for any REPAIR verdict, ``None`` otherwise. The trigger
-    is non-convergence (REPAIR with no verified progress), so the only thing the signature
-    must do is tell a contiguous repair streak from a reset on a non-REPAIR verdict."""
     if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
         return None
-    # Constant by design: the streak only distinguishes a REPAIR run from a reset, so the failure specifics are ignored.
+    identity = contract.diagnosis_result.root_cause_identity
+    if identity.primary_category == _AUTHORING_REPAIR_CATEGORY and identity.root_cause_signature:
+        return identity.root_cause_signature
+    if _AUTHORING_REPAIR_CATEGORY in identity.failure_categories and identity.root_cause_signature:
+        return identity.root_cause_signature
     return "repair_no_verified_progress"
 
 
@@ -2339,6 +2396,8 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     copilot_ctx.verified_criteria_high_water = high_water | current
     copilot_ctx.verified_prefix_high_water_len = max(prefix_high, prefix_len)
     copilot_ctx.verified_full_pass_consumed = full_pass
+    if progressed:
+        reset_no_progress_interaction_count(copilot_ctx)
 
     signature = _repair_non_convergence_signature(contract)
     if signature is None or progressed:
@@ -2374,6 +2433,7 @@ def _record_diagnosis_repair_contract(
     result: dict[str, Any],
     workflow_updated: bool = False,
 ) -> DiagnosisRepairContract:
+    inject_runtime_authoring_repair_context(copilot_ctx, result)
     contract = build_diagnosis_repair_contract(
         source_tool=source_tool,
         result=result,

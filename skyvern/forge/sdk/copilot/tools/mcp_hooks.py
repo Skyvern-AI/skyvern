@@ -54,6 +54,7 @@ from .scouting import (
     _reset_evaluate_tracker,
     _resolve_scout_role_name,
     _steer_evaluate_result,
+    account_no_progress_interaction_click,
 )
 
 LOG = structlog.get_logger()
@@ -407,6 +408,7 @@ async def _click_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    ctx.last_scout_act_observe_outcome = None
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
@@ -444,6 +446,7 @@ async def _click_post_hook(
             _attach_scout_page_summary(result, page_evidence)
             if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
                 await _maybe_attach_reached_download_target(ctx, result, url=url, page_evidence=page_evidence)
+    account_no_progress_interaction_click(ctx, result)
     return result
 
 

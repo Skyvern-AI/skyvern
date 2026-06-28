@@ -9,7 +9,7 @@ stays at the route/repository seam; everything here is side-effect free.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -17,8 +17,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    CriterionKind,
+    TerminalActionFamily,
+    _normalize_contingent_antecedent_output_path,
     is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
+    requested_output_path_for_field,
 )
 
 ReconcileAction = Literal["create", "adopt_stored", "none"]
@@ -29,6 +33,8 @@ CRITERIA_SET_STATUS_ACTIVE = "active"
 CRITERIA_SET_STATUS_SUPERSEDED = "superseded"
 TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
+_CRITERION_KINDS = ("outcome", "terminal_action")
+_TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
 
 
 @dataclass(frozen=True)
@@ -109,9 +115,14 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
         {
             "id": criterion.id,
             "outcome": criterion.outcome,
+            "contingent_on": criterion.contingent_on,
+            "contingent_antecedent_output_path": criterion.contingent_antecedent_output_path,
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
+            "output_path": criterion.output_path,
+            "kind": criterion.kind,
+            "terminal_action_family": criterion.terminal_action_family,
         }
         for criterion in criteria
     ]
@@ -129,20 +140,152 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         if not isinstance(criterion_id, str) or not isinstance(outcome, str) or not outcome.strip():
             continue
         level = item.get("level")
+        output_path = item.get("output_path")
+        contingent_on = item.get("contingent_on")
+        contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
+            item.get("contingent_antecedent_output_path")
+        )
+        kind_raw = item.get("kind")
+        kind = kind_raw if isinstance(kind_raw, str) and kind_raw in _CRITERION_KINDS else "outcome"
+        family_raw = item.get("terminal_action_family")
+        terminal_action_family = (
+            family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
+        )
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
                 outcome=outcome,
+                contingent_on=contingent_on.strip()
+                if isinstance(contingent_on, str) and contingent_on.strip()
+                else None,
+                contingent_antecedent_output_path=contingent_antecedent_output_path,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
+                output_path=output_path.strip() if isinstance(output_path, str) and output_path.strip() else None,
+                kind=cast(CriterionKind, kind),
+                terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
             )
         )
     return tuple(criteria)
 
 
+def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
+    contingent_key = criterion.contingent_on or ""
+    contingent_path_key = criterion.contingent_antecedent_output_path or ""
+    if criterion.output_path:
+        return (
+            f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1foutput_path:{criterion.output_path}"
+        )
+    return (
+        f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+        f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+    )
+
+
 def _outcome_key_set(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
-    return {normalized_criterion_outcome_key(criterion.outcome) for criterion in criteria}
+    return {_criterion_reconcile_key(criterion) for criterion in criteria}
+
+
+def _word_tokens(text: str) -> list[str]:
+    return "".join(char if char.isalnum() else " " for char in text.casefold()).split()
+
+
+_REQUESTED_OUTPUT_WORDS = frozenset(
+    "capture captured extract extracted final include included includes output read record result return returned".split()
+)
+_REQUESTED_OUTPUT_FIELD_TOKENS = frozenset(
+    "address addresses date dates email emails id identifier identifiers license licenses location locations name names "
+    "npi number numbers phone phones result specialties specialty status statuses taxonomy".split()
+)
+_GENERIC_PROFILE_MARKERS = (
+    "profile details",
+    "profile information",
+    "profile is captured",
+    "profile is extracted",
+    "intended end state",
+    "expected output",
+)
+
+
+def _requested_output_tokens(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
+    tokens: set[str] = set()
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated:
+            continue
+        outcome_tokens = _word_tokens(criterion.outcome)
+        if not any(word in _REQUESTED_OUTPUT_WORDS for word in outcome_tokens):
+            continue
+        for token in outcome_tokens:
+            if token in _REQUESTED_OUTPUT_FIELD_TOKENS:
+                tokens.add(token)
+    return tokens
+
+
+def _requested_output_paths(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
+    return {
+        criterion.output_path
+        for criterion in criteria
+        if criterion.output_path and criterion.level != "definition" and not criterion.method_mandated
+    }
+
+
+def _criterion_mentions_output_path(
+    criterion: CompletionCriterion,
+    output_path: str,
+    aliases: dict[str, str] | None = None,
+) -> bool:
+    outcome_tokens = _word_tokens(criterion.outcome)
+    max_span_len = min(4, len(outcome_tokens))
+    for span_len in range(max_span_len, 0, -1):
+        for start in range(len(outcome_tokens) - span_len + 1):
+            field_name = " ".join(outcome_tokens[start : start + span_len])
+            if requested_output_path_for_field(field_name, aliases) == output_path:
+                return True
+    return False
+
+
+def _is_generic_profile_criterion(criterion: CompletionCriterion) -> bool:
+    key = normalized_criterion_outcome_key(criterion.outcome)
+    return is_fallback_floor_criterion(criterion) or any(marker in key for marker in _GENERIC_PROFILE_MARKERS)
+
+
+def _fresh_generic_rephrase_lacks_stored_requested_outputs(
+    stored: tuple[CompletionCriterion, ...],
+    fresh: list[CompletionCriterion],
+    *,
+    requested_output_path_aliases: dict[str, str] | None = None,
+) -> bool:
+    stored_requested_criteria = tuple(
+        criterion
+        for criterion in stored
+        if criterion.output_path and criterion.level != "definition" and not criterion.method_mandated
+    )
+    stored_requested_paths = {
+        output_path for criterion in stored_requested_criteria if (output_path := criterion.output_path) is not None
+    }
+    if stored_requested_paths:
+        fresh_requested_paths = _requested_output_paths(fresh)
+        missing_paths = stored_requested_paths - fresh_requested_paths
+        if not missing_paths:
+            return False
+        if fresh and all(_is_generic_profile_criterion(criterion) for criterion in fresh):
+            return True
+        return any(
+            criterion.output_path is None
+            and _criterion_mentions_output_path(criterion, output_path, requested_output_path_aliases)
+            for criterion in fresh
+            for output_path in missing_paths
+        )
+
+    stored_requested_tokens = _requested_output_tokens(stored)
+    if not stored_requested_tokens:
+        return False
+    if not fresh or not all(_is_generic_profile_criterion(criterion) for criterion in fresh):
+        return False
+    fresh_tokens = set().union(*(_word_tokens(criterion.outcome) for criterion in fresh))
+    return bool(stored_requested_tokens - fresh_tokens)
 
 
 def reconcile_completion_criteria(
@@ -150,6 +293,7 @@ def reconcile_completion_criteria(
     fresh: list[CompletionCriterion],
     *,
     actionable: bool,
+    requested_output_path_aliases: dict[str, str] | None = None,
 ) -> ReconcileDecision:
     """Decide once per turn whether the stored set survives or a new epoch begins.
 
@@ -173,6 +317,14 @@ def reconcile_completion_criteria(
             action="adopt_stored", reason="empty_fresh", epoch=stored.goal_epoch, criteria=stored.criteria
         )
     if _outcome_key_set(fresh) <= _outcome_key_set(stored.criteria):
+        return ReconcileDecision(
+            action="adopt_stored", reason="kept", epoch=stored.goal_epoch, criteria=stored.criteria
+        )
+    if _fresh_generic_rephrase_lacks_stored_requested_outputs(
+        stored.criteria,
+        fresh,
+        requested_output_path_aliases=requested_output_path_aliases,
+    ):
         return ReconcileDecision(
             action="adopt_stored", reason="kept", epoch=stored.goal_epoch, criteria=stored.criteria
         )
@@ -214,8 +366,9 @@ def note_adjudication_on_turn_state(
         return
     turn_state.adjudication_all_no_evidence_events.append(run_plane_all_no_evidence(verification))
     turn_state.last_verdict_state_counts = verification.verdict_state_counts()
-    if verification.is_fully_satisfied() and fully_satisfied_workflow_yaml:
-        turn_state.fully_satisfied_workflow_yaml = fully_satisfied_workflow_yaml
+    turn_state.fully_satisfied_workflow_yaml = (
+        fully_satisfied_workflow_yaml if verification.is_fully_satisfied() and fully_satisfied_workflow_yaml else None
+    )
 
 
 def plan_persistence(turn_state: CompletionCriteriaTurnState | None) -> PersistencePlan | None:

@@ -5,7 +5,7 @@ import json
 import time
 from enum import StrEnum
 from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -21,7 +21,46 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_state import BrowserState
+
 LOG = structlog.get_logger()
+
+
+async def _safe_tab_title(page: Page) -> str:
+    try:
+        return await asyncio.wait_for(page.title(), timeout=1.0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("tab_title_fetch_failed", url=page.url)
+        return ""
+
+
+async def build_open_tabs_context(
+    browser_state: BrowserState,
+    working_page: Page | None,
+) -> str | None:
+    if working_page is None:
+        return None
+    pages = await browser_state.list_valid_pages()
+    if len(pages) <= 1:
+        return None
+    # Fetch titles concurrently so a few slow tabs don't add N×timeout latency to every iteration.
+    titles = await asyncio.gather(*(_safe_tab_title(p) for p in pages))
+    lines: list[str] = []
+    for i, (p, title) in enumerate(zip(pages, titles)):
+        marker = " [current]" if p == working_page else ""
+        url = p.url
+        if len(url) > 120:
+            url = url[:117] + "..."
+        if len(title) > 80:
+            title = title[:77] + "..."
+        entry = f"Tab {i}{marker}: {url}"
+        if title:
+            entry += f" ({title})"
+        lines.append(entry)
+    return "\n".join(lines)
 
 
 def load_js_script() -> str:
@@ -79,6 +118,19 @@ async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) ->
         await frame.wait_for_load_state("networkidle", timeout=timeout_ms)
     except PlaywrightError:
         return
+
+
+async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None:
+    # Best-effort readiness guard before capturing. 'domcontentloaded' fires far
+    # earlier than 'load'; pages with streaming/long-polling/SSE/websockets or a
+    # persistent spinner may never fire 'load', so a timeout here must be
+    # non-fatal — the capture has its own (separate) timeout budget.
+    if timeout_ms <= 0:
+        return
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except (PlaywrightError, TimeoutError):
+        LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
 
 
 def _load_cursor_overlay_js() -> str:
@@ -151,8 +203,9 @@ async def _current_viewpoint_screenshot_helper(
 
     try:
         if mode == ScreenshotMode.DETAILED:
-            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
-            LOG.debug("Page is fully loaded, agent is about to take screenshots")
+            await _wait_for_screenshot_load_state(
+                page, timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS
+            )
         start_time = time.time()
         screenshot: bytes = b""
         if file_path:
@@ -863,7 +916,7 @@ class SkyvernFrame:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 loading_indicator_result = "timeout"
-                LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+                LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
             except Exception:
                 loading_indicator_result = "error"
                 LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
@@ -879,7 +932,7 @@ class SkyvernFrame:
                 await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 network_idle_result = "timeout"
-                LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+                LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 

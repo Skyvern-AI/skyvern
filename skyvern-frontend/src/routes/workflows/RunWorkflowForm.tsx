@@ -46,6 +46,9 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
@@ -322,6 +325,7 @@ function RunWorkflowForm({
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -399,11 +403,19 @@ function RunWorkflowForm({
       queryClient.invalidateQueries({
         queryKey: ["runs"],
       });
-      navigate(
-        env.useNewRunsUrl
-          ? `/runs/${response.data.workflow_run_id}`
-          : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
-      );
+      if (studioEnabled) {
+        // Land in the studio shell with the Run tab live.
+        useStudioShellStore.getState().setTab("run");
+        navigate(
+          `/workflows/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
+        );
+      } else {
+        navigate(
+          env.useNewRunsUrl
+            ? `/runs/${response.data.workflow_run_id}`
+            : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+        );
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -658,7 +670,7 @@ function RunWorkflowForm({
               </ul>
               <p className="mt-2">
                 <Link
-                  to={`/workflows/${workflowPermanentId}/build`}
+                  to={workflowEditorPath(workflowPermanentId, studioEnabled)}
                   className="underline hover:no-underline"
                 >
                   Go to the editor

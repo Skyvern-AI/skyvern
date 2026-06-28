@@ -4,7 +4,6 @@ import re
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import pyotp
 import structlog
 from pydantic import BaseModel, Field
 
@@ -22,6 +21,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 
 LOG = structlog.get_logger()
@@ -112,7 +112,7 @@ def _is_mfa_like_parameter_key(key: object) -> bool:
 
 
 def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
-    """Extract TOTP from runtime navigation inputs.
+    """Extract inline OTP or magic-link content from runtime navigation inputs.
 
     Runtime inline OTP extraction is intentionally payload-only.
     """
@@ -126,7 +126,10 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
         current_item = traversal_stack.pop()
 
         if isinstance(current_item, str):
-            return OTPValue(value=current_item, type=OTPType.TOTP)
+            otp_type = (
+                OTPType.MAGIC_LINK if current_item.strip().lower().startswith(("https://", "http://")) else OTPType.TOTP
+            )
+            return OTPValue(value=current_item, type=otp_type)
 
         current_id = id(current_item)
         if current_id in visited_container_ids:
@@ -285,7 +288,7 @@ def try_generate_totp_for_credential(
     if not totp_secret:
         return None
     try:
-        code = pyotp.TOTP(totp_secret).now()
+        code = generate_totp_code(totp_secret)
         LOG.info(
             "Generated TOTP from credential secret",
             workflow_run_id=workflow_run_id,
@@ -462,6 +465,8 @@ async def poll_otp_value(
             # intentional backstops only when the webhook has no code yet.
             if totp_verification_url:
                 if org_token is None:
+                    # The org token is only needed for webhook polling. Gmail
+                    # and DB-only polling should not fail on missing webhook auth.
                     org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
                         organization_id, OrganizationAuthTokenType.api.value
                     )

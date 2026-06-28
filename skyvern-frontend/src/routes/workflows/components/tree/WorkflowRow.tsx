@@ -19,6 +19,10 @@ import {
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import { WorkflowApiResponse } from "../../types/workflowTypes";
 import { WorkflowActions } from "../../WorkflowActions";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
@@ -56,6 +60,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     foldersMap,
     workflowTagsMap,
     tagDescriptions,
+    tagColors,
     tagKeys,
     labelSuggestions,
     valueSuggestionsByKey,
@@ -68,6 +73,9 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     handleRowClick,
     handleIconClick,
   } = useWorkflowsListContext();
+  const studioEnabled = useWorkflowStudioEnabled();
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
 
   const parameterItems = (workflow.workflow_definition?.parameters ?? [])
     .filter((p) => p.parameter_type !== "output")
@@ -182,8 +190,12 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                 </TooltipProvider>
               )}
             </div>
-            {workflowTags && workflowTags.length > 0 ? (
-              <TagChipList tags={workflowTags} descriptions={tagDescriptions} />
+            {taggingEnabled && workflowTags && workflowTags.length > 0 ? (
+              <TagChipList
+                tags={workflowTags}
+                descriptions={tagDescriptions}
+                colors={tagColors}
+              />
             ) : null}
           </div>
         </TableCell>
@@ -243,13 +255,16 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     <TooltipContent>Assign to Folder</TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
-                <WorkflowTagEditor
-                  workflowPermanentId={workflow.workflow_permanent_id}
-                  tags={workflowTags ?? []}
-                  tagKeys={tagKeys}
-                  labelSuggestions={labelSuggestions}
-                  valueSuggestionsByKey={valueSuggestionsByKey}
-                />
+                {taggingEnabled ? (
+                  <WorkflowTagEditor
+                    workflowPermanentId={workflow.workflow_permanent_id}
+                    tags={workflowTags ?? []}
+                    tagKeys={tagKeys}
+                    labelSuggestions={labelSuggestions}
+                    valueSuggestionsByKey={valueSuggestionsByKey}
+                    colorMap={tagColors}
+                  />
+                ) : null}
               </>
             )}
             <TooltipProvider>
@@ -262,7 +277,10 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     onClick={(event) => {
                       handleIconClick(
                         event,
-                        `/workflows/${workflow.workflow_permanent_id}/build`,
+                        workflowEditorPath(
+                          workflow.workflow_permanent_id,
+                          studioEnabled,
+                        ),
                       );
                     }}
                   >

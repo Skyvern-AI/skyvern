@@ -51,6 +51,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
 
@@ -92,6 +93,12 @@ class TOTPVerificationResponse:
     status_code: int
     body: str
     headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CopilotAliasResolution:
+    url: str
+    kind: str = "canonical_alias"
 
 
 def _remove_rect(element: dict) -> None:
@@ -660,6 +667,26 @@ class AgentFunction:
     workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the API process should run the built-in local scheduler loop."""
 
+    def build_proxy_session_extra_http_headers(self, proxy_session_id: str | None) -> dict[str, str] | None:
+        return None
+
+    def has_proxy_session_extra_http_headers(self, extra_http_headers: dict[str, str] | None) -> bool:
+        return False
+
+    def merge_proxy_session_extra_http_headers(
+        self,
+        extra_http_headers: dict[str, str] | None,
+        proxy_session_id: str | None,
+    ) -> dict[str, str] | None:
+        proxy_session_headers = self.build_proxy_session_extra_http_headers(proxy_session_id)
+        if not proxy_session_headers:
+            return extra_http_headers
+
+        headers = dict(extra_http_headers or {})
+        for key, value in proxy_session_headers.items():
+            headers.setdefault(key, value)
+        return headers
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 
@@ -698,6 +725,45 @@ class AgentFunction:
         workflow_run: "WorkflowRun",
     ) -> bool:
         return True
+
+    async def should_use_codeblock_runner(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: "WorkflowRunContext",
+        organization_id: str | None,
+        block_label: str | None,
+        browser_session_id: str | None,
+    ) -> bool:
+        """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
+
+        Gating lives here, at the block-execution call site, rather than inside
+        execute_code_block_override so the override only runs the runner. OSS has no
+        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
+        only routes runs that have a browser session for the runner to broker against.
+        """
+        return False
+
+    async def execute_code_block_override(
+        self,
+        *,
+        block: Any,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        workflow_run_context: "WorkflowRunContext",
+        parameter_values: dict[str, Any],
+        credential_parameter_keys: set[str],
+    ) -> Any | None:
+        """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
+
+        OSS no-op returns None so callers fall through to in-process execution. Cloud
+        overrides to dispatch to the runner. Callers must gate on
+        should_use_codeblock_runner first.
+        """
+        return None
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
@@ -1388,6 +1454,14 @@ class AgentFunction:
         OSS returns empty string (no hardening).
         """
         return ""
+
+    def resolve_copilot_entrypoint_alias(
+        self,
+        *,
+        site_or_url: str,
+        normalized_alias: str,
+    ) -> CopilotAliasResolution | None:
+        return None
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""

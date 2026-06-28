@@ -4,6 +4,7 @@ of the judge-unavailable success bypass."""
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.copilot.agent import (
@@ -28,7 +29,9 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     RunEvidenceSnapshot,
     _coerce_result,
+    _render_criteria,
     combine_verification_results,
+    evaluate_completion_criteria,
     grade_definition_criteria,
     grade_present_value_criteria,
     run_plane_all_no_evidence,
@@ -59,8 +62,8 @@ from skyvern.forge.sdk.copilot.tools.completion import (
 )
 
 
-def _criterion(cid: str, outcome: str, *, level: str = "run") -> CompletionCriterion:
-    return CompletionCriterion(id=cid, outcome=outcome, level=level)  # type: ignore[arg-type]
+def _criterion(cid: str, outcome: str, *, level: str = "run", output_path: str | None = None) -> CompletionCriterion:
+    return CompletionCriterion(id=cid, outcome=outcome, level=level, output_path=output_path)  # type: ignore[arg-type]
 
 
 def _stored(
@@ -154,6 +157,63 @@ def test_reconcile_non_subset_supersedes_wholesale() -> None:
     assert decision.superseded_set_id == "wccs_old"
 
 
+def test_reconcile_keeps_stored_requested_output_when_fresh_is_generic_rephrase() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_existing",
+        goal_epoch=1,
+        criteria=(
+            _criterion("c0", "The profile details are captured."),
+            _criterion("c1", "The returned record includes ID.", output_path="output.id"),
+        ),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [_criterion("c0", "The full profile information is extracted.")],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.reason == "kept"
+    assert decision.criteria == stored.criteria
+
+
+def test_reconcile_keeps_grounded_stored_requested_output_when_fresh_rephrases_path() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_existing",
+        goal_epoch=1,
+        criteria=(_criterion("c0", "The returned record includes ID.", output_path="output.id"),),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [_criterion("c1", "The final response captures the ID.", output_path="output.id")],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.reason == "kept"
+    assert decision.criteria == stored.criteria
+
+
+def test_reconcile_keeps_grounded_stored_requested_output_when_fresh_id_is_ungrounded() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_existing",
+        goal_epoch=1,
+        criteria=(_criterion("c0", "The returned record includes ID.", output_path="output.id"),),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [_criterion("c1", "The returned record includes ID.")],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.reason == "kept"
+    assert decision.criteria == stored.criteria
+
+
 def test_reconcile_epoch_stays_monotonic_after_supersede_chain() -> None:
     # A superseded latest row still advances next_epoch, so a new set never
     # reuses an epoch number.
@@ -189,9 +249,27 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
 
 def test_criteria_json_round_trip_preserves_level_and_flags() -> None:
     criteria = (
-        CompletionCriterion(id="c0", outcome="the item is in the cart", implicit=True),
+        CompletionCriterion(
+            id="c0",
+            outcome="the returned record includes ID",
+            implicit=True,
+            output_path="output.id",
+        ),
         CompletionCriterion(id="c1", outcome="inputs are reusable", method_mandated=True, level="definition"),
     )
+    assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_criteria_json_round_trip_preserves_terminal_action_fields() -> None:
+    criteria = (
+        CompletionCriterion(
+            id="c0",
+            outcome="a commercial water service request is started",
+            kind="terminal_action",
+            terminal_action_family="request",
+        ),
+    )
+
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
 
 
@@ -308,25 +386,97 @@ def test_coerce_result_tristate_mapping() -> None:
     assert result.verdict_state_counts() == {"satisfied": 1, "unsatisfied": 3, "unknown": 2}
 
 
+def test_explicit_output_path_criterion_prevents_full_verification_when_absent() -> None:
+    id_criterion = _criterion("c1", "The returned record includes ID.", output_path="output.id")
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", id_criterion.id],
+        verdicts=[
+            _verdict("c0", "satisfied", "evidence_confirms"),
+            _verdict(id_criterion.id, "unsatisfied", "no_evidence"),
+        ],
+    )
+
+    assert id_criterion.output_path == "output.id"
+    assert id_criterion.outcome == "The returned record includes ID."
+    assert result.is_fully_satisfied() is False
+
+
+def test_completion_verifier_render_includes_required_output_path() -> None:
+    rendered = _render_criteria([_criterion("c0", "The returned record includes ID.", output_path="output.id")])
+
+    assert "required_output_path=output.id" in rendered
+
+
+def test_required_output_path_missing_is_not_satisfied_by_evidence_text() -> None:
+    id_criterion = _criterion("c1", "The returned record includes ID.", output_path="output.id")
+    criteria = [
+        _criterion(
+            "c0",
+            "The returned record includes status.",
+            output_path="output.status",
+        ),
+        id_criterion,
+    ]
+    snapshot = RunEvidenceSnapshot(
+        workflow_run_id="wr_test",
+        block_outputs={
+            "extract_profile": {
+                "output": {
+                    "id": None,
+                    "evidence_text": "Search result text mentions ID 1457803926.",
+                    "status": "active",
+                }
+            }
+        },
+    )
+
+    async def _handler(**kwargs: object) -> dict:
+        prompt = str(kwargs["prompt"])
+        assert "required_output_path=output.id" in prompt
+        assert '"id": null' in prompt
+        assert "evidence_text" in prompt
+        assert "1457803926" in prompt
+        return {
+            "verdicts": [
+                {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
+                {
+                    "criterion_id": "c1",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                    "missing_evidence": "output.id is missing/null.",
+                },
+            ]
+        }
+
+    result = asyncio.run(evaluate_completion_criteria(criteria, snapshot, _handler))
+
+    assert id_criterion.output_path == "output.id"
+    assert grade_present_value_criteria([id_criterion], snapshot) == []
+    assert result.verdicts[1].criterion_id == "c1"
+    assert result.verdicts[1].state == "unsatisfied"
+    assert result.is_fully_satisfied() is False
+
+
 _PARAMETERIZED_YAML = """\
-title: provider lookup
+title: account lookup
 workflow_definition:
   parameters:
     - parameter_type: workflow
       key: first_name
     - parameter_type: workflow
-      key: npi_number
+      key: account_id
   blocks:
     - block_type: goto_url
       label: open_portal
-      url: https://registry.example.com/search
+      url: https://example.com/search
     - block_type: navigation
       label: fill_search
-      navigation_goal: "Search for {{ first_name }} with NPI {{ npi_number }}"
+      navigation_goal: "Search for {{ first_name }} with account ID {{ account_id }}"
 """
 
 _UNREFERENCED_YAML = """\
-title: provider lookup
+title: account lookup
 workflow_definition:
   parameters:
     - parameter_type: workflow
@@ -334,29 +484,33 @@ workflow_definition:
   blocks:
     - block_type: goto_url
       label: open_portal
-      url: https://registry.example.com/search
+      url: https://example.com/search
 """
 
 _NO_PARAMS_YAML = """\
-title: provider lookup
+title: account lookup
 workflow_definition:
   parameters: []
   blocks:
     - block_type: goto_url
       label: open_portal
-      url: https://registry.example.com/search
+      url: https://example.com/search
 """
 
 
 def test_definition_grading_satisfied_when_parameters_exist_and_are_referenced() -> None:
-    criteria = [_criterion("c0", "the workflow accepts first name and NPI as reusable inputs", level="definition")]
+    criteria = [
+        _criterion("c0", "the workflow accepts first name and account ID as reusable inputs", level="definition")
+    ]
     (verdict,) = grade_definition_criteria(criteria, _PARAMETERIZED_YAML)
     assert verdict.state == "satisfied"
     assert verdict.reason_code == "definition_parameters_referenced"
 
 
 def test_definition_grading_unsatisfied_when_parameters_missing_or_unreferenced() -> None:
-    criteria = [_criterion("c0", "the workflow accepts reusable inputs", level="definition")]
+    criteria = [
+        _criterion("c0", "the workflow accepts first name and account ID as reusable inputs", level="definition")
+    ]
     (missing,) = grade_definition_criteria(criteria, _NO_PARAMS_YAML)
     assert missing.state == "unsatisfied"
     assert missing.reason_code == "definition_parameters_missing"
@@ -365,23 +519,33 @@ def test_definition_grading_unsatisfied_when_parameters_missing_or_unreferenced(
     assert unreferenced.reason_code == "definition_parameters_unreferenced"
 
 
+def test_definition_grading_abstains_when_no_specific_inputs_named() -> None:
+    criteria = [_criterion("c0", "the workflow accepts reusable inputs", level="definition")]
+    (no_params,) = grade_definition_criteria(criteria, _NO_PARAMS_YAML)
+    assert no_params.state == "unknown"
+    assert no_params.reason_code == "definition_parameters_absent"
+    (unreferenced,) = grade_definition_criteria(criteria, _UNREFERENCED_YAML)
+    assert unreferenced.state == "unknown"
+    assert unreferenced.reason_code == "definition_parameters_absent"
+
+
 def test_definition_grading_requires_every_named_input_to_match() -> None:
     criteria = [
         _criterion(
             "c0",
-            "the workflow accepts first name, last name, and NPI number as reusable inputs",
+            "the workflow accepts first name, last name, and account ID as reusable inputs",
             level="definition",
         )
     ]
-    # _PARAMETERIZED_YAML defines first_name + npi_number but not last_name:
+    # _PARAMETERIZED_YAML defines first_name + account_id but not last_name:
     # a multi-input ask must not be satisfied by a partial parameter set.
     (verdict,) = grade_definition_criteria(criteria, _PARAMETERIZED_YAML)
     assert verdict.state == "unknown"
     assert verdict.reason_code == "definition_parameters_unmatched"
 
     full_yaml = _PARAMETERIZED_YAML.replace(
-        "    - parameter_type: workflow\n      key: npi_number",
-        "    - parameter_type: workflow\n      key: last_name\n    - parameter_type: workflow\n      key: npi_number",
+        "    - parameter_type: workflow\n      key: account_id",
+        "    - parameter_type: workflow\n      key: last_name\n    - parameter_type: workflow\n      key: account_id",
     )
     (full,) = grade_definition_criteria(criteria, full_yaml)
     assert full.state == "satisfied"
@@ -395,6 +559,63 @@ def test_parse_completion_criteria_tolerates_unhashable_level() -> None:
         ]
     )
     assert [c.level for c in parsed] == ["run", "run"]
+
+
+def test_parse_completion_criteria_tolerates_unhashable_terminal_action_fields() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": ["terminal_action"],
+                "terminal_action_family": ["request"],
+            },
+            {
+                "outcome": "a permit application is submitted",
+                "kind": "terminal_action",
+                "terminal_action_family": ["application"],
+            },
+        ]
+    )
+
+    assert [c.kind for c in parsed] == ["outcome", "terminal_action"]
+    assert [c.terminal_action_family for c in parsed] == [None, None]
+
+
+def test_parse_completion_criteria_preserves_typed_terminal_action_fields() -> None:
+    (criterion,) = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": "terminal_action",
+                "terminal_action_family": "request",
+            }
+        ]
+    )
+
+    assert criterion.kind == "terminal_action"
+    assert criterion.terminal_action_family == "request"
+
+
+def test_parse_completion_criteria_defaults_invalid_terminal_action_fields() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": "terminal_action",
+                "terminal_action_family": "invoice",
+            },
+            {
+                "outcome": "the item is in the cart",
+                "kind": "done",
+                "terminal_action_family": "request",
+            },
+        ]
+    )
+
+    assert parsed[0].kind == "terminal_action"
+    assert parsed[0].terminal_action_family is None
+    assert parsed[1].kind == "outcome"
+    assert parsed[1].terminal_action_family is None
 
 
 def test_definition_grading_unknown_when_no_deterministic_check_applies() -> None:
@@ -557,21 +778,48 @@ def test_present_value_upgrade_is_upgrade_only() -> None:
     assert upgraded.verdicts[0].state == "satisfied"
     assert upgraded.verdicts[0].reason_code == "present_value_verbatim"
 
-    already_satisfied = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
-    kept = _apply_present_value_upgrades(already_satisfied, criteria, snapshot)
-    assert kept.verdicts[0].reason_code == "evidence_confirms"
+
+def test_present_value_credits_unquoted_structured_identifier() -> None:
+    criteria = [_criterion("c0", "the submitted request returns confirmation number WTR-1842-DEMO")]
+    snapshot = _snapshot({"submit_request": {"confirmation_number": "WTR-1842-DEMO", "status": "submitted"}})
+    (verdict,) = grade_present_value_criteria(criteria, snapshot)
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "present_value_verbatim"
+    assert verdict.evidence_ref == "block_outputs:submit_request"
+
+
+def test_present_value_structured_identifier_abstains_when_absent() -> None:
+    criteria = [_criterion("c0", "the submitted request returns confirmation number WTR-1842-DEMO")]
+    snapshot = _snapshot({"submit_request": {"confirmation_number": "WTR-9999-PROD"}})
+    assert grade_present_value_criteria(criteria, snapshot) == []
+
+
+def test_present_value_structured_identifier_requires_letter_and_digit() -> None:
+    # A bare word or a bare year-length token is not a high-specificity identifier.
+    plain_word = [_criterion("c0", "the page shows submitted")]
+    assert grade_present_value_criteria(plain_word, _snapshot({"x": {"state": "submitted"}})) == []
+
+    hyphen_word = [_criterion("c0", "the request is read-only")]
+    assert grade_present_value_criteria(hyphen_word, _snapshot({"x": {"mode": "read-only"}})) == []
+
+
+def test_present_value_structured_identifier_rejects_substring_of_longer_token() -> None:
+    criteria = [_criterion("c0", "confirmation number WTR-1842-DEMO")]
+    assert grade_present_value_criteria(criteria, _snapshot({"x": {"number": "WTR-1842-DEMO2"}})) == []
+
+
+def test_present_value_structured_identifier_upgrade_only() -> None:
+    criteria = [_criterion("c0", "confirmation number WTR-1842-DEMO")]
+    snapshot = _snapshot({"confirm": {"number": "WTR-1842-DEMO"}})
+
+    judge_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
+    upgraded = _apply_present_value_upgrades(judge_unknown, criteria, snapshot)
+    assert upgraded.verdicts[0].state == "satisfied"
+    assert upgraded.verdicts[0].reason_code == "present_value_verbatim"
 
     contradicts = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
-    absent_snapshot = _snapshot({"confirm": {"number": "ZZZ00000"}})
-    unchanged = _apply_present_value_upgrades(contradicts, criteria, absent_snapshot)
-    assert unchanged.verdicts[0].reason_code == "evidence_contradicts"
-
-    present_contradicts = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
-    kept_contradicts = _apply_present_value_upgrades(present_contradicts, criteria, snapshot)
-    assert kept_contradicts.verdicts[0].reason_code == "evidence_contradicts"
-
-    unavailable = CompletionVerificationResult(status="unavailable")
-    assert _apply_present_value_upgrades(unavailable, criteria, snapshot).status == "unavailable"
+    kept = _apply_present_value_upgrades(contradicts, criteria, snapshot)
+    assert kept.verdicts[0].reason_code == "evidence_contradicts"
 
 
 def test_parse_completion_criteria_coerces_level() -> None:

@@ -1,5 +1,10 @@
 import * as React from "react";
-import { PlusIcon, ReloadIcon, TokensIcon } from "@radix-ui/react-icons";
+import {
+  ChevronRightIcon,
+  PlusIcon,
+  ReloadIcon,
+  TokensIcon,
+} from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -35,7 +40,123 @@ import {
   type TagKey,
 } from "../../types/tagTypes";
 import { useApplyWorkflowTagsMutation } from "../../hooks/useWorkflowTagMutations";
+import {
+  paletteDotClass,
+  randomPaletteColor,
+  tagColorFor,
+  type PaletteColorName,
+  type TagColorMap,
+} from "../../types/tagColors";
+import { cn } from "@/util/utils";
 import { TagChip } from "./TagChip";
+import { TagColorSwatchPicker } from "./TagColorSwatchPicker";
+
+const MICRO_LABEL = "text-[10px] font-medium uppercase tracking-wider";
+
+// One half of the tag anatomy: a captioned cell that reads "filled" (the part
+// the entry actually creates) or "empty" (the part it leaves blank), so the
+// group/value split is visible structure rather than prose.
+function AnatomyCell({
+  part,
+  value,
+  placeholder,
+  dotClass,
+}: {
+  part: string;
+  value: string | null;
+  placeholder: string;
+  dotClass?: string;
+}) {
+  const filled = value !== null && value !== "";
+  return (
+    <div className="min-w-0 flex-1 space-y-1">
+      <div className={cn(MICRO_LABEL, "text-muted-foreground")}>{part}</div>
+      <div
+        className={cn(
+          "flex h-7 items-center gap-1.5 rounded-md border px-2 text-sm",
+          filled
+            ? "bg-secondary text-secondary-foreground"
+            : "border-dashed text-muted-foreground",
+        )}
+      >
+        {dotClass ? (
+          <span
+            aria-hidden="true"
+            className={cn("h-2 w-2 shrink-0 rounded-full", dotClass)}
+          />
+        ) : null}
+        <span className="truncate">{filled ? value : placeholder}</span>
+      </div>
+    </div>
+  );
+}
+
+// Live anatomy of the tag the current input will create: a Label|Group mode
+// strip plus the two labeled halves (group filled + colored vs. an empty "no
+// group" slot), so a value-only label and a grouped one are unmistakable.
+function TagCreatePreview({
+  groupName,
+  labelValue,
+  isGroupMode,
+  colorDotClass,
+}: {
+  groupName: string | null;
+  labelValue: string | null;
+  isGroupMode: boolean;
+  colorDotClass: string;
+}) {
+  return (
+    <div className="space-y-2.5">
+      {/* Visual reinforcement only — the mode is conveyed in text by the
+          anatomy cells below, so hide the decorative segments from SR. */}
+      <div
+        aria-hidden="true"
+        className="inline-flex rounded-md bg-muted p-0.5 text-[11px] font-medium"
+      >
+        <span
+          className={cn(
+            "rounded px-2 py-0.5",
+            isGroupMode
+              ? "text-muted-foreground"
+              : "bg-background text-foreground shadow-sm",
+          )}
+        >
+          Label
+        </span>
+        <span
+          className={cn(
+            "rounded px-2 py-0.5",
+            isGroupMode
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground",
+          )}
+        >
+          Group
+        </span>
+      </div>
+      <div className="flex items-end gap-1.5">
+        <AnatomyCell
+          part="Group"
+          value={isGroupMode ? groupName : null}
+          placeholder="no group"
+          dotClass={isGroupMode ? colorDotClass : ""}
+        />
+        <ChevronRightIcon
+          aria-hidden="true"
+          className={cn(
+            "mb-1.5 h-4 w-4 shrink-0",
+            isGroupMode ? "text-muted-foreground" : "text-muted-foreground/40",
+          )}
+        />
+        <AnatomyCell
+          part="Label"
+          value={labelValue}
+          placeholder="type a label"
+        />
+      </div>
+    </div>
+  );
+}
 
 type Props = {
   workflowPermanentId: string;
@@ -46,6 +167,9 @@ type Props = {
   labelSuggestions?: Array<string>;
   // Grouped values observed per key, suggested after typing `group:`.
   valueSuggestionsByKey?: Map<string, Array<string>>;
+  // (key, value) -> palette color, to color existing chips and preselect the
+  // swatch when re-adding an already-colored grouped tag.
+  colorMap?: TagColorMap;
 };
 
 // Inline tag editor: type a bare `label` for a standalone tag or `group:label`
@@ -56,10 +180,15 @@ function WorkflowTagEditor({
   tagKeys,
   labelSuggestions = [],
   valueSuggestionsByKey,
+  colorMap,
 }: Props) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
+  // Default a new grouped tag to a random swatch (re-seeded after each add); the
+  // user can override, or it syncs to the existing color when re-adding one.
+  const [selectedColor, setSelectedColor] =
+    React.useState<PaletteColorName>(randomPaletteColor);
 
   const applyMutation = useApplyWorkflowTagsMutation();
   const isPending = applyMutation.isPending;
@@ -73,7 +202,7 @@ function WorkflowTagEditor({
 
   const sortedTags = React.useMemo(() => sortTags(tags), [tags]);
 
-  function addTag(tag: Tag) {
+  function addTag(tag: Tag, color?: PaletteColorName) {
     // A write is in flight; ignore further adds so a quick double Enter/click
     // can't queue racing POSTs whose arrival order would decide the final tag.
     if (isPending) {
@@ -106,12 +235,19 @@ function WorkflowTagEditor({
     applyMutation.mutate(
       {
         workflowPermanentId,
-        data: { tags: [{ key: tag.key, value: tag.value }] },
+        data: {
+          tags: [{ key: tag.key, value: tag.value }],
+          // Color is key-scoped and only applies to grouped tags.
+          ...(tag.key !== null && color
+            ? { colors: { [tag.key]: color } }
+            : {}),
+        },
       },
       {
         onSuccess: () => {
           setQuery("");
           setError(null);
+          setSelectedColor(randomPaletteColor());
           if (isOverwrite && previousInGroup) {
             toast({
               title: "Tag overwritten",
@@ -143,10 +279,27 @@ function WorkflowTagEditor({
     candidate !== null &&
     tags.some((t) => t.key === candidate.key && t.value === candidate.value);
   const showAdd = candidate !== null && !candidateExists;
+  const isGroupedCandidate = candidate !== null && candidate.key !== null;
+
+  // Re-adding an already-colored (key, value) should keep its color, so sync the
+  // swatch to it; brand-new values keep the random/user-picked selection.
+  const candidateExistingColor =
+    candidate !== null
+      ? tagColorFor(colorMap, candidate.key, candidate.value)
+      : undefined;
+  React.useEffect(() => {
+    if (candidateExistingColor) {
+      setSelectedColor(candidateExistingColor);
+    }
+  }, [candidateExistingColor]);
 
   // When the user has typed `group:partial`, suggest existing values for that
   // group; otherwise suggest groups (to start a grouped tag) and labels.
   const { typedKey, typedValuePartial } = parseTypedTagQuery(trimmedQuery);
+
+  // A group key can be present before the value completes the candidate, so the
+  // mode follows the typed key, not only a finished candidate.
+  const isGroupMode = isGroupedCandidate || typedKey !== null;
 
   const groupSuggestions =
     typedKey === null
@@ -199,6 +352,7 @@ function WorkflowTagEditor({
                   key={tagElementKey(tag)}
                   tagKey={tag.key}
                   value={tag.value}
+                  color={tagColorFor(colorMap, tag.key, tag.value)}
                   onRemove={() => removeTag(tag)}
                 />
               ))}
@@ -221,28 +375,61 @@ function WorkflowTagEditor({
             onKeyDown={(event) => {
               if (event.key === "Enter" && candidate && showAdd) {
                 event.preventDefault();
-                addTag(candidate);
+                addTag(
+                  candidate,
+                  isGroupedCandidate ? selectedColor : undefined,
+                );
               }
             }}
           />
+          {candidate !== null || typedKey !== null ? (
+            <div className="space-y-3 border-b px-3 py-3">
+              <TagCreatePreview
+                groupName={candidate?.key ?? typedKey}
+                labelValue={candidate?.value ?? null}
+                isGroupMode={isGroupMode}
+                colorDotClass={paletteDotClass(selectedColor)}
+              />
+              {isGroupMode ? (
+                <div className="space-y-1.5">
+                  <div className={cn(MICRO_LABEL, "text-muted-foreground")}>
+                    Color
+                  </div>
+                  <TagColorSwatchPicker
+                    value={selectedColor}
+                    onChange={setSelectedColor}
+                  />
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <CommandList>
-            <CommandEmpty>Type a label or group:label.</CommandEmpty>
+            <CommandEmpty>
+              Type a label, or group:label to file it under a group.
+            </CommandEmpty>
             {showAdd && candidate ? (
               <CommandGroup>
                 <CommandItem
                   value={`__add__,${trimmedQuery}`}
-                  onSelect={() => addTag(candidate)}
+                  onSelect={() =>
+                    addTag(
+                      candidate,
+                      isGroupedCandidate ? selectedColor : undefined,
+                    )
+                  }
                 >
                   {isPending ? (
                     <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                   ) : (
                     <PlusIcon className="mr-2 h-4 w-4" />
                   )}
-                  Add “
-                  {candidate.key !== null
-                    ? `${candidate.key}: ${candidate.value}`
-                    : candidate.value}
-                  ”
+                  {isGroupedCandidate ? (
+                    <>
+                      Add “{candidate.value}” to {candidate.key}
+                    </>
+                  ) : (
+                    <>Add label “{candidate.value}”</>
+                  )}
                 </CommandItem>
               </CommandGroup>
             ) : null}

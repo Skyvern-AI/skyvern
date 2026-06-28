@@ -10,17 +10,19 @@ import yaml
 
 LOG = structlog.get_logger()
 
-# Playwright/SkyvernPage method name -> step action_type (values are ActionType members;
+# Method name -> step action_type for the editor's static step preview (values are ActionType members,
 # kept as string literals so this module does not import skyvern.webeye, matching code_block_synthesis.py).
-# Mirror the runtime recorder's maps (code_block_recorder._PAGE_ACTION_MAP / _LOCATOR_ACTION_MAP) so the
-# static editor preview surfaces the same calls the timeline records — otherwise a recorded call (e.g.
-# page.evaluate) renders in the timeline but is silently dropped from the editor step list.
+# Must stay consistent with the two surfaces that record actions at runtime, so preview matches timeline:
+# the runtime recorder's raw-Playwright maps (code_block_recorder._PAGE_ACTION_MAP / _LOCATOR_ACTION_MAP)
+# and the @action_wrap(ActionType.X) decorators on the SkyvernPage high-level API (skyvern_page.py, e.g.
+# page.extract / page.complete). null_action is excluded as a no-op probe.
 _METHOD_ACTION_TYPES: dict[str, str] = {
+    # raw Playwright (mirrors code_block_recorder)
     "goto": "goto_url",
     "click": "click",
     "dblclick": "click",
-    "check": "click",
-    "uncheck": "click",
+    "check": "checkbox",
+    "uncheck": "checkbox",
     "tap": "click",
     "fill": "input_text",
     "type": "input_text",
@@ -34,7 +36,26 @@ _METHOD_ACTION_TYPES: dict[str, str] = {
     "reload": "reload_page",
     "evaluate": "execute_js",
     "wait_for_timeout": "wait",
+    # SkyvernPage @action_wrap high-level API (mirrors skyvern_page.py)
+    "extract": "extract",
+    "fill_autocomplete": "input_text",
+    "upload_file": "upload_file",
+    "complete": "complete",
+    "terminate": "terminate",
+    "verification_code": "verification_code",
+    "solve_captcha": "solve_captcha",
+    "download_file": "download_file",
+    "wait": "wait",
+    "reload_page": "reload_page",
+    "scroll": "scroll",
+    "keypress": "keypress",
+    "move": "move",
+    "drag": "drag",
+    "left_mouse": "left_mouse",
 }
+# Methods whose natural-language `prompt` is the first positional argument (it is keyword-only on the
+# interaction methods, which the keyword scan below already covers).
+_PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
 # Awaited calls that are sync/no-op helpers — never surfaced as their own step.
 _IGNORED_METHODS: frozenset[str] = frozenset(
     {"wait_for_load_state", "wait_for_selector", "wait_for_url", "wait_for_function"}
@@ -52,6 +73,8 @@ class CodeActionSpan:
     method: str
     receiver: str  # source of the call receiver, e.g. "page" or "page.get_by_role('link', name='Login')"
     first_arg: str | None  # source of the first call arg, if any
+    prompt: str | None  # natural-language `prompt` argument value, if a string literal
+    loop_var: str | None  # name of the enclosing for-loop target, if the call is inside one
 
 
 def analyze_code_actions(code: str) -> list[CodeActionSpan]:
@@ -62,6 +85,11 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
         tree = ast.parse(code)
     except SyntaxError:
         return []
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
 
     spans: list[CodeActionSpan] = []
     for node in ast.walk(tree):
@@ -84,10 +112,43 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
                 method=method,
                 receiver=_safe_unparse(call.func.value),
                 first_arg=_safe_unparse(call.args[0]) if call.args else None,
+                prompt=_prompt_literal(call, method),
+                loop_var=_enclosing_loop_var(node, parents),
             )
         )
     spans.sort(key=lambda s: (s.line_start, s.line_end))
     return spans
+
+
+def _prompt_literal(call: ast.Call, method: str) -> str | None:
+    """The natural-language `prompt` argument as a string literal, else None.
+
+    Decode the constant straight off the AST node — re-parsing ast.unparse output would
+    re-escape real newlines/tabs in a block-scalar prompt into literal "\\n" the copy can't collapse.
+    """
+    for keyword in call.keywords:
+        if keyword.arg == "prompt":
+            return _constant_str(keyword.value)
+    if method in _PROMPT_POSITIONAL_METHODS and call.args:
+        return _constant_str(call.args[0])
+    return None
+
+
+def _constant_str(node: ast.AST) -> str | None:
+    """The decoded value of a string-literal AST node, else None (e.g. a variable or f-string)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _enclosing_loop_var(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
+    """Name of the nearest enclosing for-loop's target, when it is a plain variable."""
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.For, ast.AsyncFor)) and isinstance(current.target, ast.Name):
+            return current.target.id
+        current = parents.get(current)
+    return None
 
 
 def _safe_unparse(node: ast.AST) -> str:
@@ -121,12 +182,37 @@ def _target_label(receiver: str, first_arg: str | None) -> str:
     return "the element"
 
 
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _humanize_identifier(name: str) -> str:
+    return name.replace("_", " ").strip()
+
+
 def _describe(span: CodeActionSpan) -> str:
+    # A natural-language `prompt` is the author's own reader-facing intent (e.g.
+    # "Extract the URLs of the top 20 posts"); prefer it over a structural label, but
+    # ignore a whitespace-only prompt so a step never renders with blank copy.
+    if span.prompt:
+        normalized = _normalize_whitespace(span.prompt)
+        if normalized:
+            return normalized
     value = _string_value(span.first_arg)
     if span.action_type == "goto_url":
-        return f"Open {value}" if value else "Open the page"
+        if value:
+            return f"Open {value}"
+        # A non-literal URL is a link discovered at runtime; say what/why instead of
+        # a repeated generic "Open the page". Inside a loop it opens each iterated item.
+        if span.loop_var:
+            return f"Open each {_humanize_identifier(span.loop_var)}"
+        return "Open the linked page"
+    if span.action_type == "extract":
+        return "Extract information from the page"
     if span.action_type == "click":
         return f"Click {_target_label(span.receiver, span.first_arg)}"
+    if span.action_type == "checkbox":
+        return f"Toggle {_target_label(span.receiver, span.first_arg)}"
     if span.action_type == "hover":
         return f"Hover over {_target_label(span.receiver, span.first_arg)}"
     if span.action_type == "input_text":
@@ -148,6 +234,20 @@ def _describe(span: CodeActionSpan) -> str:
         return "Reload the page"
     if span.action_type == "execute_js":
         return "Run a script"
+    if span.action_type == "complete":
+        return "Confirm the page is complete"
+    if span.action_type == "terminate":
+        return "Stop the workflow"
+    if span.action_type == "solve_captcha":
+        return "Solve the captcha"
+    if span.action_type == "verification_code":
+        return "Enter the verification code"
+    if span.action_type == "download_file":
+        return "Download a file"
+    if span.action_type == "scroll":
+        return "Scroll the page"
+    if span.action_type in ("move", "drag", "left_mouse"):
+        return "Move the cursor"
     return "Run a step"
 
 

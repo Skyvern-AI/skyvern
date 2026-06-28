@@ -161,6 +161,16 @@ class InvalidOpenAIResponseFormat(SkyvernException):
         super().__init__(f"Invalid response format: {message}")
 
 
+class PhoneNumberInputMismatch(SkyvernException):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        self.expected_digit_count = expected_digit_count
+        self.actual_digit_count = actual_digit_count
+        super().__init__(
+            "Phone input read-back mismatch: "
+            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
@@ -1292,3 +1302,11 @@ class ImaginarySecretValue(SkyvernException):
         super().__init__(
             f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )
+
+
+class CodeBlockRunnerSelectionError(SkyvernException):
+    """Raised when the secure CodeBlock runner selection policy cannot be evaluated safely.
+
+    The block-execution call site catches this and fails the block closed instead of
+    silently falling back to in-process execution.
+    """

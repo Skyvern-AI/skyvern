@@ -22,6 +22,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useOnChange } from "@/hooks/useOnChange";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 
@@ -56,6 +57,7 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
@@ -262,6 +264,7 @@ function NodeHeader({
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
@@ -549,9 +552,16 @@ function NodeHeader({
         description: "The agent block run has been started successfully",
       });
 
-      navigate(
-        `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
-      );
+      if (studioEnabled) {
+        useStudioShellStore.getState().setTab("browser");
+        navigate(
+          `/workflows/${workflowPermanentId}/studio?wr=${response.data.run_id}&bl=${encodeURIComponent(label)}`,
+        );
+      } else {
+        navigate(
+          `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
+        );
+      }
     },
     onError: (error: AxiosError | ValidationFailureError) => {
       // The block-validation gate threw a typed error and already showed
@@ -999,31 +1009,32 @@ function NodeHeader({
               </button>
             </div>
           )}
-          {debugStore.isDebugMode && isDebuggable && (
-            <button
-              disabled={workflowRunIsRunningOrQueued}
-              className={cn("rounded p-1 disabled:opacity-50", {
-                "hover:bg-muted": workflowRunIsRunningOrQueued,
-              })}
-            >
-              {runBlock.isPending ? (
-                <ReloadIcon className="size-6 animate-spin" />
-              ) : (
-                <PlayIcon
-                  className={cn("size-6", {
-                    "pointer-events-none fill-gray-500 text-gray-500":
-                      workflowRunIsRunningOrQueued ||
-                      !workflowPermanentId ||
-                      debugSession === undefined ||
-                      isRecording,
-                  })}
-                  onClick={() => {
-                    void handleOnPlay();
-                  }}
-                />
-              )}
-            </button>
-          )}
+          {(debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
+            isDebuggable && (
+              <button
+                disabled={workflowRunIsRunningOrQueued}
+                className={cn("rounded p-1 disabled:opacity-50", {
+                  "hover:bg-muted": workflowRunIsRunningOrQueued,
+                })}
+              >
+                {runBlock.isPending ? (
+                  <ReloadIcon className="size-6 animate-spin" />
+                ) : (
+                  <PlayIcon
+                    className={cn("size-6", {
+                      "pointer-events-none fill-gray-500 text-gray-500":
+                        workflowRunIsRunningOrQueued ||
+                        !workflowPermanentId ||
+                        debugSession === undefined ||
+                        isRecording,
+                    })}
+                    onClick={() => {
+                      void handleOnPlay();
+                    }}
+                  />
+                )}
+              </button>
+            )}
           {collapseToggleButton}
           {disabled ? null : (
             <div>

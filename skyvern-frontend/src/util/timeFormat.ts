@@ -134,6 +134,7 @@ function formatExecutionTime(
 }
 
 export {
+  normalizeUtcTimestamp,
   basicLocalTimeFormat,
   compactLocalDateTime,
   basicTimeFormat,

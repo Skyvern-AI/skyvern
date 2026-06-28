@@ -10,15 +10,18 @@ import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getInitialParameters } from "./utils";
+import { StudioShell } from "../studio/StudioShell";
 import { Workspace } from "./Workspace";
 import { ProductTour } from "@/components/onboarding/ProductTour";
 import { useProductTourShortcut } from "@/hooks/useProductTourShortcut";
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
   const [searchParams] = useSearchParams();
   const posthog = usePostHog();
+  const studioEnabled = useWorkflowStudioEnabled();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -75,6 +78,7 @@ function WorkflowEditor() {
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
     browserProfileId: workflow.browser_profile_id ?? null,
+    browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
@@ -113,16 +117,26 @@ function WorkflowEditor() {
           {elements.validationError.message}
         </div>
       ) : null}
-      <div className="relative flex flex-1">
+      <div className="relative flex min-h-0 flex-1">
         <ReactFlowProvider>
-          <Workspace
-            key={workflowPermanentId}
-            initialEdges={elements.edges}
-            initialNodes={elements.nodes}
-            initialTitle={workflow.title}
-            showBrowser={false}
-            workflow={workflow}
-          />
+          {studioEnabled ? (
+            <StudioShell
+              key={workflowPermanentId}
+              initialEdges={elements.edges}
+              initialNodes={elements.nodes}
+              initialTitle={workflow.title}
+              workflow={workflow}
+            />
+          ) : (
+            <Workspace
+              key={workflowPermanentId}
+              initialEdges={elements.edges}
+              initialNodes={elements.nodes}
+              initialTitle={workflow.title}
+              showBrowser={false}
+              workflow={workflow}
+            />
+          )}
         </ReactFlowProvider>
       </div>
       <ProductTour />

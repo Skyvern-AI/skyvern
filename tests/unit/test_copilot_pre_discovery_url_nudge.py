@@ -14,13 +14,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES,
     PRE_DISCOVERY_URL_QUESTION_NUDGE,
+    PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
     _pre_discovery_url_question_nudge,
     _response_coverage_nudge,
 )
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
 class _Ctx:
@@ -38,12 +43,58 @@ class _Ctx:
         self.no_workflow_nudge_count = 0
         self.coverage_nudge_count = 0
         self.format_nudge_count = 0
+        self.test_after_update_done = False
+        self.workflow_persisted = False
+        self.last_update_block_count = None
+        self.last_test_ok = None
+        self.last_run_blocks_workflow_run_id = None
+        self.last_successful_run_blocks_workflow_run_id = None
+        self.last_outcome_gate_workflow_run_id = None
 
 
 _URL_ASK = {
     "type": "ASK_QUESTION",
     "user_response": "I can build that, but I need the exact URL to use as the entry point. Please provide the URL.",
 }
+
+_OUTPUT_CONFIRMATION_ASK = {
+    "type": "ASK_QUESTION",
+    "user_response": "Please confirm the output fields before I build this workflow.",
+}
+
+
+def _authoring_intent(*, mode: TurnIntentMode = TurnIntentMode.BUILD, requires_user_input: bool = False) -> TurnIntent:
+    return TurnIntent(
+        mode=mode,
+        authority=TurnIntentAuthority(
+            may_update_workflow=mode in {TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY},
+            may_run_blocks=mode in {TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY},
+            requires_user_input=requires_user_input,
+        ),
+    )
+
+
+def _present_contract_policy(**overrides: object) -> RequestPolicy:
+    defaults = dict(
+        user_response_policy="proceed",
+        clarification_reason="none",
+        completion_contract_status="present",
+        completion_criteria=[
+            CompletionCriterion(id="record_id", outcome="The returned record includes the requested id."),
+        ],
+    )
+    defaults.update(overrides)
+    return RequestPolicy(**defaults)
+
+
+def _present_contract_ctx(**overrides: object) -> _Ctx:
+    ctx = _Ctx()
+    ctx.build_phase = BuildPhase.COMPOSING
+    ctx.request_policy = _present_contract_policy()
+    ctx.turn_intent = _authoring_intent()
+    for name, value in overrides.items():
+        setattr(ctx, name, value)
+    return ctx
 
 
 def test_pre_discovery_url_ask_in_initial_phase_steers_to_discovery() -> None:
@@ -142,3 +193,68 @@ def test_pre_discovery_nudge_is_bounded() -> None:
         assert ctx.pre_discovery_url_question_nudge_count == expected_count
     assert _pre_discovery_url_question_nudge(ctx, _URL_ASK) is None
     assert ctx.pre_discovery_url_question_nudge_count == MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES
+
+
+def test_present_completion_contract_ask_returns_internal_retry() -> None:
+    ctx = _present_contract_ctx()
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
+def test_present_completion_contract_ask_has_no_per_rule_cap() -> None:
+    ctx = _present_contract_ctx()
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
+def test_present_completion_contract_ask_allows_request_policy_clarification() -> None:
+    ctx = _present_contract_ctx(
+        request_policy=_present_contract_policy(
+            user_response_policy="ask_clarification",
+            clarification_reason="credential_name_unresolved",
+        ),
+        turn_intent=_authoring_intent(mode=TurnIntentMode.CLARIFY, requires_user_input=True),
+    )
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
+
+
+def test_present_completion_contract_ask_allows_non_none_clarification_reason() -> None:
+    ctx = _present_contract_ctx(
+        request_policy=_present_contract_policy(clarification_reason="credential_name_unresolved"),
+    )
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
+
+
+def test_present_completion_contract_ask_allows_clarify_turn_intent() -> None:
+    ctx = _present_contract_ctx(
+        turn_intent=TurnIntent(
+            mode=TurnIntentMode.CLARIFY,
+            authority=TurnIntentAuthority(requires_user_input=True),
+        ),
+    )
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
+
+
+def test_present_completion_contract_ask_allows_turn_intent_requiring_user_input() -> None:
+    ctx = _present_contract_ctx(turn_intent=_authoring_intent(requires_user_input=True))
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"update_workflow_called": True},
+        {"last_update_block_count": 1},
+        {"last_test_ok": False},
+        {"last_run_blocks_workflow_run_id": "wr_test"},
+    ],
+)
+def test_present_completion_contract_ask_allows_after_update_or_test_marker(marker: dict[str, object]) -> None:
+    ctx = _present_contract_ctx(**marker)
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
