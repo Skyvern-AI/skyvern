@@ -95,6 +95,7 @@ def _criterion(
     contingent_antecedent_output_path: str | None = None,
     kind: str = "outcome",
     terminal_action_family: str | None = None,
+    deliverable_kind: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -105,6 +106,7 @@ def _criterion(
         contingent_antecedent_output_path=contingent_antecedent_output_path,
         kind=kind,
         terminal_action_family=terminal_action_family,
+        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
     )
 
 
@@ -3991,6 +3993,251 @@ async def test_download_registered_output_parameter_injects_and_verifies_without
         )
     ]
     assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_marked_requested_output_id_still_requires_exact_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("marked requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id")
+    requested = _criterion(
+        "c_output_id",
+        "The returned record includes output id.",
+        output_path="output.output_id",
+        deliverable_kind="registered_download",
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=[requested])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
+    assert ctx.request_policy.completion_criteria == [requested]
+
+
+@pytest.mark.asyncio
+async def test_marked_requested_output_npi_still_requires_exact_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("marked requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    requested = _criterion(
+        "c_npi",
+        "The returned record includes NPI.",
+        output_path="output.npi",
+        deliverable_kind="registered_download",
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=[requested])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == "missing_exact_field"
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
+    assert ctx.request_policy.completion_criteria == [requested]
+
+
+@pytest.mark.asyncio
+async def test_unmarked_requested_output_id_still_requires_exact_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("unmarked requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_output_id",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+async def test_marked_download_deliverable_does_not_remove_mixed_extraction_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("mixed requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id", "npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_output_id",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            ),
+            _criterion("c_npi", "The returned record includes NPI.", output_path="output.npi"),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+    assert verdicts["c_npi"].reason_code == "missing_exact_field"
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
+
+
+@pytest.mark.parametrize(
+    ("output_path", "criterion_id"),
+    [
+        ("output.downloaded_files", "c_downloaded_files"),
+        ("output.downloaded_file_urls", "c_downloaded_file_urls"),
+        ("output.downloaded_file_artifact_ids", "c_downloaded_file_artifact_ids"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_download_output_path_reconciles_with_registered_download_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    output_path: str,
+    criterion_id: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download output path must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                criterion_id,
+                "The returned record includes registered download output.",
+                output_path=output_path,
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+
+
+@pytest.mark.asyncio
+async def test_marked_download_deliverable_without_registered_evidence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("missing registered download evidence must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id")
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/statement.pdf"]',
+        affordance_text="Download",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_output_id",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+    assert verdicts[REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID].reason_code == "no_evidence"
 
 
 @pytest.mark.asyncio

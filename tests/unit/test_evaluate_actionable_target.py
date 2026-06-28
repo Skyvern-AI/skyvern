@@ -92,6 +92,25 @@ def test_signature_changes_when_controls_change() -> None:
 
 
 @pytest.mark.asyncio
+async def test_standalone_controls_only_page_surfaces_grounded_targets(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return {
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "clickable_controls": [{"selector": "#biz-tile", "text": "Business"}],
+        }
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    result = {"ok": True, "data": {"url": "https://example.com/account"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/account")
+    assert result["data"]["actionable_targets"] == [{"selector": "#biz-tile", "text": "Business"}]
+
+
+@pytest.mark.asyncio
 async def test_first_evaluate_names_targets_without_next_action(monkeypatch) -> None:
     async def fake_evidence(ctx, *, url):
         return _packet()
@@ -341,6 +360,69 @@ def test_identities_cover_all_collections() -> None:
     identities = scouting._actionable_target_identities(_full_packet())
     selectors = {sel for sel, _ in identities}
     assert {"#user", "#login", "#print", "#results", "#close"} <= selectors
+
+
+def test_identities_include_clickable_controls() -> None:
+    packet = {
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "clickable_controls": [
+            {"selector": "#biz-tile", "text": "Business"},
+            {"text": "Residential"},
+        ],
+    }
+    identities = scouting._actionable_target_identities(packet)
+    assert ("#biz-tile", "Business") in identities
+    assert ("", "Residential") in identities
+
+
+def test_identities_order_affordances_before_fields_and_selectors_first() -> None:
+    packet = {
+        "forms": [
+            {
+                "fields": [{"selector": "#user", "text": "Username"}],
+                "submit_controls": [{"selector": "#login", "text": "Log In"}],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+        "clickable_controls": [
+            {"text": "Text only tile"},
+            {"selector": "#biz-tile", "text": "Business"},
+        ],
+    }
+    identities = scouting._actionable_target_identities(packet)
+    positions = {ident: index for index, ident in enumerate(identities)}
+    field_pos = positions[("#user", "Username")]
+    # Click affordances (selector-bearing and text-only) precede the plain input field.
+    assert positions[("#login", "Log In")] < field_pos
+    assert positions[("#biz-tile", "Business")] < field_pos
+    assert positions[("", "Text only tile")] < field_pos
+    # Selector-bearing affordances precede text-only ones.
+    assert positions[("#biz-tile", "Business")] < positions[("", "Text only tile")]
+
+
+def test_click_affordance_identities_only_selector_bearing_affordances() -> None:
+    packet = {
+        "forms": [
+            {
+                "fields": [{"selector": "#user", "text": "Username"}],
+                "submit_controls": [{"selector": "#login", "text": "Log In"}],
+            }
+        ],
+        "navigation_targets": [{"selector": "a.nav", "text": "Nav"}],
+        "result_containers": [{"selector": "#results", "text": "Results"}],
+        "clickable_controls": [
+            {"selector": "#tile", "text": "Tile"},
+            {"text": "Text only"},
+        ],
+        "modal_overlays": [{"dismiss_controls": [{"selector": "#close", "text": "Close"}]}],
+    }
+    identities = scouting._click_affordance_target_identities(packet)
+    selectors = {selector for selector, _ in identities}
+    assert selectors == {"#login", "a.nav", "#tile", "#close"}
+    assert all(selector for selector, _ in identities)
 
 
 @pytest.mark.asyncio

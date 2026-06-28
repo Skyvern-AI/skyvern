@@ -88,10 +88,11 @@ class TestRequestPolicyPromptStructure:
         rendered = _render()
         assert (
             "{outcome, contingent_on, contingent_antecedent_output_path, "
-            "implicit, method_mandated, level, kind, terminal_action_family}"
+            "deliverable_kind, implicit, method_mandated, level, kind, terminal_action_family}"
         ) in rendered
         assert "kind=outcome|terminal_action" in rendered
         assert "terminal_action_family=request|application|form|order|null" in rendered
+        assert 'The only supported non-null value is "registered_download"' in rendered
 
     def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
         active = _render_active_criteria_for_prompt(
