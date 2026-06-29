@@ -336,6 +336,7 @@ interface WorkflowCopilotChatProps {
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
+  workflowRunId?: string | null;
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
@@ -411,6 +412,7 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
   liveBrowserSessionId,
+  workflowRunId: workflowRunIdProp,
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
@@ -565,7 +567,11 @@ export function WorkflowCopilotChat({
     posY: 0,
   });
   const credentialGetter = useCredentialGetter();
-  const { workflowRunId, workflowPermanentId } = useParams();
+  const { workflowRunId: routeWorkflowRunId, workflowPermanentId } =
+    useParams();
+  // The studio focuses a run via ?wr= (not a path param), so the route param is
+  // empty there; an explicit prop grounds the chat in that run and wins.
+  const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);

@@ -149,6 +149,8 @@ import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
+import { useStudioRunId } from "../studio/useStudioRunId";
+import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import {
   STUDIO_COPILOT_RAIL_WIDTH,
@@ -446,6 +448,7 @@ function Workspace({
 
   const { getNodes, getEdges } = useReactFlow();
   const { data: workflowRun } = useWorkflowRunQuery();
+  const studioRunId = useStudioRunId();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const { browserStreamingMode } = useBrowserStreamingMode();
 
@@ -2359,6 +2362,7 @@ function Workspace({
         liveBrowserSessionId={
           copilotLiveBrowserReady ? liveBrowserSessionId : null
         }
+        workflowRunId={copilotRunId({ embedded, studioRunId })}
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
