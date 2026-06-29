@@ -531,9 +531,11 @@ describe("BlockConfigSidebar settings collapse (SKY-11481)", () => {
     );
   });
 
-  test("the embedded shell uses the 0.75rem right inset mirroring the Copilot column", () => {
+  test("the embedded shell uses the 0.75rem top + right inset mirroring the Copilot column", () => {
     // The 0.75rem inset now lives on the animated shell (Resizable root), not
-    // the rail; collapsed and expanded both anchor there.
+    // the rail; collapsed and expanded both anchor there. The top inset matches
+    // the Copilot column's py-3 (0.75rem) so the two rails align below the
+    // workflow header instead of the panel sitting flush against it (SKY-11383).
     act(() => {
       useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
     });
@@ -544,6 +546,7 @@ describe("BlockConfigSidebar settings collapse (SKY-11481)", () => {
     );
     const railShell =
       screen.getByTestId("settings-rail").parentElement?.parentElement;
+    expect(railShell?.style.top).toBe("0.75rem");
     expect(railShell?.style.right).toBe("0.75rem");
 
     act(() => {
@@ -556,6 +559,7 @@ describe("BlockConfigSidebar settings collapse (SKY-11481)", () => {
     );
     const panelShell = screen.getByTestId("block-config-sidebar").parentElement
       ?.parentElement;
+    expect(panelShell?.style.top).toBe("0.75rem");
     expect(panelShell?.style.right).toBe("0.75rem");
   });
 

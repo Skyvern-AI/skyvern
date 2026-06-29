@@ -305,6 +305,7 @@ function BulkActionBar({
                   showRemove={selectedWorkflows.some(
                     (workflow) => workflow.folder_id !== null,
                   )}
+                  disabled={isOperating}
                   onSelect={(folderId) => void onMoveToFolder(folderId)}
                 />
               </DropdownMenuSubContent>
