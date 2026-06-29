@@ -167,6 +167,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
 import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
+import { duplicateBlockBelow } from "./workflowDuplicate";
 
 // Grace period after nodesInitialized before we start tracking changes.
 // Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
@@ -1099,6 +1100,31 @@ function FlowRenderer({
     [onRequestDeleteNode, readOnly],
   );
 
+  function duplicateNode(id: string) {
+    const result = duplicateBlockBelow({
+      nodes,
+      edges,
+      nodeId: id,
+      generateId: nanoid,
+      generateLabel: generateNodeLabel,
+    });
+
+    if (!result) {
+      return;
+    }
+
+    workflowChangesStore.setHasChanges(true);
+    postHog.capture("builder.block.duplicated", {
+      org_id: workflow.organization_id,
+      position: result.position,
+      source_block_id: id,
+    });
+    doLayout(result.nodes, result.edges);
+    useWorkflowPanelStore
+      .getState()
+      .setSelectedBlockId(result.duplicatedNodeId);
+  }
+
   function transmuteNode(id: string, nodeType: string) {
     const nodeToTransmute = nodes.find((node) => node.id === id);
 
@@ -1818,6 +1844,9 @@ function FlowRenderer({
             // and flip `setHasChanges(true)` on the main editor's store
             // while the user is only inspecting versions.
             requestDeleteNodeCallback: readOnly ? () => {} : requestDeleteNode,
+            duplicateNodeCallback: readOnly
+              ? () => {}
+              : (id: string) => setTimeout(() => duplicateNode(id), 0),
             // setTimeout(..., 0) escapes the Radix dropdown's pointer-event
             // lockout: a synchronous mutation inside the menu's onSelect
             // races the menu's close animation and re-renders nodes while
