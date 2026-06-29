@@ -784,6 +784,25 @@ def _phone_digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _nanp_readback_national_digits(digits: str) -> str | None:
+    if len(digits) == 10:
+        return digits
+    if len(digits) in {11, 12} and digits[:-10] == "1" * (len(digits) - 10):
+        return digits[-10:]
+    return None
+
+
+def _phone_readback_digits_match(expected_digits: str, actual_digits: str) -> bool:
+    if actual_digits == expected_digits:
+        return True
+    if len(expected_digits) == 10 and actual_digits == f"1{expected_digits}":
+        return True
+
+    expected_nanp_digits = _nanp_readback_national_digits(expected_digits)
+    actual_nanp_digits = _nanp_readback_national_digits(actual_digits)
+    return expected_nanp_digits is not None and expected_nanp_digits == actual_nanp_digits
+
+
 def _is_plain_nanp_number(value: str | None) -> bool:
     # A 10-digit North American number with no '+'/country-code/extension markers. There is no
     # international handling, so a value carrying a '+' or letters (an extension) is excluded.
@@ -867,11 +886,11 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
 
 
 async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
-    # Compare digit counts only — never the raw value, which may be a secret.
+    # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator)
     expected_digits = _phone_digits(expected_value)
     actual_digits = _phone_digits(actual_value)
-    if expected_digits != actual_digits:
+    if not _phone_readback_digits_match(expected_digits, actual_digits):
         raise PhoneNumberInputMismatch(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
