@@ -676,7 +676,7 @@ class Settings(BaseSettings):
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
-    def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
+    def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
@@ -797,7 +797,7 @@ class Settings(BaseSettings):
                 get_custom_llm_model_mappings,
             )
 
-            mapping.update(get_custom_llm_model_mappings())
+            mapping.update(get_custom_llm_model_mappings(organization_id=organization_id))
         except Exception:
             LOG.warning("Failed to load custom LLM model mappings", exc_info=True)
 

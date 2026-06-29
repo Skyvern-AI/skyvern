@@ -21,6 +21,11 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    custom_llm_id_from_model_name,
+    is_custom_llm_model_name,
+    is_custom_llm_owned_by_organization,
+)
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -94,6 +99,23 @@ NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS = 2000
 # Structured (dict/list) output can't be sliced without corrupting it; one that exceeds
 # this is dropped entirely rather than written uncapped to task_history.
 NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS = 10 * NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS
+
+
+class InvalidTaskV2ModelError(ValueError):
+    pass
+
+
+def _validate_task_v2_model_for_org(organization: Organization, model: dict[str, Any] | None) -> None:
+    if not model:
+        return
+
+    model_name = model.get("model_name")
+    if not isinstance(model_name, str) or not is_custom_llm_model_name(model_name):
+        return
+
+    custom_llm_id = custom_llm_id_from_model_name(model_name)
+    if not custom_llm_id or not is_custom_llm_owned_by_organization(custom_llm_id, organization.organization_id):
+        raise InvalidTaskV2ModelError("Custom LLM model not found for organization")
 
 
 def _get_task_v2_llm_api_handler(task_v2: TaskV2) -> Any:
@@ -285,6 +307,8 @@ async def initialize_task_v2(
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
 ) -> TaskV2:
+    _validate_task_v2_model_for_org(organization, model)
+
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
         url=user_url if user_url else None,

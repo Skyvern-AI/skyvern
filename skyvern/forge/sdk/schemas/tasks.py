@@ -337,7 +337,7 @@ class Task(TaskBase):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key(organization_id=self.organization_id)
                 return mapping.get(model_name, {}).get("llm_key")
 
         return None

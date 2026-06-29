@@ -396,6 +396,8 @@ async def run_task(
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
             )
+        except task_v2_service.InvalidTaskV2ModelError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
@@ -2794,11 +2796,13 @@ async def get_version() -> dict[str, str]:
     openapi_extra={},
 )
 @legacy_base_router.get("/models/", include_in_schema=False)
-async def models() -> ModelsResponse:
+async def models(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ModelsResponse:
     """
     Get a list of available models.
     """
-    mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
+    mapping = SettingsManager.get_settings().get_model_name_to_llm_key(organization_id=current_org.organization_id)
     just_labels = {k: v["label"] for k, v in mapping.items() if "anthropic" not in k.lower()}
 
     return ModelsResponse(models=just_labels)
@@ -4610,6 +4614,8 @@ async def run_task_v2(
             run_with=data.run_with,
             trigger_type=legacy_v2_trigger_type,
         )
+    except task_v2_service.InvalidTaskV2ModelError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:

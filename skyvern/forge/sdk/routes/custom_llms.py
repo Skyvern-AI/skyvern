@@ -111,7 +111,7 @@ async def create_custom_llm(
         token=request.config.model_dump_json(),
     )
     custom_llm = custom_llm_from_org_auth_token(token)
-    register_custom_llm_config(custom_llm.id, custom_llm.config)
+    register_custom_llm_config(custom_llm.id, custom_llm.organization_id, custom_llm.config)
     return CustomLLMResponse(custom_llm=custom_llm_response_from_org_auth_token(token))
 
 
@@ -145,7 +145,7 @@ async def update_custom_llm(
         raise HTTPException(status_code=404, detail="Custom LLM not found") from e
 
     custom_llm = custom_llm_from_org_auth_token(token)
-    register_custom_llm_config(custom_llm.id, custom_llm.config)
+    register_custom_llm_config(custom_llm.id, custom_llm.organization_id, custom_llm.config)
     return CustomLLMResponse(custom_llm=custom_llm_response_from_org_auth_token(token))
 
 

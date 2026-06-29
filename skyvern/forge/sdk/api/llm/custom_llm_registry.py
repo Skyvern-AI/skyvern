@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import structlog
@@ -14,7 +15,16 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-_custom_llm_configs: dict[str, CustomLLMConfig] = {}
+CUSTOM_LLM_MODEL_PREFIX = "custom/"
+
+
+@dataclass(frozen=True)
+class CustomLLMRegistryEntry:
+    organization_id: str
+    config: CustomLLMConfig
+
+
+_custom_llm_configs: dict[str, CustomLLMRegistryEntry] = {}
 
 
 def custom_llm_key(custom_llm_id: str) -> str:
@@ -22,7 +32,18 @@ def custom_llm_key(custom_llm_id: str) -> str:
 
 
 def custom_llm_model_name(custom_llm_id: str) -> str:
-    return f"custom/{custom_llm_id}"
+    return f"{CUSTOM_LLM_MODEL_PREFIX}{custom_llm_id}"
+
+
+def is_custom_llm_model_name(model_name: str) -> bool:
+    return model_name.startswith(CUSTOM_LLM_MODEL_PREFIX)
+
+
+def custom_llm_id_from_model_name(model_name: str) -> str | None:
+    if not is_custom_llm_model_name(model_name):
+        return None
+    custom_llm_id = model_name.removeprefix(CUSTOM_LLM_MODEL_PREFIX)
+    return custom_llm_id or None
 
 
 def _strip_provider_prefix(model_name: str, prefixes: tuple[str, ...]) -> str:
@@ -66,13 +87,13 @@ def _build_llm_config(config: CustomLLMConfig) -> LLMConfig:
     )
 
 
-def register_custom_llm_config(custom_llm_id: str, config: CustomLLMConfig) -> None:
+def register_custom_llm_config(custom_llm_id: str, organization_id: str, config: CustomLLMConfig) -> None:
     from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # noqa: PLC0415
 
     llm_key = custom_llm_key(custom_llm_id)
     LLMConfigRegistry.deregister_config(llm_key)
     LLMConfigRegistry.register_config(llm_key, _build_llm_config(config))
-    _custom_llm_configs[custom_llm_id] = config
+    _custom_llm_configs[custom_llm_id] = CustomLLMRegistryEntry(organization_id=organization_id, config=config)
     LOG.info(
         "Registered custom LLM",
         custom_llm_id=custom_llm_id,
@@ -88,13 +109,23 @@ def deregister_custom_llm_config(custom_llm_id: str) -> None:
     _custom_llm_configs.pop(custom_llm_id, None)
 
 
-def get_custom_llm_model_mappings() -> dict[str, dict[str, str]]:
+def is_custom_llm_owned_by_organization(custom_llm_id: str, organization_id: str) -> bool:
+    entry = _custom_llm_configs.get(custom_llm_id)
+    return entry is not None and entry.organization_id == organization_id
+
+
+def get_custom_llm_model_mappings(organization_id: str | None = None) -> dict[str, dict[str, str]]:
+    entries = {
+        custom_llm_id: entry
+        for custom_llm_id, entry in _custom_llm_configs.items()
+        if organization_id is None or entry.organization_id == organization_id
+    }
     return {
         custom_llm_model_name(custom_llm_id): {
             "llm_key": custom_llm_key(custom_llm_id),
-            "label": f"{config.display_name} (Custom)",
+            "label": f"{entry.config.display_name} (Custom {custom_llm_id})",
         }
-        for custom_llm_id, config in _custom_llm_configs.items()
+        for custom_llm_id, entry in entries.items()
     }
 
 
@@ -109,7 +140,7 @@ async def load_custom_llm_configs_from_database(database: AgentDB) -> None:
             continue
 
         active_ids.add(token.id)
-        register_custom_llm_config(token.id, config)
+        register_custom_llm_config(token.id, token.organization_id, config)
 
     for custom_llm_id in set(_custom_llm_configs) - active_ids:
         deregister_custom_llm_config(custom_llm_id)
