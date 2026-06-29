@@ -4714,6 +4714,10 @@ def _record_workflow_update_result(
         block_count = data.get("block_count")
         if isinstance(block_count, int):
             copilot_ctx.last_update_block_count = block_count
+    copilot_ctx.update_workflow_called = True
+    copilot_ctx.synthesized_block_reopened_after_failed_run = False
+    copilot_ctx.test_after_update_done = False
+    copilot_ctx.post_update_nudge_count = 0
     copilot_ctx.last_test_ok = None
     copilot_ctx.last_test_failure_reason = None
     clear_terminal_evidence_on_workflow_edit(copilot_ctx)
