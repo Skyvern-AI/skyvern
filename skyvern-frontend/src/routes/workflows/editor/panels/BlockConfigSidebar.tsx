@@ -1,4 +1,10 @@
-import { Cross2Icon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  Cross2Icon,
+  GearIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -10,6 +16,7 @@ import {
 } from "@/store/BlockSidebarWidthStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { cn } from "@/util/utils";
 
@@ -29,6 +36,12 @@ import {
 import { BlockConfigForm } from "./BlockConfigForm";
 import { useHasInteractedThisSession } from "./useHasInteractedThisSession";
 import { WorkflowNodeLibraryPanel } from "./WorkflowNodeLibraryPanel";
+import {
+  STUDIO_COPILOT_COLLAPSE_EASE,
+  STUDIO_COPILOT_RAIL_WIDTH,
+  STUDIO_COPILOT_TRANSITION_EASE,
+  STUDIO_COPILOT_TRANSITION_MS,
+} from "../../studio/constants";
 import type { AddNodeProps } from "../Workspace";
 
 // React Flow node type → backend WorkflowBlockType. The two diverge in
@@ -80,6 +93,83 @@ function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {
 }
 
 const FOOTER_TICK_INTERVAL_MS = 10_000;
+
+// Reuse the Copilot rail width so the two studio rails can't drift apart.
+const SETTINGS_RAIL_WIDTH = STUDIO_COPILOT_RAIL_WIDTH;
+
+type SidebarIdentity = {
+  label: string;
+  isStart: boolean;
+  blockType: WorkflowBlockType | null;
+};
+
+function getSidebarIdentity(node: AppNode | null): SidebarIdentity {
+  const isStart = node ? isStartNode(node) : false;
+  const blockType = node ? getBlockTypeFromNode(node) : null;
+  const label = isStart
+    ? "Agent Settings"
+    : typeof node?.data?.label === "string" && node.data.label.length > 0
+      ? node.data.label
+      : blockType
+        ? workflowBlockTitle[blockType]
+        : "";
+  return { label, isStart, blockType };
+}
+
+function SidebarIdentityIcon({
+  identity,
+}: Readonly<{ identity: SidebarIdentity }>) {
+  // The gear doubles as the generic "settings" glyph: it covers both the start
+  // node and the unknown-block fallback (a detached/untyped node has no icon).
+  return (
+    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
+      {!identity.isStart && identity.blockType ? (
+        <WorkflowBlockIcon
+          workflowBlockType={identity.blockType}
+          className="size-4"
+        />
+      ) : (
+        <GearIcon className="size-4" />
+      )}
+    </div>
+  );
+}
+
+// Collapsed settings rail content (slim right-edge controls), mirroring the
+// Copilot rail; the shared shell wrapper owns the card chrome + width animation.
+function SettingsRail({
+  identity,
+  onExpand,
+}: Readonly<{ identity: SidebarIdentity; onExpand: () => void }>) {
+  // Opaque background covers the clipped panel underneath immediately (no
+  // show-through "open-flicker"); only the controls fade in, like Copilot.
+  return (
+    <div
+      data-testid="settings-rail"
+      style={{ width: SETTINGS_RAIL_WIDTH }}
+      className="absolute right-0 top-0 h-full bg-slate-elevation2"
+    >
+      <div className="flex h-full flex-col items-center gap-3 py-3 duration-300 animate-in fade-in">
+        <button
+          type="button"
+          onClick={onExpand}
+          title="Show settings"
+          aria-label="Show settings"
+          className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          <ChevronLeftIcon className="h-4 w-4" />
+        </button>
+        <SidebarIdentityIcon identity={identity} />
+        <span
+          className="mt-1 max-h-[60%] overflow-hidden text-ellipsis text-xs font-medium tracking-wide text-muted-foreground"
+          style={{ writingMode: "vertical-rl" }}
+        >
+          {identity.label}
+        </span>
+      </div>
+    </div>
+  );
+}
 
 function measureElementWidth(element: HTMLElement): number | null {
   const boundingWidth = element.getBoundingClientRect().width;
@@ -193,60 +283,59 @@ function EditableBlockTitle({
 
 function BlockConfigSidebarBody({
   selectedBlockId,
+  identity,
   onClose,
-}: Readonly<{ selectedBlockId: string; onClose: () => void }>) {
-  const reactFlowInstance = useReactFlow<AppNode>();
-  const node = reactFlowInstance.getNode(selectedBlockId);
-
-  const isStart = node ? isStartNode(node) : false;
-  const blockType = node ? getBlockTypeFromNode(node) : null;
-  const label = isStart
-    ? "Agent Settings"
-    : typeof node?.data?.label === "string" && node.data.label.length > 0
-      ? node.data.label
-      : blockType
-        ? workflowBlockTitle[blockType]
-        : "";
-
+  onCollapse,
+}: Readonly<{
+  selectedBlockId: string;
+  identity: SidebarIdentity;
+  onClose: () => void;
+  // When set (studio shell), the header's close affordance collapses the panel
+  // to a rail instead of deselecting the block.
+  onCollapse?: () => void;
+}>) {
   return (
     <>
       <header className="flex h-20 items-center justify-between gap-3 border-b border-border px-6">
         <div className="flex min-w-0 items-center gap-3">
-          {isStart ? (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
-              <GearIcon className="size-4" />
-            </div>
-          ) : blockType ? (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={blockType}
-                className="size-4"
-              />
-            </div>
+          {identity.isStart || identity.blockType ? (
+            <SidebarIdentityIcon identity={identity} />
           ) : null}
           <div className="min-w-0">
-            {isStart ? (
+            {identity.isStart ? (
               <h2 className="truncate text-sm font-medium text-slate-100">
-                {label}
+                {identity.label}
               </h2>
             ) : (
               <EditableBlockTitle
                 key={selectedBlockId}
                 blockId={selectedBlockId}
-                fallbackLabel={label}
+                fallbackLabel={identity.label}
               />
             )}
             <SubLabel />
           </div>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close block configuration"
-          className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
-        >
-          <Cross2Icon className="h-4 w-4" />
-        </button>
+        {onCollapse ? (
+          <button
+            type="button"
+            onClick={onCollapse}
+            aria-label="Collapse settings"
+            title="Collapse settings"
+            className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
+          >
+            <ChevronRightIcon className="h-4 w-4" />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close block configuration"
+            className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
+          >
+            <Cross2Icon className="h-4 w-4" />
+          </button>
+        )}
       </header>
       <div className="flex-1 overflow-y-auto px-5 py-4">
         <BlockConfigForm blockId={selectedBlockId} />
@@ -307,6 +396,7 @@ function BlockConfigSidebar({
   embedded = false,
 }: BlockConfigSidebarProps) {
   const resizableRef = useRef<Resizable | null>(null);
+  const reactFlowInstance = useReactFlow<AppNode>();
   const [editorShellMetrics, setEditorShellMetrics] = useState(() => ({
     gutterPx: getBlockSidebarGutterPx(null),
     width: null as number | null,
@@ -328,6 +418,12 @@ function BlockConfigSidebar({
     (state) => state.closeWorkflowPanel,
   );
   const flushPendingCommit = usePendingCommitsStore((state) => state.flush);
+  const studioSettingsCollapsed = useStudioShellStore(
+    (state) => state.settingsCollapsed,
+  );
+  const setStudioSettingsCollapsed = useStudioShellStore(
+    (state) => state.setSettingsCollapsed,
+  );
   const containedWidth = getContainedBlockSidebarWidth(
     width,
     editorShellMetrics.width,
@@ -362,6 +458,21 @@ function BlockConfigSidebar({
     workflowPanelState.active && workflowPanelState.content === "nodeLibrary";
   const sidebarVisible =
     showLibrary || (mode !== "build" && selectedBlockId !== null);
+
+  // In the studio shell every settings panel (agent settings + each block) is
+  // collapsible to a rail; the block-library drawer is not.
+  const selectedNode =
+    !showLibrary && selectedBlockId !== null
+      ? (reactFlowInstance.getNode(selectedBlockId) ?? null)
+      : null;
+  const isCollapsibleSettings = embedded && selectedNode !== null;
+  const settingsCollapsed = isCollapsibleSettings && studioSettingsCollapsed;
+  const selectedIdentity = getSidebarIdentity(selectedNode);
+
+  // Transition stays on so the toggle always animates (like Copilot); dropped
+  // mid-drag, where the live width is tracked so the body follows the handle.
+  const [isResizing, setIsResizing] = useState(false);
+  const [resizingWidth, setResizingWidth] = useState<number | null>(null);
 
   useLayoutEffect(() => {
     if (!sidebarVisible) {
@@ -407,15 +518,17 @@ function BlockConfigSidebar({
     return () => {
       resizeObserver.disconnect();
     };
-  }, [sidebarVisible]);
+    // Re-measure on collapse toggle: the shell width changes, so the contained
+    // width bounds need refreshing.
+  }, [sidebarVisible, settingsCollapsed]);
 
   useLayoutEffect(() => {
     if (!sidebarVisible) {
       return;
     }
 
-    setRenderedWidth(containedWidth);
-  }, [containedWidth, setRenderedWidth, sidebarVisible]);
+    setRenderedWidth(settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedWidth);
+  }, [settingsCollapsed, containedWidth, setRenderedWidth, sidebarVisible]);
 
   // In build mode the block-config form is unavailable, but the node library
   // must still render so users can insert blocks from the canvas.
@@ -427,15 +540,30 @@ function BlockConfigSidebar({
     return null;
   }
 
+  // Fixed body width tracks the live handle while resizing, the stored width
+  // otherwise — never the rail width, so the clipping shell never reflows it.
+  const bodyWidth =
+    isResizing && resizingWidth !== null ? resizingWidth : containedWidth;
+
   return (
     <Resizable
       ref={resizableRef}
-      size={{ width: containedWidth, height: "auto" }}
-      minWidth={containedMinWidth}
+      size={{
+        width:
+          embedded && settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedWidth,
+        height: "auto",
+      }}
+      minWidth={
+        embedded && settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedMinWidth
+      }
       maxWidth={containedMaxWidth}
-      enable={{ left: true }}
+      enable={{ left: !(embedded && settingsCollapsed) }}
+      onResizeStart={() => setIsResizing(true)}
+      onResize={(_e, _dir, ref) => setResizingWidth(ref.offsetWidth)}
       onResizeStop={(_e, _dir, ref) => {
         setWidth(ref.offsetWidth);
+        setIsResizing(false);
+        setResizingWidth(null);
       }}
       handleClasses={{ left: "block-sidebar-resize-handle" }}
       handleStyles={{
@@ -448,33 +576,74 @@ function BlockConfigSidebar({
       style={{
         position: "absolute",
         top: embedded ? "0.75rem" : mode === "build" ? "7rem" : "2rem",
-        right: "1.5rem",
+        // Embedded mirrors the Copilot column's uniform py-3/pl-3 (0.75rem)
+        // inset; legacy keeps its wider 1.5rem gutter.
+        right: embedded ? "0.75rem" : "1.5rem",
         bottom: embedded ? "0.75rem" : "1.5rem",
+        // Copilot's open/collapse curve, always on so the toggle animates with
+        // no snap; dropped mid-drag so a resize tracks the handle 1:1.
+        transition:
+          embedded && !isResizing
+            ? `width ${STUDIO_COPILOT_TRANSITION_MS}ms ${
+                settingsCollapsed
+                  ? STUDIO_COPILOT_COLLAPSE_EASE
+                  : STUDIO_COPILOT_TRANSITION_EASE
+              }`
+            : undefined,
       }}
-      className={cn(
-        "z-30 flex flex-col",
-        "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
-      )}
+      className="z-30"
     >
-      <aside
-        data-testid="block-config-sidebar"
+      <div
         className={cn(
-          "flex h-full w-full flex-col",
-          "duration-200 ease-out animate-in slide-in-from-right-5",
+          "relative h-full w-full overflow-hidden",
+          "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
         )}
       >
-        {showLibrary ? (
-          <BlockLibrarySidebarBody
-            onAddNode={(props) => onAddNode?.(props)}
-            onClose={closeWorkflowPanel}
-          />
-        ) : selectedBlockId !== null ? (
-          <BlockConfigSidebarBody
-            selectedBlockId={selectedBlockId}
-            onClose={() => setSelectedBlockId(null)}
+        <aside
+          data-testid="block-config-sidebar"
+          style={
+            embedded
+              ? {
+                  position: "absolute",
+                  inset: 0,
+                  left: "auto",
+                  width: bodyWidth,
+                }
+              : undefined
+          }
+          className={cn(
+            "flex h-full flex-col",
+            // Collapsed: the rail covers it; disable the clipped strip.
+            embedded && settingsCollapsed && "pointer-events-none",
+            !embedded &&
+              "w-full duration-200 ease-out animate-in slide-in-from-right-5",
+          )}
+        >
+          {showLibrary ? (
+            <BlockLibrarySidebarBody
+              onAddNode={(props) => onAddNode?.(props)}
+              onClose={closeWorkflowPanel}
+            />
+          ) : selectedBlockId !== null ? (
+            <BlockConfigSidebarBody
+              selectedBlockId={selectedBlockId}
+              identity={selectedIdentity}
+              onClose={() => setSelectedBlockId(null)}
+              onCollapse={
+                isCollapsibleSettings
+                  ? () => setStudioSettingsCollapsed(true)
+                  : undefined
+              }
+            />
+          ) : null}
+        </aside>
+        {embedded && settingsCollapsed ? (
+          <SettingsRail
+            identity={selectedIdentity}
+            onExpand={() => setStudioSettingsCollapsed(false)}
           />
         ) : null}
-      </aside>
+      </div>
     </Resizable>
   );
 }

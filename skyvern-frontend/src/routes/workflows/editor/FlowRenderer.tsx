@@ -15,6 +15,7 @@ import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosin
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -447,6 +448,9 @@ function FlowRenderer({
   const selectedBlockId = useWorkflowPanelStore(
     (state) => state.selectedBlockId,
   );
+  const setSettingsCollapsed = useStudioShellStore(
+    (state) => state.setSettingsCollapsed,
+  );
 
   // Escape clears the canvas selection. The listener is mounted
   // on the FlowRenderer because that scopes the global keydown to the
@@ -460,13 +464,19 @@ function FlowRenderer({
       if (event.key !== "Escape") {
         return;
       }
+      // In the studio shell the settings panel is persistent, so Escape
+      // collapses it to the rail rather than deselecting (which would hide it).
+      if (embedded) {
+        setSettingsCollapsed(true);
+        return;
+      }
       setSelectedBlockId(null);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [setSelectedBlockId, readOnly]);
+  }, [setSelectedBlockId, setSettingsCollapsed, embedded, readOnly]);
 
   // Programmatic viewport changes (e.g. `fitView`) animate via `setViewport`,
   // which fires `onMove`. Without this gate, `constrainPan` would clamp every
@@ -1981,12 +1991,21 @@ function FlowRenderer({
                     return;
                   }
                   setSelectedBlockId(node.id);
+                  // Studio: a deliberate block click expands the persistent
+                  // settings panel (it starts collapsed on open).
+                  if (embedded) {
+                    setSettingsCollapsed(false);
+                  }
                 }}
                 onPaneClick={() => {
                   if (readOnly) {
                     return;
                   }
-                  setSelectedBlockId(null);
+                  // Studio: keep the persistent settings panel mounted on a
+                  // canvas click instead of deselecting (which would hide it).
+                  if (!embedded) {
+                    setSelectedBlockId(null);
+                  }
                 }}
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}
