@@ -918,6 +918,13 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def parse_enterprise_totp_secret(
+        self,
+        totp_secret: str,
+        organization_id: str | None = None,
+    ) -> str | None:
+        return None
+
     async def prepare_step_execution(
         self,
         organization: Organization | None,

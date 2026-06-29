@@ -612,6 +612,15 @@ class WorkflowRunContext:
             " Expected format: vault_id:item_id"
         )
 
+    async def _normalize_totp_config_for_organization(self, totp_secret: str, organization: Organization) -> str:
+        enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+            totp_secret,
+            organization_id=organization.organization_id,
+        )
+        if enterprise_totp_secret is not None:
+            return enterprise_totp_secret
+        return normalize_totp_config(totp_secret)
+
     async def _register_credential_parameter_value(
         self,
         credential_id: str,
@@ -660,7 +669,10 @@ class WorkflowRunContext:
             totp_secret_id = f"{random_secret_id}_totp"
             self.secrets[totp_secret_id] = BitwardenConstants.TOTP
             totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-            self.secrets[totp_secret_value] = normalize_totp_config(credential.totp)
+            self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                credential.totp,
+                organization,
+            )
             self.values[parameter.key]["totp"] = totp_secret_id
 
     def get_credential_totp_identifier(self, parameter_key: str) -> str | None:
@@ -808,7 +820,10 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = normalize_totp_config(field.value)
+                self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                    field.value,
+                    organization,
+                )
                 self.values[parameter.key]["totp"] = totp_secret_id
             elif field.title and field.title.lower() in ["expire date", "expiry date", "expiration date"]:
                 parts = [part.strip() for part in field.value.strip().split("/")]
@@ -1040,7 +1055,10 @@ class WorkflowRunContext:
                     totp_secret_id = f"{random_secret_id}_totp"
                     self.secrets[totp_secret_id] = BitwardenConstants.TOTP
                     totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                    self.secrets[totp_secret_value] = normalize_totp_config(secret_credentials[BitwardenConstants.TOTP])
+                    self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                        secret_credentials[BitwardenConstants.TOTP],
+                        organization,
+                    )
                     self.values[parameter.key]["totp"] = totp_secret_id
 
         except BitwardenBaseError as e:
@@ -1094,7 +1112,10 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = AzureVaultConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = normalize_totp_config(totp_secret)
+                self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                    totp_secret,
+                    organization,
+                )
                 self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_bitwarden_sensitive_information_parameter_value(
