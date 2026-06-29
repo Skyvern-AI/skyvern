@@ -14,7 +14,12 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes import custom_llms as routes
-from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMCreateRequest, CustomLLMUpdateRequest
+from skyvern.forge.sdk.schemas.custom_llms import (
+    CUSTOM_LLM_API_KEY_MASK,
+    CustomLLMConfig,
+    CustomLLMCreateRequest,
+    CustomLLMUpdateRequest,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.services import task_v2_service
@@ -126,11 +131,16 @@ async def test_custom_llm_routes_register_update_and_delete_config(
     custom_llm_id = create_response.custom_llm.id
     llm_key = custom_llm_key(custom_llm_id)
     assert LLMConfigRegistry.is_registered(llm_key)
-    assert LLMConfigRegistry.get_config(llm_key).model_name == "openrouter/anthropic/claude-3.5-sonnet"
+    registered_config = LLMConfigRegistry.get_config(llm_key)
+    assert registered_config.model_name == "openrouter/anthropic/claude-3.5-sonnet"
+    assert registered_config.litellm_params
+    assert registered_config.litellm_params["api_key"] == "sk-or"
+    assert create_response.custom_llm.config.api_key == CUSTOM_LLM_API_KEY_MASK
     assert custom_llm_model_name(custom_llm_id) in routes.settings.get_model_name_to_llm_key()
 
     list_response = await routes.list_custom_llms(org)
     assert [custom_llm.id for custom_llm in list_response.custom_llms] == [custom_llm_id]
+    assert list_response.custom_llms[0].config.api_key == CUSTOM_LLM_API_KEY_MASK
 
     update_response = await routes.update_custom_llm(
         CustomLLMUpdateRequest(
@@ -151,6 +161,70 @@ async def test_custom_llm_routes_register_update_and_delete_config(
     assert delete_response.success is True
     assert not LLMConfigRegistry.is_registered(llm_key)
     assert fake_organizations.tokens[0].valid is False
+
+
+@pytest.mark.asyncio
+async def test_list_custom_llms_does_not_register_configs(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    org = _org()
+    token = await fake_organizations.create_org_auth_token(
+        organization_id=org.organization_id,
+        token_type=OrganizationAuthTokenType.custom_llm,
+        token=CustomLLMConfig(
+            display_name="Local Llama",
+            provider="ollama",
+            model_name="llama3.1",
+        ).model_dump_json(),
+    )
+    llm_key = custom_llm_key(token.id)
+    deregister_custom_llm_config(token.id)
+
+    list_response = await routes.list_custom_llms(org)
+
+    assert [custom_llm.id for custom_llm in list_response.custom_llms] == [token.id]
+    assert not LLMConfigRegistry.is_registered(llm_key)
+
+
+@pytest.mark.asyncio
+async def test_update_custom_llm_preserves_masked_api_key(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    org = _org()
+    create_response = await routes.create_custom_llm(
+        CustomLLMCreateRequest(
+            config=CustomLLMConfig(
+                display_name="OpenRouter Claude",
+                provider="openrouter",
+                model_name="anthropic/claude-3.5-sonnet",
+                api_key="sk-or",
+            )
+        ),
+        org,
+    )
+    custom_llm_id = create_response.custom_llm.id
+
+    update_response = await routes.update_custom_llm(
+        CustomLLMUpdateRequest(
+            config=CustomLLMConfig(
+                display_name="OpenRouter GPT",
+                provider="openrouter",
+                model_name="openai/gpt-4.1",
+                api_key=CUSTOM_LLM_API_KEY_MASK,
+            )
+        ),
+        custom_llm_id,
+        org,
+    )
+
+    assert update_response.custom_llm.config.api_key == CUSTOM_LLM_API_KEY_MASK
+    stored_config = CustomLLMConfig.model_validate_json(fake_organizations.tokens[0].token)
+    assert stored_config.api_key == "sk-or"
+    registered_config = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
+    assert registered_config.litellm_params
+    assert registered_config.litellm_params["api_key"] == "sk-or"
+
+    deregister_custom_llm_config(custom_llm_id)
 
 
 @pytest.mark.asyncio

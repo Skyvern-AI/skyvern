@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 import structlog
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.agent_db import AgentDB
 
 LOG = structlog.get_logger()
 
@@ -94,16 +98,8 @@ def get_custom_llm_model_mappings() -> dict[str, dict[str, str]]:
     }
 
 
-async def load_custom_llm_configs_from_database(database: object) -> None:
-    organizations = getattr(database, "organizations", None)
-    if organizations is None:
-        return
-
-    get_tokens = getattr(organizations, "get_valid_org_auth_tokens_by_type", None)
-    if get_tokens is None:
-        return
-
-    tokens = await get_tokens(OrganizationAuthTokenType.custom_llm)
+async def load_custom_llm_configs_from_database(database: AgentDB) -> None:
+    tokens = await database.organizations.get_valid_org_auth_tokens_by_type(OrganizationAuthTokenType.custom_llm)
     active_ids: set[str] = set()
     for token in tokens:
         try:

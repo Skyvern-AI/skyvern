@@ -7,6 +7,8 @@ from typing_extensions import Self
 
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 
+CUSTOM_LLM_API_KEY_MASK = "********"
+
 
 class CustomLLMProvider(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"
@@ -106,3 +108,10 @@ def custom_llm_from_org_auth_token(token: OrganizationAuthToken) -> CustomLLM:
         modified_at=token.modified_at.isoformat(),
         valid=token.valid,
     )
+
+
+def custom_llm_response_from_org_auth_token(token: OrganizationAuthToken) -> CustomLLM:
+    custom_llm = custom_llm_from_org_auth_token(token)
+    if custom_llm.config.api_key:
+        custom_llm.config = custom_llm.config.model_copy(update={"api_key": CUSTOM_LLM_API_KEY_MASK})
+    return custom_llm
