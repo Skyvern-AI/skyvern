@@ -11,12 +11,13 @@ describe("getAuthenticatorKeyError", () => {
     ).toBe("Authenticator key is required.");
   });
 
-  it("rejects Base32-shaped authenticator keys that are too short to be useful", () => {
+  it("lets backend validation decide authenticator key format", () => {
     expect(
-      getAuthenticatorKeyError({ totp: "A", totp_type: "authenticator" }),
-    ).toBe(
-      "Authenticator key should be a raw Base32 setup key or full otpauth:// URI.",
-    );
+      getAuthenticatorKeyError({
+        totp: "provider-specific-payload",
+        totp_type: "authenticator",
+      }),
+    ).toBeNull();
   });
 
   it("accepts a raw Base32 key or a full otpauth URI", () => {
