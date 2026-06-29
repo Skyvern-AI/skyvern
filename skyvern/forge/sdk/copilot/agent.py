@@ -74,6 +74,8 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -829,12 +831,15 @@ def _build_user_context(
     system-level content (the classic code-fence breakout).
     """
     workflow_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
+    global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(global_llm_context)
     return prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         workflow_summary=escape_code_fences(_build_workflow_summary(workflow_yaml)),
         chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history_text)),
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)),
+        loaded_result_context=escape_code_fences(redact_raw_secrets_for_prompt(loaded_result_context)),
         debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
@@ -3550,7 +3555,9 @@ async def _run_copilot_turn_impl(
     chat_history_text = _format_chat_history(chat_history)
     safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
     safe_workflow_yaml = redact_raw_secrets_for_prompt(chat_request.workflow_yaml or "")
-    safe_global_llm_context = redact_raw_secrets_for_prompt(global_llm_context or "")
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(
+        redact_raw_secrets_for_prompt(global_llm_context or "")
+    )
     previous_user_messages = [msg.content for msg in chat_history if msg.sender == "user"]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
 

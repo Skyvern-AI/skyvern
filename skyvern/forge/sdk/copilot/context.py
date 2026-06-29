@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -12,6 +14,10 @@ from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
+    loaded_result_target_structure_signature,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -134,6 +140,14 @@ class ObservedPage(BaseModel):
     reached_via: str = ""
 
 
+class LoadedResultTargetContext(BaseModel):
+    selector: str = ""
+    is_table: bool = False
+    row_selector: str = ""
+    row_count: int | None = None
+    structure_signature: str = ""
+
+
 class CodeAuthoringRepairContext(BaseModel):
     block_label: str
     reason_code: str
@@ -176,9 +190,14 @@ class StructuredContext(BaseModel):
     discovery_calls_made: int = 0
     page_inspection_calls_made: int = 0
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
+    loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
-        return self.model_dump_json(indent=2)
+        payload = self.model_dump(mode="json")
+        payload["loaded_result_targets"] = [
+            _sanitized_loaded_result_target_payload(target) for target in self.loaded_result_targets
+        ]
+        return json.dumps(payload, indent=2)
 
     @classmethod
     def from_json_str(cls, raw: str | None) -> StructuredContext:
@@ -263,6 +282,65 @@ class StructuredContext(BaseModel):
             self.credentials_checked = self.credentials_checked[-40:]
 
 
+def _sanitized_loaded_result_target_payload(
+    target: LoadedResultTargetContext,
+) -> dict[str, object]:
+    structure_signature = loaded_result_target_structure_signature(
+        is_table=target.is_table,
+        row_count=target.row_count,
+    )
+    return {
+        "is_table": target.is_table,
+        "row_count": target.row_count,
+        "structure_signature": structure_signature,
+    }
+
+
+def sanitize_global_llm_context_for_prompt(global_llm_context: str | None) -> str:
+    raw = global_llm_context or ""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    targets = payload.get("loaded_result_targets")
+    if not isinstance(targets, list):
+        return raw
+
+    sanitized_targets: list[dict[str, object]] = []
+    for target in targets:
+        if not isinstance(target, Mapping):
+            continue
+        try:
+            target_context = LoadedResultTargetContext.model_validate(target)
+        except Exception:
+            continue
+        sanitized_targets.append(_sanitized_loaded_result_target_payload(target_context))
+    payload["loaded_result_targets"] = sanitized_targets
+    return json.dumps(payload, indent=2)
+
+
+def render_loaded_result_context_for_prompt(global_llm_context: str) -> str:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    if not structured.loaded_result_targets:
+        return ""
+    lines = [
+        "Author an extraction or validation block from these loaded-result targets.",
+        "Do not call evaluate just to re-read the same loaded results.",
+    ]
+    for index, target in enumerate(structured.loaded_result_targets, start=1):
+        lines.append(f"- target {index}:")
+        lines.append(f"  table: {str(target.is_table).lower()}")
+        if target.row_count is not None:
+            lines.append(f"  row_count: {target.row_count}")
+        if target.structure_signature:
+            lines.append(f"  structure_signature: {target.structure_signature}")
+    return "\n".join(lines)
+
+
 _MAX_OBSERVED_ACTED_PAGES = 20
 
 
@@ -290,6 +368,21 @@ def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[d
     return list(by_url.values())[-_MAX_OBSERVED_ACTED_PAGES:]
 
 
+def _loaded_result_targets_from_steer(
+    steer: LoadedResultCompositionEvidence | None,
+) -> list[LoadedResultTargetContext]:
+    if steer is None:
+        return []
+    return [
+        LoadedResultTargetContext(
+            is_table=target.is_table,
+            row_count=target.row_count,
+            structure_signature=target.structure_signature,
+        )
+        for target in steer.targets
+    ]
+
+
 def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
     """Fold the per-chat discovery counter into the outgoing global_llm_context.
 
@@ -307,12 +400,23 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
     inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
     flow_evidence = getattr(ctx, "flow_evidence", None) or []
-    if not raw_context and this_turn == 0 and inspections_this_turn == 0 and not flow_evidence:
+    loaded_result_targets = _loaded_result_targets_from_steer(
+        getattr(ctx, "latest_evaluate_result_composition_steer", None)
+    )
+    if (
+        not raw_context
+        and this_turn == 0
+        and inspections_this_turn == 0
+        and not flow_evidence
+        and not loaded_result_targets
+    ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
+    # Replace with this turn's targets so stale extraction hints do not persist.
+    sc.loaded_result_targets = loaded_result_targets
     return sc.to_json_str()
 
 

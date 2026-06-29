@@ -37,7 +37,13 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     plan_persistence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import (
+    AgentResult,
+    ProposalDisposition,
+    TurnNarrativePayload,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
+)
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
@@ -1107,12 +1113,15 @@ async def copilot_call_llm(
 
     # Render user prompt (untrusted content, each variable in code fences)
     # Escape triple backticks to prevent code fence breakout
+    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(chat_request.workflow_yaml or ""),
         user_message=escape_code_fences(chat_request.message),
         chat_history=escape_code_fences(chat_history_text),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
+        global_llm_context=escape_code_fences(prompt_global_llm_context),
+        loaded_result_context=escape_code_fences(loaded_result_context),
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1174,7 +1183,7 @@ async def copilot_call_llm(
 
     global_llm_context = action_data.get("global_llm_context")
     if global_llm_context is not None:
-        global_llm_context = str(global_llm_context)
+        global_llm_context = sanitize_global_llm_context_for_prompt(str(global_llm_context))
 
     if action_type == "REPLACE_WORKFLOW":
         llm_workflow_yaml = default_data_write_continue_on_failure(
@@ -1262,12 +1271,15 @@ async def _auto_correct_workflow_yaml(
         security_rules=security_rules,
     )
 
+    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         user_message=escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
         chat_history=escape_code_fences(_format_chat_history(new_chat_history)),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
+        global_llm_context=escape_code_fences(prompt_global_llm_context),
+        loaded_result_context=escape_code_fences(loaded_result_context),
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
