@@ -597,6 +597,7 @@ class CopilotContext(AgentContext):
     # state untouched, because the browser session is now in post-failure
     # state and the prefix labels can no longer be trusted as an anchor.
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
+    verified_terminal_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
     verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)

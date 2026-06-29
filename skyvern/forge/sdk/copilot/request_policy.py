@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
 
@@ -155,8 +155,17 @@ _MAX_TRACE_COMPLETION_CRITERIA = 8
 _COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
 _COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS = 200
 _COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS = 500
+_COMPLETION_CRITERION_CLASSIFICATION_TARGET_MAX_CHARS = 120
+_CLASSIFICATION_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE = re.compile(r"^output\.[A-Za-z_][A-Za-z0-9_]*$")
 _REQUESTED_OUTPUT_CRITERION_ID_PREFIX = "__copilot_requested_output__"
+_VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS: dict[str, tuple[str, bool]] = {
+    "output.login_only": ("login_only", True),
+    "output.login_gated": ("login_gated", True),
+}
+_VALIDATION_CLASSIFICATION_LABEL_OUTPUT_TARGETS: dict[str, str] = {
+    "output.path_classification": "path_classification",
+}
 
 FALLBACK_FLOOR_CRITERION_ID_PREFIX = "__copilot_fallback_floor__"
 _FALLBACK_FLOOR_BASE_ID = f"{FALLBACK_FLOOR_CRITERION_ID_PREFIX}run"
@@ -166,8 +175,9 @@ _FALLBACK_FLOOR_CREDENTIAL_OUTCOME = "The credentialed step authenticates and re
 
 CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
-CriterionKind = Literal["outcome", "terminal_action"]
+CriterionKind = Literal["outcome", "terminal_action", "validation_classification"]
 TerminalActionFamily = Literal["request", "application", "form", "order"]
+ClassificationTarget = str | bool
 ExpectedOutputShape = Literal[
     "reference_code",
     "numeric_identifier",
@@ -177,7 +187,7 @@ ExpectedOutputShape = Literal[
     "money_amount",
     "owner_label",
 ]
-_CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action"})
+_CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
 
@@ -234,6 +244,8 @@ class CompletionCriterion:
     expected_output_shape: ExpectedOutputShape | None = None
     kind: CriterionKind = "outcome"
     terminal_action_family: TerminalActionFamily | None = None
+    classification_output_key: str | None = None
+    expected_classification: ClassificationTarget | None = None
 
 
 @dataclass
@@ -329,6 +341,22 @@ class RequestPolicy:
             lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
+        validation_classification_criteria = [
+            criterion
+            for criterion in self.graded_completion_criteria()
+            if criterion.kind == "validation_classification"
+            and criterion.classification_output_key
+            and criterion.expected_classification is not None
+        ]
+        if validation_classification_criteria:
+            lines.append("validation_classification_output_contracts:")
+            for criterion in validation_classification_criteria:
+                lines.append(
+                    f"- criterion_id: {criterion.id}; "
+                    f"return_key: {criterion.classification_output_key}; "
+                    f"expected_value: {json.dumps(criterion.expected_classification)}; "
+                    "return_location: top_level_block_output"
+                )
         if self.resolved_credentials:
             lines += [
                 "resolved_credentials:",
@@ -560,6 +588,22 @@ def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
     return None
 
 
+def _coerce_classification_output_key(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    key = value.strip()
+    return key if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(key) else None
+
+
+def _coerce_expected_classification(value: Any) -> ClassificationTarget | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        collapsed = " ".join(value.split())[:_COMPLETION_CRITERION_CLASSIFICATION_TARGET_MAX_CHARS].strip()
+        return collapsed or None
+    return None
+
+
 def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
         raw = parse_final_response(raw)
@@ -633,7 +677,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     if not isinstance(raw, list):
         return []
     criteria: list[CompletionCriterion] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -664,17 +708,33 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             item.get("contingent_antecedent_output_path")
         )
         deliverable_kind = _normalize_deliverable_kind(item.get("deliverable_kind"))
+        kind = _coerce_criterion_kind(item.get("kind"))
+        classification_output_key = (
+            _coerce_classification_output_key(item.get("classification_output_key"))
+            if kind == "validation_classification"
+            else None
+        )
+        expected_classification = (
+            _coerce_expected_classification(item.get("expected_classification"))
+            if kind == "validation_classification"
+            else None
+        )
+        if kind == "validation_classification":
+            output_path = None
+            expected_output_value = None
+            expected_output_shape = None
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
-            output_path or normalized_criterion_outcome_key(outcome),
+            output_path or classification_output_key or normalized_criterion_outcome_key(outcome),
             deliverable_kind or "",
+            kind,
+            str(expected_classification) if expected_classification is not None else "",
         )
         if key in seen:
             continue
         seen.add(key)
         level_raw = item.get("level")
-        kind = _coerce_criterion_kind(item.get("kind"))
         criteria.append(
             CompletionCriterion(
                 id=f"c{len(criteria)}",
@@ -692,6 +752,8 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 expected_output_shape=expected_output_shape,
                 kind=kind,
                 terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
+                classification_output_key=classification_output_key,
+                expected_classification=expected_classification,
             )
         )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
@@ -1125,6 +1187,54 @@ def _apply_requested_output_completion_criteria(
     )
 
 
+def _validation_classification_target_for_legacy_criterion(
+    criterion: CompletionCriterion,
+) -> tuple[str, ClassificationTarget] | None:
+    if criterion.kind != "outcome" or criterion.level == "definition" or criterion.method_mandated:
+        return None
+    if not criterion.output_path:
+        return None
+    boolean_target = _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS.get(criterion.output_path)
+    if boolean_target is not None:
+        return boolean_target
+    label_key = _VALIDATION_CLASSIFICATION_LABEL_OUTPUT_TARGETS.get(criterion.output_path)
+    if label_key is None or criterion.expected_output_value is None:
+        return None
+    return (label_key, criterion.expected_output_value)
+
+
+def _apply_validation_classification_completion_criteria(policy: RequestPolicy) -> None:
+    """Promote legacy classifier output carriers into typed validation-classification contracts."""
+
+    criteria: list[CompletionCriterion] = []
+    seen_classification_targets: set[tuple[str, str]] = set()
+    for criterion in policy.completion_criteria:
+        target = _validation_classification_target_for_legacy_criterion(criterion)
+        if target is not None:
+            output_key, expected = target
+            criterion = replace(
+                criterion,
+                kind="validation_classification",
+                output_path=None,
+                expected_output_value=None,
+                expected_output_shape=None,
+                deliverable_kind=None,
+                terminal_action_family=None,
+                classification_output_key=output_key,
+                expected_classification=expected,
+            )
+        if criterion.kind == "validation_classification":
+            target_key = (
+                criterion.classification_output_key or "",
+                str(criterion.expected_classification) if criterion.expected_classification is not None else "",
+            )
+            if target_key in seen_classification_targets:
+                continue
+            seen_classification_targets.add(target_key)
+        criteria.append(criterion)
+    policy.completion_criteria = criteria
+
+
 def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | None) -> str:
     if not criteria:
         return ""
@@ -1150,6 +1260,10 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["expected_output_value"] = criterion.expected_output_value
         if criterion.expected_output_shape:
             item["expected_output_shape"] = criterion.expected_output_shape
+        if criterion.classification_output_key:
+            item["classification_output_key"] = criterion.classification_output_key
+        if criterion.expected_classification is not None:
+            item["expected_classification"] = criterion.expected_classification
         rendered.append(item)
     return json.dumps(rendered)
 
@@ -1466,6 +1580,7 @@ async def _classify_request(
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
+    _apply_validation_classification_completion_criteria(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )

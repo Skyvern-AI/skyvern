@@ -282,6 +282,7 @@ class RunEvidenceSnapshot:
 
 _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
 _MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
+_INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT = "incomplete typed classification contract"
 _MISSING_REGISTERED_DOWNLOAD_EVIDENCE = "run output did not include a non-empty registered browser download"
 
 
@@ -395,8 +396,21 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
         )
         deliverable_kind = f" [deliverable_kind={criterion.deliverable_kind}]" if criterion.deliverable_kind else ""
         output_path = f" [required_output_path={criterion.output_path}]" if criterion.output_path else ""
+        classification_output_key = (
+            f" [classification_output_key={criterion.classification_output_key}]"
+            if criterion.classification_output_key
+            else ""
+        )
+        expected_classification = (
+            f" [expected_classification={criterion.expected_classification}]"
+            if criterion.expected_classification is not None
+            else ""
+        )
         parts.append(
-            f"- {criterion.id}: {criterion.outcome}{contingent_on}{antecedent_output_path}{deliverable_kind}{output_path}{flags}"
+            f"- {criterion.id}: {criterion.outcome}"
+            f" [kind={criterion.kind}]"
+            f"{contingent_on}{antecedent_output_path}{deliverable_kind}{output_path}"
+            f"{classification_output_key}{expected_classification}{flags}"
         )
     return "\n".join(parts)
 
@@ -834,6 +848,166 @@ def grade_present_value_criteria(
                     evidence_ref=f"block_outputs:{match_label}",
                 )
             )
+    return verdicts
+
+
+def _classification_string(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _classification_value_matches(expected: str | bool, actual: Any) -> bool:
+    if isinstance(expected, bool):
+        return isinstance(actual, bool) and actual is expected
+    if not isinstance(actual, str):
+        return False
+    normalized_expected = _classification_string(expected)
+    normalized_actual = _classification_string(actual)
+    return bool(normalized_expected) and normalized_actual == normalized_expected
+
+
+def _is_empty_classification_value(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _classification_canonical_value(expected: str | bool, actual: Any) -> str | bool | None:
+    if not _classification_value_matches(expected, actual):
+        return None
+    if isinstance(expected, bool):
+        return actual
+    return _classification_string(actual)
+
+
+def _classification_output_candidates(
+    snapshot: RunEvidenceSnapshot,
+    output_key: str,
+) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    for label, payload in snapshot.block_outputs.items():
+        if isinstance(payload, dict) and output_key in payload:
+            candidates.append((f"block_outputs:{label}.{output_key}", payload[output_key]))
+    return sorted(candidates, key=lambda candidate: candidate[0])
+
+
+def _validation_classification_unsatisfied(
+    criterion: CompletionCriterion,
+    *,
+    reason_code: Literal["no_evidence", "evidence_contradicts"],
+    output_key: str,
+    evidence_ref: str | None = None,
+    missing_evidence: str | None = None,
+) -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=criterion.id,
+        state="unsatisfied",
+        reason_code=reason_code,
+        evidence_ref=evidence_ref,
+        missing_evidence=missing_evidence,
+        output_path=output_key,
+        grounding_mode="exact_value",
+        has_exact_value=True,
+    )
+
+
+def grade_validation_classification_criteria(
+    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+) -> list[CriterionVerdict]:
+    verdicts: list[CriterionVerdict] = []
+    for criterion in criteria:
+        if criterion.kind != "validation_classification":
+            continue
+        output_key = criterion.classification_output_key
+        expected = criterion.expected_classification
+        if output_key is None or expected is None:
+            verdicts.append(
+                _validation_classification_unsatisfied(
+                    criterion,
+                    reason_code="no_evidence",
+                    output_key=output_key or "",
+                    missing_evidence=_INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT,
+                )
+            )
+            continue
+        candidates = _classification_output_candidates(snapshot, output_key)
+        if not candidates:
+            verdicts.append(
+                _validation_classification_unsatisfied(
+                    criterion,
+                    reason_code="no_evidence",
+                    output_key=output_key,
+                    missing_evidence=f"missing classification output key {output_key}",
+                )
+            )
+            continue
+        if len(candidates) == 1:
+            evidence_ref, actual = candidates[0]
+            if _is_empty_classification_value(actual):
+                verdicts.append(
+                    _validation_classification_unsatisfied(
+                        criterion,
+                        reason_code="no_evidence",
+                        output_key=output_key,
+                        evidence_ref=evidence_ref,
+                        missing_evidence=f"empty classification output key {output_key}",
+                    )
+                )
+                continue
+            if not _classification_value_matches(expected, actual):
+                verdicts.append(
+                    _validation_classification_unsatisfied(
+                        criterion,
+                        reason_code="evidence_contradicts",
+                        output_key=output_key,
+                        evidence_ref=evidence_ref,
+                        missing_evidence=f"classification output key {output_key} did not match expected value",
+                    )
+                )
+                continue
+            verdicts.append(
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="satisfied",
+                    reason_code="evidence_confirms",
+                    evidence_ref=evidence_ref,
+                    output_path=output_key,
+                    grounding_mode="exact_value",
+                    has_exact_value=True,
+                )
+            )
+            continue
+        matching_canonical_values: set[str | bool] = set()
+        contradiction_evidence_ref: str | None = None
+        for evidence_ref, actual in candidates:
+            if _is_empty_classification_value(actual):
+                contradiction_evidence_ref = evidence_ref
+                break
+            canonical_value = _classification_canonical_value(expected, actual)
+            if canonical_value is None:
+                contradiction_evidence_ref = evidence_ref
+                break
+            matching_canonical_values.add(canonical_value)
+        if contradiction_evidence_ref is not None or len(matching_canonical_values) != 1:
+            verdicts.append(
+                _validation_classification_unsatisfied(
+                    criterion,
+                    reason_code="evidence_contradicts",
+                    output_key=output_key,
+                    evidence_ref=contradiction_evidence_ref,
+                    missing_evidence=f"classification output key {output_key} had contradictory evidence",
+                )
+            )
+            continue
+        evidence_ref = candidates[0][0]
+        verdicts.append(
+            CriterionVerdict(
+                criterion_id=criterion.id,
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref=evidence_ref,
+                output_path=output_key,
+                grounding_mode="exact_value",
+                has_exact_value=True,
+            )
+        )
     return verdicts
 
 

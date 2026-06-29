@@ -40,6 +40,7 @@ def split_requested_output_criteria(
             criterion.output_path
             and criterion.level != "definition"
             and not criterion.method_mandated
+            and criterion.kind != "validation_classification"
             and _normalize_output_path(criterion.output_path)
         ):
             requested.append(criterion)

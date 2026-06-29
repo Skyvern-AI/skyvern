@@ -20,6 +20,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CriterionKind,
     ExpectedOutputShape,
     TerminalActionFamily,
+    _coerce_classification_output_key,
+    _coerce_expected_classification,
     _coerce_expected_output_shape,
     _normalize_contingent_antecedent_output_path,
     _normalize_deliverable_kind,
@@ -36,7 +38,7 @@ CRITERIA_SET_STATUS_ACTIVE = "active"
 CRITERIA_SET_STATUS_SUPERSEDED = "superseded"
 TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
-_CRITERION_KINDS = ("outcome", "terminal_action")
+_CRITERION_KINDS = ("outcome", "terminal_action", "validation_classification")
 _TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
 
 
@@ -129,6 +131,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "expected_output_shape": criterion.expected_output_shape,
             "kind": criterion.kind,
             "terminal_action_family": criterion.terminal_action_family,
+            "classification_output_key": criterion.classification_output_key,
+            "expected_classification": criterion.expected_classification,
         }
         for criterion in criteria
     ]
@@ -149,6 +153,8 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         output_path = item.get("output_path")
         expected_output_value = item.get("expected_output_value")
         expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        classification_output_key = _coerce_classification_output_key(item.get("classification_output_key"))
+        expected_classification = _coerce_expected_classification(item.get("expected_classification"))
         contingent_on = item.get("contingent_on")
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
@@ -159,6 +165,17 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         terminal_action_family = (
             family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
         )
+        stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
+        stored_expected_output_value = (
+            expected_output_value.strip()
+            if isinstance(expected_output_value, str) and expected_output_value.strip()
+            else None
+        )
+        stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
+        if kind == "validation_classification":
+            stored_output_path = None
+            stored_expected_output_value = None
+            stored_expected_output_shape = None
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
@@ -171,13 +188,13 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
-                output_path=output_path.strip() if isinstance(output_path, str) and output_path.strip() else None,
-                expected_output_value=expected_output_value.strip()
-                if isinstance(expected_output_value, str) and expected_output_value.strip()
-                else None,
-                expected_output_shape=cast(ExpectedOutputShape | None, expected_output_shape),
+                output_path=stored_output_path,
+                expected_output_value=stored_expected_output_value,
+                expected_output_shape=stored_expected_output_shape,
                 kind=cast(CriterionKind, kind),
                 terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
+                classification_output_key=classification_output_key,
+                expected_classification=expected_classification,
             )
         )
     return tuple(criteria)
@@ -189,6 +206,10 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     deliverable_kind_key = criterion.deliverable_kind or ""
     expected_output_value_key = criterion.expected_output_value or ""
     expected_output_shape_key = criterion.expected_output_shape or ""
+    classification_output_key = criterion.classification_output_key or ""
+    expected_classification_key = (
+        str(criterion.expected_classification) if criterion.expected_classification is not None else ""
+    )
     if criterion.output_path:
         return (
             f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
@@ -196,10 +217,22 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
             f"\x1foutput_path:{criterion.output_path}"
             f"\x1fexpected_output_value:{expected_output_value_key}"
             f"\x1fexpected_output_shape:{expected_output_shape_key}"
+            f"\x1fkind:{criterion.kind}"
+            f"\x1fclassification_output_key:{classification_output_key}"
+            f"\x1fexpected_classification:{expected_classification_key}"
+        )
+    if criterion.kind == "validation_classification":
+        return (
+            f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1fdeliverable_kind:{deliverable_kind_key}"
+            f"\x1fkind:{criterion.kind}"
+            f"\x1fclassification_output_key:{classification_output_key}"
+            f"\x1fexpected_classification:{expected_classification_key}"
         )
     return (
         f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
         f"\x1fdeliverable_kind:{deliverable_kind_key}"
+        f"\x1fkind:{criterion.kind}"
         f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
     )
 

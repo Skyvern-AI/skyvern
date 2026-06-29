@@ -1639,6 +1639,7 @@ async def _run_blocks_and_collect_debug(
     if run_ok and all(r.get("status") == "completed" for r in results):
         for label, output in block_outputs_by_label.items():
             ctx.verified_block_outputs[label] = output
+        ctx.verified_terminal_block_outputs = dict(block_outputs_by_label)
         existing_prefix = list(getattr(ctx, "verified_prefix_labels", []) or [])
         existing_set = set(existing_prefix)
         for label in labels_to_execute:
@@ -2021,6 +2022,19 @@ def _record_run_blocks_result(
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if run_ok and isinstance(data, dict):
+        terminal_outputs: dict[str, Any] = {}
+        for block in data.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            output = block.get("extracted_data")
+            if isinstance(label, str) and isinstance(output, dict) and output:
+                terminal_outputs[label] = output
+        if terminal_outputs:
+            # Prefer the final run-result extracted_data for terminal replies;
+            # it is the same persisted run evidence completion verification saw.
+            copilot_ctx.verified_terminal_block_outputs = terminal_outputs
     copilot_ctx.completion_verification_result = completion_verification
     record_completion_verification(copilot_ctx, completion_verification)
     _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
