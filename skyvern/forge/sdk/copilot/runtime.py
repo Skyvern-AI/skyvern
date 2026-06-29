@@ -290,6 +290,8 @@ class AgentContext:
     reached_download_target: ReachedDownloadTarget | None = None
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
+    synthesized_block_offered_goal_complete: bool = False
+    synthesized_block_reopened_after_failed_run: bool = False
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0

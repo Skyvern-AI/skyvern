@@ -1065,6 +1065,7 @@ async def _maybe_attach_reached_download_target(
                 # The prompt-side offer latched before this download target resolved, so it rendered the
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
                 ctx.synthesized_block_offered = False
+                ctx.synthesized_block_offered_goal_complete = False
                 LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
         if not target.already_registered:
             _register_reached_download_scout_interaction(ctx, target, url=url)
