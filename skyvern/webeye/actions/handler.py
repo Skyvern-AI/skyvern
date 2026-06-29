@@ -2011,6 +2011,8 @@ async def _handle_multi_field_totp_sequence(
     """
     action_index = timing_info["action_index"]
     cache_key = f"{task.task_id}_totp_cache"
+    valid_from_key = f"{cache_key}_valid_from"
+    valid_until_key = f"{cache_key}_valid_until"
     current_context = skyvern_context.ensure_context()
 
     if action_index == 0:
@@ -2028,8 +2030,9 @@ async def _handle_multi_field_totp_sequence(
         # If less than threshold seconds until expiry, use the next TOTP
         if seconds_until_expiry < TOTP_EXPIRY_THRESHOLD_SECONDS:
             # Force generation of next TOTP by advancing time
-            next_time = current_totp_valid_until
-            current_totp = totp.at(next_time)
+            totp_valid_from = current_totp_valid_until
+            totp_valid_until = current_totp_valid_until + totp.interval
+            current_totp = totp.at(totp_valid_from)
 
             LOG.debug(
                 "Using multi-field TOTP flow - using NEXT TOTP due to <20s expiry",
@@ -2041,9 +2044,13 @@ async def _handle_multi_field_totp_sequence(
             )
         else:
             # Use current TOTP
+            totp_valid_from = current_totp_valid_until - totp.interval
+            totp_valid_until = current_totp_valid_until
             current_totp = totp.now()
 
         current_context.totp_codes[cache_key] = current_totp
+        current_context.totp_codes[valid_from_key] = str(totp_valid_from)
+        current_context.totp_codes[valid_until_key] = str(totp_valid_until)
     else:
         # Subsequent digits: reuse cached TOTP
         current_totp = current_context.totp_codes.get(cache_key)
@@ -2063,9 +2070,31 @@ async def _handle_multi_field_totp_sequence(
         if not totp:
             raise ValueError("Invalid TOTP secret or otpauth URI")
 
-        # Get current time and calculate TOTP expiry
+        cached_valid_from = current_context.totp_codes.get(valid_from_key)
+        cached_valid_until = current_context.totp_codes.get(valid_until_key)
+        if not cached_valid_from or not cached_valid_until:
+            LOG.error(
+                "TOTP cache metadata missing for subsequent digit",
+                action_idx=action_index,
+                cache_key=cache_key,
+            )
+            return [ActionFailure(TOTPExpiredError())]
+
+        try:
+            totp_valid_from = int(cached_valid_from)
+            totp_valid_until = int(cached_valid_until)
+        except ValueError:
+            LOG.error(
+                "TOTP cache metadata invalid for subsequent digit",
+                action_idx=action_index,
+                cache_key=cache_key,
+                cached_valid_from=cached_valid_from,
+                cached_valid_until=cached_valid_until,
+            )
+            return [ActionFailure(TOTPExpiredError())]
+
+        # Get current time and check against the cached TOTP window.
         current_time = int(time.time())
-        totp_valid_until = ((current_time // totp.interval) + 1) * totp.interval
 
         if current_time >= totp_valid_until:
             LOG.error(
@@ -2087,10 +2116,6 @@ async def _handle_multi_field_totp_sequence(
 
     # Special handling for the 6th digit (action_index=5): wait if TOTP is not yet valid
     if action_index == 5:
-        # Calculate when this TOTP becomes valid (valid_from time)
-        # If we used the next TOTP window, valid_from is the start of that window
-        totp_valid_from = totp_valid_until - totp.interval
-
         if current_time < totp_valid_from:
             # TOTP is not yet valid, wait until it becomes valid
             wait_seconds = totp_valid_from - current_time

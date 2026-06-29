@@ -1977,8 +1977,13 @@ class ForgeAgent:
             if self._is_multi_field_totp_sequence(actions):
                 context = skyvern_context.ensure_context()
                 cache_key = f"{task.task_id}_totp_cache"
-                if cache_key in context.totp_codes:
-                    context.totp_codes.pop(cache_key)
+                removed_totp_cache = False
+                for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
+                    if key in context.totp_codes:
+                        context.totp_codes.pop(key)
+                        removed_totp_cache = True
+
+                if removed_totp_cache:
                     LOG.debug(
                         "Cleaned up TOTP cache after multi-field sequence completion",
                         task_id=task.task_id,

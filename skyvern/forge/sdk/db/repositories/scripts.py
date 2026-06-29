@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -554,6 +555,34 @@ class ScriptsRepository(BaseRepository):
                 return convert_to_script_block(script_block)
             else:
                 raise NotFoundError("Script block not found")
+
+    @db_operation("clear_script_block_run_signatures")
+    async def clear_script_block_run_signatures(
+        self,
+        *,
+        organization_id: str,
+        script_block_ids: Sequence[str],
+    ) -> int:
+        chunks = _dedup_into_chunks(list(script_block_ids))
+        if not chunks:
+            return 0
+
+        total_updated = 0
+        async with self.Session() as session:
+            for chunk in chunks:
+                stmt = (
+                    update(ScriptBlockModel)
+                    .where(ScriptBlockModel.organization_id == organization_id)
+                    .where(ScriptBlockModel.script_block_id.in_(chunk))
+                    .where(ScriptBlockModel.run_signature.isnot(None))
+                    .values(run_signature=None, modified_at=naive_utc_now())
+                )
+                result = await session.execute(stmt)
+                total_updated += result.rowcount or 0
+
+            await session.commit()
+
+        return total_updated
 
     @db_operation("get_script_files")
     async def get_script_files(self, script_revision_id: str, organization_id: str) -> list[ScriptFile]:
