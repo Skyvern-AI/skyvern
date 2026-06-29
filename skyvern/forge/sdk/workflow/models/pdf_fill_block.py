@@ -32,6 +32,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.utils.pdf_parser import render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.tesseract_languages import DEFAULT_FLAT_FILL_OCR_LANGUAGES
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
 from skyvern.forge.sdk.workflow.models._jinja import render_templates_in_json_value
@@ -60,6 +61,7 @@ FLAT_FILL_OCR_TIMEOUT_SECONDS = 60
 # Outer budget across all pages so a flat PDF can't pin a worker for the full per-page timeout x max pages.
 FLAT_FILL_OCR_TOTAL_TIMEOUT_SECONDS = 300
 FLAT_FILL_MAX_PAGES = 25
+FLAT_FILL_OCR_LANGUAGES = (os.getenv("FLAT_FILL_OCR_LANGUAGES") or DEFAULT_FLAT_FILL_OCR_LANGUAGES).strip()
 
 
 @dataclass(frozen=True)
@@ -511,10 +513,7 @@ class PdfFillBlock(Block):
                 async with aiofiles.open(image_path, "wb") as f:
                     await f.write(image_bytes)
                 process = await asyncio.create_subprocess_exec(
-                    "tesseract",
-                    image_path,
-                    "stdout",
-                    "tsv",
+                    *self._tesseract_command(image_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -531,6 +530,14 @@ class PdfFillBlock(Block):
                     self._parse_tesseract_tsv(stdout.decode("utf-8", errors="replace"), page_index, len(anchors))
                 )
         return anchors
+
+    @staticmethod
+    def _tesseract_command(image_path: str) -> list[str]:
+        command = ["tesseract", image_path, "stdout"]
+        if FLAT_FILL_OCR_LANGUAGES:
+            command.extend(["-l", FLAT_FILL_OCR_LANGUAGES])
+        command.append("tsv")
+        return command
 
     @staticmethod
     def _tsv_int(row: dict[str, str], key: str) -> int | None:
