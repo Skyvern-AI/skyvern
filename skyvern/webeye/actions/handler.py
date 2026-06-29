@@ -160,6 +160,234 @@ COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
+SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
+SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
+
+
+def _select_shadow_match_enabled() -> bool:
+    return settings.SKYVERN_SELECT_SHADOW_MATCH
+
+
+def _normalize_select_shadow_text(text: Any | None) -> str:
+    if text is None:
+        return ""
+    return " ".join(SELECT_SHADOW_MATCH_APOSTROPHE_RE.sub("", str(text).lower()).split())
+
+
+def _stem_select_shadow_text(normalized_text: str) -> str:
+    stems = []
+    for word in normalized_text.split():
+        if word.endswith("s") and not word.endswith("ss"):
+            stems.append(word[:-1])
+        else:
+            stems.append(word)
+    return " ".join(stems)
+
+
+def _unique_select_shadow_index(indices: list[int]) -> int | None:
+    return indices[0] if len(indices) == 1 else None
+
+
+def _best_select_shadow_index(scored_indices: list[tuple[int, float]]) -> int | None:
+    if not scored_indices:
+        return None
+    best_score = max(score for _, score in scored_indices)
+    best_indices = [index for index, score in scored_indices if score == best_score]
+    return _unique_select_shadow_index(best_indices)
+
+
+def classify_option_match(target_value: str | None, option_labels: list[str]) -> tuple[int | None, str]:
+    target_norm = _normalize_select_shadow_text(target_value)
+    option_norms = [_normalize_select_shadow_text(label) for label in option_labels]
+    if not target_norm or not any(option_norms):
+        return None, "miss"
+
+    exact_indices = [index for index, option_norm in enumerate(option_norms) if option_norm == target_norm]
+    if exact_indices:
+        return _unique_select_shadow_index(exact_indices), "exact"
+
+    target_stem = _stem_select_shadow_text(target_norm)
+    stem_indices = [
+        index
+        for index, option_norm in enumerate(option_norms)
+        if option_norm and _stem_select_shadow_text(option_norm) == target_stem
+    ]
+    if stem_indices:
+        return _unique_select_shadow_index(stem_indices), "stem"
+
+    substring_scores = [
+        (index, float(min(len(target_norm), len(option_norm))))
+        for index, option_norm in enumerate(option_norms)
+        if len(target_norm) >= 3
+        and len(option_norm) >= 3
+        and (target_norm in option_norm or option_norm in target_norm)
+    ]
+    if substring_scores:
+        return _best_select_shadow_index(substring_scores), "fuzzy"
+
+    target_words = set(SELECT_SHADOW_MATCH_WORD_RE.findall(target_norm))
+    overlap_scores: list[tuple[int, float]] = []
+    if target_words:
+        for index, option_norm in enumerate(option_norms):
+            option_words = set(SELECT_SHADOW_MATCH_WORD_RE.findall(option_norm))
+            if option_words and target_words & option_words:
+                overlap_scores.append(
+                    (index, len(target_words & option_words) / max(len(target_words), len(option_words)))
+                )
+    if overlap_scores:
+        return _best_select_shadow_index(overlap_scores), "fuzzy"
+
+    return None, "miss"
+
+
+def _select_shadow_candidate(
+    label: str | None,
+    *,
+    element_id: str | None = None,
+    value: str | None = None,
+    keep_empty: bool = False,
+) -> dict[str, str | None] | None:
+    label_norm = " ".join((label or "").split())
+    value_norm = " ".join((value or "").split())
+    if not keep_empty and not label_norm and not value_norm:
+        return None
+    return {
+        "label": label_norm or value_norm,
+        "element_id": element_id,
+        "value": value_norm or None,
+    }
+
+
+def _select_shadow_candidates_from_select_options(options: list[Any]) -> list[dict[str, str | None]]:
+    candidates: list[dict[str, str | None]] = []
+    for option in options:
+        if isinstance(option, dict):
+            candidate = _select_shadow_candidate(
+                str(option.get("text") or ""),
+                value=str(option.get("value") or ""),
+                keep_empty=True,
+            )
+        else:
+            candidate = _select_shadow_candidate(str(option), keep_empty=True)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _select_shadow_label_from_node(node: dict) -> str | None:
+    attrs = node.get("attributes") or {}
+    for raw_label in (
+        node.get("text"),
+        attrs.get("aria-label"),
+        attrs.get("title"),
+    ):
+        label = " ".join(str(raw_label or "").split())
+        if label:
+            return label
+    return None
+
+
+def _select_shadow_candidates_from_elements(elements: list[dict]) -> list[dict[str, str | None]]:
+    queue: deque[dict] = deque(elements)
+    candidates: list[dict[str, str | None]] = []
+    while queue:
+        node = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+
+        attrs = node.get("attributes") or {}
+        role = str(attrs.get("role") or "").lower()
+        tag = str(node.get("tagName") or "").lower()
+        element_id = str(node.get("id") or "") or None
+        label = _select_shadow_label_from_node(node)
+        if label and (role == "option" or tag in ("li", "option") or bool(node.get("interactable"))):
+            candidate = _select_shadow_candidate(label, element_id=element_id)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        for option in node.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            candidate = _select_shadow_candidate(
+                str(option.get("text") or ""),
+                element_id=element_id,
+                value=str(option.get("value") or ""),
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+        for child in node.get("children") or []:
+            queue.append(child)
+    return candidates
+
+
+def _select_shadow_agrees_with_native_choice(
+    candidates: list[dict[str, str | None]],
+    matched_index: int | None,
+    *,
+    llm_index: int | None,
+    llm_value: str | None,
+) -> bool | None:
+    if matched_index is None:
+        return False
+    if llm_index is not None:
+        return matched_index == llm_index
+    if llm_value is None or matched_index >= len(candidates):
+        return None
+
+    matched_candidate = candidates[matched_index]
+    llm_value_norm = _normalize_select_shadow_text(llm_value)
+    return llm_value_norm in {
+        _normalize_select_shadow_text(matched_candidate.get("label")),
+        _normalize_select_shadow_text(matched_candidate.get("value")),
+    }
+
+
+def _select_shadow_agrees_with_element_choice(
+    candidates: list[dict[str, str | None]],
+    matched_index: int | None,
+    *,
+    llm_element_id: str | None,
+    llm_value: str | None,
+) -> bool | None:
+    if matched_index is None:
+        return False
+    if matched_index >= len(candidates):
+        return None
+
+    matched_candidate = candidates[matched_index]
+    matched_element_id = matched_candidate.get("element_id")
+    if matched_element_id and llm_element_id:
+        return matched_element_id == llm_element_id
+    if llm_value is None:
+        return None
+    return _normalize_select_shadow_text(matched_candidate.get("label")) == _normalize_select_shadow_text(llm_value)
+
+
+def _log_select_shadow_match(
+    *,
+    prompt_name: str,
+    target_value: str | None,
+    get_candidates: Callable[[], list[dict[str, str | None]]],
+    agreement: Callable[[list[dict[str, str | None]], int | None], bool | None],
+) -> None:
+    if not _select_shadow_match_enabled():
+        return
+
+    try:
+        candidates = get_candidates()
+        option_labels = [candidate["label"] or "" for candidate in candidates]
+        matched_index, tier = classify_option_match(target_value, option_labels)
+        LOG.info(
+            "select_shadow_match",
+            prompt_name=prompt_name,
+            option_count=len(option_labels),
+            match_tier=tier,
+            match_found=matched_index is not None,
+            match_agrees_with_llm=agreement(candidates, matched_index),
+        )
+    except Exception:
+        LOG.debug("select_shadow_match failed", exc_info=True)
 
 
 def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
@@ -4289,8 +4517,10 @@ async def choose_auto_completion_dropdown(
         result.incremental_elements = copy.deepcopy(incremental_element)
         html = ""
         new_interactable_element_ids = []
+        shadow_candidate_elements: list[dict] = []
         if len(incremental_element) > 0:
             cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+            shadow_candidate_elements = cleaned_incremental_element
 
             # Fast path for location inputs: if exactly one option appeared and it contains
             # what the user typed, click it directly without an LLM call.
@@ -4341,6 +4571,7 @@ async def choose_auto_completion_dropdown(
             result.incremental_elements = copy.deepcopy(
                 [scraped_page_after_open.id_to_element_dict[element_id] for element_id in new_interactable_element_ids]
             )
+            shadow_candidate_elements = result.incremental_elements
             html = scraped_page_after_open.build_element_tree()
 
         slim_output = await get_slim_output_template_value("auto-completion-choose-option")
@@ -4362,6 +4593,17 @@ async def choose_auto_completion_dropdown(
         )
         element_id = json_response.get("id", "")
         relevance_float = json_response.get("relevance_float", 0)
+        _log_select_shadow_match(
+            prompt_name="auto-completion-choose-option",
+            target_value=text,
+            get_candidates=lambda: _select_shadow_candidates_from_elements(shadow_candidate_elements),
+            agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+                candidates,
+                matched_index,
+                llm_element_id=element_id or None,
+                llm_value=json_response.get("value"),
+            ),
+        )
         if json_response.get("direct_searching", False):
             LOG.info(
                 "Decided to directly search with the current value",
@@ -5100,6 +5342,7 @@ async def select_from_emerging_elements(
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
     new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    shadow_candidate_elements: list[dict] = []
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     if new_element_subtrees:
@@ -5110,6 +5353,7 @@ async def select_from_emerging_elements(
                 strip_url_query_strings=True,
                 compress_nonnavigable_href=True,
             )
+        shadow_candidate_elements = new_element_subtrees
         incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
     else:
         LOG.warning(
@@ -5127,6 +5371,7 @@ async def select_from_emerging_elements(
                 strip_url_query_strings=True,
                 compress_nonnavigable_href=True,
             )
+        shadow_candidate_elements = fallback_tree
         incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in fallback_tree)
     LOG.debug(
         "Built HTML for emerging-element custom-select",
@@ -5164,6 +5409,17 @@ async def select_from_emerging_elements(
     # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
     raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
+    _log_select_shadow_match(
+        prompt_name="custom-select/emerging",
+        target_value=options.target_value,
+        get_candidates=lambda: _select_shadow_candidates_from_elements(shadow_candidate_elements),
+        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+            candidates,
+            matched_index,
+            llm_element_id=element_id,
+            llm_value=value,
+        ),
+    )
     if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
         raise _no_match_exception_for_dropdown(
             reasoning=json_response.get("reasoning"),
@@ -5309,6 +5565,17 @@ async def select_from_dropdown(
     # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
     raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
+    _log_select_shadow_match(
+        prompt_name="custom-select/dropdown",
+        target_value=target_value,
+        get_candidates=lambda: _select_shadow_candidates_from_elements(trimmed_element_tree),
+        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+            candidates,
+            matched_index,
+            llm_element_id=element_id,
+            llm_value=value,
+        ),
+    )
     if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
         raise _no_match_exception_for_dropdown(
             reasoning=json_response.get("reasoning"),
@@ -5806,6 +6073,17 @@ async def normal_select(
     json_response = await app.NORMAL_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
+    _log_select_shadow_match(
+        prompt_name="normal-select",
+        target_value=action.option.label or action.option.value,
+        get_candidates=lambda: _select_shadow_candidates_from_select_options(select_options),
+        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_native_choice(
+            candidates,
+            matched_index,
+            llm_index=index,
+            llm_value=value,
+        ),
+    )
 
     try:
         await locator.click(
