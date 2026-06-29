@@ -885,6 +885,7 @@ _TERMINAL_RECORD_FAMILY_ACTIONS: dict[TerminalActionFamily, frozenset[str]] = {
     "form": frozenset({"form", "submission"}),
     "order": frozenset({"order"}),
 }
+_VALIDATION_REVIEW_MIN_VALUE_COUNT = 2
 
 
 def grade_terminal_goal_record_criteria(
@@ -924,7 +925,7 @@ def grade_fallback_floor_reached_end_state_criteria(
     eligible_criteria = [criterion for criterion in criteria if is_fallback_floor_base_criterion(criterion)]
     if not eligible_criteria:
         return []
-    evidence_ref = _fallback_floor_reached_end_state_evidence_ref(snapshot)
+    evidence_ref = _fallback_floor_reached_end_state_evidence_ref(snapshot, criteria)
     if evidence_ref is None:
         return []
     return [
@@ -938,14 +939,259 @@ def grade_fallback_floor_reached_end_state_criteria(
     ]
 
 
-def _fallback_floor_reached_end_state_evidence_ref(snapshot: RunEvidenceSnapshot) -> str | None:
+def _fallback_floor_reached_end_state_evidence_ref(
+    snapshot: RunEvidenceSnapshot, criteria: list[CompletionCriterion]
+) -> str | None:
     for label, payload in snapshot.block_outputs.items():
-        record = _structured_record_payload(payload)
-        if record is None:
+        if _fallback_floor_parent_record_poisoned(payload):
             continue
-        if any(_terminal_goal_record_confirmed(record, family) for family in _TERMINAL_RECORD_FAMILIES):
+        record = _structured_record_payload(payload)
+        if record is not None and any(
+            _terminal_goal_record_confirmed(record, family) for family in _TERMINAL_RECORD_FAMILIES
+        ):
+            return f"block_outputs:{label}"
+        if any(
+            _validation_review_record_confirmed(candidate, criteria)
+            for candidate in _fallback_floor_record_candidates(payload)
+        ):
             return f"block_outputs:{label}"
     return None
+
+
+def _fallback_floor_parent_record_poisoned(payload: Any) -> bool:
+    return isinstance(payload, dict) and (
+        _terminal_goal_record_has_negative_guard(payload) or _structured_record_contradiction(payload) is not None
+    )
+
+
+def _fallback_floor_record_candidates(payload: Any) -> Iterable[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return
+    yield payload
+    for key, value in payload.items():
+        if isinstance(key, str) and key.endswith("_output") and isinstance(value, dict):
+            yield value
+
+
+def _validation_review_record_confirmed(record: dict[str, Any], criteria: list[CompletionCriterion]) -> bool:
+    if _terminal_goal_record_has_negative_guard(record):
+        return False
+    if _structured_record_contradiction(record):
+        return False
+    if record.get("all_checks_passed") is False:
+        return False
+    review_values = _normalized_review_values(record)
+    if len(review_values) < _VALIDATION_REVIEW_MIN_VALUE_COUNT:
+        return False
+    evidence_text = record.get("evidence_text")
+    if not isinstance(evidence_text, str):
+        return False
+    haystack = _normalize_present_value(evidence_text)
+    if not all(_present_verbatim(value, haystack) for value in review_values):
+        return False
+    if not _validation_review_satisfies_requested_literals(haystack, criteria):
+        return False
+    return (
+        _has_validation_only_page_evidence(record)
+        and _has_review_page_evidence(record)
+        and _has_no_submit_page_evidence(record)
+    )
+
+
+def _normalized_review_values(record: dict[str, Any]) -> list[str]:
+    review_values = record.get("review_values")
+    if not isinstance(review_values, dict):
+        review_values = record.get("review_fields")
+    if not isinstance(review_values, dict):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for _key, value in _walk_record_scalars(review_values):
+        if isinstance(value, bool):
+            continue
+        candidate = _normalize_present_value(str(value))
+        if len(candidate) >= 4 and candidate not in seen:
+            seen.add(candidate)
+            normalized.append(candidate)
+    return normalized
+
+
+def _validation_review_satisfies_requested_literals(
+    normalized_evidence_text: str, criteria: list[CompletionCriterion]
+) -> bool:
+    literal_groups = [
+        _extract_present_value_literals(criterion.outcome)
+        for criterion in criteria
+        if not is_fallback_floor_base_criterion(criterion)
+    ]
+    literal_groups = [literals for literals in literal_groups if literals]
+    if not literal_groups:
+        return True
+    return all(
+        all(_present_verbatim(literal, normalized_evidence_text) for literal in literals) for literals in literal_groups
+    )
+
+
+def _has_validation_only_page_evidence(record: dict[str, Any]) -> bool:
+    for key, value in _walk_record_scalars(record):
+        leaf_tokens = _leaf_key_word_tokens(key)
+        normalized_value = _normalize_present_value(str(value))
+        if leaf_tokens == {"validation", "only"} and value is True:
+            return True
+        if leaf_tokens == {"submit", "mode"} and normalized_value == "validation_only":
+            return True
+    return False
+
+
+def _has_review_page_evidence(record: dict[str, Any]) -> bool:
+    has_grounded_review_page = False
+    for key, value in _walk_record_scalars(record):
+        tokens = _key_word_tokens(key)
+        if _is_review_page_signal(tokens):
+            if _signal_value_is_explicit_false(value):
+                return False
+            if _signal_value_is_explicit_positive(value):
+                has_grounded_review_page = True
+        if _is_review_page_text_field(tokens) and isinstance(value, str):
+            if _present_verbatim("review", _normalize_present_value(value)):
+                has_grounded_review_page = True
+    return has_grounded_review_page
+
+
+def _final_submit_click_held(record: dict[str, Any]) -> bool:
+    held = False
+    for key, value in _walk_record_scalars(record):
+        tokens = _key_word_tokens(key)
+        if not _is_submit_or_finalize_click_signal(tokens):
+            continue
+        if _signal_value_is_meaningful_positive(value):
+            return False
+        if _signal_value_is_explicit_false(value):
+            held = True
+    return held
+
+
+def _submitted_or_confirmation_held(record: dict[str, Any]) -> bool:
+    held = False
+    for key, value in _walk_record_scalars(record):
+        tokens = _key_word_tokens(key)
+        if not (_is_submitted_request_signal(tokens) or _is_confirmation_visible_signal(tokens)):
+            continue
+        if _signal_value_is_meaningful_positive(value):
+            return False
+        if _signal_value_is_explicit_false(value):
+            held = True
+    return held
+
+
+def _submitted_or_confirmation_reached(record: dict[str, Any]) -> bool:
+    for key, value in _walk_record_scalars(record):
+        tokens = _key_word_tokens(key)
+        if not (_is_submitted_request_signal(tokens) or _is_confirmation_visible_signal(tokens)):
+            continue
+        if _signal_value_is_meaningful_positive(value):
+            return True
+    return False
+
+
+def _review_page_with_final_controls_visible(record: dict[str, Any]) -> bool:
+    if not _has_review_page_evidence(record):
+        return False
+    final_controls = record.get("final_controls_visible")
+    if isinstance(final_controls, list):
+        visible = {_normalize_present_value(str(value)) for value in final_controls if isinstance(value, str)}
+        if visible & {"submit request", "submit", "back"}:
+            return True
+    return any(
+        "final" in _key_word_tokens(key)
+        and "submit" in _key_word_tokens(key)
+        and bool({"control", "controls"} & _key_word_tokens(key))
+        and _positive_integer_count(value)
+        for key, value in _walk_record_scalars(record)
+    )
+
+
+def _positive_integer_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _has_no_submit_page_evidence(record: dict[str, Any]) -> bool:
+    if not _final_submit_click_held(record):
+        return False
+    if _submitted_or_confirmation_reached(record):
+        return False
+    if _submitted_or_confirmation_held(record):
+        return True
+    return _review_page_with_final_controls_visible(record)
+
+
+def _is_review_page_signal(tokens: set[str]) -> bool:
+    return (
+        {"review", "visible"} <= tokens
+        or {"review", "reached"} <= tokens
+        or ({"pre", "submit"} <= tokens and ("visible" in tokens or "reached" in tokens))
+    )
+
+
+def _is_review_page_text_field(tokens: set[str]) -> bool:
+    return "page" in tokens and bool(tokens & {"current", "final", "title"})
+
+
+def _is_submit_or_finalize_click_signal(tokens: set[str]) -> bool:
+    return bool(tokens & {"clicked", "click"}) and bool(tokens & {"submit", "finalize", "final"})
+
+
+def _is_submitted_request_signal(tokens: set[str]) -> bool:
+    return {"submitted", "request"} <= tokens
+
+
+def _is_confirmation_visible_signal(tokens: set[str]) -> bool:
+    return "confirmation" in tokens and ("visible" in tokens or "page" in tokens)
+
+
+def _signal_value_is_explicit_false(value: Any) -> bool:
+    if value is False:
+        return True
+    if not isinstance(value, str):
+        return False
+    normalized = _normalize_present_value(value)
+    return normalized in {
+        "false",
+        "no",
+        "none",
+        "absent",
+        "hidden",
+        "not visible",
+        "not reached",
+        "not clicked",
+        "not submitted",
+        "never clicked",
+        "never submitted",
+    }
+
+
+def _signal_value_is_explicit_positive(value: Any) -> bool:
+    if value is True:
+        return True
+    if not isinstance(value, str):
+        return False
+    normalized = _normalize_present_value(value)
+    return normalized in {
+        "true",
+        "yes",
+        "visible",
+        "shown",
+        "displayed",
+        "present",
+        "reached",
+        "loaded",
+        "opened",
+        "current",
+    }
+
+
+def _signal_value_is_meaningful_positive(value: Any) -> bool:
+    return _is_meaningful_record_value(value) and not _signal_value_is_explicit_false(value)
 
 
 def _terminal_goal_record_confirmed(record: dict[str, Any], family: TerminalActionFamily) -> bool:
@@ -1113,6 +1359,11 @@ def _key_word_tokens(key: str) -> set[str]:
     """Split a (possibly dotted/camelCase) record key path into whole-word tokens."""
     spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", key).casefold()
     return set(re.findall(r"[a-z0-9]+", spaced))
+
+
+def _leaf_key_word_tokens(key: str) -> set[str]:
+    leaf = key.rsplit(".", 1)[-1]
+    return _key_word_tokens(leaf)
 
 
 def _structured_record_has_identifier(record: dict[str, Any]) -> bool:

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
+    grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
     grade_record_semantic_consistency,
     grade_registered_download_criteria,
@@ -186,6 +187,109 @@ def _terminal_goal_payload(**overrides: Any) -> dict[str, Any]:
         "deposit_amount": "$41.00 plus initiation fee",
         "next_owner": "Provider",
         "evidence_text": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "all_checks_passed": True,
+        "validation_only": True,
+        "review_page_visible": True,
+        "submit_or_finalize_clicked": False,
+        "submitted_request": False,
+        "confirmation_page_visible": False,
+        "review_values": {
+            "visible_service_address": "1234 Sample Utility Way, Testville, CA 94016",
+            "visible_requested_start_date": "2026-06-22",
+            "visible_account_holder": "EXAMPLE REALTY LABS INC",
+        },
+        "evidence_text": (
+            "Visible Review page showed service address 1234 Sample Utility Way, Testville, CA 94016, "
+            "start date 2026-06-22, and account holder EXAMPLE REALTY LABS INC. "
+            "No Submit Request or final confirmation control was clicked."
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _generated_validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "pre_submit_review_reached": True,
+        "exact_service_address_verified": True,
+        "requested_start_date_verified": True,
+        "business_name_verified": True,
+        "account_holder_verified": True,
+        "safe_mailing_address_verified": True,
+        "no_payment_or_deposit_gate": True,
+        "validation_only": True,
+        "submit_or_finalize_clicked": False,
+        "terminal_summary": "Pre-submit review reached: True; submit/finalize control clicked: False.",
+        "final_controls_visible": ["Submit Request", "Back"],
+        "review_fields": {
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Requested Start Date": "2026-06-22",
+            "Business Name": "Example Realty Labs Inc",
+            "Account Holder": "EXAMPLE REALTY LABS INC",
+        },
+        "evidence_text": (
+            "Start Service - Review\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Business Name\nExample Realty Labs Inc\n"
+            "Account Holder\nEXAMPLE REALTY LABS INC\n"
+            "Submit Request\nBack"
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _live_validation_review_output_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "all_validations_passed": True,
+        "evidence_text": (
+            "Step 1 Find Address\n"
+            "Step 2 About Business\n"
+            "Step 3 Account Information\n"
+            "Step 4 Review\n"
+            "Step 5 Confirmation\n"
+            "Start Service - Review\n\n"
+            "Review all request details before final submission.\n\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Business Name\nExample Realty Labs Inc\n"
+            "Account Holder\nEXAMPLE REALTY LABS INC\n"
+            "Mailing Address\nPO Box 4300, Harbor City, CA 90210\n"
+            "Tax Identifier\nMasked ending in 4321\n"
+            "Payment / Deposit\nNo payment, deposit, autopay, or unsafe attestation required before review.\n"
+            "Submit Request\nBack"
+        ),
+        "final_submit_controls_present": 1,
+        "pre_submit_review_reached": True,
+        "review_page_label": "Start Service - Review",
+        "submit_mode": "validation_only",
+        "review_values": {
+            "Account Holder": "EXAMPLE REALTY LABS INC",
+            "Business Name": "Example Realty Labs Inc",
+            "Mailing Address": "PO Box 4300, Harbor City, CA 90210",
+            "Payment / Deposit": "No payment, deposit, autopay, or unsafe attestation required before review.",
+            "Requested Start Date": "2026-06-22",
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Tax Identifier": "Masked ending in 4321",
+        },
+        "submit_finalize_control_clicked": False,
+        "terminal_summary": "Pre-submit review reached: True; submit/finalize control clicked: False",
+        "validations": {
+            "account_holder_verified": True,
+            "business_name_verified": True,
+            "exact_service_address_verified": True,
+            "no_payment_deposit_gate_verified": True,
+            "requested_start_date_verified": True,
+            "safe_mailing_address_verified": True,
+        },
     }
     payload.update(overrides)
     return payload
@@ -1136,6 +1240,246 @@ def test_terminal_goal_record_does_not_take_literal_criteria_from_present_value(
     assert _satisfied_criterion_ids(grade_present_value_criteria(criteria, snapshot)) == {"c0"}
 
 
+def test_fallback_floor_accepts_validation_review_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload()})
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:submit_request",
+        )
+    ]
+
+
+def test_fallback_floor_accepts_generated_validation_review_fields_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"validate_business_start_service": _generated_validation_review_payload()}
+    )
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service",
+        )
+    ]
+
+
+def test_fallback_floor_accepts_live_validation_review_output_parameter_shape() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"validate_business_start_service_review_output": _live_validation_review_output_payload()}
+    )
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service_review_output",
+        )
+    ]
+
+
+def test_fallback_floor_rejects_generated_validation_review_after_final_click() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service": _generated_validation_review_payload(
+                submit_or_finalize_clicked=True,
+                terminal_summary="Pre-submit review reached: True; submit/finalize control clicked: True.",
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_live_validation_review_confirmation_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service_review_output": _live_validation_review_output_payload(
+                confirmation_page_visible=True,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_generated_validation_review_confirmation_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service": _generated_validation_review_payload(
+                confirmation_page_visible=True,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_bare_all_checks_passed() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": {"all_checks_passed": True}})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_normal_submit_review_without_validation_only_marker() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                validation_only=None,
+                submit_mode=None,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+@pytest.mark.parametrize("marker", ["not_validation_only", "validation_only_disabled", "previous_validation_only"])
+def test_fallback_floor_rejects_validation_only_marker_prefix_suffix_matches(marker: str) -> None:
+    payload = _validation_review_payload(validation_only=None)
+    payload[marker] = True
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_boolean_only_validation_review_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service_review": _live_validation_review_output_payload(
+                all_validations_passed=None,
+                review_values=None,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_submitted_request() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(submitted_request=True)})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_confirmation_page_visible() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"submit_request": _validation_review_payload(confirmation_page_visible=True)}
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_submit_or_finalize_click() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"submit_request": _validation_review_payload(submit_or_finalize_clicked=True)}
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_review_text_without_structured_review_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                review_page_visible=False,
+                evidence_text=(
+                    "No review page was necessary, but values 1234 Sample Utility Way, Testville, CA 94016, "
+                    "2026-06-22, and EXAMPLE REALTY LABS INC were checked."
+                ),
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_review_values_without_corroborating_text() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                evidence_text="Visible Review page showed safe values and no final click."
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_values_contradicting_requested_literals() -> None:
+    criteria = [
+        *build_classifier_fallback_floor([]),
+        _criterion(
+            "c_requested_values",
+            'Review shows service address "1234 Sample Utility Way, Testville, CA 94016" and start date "2026-06-22".',
+        ),
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                review_values={
+                    "visible_service_address": "100 Wrong Way, Atlanta, GA 30318",
+                    "visible_requested_start_date": "2026-07-01",
+                    "visible_account_holder": "EXAMPLE REALTY LABS INC",
+                },
+                evidence_text=(
+                    "Visible Review page showed service address 100 Wrong Way, Atlanta, GA 30318, "
+                    "start date 2026-07-01, and account holder EXAMPLE REALTY LABS INC. "
+                    "No Submit Request or final confirmation control was clicked."
+                ),
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(criteria, snapshot) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"error": "review mismatch"},
+        {"failure_reason": "submit disabled"},
+        {"status": "failed"},
+        {"all_checks_passed": False},
+    ],
+)
+def test_fallback_floor_rejects_validation_review_negative_guards(overrides: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(**overrides)})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_structured_contradiction() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                items=[{"item_name": "Service Review Active", "status": "Expired"}],
+                overall_status="Expired",
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_nested_under_failed_parent() -> None:
+    payload = {"status": "failed", "error": "submit blocked", "validate_review_output": _validation_review_payload()}
+    snapshot = RunEvidenceSnapshot(block_outputs={"validate_review": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
 def test_structured_record_goal_content_remains_strict_for_flat_terminal_payload() -> None:
     assert structured_record_has_goal_content(_terminal_goal_payload()) is False
 
@@ -1473,6 +1817,38 @@ def test_outcome_unverified_reason_uses_typed_missing_evidence_not_confirmation_
     assert "prefer restoring that revision" in known_good_reason
 
 
+def test_outcome_unverified_reason_guides_fallback_floor_review_output_contract() -> None:
+    policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    floor_id = policy.completion_criteria[0].id
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[floor_id],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id=floor_id,
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="run output did not include evidence for this criterion",
+            )
+        ],
+    )
+    ctx = SimpleNamespace(request_policy=policy)
+
+    reason = _outcome_unverified_reason(ctx, verification)
+
+    assert reason is not None
+    assert "review_values" in reason
+    assert "review_fields" in reason
+    assert "evidence_text" in reason
+    assert "validation_only" in reason
+    assert "submit_mode" in reason
+    assert "visible Review-page label/value strings" in reason
+    assert "do not click Submit/Finalize" in reason
+
+
 def test_outcome_unverified_reason_excludes_structurally_abstained_contingent_missing_evidence() -> None:
     policy = RequestPolicy(
         completion_criteria=[
@@ -1604,6 +1980,47 @@ def _terminal_goal_output_result(**payload_overrides: Any) -> dict:
                     "extracted_data": _terminal_goal_payload(**payload_overrides),
                 }
             ],
+        },
+    }
+
+
+def _validation_review_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_review",
+            "overall_status": "completed",
+            "executed_block_labels": ["submit_request"],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [
+                {
+                    "label": "submit_request",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": _validation_review_payload(**payload_overrides),
+                }
+            ],
+        },
+    }
+
+
+def _live_validation_review_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_review",
+            "overall_status": "completed",
+            "executed_block_labels": ["validate_business_start_service_review"],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [],
+            "output": {
+                "extracted_information": [],
+                "validate_business_start_service_review_output": _live_validation_review_output_payload(
+                    **payload_overrides
+                ),
+            },
         },
     }
 
@@ -3569,6 +3986,54 @@ async def test_maybe_run_completion_verification_fallback_floor_uses_recorded_te
 
 
 @pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_validation_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("validation review evidence must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _validation_review_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_live_output_parameter_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("live validation review output parameter evidence must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "validate_business_start_service_review")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _live_validation_review_output_result(), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:validate_business_start_service_review_output"
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run_output_parameters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3618,7 +4083,7 @@ async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_fallback_floor_uses_page_end_state_evidence(
+async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_page_end_state_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, str] = {}
@@ -3658,7 +4123,9 @@ async def test_maybe_run_completion_verification_fallback_floor_uses_page_end_st
 
     assert verification is not None
     assert verification.no_gradeable_run_plane is False
-    assert verification.is_fully_satisfied() is True
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
     assert "observed_end_state_url: https://example.test/review" in captured["prompt"]
     assert "observed_end_state_page_title: Start Service - Review" in captured["prompt"]
 
@@ -3693,6 +4160,61 @@ async def test_maybe_run_completion_verification_fallback_floor_without_evidence
     assert verification.is_fully_satisfied() is False
     assert verification.verdicts[0].state == "unsatisfied"
     assert verification.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_login_page_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> object:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "__copilot_fallback_floor__run",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "open_demo_utility_login_output",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "open_demo_utility_login")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_login_only",
+            "overall_status": "completed",
+            "executed_block_labels": ["open_demo_utility_login"],
+            "current_url": "http://localhost:8900/utility_services/demo_utility/",
+            "page_title": "Login",
+            "blocks": [
+                {
+                    "label": "open_demo_utility_login",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "login_page_reached": True,
+                        "evidence_text": "Sample Utility Portal Log in to your account User ID Password",
+                    },
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].criterion_id == "__copilot_fallback_floor__run"
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
+    assert verification.verdicts[0].evidence_ref is None
 
 
 @pytest.mark.asyncio
