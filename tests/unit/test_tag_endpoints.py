@@ -319,6 +319,33 @@ def test_tagging_gate_returns_403_when_disabled(client: TestClient) -> None:
     )
 
 
+# ----------------------------- GET /workflows tag-filter gate ------------------------
+
+
+def test_get_workflows_with_tag_filter_returns_403_when_disabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[])
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=False)
+    assert client.get("/v1/workflows?tags=env:prod").status_code == 403
+
+
+def test_get_workflows_without_tag_filter_succeeds_when_disabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[])
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=False)
+    assert client.get("/v1/workflows").status_code == 200
+
+
+def test_get_workflows_with_tag_filter_succeeds_when_enabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[])
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    assert client.get("/v1/workflows?tags=env:prod").status_code == 200
+
+
 # ----------------------------- GET /workflows/{wpid}/tags/history --------------------
 
 

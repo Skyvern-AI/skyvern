@@ -15,6 +15,8 @@ from skyvern.forge.sdk.copilot.agent import (
     _rewrite_failed_test_response,
     _verified_workflow_or_none,
 )
+from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criteria_to_json
+from skyvern.forge.sdk.copilot.completion_output_grounding import grade_requested_output_criteria
 from skyvern.forge.sdk.copilot.completion_verification import (
     REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionVerificationResult,
@@ -25,6 +27,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
+    grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
     grade_record_semantic_consistency,
     grade_registered_download_criteria,
@@ -96,6 +99,8 @@ def _criterion(
     kind: str = "outcome",
     terminal_action_family: str | None = None,
     deliverable_kind: str | None = None,
+    expected_output_value: str | None = None,
+    expected_output_shape: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -107,6 +112,8 @@ def _criterion(
         kind=kind,
         terminal_action_family=terminal_action_family,
         deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
+        expected_output_value=expected_output_value,
+        expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
     )
 
 
@@ -186,6 +193,109 @@ def _terminal_goal_payload(**overrides: Any) -> dict[str, Any]:
         "deposit_amount": "$41.00 plus initiation fee",
         "next_owner": "Provider",
         "evidence_text": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "all_checks_passed": True,
+        "validation_only": True,
+        "review_page_visible": True,
+        "submit_or_finalize_clicked": False,
+        "submitted_request": False,
+        "confirmation_page_visible": False,
+        "review_values": {
+            "visible_service_address": "1234 Sample Utility Way, Testville, CA 94016",
+            "visible_requested_start_date": "2026-06-22",
+            "visible_account_holder": "EXAMPLE REALTY LABS INC",
+        },
+        "evidence_text": (
+            "Visible Review page showed service address 1234 Sample Utility Way, Testville, CA 94016, "
+            "start date 2026-06-22, and account holder EXAMPLE REALTY LABS INC. "
+            "No Submit Request or final confirmation control was clicked."
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _generated_validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "pre_submit_review_reached": True,
+        "exact_service_address_verified": True,
+        "requested_start_date_verified": True,
+        "business_name_verified": True,
+        "account_holder_verified": True,
+        "safe_mailing_address_verified": True,
+        "no_payment_or_deposit_gate": True,
+        "validation_only": True,
+        "submit_or_finalize_clicked": False,
+        "terminal_summary": "Pre-submit review reached: True; submit/finalize control clicked: False.",
+        "final_controls_visible": ["Submit Request", "Back"],
+        "review_fields": {
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Requested Start Date": "2026-06-22",
+            "Business Name": "Example Realty Labs Inc",
+            "Account Holder": "EXAMPLE REALTY LABS INC",
+        },
+        "evidence_text": (
+            "Start Service - Review\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Business Name\nExample Realty Labs Inc\n"
+            "Account Holder\nEXAMPLE REALTY LABS INC\n"
+            "Submit Request\nBack"
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _live_validation_review_output_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "all_validations_passed": True,
+        "evidence_text": (
+            "Step 1 Find Address\n"
+            "Step 2 About Business\n"
+            "Step 3 Account Information\n"
+            "Step 4 Review\n"
+            "Step 5 Confirmation\n"
+            "Start Service - Review\n\n"
+            "Review all request details before final submission.\n\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Business Name\nExample Realty Labs Inc\n"
+            "Account Holder\nEXAMPLE REALTY LABS INC\n"
+            "Mailing Address\nPO Box 4300, Harbor City, CA 90210\n"
+            "Tax Identifier\nMasked ending in 4321\n"
+            "Payment / Deposit\nNo payment, deposit, autopay, or unsafe attestation required before review.\n"
+            "Submit Request\nBack"
+        ),
+        "final_submit_controls_present": 1,
+        "pre_submit_review_reached": True,
+        "review_page_label": "Start Service - Review",
+        "submit_mode": "validation_only",
+        "review_values": {
+            "Account Holder": "EXAMPLE REALTY LABS INC",
+            "Business Name": "Example Realty Labs Inc",
+            "Mailing Address": "PO Box 4300, Harbor City, CA 90210",
+            "Payment / Deposit": "No payment, deposit, autopay, or unsafe attestation required before review.",
+            "Requested Start Date": "2026-06-22",
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Tax Identifier": "Masked ending in 4321",
+        },
+        "submit_finalize_control_clicked": False,
+        "terminal_summary": "Pre-submit review reached: True; submit/finalize control clicked: False",
+        "validations": {
+            "account_holder_verified": True,
+            "business_name_verified": True,
+            "exact_service_address_verified": True,
+            "no_payment_deposit_gate_verified": True,
+            "requested_start_date_verified": True,
+            "safe_mailing_address_verified": True,
+        },
     }
     payload.update(overrides)
     return payload
@@ -443,6 +553,20 @@ def test_structural_unfired_ids_derive_from_empty_output_path() -> None:
     assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == ["c0"]
 
 
+def test_p7_manual_service_no_blocker_abstains() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "Any manual service blocker is reported to the user.",
+            contingent_on="a manual service blocker exists",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": {"manual_service_blocker": None}})
+
+    assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == ["c0"]
+
+
 @pytest.mark.parametrize("reason_code,state", [("evidence_contradicts", "unsatisfied"), ("unknown", "unknown")])
 def test_false_contingent_antecedent_output_abstains(reason_code: str, state: str) -> None:
     criteria = [
@@ -545,6 +669,35 @@ def test_structural_fired_evidence_overrides_empty_output_path() -> None:
     )
 
     assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == []
+
+
+def test_real_blocker_family_evidence_overrides_primary_no_blocker_marker() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"terminal_result": {"blocker": None, "manual_service_blocker": "Provider requires phone call"}}
+    )
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(criteria, snapshot)
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_ids,
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert structural_unfired_ids == []
+    assert result.is_fully_satisfied() is False
 
 
 def test_empty_verdicts_with_criteria_is_not_vacuously_satisfied() -> None:
@@ -1136,6 +1289,246 @@ def test_terminal_goal_record_does_not_take_literal_criteria_from_present_value(
     assert _satisfied_criterion_ids(grade_present_value_criteria(criteria, snapshot)) == {"c0"}
 
 
+def test_fallback_floor_accepts_validation_review_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload()})
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:submit_request",
+        )
+    ]
+
+
+def test_fallback_floor_accepts_generated_validation_review_fields_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"validate_business_start_service": _generated_validation_review_payload()}
+    )
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service",
+        )
+    ]
+
+
+def test_fallback_floor_accepts_live_validation_review_output_parameter_shape() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"validate_business_start_service_review_output": _live_validation_review_output_payload()}
+    )
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service_review_output",
+        )
+    ]
+
+
+def test_fallback_floor_rejects_generated_validation_review_after_final_click() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service": _generated_validation_review_payload(
+                submit_or_finalize_clicked=True,
+                terminal_summary="Pre-submit review reached: True; submit/finalize control clicked: True.",
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_live_validation_review_confirmation_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service_review_output": _live_validation_review_output_payload(
+                confirmation_page_visible=True,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_generated_validation_review_confirmation_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service": _generated_validation_review_payload(
+                confirmation_page_visible=True,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_bare_all_checks_passed() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": {"all_checks_passed": True}})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_normal_submit_review_without_validation_only_marker() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                validation_only=None,
+                submit_mode=None,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+@pytest.mark.parametrize("marker", ["not_validation_only", "validation_only_disabled", "previous_validation_only"])
+def test_fallback_floor_rejects_validation_only_marker_prefix_suffix_matches(marker: str) -> None:
+    payload = _validation_review_payload(validation_only=None)
+    payload[marker] = True
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_boolean_only_validation_review_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service_review": _live_validation_review_output_payload(
+                all_validations_passed=None,
+                review_values=None,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_submitted_request() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(submitted_request=True)})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_confirmation_page_visible() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"submit_request": _validation_review_payload(confirmation_page_visible=True)}
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_submit_or_finalize_click() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"submit_request": _validation_review_payload(submit_or_finalize_clicked=True)}
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_review_text_without_structured_review_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                review_page_visible=False,
+                evidence_text=(
+                    "No review page was necessary, but values 1234 Sample Utility Way, Testville, CA 94016, "
+                    "2026-06-22, and EXAMPLE REALTY LABS INC were checked."
+                ),
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_review_values_without_corroborating_text() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                evidence_text="Visible Review page showed safe values and no final click."
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_values_contradicting_requested_literals() -> None:
+    criteria = [
+        *build_classifier_fallback_floor([]),
+        _criterion(
+            "c_requested_values",
+            'Review shows service address "1234 Sample Utility Way, Testville, CA 94016" and start date "2026-06-22".',
+        ),
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                review_values={
+                    "visible_service_address": "100 Wrong Way, Atlanta, GA 30318",
+                    "visible_requested_start_date": "2026-07-01",
+                    "visible_account_holder": "EXAMPLE REALTY LABS INC",
+                },
+                evidence_text=(
+                    "Visible Review page showed service address 100 Wrong Way, Atlanta, GA 30318, "
+                    "start date 2026-07-01, and account holder EXAMPLE REALTY LABS INC. "
+                    "No Submit Request or final confirmation control was clicked."
+                ),
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(criteria, snapshot) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"error": "review mismatch"},
+        {"failure_reason": "submit disabled"},
+        {"status": "failed"},
+        {"all_checks_passed": False},
+    ],
+)
+def test_fallback_floor_rejects_validation_review_negative_guards(overrides: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(**overrides)})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_structured_contradiction() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                items=[{"item_name": "Service Review Active", "status": "Expired"}],
+                overall_status="Expired",
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_nested_under_failed_parent() -> None:
+    payload = {"status": "failed", "error": "submit blocked", "validate_review_output": _validation_review_payload()}
+    snapshot = RunEvidenceSnapshot(block_outputs={"validate_review": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
 def test_structured_record_goal_content_remains_strict_for_flat_terminal_payload() -> None:
     assert structured_record_has_goal_content(_terminal_goal_payload()) is False
 
@@ -1473,6 +1866,38 @@ def test_outcome_unverified_reason_uses_typed_missing_evidence_not_confirmation_
     assert "prefer restoring that revision" in known_good_reason
 
 
+def test_outcome_unverified_reason_guides_fallback_floor_review_output_contract() -> None:
+    policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    floor_id = policy.completion_criteria[0].id
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[floor_id],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id=floor_id,
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="run output did not include evidence for this criterion",
+            )
+        ],
+    )
+    ctx = SimpleNamespace(request_policy=policy)
+
+    reason = _outcome_unverified_reason(ctx, verification)
+
+    assert reason is not None
+    assert "review_values" in reason
+    assert "review_fields" in reason
+    assert "evidence_text" in reason
+    assert "validation_only" in reason
+    assert "submit_mode" in reason
+    assert "visible Review-page label/value strings" in reason
+    assert "do not click Submit/Finalize" in reason
+
+
 def test_outcome_unverified_reason_excludes_structurally_abstained_contingent_missing_evidence() -> None:
     policy = RequestPolicy(
         completion_criteria=[
@@ -1604,6 +2029,47 @@ def _terminal_goal_output_result(**payload_overrides: Any) -> dict:
                     "extracted_data": _terminal_goal_payload(**payload_overrides),
                 }
             ],
+        },
+    }
+
+
+def _validation_review_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_review",
+            "overall_status": "completed",
+            "executed_block_labels": ["submit_request"],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [
+                {
+                    "label": "submit_request",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": _validation_review_payload(**payload_overrides),
+                }
+            ],
+        },
+    }
+
+
+def _live_validation_review_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_review",
+            "overall_status": "completed",
+            "executed_block_labels": ["validate_business_start_service_review"],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [],
+            "output": {
+                "extracted_information": [],
+                "validate_business_start_service_review_output": _live_validation_review_output_payload(
+                    **payload_overrides
+                ),
+            },
         },
     }
 
@@ -2919,7 +3385,12 @@ async def test_requested_output_path_ignores_evidence_text(monkeypatch: pytest.M
 
     assert verification is not None
     assert verification.is_fully_satisfied() is False
-    assert verification.verdicts[0].reason_code == "missing_exact_field"
+    assert verification.verdicts[0].reason_code == "no_evidence"
+    assert (
+        verification.verdicts[0].missing_evidence
+        == "requested-output criterion lacks typed expected_output_value or expected_output_shape; "
+        "presence-only output cannot confirm value-grounded criterion"
+    )
 
 
 @pytest.mark.asyncio
@@ -2943,11 +3414,13 @@ async def test_requested_output_path_ignores_block_level_prose(monkeypatch: pyte
 
     assert verification is not None
     assert verification.is_fully_satisfied() is False
-    assert verification.verdicts[0].reason_code == "missing_exact_field"
+    assert verification.verdicts[0].reason_code == "no_evidence"
 
 
 @pytest.mark.asyncio
-async def test_requested_output_path_exact_runtime_field_satisfies(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_requested_output_path_exact_runtime_field_with_expected_value_satisfies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def fail_handler(**_: object) -> object:
         raise AssertionError("exact requested-output evidence must bypass the judge")
 
@@ -2956,7 +3429,14 @@ async def test_requested_output_path_exact_runtime_field_satisfies(monkeypatch: 
     _set_workflow_labels(ctx, "extract_profile")
     ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
     ctx.request_policy = RequestPolicy(
-        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            )
+        ]
     )
 
     verification = await _maybe_run_completion_verification(
@@ -2968,6 +3448,904 @@ async def test_requested_output_path_exact_runtime_field_satisfies(monkeypatch: 
     assert verification is not None
     assert verification.is_fully_satisfied() is True
     assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.npi"
+
+    trace = verification.to_trace_data()
+    assert trace["verdict_0_criterion_id"] == "c_npi"
+    assert trace["verdict_0_output_path"] == "output.npi"
+    assert trace["verdict_0_grounding_mode"] == "exact_value"
+    assert "verdict_0_expected_output_shape" not in trace
+    assert trace["verdict_0_has_exact_value"] is True
+    assert "1234567890" not in repr(trace)
+
+
+def test_requested_output_path_without_expected_value_structurally_abstains_for_present_values() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "request_id",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_request_id",
+                outcome="The returned record includes request id.",
+                output_path="output.request_id",
+            ),
+            CompletionCriterion(
+                id="c_provider_captured_address",
+                outcome="The returned record includes provider captured address.",
+                output_path="output.provider_captured_address",
+            ),
+            CompletionCriterion(
+                id="c_requested_date",
+                outcome="The returned record includes requested date.",
+                output_path="output.requested_date",
+            ),
+            CompletionCriterion(
+                id="c_status",
+                outcome="The returned record includes status.",
+                output_path="output.status",
+            ),
+        ]
+    )
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        ctx.request_policy.completion_criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "request_id": "100245",
+                    "provider_captured_address": "100245",
+                    "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                    "status": "2026-06-24",
+                    "evidence_text": "The request completed successfully.",
+                }
+            }
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_request_id",
+        "c_provider_captured_address",
+        "c_requested_date",
+        "c_status",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+    assert {verdict.grounding_mode for verdict in verdicts} == {"missing"}
+    assert all(verdict.has_exact_value is False for verdict in verdicts)
+
+
+def test_requested_output_shape_only_generated_fields_structurally_abstain_without_exact_values() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "selected_start_date",
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        ),
+        CompletionCriterion(
+            id="c_account_number",
+            outcome="The returned record includes account number.",
+            output_path="output.account_number",
+            expected_output_shape="numeric_identifier",
+        ),
+        CompletionCriterion(
+            id="c_selected_start_date",
+            outcome="The returned record includes selected start date.",
+            output_path="output.selected_start_date",
+            expected_output_shape="date",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {
+                    "confirmation_number": "WTR-1842-DEMO",
+                    "account_number": "100245",
+                    "selected_start_date": "2026-06-22",
+                }
+            }
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_confirmation_number",
+        "c_account_number",
+        "c_selected_start_date",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+    trace = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[criterion.id for criterion in criteria],
+        verdicts=verdicts,
+    ).to_trace_data()
+    assert trace["verdict_0_output_path"] == "output.confirmation_number"
+    assert trace["verdict_0_grounding_mode"] == "shape"
+    assert trace["verdict_0_expected_output_shape"] == "reference_code"
+    assert trace["verdict_0_has_exact_value"] is False
+    assert "WTR-1842-DEMO" not in repr(trace)
+    assert trace["fully_satisfied"] is False
+    assert trace["unmet_criterion_ids"] == []
+
+
+def test_requested_output_shape_abstains_on_p8_scrambled_values_and_ignores_evidence_text_status() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        ),
+        CompletionCriterion(
+            id="c_provider_captured_address",
+            outcome="The returned record includes provider captured address.",
+            output_path="output.provider_captured_address",
+            expected_output_shape="address",
+        ),
+        CompletionCriterion(
+            id="c_requested_date",
+            outcome="The returned record includes requested date.",
+            output_path="output.requested_date",
+            expected_output_shape="date",
+        ),
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "confirmation_number": "100245",
+                    "provider_captured_address": "100245",
+                    "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                    "status": "2026-06-24",
+                    "evidence_text": "Submitted / Processing",
+                }
+            }
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_confirmation_number",
+        "c_provider_captured_address",
+        "c_requested_date",
+        "c_status",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verifier_rejects_reconstructed_p8_scrambled_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("typed requested-output verifier should not delegate reconstructed P8 proof")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_confirmation_number",
+                "The output includes the confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c_account_number",
+                "The output includes the account number.",
+                output_path="output.account_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            _criterion(
+                "c_provider_captured_address",
+                "The output includes the provider captured address.",
+                output_path="output.provider_captured_address",
+                expected_output_shape="address",
+            ),
+            _criterion(
+                "c_requested_date",
+                "The output includes the requested date.",
+                output_path="output.requested_date",
+                expected_output_shape="date",
+            ),
+            _criterion(
+                "c_status",
+                "The output includes the request status.",
+                output_path="output.status",
+                expected_output_shape="status_label",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "confirmation_number": "QC-2002-DEMO",
+                "account_number": "100245",
+                "provider_captured_address": "100245",
+                "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                "status": "2026-06-24",
+                "evidence_text": "Submitted / Processing",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_confirmation_number"].reason_code == "structurally_abstained"
+    assert verdicts["c_account_number"].reason_code == "structurally_abstained"
+    for criterion_id in ("c_provider_captured_address", "c_requested_date", "c_status"):
+        assert verdicts[criterion_id].state == "unsatisfied"
+        assert verdicts[criterion_id].reason_code == "structurally_abstained"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verifier_accepts_value_correct_reconstructed_p8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("typed requested-output verifier should not delegate value-correct P8 proof")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_confirmation_number",
+                "The output includes the confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c_account_number",
+                "The output includes the account number.",
+                output_path="output.account_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            _criterion(
+                "c_provider_captured_address",
+                "The output includes the provider captured address.",
+                output_path="output.provider_captured_address",
+                expected_output_shape="address",
+            ),
+            _criterion(
+                "c_requested_date",
+                "The output includes the requested date.",
+                output_path="output.requested_date",
+                expected_output_shape="date",
+            ),
+            _criterion(
+                "c_status",
+                "The output includes the request status.",
+                output_path="output.status",
+                expected_output_shape="status_label",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "confirmation_number": "QC-2002-DEMO",
+                "account_number": "100245",
+                "provider_captured_address": "77 Gaslight Way, Decatur, GA 30030",
+                "requested_date": "2026-06-24",
+                "status": "Submitted / Processing",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is False
+    assert {verdict.reason_code for verdict in verification.verdicts} == {"structurally_abstained"}
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verifier_accepts_p7_with_unfired_blocker_and_fee_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c_submit", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "selected_start_date",
+        "deposit_amount",
+        "next_owner",
+        "blocker",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_submit",
+                "The service request is submitted.",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
+            _criterion(
+                "c_confirmation_number",
+                "The output includes the confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c_account_number",
+                "The output includes the account number.",
+                output_path="output.account_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            _criterion(
+                "c_selected_start_date",
+                "The output includes the selected start date.",
+                output_path="output.selected_start_date",
+                expected_output_shape="date",
+            ),
+            _criterion(
+                "c_deposit_amount",
+                "The output includes the deposit amount.",
+                output_path="output.deposit_amount",
+                expected_output_shape="money_amount",
+            ),
+            _criterion(
+                "c_next_owner",
+                "The output includes the next owner.",
+                output_path="output.next_owner",
+                expected_output_shape="owner_label",
+            ),
+            _criterion(
+                "c_blocker",
+                "Any manual service blocker is reported to the user.",
+                output_path="output.blocker",
+                contingent_on="a manual service blocker exists",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "manual_service_blocker": None,
+                "output": {
+                    "confirmation_number": "WTR-1842-DEMO",
+                    "account_number": "100245",
+                    "selected_start_date": "2026-06-22",
+                    "deposit_amount": "$41.00 plus initiation fee",
+                    "next_owner": "Provider",
+                },
+                "evidence_text": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is True
+    assert verification.structural_unfired_criterion_ids == ["c_blocker"]
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_submit"].reason_code == "evidence_confirms"
+    assert verdicts["c_blocker"].reason_code == "no_evidence"
+    assert verdicts["c_deposit_amount"].reason_code == "structurally_abstained"
+    assert all(
+        verdict.reason_code == "structurally_abstained"
+        for cid, verdict in verdicts.items()
+        if cid not in {"c_submit", "c_blocker"}
+    )
+
+
+def test_requested_output_canonical_path_precedence_rejects_wrong_top_level_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {
+                    "confirmation_number": "QC-2002-DEMO",
+                    "output": {"confirmation_number": "WTR-1842-DEMO"},
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:utility_citrus_turn_on.confirmation_number"
+
+
+@pytest.mark.parametrize("canonical_value", [None, ""])
+def test_requested_output_exact_value_canonical_placeholder_not_rescued_by_wrapper(
+    canonical_value: str | None,
+) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {
+                    "confirmation_number": canonical_value,
+                    "output": {"confirmation_number": "WTR-1842-DEMO"},
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:utility_citrus_turn_on.confirmation_number"
+
+
+def test_requested_output_one_wrapper_runtime_field_abstains_without_broad_search() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        )
+    ]
+
+    wrapped_verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"utility_citrus_turn_on": {"output": {"confirmation_number": "WTR-1842-DEMO"}}}
+        ),
+    )
+    unrelated_nested_verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"utility_citrus_turn_on": {"details": {"output": {"confirmation_number": "WTR-1842-DEMO"}}}}
+        ),
+    )
+
+    assert wrapped_verdicts[0].state == "unsatisfied"
+    assert wrapped_verdicts[0].reason_code == "structurally_abstained"
+    assert wrapped_verdicts[0].evidence_ref == "block_outputs:utility_citrus_turn_on.output.confirmation_number"
+    assert unrelated_nested_verdicts[0].state == "unsatisfied"
+    assert unrelated_nested_verdicts[0].reason_code == "missing_exact_field"
+
+
+def test_requested_output_wrapped_wrong_neighbors_structurally_abstain() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("requested_date", "status")
+    criteria = [
+        CompletionCriterion(
+            id="c_requested_date",
+            outcome="The returned record includes requested date.",
+            output_path="output.requested_date",
+            expected_output_shape="date",
+        ),
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "output": {
+                        "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                        "status": "2026-06-24",
+                    }
+                }
+            }
+        ),
+    )
+
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+
+
+@pytest.mark.parametrize("canonical_status", [None, ""])
+def test_requested_output_shape_canonical_placeholder_not_rescued_by_wrapper(
+    canonical_status: str | None,
+) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "status": canonical_status,
+                    "output": {"status": "Submitted / Processing"},
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_ref is None
+
+
+def test_requested_output_exact_values_reject_p8_scrambled_neighbors() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="QC-2002-DEMO",
+        ),
+        CompletionCriterion(
+            id="c_provider_captured_address",
+            outcome="The returned record includes provider captured address.",
+            output_path="output.provider_captured_address",
+            expected_output_value="77 Gaslight Way, Decatur, GA 30030",
+        ),
+        CompletionCriterion(
+            id="c_requested_date",
+            outcome="The returned record includes requested date.",
+            output_path="output.requested_date",
+            expected_output_value="2026-06-24",
+        ),
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_value="Submitted / Processing",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "confirmation_number": "QC-2002-DEMO",
+                    "provider_captured_address": "100245",
+                    "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                    "status": "2026-06-24",
+                    "evidence_text": "Submitted / Processing",
+                }
+            }
+        ),
+    )
+
+    verdicts_by_id = {verdict.criterion_id: verdict for verdict in verdicts}
+    assert verdicts_by_id["c_confirmation_number"].reason_code == "evidence_confirms"
+    for criterion_id in ("c_provider_captured_address", "c_requested_date", "c_status"):
+        assert verdicts_by_id[criterion_id].state == "unsatisfied"
+        assert verdicts_by_id[criterion_id].reason_code == "evidence_contradicts"
+
+
+@pytest.mark.parametrize("status", [None, "None", "null", "n/a", "na", "", "-", "--"])
+def test_requested_output_status_shape_treats_null_placeholders_as_missing(status: str | None) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "status": status,
+                    "evidence_text": "Submitted / Processing",
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code in {"missing_exact_field", "structurally_abstained"}
+
+
+@pytest.mark.parametrize("status", ["Submitted / Processing", "Approved", "Pending Review", "Not Credentialed"])
+def test_requested_output_status_shape_structurally_abstains_for_real_labels(status: str) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_peach_gas_quickconnect": {"status": status}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+
+
+@pytest.mark.parametrize(
+    "deposit_amount",
+    [
+        "2026-06-22",
+        "100245",
+        "77 Gaslight Way, Decatur, GA 30030",
+        "Submitted / Processing",
+        "https://utility.example.test/pay",
+        "initiation fee applies",
+    ],
+)
+def test_requested_output_money_amount_shape_structurally_abstains_for_present_neighbors(deposit_amount: str) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("deposit_amount")
+    criteria = [
+        _criterion(
+            "c_deposit_amount",
+            "The output includes the deposit amount.",
+            output_path="output.deposit_amount",
+            expected_output_shape="money_amount",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_citrus_turn_on": {"deposit_amount": deposit_amount}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+
+
+def test_requested_output_exact_wrong_value_beats_matching_shape() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+            expected_output_shape="reference_code",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_citrus_turn_on": {"confirmation_number": "QC-2002-DEMO"}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+def test_requested_output_shape_missing_field_is_missing_exact_field() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_citrus_turn_on": {"evidence_text": "WTR-1842-DEMO"}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_requires_expected_value_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-grounded requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("service_address", "requested_start_date")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_address",
+                outcome="The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="1234 Sample Utility Way",
+            ),
+            CompletionCriterion(
+                id="c_date",
+                outcome="The returned record includes requested start date.",
+                output_path="output.requested_start_date",
+                expected_output_value="2026-06-22",
+            ),
+        ]
+    )
+
+    swapped = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "service_address": "2026-06-22",
+                "requested_start_date": "1234 Sample Utility Way",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert swapped is not None
+    assert swapped.is_fully_satisfied() is False
+    assert {verdict.reason_code for verdict in swapped.verdicts} == {"evidence_contradicts"}
+
+    matched = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "service_address": "1234 Sample Utility Way",
+                "requested_start_date": "2026-06-22",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert matched is not None
+    assert matched.is_fully_satisfied() is True
+    assert {verdict.reason_code for verdict in matched.verdicts} == {"evidence_confirms"}
+
+
+@pytest.mark.asyncio
+async def test_rehydrated_requested_output_expected_value_blocks_scrambled_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-grounded requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("service_address", "requested_start_date")
+    criteria = (
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned record includes service address.",
+            output_path="output.service_address",
+            expected_output_value="1234 Sample Utility Way",
+        ),
+        CompletionCriterion(
+            id="c_date",
+            outcome="The returned record includes requested start date.",
+            output_path="output.requested_start_date",
+            expected_output_value="2026-06-22",
+        ),
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria_from_json(criteria_to_json(criteria))))
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "service_address": "2026-06-22",
+                "requested_start_date": "1234 Sample Utility Way",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert {verdict.reason_code for verdict in verification.verdicts} == {"evidence_contradicts"}
 
 
 @pytest.mark.asyncio
@@ -3007,7 +4385,7 @@ async def test_requested_output_path_does_not_match_block_label_only(monkeypatch
 
     assert verification is not None
     assert verification.is_fully_satisfied() is False
-    assert verification.verdicts[0].reason_code == "missing_exact_field"
+    assert verification.verdicts[0].reason_code == "no_evidence"
 
 
 @pytest.mark.asyncio
@@ -3048,7 +4426,12 @@ async def test_requested_output_path_normalizes_jsonpath_and_indexes(
     ctx.code_artifact_metadata = _metadata_for_requested_paths(goal_value_path)
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path=requested_path)
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path=requested_path,
+                expected_output_value="1234567890",
+            )
         ]
     )
 
@@ -3080,6 +4463,7 @@ async def test_requested_output_path_aliases_authored_contract_to_requested_path
                 id="c_npi",
                 outcome="The nested record NPI is returned.",
                 output_path="output.records[].npi",
+                expected_output_value="1234567890",
             )
         ]
     )
@@ -3112,6 +4496,7 @@ async def test_requested_output_path_requires_exact_nested_runtime_field(
                 id="c_address",
                 outcome="Each listed location includes address.",
                 output_path="output.locations[].address",
+                expected_output_value="100 Main St",
             )
         ]
     )
@@ -3124,6 +4509,9 @@ async def test_requested_output_path_requires_exact_nested_runtime_field(
     assert missing is not None
     assert missing.is_fully_satisfied() is False
     assert missing.verdicts[0].reason_code == "missing_exact_field"
+    assert missing.verdicts[0].missing_evidence == (
+        "run output did not include exact structured field output.locations[].address"
+    )
 
     satisfied = await _maybe_run_completion_verification(
         ctx,
@@ -3145,7 +4533,14 @@ async def test_requested_output_path_uses_only_accepted_metadata(monkeypatch: py
     _set_workflow_labels(ctx, "extract_profile")
     ctx.raw_code_artifact_metadata = _metadata_for_requested_paths("npi")
     ctx.request_policy = RequestPolicy(
-        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            )
+        ]
     )
 
     rejected = await _maybe_run_completion_verification(
@@ -3190,7 +4585,14 @@ async def test_requested_output_path_can_use_static_return_key_contract(
         """
     )
     ctx.request_policy = RequestPolicy(
-        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            )
+        ]
     )
 
     verification = await _maybe_run_completion_verification(
@@ -3226,7 +4628,12 @@ async def test_requested_output_path_can_use_static_list_return_key_contract(
     )
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.[].npi")
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.[].npi",
+                expected_output_value="1234567890",
+            )
         ]
     )
 
@@ -3256,7 +4663,12 @@ async def test_requested_output_criteria_are_not_sent_to_judge(monkeypatch: pyte
     ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi"),
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            ),
             CompletionCriterion(id="c_cart", outcome="The cart contains the selected item."),
         ]
     )
@@ -3272,6 +4684,78 @@ async def test_requested_output_criteria_are_not_sent_to_judge(monkeypatch: pyte
     assert seen_prompts and "c_npi" not in seen_prompts[0]
     assert "c_cart" in seen_prompts[0]
     assert {verdict.criterion_id for verdict in verification.verdicts} == {"c_npi", "c_cart"}
+
+
+@pytest.mark.asyncio
+async def test_present_generic_requested_output_without_expected_value_abstains_without_vetoing_run_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c_submit", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("customer_name")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_customer_name",
+                outcome="The returned record includes customer name.",
+                output_path="output.customer_name",
+            ),
+            _criterion(
+                "c_submit",
+                "The record extraction completes.",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"customer_name": "Sample Customer"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_customer_name"].reason_code == "structurally_abstained"
+    assert verdicts["c_submit"].reason_code == "evidence_confirms"
+
+
+@pytest.mark.asyncio
+async def test_all_abstained_requested_outputs_do_not_satisfy_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output only abstention should not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("customer_name")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_customer_name",
+                outcome="The returned record includes customer name.",
+                output_path="output.customer_name",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"customer_name": "Sample Customer"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "structurally_abstained"
 
 
 @pytest.mark.asyncio
@@ -3297,7 +4781,7 @@ async def test_requested_output_bypasses_judge_satisfaction_without_exact_field(
 
     assert verification is not None
     assert verification.is_fully_satisfied() is False
-    assert verification.verdicts[0].reason_code == "missing_exact_field"
+    assert verification.verdicts[0].reason_code == "no_evidence"
 
 
 @pytest.mark.asyncio
@@ -3328,13 +4812,13 @@ async def test_requested_output_verdict_survives_unavailable_judge_result(
     assert verification.status == "evaluated"
     assert verification.is_fully_satisfied() is False
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdicts["c_npi"].reason_code == "missing_exact_field"
+    assert verdicts["c_npi"].reason_code == "no_evidence"
     assert verdicts["c_npi"].satisfied is False
     assert verdicts["c_cart"].state == "unknown"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason_code", ["missing_exact_field", "unproducible"])
+@pytest.mark.parametrize("reason_code", ["no_evidence", "unproducible"])
 async def test_unfired_contingent_requested_output_miss_does_not_veto_satisfied_run_criterion(
     monkeypatch: pytest.MonkeyPatch,
     reason_code: str,
@@ -3345,7 +4829,7 @@ async def test_unfired_contingent_requested_output_miss_does_not_veto_satisfied_
     _patch_completion_handler(monkeypatch, fail_handler)
     ctx = _run_ctx()
     _set_workflow_labels(ctx, "extract_profile")
-    if reason_code == "missing_exact_field":
+    if reason_code == "no_evidence":
         ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
         output = {"status": "DONE", "blocker": False}
     else:
@@ -3374,7 +4858,7 @@ async def test_unfired_contingent_requested_output_miss_does_not_veto_satisfied_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason_code", ["missing_exact_field", "unproducible"])
+@pytest.mark.parametrize("reason_code", ["no_evidence", "unproducible"])
 async def test_fired_contingent_requested_output_miss_still_vetoes(
     monkeypatch: pytest.MonkeyPatch,
     reason_code: str,
@@ -3385,7 +4869,7 @@ async def test_fired_contingent_requested_output_miss_still_vetoes(
     _patch_completion_handler(monkeypatch, fail_handler)
     ctx = _run_ctx()
     _set_workflow_labels(ctx, "extract_profile")
-    if reason_code == "missing_exact_field":
+    if reason_code == "no_evidence":
         ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
         output = {"status": "DONE", "blocker": True}
     else:
@@ -3459,7 +4943,12 @@ async def test_requested_output_satisfaction_is_not_vetoed_by_fallback_record_ab
     ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi"),
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            ),
             *_structured_record_criteria(),
         ]
     )
@@ -3569,6 +5058,54 @@ async def test_maybe_run_completion_verification_fallback_floor_uses_recorded_te
 
 
 @pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_validation_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("validation review evidence must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _validation_review_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_live_output_parameter_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("live validation review output parameter evidence must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "validate_business_start_service_review")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _live_validation_review_output_result(), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:validate_business_start_service_review_output"
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run_output_parameters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3618,7 +5155,7 @@ async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_fallback_floor_uses_page_end_state_evidence(
+async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_page_end_state_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, str] = {}
@@ -3658,7 +5195,9 @@ async def test_maybe_run_completion_verification_fallback_floor_uses_page_end_st
 
     assert verification is not None
     assert verification.no_gradeable_run_plane is False
-    assert verification.is_fully_satisfied() is True
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
     assert "observed_end_state_url: https://example.test/review" in captured["prompt"]
     assert "observed_end_state_page_title: Start Service - Review" in captured["prompt"]
 
@@ -3693,6 +5232,61 @@ async def test_maybe_run_completion_verification_fallback_floor_without_evidence
     assert verification.is_fully_satisfied() is False
     assert verification.verdicts[0].state == "unsatisfied"
     assert verification.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_login_page_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> object:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "__copilot_fallback_floor__run",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "open_demo_utility_login_output",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "open_demo_utility_login")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_login_only",
+            "overall_status": "completed",
+            "executed_block_labels": ["open_demo_utility_login"],
+            "current_url": "http://localhost:8900/utility_services/demo_utility/",
+            "page_title": "Login",
+            "blocks": [
+                {
+                    "label": "open_demo_utility_login",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "login_page_reached": True,
+                        "evidence_text": "Sample Utility Portal Log in to your account User ID Password",
+                    },
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].criterion_id == "__copilot_fallback_floor__run"
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
+    assert verification.verdicts[0].evidence_ref is None
 
 
 @pytest.mark.asyncio
@@ -3996,7 +5590,7 @@ async def test_download_registered_output_parameter_injects_and_verifies_without
 
 
 @pytest.mark.asyncio
-async def test_marked_requested_output_id_still_requires_exact_field(
+async def test_marked_requested_output_id_without_expected_value_is_no_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fail_handler(**_: object) -> object:
@@ -4029,13 +5623,13 @@ async def test_marked_requested_output_id_still_requires_exact_field(
     assert verification is not None
     assert verification.is_fully_satisfied() is False
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
     assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
     assert ctx.request_policy.completion_criteria == [requested]
 
 
 @pytest.mark.asyncio
-async def test_marked_requested_output_npi_still_requires_exact_field(
+async def test_marked_requested_output_npi_without_expected_value_is_no_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fail_handler(**_: object) -> object:
@@ -4068,13 +5662,13 @@ async def test_marked_requested_output_npi_still_requires_exact_field(
     assert verification is not None
     assert verification.is_fully_satisfied() is False
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdicts["c_npi"].reason_code == "missing_exact_field"
+    assert verdicts["c_npi"].reason_code == "no_evidence"
     assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
     assert ctx.request_policy.completion_criteria == [requested]
 
 
 @pytest.mark.asyncio
-async def test_unmarked_requested_output_id_still_requires_exact_field(
+async def test_unmarked_requested_output_id_without_expected_value_is_no_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fail_handler(**_: object) -> object:
@@ -4109,7 +5703,7 @@ async def test_unmarked_requested_output_id_still_requires_exact_field(
     assert verification is not None
     assert verification.is_fully_satisfied() is False
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
 
 
 @pytest.mark.asyncio
@@ -4150,8 +5744,8 @@ async def test_marked_download_deliverable_does_not_remove_mixed_extraction_fiel
     assert verification is not None
     assert verification.is_fully_satisfied() is False
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
-    assert verdicts["c_npi"].reason_code == "missing_exact_field"
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
+    assert verdicts["c_npi"].reason_code == "no_evidence"
     assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
 
 
@@ -4236,7 +5830,7 @@ async def test_marked_download_deliverable_without_registered_evidence_fails_clo
     assert verification is not None
     assert verification.is_fully_satisfied() is False
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdicts["c_output_id"].reason_code == "missing_exact_field"
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
     assert verdicts[REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID].reason_code == "no_evidence"
 
 

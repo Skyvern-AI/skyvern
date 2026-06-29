@@ -45,7 +45,7 @@ function SelectionCheckbox({
         className={cn(
           "pointer-events-none transition-opacity",
           !hasSelection &&
-            "opacity-0 focus-visible:opacity-100 group-hover/row:opacity-100",
+            "opacity-0 focus-visible:opacity-100 group-hover/row:opacity-100 group-data-[row-active]/row:opacity-100",
         )}
       />
     </div>
