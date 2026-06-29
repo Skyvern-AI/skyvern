@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import {
   CodeIcon,
   CounterClockwiseClockIcon,
+  Cross2Icon,
   ExclamationTriangleIcon,
   GlobeIcon,
   PlayIcon,
@@ -104,9 +105,13 @@ export function RunHero({
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   // Block runs default to the live debug stream; this opts into the recording.
   const [recordingOpen, setRecordingOpen] = useState(false);
+  // The failure banner is dismissable; the route reuses this instance across
+  // runs, so clear the dismissal whenever the run changes.
+  const [failureDismissed, setFailureDismissed] = useState(false);
   useEffect(() => {
     setStreamUrl(null);
     setRecordingOpen(false);
+    setFailureDismissed(false);
   }, [workflowRunId]);
 
   const scrubbing = pinnedFrameId != null && pinnedFrameId !== "stream";
@@ -334,13 +339,25 @@ export function RunHero({
         ) : null}
 
         {failed &&
+        !failureDismissed &&
         !scrubbing &&
         (center === "screenshot" ||
           (showDebugStream && center === "stream")) ? (
           <div className="absolute inset-x-0 bottom-0 m-4 rounded-lg border border-destructive/40 bg-slate-elevation1/95 p-4 shadow-lg backdrop-blur">
-            <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-              <ExclamationTriangleIcon className="h-4 w-4 text-destructive" />
-              {failureReason ?? "The run failed."}
+            <div className="flex items-start gap-2 text-sm font-semibold text-foreground">
+              <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <span className="min-w-0 flex-1">
+                {failureReason ?? "The run failed."}
+              </span>
+              <button
+                type="button"
+                onClick={() => setFailureDismissed(true)}
+                className="-mr-1 -mt-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                aria-label="Dismiss"
+                title="Dismiss"
+              >
+                <Cross2Icon className="h-4 w-4" />
+              </button>
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
               {onFix ? (
