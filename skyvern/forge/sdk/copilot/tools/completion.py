@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_registered_download_criteria,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    grade_validation_classification_criteria,
     is_fallback_floor_base_criterion,
     is_registered_download_completion_criterion,
     registered_download_completion_criterion,
@@ -309,16 +310,26 @@ async def _maybe_run_completion_verification_from_page_observation(
             if requested_output_criteria
             else []
         )
+        validation_classification_verdicts = grade_validation_classification_criteria(judgeable_run_criteria, snapshot)
+        validation_classification_ids = {verdict.criterion_id for verdict in validation_classification_verdicts}
+        remaining_judgeable_run_criteria = [
+            criterion for criterion in judgeable_run_criteria if criterion.id not in validation_classification_ids
+        ]
         remaining = _copilot_seconds_remaining(copilot_ctx)
         if (
             remaining is not None
             and remaining
             <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
         ):
-            run_result = _merge_run_verdicts_if_requested_output_exists(
-                run_criteria,
-                requested_output_verdicts,
-                structural_unfired_criterion_ids=run_structural_unfired_ids,
+            run_result = (
+                _merge_run_verdicts(
+                    run_criteria,
+                    requested_output_verdicts,
+                    validation_classification_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+                if requested_output_verdicts or validation_classification_verdicts
+                else None
             )
             verification = (
                 combine_verification_results(
@@ -345,47 +356,66 @@ async def _maybe_run_completion_verification_from_page_observation(
                     status="evaluated",
                     criterion_ids=[criterion.id for criterion in run_criteria],
                     verdicts=requested_output_verdicts
+                    + validation_classification_verdicts
                     + [
                         CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
-                        for criterion in judgeable_run_criteria
+                        for criterion in remaining_judgeable_run_criteria
                     ],
                     contingent_criterion_ids=run_contingent_ids,
                     contingent_on_by_criterion_id=run_contingent_on_by_id,
                     contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
                     structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
-            elif not judgeable_run_criteria:
+            elif not remaining_judgeable_run_criteria:
                 run_result = _merge_run_verdicts(
                     run_criteria,
                     requested_output_verdicts,
+                    validation_classification_verdicts,
                     structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
             else:
                 handler = await _completion_verification_handler(copilot_ctx)
                 if handler is None:
-                    run_result = _merge_run_verdicts_if_requested_output_exists(
-                        run_criteria,
-                        requested_output_verdicts,
-                        structural_unfired_criterion_ids=run_structural_unfired_ids,
+                    run_result = (
+                        _merge_run_verdicts(
+                            run_criteria,
+                            requested_output_verdicts,
+                            validation_classification_verdicts,
+                            structural_unfired_criterion_ids=run_structural_unfired_ids,
+                        )
+                        if requested_output_verdicts or validation_classification_verdicts
+                        else None
                     )
                     if run_result is None:
                         return None
                 else:
-                    judgeable_result = await evaluate_completion_criteria(judgeable_run_criteria, snapshot, handler)
-                    judgeable_result = _apply_present_value_upgrades(judgeable_result, judgeable_run_criteria, snapshot)
+                    judgeable_result = await evaluate_completion_criteria(
+                        remaining_judgeable_run_criteria,
+                        snapshot,
+                        handler,
+                    )
+                    judgeable_result = _apply_present_value_upgrades(
+                        judgeable_result,
+                        remaining_judgeable_run_criteria,
+                        snapshot,
+                    )
                     if judgeable_result.status != "evaluated":
-                        run_result = (
-                            _merge_run_verdicts_if_requested_output_exists(
+                        deterministic_result = (
+                            _merge_run_verdicts(
                                 run_criteria,
                                 requested_output_verdicts,
+                                validation_classification_verdicts,
                                 structural_unfired_criterion_ids=run_structural_unfired_ids,
                             )
-                            or judgeable_result
+                            if requested_output_verdicts or validation_classification_verdicts
+                            else None
                         )
+                        run_result = deterministic_result or judgeable_result
                     else:
                         run_result = _merge_run_verdicts(
                             run_criteria,
                             requested_output_verdicts,
+                            validation_classification_verdicts,
                             judgeable_result.verdicts,
                             structural_unfired_criterion_ids=run_structural_unfired_ids,
                         )
@@ -668,6 +698,9 @@ def _apply_present_value_upgrades(
     upgrades.update(
         {verdict.criterion_id: verdict for verdict in grade_structured_record_criteria(run_criteria, snapshot)}
     )
+    upgrades.update(
+        {verdict.criterion_id: verdict for verdict in grade_validation_classification_criteria(run_criteria, snapshot)}
+    )
     if include_terminal_goal_records:
         upgrades.update(
             {
@@ -830,6 +863,8 @@ def _deterministic_run_verification_result(
     for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_registered_download_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_validation_classification_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in semantic_verdicts:
         deterministic_by_id[verdict.criterion_id] = verdict

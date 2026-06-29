@@ -3002,6 +3002,44 @@ class TestNativeToolSurface:
 
 class TestRequestPolicyCredentialResolution:
     @pytest.mark.asyncio
+    async def test_request_policy_classifier_uses_configured_default_timeout_budget(self, monkeypatch) -> None:
+        from skyvern.config import Settings, settings
+        from skyvern.forge.sdk.copilot import request_policy as rp
+
+        default_timeout = Settings.model_fields["COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS"].default
+        assert default_timeout == 12.0
+
+        observed_timeouts: list[float | None] = []
+        real_wait_for = rp.asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout=None):
+            observed_timeouts.append(timeout)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", default_timeout)
+        monkeypatch.setattr(rp.time, "monotonic", lambda: 1000.0)
+        monkeypatch.setattr(rp.asyncio, "wait_for", recording_wait_for)
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "success"
+        assert observed_timeouts == [default_timeout]
+
+    @pytest.mark.asyncio
     async def test_request_policy_classifier_timeout_does_not_retry(self, monkeypatch) -> None:
         from skyvern.config import settings
 
@@ -4916,6 +4954,24 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert "explicitly asks for an untested draft" in prompt
         assert "workflow was drafted without testing as requested" in prompt
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
+
+
+class TestValidationClassificationOutputContractRule:
+    def test_build_system_prompt_requires_exact_top_level_classification_contract_keys(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
+
+        assert "validation_classification_output_contracts" in prompt
+        assert "explicitly `return` a dict" in prompt
+        assert "Do not rely on schema defaults or exposed top-level locals" in prompt
+        assert "exact `return_key` as a top-level key" in prompt
+        assert "goal_value_paths" in prompt
+        assert "extraction_schema" in prompt
+        assert "reject code-only output blocks without that metadata" in prompt
+        assert "observed_gate_phrase" in prompt
+        assert "Synonyms such as `path_login_only`, `classification`, or prose in `evidence_text`" in prompt
+        assert "do not replace the required key" in prompt
 
 
 class TestCopilotConfig:

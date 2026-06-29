@@ -10,10 +10,12 @@ from skyvern.forge.sdk.copilot.agent import (
     _FALLBACK_BLOCKER_REPLY,
     _RAW_SECRET_LEAK_REFUSAL,
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
+    _build_goal_satisfied_exit_result,
     _build_output_policy_blocked_result,
     _build_turn_halt_exit_result,
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
+    _verified_workflow_success_reply,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
@@ -25,7 +27,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPolicyReason, OutputPolicyVerdict
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 
@@ -593,6 +595,37 @@ def _fully_satisfied_result() -> CompletionVerificationResult:
     )
 
 
+def _fully_satisfied_classification_result() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_validation"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_validation",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                output_path="login_only",
+                grounding_mode="exact_value",
+                has_exact_value=True,
+            )
+        ],
+    )
+
+
+def _classification_policy() -> RequestPolicy:
+    return RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_validation",
+                outcome="The run classifies the path as login gated.",
+                kind="validation_classification",
+                classification_output_key="login_only",
+                expected_classification=True,
+            )
+        ]
+    )
+
+
 def _seed_verified_outcome(ctx: CopilotContext) -> None:
     ctx.completion_verification_result = _fully_satisfied_result()
     ctx.last_artifact_health_blocker_reason = None
@@ -638,6 +671,141 @@ def test_verified_outcome_preserve_sets_verified_success_payload() -> None:
     assert overridden.narrative_payload is not None
     assert overridden.narrative_payload["verifiedSuccess"] is True
     assert overridden.narrative_payload["proposalDisposition"] == "review_tested"
+
+
+@pytest.mark.asyncio
+async def test_verified_classification_success_surfaces_terminal_verdict_and_reload_payload() -> None:
+    ctx = _ctx()
+    ctx.stream = None
+    ctx.turn_id = "turn-classified"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    _seed_verified_outcome(ctx)
+    ctx.request_policy = _classification_policy()
+    ctx.completion_verification_result = _fully_satisfied_classification_result()
+    ctx.verified_block_outputs = {
+        "inspect_access_path": {
+            "login_only": True,
+            "visible_page_path_label": "Start service sign-in gate",
+            "safest_reachable_next_step": "Stop before account-specific setup.",
+            "recommended_next_action": "Ask the user for online account access before continuing.",
+            "evidence_text": "The page says Sign in or register to continue.",
+        }
+    }
+
+    result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+    assert "login-gated" in result.user_response
+    assert "login_only=true" in result.user_response
+    assert "visible_page_path_label=Start service sign-in gate" in result.user_response
+    assert "safest_reachable_next_step=Stop before account-specific setup." in result.user_response
+    assert "recommended_next_action=Ask the user for online account access before continuing." in result.user_response
+    assert "observed_gate_phrase=Sign in or register to continue" in result.user_response
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["terminalMessage"] == result.user_response
+
+
+def test_verified_classification_summary_does_not_display_unobserved_expected_value() -> None:
+    ctx = _ctx()
+    _seed_verified_outcome(ctx)
+    ctx.request_policy = _classification_policy()
+    ctx.completion_verification_result = _fully_satisfied_classification_result()
+    ctx.verified_block_outputs = {}
+
+    response = _verified_workflow_success_reply(ctx)
+
+    assert response == "I created and tested the workflow successfully."
+    assert "login_only=true" not in response
+    assert "login-gated" not in response
+    assert "observed_gate_phrase=Sign in or register to continue" not in response
+
+
+def test_verified_classification_summary_uses_terminal_snapshot_when_frontier_outputs_clear() -> None:
+    ctx = _ctx()
+    _seed_verified_outcome(ctx)
+    ctx.request_policy = _classification_policy()
+    ctx.completion_verification_result = _fully_satisfied_classification_result()
+    ctx.verified_block_outputs = {}
+    ctx.verified_terminal_block_outputs = {
+        "inspect_access_path": {
+            "login_only": True,
+            "visible_page_path_label": "Start, Stop or Move Service",
+            "matched_gate_phrases": ["sign in or register to continue"],
+        }
+    }
+
+    response = _verified_workflow_success_reply(ctx)
+
+    assert "login_only=true" in response
+    assert "login-gated" in response
+    assert "visible_page_path_label=Start, Stop or Move Service" in response
+    assert "observed_gate_phrase=Sign in or register to continue" in response
+
+
+def test_verified_classification_summary_labels_login_gate_from_verified_gate_phrase() -> None:
+    ctx = _ctx()
+    _seed_verified_outcome(ctx)
+    ctx.request_policy = RequestPolicy(completion_criteria=[CompletionCriterion(id="c0", outcome="Reached gate")])
+    ctx.completion_verification_result = _fully_satisfied_result()
+    ctx.verified_terminal_block_outputs = {
+        "inspect_access_path": {
+            "visible_page_path_label": "Start, Stop or Move Service > Start Service",
+            "observed_gate_phrase": "Sign in or register to continue",
+        }
+    }
+
+    response = _verified_workflow_success_reply(ctx)
+
+    assert "visible_page_path_label=Start, Stop or Move Service > Start Service" in response
+    assert "observed_gate_phrase=Sign in or register to continue" in response
+    assert "login-gated" in response
+
+
+def test_verified_classification_summary_requires_completion_verification() -> None:
+    ctx = _ctx()
+    ctx.request_policy = _classification_policy()
+    ctx.verified_block_outputs = {
+        "inspect_access_path": {
+            "login_only": True,
+            "visible_page_path_label": "Start service sign-in gate",
+            "evidence_text": "The page prose says login-gated and login_only=true.",
+        }
+    }
+
+    response = _verified_workflow_success_reply(ctx)
+
+    assert response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    assert "login-gated" not in response
+    assert "login_only=true" not in response
+
+
+def test_verified_classification_summary_requires_fully_satisfied_verification() -> None:
+    ctx = _ctx()
+    ctx.request_policy = _classification_policy()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_validation"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_validation",
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                output_path="login_only",
+            )
+        ],
+    )
+    ctx.verified_block_outputs = {
+        "inspect_access_path": {
+            "login_only": True,
+            "visible_page_path_label": "Start service sign-in gate",
+        }
+    }
+
+    response = _verified_workflow_success_reply(ctx)
+
+    assert response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    assert "login-gated" not in response
+    assert "login_only=true" not in response
 
 
 def test_unverified_blocker_still_renders_blocker_text() -> None:

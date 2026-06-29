@@ -65,6 +65,9 @@ def _criterion(
     deliverable_kind: str | None = None,
     expected_output_value: str | None = None,
     expected_output_shape: str | None = None,
+    kind: str = "outcome",
+    classification_output_key: str | None = None,
+    expected_classification: str | bool | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -77,6 +80,9 @@ def _criterion(
         deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
         expected_output_value=expected_output_value,
         expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
+        kind=kind,  # type: ignore[arg-type]
+        classification_output_key=classification_output_key,
+        expected_classification=expected_classification,
     )
 
 
@@ -467,6 +473,163 @@ def test_parse_completion_criteria_accepts_only_declared_expected_output_shapes(
 
     assert valid.expected_output_shape == "reference_code"
     assert invalid.expected_output_shape is None
+
+
+def test_parse_completion_criteria_preserves_validation_classification_contract() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "outcome",
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+        ]
+    )
+
+    assert len(parsed) == 2
+    assert parsed[0].kind == "validation_classification"
+    assert parsed[0].classification_output_key == "login_gated"
+    assert parsed[0].expected_classification is True
+    assert parsed[1].kind == "outcome"
+
+
+def test_parse_completion_criteria_drops_requested_output_fields_for_validation_classification() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "output_path": "output.path_classification",
+                "expected_output_value": "login_gated",
+                "expected_output_shape": "status_label",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].kind == "validation_classification"
+    assert parsed[0].output_path is None
+    assert parsed[0].expected_output_value is None
+    assert parsed[0].expected_output_shape is None
+
+
+def test_parse_completion_criteria_dedupes_validation_classification_by_target_and_output_key() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "login_gated",
+            },
+            {
+                "outcome": "Duplicate phrasing should not matter for the same classification target.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "login_gated",
+            },
+            {
+                "outcome": "A different expected classification stays distinct.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "public",
+            },
+        ]
+    )
+
+    assert [(criterion.classification_output_key, criterion.expected_classification) for criterion in parsed] == [
+        ("path_classification", "login_gated"),
+        ("path_classification", "public"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_policy_promotes_login_only_output_to_validation_classification_contract() -> None:
+    policy = await _policy_for_message(
+        (
+            "I need a reusable validation-only workflow that checks whether Riverbend Gas has a public path for "
+            "starting gas service from http://localhost:8900/utility_services/riverbend_gas/. It should look for a "
+            "start, connect, new service, or move-in path without logging in, creating an account, entering identity "
+            "details, entering payment details, accepting terms, or submitting anything. For this eval run, classify "
+            "the safest reachable next step and return a structured summary showing whether a public form exists, "
+            "whether the path is login-only, the visible page/path label, and the recommended next action."
+        ),
+        [
+            {
+                "outcome": "The returned record includes public path exists.",
+                "output_path": "output.public_path_exists",
+            },
+            {
+                "outcome": "The returned record includes safest reachable next step.",
+                "output_path": "output.safest_reachable_next_step",
+            },
+            {
+                "outcome": "The returned record includes login only.",
+                "output_path": "output.login_only",
+            },
+        ],
+    )
+
+    validation_criteria = [
+        criterion for criterion in policy.completion_criteria if criterion.kind == "validation_classification"
+    ]
+    assert len(validation_criteria) == 1
+    assert validation_criteria[0].classification_output_key == "login_only"
+    assert validation_criteria[0].expected_classification is True
+    assert validation_criteria[0].output_path is None
+    assert validation_criteria[0].expected_output_value is None
+    assert not _criteria_for_path(policy, "output.login_only")
+
+
+def test_prompt_summary_includes_validation_classification_output_contract() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_login_only",
+                "The run classifies whether the path is login-only.",
+                kind="validation_classification",
+                classification_output_key="login_only",
+                expected_classification=True,
+            )
+        ]
+    )
+
+    summary = policy.prompt_summary()
+
+    assert "validation_classification_output_contracts:" in summary
+    assert "criterion_id: c_login_only" in summary
+    assert "return_key: login_only" in summary
+    assert "expected_value: true" in summary
+    assert "return_location: top_level_block_output" in summary
+
+
+@pytest.mark.asyncio
+async def test_request_policy_promotes_path_classification_when_classifier_supplies_target() -> None:
+    policy = await _policy_for_message(
+        "Classify whether the service path is login-gated and return path classification.",
+        [
+            {
+                "outcome": "The returned record includes path classification.",
+                "output_path": "output.path_classification",
+                "expected_output_value": "login-gated",
+            }
+        ],
+    )
+
+    assert len(policy.completion_criteria) == 1
+    criterion = policy.completion_criteria[0]
+    assert criterion.kind == "validation_classification"
+    assert criterion.classification_output_key == "path_classification"
+    assert criterion.expected_classification == "login-gated"
+    assert criterion.output_path is None
+    assert criterion.expected_output_value is None
 
 
 @pytest.mark.asyncio
@@ -917,6 +1080,33 @@ def test_active_criteria_rendering_includes_expected_output_shape_as_structured_
     ]
 
 
+def test_active_criteria_rendering_includes_validation_classification_contract() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The run classifies whether the path is login gated.",
+                kind="validation_classification",
+                classification_output_key="login_gated",
+                expected_classification=True,
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "The run classifies whether the path is login gated.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "kind": "validation_classification",
+            "terminal_action_family": None,
+            "classification_output_key": "login_gated",
+            "expected_classification": True,
+        }
+    ]
+
+
 def test_criteria_json_round_trips_contingent_on() -> None:
     criteria = (
         _criterion(
@@ -959,6 +1149,43 @@ def test_criteria_json_round_trips_expected_output_shape() -> None:
     restored = criteria_from_json(criteria_to_json(criteria))
 
     assert restored == criteria
+
+
+def test_criteria_json_round_trips_validation_classification_contract() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="login_gated",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+
+
+def test_criteria_json_rehydrates_validation_classification_without_requested_output_fields() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            output_path="output.path_classification",
+            expected_output_value="login_gated",
+            expected_output_shape="status_label",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert len(restored) == 1
+    assert restored[0].kind == "validation_classification"
+    assert restored[0].output_path is None
+    assert restored[0].expected_output_value is None
+    assert restored[0].expected_output_shape is None
 
 
 def test_request_policy_trace_exposes_requested_output_grounding_contract_without_values() -> None:
@@ -1043,6 +1270,36 @@ def test_reconcile_supersedes_same_output_path_with_different_expected_output_sh
             "The returned record includes confirmation number.",
             output_path="output.confirmation_number",
             expected_output_shape="numeric_identifier",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        fresh,
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == tuple(fresh)
+
+
+def test_reconcile_supersedes_validation_classification_with_different_target() -> None:
+    stored = _stored(
+        _criterion(
+            "s0",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="login_gated",
+        )
+    )
+    fresh = [
+        _criterion(
+            "c0",
+            "The run classifies whether the path is public.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="public",
         )
     ]
 

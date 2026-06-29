@@ -16,7 +16,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _verified_workflow_or_none,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criteria_to_json
-from skyvern.forge.sdk.copilot.completion_output_grounding import grade_requested_output_criteria
+from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    grade_requested_output_criteria,
+    split_requested_output_criteria,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
     REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionVerificationResult,
@@ -33,6 +36,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_registered_download_criteria,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    grade_validation_classification_criteria,
     registered_download_completion_criterion,
     run_plane_all_no_evidence,
     structural_unfired_contingent_criterion_ids,
@@ -101,6 +105,8 @@ def _criterion(
     deliverable_kind: str | None = None,
     expected_output_value: str | None = None,
     expected_output_shape: str | None = None,
+    classification_output_key: str | None = None,
+    expected_classification: str | bool | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -114,6 +120,8 @@ def _criterion(
         deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
         expected_output_value=expected_output_value,
         expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
+        classification_output_key=classification_output_key,
+        expected_classification=expected_classification,
     )
 
 
@@ -1289,6 +1297,258 @@ def test_terminal_goal_record_does_not_take_literal_criteria_from_present_value(
     assert _satisfied_criterion_ids(grade_present_value_criteria(criteria, snapshot)) == {"c0"}
 
 
+def _validation_classification_criterion(
+    expected_classification: str | bool = "login_gated",
+    *,
+    key: str = "path_classification",
+) -> CompletionCriterion:
+    return _criterion(
+        "c_validation",
+        "The run classifies whether the path is login gated.",
+        kind="validation_classification",
+        classification_output_key=key,
+        expected_classification=expected_classification,
+    )
+
+
+def test_validation_classification_grader_credits_matching_string_value() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    assert grade_validation_classification_criteria([criterion], snapshot) == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:classify_path.path_classification",
+            output_path="path_classification",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        )
+    ]
+
+
+def test_validation_classification_grader_credits_matching_boolean_value() -> None:
+    criterion = _validation_classification_criterion(True, key="login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"login_gated": True}})
+
+    assert _satisfied_criterion_ids(grade_validation_classification_criteria([criterion], snapshot)) == {"c_validation"}
+
+
+def test_validation_classification_grader_credits_repeated_matching_boolean_values() -> None:
+    criterion = _validation_classification_criterion(True, key="login_only")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path": {"login_only": True},
+            "classify_path_output": {"login_only": True},
+        }
+    )
+
+    assert grade_validation_classification_criteria([criterion], snapshot) == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:classify_path.login_only",
+            output_path="login_only",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            expected_classification="login_gated",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+        ),
+    ],
+)
+def test_validation_classification_grader_fails_closed_for_incomplete_contract(
+    criterion: CompletionCriterion,
+) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].criterion_id == "c_validation"
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "no_evidence"
+    assert verdicts[0].missing_evidence == "incomplete typed classification contract"
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason_code"),
+    [
+        ({}, "no_evidence"),
+        ({"path_classification": None}, "no_evidence"),
+        ({"path_classification": ""}, "no_evidence"),
+        ({"path_classification": []}, "no_evidence"),
+        ({"path_classification": {}}, "no_evidence"),
+        ({"path_classification": "public"}, "evidence_contradicts"),
+        ({"path_classification": ["login_gated"]}, "evidence_contradicts"),
+        ({"path_classification": True}, "evidence_contradicts"),
+        ({"success": True}, "no_evidence"),
+        ({"evidence_text": "The path is login_gated."}, "no_evidence"),
+    ],
+)
+def test_validation_classification_grader_fails_closed_for_non_matching_values(
+    payload: Any,
+    reason_code: str,
+) -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": payload})
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].criterion_id == "c_validation"
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == reason_code
+
+
+def test_validation_classification_grader_credits_repeated_matching_string_values() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path_a": {"path_classification": "login_gated"},
+            "classify_path_b": {"path_classification": "login_gated"},
+        }
+    )
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0] == CriterionVerdict(
+        criterion_id="c_validation",
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref="block_outputs:classify_path_a.path_classification",
+        output_path="path_classification",
+        grounding_mode="exact_value",
+        has_exact_value=True,
+    )
+
+
+def test_validation_classification_grader_fails_closed_for_conflicting_candidates() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path_a": {"path_classification": "login_gated"},
+            "classify_path_b": {"path_classification": "public"},
+        }
+    )
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+@pytest.mark.parametrize(
+    "mixed_value",
+    [
+        None,
+        "",
+        [],
+        {},
+        "true",
+        False,
+    ],
+)
+def test_validation_classification_grader_fails_closed_for_mixed_repeated_boolean_candidates(
+    mixed_value: Any,
+) -> None:
+    criterion = _validation_classification_criterion(True, key="login_only")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path": {"login_only": True},
+            "classify_path_output": {"login_only": mixed_value},
+        }
+    )
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+def test_validation_classification_grader_rejects_same_named_scalar_block_label() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"path_classification": "login_gated"})
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "no_evidence"
+
+
+def test_validation_classification_is_not_requested_output_criterion() -> None:
+    criterion = _criterion(
+        "c_validation",
+        "The run classifies whether the path is login gated.",
+        kind="validation_classification",
+        output_path="output.path_classification",
+        expected_output_value="login_gated",
+    )
+
+    requested, remaining = split_requested_output_criteria([criterion])
+
+    assert requested == []
+    assert remaining == [criterion]
+
+
+def test_validation_classification_grader_does_not_cross_credit_outcome_or_terminal_action() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    assert (
+        grade_validation_classification_criteria(
+            [
+                _criterion(
+                    "c_outcome",
+                    "The run classifies whether the path is login gated.",
+                    classification_output_key="path_classification",
+                    expected_classification="login_gated",
+                ),
+                _criterion(
+                    "c_terminal",
+                    "The run classifies whether the path is login gated.",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    classification_output_key="path_classification",
+                    expected_classification="login_gated",
+                ),
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_validation_classification_grader_repeats_same_verdict_for_same_output() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    first = grade_validation_classification_criteria([criterion], snapshot)
+    second = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert first == second
+
+
 def test_fallback_floor_accepts_validation_review_evidence() -> None:
     snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload()})
 
@@ -2054,6 +2314,30 @@ def _validation_review_output_result(**payload_overrides: Any) -> dict:
     }
 
 
+def _validation_classification_output_result(value: Any) -> dict:
+    return _validation_classification_payload_result({"path_classification": value})
+
+
+def _validation_classification_payload_result(payload: dict[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_classification",
+            "overall_status": "completed",
+            "executed_block_labels": ["classify_path"],
+            "current_url": "https://example.test/login",
+            "blocks": [
+                {
+                    "label": "classify_path",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": payload,
+                }
+            ],
+        },
+    }
+
+
 def _live_validation_review_output_result(**payload_overrides: Any) -> dict:
     return {
         "ok": True,
@@ -2345,6 +2629,249 @@ async def test_non_fallback_judge_confirmed_run_still_fires_barrier(monkeypatch:
     _record_run_blocks_result(ctx, result, completion_verification=verification)
     assert outcome_fully_verified(ctx) is True
     assert verified_goal_satisfied_context(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_validation_classification_block_output_satisfies_without_judge_unknown_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("typed validation classification should be graded deterministically")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_validation_classification_criterion("login_gated")])
+
+    first = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_output_result("login_gated"),
+        time.monotonic(),
+    )
+    second = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_output_result("login_gated"),
+        time.monotonic(),
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.is_fully_satisfied() is True
+    assert second.is_fully_satisfied() is True
+    assert first.verdicts == second.verdicts
+
+
+@pytest.mark.asyncio
+async def test_validation_classification_duplicate_registered_output_surfaces_satisfy_without_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("repeated coherent typed classification evidence should not require judge authority")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_validation_classification_criterion(True, key="login_only")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_validation_classification",
+                "overall_status": "completed",
+                "executed_block_labels": ["classify_path"],
+                "current_url": "https://example.test/login",
+                "blocks": [
+                    {
+                        "label": "classify_path",
+                        "block_type": "CODE",
+                        "status": "completed",
+                        "extracted_data": {"login_only": True},
+                    }
+                ],
+                "registered_output_parameter_values": [
+                    {
+                        "workflow_run_id": "wr_validation_classification",
+                        "output_parameter_id": "op_login_only",
+                        "output_parameter_key": "classify_path_output",
+                        "block_label": "classify_path",
+                        "block_type": "CODE",
+                        "value": {"login_only": True},
+                    }
+                ],
+            },
+        },
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:classify_path.login_only",
+            output_path="login_only",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_validation_classification_is_not_satisfied_by_fallback_floor_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_validation",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                    "missing_evidence": "matching classification output at path_classification",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "submit_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _validation_classification_criterion("login_gated"),
+            *build_classifier_fallback_floor([]),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _validation_review_output_result(),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert "c_validation" in {verdict.criterion_id for verdict in verification.verdicts if not verdict.satisfied}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"evidence_text": "The path is login_gated."},
+        {"success": True},
+    ],
+)
+@pytest.mark.asyncio
+async def test_validation_classification_missing_or_prose_only_evidence_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"verdicts": [{"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_validation_classification_criterion("login_gated")])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_payload_result(payload),
+        time.monotonic(),
+    )
+
+    assert calls == 0
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="unsatisfied",
+            reason_code="no_evidence",
+            output_path="path_classification",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+            missing_evidence="missing classification output key path_classification",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            expected_classification="login_gated",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            output_path="output.path_classification",
+            expected_output_value="login_gated",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validation_classification_incomplete_contract_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    criterion: CompletionCriterion,
+) -> None:
+    calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "verdicts": [
+                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c_other", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("path_classification")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            criterion,
+            _criterion("c_other", "The run produced ordinary page evidence."),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_output_result("login_gated"),
+        time.monotonic(),
+    )
+
+    assert calls == 1
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdict_by_id["c_validation"].state == "unsatisfied"
+    assert verdict_by_id["c_validation"].reason_code == "no_evidence"
+    assert verdict_by_id["c_validation"].missing_evidence == "incomplete typed classification contract"
+    assert verdict_by_id["c_other"].satisfied is True
 
 
 @pytest.mark.asyncio
@@ -2928,6 +3455,142 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
     assert outcome_fully_verified(ctx) is True
     assert "current_page_observation" in seen_prompt["prompt"]
     assert "SKU-12345 is present in the cart" in seen_prompt["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_page_observation_validation_classification_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {
+            "verdicts": [
+                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c_page", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _validation_classification_criterion("login_gated"),
+            _criterion("c_page", "The page observation confirms the path was inspected."),
+        ]
+    )
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"evidence_text": "The path is login_gated."},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"evidence_text": "The path is login_gated."},
+    )
+
+    assert handler_calls == 1
+    assert result is not None
+    assert result.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    assert verdict_by_id["c_validation"] == CriterionVerdict(
+        criterion_id="c_validation",
+        state="unsatisfied",
+        reason_code="no_evidence",
+        output_path="path_classification",
+        grounding_mode="exact_value",
+        has_exact_value=True,
+        missing_evidence="missing classification output key path_classification",
+    )
+    assert verdict_by_id["c_page"].satisfied is True
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            expected_classification="login_gated",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            output_path="output.path_classification",
+            expected_output_value="login_gated",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_page_observation_validation_classification_incomplete_contract_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    criterion: CompletionCriterion,
+) -> None:
+    handler_calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {
+            "verdicts": [
+                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c_page", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("path_classification")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            criterion,
+            _criterion("c_page", "The page observation confirms the path was inspected."),
+        ]
+    )
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"path_classification": "login_gated"},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"path_classification": "login_gated"},
+    )
+
+    assert handler_calls == 1
+    assert result is not None
+    assert result.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    assert verdict_by_id["c_validation"].state == "unsatisfied"
+    assert verdict_by_id["c_validation"].reason_code == "no_evidence"
+    assert verdict_by_id["c_validation"].missing_evidence == "incomplete typed classification contract"
+    assert verdict_by_id["c_page"].satisfied is True
 
 
 @pytest.mark.asyncio
