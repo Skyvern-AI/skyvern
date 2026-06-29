@@ -713,6 +713,12 @@ function WorkflowsTree() {
     matchesParameter,
     handleRowClick,
     handleIconClick,
+    onRowDeleted: (id) => {
+      if (!selected.has(id)) return;
+      const next = new Set(selected);
+      next.delete(id);
+      replaceSelection(next);
+    },
   };
 
   const showFlatInitialSkeleton =
@@ -998,7 +1004,7 @@ function WorkflowsTree() {
         </div>
         <WorkflowsListContext.Provider value={listContextValue}>
           <div className="overflow-hidden rounded-lg border border-border">
-            <Table className="table-fixed">
+            <Table className="table-fixed [&_td:last-child]:pr-6 [&_th:last-child]:pr-6">
               <TableHeader>
                 <TableRow className="group/header">
                   {showCheckbox && (

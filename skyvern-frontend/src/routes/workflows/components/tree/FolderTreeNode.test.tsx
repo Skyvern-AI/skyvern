@@ -75,6 +75,7 @@ const contextValue: WorkflowsListContextValue = {
   matchesParameter: () => false,
   handleRowClick: () => {},
   handleIconClick: () => {},
+  onRowDeleted: () => {},
 };
 
 function renderNode({

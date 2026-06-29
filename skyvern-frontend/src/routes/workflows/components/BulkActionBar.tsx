@@ -1,13 +1,15 @@
 import { getClient } from "@/api/AxiosClient";
+import { useState } from "react";
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
-import { SelectionBar, SelectionBarDivider } from "@/components/SelectionBar";
+import { SelectionBar } from "@/components/SelectionBar";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuPortal,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -22,17 +24,18 @@ import {
 import {
   BookmarkFilledIcon,
   BookmarkIcon,
+  ChevronDownIcon,
   CopyIcon,
-  DotsHorizontalIcon,
   DownloadIcon,
+  TokensIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
 import { convert } from "../editor/workflowEditorUtils";
 import { Tag, TagKey } from "../types/tagTypes";
 import { WorkflowApiResponse } from "../types/workflowTypes";
-import { BulkTagPicker } from "./tagging/BulkTagPicker";
-import { WorkflowFolderSelector } from "./WorkflowFolderSelector";
+import { FolderPickerCommand } from "./FolderPickerCommand";
+import { TagPickerCommand } from "./tagging/TagPickerCommand";
 
 type Props = {
   selectedWorkflows: WorkflowApiResponse[];
@@ -84,6 +87,7 @@ function BulkActionBar({
   const templates = selectedWorkflows.filter(
     (workflow) => workflow.is_template,
   );
+  const [tagError, setTagError] = useState<string | null>(null);
 
   async function handleBulkClone() {
     onOperatingChange(true);
@@ -176,6 +180,11 @@ function BulkActionBar({
   }
 
   async function handleBulkTagApply(tag: Tag) {
+    // The submenu stays open after a pick (tagging is additive), so guard against
+    // a second apply racing the first set of POSTs for the same selection.
+    if (isOperating) {
+      return;
+    }
     onOperatingChange(true);
     try {
       const client = await getClient(credentialGetter);
@@ -235,51 +244,76 @@ function BulkActionBar({
     downloadFile(`agents-export-${selectedWorkflows.length}.${type}`, contents);
   }
 
+  const agentNoun = count === 1 ? "agent" : "agents";
+
   return (
     <SelectionBar
       count={count}
       isOperating={isOperating}
       onClear={onClearSelection}
     >
-      <WorkflowFolderSelector
-        currentFolderId={null}
-        bulkCount={count}
-        onBulkFolderSelect={onMoveToFolder}
-        bulkHasFolders={selectedWorkflows.some(
-          (workflow) => workflow.folder_id !== null,
-        )}
-        disabled={isOperating}
-        trigger={
-          <Button size="sm" variant="ghost" disabled={isOperating}>
-            <FolderIcon className="mr-1.5 h-4 w-4" />
-            Move to folder
-          </Button>
-        }
-      />
-      {taggingEnabled && (
-        <BulkTagPicker
-          bulkCount={count}
-          tagKeys={tagKeys}
-          labelSuggestions={labelSuggestions}
-          valueSuggestionsByKey={valueSuggestionsByKey}
-          disabled={isOperating}
-          onApplyTag={handleBulkTagApply}
-        />
-      )}
-      <DropdownMenu>
+      <DropdownMenu
+        onOpenChange={(open) => {
+          if (!open) {
+            setTagError(null);
+          }
+        }}
+      >
         <DropdownMenuTrigger asChild>
           <Button size="sm" variant="ghost" disabled={isOperating}>
-            <DotsHorizontalIcon className="mr-1.5 h-4 w-4" />
-            More
+            Actions
+            <ChevronDownIcon className="ml-1.5 h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" side="top">
-          <DropdownMenuItem
-            className="p-2"
-            onSelect={() => void handleBulkClone()}
-          >
+        <DropdownMenuContent align="start" side="top" className="w-56">
+          {taggingEnabled && (
+            <DropdownMenuSub
+              onOpenChange={(open) => {
+                if (!open) {
+                  setTagError(null);
+                }
+              }}
+            >
+              <DropdownMenuSubTrigger>
+                <TokensIcon className="mr-2 h-4 w-4" />
+                Tag {count} {agentNoun}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuSubContent className="w-72 p-0">
+                  <TagPickerCommand
+                    tagKeys={tagKeys}
+                    labelSuggestions={labelSuggestions}
+                    valueSuggestionsByKey={valueSuggestionsByKey}
+                    error={tagError}
+                    onErrorChange={setTagError}
+                    disabled={isOperating}
+                    onApply={(tag) => void handleBulkTagApply(tag)}
+                  />
+                </DropdownMenuSubContent>
+              </DropdownMenuPortal>
+            </DropdownMenuSub>
+          )}
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <FolderIcon className="mr-2 h-4 w-4" />
+              Move {count} to folder
+            </DropdownMenuSubTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuSubContent className="w-72 p-0">
+                <FolderPickerCommand
+                  currentFolderId={null}
+                  showRemove={selectedWorkflows.some(
+                    (workflow) => workflow.folder_id !== null,
+                  )}
+                  onSelect={(folderId) => void onMoveToFolder(folderId)}
+                />
+              </DropdownMenuSubContent>
+            </DropdownMenuPortal>
+          </DropdownMenuSub>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => void handleBulkClone()}>
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone
+            Clone {count}
           </DropdownMenuItem>
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>
@@ -312,7 +346,7 @@ function BulkActionBar({
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>
               <DownloadIcon className="mr-2 h-4 w-4" />
-              Export as...
+              Export
             </DropdownMenuSubTrigger>
             <DropdownMenuPortal>
               <DropdownMenuSubContent>
@@ -325,19 +359,16 @@ function BulkActionBar({
               </DropdownMenuSubContent>
             </DropdownMenuPortal>
           </DropdownMenuSub>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            className="text-destructive focus:text-destructive"
+            onSelect={() => onDeleteRequest()}
+          >
+            <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
+            Delete {count}
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <SelectionBarDivider />
-      <Button
-        size="sm"
-        variant="ghost"
-        className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-        onClick={onDeleteRequest}
-        disabled={isOperating}
-      >
-        <GarbageIcon className="mr-1.5 h-4 w-4" />
-        Delete
-      </Button>
     </SelectionBar>
   );
 }
