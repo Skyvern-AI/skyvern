@@ -59,6 +59,9 @@ function Pill({ tone, className, children }: PillProps) {
 type Props = {
   className?: string;
   status: Status | "pending";
+  // By default the label is sr-only below md (compact pill in dense tables);
+  // set this where the label must stay visible at every width, e.g. a tab chip.
+  alwaysShowLabel?: boolean;
 };
 
 function variantForStatus(status: Status | "pending"): StatusVariant {
@@ -109,7 +112,7 @@ function iconForStatus(status: Status | "pending") {
   }
 }
 
-function StatusBadge({ className, status }: Props) {
+function StatusBadge({ className, status, alwaysShowLabel = false }: Props) {
   const statusText = status === "timed_out" ? "timed out" : status;
 
   return (
@@ -122,7 +125,9 @@ function StatusBadge({ className, status }: Props) {
       title={statusText}
     >
       {iconForStatus(status)}
-      <span className="sr-only md:not-sr-only">{statusText}</span>
+      <span className={alwaysShowLabel ? undefined : "sr-only md:not-sr-only"}>
+        {statusText}
+      </span>
     </Badge>
   );
 }

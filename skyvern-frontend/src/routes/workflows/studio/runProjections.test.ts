@@ -10,6 +10,7 @@ import {
   buildActionIndex,
   buildBlockStatusMap,
   buildFilmstrip,
+  finalizedRunStatus,
   runOutcomeFromStatus,
 } from "./runProjections";
 
@@ -105,6 +106,25 @@ describe("runOutcomeFromStatus", () => {
     expect(runOutcomeFromStatus(Status.Terminated)).toBe("failed");
     expect(runOutcomeFromStatus(Status.TimedOut)).toBe("failed");
     expect(runOutcomeFromStatus(Status.Canceled)).toBe("failed");
+  });
+});
+
+describe("finalizedRunStatus", () => {
+  test("null while there is no status or the run is in-flight", () => {
+    expect(finalizedRunStatus(null)).toBeNull();
+    expect(finalizedRunStatus(undefined)).toBeNull();
+    expect(finalizedRunStatus(Status.Created)).toBeNull();
+    expect(finalizedRunStatus(Status.Queued)).toBeNull();
+    expect(finalizedRunStatus(Status.Running)).toBeNull();
+    expect(finalizedRunStatus(Status.Paused)).toBeNull();
+  });
+
+  test("preserves the real terminal status instead of collapsing it", () => {
+    expect(finalizedRunStatus(Status.Completed)).toBe(Status.Completed);
+    expect(finalizedRunStatus(Status.Failed)).toBe(Status.Failed);
+    expect(finalizedRunStatus(Status.Terminated)).toBe(Status.Terminated);
+    expect(finalizedRunStatus(Status.TimedOut)).toBe(Status.TimedOut);
+    expect(finalizedRunStatus(Status.Canceled)).toBe(Status.Canceled);
   });
 });
 

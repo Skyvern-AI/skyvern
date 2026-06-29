@@ -4,7 +4,7 @@ import {
   ReadableActionTypes,
   Status,
 } from "@/api/types";
-import { statusIsAFailureType } from "@/routes/tasks/types";
+import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
 import {
   isBlockItem,
   WorkflowRunTimelineItem,
@@ -51,6 +51,16 @@ export function runOutcomeFromStatus(
     return "failed";
   }
   return "running";
+}
+
+// Null while the run is in-flight; the tab shows only the terminal status.
+export function finalizedRunStatus(
+  status: Status | null | undefined,
+): Status | null {
+  if (status == null) {
+    return null;
+  }
+  return statusIsFinalized({ status }) ? status : null;
 }
 
 export type FilmstripFrame = {
