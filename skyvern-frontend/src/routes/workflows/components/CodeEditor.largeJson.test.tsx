@@ -66,6 +66,11 @@ describe("isOversizedDocument", () => {
     const value = JSON.stringify({ note: "[".repeat(500) }, null, 2);
     expect(isOversizedDocument(value)).toBe(false);
   });
+
+  it("treats an absent (undefined/null) document as not oversized", () => {
+    expect(isOversizedDocument(undefined)).toBe(false);
+    expect(isOversizedDocument(null)).toBe(false);
+  });
 });
 
 describe("CodeEditor large-document guard", () => {
@@ -94,6 +99,14 @@ describe("CodeEditor large-document guard", () => {
     const value = deeplyNestedJson(5_000);
     expect(() =>
       render(<CodeEditor value={value} language="json" />),
+    ).not.toThrow();
+  });
+
+  it("renders without throwing when the document value is absent", () => {
+    expect(() =>
+      render(
+        <CodeEditor value={undefined as unknown as string} language="json" />,
+      ),
     ).not.toThrow();
   });
 });

@@ -43,7 +43,10 @@ function getMaxStructureDepth(text: string, cap: number): number {
  * call stack (SKY-11432). Above these bounds the editor falls back to plain,
  * unwrapped text instead of syntax-highlighted, wrapped rendering.
  */
-export function isOversizedDocument(value: string): boolean {
+export function isOversizedDocument(value: string | null | undefined): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
   if (value.length > LARGE_DOCUMENT_CHAR_THRESHOLD) {
     return true;
   }
