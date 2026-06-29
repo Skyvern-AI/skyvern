@@ -503,6 +503,7 @@ class PDFFormat(StrEnum):
 class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
 
 
 class FileUploadDestination(BaseModel):
@@ -527,6 +528,9 @@ class FileUploadDestination(BaseModel):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_blob_name: str | None = None
+
+    google_access_token: str | None = None
+    google_drive_folder_id: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -906,6 +910,8 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
     path: str | None = None
 
 

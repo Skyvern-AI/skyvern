@@ -28,10 +28,10 @@ class GoogleOAuthCredentialListResponse(BaseModel):
 class CreateGoogleOAuthAuthorizeRequest(BaseModel):
     redirect_uri: str = Field(..., description="Redirect URI the consent flow will return to")
     credential_name: str = Field(default="Default", description="Human-readable name for this credential")
-    scope_profile: Literal["google_sheets", "gmail"] | None = Field(
+    scope_profile: Literal["google_sheets", "gmail", "google_drive"] | None = Field(
         default=None,
         description="Allowed Google OAuth scope profile to request. Defaults to google_sheets.",
-        examples=["google_sheets", "gmail"],
+        examples=["google_sheets", "gmail", "google_drive"],
     )
     app_origin: str | None = Field(
         default=None,

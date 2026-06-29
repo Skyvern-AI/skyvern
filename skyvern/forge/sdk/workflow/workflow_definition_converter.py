@@ -631,6 +631,8 @@ def block_yaml_to_block(
             azure_storage_account_name=block_yaml.azure_storage_account_name,
             azure_storage_account_key=block_yaml.azure_storage_account_key,
             azure_blob_container_name=block_yaml.azure_blob_container_name,
+            google_credential_id=block_yaml.google_credential_id,
+            google_drive_folder_id=block_yaml.google_drive_folder_id,
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:

@@ -4,6 +4,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Label } from "@/components/ui/label";
+import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import {
   Select,
   SelectContent,
@@ -11,6 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { helpTooltips } from "../../helpContent";
 import { type FileUploadNode, type FileUploadNodeData } from "./types";
@@ -45,6 +47,8 @@ function FileUploadEditorBody({
     azureStorageAccountName,
     azureStorageAccountKey,
     azureBlobContainerName,
+    googleCredentialId,
+    googleDriveFolderId,
   } = data;
   const update = useUpdate<FileUploadNodeData>({ id: blockId, editable });
 
@@ -58,7 +62,8 @@ function FileUploadEditorBody({
         <Select
           value={storageType}
           onValueChange={(value) =>
-            value && update({ storageType: value as "s3" | "azure" })
+            value &&
+            update({ storageType: value as "s3" | "azure" | "google_drive" })
           }
           disabled={!editable}
         >
@@ -68,6 +73,7 @@ function FileUploadEditorBody({
           <SelectContent>
             <SelectItem value="s3">Amazon S3</SelectItem>
             <SelectItem value="azure">Azure Blob Storage</SelectItem>
+            <SelectItem value="google_drive">Google Drive</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -218,6 +224,37 @@ function FileUploadEditorBody({
               nodeId={blockId}
               onChange={(value) => update({ path: value })}
               value={path as string}
+              className="nopan text-xs"
+            />
+          </div>
+        </>
+      )}
+
+      {storageType === "google_drive" && (
+        <>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Google Account</Label>
+              <HelpTooltip content="The connected Google account used for Drive uploads." />
+            </div>
+            <GoogleOAuthCredentialSelector
+              nodeId={blockId}
+              value={googleCredentialId ?? ""}
+              onChange={(value) => update({ googleCredentialId: value })}
+              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                Google Drive Folder ID (Required)
+              </Label>
+              <HelpTooltip content="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ googleDriveFolderId: value })}
+              value={googleDriveFolderId ?? ""}
               className="nopan text-xs"
             />
           </div>

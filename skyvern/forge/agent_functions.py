@@ -39,7 +39,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
@@ -1411,7 +1411,7 @@ class AgentFunction:
         organization_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Upload a single file to customer-specified S3 or Azure storage.
+        """Upload a single file to customer-specified cloud storage.
 
         Returns the customer-facing URI (``destination.customer_uri``).  The
         cloud override routes NAT-org traffic through the egress proxy so it
@@ -1446,6 +1446,16 @@ class AgentFunction:
             )
             await azure_client.upload_file_from_path(destination.sdk_uri, file_path)
             return destination.customer_uri
+
+        if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not destination.google_access_token or not destination.google_drive_folder_id:
+                raise ValueError("Google Drive destination is missing required fields")
+            uploaded_file = await google_drive_service.upload_file(
+                access_token=destination.google_access_token,
+                file_path=file_path,
+                folder_id=destination.google_drive_folder_id,
+            )
+            return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
 
         raise ValueError(f"Unsupported storage type: {destination.storage_type}")
 

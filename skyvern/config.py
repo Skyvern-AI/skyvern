@@ -676,6 +676,9 @@ class Settings(BaseSettings):
     # Google Sheets API runtime tuning
     GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
     GOOGLE_SHEETS_API_MAX_RETRIES: int = 3
+    # Google Drive API runtime tuning
+    GOOGLE_DRIVE_API_TIMEOUT_SECONDS: float = 30.0
+    GOOGLE_DRIVE_API_MAX_RETRIES: int = 3
 
     # Cleanup Cron Settings
     ENABLE_CLEANUP_CRON: bool = False
