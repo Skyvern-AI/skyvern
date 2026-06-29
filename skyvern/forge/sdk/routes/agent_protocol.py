@@ -4242,6 +4242,12 @@ async def get_workflows(
             else:
                 workflow_tags.append((tag_key, tag_value))
 
+    if workflow_tags and not await app.AGENT_FUNCTION.is_workflow_tagging_enabled(current_org.organization_id):
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Workflow tagging is not enabled for this organization.",
+        )
+
     if template and workflow_tags:
         # Templates are global; tags are org-scoped, so the two can't combine.
         raise HTTPException(
