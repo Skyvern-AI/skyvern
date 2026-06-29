@@ -18,6 +18,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
+from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -99,6 +100,15 @@ class TOTPVerificationResponse:
 class CopilotAliasResolution:
     url: str
     kind: str = "canonical_alias"
+
+
+@dataclass(frozen=True)
+class FieldOptionResolution:
+    matched_index: int | None
+    matched_label: str | None
+    matched_value: str | None
+    confidence: float
+    fallback_to_llm: bool
 
 
 def _remove_rect(element: dict) -> None:
@@ -1571,6 +1581,41 @@ class AgentFunction:
         Override in cloud to inject platform-specific passes.
         """
         return None
+
+    async def resolve_field_option(
+        self,
+        *,
+        target_value: str,
+        option_labels: list[str],
+        option_values: list[str | None],
+        field_context: Any,
+        url: str | None,
+        organization_id: str | None,
+    ) -> FieldOptionResolution:
+        """Resolve a requested field value against option labels.
+
+        Only high-precision exact or whole-stem singular/plural matches are
+        resolvable. A ``None`` match or ``fallback_to_llm=True`` means the
+        caller must defer to the LLM path.
+        """
+        matched_index = match_option_exact_or_stem(target_value, option_labels)
+        if matched_index is None:
+            return FieldOptionResolution(
+                matched_index=None,
+                matched_label=None,
+                matched_value=None,
+                confidence=0.0,
+                fallback_to_llm=True,
+            )
+
+        matched_value = option_values[matched_index] if matched_index < len(option_values) else None
+        return FieldOptionResolution(
+            matched_index=matched_index,
+            matched_label=option_labels[matched_index],
+            matched_value=matched_value,
+            confidence=1.0,
+            fallback_to_llm=False,
+        )
 
     async def fill_custom_widget(
         self,

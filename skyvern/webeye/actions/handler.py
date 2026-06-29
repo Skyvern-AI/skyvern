@@ -146,6 +146,7 @@ from skyvern.webeye.utils.dom import (
     DomUtil,
     InteractiveElement,
     SkyvernElement,
+    SkyvernOptionType,
     is_post_dispatch_click_timeout,
 )
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -155,6 +156,7 @@ LOG = structlog.get_logger()
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
+COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
@@ -612,6 +614,30 @@ async def _is_tel_digit_fix_enabled(task: Task) -> bool:
         return False
 
 
+async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
+    organization_id = task.organization_id
+    if not organization_id:
+        return False
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+    try:
+        return bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                COLLAPSE_SELECT_FANOUT_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate collapse-select-fanout flag; defaulting to disabled",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+
 async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
     # Compare digit counts only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator)
@@ -630,6 +656,191 @@ async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_n
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
     )
+
+
+def _select_option_target_value(option: SelectOption) -> str | None:
+    if option.label:
+        return option.label
+    if option.value:
+        return option.value
+    return None
+
+
+def _select_option_labels_and_values(options: list[SkyvernOptionType]) -> tuple[list[str], list[str | None]]:
+    labels: list[str] = []
+    values: list[str | None] = []
+    for option in options:
+        labels.append(option.get("text") or option.get("value") or "")
+        values.append(option.get("value"))
+    return labels, values
+
+
+def _normal_select_successful(action_results: list[ActionResult]) -> bool:
+    return any(isinstance(action_result, ActionSuccess) for action_result in action_results)
+
+
+def _select_value_is_ambiguous(options: list[SkyvernOptionType], value: str | None) -> bool:
+    if value is None:
+        return False
+    return sum(1 for option in options if option.get("value") == value) > 1
+
+
+async def _select_deterministic_normal_option(
+    *,
+    action: actions.SelectOptionAction,
+    skyvern_element: SkyvernElement,
+    locator: Locator,
+    matched_label: str | None,
+    matched_value: str | None,
+    matched_index: int | None,
+) -> list[ActionResult]:
+    action_result: list[ActionResult] = []
+    is_success = False
+
+    try:
+        await locator.click(
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.info(
+            "Failed to click before select action",
+            exc_info=True,
+            action=action,
+            locator=locator,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
+
+    value = matched_value if matched_value is not None else matched_label
+    if value is not None and not _select_value_is_ambiguous(skyvern_element.get_options(), value):
+        try:
+            await locator.select_option(
+                value=value,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
+            LOG.info(
+                "Failed to take select action by value",
+                exc_info=True,
+                action=action,
+                locator=locator,
+            )
+
+    if not is_success and matched_label is not None and matched_label != value:
+        try:
+            await locator.select_option(
+                label=matched_label,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
+            LOG.info(
+                "Failed to take select action by label",
+                exc_info=True,
+                action=action,
+                locator=locator,
+            )
+
+    if not is_success and matched_index is not None:
+        if matched_index >= len(skyvern_element.get_options()):
+            action_result.append(ActionFailure(OptionIndexOutOfBound(action.element_id)))
+            LOG.info(
+                "option index is out of bound",
+                action=action,
+                locator=locator,
+            )
+        else:
+            try:
+                await locator.select_option(
+                    index=matched_index,
+                    timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                )
+                is_success = True
+                action_result.append(ActionSuccess())
+            except Exception:
+                action_result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
+                LOG.info(
+                    "Failed to click on the option by index",
+                    exc_info=True,
+                    action=action,
+                    locator=locator,
+                )
+
+    if len(action_result) == 0:
+        action_result.append(ActionFailure(EmptySelect(element_id=action.element_id)))
+
+    return action_result
+
+
+async def _verify_normal_select_option(
+    *,
+    locator: Locator,
+    matched_index: int,
+    matched_label: str | None,
+    matched_value: str | None,
+) -> bool:
+    try:
+        selection = await locator.evaluate(
+            r"""
+            (select) => {
+                const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
+                if (!(select instanceof HTMLSelectElement)) {
+                    return { index: null, label: null, value: normalize(select?.value) };
+                }
+                const option = select.options[select.selectedIndex] ?? null;
+                return {
+                    index: select.selectedIndex,
+                    label: option ? normalize(option.textContent) : null,
+                    value: option ? normalize(option.value) : normalize(select.value),
+                };
+            }
+            """
+        )
+    except Exception:
+        LOG.info(
+            "Failed to read normal select option after deterministic selection",
+            expected_index=matched_index,
+            expected_label=matched_label,
+            expected_value=matched_value,
+            exc_info=True,
+        )
+        return False
+
+    if not isinstance(selection, dict):
+        LOG.info(
+            "Normal select read-back returned unexpected payload",
+            expected_index=matched_index,
+            expected_label=matched_label,
+            expected_value=matched_value,
+            actual_selection=selection,
+        )
+        return False
+
+    actual_index = selection.get("index")
+    actual_value = selection.get("value")
+    actual_label = selection.get("label") or actual_value
+    if (
+        actual_index == matched_index
+        and actual_label == matched_label
+        and (matched_value is None or actual_value == matched_value)
+    ):
+        return True
+
+    LOG.info(
+        "Normal select read-back did not match deterministic option",
+        expected_index=matched_index,
+        expected_label=matched_label,
+        expected_value=matched_value,
+        actual_index=actual_index,
+        actual_label=actual_label,
+        actual_value=actual_value,
+    )
+    return False
 
 
 async def check_date_format(
@@ -5487,7 +5698,10 @@ async def normal_select(
     step: Step,
     builder: ElementTreeBuilder,
 ) -> List[ActionResult]:
-    action.set_has_mini_agent()
+    collapse_select_fanout_enabled = await _is_collapse_select_fanout_enabled(task)
+    if not collapse_select_fanout_enabled:
+        action.set_has_mini_agent()
+
     try:
         current_text = await skyvern_element.get_attr("selected")
         if current_text and (current_text == action.option.label or current_text == action.option.value):
@@ -5510,7 +5724,46 @@ async def normal_select(
         context=input_or_select_context,
     )
 
-    await skyvern_element.refresh_select_options()
+    select_options_result = await skyvern_element.refresh_select_options()
+    select_options = select_options_result[0] if select_options_result else skyvern_element.get_options()
+    target_value = _select_option_target_value(action.option)
+    if target_value and select_options and collapse_select_fanout_enabled:
+        option_labels, option_values = _select_option_labels_and_values(select_options)
+        resolution = await app.AGENT_FUNCTION.resolve_field_option(
+            target_value=target_value,
+            option_labels=option_labels,
+            option_values=option_values,
+            field_context=input_or_select_context.model_dump(),
+            url=task.url,
+            organization_id=task.organization_id,
+        )
+        if not resolution.fallback_to_llm and resolution.matched_index is not None:
+            deterministic_result = await _select_deterministic_normal_option(
+                action=action,
+                skyvern_element=skyvern_element,
+                locator=locator,
+                matched_label=resolution.matched_label,
+                matched_value=resolution.matched_value,
+                matched_index=resolution.matched_index,
+            )
+            if _normal_select_successful(deterministic_result) and await _verify_normal_select_option(
+                locator=locator,
+                matched_index=resolution.matched_index,
+                matched_label=resolution.matched_label,
+                matched_value=resolution.matched_value,
+            ):
+                return deterministic_result
+
+            LOG.info(
+                "Deterministic normal-select failed; falling back to LLM path",
+                action=action,
+                target_value=target_value,
+                matched_index=resolution.matched_index,
+                matched_label=resolution.matched_label,
+            )
+
+    if collapse_select_fanout_enabled:
+        action.set_has_mini_agent()
     options_html = skyvern_element.build_HTML()
     field_information = (
         input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
