@@ -555,7 +555,7 @@ function NodeHeader({
       });
 
       if (studioEnabled) {
-        useStudioShellStore.getState().setTab("browser");
+        useStudioShellStore.getState().setTab("run");
         navigate(
           `/workflows/${workflowPermanentId}/studio?wr=${response.data.run_id}&bl=${encodeURIComponent(label)}`,
         );

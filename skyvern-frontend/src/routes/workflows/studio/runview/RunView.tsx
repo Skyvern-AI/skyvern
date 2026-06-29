@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Share1Icon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
-import { useSearchParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
@@ -14,6 +14,7 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
 import { cn } from "@/util/utils";
 
+import { useDebugSessionQuery } from "../../hooks/useDebugSessionQuery";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
@@ -47,6 +48,11 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(queryOptions);
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
+  const { workflowPermanentId } = useParams();
+  const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+    enabled: false,
+  });
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
@@ -115,31 +121,36 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
     );
   }, [pinnedFrameId, workflowRunId, setSearchParams]);
 
-  // Pin the resolved run into ?wr= while the Run tab shows it (an ?active=-only link
-  // becomes stable). Gated on the tab: RunView also mounts under Editor, no ?wr= there.
+  // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
+  // the tab: RunView also mounts under Editor, no ?wr= there.
+  //
+  // The guard reads the LIVE URL, not this render's searchParams: a block-run launch
+  // navigates to ?wr=&bl= via a separate router update, and the editor→run transition
+  // can fire this effect from a render whose searchParams closure predates it. Reading
+  // the live URL avoids writing the stale latest-run id back over the new run (which
+  // reverted ?wr= and dropped ?bl=, disabling the debug stream).
   useEffect(() => {
     if (studioTab !== "run") {
       return;
     }
-    const resolvedRunId = workflowRun?.workflow_run_id;
-    if (!resolvedRunId) {
+    if (!workflowRunId) {
+      return;
+    }
+    if (new URLSearchParams(window.location.search).get("wr")) {
       return;
     }
     setSearchParams(
       (prev) => {
-        if (prev.get("wr") === resolvedRunId && !prev.has("bl")) {
+        if (prev.get("wr")) {
           return prev;
         }
         const next = new URLSearchParams(prev);
-        next.set("wr", resolvedRunId);
-        // Viewing the run, not the block-run browser — drop stale ?bl= so a reload
-        // doesn't snap back to the Browser tab.
-        next.delete("bl");
+        next.set("wr", workflowRunId);
         return next;
       },
       { replace: true },
     );
-  }, [studioTab, workflowRun, setSearchParams]);
+  }, [studioTab, workflowRunId, setSearchParams]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
 
@@ -148,6 +159,15 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
+  // A block run executes in the debug session; on the Run tab show that same live
+  // debug stream (the shared node) instead of a separate run stream — but only when
+  // the run's browser session IS the current debug session. A historical block-run
+  // link whose debug session is gone/different falls back to the normal run view.
+  const showDebugStream =
+    studioTab === "run" &&
+    searchParams.has("bl") &&
+    workflowRun?.browser_session_id != null &&
+    workflowRun.browser_session_id === debugSession?.browser_session_id;
 
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
   const shownFrame =
@@ -246,6 +266,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
             workflowRunId={workflowRun.workflow_run_id}
             shownFrame={shownFrame}
             running={running}
+            showDebugStream={showDebugStream}
             provisioning={
               workflowRun.status === Status.Created ||
               workflowRun.status === Status.Queued
