@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import quote
 
 import pyotp
 import pytest
@@ -53,6 +54,11 @@ def _mock_totp_preview_dependencies(
     )
     mock_credentials = SimpleNamespace(get_credential=AsyncMock(return_value=db_credential))
     monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
+    )
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
 
     return db_credential, vault_service, mock_credentials
@@ -104,6 +110,23 @@ def test_authenticator_totp_validation_preserves_uri_configuration() -> None:
         username="user@example.com",
         password="pw",
         totp=totp_uri,
+        totp_type=TotpType.AUTHENTICATOR,
+    )
+
+    credentials._normalize_authenticator_totp_or_raise(credential)
+
+    assert credential.totp == totp_uri
+
+
+def test_authenticator_totp_validation_preserves_decoded_uri_configuration() -> None:
+    totp_uri = (
+        "otpauth://totp/Example:user@example.com"
+        "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+    )
+    credential = NonEmptyPasswordCredential(
+        username="user@example.com",
+        password="pw",
+        totp=quote(totp_uri, safe=""),
         totp_type=TotpType.AUTHENTICATOR,
     )
 
