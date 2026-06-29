@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -40,6 +40,7 @@ _MISSING_EVIDENCE_MAX_CHARS = 500
 _MAX_BLOCK_OUTPUTS = 20
 _MAX_TRACE_VERDICTS = 8
 _REASON_CODES = frozenset({"evidence_confirms", "no_evidence", "evidence_contradicts", "unknown"})
+_STRUCTURAL_ABSTENTION_REASON_CODE = "structurally_abstained"
 _CONTINGENT_ABSTENTION_REASON_CODES = frozenset(
     {"unknown", "no_evidence", "evidence_contradicts", "missing_exact_field", "unproducible"}
 )
@@ -78,6 +79,10 @@ class CriterionVerdict:
     reason_code: str
     evidence_ref: str | None = None
     missing_evidence: str | None = None
+    output_path: str | None = None
+    grounding_mode: Literal["exact_value", "shape", "missing"] | None = None
+    expected_output_shape: str | None = None
+    has_exact_value: bool = False
 
     @property
     def satisfied(self) -> bool:
@@ -119,6 +124,8 @@ class CompletionVerificationResult:
                 self.structural_unfired_criterion_ids,
             ):
                 continue
+            if verdict is not None and _is_structural_requested_output_abstention(verdict):
+                continue
             return False
         return satisfied_run_plane_count > 0
 
@@ -133,7 +140,9 @@ class CompletionVerificationResult:
         unmet = [
             verdict
             for verdict in self.verdicts
-            if not verdict.satisfied and not self.is_structural_contingent_abstention(verdict)
+            if not verdict.satisfied
+            and not self.is_structural_contingent_abstention(verdict)
+            and not _is_structural_requested_output_abstention(verdict)
         ]
         missing_evidence: list[str] = []
         for verdict in unmet:
@@ -162,6 +171,19 @@ class CompletionVerificationResult:
             data[f"{prefix}_state"] = verdict.state
             data[f"{prefix}_satisfied"] = verdict.satisfied
             data[f"{prefix}_reason_code"] = verdict.reason_code
+            if verdict.output_path:
+                data[f"{prefix}_output_path"] = verdict.output_path
+            if verdict.grounding_mode:
+                data[f"{prefix}_grounding_mode"] = verdict.grounding_mode
+            if verdict.expected_output_shape:
+                data[f"{prefix}_expected_output_shape"] = verdict.expected_output_shape
+            if (
+                verdict.output_path
+                or verdict.grounding_mode
+                or verdict.expected_output_shape
+                or verdict.has_exact_value
+            ):
+                data[f"{prefix}_has_exact_value"] = verdict.has_exact_value
             if contingent_on := self.contingent_on_by_criterion_id.get(verdict.criterion_id):
                 data[f"{prefix}_contingent_on"] = contingent_on
             if contingent_path := self.contingent_antecedent_output_path_by_criterion_id.get(verdict.criterion_id):
@@ -172,7 +194,12 @@ class CompletionVerificationResult:
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
-            detail = None if self.is_structural_contingent_abstention(verdict) else verdict_missing_evidence(verdict)
+            detail = (
+                None
+                if self.is_structural_contingent_abstention(verdict)
+                or _is_structural_requested_output_abstention(verdict)
+                else verdict_missing_evidence(verdict)
+            )
             if detail:
                 data[f"{prefix}_missing_evidence"] = detail
         return data
@@ -398,7 +425,7 @@ def _field_aliases_for_output_path(path: str) -> tuple[str, str]:
     return field, f"{field}_output"
 
 
-def _find_structured_field_values(value: Any, field_names: set[str]) -> Iterable[Any]:
+def _find_structured_field_values(value: Any, field_names: Collection[str]) -> Iterable[Any]:
     if isinstance(value, dict):
         for key, item in value.items():
             if isinstance(key, str) and key in field_names:
@@ -424,12 +451,75 @@ def structural_unfired_contingent_criterion_ids(
             if key in field_names:
                 values.append(value)
             values.extend(_find_structured_field_values(value, field_names))
+        if _is_blocker_contingent_criterion(criterion):
+            if _has_real_blocker_evidence(snapshot):
+                continue
+            if _has_structural_no_blocker_evidence(snapshot):
+                unfired_ids.append(criterion.id)
+                continue
         if not values:
             continue
         if any(_is_meaningful_contingent_antecedent_value(value) for value in values):
             continue
         unfired_ids.append(criterion.id)
     return unfired_ids
+
+
+def _is_blocker_contingent_criterion(criterion: CompletionCriterion) -> bool:
+    path = criterion.contingent_antecedent_output_path
+    if path is None:
+        return False
+    return _output_path_field(path) in {"blocker", "manual_service_blocker"}
+
+
+_BLOCKER_FIELDS = frozenset({"blocker", "blocker_output", "manual_service_blocker", "manual_service_blocker_output"})
+
+
+def _blocker_family_values(snapshot: RunEvidenceSnapshot) -> list[Any]:
+    values: list[Any] = []
+    for key, value in snapshot.block_outputs.items():
+        if key in _BLOCKER_FIELDS:
+            values.append(value)
+        values.extend(_find_structured_field_values(value, _BLOCKER_FIELDS))
+    return values
+
+
+def _has_real_blocker_evidence(snapshot: RunEvidenceSnapshot) -> bool:
+    return any(_is_real_blocker_evidence(value) for value in _blocker_family_values(snapshot))
+
+
+def _is_real_blocker_evidence(value: Any) -> bool:
+    return _is_meaningful_contingent_antecedent_value(value) and not _is_structural_no_blocker_marker(value)
+
+
+def _has_structural_no_blocker_evidence(snapshot: RunEvidenceSnapshot) -> bool:
+    for value in _blocker_family_values(snapshot):
+        if _is_structural_no_blocker_marker(value):
+            return True
+    return False
+
+
+def _is_structural_no_blocker_marker(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(value.casefold().split())
+    return normalized in {
+        "",
+        "none",
+        "null",
+        "false",
+        "no",
+        "n/a",
+        "na",
+        "no blocker",
+        "no blockers",
+        "none found",
+        "not blocked",
+    }
 
 
 def _coerce_result(
@@ -1575,6 +1665,10 @@ _DEFINITION_REASON_PREFIX = "definition_"
 
 def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
+
+
+def _is_structural_requested_output_abstention(verdict: CriterionVerdict) -> bool:
+    return verdict.state == "unsatisfied" and verdict.reason_code == _STRUCTURAL_ABSTENTION_REASON_CODE
 
 
 def _is_contingent_abstention(
