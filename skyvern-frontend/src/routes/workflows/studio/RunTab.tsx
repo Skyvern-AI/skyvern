@@ -1,4 +1,4 @@
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { useStudioShellStore } from "@/store/StudioShellStore";
 
@@ -13,6 +13,7 @@ import { useStudioRunId } from "./useStudioRunId";
 export function RunTab() {
   const navigate = useNavigate();
   const urlRunId = useStudioRunId();
+  const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
   const setCopilotCollapsed = useStudioShellStore((s) => s.setCopilotCollapsed);
   const { data: runs } = useWorkflowRunsQuery({
@@ -21,12 +22,19 @@ export function RunTab() {
     pageSize: 1,
   });
   const runId = urlRunId ?? runs?.[0]?.workflow_run_id;
+  // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
+  // so suppress that CTA for block runs (the block is rerun from the editor).
+  const isBlockRun = searchParams.has("bl");
 
   return (
     <RunView
       workflowRunId={runId}
       onFix={() => setCopilotCollapsed(false)}
-      onRetry={() => navigate(`/workflows/${workflowPermanentId}/run`)}
+      onRetry={
+        isBlockRun
+          ? undefined
+          : () => navigate(`/workflows/${workflowPermanentId}/run`)
+      }
     />
   );
 }

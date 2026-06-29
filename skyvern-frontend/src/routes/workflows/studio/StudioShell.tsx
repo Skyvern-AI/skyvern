@@ -16,6 +16,7 @@ import {
   STUDIO_COPILOT_TRANSITION_EASE,
   STUDIO_COPILOT_TRANSITION_MS,
   STUDIO_COPILOT_WIDTH,
+  initialStudioTab,
   studioPanelId,
   studioTabId,
 } from "./constants";
@@ -49,19 +50,24 @@ export function StudioShell(props: StudioWorkspaceProps) {
   );
   const [browserStreamSlot, setBrowserStreamSlot] =
     useState<HTMLElement | null>(null);
+  const [runStreamSlot, setRunStreamSlot] = useState<HTMLElement | null>(null);
   const [streamHolderEl, setStreamHolderEl] = useState<HTMLElement | null>(
     null,
   );
 
-  // Move the persistent stream node into the showing surface (PiP / Browser tab),
-  // parking it in the offscreen holder otherwise so the socket stays warm.
+  // Move the persistent stream node into the showing surface (PiP / Browser tab /
+  // Run tab for a block run), parking it in the offscreen holder otherwise so the
+  // socket stays warm. runStreamSlot is registered only for a block run, so a full
+  // run on the Run tab falls through to the holder and keeps its own RunLiveStream.
   useLayoutEffect(() => {
     const activeSlot =
       tab === "browser"
         ? browserStreamSlot
         : tab === "editor" && !pipMinimized
           ? editorStreamSlot
-          : null;
+          : tab === "run"
+            ? runStreamSlot
+            : null;
     const dest = activeSlot ?? streamHolderEl;
     if (dest && streamHostEl.parentElement !== dest) {
       // BrowserStream re-asserts scaleViewport on its own resize, so it rescales
@@ -73,12 +79,18 @@ export function StudioShell(props: StudioWorkspaceProps) {
     pipMinimized,
     editorStreamSlot,
     browserStreamSlot,
+    runStreamSlot,
     streamHolderEl,
     streamHostEl,
   ]);
 
   const shellContextValue = useMemo(
-    () => ({ copilotPortalEl, setEditorStreamSlot, setBrowserStreamSlot }),
+    () => ({
+      copilotPortalEl,
+      setEditorStreamSlot,
+      setBrowserStreamSlot,
+      setRunStreamSlot,
+    }),
     [copilotPortalEl],
   );
 
@@ -86,7 +98,6 @@ export function StudioShell(props: StudioWorkspaceProps) {
   // later URL writes (the Run tab writes ?wr=/?active=) or it fights manual switches.
   const [searchParams] = useSearchParams();
   const deepLinkRunId = searchParams.get("wr");
-  const deepLinkBlockLabel = searchParams.get("bl");
   const deepLinkActive = searchParams.get("active");
   const initialTabAppliedRef = useRef(false);
   useEffect(() => {
@@ -94,16 +105,8 @@ export function StudioShell(props: StudioWorkspaceProps) {
       return;
     }
     initialTabAppliedRef.current = true;
-    if (deepLinkRunId && deepLinkBlockLabel) {
-      setTab("browser");
-      return;
-    }
-    if (deepLinkRunId || deepLinkActive) {
-      setTab("run");
-      return;
-    }
-    setTab("editor");
-  }, [deepLinkRunId, deepLinkBlockLabel, deepLinkActive, setTab]);
+    setTab(initialStudioTab({ runId: deepLinkRunId, active: deepLinkActive }));
+  }, [deepLinkRunId, deepLinkActive, setTab]);
 
   const copilotWidth = copilotCollapsed
     ? STUDIO_COPILOT_RAIL_WIDTH

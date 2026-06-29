@@ -14,6 +14,7 @@ import { cn } from "@/util/utils";
 
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { FilmstripFrame } from "../runProjections";
+import { useStudioShellContext } from "../StudioShellContext";
 import { HeroRecording } from "./HeroRecording";
 import { HeroScreenshot } from "./HeroScreenshot";
 import { RunLiveStream } from "./RunLiveStream";
@@ -22,6 +23,9 @@ type RunHeroProps = {
   workflowRunId: string;
   shownFrame: FilmstripFrame | null;
   running: boolean;
+  // A block run shows the shared debug-session stream (re-parented in by the
+  // shell), view-only, instead of mounting a separate run stream.
+  showDebugStream: boolean;
   provisioning: boolean;
   isPaused: boolean;
   failed: boolean;
@@ -73,6 +77,7 @@ export function RunHero({
   workflowRunId,
   shownFrame,
   running,
+  showDebugStream,
   provisioning,
   isPaused,
   failed,
@@ -93,27 +98,37 @@ export function RunHero({
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const codeOpen = useRunViewStore((s) => s.codeOpen);
   const setCodeOpen = useRunViewStore((s) => s.setCodeOpen);
+  const { setRunStreamSlot } = useStudioShellContext();
 
   // The live page URL comes from the stream frames (CDP); reset per run.
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  // Block runs default to the live debug stream; this opts into the recording.
+  const [recordingOpen, setRecordingOpen] = useState(false);
   useEffect(() => {
     setStreamUrl(null);
+    setRecordingOpen(false);
   }, [workflowRunId]);
 
   const scrubbing = pinnedFrameId != null && pinnedFrameId !== "stream";
   const hasRecording = recordingUrls.length > 0;
 
-  // A failed run defaults to its last screenshot so the fix/retry CTA is
-  // visible; otherwise a finished run defaults to the recording.
+  // A block run keeps the live debug stream as its default view (while running and
+  // once parked on the final page), unless the user scrubs, opens code, or the
+  // recording. A full run shows its live stream only while running, then the
+  // recording or its last screenshot.
   const center: CenterView = codeOpen
     ? "code"
-    : running && !scrubbing
-      ? "stream"
-      : scrubbing
-        ? "screenshot"
-        : hasRecording && !failed
+    : scrubbing
+      ? "screenshot"
+      : showDebugStream
+        ? recordingOpen && hasRecording
           ? "recording"
-          : "screenshot";
+          : "stream"
+        : running
+          ? "stream"
+          : hasRecording && !failed
+            ? "recording"
+            : "screenshot";
 
   const headerLabel =
     center === "stream"
@@ -145,7 +160,34 @@ export function RunHero({
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {running ? (
+          {showDebugStream ? (
+            <>
+              <ViewToggle
+                active={center === "stream"}
+                onClick={() => {
+                  setRecordingOpen(false);
+                  pinFrame("stream");
+                }}
+                icon={
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
+                }
+              >
+                Live
+              </ViewToggle>
+              {hasRecording ? (
+                <ViewToggle
+                  active={center === "recording"}
+                  onClick={() => {
+                    setRecordingOpen(true);
+                    jumpToLive();
+                  }}
+                  icon={<PlayIcon className="h-3 w-3" />}
+                >
+                  Recording
+                </ViewToggle>
+              ) : null}
+            </>
+          ) : running ? (
             <ViewToggle
               active={center === "stream"}
               onClick={() => pinFrame("stream")}
@@ -213,7 +255,17 @@ export function RunHero({
             />
           </div>
         ) : center === "stream" ? (
-          provisioning ? (
+          showDebugStream ? (
+            // The shell re-parents the persistent debug-session stream into this
+            // slot (the same node as the Browser tab), so a block run shows its
+            // live browser here, view-only. The slot unmounts when the user scrubs
+            // or opens code/recording, which parks the node back offscreen.
+            <div
+              ref={setRunStreamSlot}
+              data-testid="run-stream-slot"
+              className="absolute inset-0"
+            />
+          ) : provisioning ? (
             // Mounting the stream while the run is still queued opens a socket
             // the backend never feeds; wait until the run is actually running.
             <div className="absolute inset-0">
@@ -256,10 +308,13 @@ export function RunHero({
             <span className="truncate">
               Inspecting step · <b>{shownFrame.label}</b>
             </span>
-            {running ? (
+            {running || showDebugStream ? (
               <button
                 type="button"
-                onClick={() => pinFrame("stream")}
+                onClick={() => {
+                  setRecordingOpen(false);
+                  pinFrame("stream");
+                }}
                 className="ml-1 inline-flex items-center gap-1.5 rounded-full bg-white/15 px-2 py-0.5 text-[11px] hover:bg-white/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white"
               >
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
@@ -278,7 +333,10 @@ export function RunHero({
           </div>
         ) : null}
 
-        {center === "screenshot" && failed && !scrubbing ? (
+        {failed &&
+        !scrubbing &&
+        (center === "screenshot" ||
+          (showDebugStream && center === "stream")) ? (
           <div className="absolute inset-x-0 bottom-0 m-4 rounded-lg border border-destructive/40 bg-slate-elevation1/95 p-4 shadow-lg backdrop-blur">
             <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
               <ExclamationTriangleIcon className="h-4 w-4 text-destructive" />
