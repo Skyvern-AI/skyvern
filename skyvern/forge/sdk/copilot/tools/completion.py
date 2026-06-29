@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_registered_download_criteria,
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
+    is_fallback_floor_base_criterion,
     is_registered_download_completion_criterion,
     registered_download_completion_criterion,
     structural_unfired_contingent_criterion_ids,
@@ -67,6 +68,14 @@ LOG = structlog.get_logger()
 
 _TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
 _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+_VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT = (
+    " For validation-only pre-submit Review pages, do not repair by returning only booleans such as "
+    "pre_submit_review_reached, submit_control_visible, submit_or_finalize_clicked, or per-field *_verified flags. "
+    "The Review block output must include an explicit validation-only marker such as `validation_only: true` or "
+    '`submit_mode: "validation_only"`, `review_values` or `review_fields` as visible Review-page label/value '
+    "strings, `evidence_text` containing the visible Review-page text that verbatim contains those values, and an "
+    "explicit false submit/finalize-click signal. Stop on the Review page; do not click Submit/Finalize."
+)
 
 
 def _completion_request_policy(copilot_ctx: Any) -> Any | None:
@@ -745,6 +754,35 @@ def _merge_run_verdicts_if_requested_output_exists(
     )
 
 
+def _filter_judged_fallback_floor_satisfaction(
+    run_criteria: list[CompletionCriterion],
+    judged_result: CompletionVerificationResult,
+    deterministic_result: CompletionVerificationResult | None,
+) -> list[CriterionVerdict]:
+    deterministic_satisfied_ids = {
+        verdict.criterion_id
+        for verdict in (deterministic_result.verdicts if deterministic_result is not None else [])
+        if verdict.satisfied
+    }
+    fallback_floor_ids = {criterion.id for criterion in run_criteria if is_fallback_floor_base_criterion(criterion)}
+    verdicts: list[CriterionVerdict] = []
+    for verdict in judged_result.verdicts:
+        if verdict.criterion_id in fallback_floor_ids and verdict.satisfied:
+            if verdict.criterion_id in deterministic_satisfied_ids:
+                verdicts.append(verdict)
+            else:
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=verdict.criterion_id,
+                        state="unsatisfied",
+                        reason_code="no_evidence",
+                    )
+                )
+            continue
+        verdicts.append(verdict)
+    return verdicts
+
+
 def _run_criteria_for_verdicts(
     run_criteria: list[CompletionCriterion], *verdict_groups: list[CriterionVerdict]
 ) -> list[CompletionCriterion]:
@@ -1012,7 +1050,13 @@ async def _maybe_run_completion_verification(
                 verdicts = list(requested_output_verdicts)
                 if deterministic_result is not None:
                     verdicts.extend(deterministic_result.verdicts)
-                verdicts.extend(judged_result.verdicts)
+                verdicts.extend(
+                    _filter_judged_fallback_floor_satisfaction(
+                        judgeable_run_criteria,
+                        judged_result,
+                        deterministic_result,
+                    )
+                )
                 run_result = CompletionVerificationResult(
                     status="evaluated",
                     criterion_ids=[criterion.id for criterion in run_criteria],
@@ -1061,11 +1105,13 @@ def _outcome_unverified_reason(
         criteria: list[CompletionCriterion] = list(policy.completion_criteria) if policy is not None else []
         known_good = _known_good_revision_hint(copilot_ctx)
         missing_detail = _missing_evidence_detail(completion_verification, criteria)
+        validation_review_hint = _validation_review_output_contract_hint(completion_verification, criteria)
         if missing_detail:
             return (
                 "The run completed but did not demonstrate the goal outcome(s). "
                 f"Missing evidence: {missing_detail}. "
-                f"Add or fix the block that produces the missing outcome evidence, then re-run.{known_good}"
+                "Add or fix the block that produces the missing outcome evidence, then "
+                f"re-run.{validation_review_hint}{known_good}"
             )
         unmet = summarize_unsatisfied_outcomes(completion_verification, criteria)
         detail = f": {unmet}" if unmet else ""
@@ -1073,7 +1119,7 @@ def _outcome_unverified_reason(
         return (
             f"The run completed but did not demonstrate the goal outcome(s){detail}. "
             "Add or fix the block that produces the missing outcome evidence, "
-            f"then re-run.{known_good}"
+            f"then re-run.{validation_review_hint}{known_good}"
         )
     # An 'unavailable' result reaches here only when verification was required;
     # fail closed and ask for a re-run rather than claim an unverified success.
@@ -1090,6 +1136,19 @@ def _known_good_revision_hint(copilot_ctx: Any) -> str:
             " A previously tested revision of this workflow satisfied every criterion; if repairs regress "
             "working blocks, prefer restoring that revision over rewriting them."
         )
+    return ""
+
+
+def _validation_review_output_contract_hint(
+    completion_verification: CompletionVerificationResult, criteria: list[CompletionCriterion]
+) -> str:
+    fallback_floor_ids = {criterion.id for criterion in criteria if is_fallback_floor_base_criterion(criterion)}
+    if not fallback_floor_ids:
+        return ""
+    for verdict in completion_verification.verdicts:
+        if verdict.criterion_id in fallback_floor_ids and verdict.state == "unsatisfied":
+            if verdict.reason_code == "no_evidence":
+                return _VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT
     return ""
 
 

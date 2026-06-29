@@ -81,6 +81,8 @@ from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_con
 from skyvern.forge.sdk.copilot.enforcement import (
     artifact_health_blocked,
     outcome_fully_verified,
+    synthesized_persistence_reopened_after_failed_run,
+    synthesized_trajectory_is_goal_complete,
     verified_goal_claim_authorized,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
@@ -722,7 +724,8 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="policy_not_code_only_browser")
         return ""
-    if ctx.update_workflow_called:
+    reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
+    if ctx.update_workflow_called and not reopened_after_failed_run:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
         return ""
     if not ctx.scout_trajectory:
@@ -730,7 +733,13 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         return ""
     trajectory_len = len(ctx.scout_trajectory)
     previous_offer_len = ctx.synthesized_block_offered_trajectory_len
-    if ctx.synthesized_block_offered and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD:
+    trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    if (
+        ctx.synthesized_block_offered
+        and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+        and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
+        and not reopened_after_failed_run
+    ):
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
             reason="already_offered",
@@ -751,6 +760,9 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         return ""
     ctx.synthesized_block_offered = True
     ctx.synthesized_block_offered_trajectory_len = trajectory_len
+    ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete
+    if reopened_after_failed_run:
+        ctx.synthesized_block_reopened_after_failed_run = True
     LOG.info(
         "copilot_synthesized_block_offer_rendered",
         trajectory_len=trajectory_len,

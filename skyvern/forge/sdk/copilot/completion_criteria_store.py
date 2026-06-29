@@ -18,7 +18,9 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     CriterionKind,
+    ExpectedOutputShape,
     TerminalActionFamily,
+    _coerce_expected_output_shape,
     _normalize_contingent_antecedent_output_path,
     _normalize_deliverable_kind,
     is_fallback_floor_criterion,
@@ -123,6 +125,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
             "output_path": criterion.output_path,
+            "expected_output_value": criterion.expected_output_value,
+            "expected_output_shape": criterion.expected_output_shape,
             "kind": criterion.kind,
             "terminal_action_family": criterion.terminal_action_family,
         }
@@ -143,6 +147,8 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             continue
         level = item.get("level")
         output_path = item.get("output_path")
+        expected_output_value = item.get("expected_output_value")
+        expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
         contingent_on = item.get("contingent_on")
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
@@ -166,6 +172,10 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
                 output_path=output_path.strip() if isinstance(output_path, str) and output_path.strip() else None,
+                expected_output_value=expected_output_value.strip()
+                if isinstance(expected_output_value, str) and expected_output_value.strip()
+                else None,
+                expected_output_shape=cast(ExpectedOutputShape | None, expected_output_shape),
                 kind=cast(CriterionKind, kind),
                 terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
             )
@@ -177,11 +187,15 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     deliverable_kind_key = criterion.deliverable_kind or ""
+    expected_output_value_key = criterion.expected_output_value or ""
+    expected_output_shape_key = criterion.expected_output_shape or ""
     if criterion.output_path:
         return (
             f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
             f"\x1fdeliverable_kind:{deliverable_kind_key}"
             f"\x1foutput_path:{criterion.output_path}"
+            f"\x1fexpected_output_value:{expected_output_value_key}"
+            f"\x1fexpected_output_shape:{expected_output_shape_key}"
         )
     return (
         f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
@@ -203,7 +217,7 @@ _REQUESTED_OUTPUT_WORDS = frozenset(
 )
 _REQUESTED_OUTPUT_FIELD_TOKENS = frozenset(
     "address addresses date dates email emails id identifier identifiers license licenses location locations name names "
-    "npi number numbers phone phones result specialties specialty status statuses taxonomy".split()
+    "npi number numbers owner owners phone phones result specialties specialty status statuses taxonomy".split()
 )
 _GENERIC_PROFILE_MARKERS = (
     "profile details",

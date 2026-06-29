@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.enforcement import (
     register_no_progress_interaction_click,
+    synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
 )
 from skyvern.forge.sdk.copilot.loop_detection import (
@@ -75,6 +76,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "reached_download_target",
     "synthesized_block_offered",
     "synthesized_block_offered_trajectory_len",
+    "synthesized_block_offered_goal_complete",
     "consecutive_no_progress_interaction_count",
 )
 
@@ -313,6 +315,22 @@ class SkyvernOverlayMCPServer(MCPServer):
                     tool_name=tool_name,
                 )
                 return _copilot_to_call_tool_result({"ok": False, "error": terminal_challenge_payload})
+
+        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name)
+        if persistence_signal is not None:
+            LOG.warning(
+                "Synthesized block persistence required before MCP tool",
+                tool_name=tool_name,
+                synthesized_block_offered_trajectory_len=getattr(
+                    copilot_ctx,
+                    "synthesized_block_offered_trajectory_len",
+                    None,
+                ),
+            )
+            payload = stash_blocker_signal(copilot_ctx, persistence_signal)
+            result = {"ok": False, "error": payload}
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
+            return _copilot_to_call_tool_result(result)
 
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:

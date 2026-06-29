@@ -1978,7 +1978,10 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=131072,
+            # MiMo v2.5 is a reasoning model; uncapped it emits 100k+ reasoning/output
+            # tokens (multi-minute calls) on short prompts. Cap output + reasoning effort.
+            max_completion_tokens=16384,
+            reasoning_effort="low",
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
