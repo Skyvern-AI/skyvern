@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from skyvern.forge.sdk.copilot.context import ObservedPage, StructuredContext, _merge_observed_acted_pages
+from skyvern.forge.sdk.copilot.context import (
+    LoadedResultTargetContext,
+    ObservedPage,
+    StructuredContext,
+    _merge_observed_acted_pages,
+    finalize_discovery_counter_in_global_llm_context,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
+)
+from skyvern.forge.sdk.copilot.result_evidence import (
+    loaded_result_composition_evidence_from_page,
+    loaded_result_target_structure_signature,
+)
 
 
 def test_merge_turn_summary_caps_urls_visited() -> None:
@@ -69,6 +83,205 @@ def test_resolved_credential_ids_survive_context_roundtrip() -> None:
     rehydrated = StructuredContext.from_json_str(ctx.to_json_str())
 
     assert [check.credential_id for check in rehydrated.credentials_checked] == ["cred_amazon"]
+
+
+def test_loaded_result_targets_roundtrip_without_selector_fields_or_legacy_signature() -> None:
+    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
+    ctx = StructuredContext(
+        loaded_result_targets=[
+            LoadedResultTargetContext(
+                selector="#results",
+                is_table=True,
+                row_selector="tr.statement",
+                row_count=2,
+                structure_signature="legacy-selector-derived-sig",
+            )
+        ]
+    )
+
+    raw = ctx.to_json_str()
+    rehydrated = StructuredContext.from_json_str(ctx.to_json_str())
+
+    assert "#results" not in raw
+    assert "tr.statement" not in raw
+    assert "legacy-selector-derived-sig" not in raw
+    assert rehydrated.loaded_result_targets == [
+        LoadedResultTargetContext(
+            is_table=True,
+            row_count=2,
+            structure_signature=expected_signature,
+        )
+    ]
+
+
+def test_sanitize_global_llm_context_strips_loaded_result_selectors_and_recomputes_legacy_signature() -> None:
+    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
+    raw = json.dumps(
+        {
+            "user_goal": "extract loaded results",
+            "loaded_result_targets": [
+                {
+                    "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
+                    "is_table": True,
+                    "row_selector": 'tr[data-account="987654321"]',
+                    "row_count": 2,
+                    "sample_rows": ["Jane Customer account 123456"],
+                    "structure_signature": "legacy-selector-derived-sig",
+                }
+            ],
+        }
+    )
+
+    sanitized = sanitize_global_llm_context_for_prompt(raw)
+
+    assert "Jane" not in sanitized
+    assert "Customer" not in sanitized
+    assert "123456" not in sanitized
+    assert "987654321" not in sanitized
+    assert "legacy-selector-derived-sig" not in sanitized
+    payload = json.loads(sanitized)
+    assert payload["loaded_result_targets"] == [
+        {
+            "is_table": True,
+            "row_count": 2,
+            "structure_signature": expected_signature,
+        }
+    ]
+
+
+def test_sanitize_global_llm_context_recomputes_legacy_signature_without_selector_keys() -> None:
+    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
+    raw = json.dumps(
+        {
+            "user_goal": "extract loaded results",
+            "loaded_result_targets": [
+                {
+                    "is_table": True,
+                    "row_count": 2,
+                    "structure_signature": "legacy-selector-derived-sig",
+                }
+            ],
+        }
+    )
+
+    sanitized = sanitize_global_llm_context_for_prompt(raw)
+
+    assert "legacy-selector-derived-sig" not in sanitized
+    payload = json.loads(sanitized)
+    assert payload["loaded_result_targets"] == [
+        {
+            "is_table": True,
+            "row_count": 2,
+            "structure_signature": expected_signature,
+        }
+    ]
+
+
+def test_finalize_context_persists_latest_loaded_result_targets_sanitizes_selectors() -> None:
+    selector = '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]'
+    row_selector = 'tr[data-account="987654321"]'
+    pii_steer = loaded_result_composition_evidence_from_page(
+        {
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": selector,
+                    "row_selector": row_selector,
+                    "row_count": 2,
+                    "sample_rows": ["May 2026 $42.00"],
+                    "text": "Statement results",
+                    "evidence_source": "evaluate",
+                    "observation_id": "obs-1",
+                }
+            ]
+        }
+    )
+    generic_steer = loaded_result_composition_evidence_from_page(
+        {
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": "#results",
+                    "row_selector": "tr.statement",
+                    "row_count": 2,
+                    "sample_rows": ["May 2026 $42.00"],
+                    "text": "Statement results",
+                    "evidence_source": "evaluate",
+                    "observation_id": "obs-1",
+                }
+            ]
+        }
+    )
+    assert pii_steer is not None
+    assert generic_steer is not None
+    assert pii_steer.structure_signature == generic_steer.structure_signature
+    assert pii_steer.targets[0].structure_signature == generic_steer.targets[0].structure_signature
+
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=pii_steer,
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
+
+    assert raw is not None
+    assert selector not in raw
+    assert row_selector not in raw
+    assert "Jane" not in raw
+    assert "Customer" not in raw
+    assert "123456" not in raw
+    assert "987654321" not in raw
+    assert "May 2026 $42.00" not in raw
+    assert "Statement results" not in raw
+    assert "evaluate" not in raw
+    assert "obs-1" not in raw
+    persisted_target = json.loads(raw)["loaded_result_targets"][0]
+    assert persisted_target == {
+        "is_table": True,
+        "row_count": 2,
+        "structure_signature": generic_steer.targets[0].structure_signature,
+    }
+    structured = StructuredContext.from_json_str(raw)
+    assert structured.loaded_result_targets == [
+        LoadedResultTargetContext(
+            is_table=True,
+            row_count=2,
+            structure_signature=generic_steer.targets[0].structure_signature,
+        )
+    ]
+
+
+def test_finalize_context_clears_stale_loaded_result_targets_when_no_current_steer() -> None:
+    stale_context = StructuredContext(
+        user_goal="extract loaded results",
+        loaded_result_targets=[
+            LoadedResultTargetContext(
+                is_table=True,
+                row_count=2,
+                structure_signature=loaded_result_target_structure_signature(is_table=True, row_count=2),
+            )
+        ],
+    )
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=1,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, stale_context.to_json_str())
+
+    assert raw is not None
+    payload = json.loads(raw)
+    assert payload["loaded_result_targets"] == []
+    assert StructuredContext.from_json_str(raw).loaded_result_targets == []
+    assert render_loaded_result_context_for_prompt(raw) == ""
 
 
 def test_merge_turn_summary_falls_back_to_summary_without_structured_credentials() -> None:

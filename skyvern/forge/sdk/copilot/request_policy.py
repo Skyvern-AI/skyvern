@@ -14,7 +14,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.secret_redaction import (
@@ -1243,6 +1243,7 @@ async def _classify_request(
     # can distinguish unsafe secret use from redacted draft/spec conversion.
     # Timeout and exception fallbacks remain conservative blocks below.
     safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
@@ -1253,7 +1254,7 @@ async def _classify_request(
         latest_prior_user_turn=transcript.latest_prior_user_turn,
         latest_assistant_turn=transcript.latest_assistant_turn,
         retained_history=transcript.retained_history,
-        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)[:2048]),
+        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
         active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
     )
     raw, failure_kind, retry_count = await _run_request_policy_classifier(handler, prompt)

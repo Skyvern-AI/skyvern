@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -398,6 +399,44 @@ class TestActiveCriteriaPromptAnchor:
             handler=_capture_handler(captured),
         )
         assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]
+
+
+class TestLoadedResultContextPromptSanitization:
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_sanitizes_loaded_result_context_before_prompt(self) -> None:
+        captured: dict[str, str] = {}
+        raw_context = json.dumps(
+            {
+                "loaded_result_targets": [
+                    {
+                        "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
+                        "is_table": True,
+                        "row_selector": 'tr[data-account="987654321"]',
+                        "row_count": 2,
+                        "structure_signature": "legacy-selector-derived-sig",
+                    }
+                ]
+            }
+        )
+
+        await _classify_request(
+            user_message="build from the loaded results",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=raw_context,
+            handler=_capture_handler(captured),
+        )
+
+        prompt = captured["prompt"]
+        for value in (
+            "Jane",
+            "Customer",
+            "123456",
+            "987654321",
+            "legacy-selector-derived-sig",
+        ):
+            assert value not in prompt
+        assert '"row_count": 2' in prompt
 
 
 class TestClassifierFallbackCompletionCriteria:
