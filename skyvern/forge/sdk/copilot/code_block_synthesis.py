@@ -1059,6 +1059,7 @@ def build_artifact_metadata_skeleton(
                 "covered_criteria": [_FILL_CRITERION_ID],
                 "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
                 "extraction_schema": _FILL_EXTRACTION_SCHEMA,
+                "extraction_schema_provenance": "self_authored",
                 "observation_refs": [observation_ref_id],
             }
         ],
