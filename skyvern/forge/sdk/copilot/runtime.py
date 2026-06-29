@@ -36,10 +36,12 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -184,7 +186,6 @@ class AgentContext:
     copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
-    null_data_streak_count: int = 0
     last_test_ok: bool | None = None
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None
@@ -201,6 +202,15 @@ class AgentContext:
     code_native_pending_capability: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    code_authoring_guardrail_reject_count: int = 0
+    last_code_authoring_reject_was_credential_priority: bool = False
+    # Climbs on each click that made no verified forward progress (failed/timed-out
+    # click or a hollow post-click observe); resets on verified progress.
+    consecutive_no_progress_interaction_count: int = 0
+    last_scout_act_observe_outcome: str | None = None
+    last_scout_act_observe_packet: dict[str, Any] | None = None
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
@@ -232,6 +242,7 @@ class AgentContext:
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     completion_verification_result: CompletionVerificationResult | None = None
+    verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
     # Ordered, bounded list of typed page-evidence packets — one per page observed
@@ -285,6 +296,12 @@ class AgentContext:
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_typed_value: str | None = None
+    # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
+    # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
+    pending_scout_role_name: tuple[str, str, str] | None = None
+    # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
+    # settle re-perception on whether that selector still resolves to a live element.
+    pending_scout_click_selector: str | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.
@@ -301,6 +318,10 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
+    # Latest edited-schema-incompatibility terminal outcome, set when an edited
+    # extraction_schema declares fields that map to no output the block produces.
+    # Surfaced into the persisted TurnOutcome so a later turn can report it.
+    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:

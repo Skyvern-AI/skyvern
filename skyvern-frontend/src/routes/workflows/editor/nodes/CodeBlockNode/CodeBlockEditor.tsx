@@ -13,6 +13,7 @@ import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
+import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { deepEqualStringArrays } from "@/util/equality";
 import { cn } from "@/util/utils";
@@ -20,7 +21,8 @@ import { cn } from "@/util/utils";
 import { type AppNode, isWorkflowBlockNode } from "..";
 import { dataSchemaExampleValue } from "../types";
 import { CodeBlockPlainCard } from "./CodeBlockPlainCard";
-import type { CodeBlockView } from "./CodeBlockViewToggle";
+import { getStepLabel } from "./stepPresentation";
+import { CodeBlockViewToggle, type CodeBlockView } from "./CodeBlockViewToggle";
 import type { CodeBlockNode, CodeBlockNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
 
@@ -34,35 +36,21 @@ function formatStepLines(step: CodeBlockStep): string {
   return `L${step.line_start}-${step.line_end}`;
 }
 
-function CodeBlockEditor({
-  blockId,
-  view,
-}: {
-  blockId: string;
-  view?: CodeBlockView;
-}) {
+function CodeBlockEditor({ blockId }: { blockId: string }) {
   const rf = useReactFlow<AppNode>();
   const node = rf.getNode(blockId);
   if (!node || !isWorkflowBlockNode(node) || node.type !== "codeBlock") {
     return null;
   }
-  return (
-    <CodeBlockEditorBody
-      blockId={blockId}
-      node={node as CodeBlockNode}
-      view={view}
-    />
-  );
+  return <CodeBlockEditorBody blockId={blockId} node={node as CodeBlockNode} />;
 }
 
 function CodeBlockEditorBody({
   blockId,
   node,
-  view,
 }: {
   blockId: string;
   node: CodeBlockNode;
-  view?: CodeBlockView;
 }) {
   const data = node.data;
   const { editable } = data;
@@ -72,6 +60,7 @@ function CodeBlockEditorBody({
   // Code-first layout needs the access flag plus a prompt; otherwise keep the legacy manual layout.
   const isCodeFirst = data.prompt != null && codeFirstAccess;
   const steps = data.steps ?? [];
+  const [view, setView] = useState<CodeBlockView>("plain");
   const [stepsOpen, setStepsOpen] = useState(true);
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
   const activeStep =
@@ -153,7 +142,8 @@ function CodeBlockEditorBody({
         update({ code: value });
       }}
       className="nopan"
-      fontSize={8}
+      fontSize={10}
+      lineWrap={false}
       extraExtensions={codeExtensions}
     />
   );
@@ -186,99 +176,109 @@ function CodeBlockEditorBody({
     />
   );
 
-  if (isCodeFirst && view === "plain") {
-    return (
-      <div data-testid="code-block-block-form" className="space-y-4">
-        {goalField}
-        <CodeBlockPlainCard
-          steps={steps}
-          generating={isGenerating}
-          onStop={requestCancel}
-        />
+  // Technical step list shown alongside the code: clicking a step highlights
+  // the lines it maps to in the editor.
+  const stepLineList =
+    steps.length > 0 ? (
+      <div className="space-y-2">
+        <button
+          type="button"
+          aria-expanded={stepsOpen}
+          className="flex w-full items-center justify-between text-xs text-slate-300"
+          onClick={() => setStepsOpen((open) => !open)}
+        >
+          <span>Steps ({steps.length})</span>
+          <ChevronDownIcon
+            className={cn(
+              "size-4 transition-transform",
+              stepsOpen && "rotate-180",
+            )}
+          />
+        </button>
+        {stepsOpen && (
+          <ol className="space-y-1">
+            {steps.map((step, index) => {
+              const hasLines = step.line_start != null;
+              const isActive = activeStepIndex === index;
+              return (
+                <li key={index}>
+                  <button
+                    type="button"
+                    disabled={!hasLines}
+                    aria-pressed={isActive}
+                    onClick={() =>
+                      setActiveStepIndex((current) =>
+                        current === index ? null : index,
+                      )
+                    }
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded bg-slate-elevation1 px-2 py-1 text-left text-xs",
+                      hasLines && "hover:bg-slate-elevation2",
+                      isActive && "ring-1 ring-sky-400/60",
+                      !hasLines && "cursor-default",
+                    )}
+                  >
+                    <span className="w-5 shrink-0 tabular-nums text-slate-500">
+                      {index + 1}.
+                    </span>
+                    <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-400">
+                      {getStepLabel(step.action_type)}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-slate-300">
+                      {getCodeStepPlainText(step)}
+                    </span>
+                    {hasLines && (
+                      <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                        {formatStepLines(step)}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+        )}
       </div>
-    );
-  }
+    ) : null;
 
-  if (isCodeFirst && view === "code") {
+  if (!isCodeFirst) {
     return (
       <div data-testid="code-block-block-form" className="space-y-4">
         {inputsField}
-        {dataSchemaField}
-        {codeEditorElement}
+        <div className="space-y-2">
+          <Label className="text-xs text-slate-300">Code Input</Label>
+          {codeEditorElement}
+        </div>
       </div>
     );
   }
 
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
-      {isCodeFirst && goalField}
-      {isCodeFirst && steps.length > 0 && (
-        <div className="space-y-2">
-          <button
-            type="button"
-            aria-expanded={stepsOpen}
-            className="flex w-full items-center justify-between text-xs text-slate-300"
-            onClick={() => setStepsOpen((open) => !open)}
-          >
-            <span>Steps ({steps.length})</span>
-            <ChevronDownIcon
-              className={cn(
-                "size-4 transition-transform",
-                stepsOpen && "rotate-180",
-              )}
-            />
-          </button>
-          {stepsOpen && (
-            <ol className="space-y-1">
-              {steps.map((step, index) => {
-                const hasLines = step.line_start != null;
-                const isActive = activeStepIndex === index;
-                return (
-                  <li key={index}>
-                    <button
-                      type="button"
-                      disabled={!hasLines}
-                      aria-pressed={isActive}
-                      onClick={() =>
-                        setActiveStepIndex((current) =>
-                          current === index ? null : index,
-                        )
-                      }
-                      className={cn(
-                        "flex w-full items-center gap-2 rounded bg-slate-elevation1 px-2 py-1 text-left text-xs",
-                        hasLines && "hover:bg-slate-elevation2",
-                        isActive && "ring-1 ring-sky-400/60",
-                        !hasLines && "cursor-default",
-                      )}
-                    >
-                      <span className="w-5 shrink-0 tabular-nums text-slate-500">
-                        {index + 1}.
-                      </span>
-                      <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-400">
-                        {step.action_type}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate text-slate-300">
-                        {step.title ?? step.description ?? ""}
-                      </span>
-                      {hasLines && (
-                        <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
-                          {formatStepLines(step)}
-                        </span>
-                      )}
-                    </button>
-                  </li>
-                );
-              })}
-            </ol>
-          )}
-        </div>
-      )}
-      {inputsField}
-      {isCodeFirst && dataSchemaField}
-      <div className="space-y-2">
-        <Label className="text-xs text-slate-300">Code Input</Label>
-        {codeEditorElement}
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-xs text-slate-300">View</Label>
+        <CodeBlockViewToggle value={view} onChange={setView} />
       </div>
+      {view === "plain" ? (
+        <>
+          {goalField}
+          <CodeBlockPlainCard
+            steps={steps}
+            generating={isGenerating}
+            onStop={requestCancel}
+          />
+        </>
+      ) : (
+        <>
+          {stepLineList}
+          {inputsField}
+          {dataSchemaField}
+          <div className="space-y-2">
+            <Label className="text-xs text-slate-300">Code Input</Label>
+            {codeEditorElement}
+          </div>
+        </>
+      )}
     </div>
   );
 }

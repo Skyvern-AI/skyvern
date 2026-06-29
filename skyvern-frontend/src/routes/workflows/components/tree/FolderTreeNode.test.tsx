@@ -63,6 +63,7 @@ const contextValue: WorkflowsListContextValue = {
   foldersMap: new Map(),
   workflowTagsMap: {},
   tagDescriptions: new Map(),
+  tagColors: new Map(),
   tagKeys: [],
   labelSuggestions: [],
   valueSuggestionsByKey: new Map(),

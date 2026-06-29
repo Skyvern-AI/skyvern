@@ -374,7 +374,7 @@ describe("useEditorOnboardingTour", () => {
       expect(lastInstance().drive).toHaveBeenCalledOnce();
     });
 
-    it("ignores manual re-trigger when the experiment flag is disabled", () => {
+    it("starts manual re-trigger even when the experiment flag is disabled", () => {
       flagState.variant = false;
       const ctx = makeContext({
         isNewUser: false,
@@ -385,6 +385,19 @@ describe("useEditorOnboardingTour", () => {
       });
       renderHook(() => useEditorOnboardingTour(), {
         wrapper: wrapWith(ctx),
+      });
+
+      act(() => {
+        useProductTourStore.getState().requestTour();
+      });
+
+      expect(driverMock()).toHaveBeenCalledOnce();
+      expect(lastInstance().drive).toHaveBeenCalledOnce();
+    });
+
+    it("ignores manual re-trigger when no onboarding provider is mounted", () => {
+      renderHook(() => useEditorOnboardingTour(), {
+        wrapper: ({ children }) => <>{children}</>,
       });
 
       act(() => {

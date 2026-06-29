@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
@@ -21,7 +23,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 
-from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, _composition_get_structured_evidence
 from .banned_blocks import (
     _CODE_ONLY_SELECTOR_ACTION_TOOLS,
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
@@ -40,18 +42,25 @@ from .page_observation import (
     _resolve_url_title,
 )
 from .scouting import (
+    _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
+    _actionable_targets_for_result,
     _attach_scout_page_summary,
+    _capture_scout_role_name,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
+    _click_affordance_target_identities,
     _consume_scout_source_url,
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_reached_download_target,
+    _prenav_role_name_for_selector,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
     _reset_evaluate_tracker,
     _resolve_scout_role_name,
+    _selector_live_match_count,
     _steer_evaluate_result,
+    account_no_progress_interaction_click,
 )
 
 LOG = structlog.get_logger()
@@ -287,6 +296,10 @@ async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    # Cleared up front so an early return below (deterministic result, jQuery reject, no selector)
+    # cannot leave a prior click's stash for this click's post-hook to consume.
+    ctx.pending_scout_role_name = None
+    ctx.pending_scout_click_selector = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -294,6 +307,7 @@ async def _click_pre_hook(
     selector = params.get("selector", "")
     if not selector:
         return None
+    ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
     if _JQUERY_SELECTOR_RE.search(selector):
         return {
             "ok": False,
@@ -308,6 +322,7 @@ async def _click_pre_hook(
                 "b => {{ if (b.textContent.includes('Download')) b.click() }})"
             ),
         }
+    await _capture_scout_role_name(ctx, selector)
     return None
 
 
@@ -401,8 +416,14 @@ async def _click_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    ctx.last_scout_act_observe_outcome = None
+    ctx.last_scout_act_observe_packet = None
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_role_name = ctx.pending_scout_role_name
+    ctx.pending_scout_role_name = None
+    attempted_selector = ctx.pending_scout_click_selector
+    ctx.pending_scout_click_selector = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = _selector_from_tool_data(data, prefer_resolved_when_empty=True)
@@ -415,6 +436,8 @@ async def _click_post_hook(
         }
         navigated = bool(source_url) and bool(url) and source_url != url
         role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+        if navigated and not (role and accessible_name):
+            role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
         result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
         _record_scouted_interaction(
             ctx,
@@ -434,7 +457,137 @@ async def _click_post_hook(
             _attach_scout_page_summary(result, page_evidence)
             if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
                 await _maybe_attach_reached_download_target(ctx, result, url=url, page_evidence=page_evidence)
+    account_no_progress_interaction_click(ctx, result)
+    try:
+        await _attach_reperception_targets_on_non_advancing_click(result, raw, ctx, attempted_selector)
+    except Exception:
+        LOG.warning("copilot_click_reperception_attach_failed", exc_info=True)
     return result
+
+
+_SETTLE_GROUNDED_TARGETS_INSTRUCTION = (
+    "The page updated after your click; click one of the grounded targets below instead of re-evaluating."
+)
+
+
+def _grounded_actionable_targets(parsed: dict[str, Any] | None) -> list[dict[str, str]]:
+    if parsed is None:
+        return []
+    return _actionable_targets_for_result(_click_affordance_target_identities(parsed))
+
+
+def _attach_actionable_targets(result: dict[str, Any], targets: list[dict[str, str]], *, settle_steer: bool) -> None:
+    if not targets:
+        return
+    container = result.get("data")
+    if not isinstance(container, dict):
+        container = {}
+        result["data"] = container
+    container["actionable_targets"] = targets
+    if settle_steer:
+        container["next_action"] = "click"
+        container["next_action_reason"] = _SETTLE_GROUNDED_TARGETS_INSTRUCTION
+    LOG.info(
+        "copilot_click_grounded_targets_attached",
+        target_count=len(targets),
+        via="settle" if settle_steer else "reperception",
+    )
+
+
+async def _safe_composition_evidence(ctx: AgentContext, url: str, *, timeout_seconds: float) -> dict[str, Any] | None:
+    if timeout_seconds <= 0:
+        return None
+    try:
+        return await _composition_get_structured_evidence(
+            ctx,
+            inspected_url=url,
+            current_url=url,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        return None
+
+
+async def _click_failure_warrants_settle(
+    ctx: AgentContext, attempted_selector: str | None, *, timeout_seconds: float
+) -> bool:
+    """Pay the bounded settle only for a precondition-gated control: the attempted selector resolves to
+    a live element now (exists-but-was-not-actionable). A zero-match invented selector, or one that can
+    no longer be read, never warrants it, so the common invented-selector path stays fast."""
+    match_count = await _selector_live_match_count(ctx, attempted_selector, timeout_seconds=timeout_seconds)
+    return match_count is not None and match_count >= 1
+
+
+async def _settle_grounded_targets_on_pending_update(
+    ctx: AgentContext,
+    *,
+    url: str,
+    attempted_selector: str | None,
+) -> list[dict[str, str]]:
+    """Bounded re-probe of the side-effect-free extractor until a precondition-gated control's
+    grounded targets appear (a just-issued AJAX populated the page) or the settle deadline expires."""
+    deadline = time.monotonic() + settings.COPILOT_CLICK_SETTLE_DEADLINE_SECONDS
+
+    def _remaining_budget(default: float) -> float:
+        return min(default, max(0.0, deadline - time.monotonic()))
+
+    warrants_budget = _remaining_budget(_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS)
+    if warrants_budget <= 0:
+        return []
+    if not await _click_failure_warrants_settle(ctx, attempted_selector, timeout_seconds=warrants_budget):
+        return []
+    probes_run = 0
+    for _ in range(max(0, settings.COPILOT_CLICK_SETTLE_MAX_PROBES)):
+        sleep_budget = _remaining_budget(settings.COPILOT_CLICK_SETTLE_DELAY_SECONDS)
+        if sleep_budget <= 0 and time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(sleep_budget)
+        probe_budget = _remaining_budget(settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS)
+        if probe_budget <= 0:
+            break
+        probes_run += 1
+        targets = _grounded_actionable_targets(await _safe_composition_evidence(ctx, url, timeout_seconds=probe_budget))
+        if targets:
+            LOG.info("copilot_click_settle_reprobe", warranted=True, probes_run=probes_run, target_count=len(targets))
+            return targets
+    LOG.info("copilot_click_settle_reprobe", warranted=True, probes_run=probes_run, target_count=0)
+    return []
+
+
+async def _attach_reperception_targets_on_non_advancing_click(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+    attempted_selector: str | None,
+) -> None:
+    """Re-perceive after a click that did not advance the build (a zero-match failure or a
+    successful-but-hollow observe), so the next attempt copies a grounded selector instead of
+    re-emitting an invented one. Side-effect-free parse: the no-progress counter and
+    last_scout_act_observe_outcome are settled by the caller and left untouched."""
+    ok = bool(result.get("ok"))
+    non_advancing = (not ok) or ctx.last_scout_act_observe_outcome == "hollow"
+    if not non_advancing:
+        return
+    existing = result.get("data")
+    if isinstance(existing, dict) and existing.get("actionable_targets"):
+        return
+    if ok:
+        immediate = _grounded_actionable_targets(ctx.last_scout_act_observe_packet)
+        if immediate:
+            _attach_actionable_targets(result, immediate, settle_steer=False)
+            return
+    url, _ = await _resolve_url_title(raw, ctx)
+    if not url:
+        return
+    parsed = await _safe_composition_evidence(
+        ctx, url, timeout_seconds=settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
+    )
+    targets = _grounded_actionable_targets(parsed)
+    if targets:
+        _attach_actionable_targets(result, targets, settle_steer=False)
+        return
+    settled = await _settle_grounded_targets_on_pending_update(ctx, url=url, attempted_selector=attempted_selector)
+    _attach_actionable_targets(result, settled, settle_steer=True)
 
 
 _TYPE_READBACK_SETTLE_SECONDS = 0.3

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import structlog
-from sqlalchemy import asc, case, or_, select
+from sqlalchemy import case, desc, or_, select
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
@@ -13,10 +13,12 @@ from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_browser_profile_id
 from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
     PersistentBrowserSessionModel,
 )
+from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
 from skyvern.forge.sdk.db.utils import serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -24,9 +26,11 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.schemas.proxy_pinning import generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
 LOG = structlog.get_logger()
+_UNSET = object()
 
 
 class BrowserSessionsRepository(BaseRepository):
@@ -39,13 +43,24 @@ class BrowserSessionsRepository(BaseRepository):
         name: str,
         description: str | None = None,
         source_browser_type: str | None = None,
+        proxy_location: ProxyLocationInput = None,
+        proxy_session_id: str | None = None,
     ) -> BrowserProfile:
         async with self.Session() as session:
+            browser_profile_id = generate_browser_profile_id()
+            proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                entity_id=browser_profile_id,
+            )
             browser_profile = BrowserProfileModel(
+                browser_profile_id=browser_profile_id,
                 organization_id=organization_id,
                 name=name,
                 description=description,
                 source_browser_type=source_browser_type,
+                proxy_location=serialize_proxy_location(proxy_location),
+                proxy_session_id=proxy_session_id,
             )
             session.add(browser_profile)
             await session.commit()
@@ -97,7 +112,13 @@ class BrowserSessionsRepository(BaseRepository):
                         BrowserProfileModel.description.ilike(search_like),
                     )
                 )
-            query = query.order_by(asc(BrowserProfileModel.created_at)).limit(page_size).offset(db_page * page_size)
+            # The id tie-break only needs to be deterministic so pagination stays
+            # stable when created_at collides; it isn't meant to encode recency.
+            query = (
+                query.order_by(desc(BrowserProfileModel.created_at), desc(BrowserProfileModel.browser_profile_id))
+                .limit(page_size)
+                .offset(db_page * page_size)
+            )
             browser_profiles = await session.scalars(query)
             return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
 
@@ -120,6 +141,24 @@ class BrowserSessionsRepository(BaseRepository):
             browser_profile.deleted_at = naive_utc_now()
             await session.commit()
 
+    @db_operation("hard_delete_browser_profile")
+    async def hard_delete_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            await session.delete(browser_profile)
+            await session.commit()
+
     @db_operation("update_browser_profile")
     async def update_browser_profile(
         self,
@@ -127,6 +166,9 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str,
         name: str | None = None,
         description: str | None = None,
+        proxy_location: ProxyLocationInput | object = _UNSET,
+        proxy_session_id: str | None | object = _UNSET,
+        rotate_proxy_session_id: bool = False,
     ) -> BrowserProfile:
         async with self.Session() as session:
             query = (
@@ -143,6 +185,14 @@ class BrowserSessionsRepository(BaseRepository):
                 browser_profile.name = name
             if description is not None:
                 browser_profile.description = description
+            apply_proxy_pin_to_model(
+                browser_profile,
+                entity_id=profile_id,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                unset=_UNSET,
+                rotate_proxy_session_id=rotate_proxy_session_id,
+            )
 
             await session.commit()
             await session.refresh(browser_profile)
@@ -264,28 +314,43 @@ class BrowserSessionsRepository(BaseRepository):
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
         proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL,
+        proxy_session_id: str | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
+        proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+        )
         extensions_str: list[str] | None = (
             [extension.value for extension in extensions] if extensions is not None else None
         )
+        serialized_proxy_location = serialize_proxy_location(proxy_location)
         async with self.Session() as session:
             browser_session = PersistentBrowserSessionModel(
                 organization_id=organization_id,
                 runnable_type=runnable_type,
                 runnable_id=runnable_id,
                 timeout_minutes=timeout_minutes,
-                proxy_location=serialize_proxy_location(proxy_location),
+                proxy_location=serialized_proxy_location,
+                proxy_session_id=proxy_session_id,
                 extensions=extensions_str,
                 browser_type=browser_type.value if browser_type else None,
                 browser_profile_id=browser_profile_id,
                 generate_browser_profile=generate_browser_profile,
             )
             session.add(browser_session)
+            await session.flush()
+            if (
+                serialized_proxy_location == ProxyLocation.RESIDENTIAL_ISP.value
+                and browser_session.proxy_session_id is None
+            ):
+                browser_session.proxy_session_id = generate_proxy_session_id(
+                    browser_session.persistent_browser_session_id
+                )
             await session.commit()
             await session.refresh(browser_session)
             return PersistentBrowserSession.model_validate(browser_session)

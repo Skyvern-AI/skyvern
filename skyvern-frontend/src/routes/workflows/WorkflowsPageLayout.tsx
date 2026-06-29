@@ -5,6 +5,9 @@ function WorkflowsPageLayout() {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
   const workflowEditMatch = useMatch("/workflows/:workflowPermanentId/edit");
+  const workflowStudioMatch = useMatch(
+    "/workflows/:workflowPermanentId/studio",
+  );
   const workflowBuildMatch = useMatch("/workflows/:workflowPermanentId/build");
   const workflowBlockBuildMatch = useMatch(
     "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/build",
@@ -15,6 +18,7 @@ function WorkflowsPageLayout() {
   );
   const match =
     workflowEditMatch ||
+    workflowStudioMatch ||
     workflowBuildMatch ||
     workflowBlockBuildMatch ||
     workflowDebugMatch ||

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -11,7 +13,11 @@ from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
+    loaded_result_target_structure_signature,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -95,6 +101,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
@@ -133,6 +140,43 @@ class ObservedPage(BaseModel):
     reached_via: str = ""
 
 
+class LoadedResultTargetContext(BaseModel):
+    selector: str = ""
+    is_table: bool = False
+    row_selector: str = ""
+    row_count: int | None = None
+    structure_signature: str = ""
+
+
+class CodeAuthoringRepairContext(BaseModel):
+    block_label: str
+    reason_code: str
+    unresolved_names: list[str] = Field(default_factory=list)
+    parameter_keys: list[str] = Field(default_factory=list)
+    available_parameter_keys: list[str] = Field(default_factory=list)
+    binding_candidates: list[str] = Field(default_factory=list)
+    selector: str | None = None
+    source_url: str | None = None
+    refiner_selector: str | None = None
+    selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
+    allowed_global_names: list[str] = Field(default_factory=list)
+    allowed_helper_surface: dict[str, list[str]] = Field(default_factory=dict)
+    runtime_failure_reason: str | None = None
+    runtime_failure_class: str | None = None
+    failed_block_status: str | None = None
+    workflow_run_id: str | None = None
+    current_origin: str | None = None
+    current_url_present: bool = False
+    current_title_present: bool = False
+    page_evidence_source: str | None = None
+    observed_after_workflow_run: bool = False
+    page_form_summaries: list[str] = Field(default_factory=list)
+    page_result_summaries: list[str] = Field(default_factory=list)
+    page_action_summaries: list[str] = Field(default_factory=list)
+    page_challenge_summaries: list[str] = Field(default_factory=list)
+    repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
+
+
 class StructuredContext(BaseModel):
     user_goal: str = ""
     urls_visited: list[UrlVisit] = Field(default_factory=list)
@@ -146,9 +190,14 @@ class StructuredContext(BaseModel):
     discovery_calls_made: int = 0
     page_inspection_calls_made: int = 0
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
+    loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
-        return self.model_dump_json(indent=2)
+        payload = self.model_dump(mode="json")
+        payload["loaded_result_targets"] = [
+            _sanitized_loaded_result_target_payload(target) for target in self.loaded_result_targets
+        ]
+        return json.dumps(payload, indent=2)
 
     @classmethod
     def from_json_str(cls, raw: str | None) -> StructuredContext:
@@ -233,6 +282,65 @@ class StructuredContext(BaseModel):
             self.credentials_checked = self.credentials_checked[-40:]
 
 
+def _sanitized_loaded_result_target_payload(
+    target: LoadedResultTargetContext,
+) -> dict[str, object]:
+    structure_signature = loaded_result_target_structure_signature(
+        is_table=target.is_table,
+        row_count=target.row_count,
+    )
+    return {
+        "is_table": target.is_table,
+        "row_count": target.row_count,
+        "structure_signature": structure_signature,
+    }
+
+
+def sanitize_global_llm_context_for_prompt(global_llm_context: str | None) -> str:
+    raw = global_llm_context or ""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    targets = payload.get("loaded_result_targets")
+    if not isinstance(targets, list):
+        return raw
+
+    sanitized_targets: list[dict[str, object]] = []
+    for target in targets:
+        if not isinstance(target, Mapping):
+            continue
+        try:
+            target_context = LoadedResultTargetContext.model_validate(target)
+        except Exception:
+            continue
+        sanitized_targets.append(_sanitized_loaded_result_target_payload(target_context))
+    payload["loaded_result_targets"] = sanitized_targets
+    return json.dumps(payload, indent=2)
+
+
+def render_loaded_result_context_for_prompt(global_llm_context: str) -> str:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    if not structured.loaded_result_targets:
+        return ""
+    lines = [
+        "Author an extraction or validation block from these loaded-result targets.",
+        "Do not call evaluate just to re-read the same loaded results.",
+    ]
+    for index, target in enumerate(structured.loaded_result_targets, start=1):
+        lines.append(f"- target {index}:")
+        lines.append(f"  table: {str(target.is_table).lower()}")
+        if target.row_count is not None:
+            lines.append(f"  row_count: {target.row_count}")
+        if target.structure_signature:
+            lines.append(f"  structure_signature: {target.structure_signature}")
+    return "\n".join(lines)
+
+
 _MAX_OBSERVED_ACTED_PAGES = 20
 
 
@@ -260,12 +368,27 @@ def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[d
     return list(by_url.values())[-_MAX_OBSERVED_ACTED_PAGES:]
 
 
+def _loaded_result_targets_from_steer(
+    steer: LoadedResultCompositionEvidence | None,
+) -> list[LoadedResultTargetContext]:
+    if steer is None:
+        return []
+    return [
+        LoadedResultTargetContext(
+            is_table=target.is_table,
+            row_count=target.row_count,
+            structure_signature=target.structure_signature,
+        )
+        for target in steer.targets
+    ]
+
+
 def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
     """Fold the per-chat discovery counter into the outgoing global_llm_context.
 
     Called from agent.py's `_make_agent_result` factory so every AgentResult
     exit path — timeout, cancel, max-turns, output-policy block, request-
-    policy clarification, feasibility clarification, non-retriable nav error,
+    policy clarification, infeasibility clarification, non-retriable nav error,
     normal translate-result, missing-SDK fallback, unexpected-error fallback —
     carries the updated count.
 
@@ -277,12 +400,23 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
     inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
     flow_evidence = getattr(ctx, "flow_evidence", None) or []
-    if not raw_context and this_turn == 0 and inspections_this_turn == 0 and not flow_evidence:
+    loaded_result_targets = _loaded_result_targets_from_steer(
+        getattr(ctx, "latest_evaluate_result_composition_steer", None)
+    )
+    if (
+        not raw_context
+        and this_turn == 0
+        and inspections_this_turn == 0
+        and not flow_evidence
+        and not loaded_result_targets
+    ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
+    # Replace with this turn's targets so stale extraction hints do not persist.
+    sc.loaded_result_targets = loaded_result_targets
     return sc.to_json_str()
 
 
@@ -294,8 +428,7 @@ class AgentResult:
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
     workflow_was_persisted: bool = False
-    # Tells the route to null any persisted proposed_workflow. Set by the
-    # feasibility-gate fast-path and by ASK_QUESTION turns.
+    # Route nulls any persisted proposed_workflow when this is set.
     clear_proposed_workflow: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from
@@ -371,6 +504,7 @@ class CopilotContext(AgentContext):
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     impose_synthesized_code_block: bool = False
     target_block_label: str | None = None
@@ -391,6 +525,7 @@ class CopilotContext(AgentContext):
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
+    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.
@@ -433,11 +568,6 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
-    # Consecutive test runs whose data-producing blocks completed with no
-    # meaningful output (missing, empty, or all-null fields). Resets when a
-    # run produces real data. Used to escalate when the agent is stuck
-    # retrying extraction against a page that doesn't contain the data.
-    null_data_streak_count: int = 0
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
@@ -480,6 +610,14 @@ class CopilotContext(AgentContext):
     repeated_failure_streak_count: int = 0
     last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
+    # Unlike the identity-keyed repair ceiling, this climbs even when every
+    # rejection is different; it resets only on an accepted persist.
+    code_authoring_guardrail_reject_count: int = 0
+    # True when the most-recent such rejection deferred to the credential-scout
+    # gate, so the churn backstop yields to that message instead of pre-empting it.
+    last_code_authoring_reject_was_credential_priority: bool = False
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
+    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the
     # high-water length of the verified block prefix. A repair that grows either

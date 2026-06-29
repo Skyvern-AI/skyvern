@@ -15,12 +15,20 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    selector_match_count_expression as _selector_match_count_expression,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
+    has_actionable_steer_content,
     has_bounded_page_schema,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    register_no_progress_interaction_click,
+    reset_no_progress_interaction_count,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
 )
@@ -90,6 +98,7 @@ def _consume_pending_browser_interaction_observation(
             current_url=current_url,
         )
         return False
+    reset_no_progress_interaction_count(ctx)
     return True
 
 
@@ -148,7 +157,9 @@ def _role_name_from_selector(selector: str | None) -> tuple[str, str] | None:
     return role, name
 
 
-async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None) -> tuple[str, str] | None:
+async def _capture_accessible_role_name(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> tuple[str, str] | None:
     """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
 
     A failed read degrades gracefully to None so the selector-only auto-credit
@@ -166,7 +177,7 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None)
                 "skyvern_evaluate",
                 {"expression": _scout_accessible_role_name_expression(selector)},
             ),
-            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except Exception:
         return None
@@ -179,6 +190,79 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None)
     name = str(value.get("accessible_name") or "").strip()
     if not role and not name:
         return None
+    return role, name
+
+
+# A click pre-hook runs inline before the click dispatch, so the read is bounded well under the
+# discovery timeout to avoid delaying the action when the element resists a fast a11y read.
+_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS = 2.0
+
+
+async def _selector_live_match_count(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float | None = None
+) -> int | None:
+    """Live element count for a selector, or None when the page read is unavailable or the selector
+    is invalid; lets a failed click tell an invented zero-match selector from a not-yet-actionable one."""
+    selector = _selector_text(selector)
+    if not selector:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    timeout = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    if timeout <= 0:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _selector_match_count_expression(selector)},
+            ),
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
+    """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
+
+    A navigating click leaves only the landing page, so the post-action read returns the wrong
+    element; this captures the source-page anchor so a bare-selector navigating click still carries a
+    role/name into the trajectory."""
+    ctx.pending_scout_role_name = None
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    parsed = _role_name_from_selector(selector)
+    if parsed is not None:
+        role, name = parsed
+    else:
+        captured = await _capture_accessible_role_name(
+            ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+        )
+        if captured is None:
+            return
+        role, name = captured
+    if not role or not name:
+        return
+    ctx.pending_scout_role_name = (selector, role, name)
+
+
+def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
+    """Return the pre-navigation (role, accessible_name) only when the recorded selector matches the
+    stashed one, so a navigating click's anchor is never applied to a different element."""
+    if pending is None:
+        return "", ""
+    stashed_selector, role, name = pending
+    if stashed_selector != _selector_text(selector):
+        return "", ""
     return role, name
 
 
@@ -298,6 +382,10 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         )
         if parsed is not None and has_bounded_page_schema(parsed):
             outcome = "attached"
+        elif parsed is not None and has_actionable_steer_content(parsed):
+            # Standalone clickable controls are steer-able grounding but not forward progress:
+            # keep parsed for the steer while the hollow outcome still climbs the no-progress counter.
+            outcome = "hollow"
         elif parsed is not None:
             outcome = "hollow"
             parsed = None
@@ -306,6 +394,8 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
     except Exception:
         parsed = None
         outcome = "error"
+    ctx.last_scout_act_observe_outcome = outcome
+    ctx.last_scout_act_observe_packet = parsed
     LOG.info(
         "copilot_scout_act_observe",
         outcome=outcome,
@@ -336,7 +426,7 @@ async def _register_scout_interaction_observation(
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
         parsed = await _scout_act_observe_page_evidence(ctx, url=url)
-        if parsed is not None:
+        if parsed is not None and has_bounded_page_schema(parsed):
             # Identity keys overwrite the parsed packet so the entry stays a
             # scout_interaction observation, with the schema merged before append.
             evidence = {**parsed, **evidence}
@@ -346,6 +436,21 @@ async def _register_scout_interaction_observation(
             _clear_pending_browser_interaction_observation(ctx)
     step = _append_flow_evidence(ctx, evidence, reached_via="interaction")
     return step, page_evidence
+
+
+def account_no_progress_interaction_click(ctx: AgentContext, result: dict[str, Any]) -> None:
+    """Climb or reset the no-forward-progress counter from a click's outcome: a failed click or hollow
+    observe is no progress, an attached observe is progress, a capture timeout/error is neutral."""
+    if not result.get("ok"):
+        register_no_progress_interaction_click(ctx, outcome="click_failed")
+        return
+    outcome = ctx.last_scout_act_observe_outcome
+    if outcome == "attached":
+        reset_no_progress_interaction_count(ctx)
+    elif outcome == "hollow":
+        register_no_progress_interaction_click(ctx, outcome="hollow")
+    else:
+        LOG.info("copilot_no_progress_interaction_neutral", outcome=outcome)
 
 
 _PAGE_SUMMARY_TEXT_CAP = 80
@@ -489,27 +594,73 @@ def _reset_evaluate_tracker(ctx: AgentContext) -> None:
 
 
 def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
+    affordances: list[tuple[str, str]] = []
+    fields: list[tuple[str, str]] = []
+
+    def identity(control: Any) -> tuple[str, str] | None:
+        if not isinstance(control, dict):
+            return None
+        selector = _summary_text(control.get("selector"))
+        text = _summary_text(control.get("text") or control.get("value") or control.get("aria_label"))
+        if selector or text:
+            return (selector, text)
+        return None
+
+    def add_affordance(control: Any) -> None:
+        ident = identity(control)
+        if ident is not None:
+            affordances.append(ident)
+
+    for form in evidence.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        for control in form.get("submit_controls") or []:
+            add_affordance(control)
+        for field_entry in form.get("fields") or []:
+            ident = identity(field_entry)
+            if ident is not None:
+                fields.append(ident)
+    for target in evidence.get("navigation_targets") or []:
+        add_affordance(target)
+    for control in evidence.get("clickable_controls") or []:
+        add_affordance(control)
+    for overlay in evidence.get("modal_overlays") or []:
+        if not isinstance(overlay, dict):
+            continue
+        for control in overlay.get("dismiss_controls") or []:
+            add_affordance(control)
+    for container in evidence.get("result_containers") or []:
+        add_affordance(container)
+    # Click affordances precede plain input fields, and selector-bearing controls precede
+    # text-only ones, so the capped payload surfaces executable selectors first.
+    affordances.sort(key=lambda item: 0 if item[0] else 1)
+    return affordances + fields
+
+
+def _click_affordance_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
+    """Selector-bearing click affordances only (submit controls, navigation targets, standalone
+    clickable controls, modal dismiss controls), so the re-perception attach hands back a real
+    selector to copy and never a plain input field, result container, or text-only control."""
     identities: list[tuple[str, str]] = []
 
     def add(control: Any) -> None:
         if not isinstance(control, dict):
             return
         selector = _summary_text(control.get("selector"))
+        if not selector:
+            return
         text = _summary_text(control.get("text") or control.get("value") or control.get("aria_label"))
-        if selector or text:
-            identities.append((selector, text))
+        identities.append((selector, text))
 
     for form in evidence.get("forms") or []:
         if not isinstance(form, dict):
             continue
-        for field_entry in form.get("fields") or []:
-            add(field_entry)
         for control in form.get("submit_controls") or []:
             add(control)
     for target in evidence.get("navigation_targets") or []:
         add(target)
-    for container in evidence.get("result_containers") or []:
-        add(container)
+    for control in evidence.get("clickable_controls") or []:
+        add(control)
     for overlay in evidence.get("modal_overlays") or []:
         if not isinstance(overlay, dict):
             continue
@@ -725,7 +876,16 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
 
     post_url = await _live_working_page_url(ctx) or url
     post_evidence = await _scout_act_observe_page_evidence(ctx, url=post_url)
-    _record_scouted_interaction(ctx, tool_name="click", selector=selector, source_url=pre_url)
+    navigated = bool(pre_url) and bool(post_url) and pre_url != post_url
+    role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+    _record_scouted_interaction(
+        ctx,
+        tool_name="click",
+        selector=selector,
+        source_url=pre_url,
+        role=role,
+        accessible_name=accessible_name,
+    )
 
     for key in ("next_action", "next_action_reason", "actionable_targets"):
         data.pop(key, None)
@@ -778,7 +938,7 @@ async def _maybe_steer_evaluate_to_action(
             if isinstance(page_evidence, _UnsetEvidence)
             else page_evidence
         )
-        if parsed is None or not has_bounded_page_schema(parsed):
+        if parsed is None or not has_actionable_steer_content(parsed):
             _reset_evaluate_tracker(ctx)
             return False
         loaded_results = loaded_result_composition_evidence_from_page(parsed)

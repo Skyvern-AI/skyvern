@@ -37,7 +37,14 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     plan_persistence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import (
+    AgentResult,
+    ProposalDisposition,
+    TurnNarrativePayload,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
+)
+from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.copilot.recoverable_failure import (
@@ -66,6 +73,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotChatSummary,
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotStreamErrorUpdate,
@@ -921,6 +929,7 @@ async def _commit_staged_workflow(
         totp_identifier=staged_workflow.totp_identifier,
         persist_browser_session=staged_workflow.persist_browser_session,
         browser_profile_id=staged_workflow.browser_profile_id,
+        browser_profile_key=staged_workflow.browser_profile_key,
         model=staged_workflow.model,
         max_screenshot_scrolling_times=staged_workflow.max_screenshot_scrolls,
         extra_http_headers=staged_workflow.extra_http_headers,
@@ -957,6 +966,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         totp_identifier=original_workflow.totp_identifier,
         persist_browser_session=original_workflow.persist_browser_session,
         browser_profile_id=original_workflow.browser_profile_id,
+        browser_profile_key=original_workflow.browser_profile_key,
         model=original_workflow.model,
         max_screenshot_scrolling_times=original_workflow.max_screenshot_scrolls,
         extra_http_headers=original_workflow.extra_http_headers,
@@ -1103,12 +1113,15 @@ async def copilot_call_llm(
 
     # Render user prompt (untrusted content, each variable in code fences)
     # Escape triple backticks to prevent code fence breakout
+    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(chat_request.workflow_yaml or ""),
         user_message=escape_code_fences(chat_request.message),
         chat_history=escape_code_fences(chat_history_text),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
+        global_llm_context=escape_code_fences(prompt_global_llm_context),
+        loaded_result_context=escape_code_fences(loaded_result_context),
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1170,10 +1183,12 @@ async def copilot_call_llm(
 
     global_llm_context = action_data.get("global_llm_context")
     if global_llm_context is not None:
-        global_llm_context = str(global_llm_context)
+        global_llm_context = sanitize_global_llm_context_for_prompt(str(global_llm_context))
 
     if action_type == "REPLACE_WORKFLOW":
-        llm_workflow_yaml = action_data.get("workflow_yaml", "")
+        llm_workflow_yaml = default_data_write_continue_on_failure(
+            action_data.get("workflow_yaml", ""), chat_request.workflow_yaml
+        )
         applied_workflow_yaml = llm_workflow_yaml
         try:
             updated_workflow = _process_workflow_yaml(
@@ -1190,15 +1205,18 @@ async def copilot_call_llm(
                     timestamp=datetime.now(timezone.utc),
                 )
             )
-            corrected_workflow_yaml = await _auto_correct_workflow_yaml(
-                llm_api_handler=llm_api_handler,
-                organization_id=organization_id,
-                user_response=user_response,
-                workflow_yaml=llm_workflow_yaml,
-                chat_history=chat_history,
-                global_llm_context=global_llm_context,
-                debug_run_info_text=debug_run_info_text,
-                error=e,
+            corrected_workflow_yaml = default_data_write_continue_on_failure(
+                await _auto_correct_workflow_yaml(
+                    llm_api_handler=llm_api_handler,
+                    organization_id=organization_id,
+                    user_response=user_response,
+                    workflow_yaml=llm_workflow_yaml,
+                    chat_history=chat_history,
+                    global_llm_context=global_llm_context,
+                    debug_run_info_text=debug_run_info_text,
+                    error=e,
+                ),
+                chat_request.workflow_yaml,
             )
             updated_workflow = _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
@@ -1253,12 +1271,15 @@ async def _auto_correct_workflow_yaml(
         security_rules=security_rules,
     )
 
+    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         user_message=escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
         chat_history=escape_code_fences(_format_chat_history(new_chat_history)),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
+        global_llm_context=escape_code_fences(prompt_global_llm_context),
+        loaded_result_context=escape_code_fences(loaded_result_context),
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1572,6 +1593,7 @@ def _process_workflow_yaml(
         totp_identifier=workflow_yaml_request.totp_identifier,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
         browser_profile_id=workflow_yaml_request.browser_profile_id,
+        browser_profile_key=workflow_yaml_request.browser_profile_key,
         model=workflow_yaml_request.model,
         max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
         extra_http_headers=workflow_yaml_request.extra_http_headers,
@@ -2575,26 +2597,55 @@ async def workflow_copilot_chat_post(
     return FastAPIEventSourceStream.create(request, stream_handler)
 
 
-@base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
-async def workflow_copilot_chat_history(
-    workflow_permanent_id: str,
+@base_router.get("/workflow/copilot/chats", include_in_schema=False)
+async def list_workflow_copilot_chats(
+    workflow_permanent_id: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    search: str | None = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
-) -> WorkflowCopilotChatHistoryResponse:
-    latest_chat = await app.DATABASE.workflow_params.get_latest_workflow_copilot_chat(
+) -> list[WorkflowCopilotChatSummary]:
+    return await app.DATABASE.workflow_params.get_workflow_copilot_chats(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
+        page=page,
+        page_size=page_size,
+        search=search,
     )
-    if latest_chat:
+
+
+@base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
+async def workflow_copilot_chat_history(
+    workflow_permanent_id: str | None = None,
+    workflow_copilot_chat_id: str | None = None,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowCopilotChatHistoryResponse:
+    if workflow_copilot_chat_id:
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=workflow_copilot_chat_id,
+        )
+    elif workflow_permanent_id:
+        chat = await app.DATABASE.workflow_params.get_latest_workflow_copilot_chat(
+            organization_id=organization.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="workflow_permanent_id or workflow_copilot_chat_id is required",
+        )
+    if chat:
         chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
-            latest_chat.workflow_copilot_chat_id
+            chat.workflow_copilot_chat_id
         )
     else:
         chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
-        workflow_copilot_chat_id=latest_chat.workflow_copilot_chat_id if latest_chat else None,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         chat_history=convert_to_history_messages(chat_messages),
-        proposed_workflow=latest_chat.proposed_workflow if latest_chat else None,
-        auto_accept=latest_chat.auto_accept if latest_chat else None,
+        proposed_workflow=chat.proposed_workflow if chat else None,
+        auto_accept=chat.auto_accept if chat else None,
     )
 
 

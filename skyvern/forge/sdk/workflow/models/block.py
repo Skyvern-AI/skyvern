@@ -28,7 +28,6 @@ import aiohttp
 import docx
 import filetype
 import pandas as pd
-import pyotp
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
@@ -50,6 +49,7 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
@@ -93,8 +93,9 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
@@ -214,7 +215,7 @@ async def capture_block_download_baseline(
         async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
             baseline_files = await app.STORAGE.get_downloaded_files(
                 organization_id=organization_id,
-                run_id=context.run_id or workflow_run_id,
+                run_id=resolve_run_download_id(context, fallback_run_id=workflow_run_id),
             )
             context.loop_internal_state = {
                 DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(fi) for fi in baseline_files],
@@ -494,6 +495,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        download_run_id_override: str | None = None,
     ) -> BrowserState | None:
         """
         Acquire or create browser state for block execution.
@@ -508,27 +510,28 @@ class Block(BaseModel, abc.ABC):
         if browser_session_id and organization_id:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
             if browser_state is not None:
-                adopted_context = browser_state.browser_context
-                adopted_browser = adopted_context.browser if adopted_context else None
-                if adopted_browser is not None:
-                    try:
-                        rebind_run_id = resolve_run_download_id(
-                            skyvern_context.current(), fallback_run_id=workflow_run_id
-                        )
-                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
+                rebind_run_id = download_run_id_override or resolve_run_download_id(
+                    skyvern_context.current(), fallback_run_id=workflow_run_id
+                )
+                try:
+                    adopted_context = browser_state.browser_context
+                    adopted_browser = adopted_context.browser if adopted_context else None
+                    rebind_page = None if adopted_browser is not None else await browser_state.get_working_page()
+                    if adopted_browser is not None or rebind_page is not None:
+                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id, page=rebind_page)
                         LOG.info(
                             "Rebound download dir on adopted persistent session",
                             browser_session_id=browser_session_id,
                             workflow_run_id=workflow_run_id,
                             run_id=rebind_run_id,
                         )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to rebind download dir on adopted persistent session",
-                            browser_session_id=browser_session_id,
-                            workflow_run_id=workflow_run_id,
-                            exc_info=True,
-                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to rebind download dir on adopted persistent session",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
@@ -612,6 +615,28 @@ class Block(BaseModel, abc.ABC):
                     workflow_run_id=workflow_run_id,
                 )
                 return None
+
+        if not (browser_session_id and organization_id) and browser_state is not None:
+            rebind_run_id = download_run_id_override or resolve_run_download_id(
+                skyvern_context.current(), fallback_run_id=workflow_run_id
+            )
+            try:
+                owning_browser = browser_state.browser_context.browser if browser_state.browser_context else None
+                rebind_page = None if owning_browser is not None else await browser_state.get_working_page()
+                if owning_browser is not None or rebind_page is not None:
+                    await rebind_download_dir(owning_browser, run_id=rebind_run_id, page=rebind_page)
+                    LOG.info(
+                        "Rebound download dir on workflow-run browser",
+                        workflow_run_id=workflow_run_id,
+                        run_id=rebind_run_id,
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to rebind download dir on workflow-run browser",
+                    workflow_run_id=workflow_run_id,
+                    run_id=rebind_run_id,
+                    exc_info=True,
+                )
 
         return browser_state
 
@@ -2211,6 +2236,9 @@ class ForLoopBlock(Block):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
 
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
 
@@ -2387,7 +2415,7 @@ class ForLoopBlock(Block):
                             to_downloaded_file_signature(fi)
                             for fi in await app.STORAGE.get_downloaded_files(
                                 organization_id=organization_id or "",
-                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                                run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
                         ]
                 except asyncio.TimeoutError:
@@ -2851,6 +2879,9 @@ class WhileLoopBlock(Block):
                     if default_next_map.get(block.label) is None:
                         default_next_map[block.label] = blocks[idx + 1].label
 
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
 
@@ -3114,7 +3145,7 @@ class WhileLoopBlock(Block):
                             to_downloaded_file_signature(fi)
                             for fi in await app.STORAGE.get_downloaded_files(
                                 organization_id=organization_id or "",
-                                run_id=loop_context.run_id if loop_context.run_id else workflow_run_id,
+                                run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
                         ]
                 except asyncio.TimeoutError:
@@ -3855,16 +3886,18 @@ async def wrapper({default_args}):
         organization_id: str | None,
         workflow_run_id: str,
         workflow_run_block_id: str,
+        download_run_id: str | None = None,
     ) -> list[FileInfo]:
         # Register up front so the block output carries downloaded_file_urls for
         # downstream blocks in the same run; workflow finalization re-runs the save safely.
         if not organization_id:
             return []
+        storage_run_id = download_run_id or workflow_run_id
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -3885,7 +3918,7 @@ async def wrapper({default_args}):
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 return await app.STORAGE.get_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -3957,10 +3990,12 @@ async def wrapper({default_args}):
                 self.label,
             )
 
+        resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            download_run_id_override=resolved_download_id,
         )
         if not browser_state:
             return await self.build_block_result(
@@ -4005,6 +4040,7 @@ async def wrapper({default_args}):
 
         # get all parameters into a dictionary
         parameter_values = {}
+        credential_parameter_keys: set[str] = set()
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
             if not parameter.parameter_type.is_secret_or_credential() and not (
@@ -4024,6 +4060,7 @@ async def wrapper({default_args}):
                     )
                 parameter_values[parameter.key] = value
                 continue
+            credential_parameter_keys.add(parameter.key)
             if isinstance(value, dict):
                 real_secret_values = {}
                 for credential_field, credential_place_holder in value.items():
@@ -4039,7 +4076,7 @@ async def wrapper({default_args}):
                         totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
                         totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
                         if totp_secret:
-                            secret_value = pyotp.TOTP(totp_secret).now()
+                            secret_value = generate_totp_code(totp_secret)
                             # The pre-minted .totp string is exposed to user code (legacy path),
                             # so register it for masking like any other resolved secret.
                             _register_code_block_secret(workflow_run_context, secret_value)
@@ -4058,6 +4095,52 @@ async def wrapper({default_args}):
             else:
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
+
+        try:
+            use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_context=workflow_run_context,
+                organization_id=organization_id,
+                block_label=self.label,
+                browser_session_id=browser_session_id,
+            )
+        except CodeBlockRunnerSelectionError as selection_error:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(selection_error),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        LOG.info(
+            "CodeBlock runner selection at block",
+            use_codeblock_runner=use_codeblock_runner,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=self.label,
+        )
+        if use_codeblock_runner:
+            secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                workflow_run_context=workflow_run_context,
+                parameter_values=parameter_values,
+                credential_parameter_keys=credential_parameter_keys,
+            )
+            LOG.info(
+                "Secure CodeBlock override returned",
+                override_returned_none=secure_code_block_result is None,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+            )
+            if secure_code_block_result is not None:
+                return secure_code_block_result
 
         workflow_run_block = None
 
@@ -4262,6 +4345,7 @@ async def wrapper({default_args}):
             organization_id=organization_id or workflow_run_context.organization_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
+            download_run_id=resolved_download_id,
         )
         current_context = skyvern_context.current()
         downloaded_files = filter_downloaded_files_for_current_iteration(
@@ -4731,12 +4815,15 @@ class FileUploadBlock(Block):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
     path: str | None = None
     continue_on_empty: bool = Field(
         default=False,
         description=(
-            "When the run download directory has no files, fail the block (False, default) instead "
-            "of reporting success. Set True to allow an empty upload (success with no files uploaded)."
+            "When the run download directory has no files, allow the empty upload only after confirming no registered, "
+            "browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an "
+            "empty upload."
         ),
     )
 
@@ -4768,6 +4855,12 @@ class FileUploadBlock(Block):
         if self.azure_blob_container_name and workflow_run_context.has_parameter(self.azure_blob_container_name):
             parameters.append(workflow_run_context.get_parameter(self.azure_blob_container_name))
 
+        if self.google_credential_id and workflow_run_context.has_parameter(self.google_credential_id):
+            parameters.append(workflow_run_context.get_parameter(self.google_credential_id))
+
+        if self.google_drive_folder_id and workflow_run_context.has_parameter(self.google_drive_folder_id):
+            parameters.append(workflow_run_context.get_parameter(self.google_drive_folder_id))
+
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
@@ -4797,6 +4890,14 @@ class FileUploadBlock(Block):
         if self.azure_blob_container_name:
             self.azure_blob_container_name = self.format_block_parameter_template_from_workflow_run_context(
                 self.azure_blob_container_name, workflow_run_context
+            )
+        if self.google_credential_id:
+            self.google_credential_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.google_credential_id, workflow_run_context
+            )
+        if self.google_drive_folder_id:
+            self.google_drive_folder_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.google_drive_folder_id, workflow_run_context
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
@@ -4863,6 +4964,208 @@ class FileUploadBlock(Block):
             azure_blob_name=blob_name,
         )
 
+    @staticmethod
+    def _build_google_drive_destination(
+        *,
+        access_token: str,
+        folder_id: str,
+    ) -> FileUploadDestination:
+        return FileUploadDestination(
+            storage_type=FileStorageType.GOOGLE_DRIVE,
+            customer_uri=f"https://drive.google.com/drive/folders/{folder_id}",
+            sdk_uri=f"https://drive.google.com/drive/folders/{folder_id}",
+            google_access_token=access_token,
+            google_drive_folder_id=folder_id,
+        )
+
+    @staticmethod
+    def _candidate_download_signal_run_ids(
+        *,
+        context: SkyvernContext | None,
+        workflow_run_id: str,
+        run_download_id: str | None,
+    ) -> list[str]:
+        candidate_run_ids: list[str] = []
+        for candidate in (
+            run_download_id,
+            workflow_run_id,
+            context.run_id if context else None,
+            context.workflow_run_id if context else None,
+        ):
+            if candidate and candidate not in candidate_run_ids:
+                candidate_run_ids.append(candidate)
+        if not candidate_run_ids and context and context.task_id:
+            candidate_run_ids.append(context.task_id)
+        return candidate_run_ids
+
+    def _get_files_to_upload_from_download_dir(
+        self,
+        *,
+        download_files_path: str,
+        max_file_count: int,
+    ) -> list[str]:
+        files_to_upload = []
+        if os.path.isdir(download_files_path):
+            files = os.listdir(download_files_path)
+            if len(files) > max_file_count:
+                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
+            for file in files:
+                if os.path.isdir(os.path.join(download_files_path, file)):
+                    LOG.warning("FileUploadBlock Skipping directory", file=file)
+                    continue
+                files_to_upload.append(os.path.join(download_files_path, file))
+        return files_to_upload
+
+    def _get_files_in_alternate_candidate_download_dirs(
+        self,
+        *,
+        context: SkyvernContext | None,
+        workflow_run_id: str,
+        run_download_id: str | None,
+        download_files_path: str,
+        max_file_count: int,
+    ) -> tuple[list[str] | None, str]:
+        """Return alternate local files plus a failure-reason count label.
+
+        None means the local evidence could not be trusted, so execute() fails closed rather than no-oping.
+        """
+        for candidate_run_id in self._candidate_download_signal_run_ids(
+            context=context,
+            workflow_run_id=workflow_run_id,
+            run_download_id=run_download_id,
+        ):
+            candidate_download_files_path = str(get_path_for_workflow_download_directory(candidate_run_id).absolute())
+            if candidate_download_files_path == download_files_path:
+                continue
+            try:
+                alternate_files = self._get_files_to_upload_from_download_dir(
+                    download_files_path=candidate_download_files_path,
+                    max_file_count=max_file_count,
+                )
+            except ValueError:
+                LOG.warning(
+                    "FileUploadBlock found too many files in an alternate candidate download directory",
+                    workflow_run_id=workflow_run_id,
+                    candidate_run_id=candidate_run_id,
+                    download_files_path=download_files_path,
+                    candidate_download_files_path=candidate_download_files_path,
+                    exc_info=True,
+                )
+                return None, "too_many"
+            if alternate_files:
+                LOG.warning(
+                    "FileUploadBlock found files in an alternate candidate download directory",
+                    workflow_run_id=workflow_run_id,
+                    candidate_run_id=candidate_run_id,
+                    download_files_path=download_files_path,
+                    candidate_download_files_path=candidate_download_files_path,
+                    file_count=len(alternate_files),
+                )
+                return alternate_files, str(len(alternate_files))
+        return [], "0"
+
+    async def _get_browser_session_downloaded_files_for_empty_scan(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        browser_session_id: str | None,
+    ) -> list[str] | None:
+        if not browser_session_id:
+            # No persistent-session namespace exists to inspect, so this signal cannot contain downloads.
+            return []
+        if not organization_id:
+            LOG.warning(
+                "FileUploadBlock cannot check browser-session downloads without organization_id",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+            )
+            return None
+
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout checking browser-session downloads for empty FileUploadBlock scan",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+            )
+            return None
+        except Exception:
+            LOG.warning(
+                "Failed to check browser-session downloads for empty FileUploadBlock scan",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_session_id=browser_session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _get_registered_downloaded_files_for_empty_scan(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        run_download_id: str | None,
+        context: SkyvernContext | None,
+    ) -> list[FileInfo] | None:
+        """Return registered downloads, or None when the signal is unknown.
+
+        A timeout on any candidate stays unknown even if later candidates might be empty; an empty later lookup cannot
+        prove that the timed-out candidate had no downloads, so the caller fails closed.
+        """
+        if not organization_id:
+            LOG.warning(
+                "FileUploadBlock cannot check registered downloads without organization_id",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+        registered_downloaded_files: list[FileInfo] = []
+        for candidate_run_id in self._candidate_download_signal_run_ids(
+            context=context,
+            workflow_run_id=workflow_run_id,
+            run_download_id=run_download_id,
+        ):
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    registered_downloaded_files.extend(
+                        await app.STORAGE.get_downloaded_files(
+                            organization_id=organization_id,
+                            run_id=candidate_run_id,
+                        )
+                    )
+                    if registered_downloaded_files:
+                        return registered_downloaded_files
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout checking registered downloads for empty FileUploadBlock scan",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    candidate_run_id=candidate_run_id,
+                )
+                return None
+            except Exception:
+                LOG.warning(
+                    "Failed to check registered downloads for empty FileUploadBlock scan",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    candidate_run_id=candidate_run_id,
+                    exc_info=True,
+                )
+                return None
+
+        return registered_downloaded_files
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4890,6 +5193,11 @@ class FileUploadBlock(Block):
                 missing_parameters.append("azure_storage_account_key")
             if not self.azure_blob_container_name or self.azure_blob_container_name == "":
                 missing_parameters.append("azure_blob_container_name")
+        elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not self.google_credential_id:
+                missing_parameters.append("google_credential_id")
+            if not self.google_drive_folder_id:
+                missing_parameters.append("google_drive_folder_id")
         else:
             return await self.build_block_result(
                 success=False,
@@ -4923,38 +5231,88 @@ class FileUploadBlock(Block):
             )
 
         context = skyvern_context.current()
-        download_files_path = str(
-            get_path_for_workflow_download_directory(
-                resolve_run_download_id(context, fallback_run_id=workflow_run_id)
-            ).absolute()
-        )
+        run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+        download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
 
-        uploaded_uris = []
+        uploaded_uris: list[str] = []
         try:
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             files_to_upload = []
-            if os.path.isdir(download_files_path):
-                files = os.listdir(download_files_path)
-                max_file_count = (
-                    MAX_UPLOAD_FILE_COUNT
-                    if self.storage_type == FileStorageType.S3
-                    else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
-                )
-                if len(files) > max_file_count:
-                    raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
-                for file in files:
-                    if os.path.isdir(os.path.join(download_files_path, file)):
-                        LOG.warning("FileUploadBlock Skipping directory", file=file)
-                        continue
-                    files_to_upload.append(os.path.join(download_files_path, file))
+            max_file_count = (
+                MAX_UPLOAD_FILE_COUNT
+                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE}
+                else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            )
+            files_to_upload = self._get_files_to_upload_from_download_dir(
+                download_files_path=download_files_path,
+                max_file_count=max_file_count,
+            )
 
             if not files_to_upload and not self.continue_on_empty:
-                # Never green on a zero-file upload by default: a download-dir/scan-dir desync
-                # would otherwise be silent data loss (SKY-11153). Opt out with continue_on_empty.
+                (
+                    (alternate_files, alternate_file_count),
+                    browser_session_downloaded_files,
+                    registered_downloaded_files,
+                ) = await asyncio.gather(
+                    asyncio.to_thread(
+                        self._get_files_in_alternate_candidate_download_dirs,
+                        context=context,
+                        workflow_run_id=workflow_run_id,
+                        run_download_id=run_download_id,
+                        download_files_path=download_files_path,
+                        max_file_count=max_file_count,
+                    ),
+                    self._get_browser_session_downloaded_files_for_empty_scan(
+                        organization_id=organization_id or workflow_run_context.organization_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        browser_session_id=browser_session_id or (context.browser_session_id if context else None),
+                    ),
+                    self._get_registered_downloaded_files_for_empty_scan(
+                        organization_id=organization_id or workflow_run_context.organization_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        run_download_id=run_download_id,
+                        context=context,
+                    ),
+                )
+                if (
+                    registered_downloaded_files == []
+                    and alternate_files == []
+                    and browser_session_downloaded_files == []
+                ):
+                    LOG.info(
+                        "FileUploadBlock empty scan has no registered downloads; treating as no-op",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        download_files_path=download_files_path,
+                        storage_type=self.storage_type,
+                    )
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
+                    return await self.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value=uploaded_uris,
+                        status=BlockStatus.completed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
+                registered_download_count = (
+                    str(len(registered_downloaded_files)) if registered_downloaded_files is not None else "unknown"
+                )
+                browser_session_download_count = (
+                    str(len(browser_session_downloaded_files))
+                    if browser_session_downloaded_files is not None
+                    else "unknown"
+                )
                 return await self.build_block_result(
                     success=False,
                     failure_reason=(
                         f"No files found to upload in the run download directory ({download_files_path}); "
+                        f"registered_download_count={registered_download_count}; "
+                        f"alternate_file_count={alternate_file_count}; "
+                        f"browser_session_download_count={browser_session_download_count}; "
                         f"nothing was sent to {self.storage_type}."
                     ),
                     output_parameter_value=None,
@@ -5015,6 +5373,40 @@ class FileUploadBlock(Block):
                     )
                     uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
+            elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
+                org_id = organization_id or workflow_run_context.organization_id
+                if not org_id:
+                    raise ValueError("organization_id is required for Google Drive uploads")
+                google_credential_id = (
+                    workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
+                    or self.google_credential_id
+                )
+                if not google_credential_id:
+                    raise ValueError("Google credential id is required")
+
+                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+                    organization_id=org_id,
+                    credential_id=google_credential_id,
+                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                )
+                if not google_credentials or not google_credentials.token:
+                    raise ValueError("Google Drive credential is not connected or is missing required scopes")
+
+                folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
+                for file_path in files_to_upload:
+                    LOG.info("FileUploadBlock Uploading file to Google Drive", file_path=file_path)
+                    destination = self._build_google_drive_destination(
+                        access_token=google_credentials.token,
+                        folder_id=folder_id,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=org_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
+                LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation
                 raise ValueError(f"Unsupported storage type: {self.storage_type}")
@@ -5657,6 +6049,21 @@ class FileParserBlock(Block):
             )
             raise
 
+    async def _resolve_file_parser_handler(
+        self, prompt_type: str, distinct_id: str | None, organization_id: str | None
+    ) -> LLMAPIHandler:
+        """Resolve the default handler for a file-parser prompt type.
+
+        Honors the LLM_CONFIG_BY_PROMPT_TYPE PostHog flag (keyed by prompt type) so the
+        OCR and extraction models can be set without a deploy; falls back to the primary
+        handler. A block-level override_llm_key still takes precedence at the call site.
+        """
+        if distinct_id:
+            posthog_handler = await get_llm_handler_for_prompt_type(prompt_type, distinct_id, organization_id)
+            if posthog_handler:
+                return posthog_handler
+        return app.LLM_API_HANDLER
+
     async def _ocr_pdf_pages(
         self,
         page_images: list[bytes],
@@ -5671,8 +6078,11 @@ class FileParserBlock(Block):
         truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
         """
         llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+        default_handler = await self._resolve_file_parser_handler(
+            "extract-text-from-image", workflow_run_block_id, organization_id
+        )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=app.LLM_API_HANDLER
+            self.override_llm_key, default=default_handler
         )
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
@@ -5743,8 +6153,11 @@ class FileParserBlock(Block):
                 image_bytes = f.read()
 
             llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            default_handler = await self._resolve_file_parser_handler(
+                "extract-text-from-image", workflow_run_block_id, organization_id
+            )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                self.override_llm_key, default=app.LLM_API_HANDLER
+                self.override_llm_key, default=default_handler
             )
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
@@ -5861,7 +6274,10 @@ class FileParserBlock(Block):
         )
 
         llm_key = self.override_llm_key
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+        default_handler = await self._resolve_file_parser_handler(
+            "extract-information-from-file-text", workflow_run_block_id, organization_id
+        )
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
 
         llm_response = await llm_api_handler(
             prompt=llm_prompt,
@@ -6691,6 +7107,12 @@ class TaskV2Block(Block):
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
                 workflow_system_prompt=self.workflow_system_prompt,
                 trigger_type=inherited_v2_trigger_type,
+                # Pin the child to the parent's remote browser (CDP address + the
+                # headers its handshake authenticates with) so a cloud-browser run
+                # doesn't fall back to a fresh local Chrome.
+                browser_address=workflow_run.browser_address,
+                extra_http_headers=workflow_run.extra_http_headers,
+                cdp_connect_headers=workflow_run.cdp_connect_headers,
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -7352,17 +7774,19 @@ class PrintPageBlock(Block):
         organization_id: str | None,
         workflow_run_id: str,
         workflow_run_block_id: str,
+        download_run_id: str | None = None,
     ) -> list[FileInfo]:
         # Workflow finalization eventually runs save_downloaded_files, but the block
         # output snapshot is recorded now and the UI keys off downloaded_file_urls
         # on the block — so we register up front and let finalization re-run safely.
         if not organization_id:
             return []
+        storage_run_id = download_run_id or workflow_run_id
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -7383,7 +7807,7 @@ class PrintPageBlock(Block):
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 return await app.STORAGE.get_downloaded_files(
                     organization_id=organization_id,
-                    run_id=workflow_run_id,
+                    run_id=storage_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -7408,10 +7832,12 @@ class PrintPageBlock(Block):
         if block_context:
             await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
+        resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            download_run_id_override=resolved_download_id,
         )
         if not browser_state:
             return await self.build_block_result(
@@ -7461,7 +7887,7 @@ class PrintPageBlock(Block):
             filename = f"page_{timestamp_str}.pdf"
 
         # Save PDF to download directory so it appears in runs UI
-        download_dir = get_download_dir(workflow_run_id)
+        download_dir = get_download_dir(resolved_download_id)
         file_path = os.path.join(download_dir, filename)
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(pdf_bytes)
@@ -7480,6 +7906,7 @@ class PrintPageBlock(Block):
             organization_id=artifact_org_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
+            download_run_id=resolved_download_id,
         )
 
         current_context = skyvern_context.current()
@@ -9307,3 +9734,40 @@ BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 
 BranchCriteriaSubclasses = Union[JinjaBranchCriteria, PromptBranchCriteria]
 BranchCriteriaTypeVar = Annotated[BranchCriteriaSubclasses, Field(discriminator="criteria_type")]
+
+
+def resolve_conditional_merge_edges(
+    blocks: list[BlockTypeVar],
+    label_to_block: dict[str, BlockTypeVar],
+    default_next_map: dict[str, str | None],
+) -> None:
+    """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
+
+    SKY-8571: iterates to convergence so an outer conditional patched on one pass can let an inner
+    conditional's branch terminals be patched on the next. Mutates default_next_map in place.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for block in blocks:
+            if not isinstance(block, ConditionalBlock):
+                continue
+            successor = default_next_map.get(block.label)
+            if not successor:
+                continue
+            for branch in block.ordered_branches:
+                target = branch.next_block_label
+                if not target or target == successor:
+                    continue
+                cur: str | None = target
+                visited: set[str] = set()
+                while cur and cur in label_to_block and cur not in visited:
+                    if cur == successor:
+                        break
+                    visited.add(cur)
+                    nxt = default_next_map.get(cur)
+                    if nxt is None:
+                        default_next_map[cur] = successor
+                        changed = True
+                        break
+                    cur = nxt

@@ -219,7 +219,7 @@ def set_download_file_listener(
                 if not file_path.exists():
                     # On an adopted persistent session the bytes live on the run connection, not
                     # this worker connection; saving is the run side's job, so skip rather than crash.
-                    LOG.warning(
+                    LOG.debug(
                         "Download artifact absent on this connection; skipping worker-side rename",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
@@ -299,33 +299,82 @@ def initialize_download_dir() -> str:
     return get_download_dir(resolve_run_download_id(context))
 
 
-async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
+async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, page: Page | None = None) -> None:
     if not run_id:
         # No run_id means no run-scoped dir to bind to, so the session keeps its current download
         # binding. Adoption callers always pass a run id, so warn on the unexpected miss.
         LOG.warning("rebind_download_dir skipped: missing run_id")
         return
     download_dir = get_download_dir(run_id)
-    cdp_session = await browser.new_browser_cdp_session()
-    await cdp_session.send(
-        "Browser.setDownloadBehavior",
-        {
-            "behavior": "allow",
-            "downloadPath": download_dir,
-        },
-    )
+
+    if browser is not None:
+        rebind_contexts = list(browser.contexts)
+    elif page is not None:
+        rebind_contexts = [page.context]
+    else:
+        LOG.warning("rebind_download_dir skipped: no browser or page to bind", run_id=run_id)
+        return
+
     rebound_interceptors = 0
-    for context in browser.contexts:
-        interceptor = getattr(context, "_skyvern_cdp_download_interceptor", None)
+    monitor_owns_binding = False
+    for context in rebind_contexts:
+        interceptor: CDPDownloadInterceptor | None = getattr(context, "_skyvern_cdp_download_interceptor", None)
         if interceptor is not None:
             interceptor.set_download_dir(download_dir)
             rebound_interceptors += 1
+            if interceptor.is_monitoring_browser_downloads():
+                monitor_owns_binding = True
+
+    setdownloadbehavior_applied = False
+    if monitor_owns_binding:
+        # The download monitor holds {behavior:deny, eventsEnabled:True} and saves files over HTTP
+        # (remote CDP has no valid downloadPath). Re-sending allow/downloadPath would disable it, so
+        # only its run-scoped dir is rebound above.
+        LOG.info(
+            "setDownloadBehavior skipped: download monitor owns binding",
+            download_dir=download_dir,
+            run_id=run_id,
+            rebound_interceptors=rebound_interceptors,
+            monitor_owns_binding=monitor_owns_binding,
+        )
+        return
+
+    try:
+        if browser is not None:
+            cdp_session = await browser.new_browser_cdp_session()
+        elif page is not None:
+            # launch_persistent_context browsers expose no owning Browser, so acquire the CDP session
+            # through the context.
+            cdp_session = await page.context.new_cdp_session(page)
+        else:
+            return
+        await cdp_session.send(
+            "Browser.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": download_dir,
+            },
+        )
+        setdownloadbehavior_applied = True
+    except Exception:
+        # Fail open: a rebind/setDownloadBehavior failure must never break a browser launch or run.
+        # Downloads keep their launch-time binding.
+        LOG.warning(
+            "setDownloadBehavior rebind failed; keeping current download binding",
+            download_dir=download_dir,
+            run_id=run_id,
+            rebound_interceptors=rebound_interceptors,
+            exc_info=True,
+        )
+        return
 
     LOG.info(
         "setDownloadBehavior applied",
         download_dir=download_dir,
         run_id=run_id,
         rebound_interceptors=rebound_interceptors,
+        setdownloadbehavior_applied=setdownloadbehavior_applied,
+        monitor_owns_binding=monitor_owns_binding,
     )
 
 
@@ -974,7 +1023,11 @@ async def _connect_to_cdp_browser(
     )
 
     if apply_download_behaviour:
-        await _apply_download_behaviour(browser)
+        try:
+            await _apply_download_behaviour(browser)
+        except Exception:
+            # Fail open: a download-behaviour rebind failure must never break a browser launch.
+            LOG.warning("Failed to apply download behaviour on browser launch", exc_info=True)
 
     # Decide whether to create fresh context or reuse existing one
     contexts = browser.contexts

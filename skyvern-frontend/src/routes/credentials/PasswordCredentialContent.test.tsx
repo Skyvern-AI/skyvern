@@ -6,6 +6,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { useEffect, useState } from "react";
 import { MemoryRouter } from "react-router-dom";
@@ -72,7 +73,10 @@ function ModalLikeHarness({
 }
 
 describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression)", () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
   it("preserves saved totp_identifier when modal hydrates an email-TOTP credential into a form that started at PASSWORD_CREDENTIAL_INITIAL_VALUES", async () => {
     // Reproduces the bug:
@@ -147,6 +151,260 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       );
     });
     expect(autoFillCall).toBeTruthy();
+  });
+
+  it("marks Authenticator App as the selected 2FA method when a new credential opens the 2FA section", async () => {
+    const onChangeSpy = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+
+    const authenticatorCall = onChangeSpy.mock.calls.find((call) => {
+      const next = call[0] as Values;
+      return next.totp_type === "authenticator";
+    });
+    expect(authenticatorCall).toBeTruthy();
+  });
+
+  it("keeps Authenticator App selected when the user types a key without clicking the method tile", async () => {
+    const onChangeSpy = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    fireEvent.change(screen.getByPlaceholderText("e.g. JBSWY3DPEHPK3PXP"), {
+      target: { value: "JBSWY3DPEHPK3PXP" },
+    });
+
+    const typedCall = onChangeSpy.mock.calls.find((call) => {
+      const next = call[0] as Values;
+      return (
+        next.totp_type === "authenticator" && next.totp === "JBSWY3DPEHPK3PXP"
+      );
+    });
+    expect(typedCall).toBeTruthy();
+  });
+
+  it("imports an otpauth URI from an uploaded QR code image", async () => {
+    const onChangeSpy = vi.fn();
+    const imageBitmap = { close: vi.fn() } as unknown as ImageBitmap;
+    class MockBarcodeDetector {
+      detect = vi.fn().mockResolvedValue([
+        {
+          rawValue:
+            "otpauth://totp/user@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Example",
+        },
+      ]);
+    }
+    vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue(imageBitmap));
+    vi.stubGlobal("BarcodeDetector", MockBarcodeDetector);
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    fireEvent.change(screen.getByLabelText("Upload QR code image"), {
+      target: {
+        files: [new File(["qr"], "totp.png", { type: "image/png" })],
+      },
+    });
+
+    await waitFor(() => {
+      const qrCall = onChangeSpy.mock.calls.find((call) => {
+        const next = call[0] as Values;
+        return (
+          next.totp_type === "authenticator" &&
+          next.totp.startsWith("otpauth://totp/")
+        );
+      });
+      expect(qrCall).toBeTruthy();
+    });
+    expect(imageBitmap.close).toHaveBeenCalled();
+  });
+
+  it("imports a non-otpauth QR payload for server-side validation", async () => {
+    const onChangeSpy = vi.fn();
+    const imageBitmap = { close: vi.fn() } as unknown as ImageBitmap;
+    class MockBarcodeDetector {
+      detect = vi.fn().mockResolvedValue([
+        {
+          rawValue: "custom-authenticator://activate?payload=opaque",
+        },
+      ]);
+    }
+    vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue(imageBitmap));
+    vi.stubGlobal("BarcodeDetector", MockBarcodeDetector);
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    fireEvent.change(screen.getByLabelText("Upload QR code image"), {
+      target: {
+        files: [new File(["qr"], "totp.png", { type: "image/png" })],
+      },
+    });
+
+    await waitFor(() => {
+      const qrCall = onChangeSpy.mock.calls.find((call) => {
+        const next = call[0] as Values;
+        return (
+          next.totp_type === "authenticator" &&
+          next.totp === "custom-authenticator://activate?payload=opaque"
+        );
+      });
+      expect(qrCall).toBeTruthy();
+    });
+    expect(imageBitmap.close).toHaveBeenCalled();
+  });
+
+  it("shows an inline fallback when the browser cannot scan QR codes", async () => {
+    const onChangeSpy = vi.fn();
+    vi.stubGlobal("BarcodeDetector", undefined);
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    fireEvent.change(screen.getByLabelText("Upload QR code image"), {
+      target: {
+        files: [new File(["qr"], "totp.png", { type: "image/png" })],
+      },
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          "QR scanning is not supported by this browser. Paste the setup key or otpauth:// URI instead.",
+        ),
+      ).toBeTruthy();
+    });
+  });
+
+  it("shows the QR fallback when the browser rejects QR detection", async () => {
+    const onChangeSpy = vi.fn();
+    const createImageBitmapMock = vi.fn();
+    class MockBarcodeDetector {
+      constructor() {
+        throw new TypeError("Unsupported barcode format");
+      }
+
+      detect = vi.fn();
+    }
+    vi.stubGlobal("createImageBitmap", createImageBitmapMock);
+    vi.stubGlobal("BarcodeDetector", MockBarcodeDetector);
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    fireEvent.change(screen.getByLabelText("Upload QR code image"), {
+      target: {
+        files: [new File(["qr"], "totp.png", { type: "image/png" })],
+      },
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          "QR scanning is not supported by this browser. Paste the setup key or otpauth:// URI instead.",
+        ),
+      ).toBeTruthy();
+    });
+    expect(createImageBitmapMock).not.toHaveBeenCalled();
   });
 
   it("preserves an intentionally-empty totp_identifier when hydrating a saved email-TOTP credential", async () => {
@@ -249,5 +507,57 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       );
     });
     expect(reseedCall).toBeTruthy();
+  });
+
+  it("allows QR upload to set the TOTP payload", async () => {
+    const onChangeSpy = vi.fn();
+    const close = vi.fn();
+    const detect = vi
+      .fn()
+      .mockResolvedValue([{ rawValue: "decoded-qr-payload" }]);
+    class BarcodeDetector {
+      detect: typeof detect;
+
+      constructor() {
+        this.detect = detect;
+      }
+    }
+    vi.stubGlobal("BarcodeDetector", BarcodeDetector);
+    vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue({ close }));
+
+    const { container } = render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "Example Login",
+            username: "user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "authenticator",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+    const input = container.querySelector('input[type="file"]');
+    expect(input).toBeTruthy();
+    const file = new File(["qr"], "qr.png", { type: "image/png" });
+
+    await act(async () => {
+      fireEvent.change(input as HTMLInputElement, {
+        target: { files: [file] },
+      });
+    });
+
+    await waitFor(() =>
+      expect(onChangeSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          totp: "decoded-qr-payload",
+          totp_type: "authenticator",
+        }),
+      ),
+    );
+    expect(close).toHaveBeenCalled();
   });
 });

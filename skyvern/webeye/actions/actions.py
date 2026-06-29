@@ -162,6 +162,10 @@ class Action(BaseModel):
     # Pressing Tab would move focus away and break that next action.
     skip_auto_complete_tab: bool = False
 
+    # Transient (never serialized): set per-step by the agent loop when this INPUT_TEXT's next
+    # batched action would clobber an in-action combobox selection.
+    stop_batch_after_dropdown_select: bool = Field(default=False, exclude=True)
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None
@@ -253,9 +257,10 @@ class ReloadPageAction(Action):
     action_type: ActionType = ActionType.RELOAD_PAGE
 
 
-# TODO: right now, it's only enabled when there's magic link during login
 class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
+    # When set, close the open tab at this index in the open-tabs list instead of the current tab.
+    tab_index: int | None = None
 
 
 class NewTabAction(Action):

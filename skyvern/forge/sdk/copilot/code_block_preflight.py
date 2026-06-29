@@ -11,15 +11,30 @@ import textwrap
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable
 
+from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+
+SANDBOX_UNRESOLVED_NAME_REASON_CODE = "SANDBOX_UNRESOLVED_NAME"
 
 
 @dataclass(frozen=True)
 class CodeBlockPreflightDiagnostic:
     code: str
     message: str
+
+
+@dataclass(frozen=True)
+class CodeBlockSandboxNameDiagnostic:
+    code: str
+    message: str
+    unresolved_names: tuple[str, ...]
+    class_names: tuple[str, ...]
+    parameter_keys: tuple[str, ...]
+    allowed_global_names: tuple[str, ...]
+    allowed_helper_surface: dict[str, tuple[str, ...]]
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")
@@ -44,6 +59,145 @@ def _sandbox_global_names() -> frozenset[str]:
     # Keep this derived from the runtime sandbox, but resolve it lazily so the
     # analyzer does not bind itself to CodeBlock import-time behavior.
     return frozenset(name for name in CodeBlock.build_safe_vars() if not name.startswith("__")) | {"page"}
+
+
+@cache
+def _sandbox_shim_surface() -> dict[str, frozenset[str]]:
+    return {
+        name: frozenset(vars(value))
+        for name, value in CodeBlock.build_safe_vars().items()
+        if isinstance(value, SimpleNamespace)
+    }
+
+
+def sandbox_allowed_global_names() -> list[str]:
+    return sorted(_sandbox_global_names())
+
+
+def sandbox_allowed_helper_surface() -> dict[str, list[str]]:
+    return {name: sorted(surface) for name, surface in sorted(_sandbox_shim_surface().items())}
+
+
+def strip_redundant_sandbox_imports(code: str) -> tuple[str, list[str]]:
+    """Remove top-level imports the runtime sandbox already injects.
+
+    A module import is removed only when the runtime sandbox provides the same
+    name as a ``SimpleNamespace`` helper and every attribute the code reads on
+    that name is present on the injected helper. Aliased imports, submodule
+    imports, from-imports, compound-line imports, non-sandbox modules, imports
+    whose used surface exceeds the injected helper, and bare uses of the name as
+    a value are all left in place so ``CodeBlock.is_safe_code`` still rejects
+    them with immediate author-time feedback.
+    """
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, []
+
+    shim_surface = _sandbox_shim_surface()
+    attribute_use = _module_attribute_use(tree)
+    bare_use = _module_bare_use(tree)
+
+    removable_spans: list[tuple[int, int]] = []
+    stripped_modules: list[str] = []
+    occupied_lines = _occupied_line_numbers(tree)
+    for node in tree.body:
+        if not isinstance(node, ast.Import):
+            continue
+        candidate_modules = _strippable_module_names(node, shim_surface, attribute_use, bare_use)
+        if candidate_modules is None:
+            continue
+        if node.end_lineno is None:
+            continue
+        if _line_span_shares_other_statement(node, occupied_lines):
+            continue
+        removable_spans.append((node.lineno, node.end_lineno))
+        stripped_modules.extend(candidate_modules)
+
+    if not removable_spans:
+        return code, []
+
+    sanitized = _remove_line_spans(code, removable_spans)
+    try:
+        ast.parse(sanitized)
+    except SyntaxError:
+        return code, []
+    return sanitized, stripped_modules
+
+
+def _strippable_module_names(
+    node: ast.Import,
+    shim_surface: dict[str, frozenset[str]],
+    attribute_use: dict[str, set[str]],
+    bare_use: set[str],
+) -> list[str] | None:
+    modules: list[str] = []
+    for alias in node.names:
+        if alias.asname is not None or "." in alias.name:
+            return None
+        if alias.name not in shim_surface:
+            return None
+        if alias.name in bare_use:
+            return None
+        if not attribute_use.get(alias.name, set()).issubset(shim_surface[alias.name]):
+            return None
+        modules.append(alias.name)
+    return modules or None
+
+
+def _module_attribute_use(tree: ast.AST) -> dict[str, set[str]]:
+    usage: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and isinstance(node.value.ctx, ast.Load)
+        ):
+            usage.setdefault(node.value.id, set()).add(node.attr)
+    return usage
+
+
+def _module_bare_use(tree: ast.AST) -> set[str]:
+    # id() of each ast.Attribute value Name is stable across both walks of the same parsed tree.
+    attribute_base_names: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            attribute_base_names.add(id(node.value))
+    bare: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in attribute_base_names:
+            bare.add(node.id)
+    return bare
+
+
+def _occupied_line_numbers(tree: ast.AST) -> dict[int, set[int]]:
+    lines: dict[int, set[int]] = {}
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        if node.lineno is None or node.end_lineno is None:
+            continue
+        for line in range(node.lineno, node.end_lineno + 1):
+            lines.setdefault(line, set()).add(id(node))
+    return lines
+
+
+def _line_span_shares_other_statement(node: ast.Import, occupied_lines: dict[int, set[int]]) -> bool:
+    if node.end_lineno is None:
+        return True
+    for line in range(node.lineno, node.end_lineno + 1):
+        if any(owner != id(node) for owner in occupied_lines.get(line, set())):
+            return True
+    return False
+
+
+def _remove_line_spans(code: str, spans: list[tuple[int, int]]) -> str:
+    drop_lines: set[int] = set()
+    for start, end in spans:
+        drop_lines.update(range(start, end + 1))
+    kept = [line for index, line in enumerate(code.splitlines(keepends=True), start=1) if index not in drop_lines]
+    return "".join(kept)
 
 
 def preflight_code_block(
@@ -107,14 +261,26 @@ def sandbox_unresolved_name_diagnostics(
     ambiguous control-flow bindings do not satisfy later reads.
     """
 
+    repair_diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+    if repair_diagnostic is None:
+        return []
+    return [CodeBlockPreflightDiagnostic(code=repair_diagnostic.code, message=repair_diagnostic.message)]
+
+
+def sandbox_unresolved_name_repair_diagnostic(
+    code: str,
+    *,
+    parameter_keys: Iterable[str] = (),
+) -> CodeBlockSandboxNameDiagnostic | None:
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
     except SyntaxError:
-        return []
+        return None
 
-    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_keys).analyze(tree.body)
+    parameter_key_list = sorted(key for key in dict.fromkeys(parameter_keys) if _valid_python_identifier(key))
+    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_key_list).analyze(tree.body)
     if not unresolved_names and not class_names:
-        return []
+        return None
 
     names = sorted(unresolved_names)
     rejected_classes = sorted(class_names)
@@ -126,24 +292,29 @@ def sandbox_unresolved_name_diagnostics(
             "class definitions unavailable in the code sandbox: " + ", ".join(f"`{name}`" for name in rejected_classes)
         )
     detail = "; ".join(detail_parts)
-    return [
-        CodeBlockPreflightDiagnostic(
-            code="SANDBOX_UNRESOLVED_NAME",
-            message=(
-                f"Code block references names that are unavailable in the runtime code sandbox or are not "
-                f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
-                "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
-                "exception type."
-            ),
-        )
-    ]
+    return CodeBlockSandboxNameDiagnostic(
+        code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        message=(
+            f"Code block references names that are unavailable in the runtime code sandbox or are not "
+            f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
+            "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
+            "exception type."
+        ),
+        unresolved_names=tuple(names),
+        class_names=tuple(rejected_classes),
+        parameter_keys=tuple(parameter_key_list),
+        allowed_global_names=tuple(sandbox_allowed_global_names()),
+        allowed_helper_surface={
+            helper: tuple(attributes) for helper, attributes in sandbox_allowed_helper_surface().items()
+        },
+    )
 
 
 def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     tree, _ = _parse_static_ast(code)
     if tree is None:
         return []
-    return _author_time_ast_diagnostics(tree)
+    return [*_author_time_security_diagnostics(code), *_author_time_ast_diagnostics(tree)]
 
 
 def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
@@ -153,7 +324,7 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     if tree is None:
         return []
 
-    diagnostics = _author_time_ast_diagnostics(tree)
+    diagnostics = [*_author_time_security_diagnostics(code), *_author_time_ast_diagnostics(tree)]
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -184,6 +355,24 @@ def _parse_static_ast(code: str) -> tuple[ast.AST | None, CodeBlockPreflightDiag
             message=f"Code block does not parse as Python: {exc.msg}. Fix the snippet before persisting it.",
         )
     return tree, None
+
+
+def _author_time_security_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+    normalized_code = textwrap.dedent(code).strip()
+    return [
+        _author_time_security_diagnostic(error)
+        for error in author_time_code_security_errors(label="code", code=normalized_code)
+    ]
+
+
+def _author_time_security_diagnostic(error: CodeBlockSecurityError) -> CodeBlockPreflightDiagnostic:
+    return CodeBlockPreflightDiagnostic(
+        code=error.reason_code,
+        message=(
+            f"{error.reason_code}: {error.surface} is not allowed in persisted workflow code blocks. "
+            "Use locators and locator DOM-reading methods instead."
+        ),
+    )
 
 
 def _author_time_ast_diagnostics(tree: ast.AST) -> list[CodeBlockPreflightDiagnostic]:

@@ -12,18 +12,41 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CREDENTIAL_SCOUT_VERIFY_REPLY,
+    CopilotToolBlockerSignal,
+    assert_clean_user_facing_text,
+)
+from skyvern.forge.sdk.copilot.code_block_preflight import (
+    SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+    _sandbox_shim_surface,
+    strip_redundant_sandbox_imports,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr, _get_by_role_expr_strict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
+    MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
+    _check_enforcement,
+)
+from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _code_block_safety_errors,
     _detect_stale_block_metadata,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.workflow_update import _strip_redundant_sandbox_imports_in_yaml
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind, _kind_for_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
+from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
 
 def _yaml(body: str) -> str:
@@ -40,6 +63,32 @@ _IMPORTING_CODE_YAML = _yaml(
         code: |
           import asyncio
           await page.goto("https://example.com/search")
+    """
+)
+
+_REQUESTS_IMPORT_CODE_YAML = _yaml(
+    """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          import requests
+          await page.goto("https://example.com/search")
+    """
+)
+
+_ASYNCIO_GATHER_IMPORT_CODE_YAML = _yaml(
+    """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          import asyncio
+          await asyncio.gather(page.goto("https://example.com/search"))
     """
 )
 
@@ -410,12 +459,44 @@ def _terminal_metadata(label: str, declared_goal: str) -> dict:
     }
 
 
+def _stale_unresolved_repair_context() -> CodeAuthoringRepairContext:
+    return CodeAuthoringRepairContext(
+        block_label="stale_block",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["stale_name"],
+        parameter_keys=[],
+    )
+
+
 class TestCodeSafetySeam:
     def test_import_in_new_code_block_is_a_seam_error(self) -> None:
         errors = _code_block_safety_errors(_IMPORTING_CODE_YAML, None)
         assert len(errors) == 1
         assert "search_registry" in errors[0]
         assert "Not allowed to import modules" in errors[0]
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import requests\nawait page.goto('https://example.com')",
+            "import os as json\nvalue = json",
+            "import json.decoder\nvalue = 1",
+            "from re import search\nmatch = search(r'x', 'x')",
+        ],
+    )
+    def test_unsafe_import_classifications_are_seam_errors(self, code: str) -> None:
+        errors = _code_block_safety_errors(_code_yaml(code), None)
+        assert any("Not allowed to import modules" in str(error) for error in errors)
+
+    def test_dunder_and_blocked_attr_use_are_seam_errors(self) -> None:
+        dunder_errors = _code_block_safety_errors(_code_yaml("value = page.__class__"), None)
+        assert any("private methods or attributes" in str(error) for error in dunder_errors)
+        blocked_errors = _code_block_safety_errors(_code_yaml("value = page.modules"), None)
+        assert any("Not allowed to access 'modules'" in str(error) for error in blocked_errors)
+
+    def test_stripped_shim_import_keeps_name_resolvable_at_seam(self) -> None:
+        sanitized, _ = strip_redundant_sandbox_imports("import json\nvalue = json.dumps({'a': 1})")
+        assert _code_block_safety_errors(_code_yaml(sanitized), None) == []
 
     def test_unchanged_legacy_code_block_is_not_rechecked(self) -> None:
         assert _code_block_safety_errors(_IMPORTING_CODE_YAML, _IMPORTING_CODE_YAML) == []
@@ -425,6 +506,22 @@ class TestCodeSafetySeam:
 
     def test_safe_code_passes(self) -> None:
         assert _code_block_safety_errors(_SAFE_CODE_YAML, None) == []
+
+    @pytest.mark.asyncio
+    async def test_denied_page_api_attribute_is_repairable_preflight_error_without_duplicate_generic_message(
+        self,
+    ) -> None:
+        result = await _update_workflow(
+            {"workflow_yaml": _code_yaml("text = await page.evaluate('() => document.body.innerText')")},
+            _standard_ctx(),
+        )
+
+        assert result["ok"] is False
+        joined = result["error"]
+        assert "AUTHOR_PAGE_EVALUATE" in joined
+        assert "failed the generated-code preflight check" in joined
+        assert joined.count("failed the sandbox safety check") == 0
+        assert joined.count("page.evaluate is not allowed") == 1
 
     def test_unresolved_sandbox_names_are_seam_errors(self) -> None:
         errors = _code_block_safety_errors(
@@ -568,23 +665,427 @@ class TestCodeSafetySeam:
         assert "not valid Python" in errors[0]
 
     @pytest.mark.asyncio
-    async def test_update_workflow_rejects_import_before_any_run(self) -> None:
+    async def test_update_workflow_strips_redundant_import_before_any_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
         result = await _update_workflow({"workflow_yaml": _IMPORTING_CODE_YAML}, ctx)
+        assert result["ok"] is True
+        assert "import asyncio" not in ctx.workflow_yaml
+        assert result["data"]["stripped_redundant_imports"] == ["asyncio"]
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_still_rejects_third_party_import_before_any_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML}, ctx)
         assert result["ok"] is False
         assert "Not allowed to import modules" in result["error"]
-        assert "import" not in result["user_facing_summary"]
-        assert result["user_facing_summary"]
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_still_rejects_surface_exceeding_shim_import_before_any_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _ASYNCIO_GATHER_IMPORT_CODE_YAML}, ctx)
+        assert result["ok"] is False
+        assert "Not allowed to import modules" in result["error"]
 
     @pytest.mark.asyncio
     async def test_code_rejection_does_not_salvage_metadata_into_ctx(self) -> None:
         ctx = _code_only_ctx()
         metadata = [_terminal_metadata("search_registry", "search the registry")]
         result = await _update_workflow(
-            {"workflow_yaml": _IMPORTING_CODE_YAML, "code_artifact_metadata": metadata}, ctx
+            {"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML, "code_artifact_metadata": metadata}, ctx
         )
         assert result["ok"] is False
         assert ctx.code_artifact_metadata == {}
+
+    @pytest.mark.asyncio
+    async def test_code_only_unresolved_name_rejection_records_repair_context_and_accept_clears(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+
+        rejected = await _update_workflow({"workflow_yaml": _code_yaml("print(provider_query)")}, ctx)
+
+        assert rejected["ok"] is False
+        repair_context = ctx.last_code_authoring_repair_context
+        assert isinstance(repair_context, CodeAuthoringRepairContext)
+        result_context = rejected["data"]["authoring_repair_context"]
+        assert result_context["block_label"] == "search_registry"
+        assert result_context["reason_code"] == SANDBOX_UNRESOLVED_NAME_REASON_CODE
+        assert result_context["unresolved_names"] == ["provider_query"]
+        assert result_context["parameter_keys"] == []
+        assert result_context["available_parameter_keys"] == []
+        assert result_context["binding_candidates"] == ["provider_query"]
+        assert "page" in result_context["allowed_global_names"]
+        assert "json" in result_context["allowed_global_names"]
+        assert "dumps" in result_context["allowed_helper_surface"]["json"]
+        assert "print(provider_query)" not in str(result_context)
+        assert (
+            sanitize_tool_result_for_llm("update_workflow", rejected)["data"]["authoring_repair_context"]
+            == result_context
+        )
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert accepted["ok"] is True
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.asyncio
+    async def test_code_only_exact_declared_string_parameters_are_adopted_for_unresolved_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Registry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_query, default_value: Sample}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location, default_value: City}
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  await page.locator("#query").fill(str(provider_query))
+                  await page.locator("#location").fill(str(search_location))
+            """
+        )
+
+        accepted = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert accepted["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["provider_query", "search_location"]
+
+    @pytest.mark.asyncio
+    async def test_code_only_partial_declared_parameter_name_still_rejects(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Registry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_query, default_value: Sample}
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  await page.locator("#query").fill(str(provider_name))
+            """
+        )
+
+        rejected = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert rejected["ok"] is False
+        result_context = rejected["data"]["authoring_repair_context"]
+        assert result_context["unresolved_names"] == ["provider_name"]
+        assert result_context["available_parameter_keys"] == ["provider_query"]
+        assert result_context["binding_candidates"] == ["provider_query", "provider_name"]
+
+    @pytest.mark.asyncio
+    async def test_unresolved_name_repair_context_includes_existing_workflow_binding_candidates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
+
+        def capture_info(event: str, **kwargs: str | list[str]) -> None:
+            info_calls.append((event, kwargs))
+
+        monkeypatch.setattr(workflow_update_module.LOG, "info", capture_info)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Registry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_query, default_value: Sample}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location, default_value: City}
+              - {parameter_type: workflow, workflow_parameter_type: credential_id, key: login_credential}
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  print(provider_name)
+            """
+        )
+
+        rejected = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert rejected["ok"] is False
+        repair_context = rejected["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == SANDBOX_UNRESOLVED_NAME_REASON_CODE
+        assert repair_context["unresolved_names"] == ["provider_name"]
+        assert repair_context["parameter_keys"] == []
+        assert repair_context["available_parameter_keys"] == ["provider_query", "search_location"]
+        assert repair_context["binding_candidates"] == ["provider_query", "search_location", "provider_name"]
+        assert "login_credential" not in str(repair_context)
+        assert (
+            "copilot code authoring repair context stored",
+            {
+                "reason_code": SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+                "block_label": "search_registry",
+                "unresolved_names": ["provider_name"],
+                "parameter_keys": [],
+                "available_parameter_keys": ["provider_query", "search_location"],
+                "binding_candidates": ["provider_query", "search_location", "provider_name"],
+            },
+        ) in info_calls
+
+    @pytest.mark.asyncio
+    async def test_standard_policy_unresolved_name_rejection_has_no_repair_context(self) -> None:
+        ctx = _standard_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _code_yaml("print(provider_query)")}, ctx)
+
+        assert result["ok"] is False
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.parametrize(
+        "workflow_yaml",
+        [
+            _SAFE_CODE_YAML.replace('await page.goto("https://example.com/search")', "await page.goto("),
+            _REQUESTS_IMPORT_CODE_YAML,
+            _code_yaml('await page.evaluate("1 + 1")'),
+            _code_yaml("""await page.wait_for_function("document.body.innerText.includes('Submitted')")"""),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_name_authoring_rejects_do_not_carry_repair_context(self, workflow_yaml: str) -> None:
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.parametrize(
+        "workflow_yaml",
+        [
+            _code_yaml("import os\nprint(provider_query)"),
+            _code_yaml("await page.evaluate(provider_query)"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_mixed_primary_authoring_rejects_do_not_carry_repair_context(self, workflow_yaml: str) -> None:
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.asyncio
+    async def test_imposition_reject_carries_ambiguous_selector_repair_context(self) -> None:
+        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
+        private_url = "https://example.com/orders?session=secret-token#account"
+        for interaction in ctx.scout_trajectory:
+            interaction["source_url"] = private_url
+
+        result = await _update_workflow({"workflow_yaml": _resale_submitted_yaml("button:nth-of-type(2)")}, ctx)
+
+        assert result["ok"] is False
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "ambiguous_bare_selector"
+        assert repair_context["block_label"] == "order_status"
+        assert repair_context["selector"] == "button"
+        assert repair_context["source_url"] == "https://example.com"
+        assert "secret-token" not in str(repair_context)
+        assert repair_context["refiner_selector"] is None
+        assert repair_context["selector_alternatives"] == [
+            {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"}
+        ]
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
+
+    def test_ambiguous_selector_repair_context_only_carries_valid_refiner(self) -> None:
+        code_block = {"label": "order_status"}
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "selector": "button",
+            "trajectory_index": 0,
+        }
+        scout_trajectory = [
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {
+                "tool_name": "click",
+                "selector": "button:nth-of-type(2)",
+                "source_url": _RESALE_URL,
+                "trajectory_index": 1,
+            },
+        ]
+
+        repair_context = workflow_update_module._ambiguous_bare_selector_repair_context(
+            code_block=code_block,
+            dropped=dropped,
+            scout_trajectory=scout_trajectory,
+        )
+
+        assert isinstance(repair_context, CodeAuthoringRepairContext)
+        assert repair_context.refiner_selector is None
+        assert repair_context.selector_alternatives == []
+
+        scout_trajectory.append(
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 2,
+            }
+        )
+        repair_context = workflow_update_module._ambiguous_bare_selector_repair_context(
+            code_block=code_block,
+            dropped=dropped,
+            scout_trajectory=scout_trajectory,
+        )
+
+        assert isinstance(repair_context, CodeAuthoringRepairContext)
+        assert repair_context.refiner_selector == 'button[data-action="status"]'
+        assert repair_context.selector_alternatives == []
+
+    def test_ambiguous_selector_repair_context_carries_sanitized_same_page_alternatives(self) -> None:
+        code_block = {"label": "order_status"}
+        private_url = "https://example.com/orders?session=secret-token#account"
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#order-id",
+                "source_url": private_url,
+                "role": "textbox",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "click", "selector": "button", "source_url": private_url, "trajectory_index": 1},
+            {
+                "tool_name": "click",
+                "selector": "button:nth-of-type(2)",
+                "source_url": private_url,
+                "role": "button",
+                "trajectory_index": 2,
+            },
+            {
+                "tool_name": "click",
+                "selector": 'role=button[name="Order status"]',
+                "source_url": private_url,
+                "role": "button",
+                "trajectory_index": 3,
+            },
+            {
+                "tool_name": "hover",
+                "selector": "#order-total",
+                "source_url": private_url,
+                "role": "status",
+                "trajectory_index": 4,
+            },
+            {
+                "tool_name": "click",
+                "selector": '[data-action="other-page"]',
+                "source_url": "https://example.com/account",
+                "role": "button",
+                "trajectory_index": 5,
+            },
+        ]
+
+        repair_context = workflow_update_module._ambiguous_bare_selector_repair_context(
+            code_block=code_block,
+            dropped=dropped,
+            scout_trajectory=scout_trajectory,
+        )
+
+        assert isinstance(repair_context, CodeAuthoringRepairContext)
+        assert repair_context.source_url == "https://example.com"
+        assert repair_context.refiner_selector is None
+        assert repair_context.selector_alternatives == [
+            {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"},
+            {"tool_name": "click", "role": "button", "selector": 'role=button[name="Order status"]'},
+            {"tool_name": "hover", "role": "status", "selector": "#order-total"},
+        ]
+        dumped = repair_context.model_dump(mode="json")
+        assert "secret-token" not in str(dumped)
+        assert "button:nth-of-type" not in str(dumped)
+        assert "other-page" not in str(dumped)
+
+    @pytest.mark.asyncio
+    async def test_imposition_reject_replaces_stale_repair_context(self) -> None:
+        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
+        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
+
+        result = await _update_workflow({"workflow_yaml": _resale_submitted_yaml("button:nth-of-type(2)")}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["authoring_repair_context"]["reason_code"] == "ambiguous_bare_selector"
+        assert result["data"]["authoring_repair_context"]["selector_alternatives"] == [
+            {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"}
+        ]
+        assert ctx.last_code_authoring_repair_context != _stale_unresolved_repair_context()
+
+
+class TestCodeRepairProgressClassification:
+    @pytest.mark.asyncio
+    async def test_code_safety_seam_reject_carries_progress_surface_kind(self) -> None:
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _REQUESTS_IMPORT_CODE_YAML}, ctx)
+        assert result["ok"] is False
+        assert result["data"]["surface_kind"] == "code_repair_progress"
+        assert result["data"]["progress_text"]
+        # The substantive copy is unchanged; the progress text is a separate carrier.
+        assert result["user_facing_summary"] == (
+            "I need to adjust the workflow's code so it can run safely before testing."
+        )
+        assert result["data"]["progress_text"] != result["user_facing_summary"]
+
+    @pytest.mark.asyncio
+    async def test_raw_conflict_marker_reject_carries_progress_surface_kind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": f"<<<<<<< HEAD\n{_SAFE_CODE_YAML}"}, ctx)
+        assert result["ok"] is False
+        assert result["data"]["surface_kind"] == "code_repair_progress"
+        assert result["data"]["progress_text"]
+
+    @pytest.mark.asyncio
+    async def test_credential_scout_reject_is_not_classified_as_progress(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        result = await _update_workflow(
+            {
+                "workflow_yaml": _credential_code_yaml(
+                    code="""
+                    await page.locator("#email").fill(login_credential.username)
+                    await page.locator("input[type='password']").fill(login_credential.password)
+                    await page.locator("#totpmfa").fill(login_credential.totp)
+                    await page.locator("input[type='submit']").click()
+                    await page.wait_for_load_state("load")
+                    """
+                )
+            },
+            ctx,
+        )
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["data"].get("surface_kind") is None
 
 
 class TestCodeBlockParameterPersistSeam:
@@ -593,6 +1094,7 @@ class TestCodeBlockParameterPersistSeam:
         _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
         ctx.workflow_yaml = _SAFE_CODE_YAML
+        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
         submitted = _directory_blocks_yaml(
             """
             - block_type: code
@@ -610,6 +1112,8 @@ class TestCodeBlockParameterPersistSeam:
         assert "`address_or_postal_code`" in result["error"]
         assert "workflow_definition.parameters" in result["error"]
         assert ctx.workflow_yaml == _SAFE_CODE_YAML
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
     async def test_nested_code_block_undeclared_parameter_key_rejects(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -941,9 +1445,15 @@ class TestCompiledAuthoringImposition:
             {"workflow_yaml": _SUBMITTED_LITERAL_YAML, "code_artifact_metadata": metadata}, ctx
         )
 
-        assert result["ok"] is False
-        assert "does not return a keyed structure" in result["error"]
-        assert ctx.workflow_yaml == ""
+        assert result["ok"] is True
+        substitutions = result["data"]["imposed_substitutions"]
+        assert substitutions["scrubbed_stale_selected_goal_value_paths"] is True
+        assert "preserved_submitted_extraction_code" not in substitutions
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert not workflow_update_module._artifact_declares_goal_values(ctx.code_artifact_metadata["search_registry"])
 
     @pytest.mark.asyncio
     async def test_output_intent_requires_artifact_metadata_before_persist(
@@ -951,6 +1461,7 @@ class TestCompiledAuthoringImposition:
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()
+        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
         submitted = _yaml(
             """
             title: Provider lookup
@@ -973,6 +1484,8 @@ class TestCompiledAuthoringImposition:
         assert "must pass `code_artifact_metadata`" in result["error"]
         assert "goal_value_paths" in result["error"]
         assert ctx.workflow_yaml == ""
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
     async def test_output_intent_rejects_partial_metadata_without_output_label(
@@ -1434,12 +1947,43 @@ class TestCompiledAuthoringImposition:
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()
+        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LOCATOR_FILL_COMPUTED_LITERAL_YAML}, ctx)
 
         assert result["ok"] is False
         assert "submitted code mixes direct fills using `provider_name`" in result["error"]
         assert ctx.workflow_yaml == ""
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.asyncio
+    async def test_typed_default_contract_reject_clears_stale_repair_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._typed_default_ctx()
+        submitted = _yaml(
+            """
+            title: Product lookup
+            workflow_definition:
+              parameters: invalid
+              blocks:
+              - block_type: code
+                label: search_catalog
+                code: |
+                  await page.locator("#search").fill("example_sku_123")
+            """
+        )
+        ctx.workflow_yaml = submitted
+        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "workflow_definition.parameters must be a list" in result["error"]
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
     async def test_unknown_computed_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1451,6 +1995,65 @@ class TestCompiledAuthoringImposition:
         assert result["ok"] is False
         assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
         assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_multi_input_missing_synthesized_parameter_rejects_with_repair_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#confirmation",
+                "source_url": "https://example.com/orders",
+                "typed_length": 10,
+                "role": "textbox",
+                "accessible_name": "Enter Confirmation",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#postal",
+                "source_url": "https://example.com/orders",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "ZIP Code",
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Order lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: order_lookup}
+              blocks:
+              - block_type: code
+                label: order_status
+                parameter_keys: [order_lookup]
+                code: |
+                  await page.locator("#confirmation").fill(str(order_lookup))
+                  await page.locator("#postal").fill(str(order_lookup))
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "missing submitted workflow parameter and literal binding is ambiguous" in result["error"]
+        assert ctx.workflow_yaml == ""
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["block_label"] == "order_status"
+        assert repair_context["unresolved_names"] == ["enter_confirmation"]
+        assert repair_context["available_parameter_keys"] == ["order_lookup"]
+        assert repair_context["binding_candidates"] == ["enter_confirmation", "order_lookup"]
+        assert "update_and_run_blocks" in repair_context["repair_instruction"]
+        assert "secret" not in str(repair_context).lower()
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
 
     @pytest.mark.asyncio
     async def test_synthesized_internal_parameter_aliases_to_existing_declared_default(
@@ -1922,6 +2525,145 @@ class TestCompiledAuthoringImposition:
                 assert "other_sku_456" in str(block.get("code") or "")
                 assert "str(search)" not in str(block.get("code") or "")
 
+    def _role_name_nav_download_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": "https://example.com/billing",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "a",
+                "source_url": "https://example.com/billing",
+                "role": "link",
+                "accessible_name": "View Printable Statement",
+            },
+        ]
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/billing/statement.pdf"]',
+            affordance_text="View Printable Statement",
+            download_kind="attribute",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        return ctx
+
+    def test_role_name_bare_nav_click_imposes_with_emitted_get_by_role(self) -> None:
+        ctx = self._role_name_nav_download_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert result.violations == []
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        assert 'await page.get_by_role("link", name="View Printable Statement", exact=True).click()' in block["code"]
+        assert "async with page.expect_download()" in block["code"]
+        assert "/billing/statement.pdf" in block["code"]
+
+    def test_anchorless_bare_nav_click_still_blocks_imposition(self) -> None:
+        ctx = self._role_name_nav_download_ctx()
+        ctx.scout_trajectory[1].pop("role")
+        ctx.scout_trajectory[1].pop("accessible_name")
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+
+    def test_provenance_gate_admits_self_validating_aria_role_name(self) -> None:
+        entry = {
+            "trajectory_index": 1,
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "View Statements",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(entry) is True
+
+    def test_provenance_gate_rejects_tampered_aria_role_name(self) -> None:
+        tampered_literal = {
+            "selector": "a",
+            "emitted_literal": 'page.get_by_role("link", name="Spoofed")',
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "View Statements",
+        }
+        tampered_role = {
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr_strict("link", "View Statements"),
+            "source": "aria_role_name",
+            "role": "button",
+            "name": "View Statements",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered_literal) is False
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered_role) is False
+
+    def test_provenance_gate_keeps_selector_byte_equality(self) -> None:
+        assert (
+            workflow_update_module._locator_provenance_is_self_validating(
+                {"selector": "#row", "emitted_literal": "#row", "source": "selector"}
+            )
+            is True
+        )
+        assert (
+            workflow_update_module._locator_provenance_is_self_validating(
+                {"selector": "#row", "emitted_literal": "#other", "source": "selector"}
+            )
+            is False
+        )
+        assert (
+            workflow_update_module._locator_provenance_is_self_validating(
+                {"selector": "#row", "emitted_literal": "#row", "source": "first_fallback"}
+            )
+            is False
+        )
+
+    def test_provenance_gate_admits_self_validating_exact_aria_role_name(self) -> None:
+        entry = {
+            "trajectory_index": 1,
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr_strict("link", "Download"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "Download",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(entry) is True
+
+    def test_provenance_gate_rejects_non_exact_aria_role_name_literal(self) -> None:
+        tampered = {
+            "selector": "a",
+            "emitted_literal": _get_by_role_expr("link", "Download"),
+            "source": "aria_role_name",
+            "role": "link",
+            "name": "Download",
+        }
+        assert workflow_update_module._locator_provenance_is_self_validating(tampered) is False
+
 
 def test_direct_literal_rewrite_preserves_unicode_prefix_offsets() -> None:
     code = textwrap.dedent(
@@ -2183,7 +2925,7 @@ class TestCredentialScoutPersistGate:
     )
     _UNSAFE_SUBMIT_CODE_YAML = _credential_code_yaml(
         code="""
-        import asyncio
+        leaked = page.__class__
         await page.locator("#email").fill(login_credential.username)
         await page.locator("input[type='password']").fill(login_credential.password)
         await page.locator("input[type='submit']").click()
@@ -2231,12 +2973,15 @@ class TestCredentialScoutPersistGate:
     async def test_rejects_credential_submit_code_without_matching_fill_scouts(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
+        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
 
         result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
 
         assert result["ok"] is False
         assert "fill_credential_field" in result["error"]
         assert "click the submit control or press Enter" in result["error"]
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
         assert result["user_facing_summary"] == (
             "I need to verify the saved-credential login in the browser before I can save or run this code."
         )
@@ -2256,7 +3001,7 @@ class TestCredentialScoutPersistGate:
         )
         assert result["data"]["failure_type"] == "missing_credential_or_init"
         code_safety_diagnostics = result["data"]["diagnostic_code_safety_errors"]
-        assert any("Not allowed to import modules" in error for error in code_safety_diagnostics)
+        assert any("private methods or attributes" in error for error in code_safety_diagnostics)
 
     @pytest.mark.asyncio
     async def test_allows_submit_code_gate_once_matching_fills_and_submit_are_scouted(self) -> None:
@@ -2366,3 +3111,2162 @@ class TestCredentialScoutPersistGate:
 def test_run_id_leak_check_covers_non_numeric_ids() -> None:
     with pytest.raises(ValueError):
         assert_clean_user_facing_text("Outcome uncertain for wr_sample_123abc.")
+
+
+class TestStripRedundantSandboxImports:
+    @pytest.mark.parametrize(
+        ("code", "expected_module"),
+        [
+            ("import asyncio\nawait page.goto('https://example.com')", "asyncio"),
+            ("import asyncio\nawait asyncio.sleep(1)", "asyncio"),
+            ("import json\nvalue = json.dumps({})", "json"),
+            ("import json\nvalue = json.loads('{}')", "json"),
+            ("import re\nmatch = re.search(r'x', 'x')", "re"),
+            ("import html\nvalue = html.escape('<')", "html"),
+        ],
+    )
+    def test_strips_redundant_shim_import(self, code: str, expected_module: str) -> None:
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == [expected_module]
+        assert f"import {expected_module}" not in sanitized
+        CodeBlock.is_safe_code(sanitized)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import asyncio\nawait asyncio.gather(page.goto('https://example.com'))",
+            "import json\ntry:\n    json.loads('x')\nexcept json.JSONDecodeError:\n    pass",
+            "import html\nvalue = html.unescape('&amp;')",
+            "import re\nvalue = re.subn(r'a', 'b', 'a')",
+            "import json\nvalue = json",
+        ],
+    )
+    def test_does_not_strip_surface_exceeding_or_bare_use(self, code: str) -> None:
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == []
+        assert sanitized == code
+        with pytest.raises(InsecureCodeDetected):
+            CodeBlock.is_safe_code(sanitized)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import os as json\nvalue = json",
+            "import json.decoder\nvalue = 1",
+            "from re import search\nmatch = search(r'x', 'x')",
+            "import json; value = json.dumps({})",
+            "import requests\nvalue = requests",
+            "import os\nvalue = 1",
+            'import re; import os\nresult = os.environ.get("AWS_SECRET_ACCESS_KEY")',
+            'import os; import re\nresult = os.environ.get("AWS_SECRET_ACCESS_KEY")',
+            'import json; import requests\nresult = requests.get("https://example.com")',
+        ],
+    )
+    def test_does_not_strip_unsafe_classifications(self, code: str) -> None:
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == []
+        assert sanitized == code
+        with pytest.raises(InsecureCodeDetected):
+            CodeBlock.is_safe_code(sanitized)
+
+    def test_preserves_surrounding_comments(self) -> None:
+        code = "import asyncio  # drop me\n# keep this comment\nawait asyncio.sleep(1)  # trailing"
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == ["asyncio"]
+        assert "# keep this comment" in sanitized
+        assert "# trailing" in sanitized
+        assert "import asyncio" not in sanitized
+
+    def test_syntax_error_is_returned_unchanged(self) -> None:
+        code = "import asyncio\nawait page.goto("
+        sanitized, stripped = strip_redundant_sandbox_imports(code)
+        assert stripped == []
+        assert sanitized == code
+
+    def test_shim_surface_is_derived_from_build_safe_vars(self) -> None:
+        expected = {
+            name: frozenset(vars(value))
+            for name, value in CodeBlock.build_safe_vars().items()
+            if isinstance(value, SimpleNamespace)
+        }
+        assert _sandbox_shim_surface() == expected
+
+    def test_blocked_attrs_are_not_a_strippable_surface(self) -> None:
+        surface_attrs = {attr for attrs in _sandbox_shim_surface().values() for attr in attrs}
+        assert surface_attrs.isdisjoint(CodeBlock.BLOCKED_ATTRS)
+
+
+class TestStripRedundantSandboxImportsInYaml:
+    def test_malformed_yaml_is_returned_unchanged(self) -> None:
+        malformed = "title: [unterminated\n"
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(malformed)
+        assert stripped == []
+        assert sanitized == malformed
+
+    def test_non_workflow_yaml_is_returned_unchanged(self) -> None:
+        non_workflow = "just: a mapping\n"
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(non_workflow)
+        assert stripped == []
+        assert sanitized == non_workflow
+
+    def test_multi_block_strips_per_block(self) -> None:
+        multi_block = _yaml(
+            """
+            title: Multi
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: first
+                code: |
+                  import asyncio
+                  await asyncio.sleep(1)
+              - block_type: code
+                label: second
+                code: |
+                  await page.goto("https://example.com")
+              - block_type: code
+                label: third
+                code: |
+                  import json
+                  value = json.dumps({})
+            """
+        )
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(multi_block)
+        assert sorted(stripped) == ["asyncio", "json"]
+        assert "import asyncio" not in sanitized
+        assert "import json" not in sanitized
+
+    def test_no_change_returns_original_text(self) -> None:
+        sanitized, stripped = _strip_redundant_sandbox_imports_in_yaml(_SAFE_CODE_YAML)
+        assert stripped == []
+        assert sanitized == _SAFE_CODE_YAML
+
+
+def _distinct_guardrail_yaml(index: int) -> str:
+    bodies = [
+        f"value = undefined_helper_{index}()",
+        f'import os\nawait page.goto("https://example.com/{index}")',
+        f'await page.evaluate("{index} + 1")',
+    ]
+    return _code_yaml(bodies[index % len(bodies)])
+
+
+def _distinct_credential_collision_yaml(index: int) -> str:
+    unsafe = [
+        f"value = undefined_helper_{index}()",
+        "import os",
+        f'await page.evaluate("{index} + 1")',
+    ]
+    return _credential_code_yaml(
+        code=f"""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        {unsafe[index % len(unsafe)]}
+        """
+    )
+
+
+def _page_evaluate_credential_collision_yaml(index: int) -> str:
+    return _distinct_credential_collision_yaml((index * 3) + 2)
+
+
+def _safe_credential_collision_yaml(index: int) -> str:
+    return _credential_code_yaml(
+        code=f"""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        landing_url_{index} = "https://example.com/portal/{index}"
+        """
+    )
+
+
+def _terminal_challenge_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="A site verification challenge blocked the run.",
+        user_facing_reason="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+    )
+
+
+class TestCodeAuthoringGuardrailChurnBackstop:
+    @pytest.mark.asyncio
+    async def test_counter_climbs_on_distinct_rejects_and_resets_on_accept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            result = await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+            assert result["ok"] is False
+            assert ctx.code_authoring_guardrail_reject_count == index + 1
+        assert ctx.blocker_signal is None
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+        assert accepted["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_counter_climbs_through_credential_scout_branch(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        unsafe_credential_yaml = _credential_code_yaml(
+            code="""
+            import os
+            await page.locator("#email").fill(login_credential.username)
+            await page.locator("input[type='password']").fill(login_credential.password)
+            await page.locator("input[type='submit']").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": unsafe_credential_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert ctx.code_authoring_guardrail_reject_count == 1
+
+    @pytest.mark.asyncio
+    async def test_clean_accept_does_not_climb_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
+        assert "safety checks rejected" in churn.user_facing_reason
+
+    @pytest.mark.asyncio
+    async def test_nth_reject_defers_to_pre_existing_terminal_blocker(self) -> None:
+        ctx = _code_only_ctx()
+        terminal = _terminal_challenge_signal()
+        ctx.blocker_signal = terminal
+        ctx.latest_tool_blocker_signal = terminal
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.blocker_signal is terminal
+        assert ctx.latest_tool_blocker_signal is terminal
+
+    @pytest.mark.asyncio
+    async def test_mixed_credential_and_unresolved_name_reject_returns_code_repair_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
+
+        def capture_info(event: str, **kwargs: str | list[str]) -> None:
+            info_calls.append((event, kwargs))
+
+        monkeypatch.setattr(workflow_update_module.LOG, "info", capture_info)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert result["ok"] is False
+        assert result["data"]["surface_kind"] == "code_repair_progress"
+        assert "failure_type" not in result["data"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == SANDBOX_UNRESOLVED_NAME_REASON_CODE
+        assert repair_context["block_label"] == "login_with_saved_credential"
+        assert repair_context["unresolved_names"] == ["undefined_helper_0"]
+        assert result["user_facing_summary"] != CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert (
+            "copilot code authoring repair context stored",
+            {
+                "reason_code": SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+                "block_label": "login_with_saved_credential",
+                "unresolved_names": ["undefined_helper_0"],
+                "parameter_keys": [],
+                "available_parameter_keys": [],
+                "binding_candidates": ["undefined_helper_0"],
+            },
+        ) in info_calls
+
+    @pytest.mark.asyncio
+    async def test_single_credential_priority_reject_defers_to_credential_scout_reply(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(1)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_mixed_credential_and_non_name_guardrail_uses_credential_priority_path(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(1)}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.last_code_authoring_repair_context is None
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+
+    @pytest.mark.asyncio
+    async def test_standard_policy_mixed_credential_and_unresolved_name_omits_repair_context(self) -> None:
+        ctx = _standard_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(0)}, ctx)
+
+        assert result["ok"] is False
+        assert "authoring_repair_context" not in result["data"]
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_reject_defers_below_higher_bound(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1):
+            await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_churn_stashes_credential_blocker_at_higher_bound(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result: dict[str, object] = {}
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS):
+            result = await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "credential_priority_authoring_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
+
+    @pytest.mark.asyncio
+    async def test_credential_priority_churn_renders_credential_scout_reply_through_enforcement(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS):
+            await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
+
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "credential_priority_authoring_churn"
+        assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
+
+    @pytest.mark.asyncio
+    async def test_single_pure_credential_reject_defers_to_credential_scout_reply(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert "diagnostic_code_safety_errors" not in result["data"]
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_pure_credential_priority_churn_climbs_and_halts(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result: dict[str, object] = {}
+        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1):
+            result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(index)}, ctx)
+            assert result["ok"] is False
+            assert result["data"]["failure_type"] == "missing_credential_or_init"
+            assert "diagnostic_code_safety_errors" not in result["data"]
+            assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+            assert ctx.code_authoring_guardrail_reject_count == index + 1
+
+        assert ctx.blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+        result = await _update_workflow(
+            {"workflow_yaml": _safe_credential_collision_yaml(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1)}, ctx
+        )
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "credential_priority_authoring_churn"
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
+
+    @pytest.mark.asyncio
+    async def test_name_safety_churn_still_halts_after_credential_priority_reject(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    @pytest.mark.asyncio
+    async def test_non_credential_reject_halts_immediately_when_count_pre_charged(self) -> None:
+        # Credential-priority rejects can push the shared counter into the 4..8 band where the
+        # credential bound still defers; a later non-credential reject flips the flag and halts at
+        # once on the non-credential N=4, since the count is already past it.
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 1):
+            await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(index)}, ctx)
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 1
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+        assert ctx.blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 2
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+        with pytest.raises(CopilotTurnHalt) as excinfo:
+            _check_enforcement(ctx)
+        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    @pytest.mark.asyncio
+    async def test_accept_after_latched_churn_clears_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _code_only_ctx()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+
+        _stub_successful_update(monkeypatch)
+        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert accepted["ok"] is True
+        assert ctx.code_authoring_guardrail_reject_count == 0
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+
+_RESALE_URL = "https://example.com/orders"
+_QUOTE_URL = "https://example.com/quote"
+
+
+def _resale_ctx(*, refiner_selector: str = 'button[data-action="status"]') -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#order-id",
+            "source_url": _RESALE_URL,
+            "typed_length": 6,
+            "typed_value": "abc123",
+            "role": "textbox",
+            "accessible_name": "Order ID",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": "button",
+            "source_url": _RESALE_URL,
+            "trajectory_index": 1,
+        },
+        {
+            "tool_name": "click",
+            "selector": refiner_selector,
+            "source_url": _RESALE_URL,
+            "trajectory_index": 2,
+        },
+    ]
+    return ctx
+
+
+def _resale_submitted_yaml(refiner_selector: str = 'button[data-action="status"]') -> str:
+    escaped = refiner_selector.replace('"', '\\"')
+    return _yaml(
+        f"""
+        title: Order status
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: order_status
+            code: |
+              await page.locator("#order-id").fill(str(order_id))
+              await page.locator("{escaped}").click()
+        """
+    )
+
+
+def _quote_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#zip",
+            "source_url": _QUOTE_URL,
+            "typed_length": 5,
+            "typed_value": "02110",
+            "role": "textbox",
+            "accessible_name": "ZIP code",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#continue",
+            "source_url": _QUOTE_URL,
+            "trajectory_index": 1,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#coverage-next",
+            "source_url": "https://example.com/quote/coverage",
+            "trajectory_index": 2,
+        },
+    ]
+    return ctx
+
+
+def _code_blocks(parsed: dict[str, object]) -> dict[str, dict[str, object]]:
+    blocks = [block for block in workflow_blocks(parsed) if str(block.get("block_type") or "").lower() == "code"]
+    return {str(block.get("label") or ""): block for block in blocks}
+
+
+def _submitted_with_sibling_code(sibling_code: str) -> str:
+    indented = textwrap.indent(textwrap.dedent(sibling_code).strip(), " " * 14)
+    return _yaml(
+        f"""
+        title: Quote
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+            code: |
+              await page.locator("#zip").fill(str(zip_code))
+              await page.locator("#continue").click()
+          - block_type: code
+            label: preserved_code
+            code: |
+{indented}
+        """
+    )
+
+
+class TestWholeTrajectoryImposition:
+    def test_imposes_over_unscouted_browser_fill_in_selected_block(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#electricDate").fill("2026-07-01")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#electricDate" not in code
+        assert code.index('page.locator("#zip")') < code.index('page.locator("#continue")')
+        assert code.index('page.locator("#continue")') < code.index('page.locator("#coverage-next")')
+
+    def test_imposes_over_unscouted_selected_block_extra_click(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#electricDate").click()
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#electricDate" not in code
+        assert 'page.locator("#zip")' in code
+        assert 'page.locator("#continue")' in code
+        assert 'page.locator("#coverage-next")' in code
+
+    def test_p10_shaped_selected_surplus_browser_mutations_are_discarded(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#electricPlan").select_option("basic")
+                  await page.locator("#electricDate").fill("2026-07-01")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#electricPlan" not in code
+        assert "#electricDate" not in code
+        assert result.substitutions["source_trajectory_count"] == 3
+        assert code.index('page.locator("#zip")') < code.index('page.locator("#continue")')
+        assert code.index('page.locator("#continue")') < code.index('page.locator("#coverage-next")')
+
+    def test_wrong_selected_block_receiver_is_overwritten_by_scout_spine(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#wrongZip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#wrongZip" not in code
+        assert 'page.locator("#zip")' in code
+
+    def test_selected_alias_locator_extra_is_discarded_by_imposition(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  target = page.locator("#electricDate")
+                  await target.fill("2026-07-01")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#electricDate" not in code
+        assert 'target = page.locator("#electricDate")' not in code
+        assert 'page.locator("#zip")' in code
+        assert 'page.locator("#coverage-next")' in code
+
+    def test_selected_helper_extra_is_discarded_by_imposition(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  async def clear(target):
+                      await target.evaluate("node => node.remove()")
+                  await clear(target=page.locator("#electricDate"))
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#electricDate" not in code
+        assert "async def clear" not in code
+
+    def test_selected_dynamic_extra_is_discarded_by_imposition(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await getattr(page.locator("#electricDate"), "fill")("2026-07-01")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "#electricDate" not in code
+        assert "getattr" not in code
+
+    def test_rejects_extra_changed_block_with_unscouted_browser_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#coverage-next").click()
+              - block_type: code
+                label: invented_browser_step
+                code: |
+                  await page.locator("#electricDate").fill("2026-07-01")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("unscouted browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_unknown_page_receiver_call(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            await page.evaluate("window.localStorage.clear()")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_unknown_direct_locator_receiver_call(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            await page.locator("#electricDate").evaluate("node => node.remove()")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_unknown_locator_alias_receiver_call(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            target = page.locator("#electricDate")
+            await target.evaluate("node => node.remove()")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_page_alias_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            p = page
+            await p.goto("https://example.com/other")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_transitive_page_alias_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            p = page
+            q = p
+            await q.goto("https://example.com/other")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_transitive_locator_alias_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            target = page.locator("#electricDate")
+            other = target
+            await other.fill("2026-07-01")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_bound_method_alias_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            fill_electric = page.locator("#electricDate").fill
+            await fill_electric("2026-07-01")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_transitive_bound_method_alias_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            fill_electric = page.locator("#electricDate").fill
+            other = fill_electric
+            await other("2026-07-01")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_dynamic_dispatch_on_page(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            await getattr(page, "goto")("https://example.com/other")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_dynamic_dispatch_on_locator_alias(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            target = page.locator("#electricDate")
+            await getattr(target, "fill")("2026-07-01")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_helper_receiving_browser_object(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            async def clear(target):
+                await target.evaluate("node => node.remove()")
+            await clear(page.locator("#electricDate"))
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_helper_receiving_browser_keyword_object(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            async def clear(target):
+                await target.evaluate("node => node.remove()")
+            await clear(target=page.locator("#electricDate"))
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_rejects_helper_receiving_page_keyword_object(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(
+            """
+            async def navigate(page_arg):
+                await page_arg.goto("https://example.com/other")
+            await navigate(page_arg=page)
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_preserves_simple_extraction_only_block(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+              - block_type: code
+                label: summarize_quote
+                code: |
+                  heading = await page.locator("h1").inner_text()
+                  return {{"heading": heading}}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
+        assert "#coverage-next" in str(blocks[workflow_update_module._SYNTHESIZED_BLOCK_LABEL]["code"])
+        assert str(blocks["summarize_quote"]["code"]).strip() == (
+            'heading = await page.locator("h1").inner_text()\nreturn {"heading": heading}'
+        )
+
+    def test_preserves_read_only_selected_extraction_suffix_after_exact_spine(self) -> None:
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            textwrap.dedent(synthesized.code).rstrip()
+            + '\nheading = await page.locator("h1").inner_text()\nreturn {"heading": heading}\n'
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        assert result.substitutions["preserved_extraction_suffix"] is True
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert 'await page.locator("#coverage-next").click()' in code
+        assert 'heading = await page.locator("h1").inner_text()' in code
+        assert code.index('await page.locator("#coverage-next").click()') < code.index(
+            'heading = await page.locator("h1").inner_text()'
+        )
+
+    def test_preserves_page_read_only_selected_extraction_suffix_after_exact_spine(self) -> None:
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            textwrap.dedent(synthesized.code).rstrip()
+            + '\nheading = await page.inner_text("h1")\nreturn {"heading": heading}\n'
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        assert result.substitutions["preserved_extraction_suffix"] is True
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert 'await page.locator("#coverage-next").click()' in code
+        assert 'heading = await page.inner_text("h1")' in code
+        assert code.index('await page.locator("#coverage-next").click()') < code.index(
+            'heading = await page.inner_text("h1")'
+        )
+
+    def test_rejects_selected_extraction_suffix_browser_mutation(self) -> None:
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            textwrap.dedent(synthesized.code).rstrip() + '\nawait page.locator("#electricDate").fill("2026-07-01")\n'
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any(
+            "extraction suffix contains unscouted browser action" in violation for violation in result.violations
+        )
+        assert result.substitutions is None
+
+    def test_rejects_selected_extraction_suffix_alias_browser_mutation(self) -> None:
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            textwrap.dedent(synthesized.code).rstrip()
+            + '\ntarget = page.locator("#electricDate")\nawait target.fill("2026-07-01")\n'
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any(
+            "extraction suffix contains ambiguous browser action" in violation for violation in result.violations
+        )
+        assert result.substitutions is None
+
+    def test_rejects_ambiguous_helper_browser_mutation(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+              - block_type: code
+                label: helper_step
+                code: |
+                  async def fill(locator, value):
+                      await locator.fill(value)
+                  target = page.locator("#electricDate")
+                  await fill(target, "2026-07-01")
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous browser action" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_multi_screen_trajectory_persists_in_order_with_proven_locators(self) -> None:
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        code = str(block["code"])
+        assert code.index('page.locator("#zip")') < code.index('page.locator("#continue")')
+        assert code.index('page.locator("#continue")') < code.index('page.locator("#coverage-next")')
+
+    @pytest.mark.asyncio
+    async def test_changed_selected_browser_action_args_do_not_preserve_submitted_extraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = textwrap.dedent(synthesized.code).replace(
+            'await page.locator("#zip").fill(str(zip_code))',
+            'await page.locator("#zip").fill("99999")',
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                parameter_keys: [zip_code]
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert 'await page.locator("#zip").fill(str(zip_code))' in code
+        assert 'await page.locator("#zip").fill("99999")' not in code
+
+    @pytest.mark.asyncio
+    async def test_assigned_parameter_key_does_not_preserve_submitted_extraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            'zip_code = "99999"\n'
+            + textwrap.dedent(synthesized.code).rstrip()
+            + f'\n{workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output = {{"quote": "Q-001"}}\n'
+            + f"return {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output\n"
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              parameters:
+              - {{parameter_type: workflow, workflow_parameter_type: string, key: zip_code, default_value: "02110"}}
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                parameter_keys: [zip_code]
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "assigns synthesized parameter key(s) `zip_code`" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_destructured_parameter_key_does_not_preserve_submitted_extraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            '(zip_code,) = ("99999",)\n'
+            + textwrap.dedent(synthesized.code).rstrip()
+            + f'\n{workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output = {{"quote": "Q-001"}}\n'
+            + f"return {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output\n"
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              parameters:
+              - {{parameter_type: workflow, workflow_parameter_type: string, key: zip_code, default_value: "02110"}}
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                parameter_keys: [zip_code]
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "assigns synthesized parameter key(s) `zip_code`" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_starred_parameter_key_does_not_preserve_submitted_extraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            '*zip_code, = ["99999"]\n'
+            + textwrap.dedent(synthesized.code).rstrip()
+            + f'\n{workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output = {{"quote": "Q-001"}}\n'
+            + f"return {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output\n"
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              parameters:
+              - {{parameter_type: workflow, workflow_parameter_type: string, key: zip_code, default_value: "02110"}}
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                parameter_keys: [zip_code]
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "assigns synthesized parameter key(s) `zip_code`" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_alias_reconciled_selected_spine_preserves_submitted_extraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        label = workflow_update_module._SYNTHESIZED_BLOCK_LABEL
+        submitted_code = (
+            textwrap.dedent(synthesized.code).replace("zip_code", "postal_code").rstrip()
+            + f'\n{label}_output = {{"quote": "Q-001"}}\nreturn {label}_output\n'
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              parameters:
+              - {{parameter_type: workflow, workflow_parameter_type: string, key: postal_code, default_value: "02110"}}
+              blocks:
+              - block_type: code
+                label: {label}
+                parameter_keys: [postal_code]
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [_terminal_metadata(label, "quote")],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        substitutions = result["data"]["imposed_substitutions"]
+        assert substitutions["preserved_submitted_extraction_code"] is True
+        assert substitutions["parameter_aliases"] == {"zip_code": "postal_code"}
+        assert "scrubbed_stale_selected_goal_value_paths" not in substitutions
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert block["parameter_keys"] == ["postal_code"]
+        code = str(block["code"])
+        assert "postal_code" in code
+        assert "zip_code" not in code
+        assert f"return {label}_output" in code
+        artifact = ctx.code_artifact_metadata[label]
+        assert workflow_update_module._artifact_declares_goal_values(artifact)
+
+    @pytest.mark.asyncio
+    async def test_metadata_selected_extraction_only_imposes_scout_spine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  records = [{{"quote": "pending"}}]
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote result")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _code_blocks(parsed)[workflow_update_module._SYNTHESIZED_BLOCK_LABEL]
+        code = str(block["code"])
+        assert result["data"]["imposed_substitutions"]["source_trajectory_count"] == 3
+        assert 'await page.locator("#zip").fill(str(zip_code))' in code
+        assert 'await page.locator("#continue").click()' in code
+        assert 'await page.locator("#coverage-next").click()' in code
+        assert 'records = [{"quote": "pending"}]' in code
+        assert code.index('await page.locator("#coverage-next").click()') < code.index(
+            'records = [{"quote": "pending"}]'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_selected_goal_paths_do_not_block_imposed_scout_spine(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#electricDate").fill("2026-07-01")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [_terminal_metadata("quote_flow", "quote result")],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["imposed_substitutions"]["scrubbed_stale_selected_goal_value_paths"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "#electricDate" not in code
+        assert 'await page.locator("#zip").fill(str(zip_code))' in code
+        artifact = ctx.code_artifact_metadata["quote_flow"]
+        assert not workflow_update_module._artifact_declares_goal_values(artifact)
+
+    @pytest.mark.asyncio
+    async def test_metadata_selected_page_goto_extra_is_discarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.goto("https://example.com/other")
+                  records = [{"number": "Q-001"}]
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [_terminal_metadata("quote_flow", "quote result")],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert 'page.goto("https://example.com/other")' not in code
+        assert 'records = [{"number": "Q-001"}]' not in code
+        assert 'await page.locator("#zip").fill(str(zip_code))' in code
+        assert result["data"]["imposed_substitutions"]["scrubbed_stale_selected_goal_value_paths"] is True
+
+    @pytest.mark.asyncio
+    async def test_valid_selected_extraction_suffix_keeps_goal_path_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = textwrap.dedent(synthesized.code).rstrip() + '\nreturn {"records": [{"number": "Q-001"}]}\n'
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote result")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["imposed_substitutions"]["preserved_extraction_suffix"] is True
+        artifact = ctx.code_artifact_metadata[workflow_update_module._SYNTHESIZED_BLOCK_LABEL]
+        assert workflow_update_module._artifact_declares_goal_values(artifact)
+
+    @pytest.mark.asyncio
+    async def test_p9_opaque_self_authored_extraction_metadata_is_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        label = workflow_update_module._SYNTHESIZED_BLOCK_LABEL
+        submitted_code = (
+            textwrap.dedent(synthesized.code).rstrip()
+            + f'\n{label}_output = {{"premium": "$123", "eligible": True}}\nreturn {label}_output\n'
+        )
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+        schema = (
+            '{"type":"object","properties":{"premium":{"type":"string"},'
+            '"eligible":{"type":"boolean"}},"required":["premium","eligible"]}'
+        )
+        metadata = _terminal_metadata(label, "quote result")
+        metadata["claimed_outcomes"][0]["goal_value_paths"] = ["premium", "eligible"]
+        metadata["claimed_outcomes"][0]["extraction_schema"] = schema
+        metadata["claimed_outcomes"][0]["extraction_schema_provenance"] = "self_authored"
+        metadata["terminal_verifier_expectations"][0]["goal_value_paths"] = ["premium", "eligible"]
+        metadata["terminal_verifier_expectations"][0]["extraction_schema"] = schema
+        metadata["terminal_verifier_expectations"][0]["extraction_schema_provenance"] = "self_authored"
+
+        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": [metadata]}, ctx)
+
+        assert result["ok"] is True
+        assert result["data"]["imposed_substitutions"]["preserved_extraction_suffix"] is True
+        assert "scrubbed_stale_selected_goal_value_paths" not in result["data"]["imposed_substitutions"]
+        artifact = ctx.code_artifact_metadata[label]
+        assert artifact["claimed_outcomes"][0]["goal_value_paths"] == ["premium", "eligible"]
+        assert artifact["terminal_verifier_expectations"][0]["goal_value_paths"] == ["premium", "eligible"]
+        assert artifact["claimed_outcomes"][0]["extraction_schema"] == schema
+        code = str(_single_code_block(parse_workflow_yaml(ctx.workflow_yaml))["code"])
+        assert f"return {label}_output" in code
+
+    @pytest.mark.asyncio
+    async def test_invalid_selected_extraction_suffix_keeps_goal_path_rejection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = textwrap.dedent(synthesized.code).rstrip() + "\nheading = 'Review'\n"
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [
+                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote result")
+                ],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "does not return a keyed structure" in result["error"]
+        assert "records" in result["error"]
+
+    def test_rejects_selected_extraction_suffix_page_mutation(self) -> None:
+        ctx = _quote_ctx()
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = textwrap.dedent(synthesized.code).rstrip() + '\nawait page.goto("https://example.com/other")\n'
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+{textwrap.indent(submitted_code, " " * 18)}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any(
+            "extraction suffix contains unscouted browser action" in violation for violation in result.violations
+        )
+        assert result.substitutions is None
+
+    @pytest.mark.asyncio
+    async def test_sibling_invalid_goal_paths_still_reject(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            f"""
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+              - block_type: code
+                label: summarize_quote
+                code: |
+                  return await page.locator("h1").inner_text()
+            """
+        )
+
+        result = await _update_workflow(
+            {"workflow_yaml": submitted, "code_artifact_metadata": [_terminal_metadata("summarize_quote", "summary")]},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "summarize_quote" in result["error"]
+        assert "flat text blob" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_p10_shaped_stale_metadata_imposes_scout_spine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _quote_ctx()
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#electricDate").fill("2026-07-01")
+                  await page.locator("#electricPlan").select_option("basic")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted,
+                "code_artifact_metadata": [_terminal_metadata("quote_flow", "quote result")],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "#electricDate" not in code
+        assert "#electricPlan" not in code
+        assert code.index('page.locator("#zip")') < code.index('page.locator("#continue")')
+        assert code.index('page.locator("#continue")') < code.index('page.locator("#coverage-next")')
+
+
+class TestBareDropSupersession:
+    def test_selector_refines_css_accepts_identity_qualifiers(self) -> None:
+        for candidate in (
+            'button[data-action="status"]',
+            "button#submit",
+            "button.primary",
+            'button[aria-label="Close ]"]',  # a literal ] inside the attribute value must not read as a combinator
+        ):
+            assert workflow_update_module._selector_refines("button", candidate) is True
+
+    def test_selector_refines_role_accepts_named_same_role(self) -> None:
+        assert workflow_update_module._selector_refines("role=button", 'role=button[name="Next"]') is True
+
+    def test_selector_refines_rejects_positional_structural_and_cross_shape(self) -> None:
+        bare = "button"
+        for candidate in (
+            "button:nth-child(2)",
+            "button:nth-of-type(2)",
+            "button >> nth=1",
+            "button.primary span",
+            "button#x + button",
+            "button[data-x] > svg",
+            "button:visible",
+            "button:enabled",
+            "button:not(.foo)",
+            'button:has-text("Next")',
+            "a[href]",
+            "buttonx[id=1]",
+            "button",
+        ):
+            assert workflow_update_module._selector_refines(bare, candidate) is False
+        assert workflow_update_module._selector_refines("role=button", 'role=link[name="Next"]') is False
+        assert workflow_update_module._selector_refines("role=button", 'button[data-action="x"]') is False
+        assert workflow_update_module._selector_refines("button", 'role=button[name="x"]') is False
+        assert workflow_update_module._selector_refines("role=button", 'role=button[name="N"] >> nth=1') is False
+
+    def test_stable_bare_click_refiner_accepts_only_same_kind_text_and_role_anchors(self) -> None:
+        assert (
+            workflow_update_module._stable_same_kind_bare_click_refiner(
+                "button", "xpath=//button[normalize-space()='Check Order Status']"
+            )
+            is True
+        )
+        assert workflow_update_module._stable_same_kind_bare_click_refiner("button", 'role=button[name="Next"]') is True
+        for candidate in (
+            "xpath=//a[normalize-space()='Check Order Status']",
+            'role=link[name="Next"]',
+            "xpath=(//button[normalize-space()='Check Order Status'])[2]",
+            "xpath=//button[contains(normalize-space(), 'Check')]",
+        ):
+            assert workflow_update_module._stable_same_kind_bare_click_refiner("button", candidate) is False
+
+    def test_supersession_true_returns_pairing_record(self) -> None:
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        ctx = _resale_ctx()
+        claimed: set[int] = set()
+        forgiven, record = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=claimed
+        )
+        assert forgiven is True
+        assert record == {
+            "dropped_index": 1,
+            "dropped_selector": "button",
+            "refiner_index": 2,
+            "refiner_selector": 'button[data-action="status"]',
+            "source_url": _RESALE_URL,
+        }
+        assert claimed == {2}
+
+    def test_supersession_false_across_different_source_url(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory[2]["source_url"] = "https://example.com/other"
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        forgiven, record = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+        )
+        assert forgiven is False
+        assert record is None
+
+    def test_supersession_false_without_later_refiner(self) -> None:
+        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        forgiven, _ = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+        )
+        assert forgiven is False
+
+    def test_supersession_false_on_empty_source_url(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory[1]["source_url"] = ""
+        dropped = {
+            "reason_code": "ambiguous_bare_selector",
+            "tool_name": "click",
+            "selector": "button",
+            "trajectory_index": 1,
+        }
+        forgiven, _ = workflow_update_module._bare_drop_superseded_on_screen(
+            dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+        )
+        assert forgiven is False
+
+    def test_supersession_false_on_out_of_bounds_index(self) -> None:
+        ctx = _resale_ctx()
+        for bad_index in (-1, 99, "1", None):
+            dropped = {
+                "reason_code": "ambiguous_bare_selector",
+                "tool_name": "click",
+                "selector": "button",
+                "trajectory_index": bad_index,
+            }
+            forgiven, _ = workflow_update_module._bare_drop_superseded_on_screen(
+                dropped, ctx.scout_trajectory, claimed_refiner_indices=set()
+            )
+            assert forgiven is False
+
+    def test_imposition_forgives_mid_trajectory_bare_drop_and_records_substitution(self) -> None:
+        ctx = _resale_ctx()
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_resale_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        forgiven = result.substitutions["forgiven_superseded_bare_drops"]
+        assert forgiven == [
+            {
+                "dropped_index": 1,
+                "dropped_selector": "button",
+                "refiner_index": 2,
+                "refiner_selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+            }
+        ]
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        assert 'button[data-action=\\"status\\"]' in str(block["code"])
+
+    def test_imposition_keeps_bare_drop_fatal_when_sibling_is_positional(self) -> None:
+        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            _resale_submitted_yaml("button:nth-of-type(2)"), ctx
+        )
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    def test_imposition_one_refiner_does_not_forgive_two_bare_drops(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 3,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#start").click()
+                  await page.locator("button[data-action=\\"status\\"]").click()
+            """
+        )
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+
+    def test_imposition_two_refiners_forgive_two_bare_drops(self) -> None:
+        ctx = _resale_ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="open"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 3,
+            },
+            {
+                "tool_name": "click",
+                "selector": 'button[data-action="status"]',
+                "source_url": _RESALE_URL,
+                "trajectory_index": 4,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#start").click()
+                  await page.locator("button[data-action=\\"open\\"]").click()
+                  await page.locator("button[data-action=\\"status\\"]").click()
+            """
+        )
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        forgiven = result.substitutions["forgiven_superseded_bare_drops"]
+        assert {record["dropped_index"] for record in forgiven} == {1, 2}
+        assert {record["refiner_index"] for record in forgiven} == {3, 4}
+
+    def test_imposition_two_exact_text_xpath_button_refiners_forgive_two_bare_drops(self) -> None:
+        ctx = _resale_ctx()
+        first_refiner = "xpath=//button[normalize-space()='Check Order Status']"
+        second_refiner = "xpath=//button[normalize-space()='View / Download']"
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#order-id",
+                "source_url": _RESALE_URL,
+                "typed_length": 6,
+                "typed_value": "abc123",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
+            {"tool_name": "click", "selector": first_refiner, "source_url": _RESALE_URL, "trajectory_index": 3},
+            {"tool_name": "click", "selector": second_refiner, "source_url": _RESALE_URL, "trajectory_index": 4},
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#order-id").fill(str(order_id))
+                  await page.locator("xpath=//button[normalize-space()='Check Order Status']").click()
+                  await page.locator("xpath=//button[normalize-space()='View / Download']").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        forgiven = result.substitutions["forgiven_superseded_bare_drops"]
+        assert {record["dropped_index"] for record in forgiven} == {1, 2}
+        assert {record["refiner_index"] for record in forgiven} == {3, 4}
+        assert {record["refiner_selector"] for record in forgiven} == {first_refiner, second_refiner}
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        assert first_refiner in str(block["code"])
+        assert second_refiner in str(block["code"])
+
+    def test_imposition_one_exact_text_xpath_refiner_does_not_forgive_two_bare_drops(self) -> None:
+        ctx = _resale_ctx()
+        refiner = "xpath=//button[normalize-space()='Check Order Status']"
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
+            {"tool_name": "click", "selector": refiner, "source_url": _RESALE_URL, "trajectory_index": 3},
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#start").click()
+                  await page.locator("xpath=//button[normalize-space()='Check Order Status']").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+
+    def test_imposition_positional_xpath_refiner_keeps_bare_drop_fatal(self) -> None:
+        ctx = _resale_ctx()
+        positional_refiner = "xpath=(//button[normalize-space()='Check Order Status'])[2]"
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
+            {"tool_name": "click", "selector": positional_refiner, "source_url": _RESALE_URL, "trajectory_index": 2},
+        ]
+        submitted = _yaml(
+            """
+            title: Order status
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: order_status
+                code: |
+                  await page.locator("#start").click()
+                  await page.locator("xpath=(//button[normalize-space()='Check Order Status'])[2]").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert any("ambiguous_bare_selector" in violation for violation in result.violations)
+        assert result.substitutions is None
+
+    @pytest.mark.asyncio
+    async def test_auto_act_non_navigating_reads_role_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _auto_act_scout_ctx()
+        captured: dict[str, object] = {}
+
+        async def _fake_resolve(
+            _ctx: AgentContext, selector: str | None, *, allow_browser_read: bool
+        ) -> tuple[str, str]:
+            captured["allow_browser_read"] = allow_browser_read
+            return "button", "Continue"
+
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _fake_resolve)
+
+        async def _same_url(_ctx: AgentContext) -> str:
+            return "https://example.com/orders"
+
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", _same_url)
+
+        async def _evidence(_ctx: AgentContext, *, url: str) -> dict[str, object] | None:
+            return None
+
+        monkeypatch.setattr(scouting_module, "_scout_act_observe_page_evidence", _evidence)
+
+        acted = await scouting_module._auto_act_on_repeat(
+            ctx,
+            {"data": {}},
+            url="https://example.com/orders",
+            target={"selector": "#continue", "text": "Continue"},
+        )
+
+        assert acted is True
+        assert captured["allow_browser_read"] is True
+        last = ctx.scout_trajectory[-1]
+        assert last["role"] == "button"
+        assert last["accessible_name"] == "Continue"
+
+    @pytest.mark.asyncio
+    async def test_auto_act_navigating_skips_browser_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _auto_act_scout_ctx()
+        captured: dict[str, object] = {}
+
+        async def _fake_resolve(
+            _ctx: AgentContext, selector: str | None, *, allow_browser_read: bool
+        ) -> tuple[str, str]:
+            captured["allow_browser_read"] = allow_browser_read
+            return "", ""
+
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _fake_resolve)
+
+        urls = iter(["https://example.com/orders", "https://example.com/status"])
+
+        async def _moving_url(_ctx: AgentContext) -> str:
+            return next(urls)
+
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", _moving_url)
+
+        async def _evidence(_ctx: AgentContext, *, url: str) -> dict[str, object] | None:
+            return None
+
+        monkeypatch.setattr(scouting_module, "_scout_act_observe_page_evidence", _evidence)
+
+        acted = await scouting_module._auto_act_on_repeat(
+            ctx,
+            {"data": {}},
+            url="https://example.com/orders",
+            target={"selector": "#continue", "text": "Continue"},
+        )
+
+        assert acted is True
+        assert captured["allow_browser_read"] is False
+
+
+def _auto_act_scout_ctx() -> AgentContext:
+    ctx = AgentContext.__new__(AgentContext)
+    ctx.browser_session_id = None
+    ctx.scouted_interactions = []
+    ctx.scout_trajectory = []
+    ctx.discovery_mcp_server = _AutoActClickServer()
+    return ctx
+
+
+class _AutoActClickServer:
+    async def call_internal_tool(self, tool_name: str, args: dict[str, object]) -> dict[str, object]:
+        return {"ok": True, "data": {"selector": args.get("selector")}}

@@ -6,16 +6,18 @@ import { CodeEditor } from "../components/CodeEditor";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useActiveWorkflowRunItem } from "./useActiveWorkflowRunItem";
 import {
-  hasExtractedInformation,
+  getBlockOutputDisplayValue,
+  getExtractedInformationDisplayValue,
   isAction,
   isWorkflowRunBlock,
+  shouldShowExtractedInformation,
 } from "../types/workflowRunTypes";
+import { JsonExplorer } from "./blockDetail/BlockInspector";
 import { findBlockSurroundingAction } from "./workflowTimelineUtils";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
-import { isTaskVariantBlock } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
 import {
   pickDownloadedFileFilename,
@@ -116,23 +118,16 @@ function WorkflowRunOutput() {
     [outputs],
   );
 
-  const activeBlockOutput = activeBlock?.output;
-  const activeBlockStatus = activeBlock?.status;
-  const activeBlockType = activeBlock?.block_type;
   const blockOutputJsonCompact = useMemo(() => {
-    if (activeBlockOutput === undefined || activeBlockOutput === null) {
+    if (
+      !activeBlock ||
+      activeBlock.output === undefined ||
+      activeBlock.output === null
+    ) {
       return "";
     }
-    const isCompletedTaskBlock =
-      activeBlockType !== undefined &&
-      isTaskVariantBlock({ block_type: activeBlockType }) &&
-      activeBlockStatus === Status.Completed;
-    const value =
-      isCompletedTaskBlock && hasExtractedInformation(activeBlockOutput)
-        ? activeBlockOutput.extracted_information
-        : activeBlockOutput;
-    return JSON.stringify(value);
-  }, [activeBlockOutput, activeBlockStatus, activeBlockType]);
+    return JSON.stringify(getBlockOutputDisplayValue(activeBlock));
+  }, [activeBlock]);
 
   if (workflowRunTimelineIsLoading) {
     return <div>Loading...</div>;
@@ -143,9 +138,16 @@ function WorkflowRunOutput() {
   }
 
   const showExtractedInformation =
-    activeBlock &&
-    isTaskVariantBlock(activeBlock) &&
-    activeBlock.status === Status.Completed;
+    activeBlock && shouldShowExtractedInformation(activeBlock);
+  const extractedInformationValue = activeBlock
+    ? getExtractedInformationDisplayValue(activeBlock)
+    : null;
+  // Only flat/nested objects benefit from the structured tree; scalars, arrays,
+  // and null read better as formatted JSON, so keep the CodeEditor for those.
+  const extractedInformationIsRecord =
+    typeof extractedInformationValue === "object" &&
+    extractedInformationValue !== null &&
+    !Array.isArray(extractedInformationValue);
 
   const showFailureReason =
     activeBlock &&
@@ -175,6 +177,9 @@ function WorkflowRunOutput() {
       ? getBlockDownloadedFileUrls(activeBlock.output, allFileUrls)
       : allFileUrls;
   const observerOutput = workflowRun?.task_v2?.output;
+  const webhookFailureReasonData =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
 
   const blockContextKey = activeBlock
     ? `block:${activeBlock.workflow_run_id}:${activeBlock.workflow_run_block_id}`
@@ -193,6 +198,16 @@ function WorkflowRunOutput() {
 
   return (
     <div className="space-y-5">
+      {webhookFailureReasonData ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Webhook Failure Reason</h1>
+            <div className="space-y-2 text-yellow-600">
+              {webhookFailureReasonData}
+            </div>
+          </div>
+        </div>
+      ) : null}
       {activeBlock ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
@@ -239,19 +254,20 @@ function WorkflowRunOutput() {
             ) : showExtractedInformation ? (
               <div className="space-y-2">
                 <h2>Extracted Information</h2>
-                <CodeEditor
-                  language="json"
-                  value={JSON.stringify(
-                    (hasExtractedInformation(activeBlock.output) &&
-                      activeBlock.output.extracted_information) ??
-                      null,
-                    null,
-                    2,
-                  )}
-                  minHeight="96px"
-                  maxHeight="200px"
-                  readOnly
-                />
+                {extractedInformationIsRecord ? (
+                  <JsonExplorer
+                    value={extractedInformationValue}
+                    rootLabel="extracted_information"
+                  />
+                ) : (
+                  <CodeEditor
+                    language="json"
+                    value={JSON.stringify(extractedInformationValue, null, 2)}
+                    minHeight="96px"
+                    maxHeight="200px"
+                    readOnly
+                  />
+                )}
               </div>
             ) : activeBlock.output !== null ? (
               <div className="space-y-2">

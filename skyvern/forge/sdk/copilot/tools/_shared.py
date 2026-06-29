@@ -182,6 +182,47 @@ _TASK_OUTPUT_PAYLOAD_FIELDS: tuple[str, ...] = (
     "downloaded_files",
     "downloaded_file_urls",
 )
+_TASK_OUTPUT_PARAMETER_SUFFIX = "_output"
+
+
+def _workflow_output_parameter_payloads(extracted_data: Any) -> dict[str, Any]:
+    """Return workflow output-parameter values embedded in a block output."""
+    if not isinstance(extracted_data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in extracted_data.items()
+        if isinstance(key, str) and key.endswith(_TASK_OUTPUT_PARAMETER_SUFFIX)
+    }
+
+
+def _registered_output_parameter_payloads(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """``workflow_run_output_parameters`` is the runtime's authoritative persisted
+    value surface. Keep this scoped to the run result carrying it so prior-run
+    accumulated outputs cannot satisfy the current run's completion contract.
+    """
+    run_id = data.get("workflow_run_id")
+    registered_values = data.get("registered_output_parameter_values")
+    registered_outputs = data.get("workflow_run_output_parameters")
+    registered = []
+    if isinstance(registered_values, list):
+        registered.extend(registered_values)
+    if isinstance(registered_outputs, list):
+        registered.extend(registered_outputs)
+    if not registered:
+        return []
+    if not isinstance(run_id, str):
+        # Without a current run id the payloads can't be attributed to this run;
+        # fail closed so prior-run accumulated outputs can't satisfy its contract.
+        return []
+    payloads: list[Mapping[str, Any]] = []
+    for item in registered:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("workflow_run_id") != run_id:
+            continue
+        payloads.append(item)
+    return payloads
 
 
 def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
@@ -196,7 +237,9 @@ def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
     json_schema that happens to include an ``extracted_information`` field.
     """
     if block_type in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(extracted_data, dict):
-        return {field: extracted_data.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+        payload = {field: extracted_data.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+        payload.update(_workflow_output_parameter_payloads(extracted_data))
+        return payload
     return extracted_data
 
 

@@ -12,6 +12,10 @@ metadata:
   - Credit card credentials: ``last_four``, ``brand``
   - Secret credentials: ``secret_label``
 
+The one narrow exception is ``GET /credentials/{credential_id}/totp-code``,
+which may return a transient current authenticator code derived from a stored
+TOTP seed. It must never return the seed itself.
+
 This is enforced by the ``*CredentialResponse`` Pydantic models and the
 ``_convert_to_response()`` helper. When adding new credential types or
 modifying existing ones, ensure that:
@@ -28,10 +32,13 @@ exact threat the vault architecture is designed to prevent.
 
 import asyncio
 import json
-from typing import Annotated
+import time
+from dataclasses import dataclass
+from typing import Annotated, Any
 
+import pyotp
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
 from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
@@ -62,16 +69,19 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
+    BitwardenItemsResponse,
     CancelTestResponse,
     CreateCredentialRequest,
     Credential,
     CredentialResponse,
+    CredentialTotpCodeResponse,
     CredentialType,
     CredentialVaultType,
     CreditCardCredentialResponse,
     NonEmptyPasswordCredential,
     OnePasswordItemOverview,
     OnePasswordItemsResponse,
+    PasswordCredential,
     PasswordCredentialResponse,
     SecretCredentialResponse,
     TestCredentialRequest,
@@ -79,6 +89,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TestCredentialStatusResponse,
     TestLoginRequest,
     TestLoginResponse,
+    TotpType,
     UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import (
@@ -101,6 +112,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCrea
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credentials import normalize_totp_config, parse_totp_config
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -109,6 +121,9 @@ from skyvern.schemas.credential_folders import (
     CredentialFolderUpdate,
     UpdateCredentialFolderRequest,
 )
+from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
+from skyvern.schemas.proxy_pinning import redact_proxy_session_id
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     LoginBlockYAML,
@@ -144,6 +159,185 @@ _ORG_AUTH_CREDENTIAL_TOKEN_TYPES = {
 _SESSION_PERSIST_MAX_WAIT_SECONDS = (_SESSION_PERSIST_MAX_RETRIES - 1) * _SESSION_PERSIST_RETRY_INTERVAL_SECONDS
 # Buffer over the max wait so the status endpoint doesn't misreport while the task still retries.
 _PROFILE_GRACE_PERIOD_HEADROOM_SECONDS = 15
+_AUTHENTICATOR_SECRET_REQUIRED_DETAIL = (
+    "Authenticator key is required. Paste the raw setup key or full otpauth:// URI from the website's 2FA setup screen."
+)
+_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
+    "Invalid authenticator key. Paste the raw Base32 setup key or full otpauth:// URI "
+    "from the website's 2FA setup screen."
+)
+_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
+    "Saved authenticator key is invalid. Edit the credential and paste the raw setup key "
+    "or full otpauth:// URI from the website's 2FA setup screen."
+)
+_TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
+
+
+@dataclass(frozen=True)
+class _TotpCodePreviewCacheEntry:
+    code: str
+    expires_at: int
+
+
+_TOTP_CODE_PREVIEW_CACHE: dict[tuple[str, str], _TotpCodePreviewCacheEntry] = {}
+# Best-effort, per-process UX cache. Correctness never depends on sharing this
+# across workers; entries are bounded and expire at the active TOTP window.
+
+
+def _parse_authenticator_totp_config_or_raise(
+    totp_secret: str | None,
+    *,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> tuple[pyotp.TOTP, str]:
+    raw_totp_secret = (totp_secret or "").strip()
+    if raw_totp_secret == "":
+        raise HTTPException(status_code=400, detail=missing_detail)
+
+    normalized_totp_secret = normalize_totp_config(raw_totp_secret)
+    totp = parse_totp_config(normalized_totp_secret)
+    if not totp:
+        raise HTTPException(status_code=400, detail=invalid_detail)
+    return totp, normalized_totp_secret
+
+
+def _build_authenticator_totp_or_raise(
+    totp_secret: str | None,
+    *,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> pyotp.TOTP:
+    totp, _ = _parse_authenticator_totp_config_or_raise(
+        totp_secret,
+        missing_detail=missing_detail,
+        invalid_detail=invalid_detail,
+    )
+    return totp
+
+
+async def _parse_enterprise_totp_secret_or_raise(
+    totp_secret: str | None,
+    *,
+    organization_id: str,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> str | None:
+    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+        totp_secret or "",
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret == "":
+        raise HTTPException(status_code=400, detail=invalid_detail)
+    return enterprise_totp_secret
+
+
+async def _build_authenticator_totp_for_organization_or_raise(
+    totp_secret: str | None,
+    *,
+    organization_id: str,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> pyotp.TOTP:
+    parsed_totp_secret = await _parse_enterprise_totp_secret_or_raise(
+        totp_secret,
+        organization_id=organization_id,
+        invalid_detail=invalid_detail,
+    )
+    return _build_authenticator_totp_or_raise(
+        parsed_totp_secret if parsed_totp_secret is not None else totp_secret,
+        missing_detail=missing_detail,
+        invalid_detail=invalid_detail,
+    )
+
+
+def _parse_authenticator_totp_or_raise(
+    totp_secret: str | None,
+    *,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> str:
+    _, normalized_totp_secret = _parse_authenticator_totp_config_or_raise(
+        totp_secret,
+        missing_detail=missing_detail,
+        invalid_detail=invalid_detail,
+    )
+    return normalized_totp_secret
+
+
+def _normalize_authenticator_totp_or_raise(credential: PasswordCredential | TestLoginRequest) -> None:
+    if credential.totp_type != TotpType.AUTHENTICATOR:
+        return
+
+    credential.totp = _parse_authenticator_totp_or_raise(credential.totp)
+
+
+async def _normalize_authenticator_totp_for_organization_or_raise(
+    credential: PasswordCredential | TestLoginRequest,
+    *,
+    organization_id: str,
+) -> None:
+    if credential.totp_type != TotpType.AUTHENTICATOR:
+        return
+
+    enterprise_totp_secret = await _parse_enterprise_totp_secret_or_raise(
+        credential.totp,
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret is not None:
+        # Keep enterprise payloads raw in credential.totp; runtime paths re-parse
+        # them through the cloud parser before generating codes.
+        return
+
+    _normalize_authenticator_totp_or_raise(credential)
+
+
+def _get_cached_totp_code_preview(
+    *,
+    organization_id: str,
+    credential_id: str,
+    now: int,
+) -> CredentialTotpCodeResponse | None:
+    cache_key = (organization_id, credential_id)
+    cached = _TOTP_CODE_PREVIEW_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    if cached.expires_at <= now:
+        _TOTP_CODE_PREVIEW_CACHE.pop(cache_key, None)
+        return None
+    return CredentialTotpCodeResponse(code=cached.code, seconds_remaining=cached.expires_at - now)
+
+
+def _clear_cached_totp_code_preview(*, organization_id: str, credential_id: str) -> None:
+    """Clear this worker's best-effort preview cache entry after a mutation.
+
+    The cache is intentionally per-process UX protection for repeated preview
+    reads. Other workers can keep serving the previous within-window code or
+    error until the active TOTP window expires.
+    """
+    _TOTP_CODE_PREVIEW_CACHE.pop((organization_id, credential_id), None)
+
+
+def _prune_totp_code_preview_cache(*, now: int) -> None:
+    for cache_key, cached in list(_TOTP_CODE_PREVIEW_CACHE.items()):
+        if cached.expires_at <= now:
+            _TOTP_CODE_PREVIEW_CACHE.pop(cache_key, None)
+
+
+def _cache_totp_code_preview(
+    *,
+    organization_id: str,
+    credential_id: str,
+    code: str,
+    now: int,
+    expires_at: int,
+) -> None:
+    _prune_totp_code_preview_cache(now=now)
+    while len(_TOTP_CODE_PREVIEW_CACHE) >= _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES:
+        _TOTP_CODE_PREVIEW_CACHE.pop(next(iter(_TOTP_CODE_PREVIEW_CACHE)))
+
+    _TOTP_CODE_PREVIEW_CACHE[(organization_id, credential_id)] = _TotpCodePreviewCacheEntry(
+        code=code,
+        expires_at=expires_at,
+    )
 
 
 async def fetch_credential_item_background(item_id: str) -> None:
@@ -359,6 +553,12 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
+    if isinstance(data.credential, NonEmptyPasswordCredential):
+        await _normalize_authenticator_totp_for_organization_or_raise(
+            data.credential,
+            organization_id=current_org.organization_id,
+        )
+
     credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
 
     try:
@@ -375,42 +575,7 @@ async def create_credential(
         # Early resyncing the Bitwarden vault
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
 
-    if data.credential_type == CredentialType.PASSWORD:
-        credential_response = PasswordCredentialResponse(
-            username=data.credential.username,
-            totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
-            totp_identifier=data.credential.totp_identifier if hasattr(data.credential, "totp_identifier") else None,
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=data.credential_type,
-            name=data.name,
-            vault_type=credential.vault_type,
-        )
-    elif data.credential_type == CredentialType.CREDIT_CARD:
-        credential_response = CreditCardCredentialResponse(
-            last_four=data.credential.card_number[-4:],
-            brand=data.credential.card_brand,
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=data.credential_type,
-            name=data.name,
-            vault_type=credential.vault_type,
-        )
-    elif data.credential_type == CredentialType.SECRET:
-        credential_response = SecretCredentialResponse(secret_label=data.credential.secret_label)
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=data.credential_type,
-            name=data.name,
-            vault_type=credential.vault_type,
-        )
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported credential type: {data.credential_type}")
+    return _convert_to_response(credential)
 
 
 LOGIN_TEST_PROMPT = (
@@ -534,17 +699,26 @@ async def rename_credential(
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    update_kwargs: dict = {
+    update_kwargs: dict[str, Any] = {
         "credential_id": credential_id,
         "organization_id": current_org.organization_id,
-        "name": data.name,
     }
+    if "name" in data.model_fields_set:
+        update_kwargs["name"] = data.name
     if data.tested_url is not None:
         update_kwargs["tested_url"] = data.tested_url
     if data.user_context is not None:
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
         update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
+    _apply_proxy_pin_update(
+        update_kwargs,
+        proxy_location_was_set="proxy_location" in data.model_fields_set,
+        proxy_location=data.proxy_location,
+        proxy_session_id_was_set="proxy_session_id" in data.model_fields_set,
+        proxy_session_id=data.proxy_session_id,
+        rotate_proxy_session_id=data.rotate_proxy_session_id,
+    )
     updated = await app.DATABASE.credentials.update_credential(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
@@ -579,6 +753,10 @@ async def test_login(
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
     organization_id = current_org.organization_id
+    await _normalize_authenticator_totp_for_organization_or_raise(
+        data,
+        organization_id=organization_id,
+    )
 
     # Create a temporary credential
     create_request = CreateCredentialRequest(
@@ -603,6 +781,19 @@ async def test_login(
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
 
     credential_id = credential.credential_id
+    if "proxy_location" in data.model_fields_set or "proxy_session_id" in data.model_fields_set:
+        update_kwargs: dict[str, Any] = {
+            "credential_id": credential_id,
+            "organization_id": organization_id,
+        }
+        _apply_proxy_pin_update(
+            update_kwargs,
+            proxy_location_was_set="proxy_location" in data.model_fields_set,
+            proxy_location=data.proxy_location,
+            proxy_session_id_was_set="proxy_session_id" in data.model_fields_set,
+            proxy_session_id=data.proxy_session_id,
+        )
+        credential = await app.DATABASE.credentials.update_credential(**update_kwargs)
 
     LOG.info(
         "Testing login with inline credentials",
@@ -656,7 +847,16 @@ async def test_login(
             request=workflow_create_request,
         )
 
-        run_request = WorkflowRequestBody()
+        credential_proxy_session_id = getattr(credential, "proxy_session_id", None)
+        if credential_proxy_session_id:
+            run_request = WorkflowRequestBody(
+                proxy_location=getattr(credential, "proxy_location", None) or ProxyLocation.RESIDENTIAL_ISP,
+                extra_http_headers=app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(
+                    credential_proxy_session_id
+                ),
+            )
+        else:
+            run_request = WorkflowRequestBody()
 
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -842,7 +1042,15 @@ async def test_credential(
         # Boot fresh (don't seed the saved profile): a reused profile is loaded read-only and the
         # refreshed session would never persist. A fresh login persists via the normal session path,
         # which the saver then writes onto existing_browser_profile_id.
-        run_request = WorkflowRequestBody()
+        if credential.proxy_session_id:
+            run_request = WorkflowRequestBody(
+                proxy_location=credential.proxy_location or ProxyLocation.RESIDENTIAL_ISP,
+                extra_http_headers=app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(
+                    credential.proxy_session_id
+                ),
+            )
+        else:
+            run_request = WorkflowRequestBody()
 
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -1207,12 +1415,28 @@ async def _create_browser_profile_after_workflow(
 
             # Session persistence lags the run reaching completed (see clean_up_workflow),
             # so retrieval retries on a budget sized to that lag.
+            workflow = await app.DATABASE.workflows.get_workflow(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+            )
+            if not workflow:
+                LOG.warning(
+                    "Workflow not found during browser profile creation",
+                    credential_id=credential_id,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
+                return
+            browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
+                workflow=workflow,
+                workflow_run=workflow_run,
+            )
             session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
                 session_dir = await app.STORAGE.retrieve_browser_session(
                     organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_permanent_id=browser_session_storage_key,
                 )
                 if session_dir:
                     break
@@ -1238,7 +1462,16 @@ async def _create_browser_profile_after_workflow(
 
             # Re-save overwrites the existing profile in place so references to its id keep
             # working; a first-time save (or a since-deleted profile) creates a new one.
+            credential = await app.DATABASE.credentials.get_credential(
+                credential_id=credential_id,
+                organization_id=organization_id,
+            )
+            proxy_location = credential.proxy_location if credential else None
+            proxy_session_id = credential.proxy_session_id if credential else None
+            credential_has_proxy_pin = proxy_session_id is not None
+
             target_profile_id = existing_browser_profile_id
+            existing_profile = None
             reused_existing = False
             if target_profile_id:
                 existing_profile = await app.DATABASE.browser_sessions.get_browser_profile(
@@ -1249,13 +1482,33 @@ async def _create_browser_profile_after_workflow(
                 if not reused_existing:
                     target_profile_id = None
 
+            should_update_existing_profile_pin = False
             if not target_profile_id:
                 profile = await app.DATABASE.browser_sessions.create_browser_profile(
                     organization_id=organization_id,
                     name=f"Profile - {credential_name} ({credential_id})",
                     description=f"Browser profile from credential test for {credential_name}",
+                    proxy_location=proxy_location,
+                    proxy_session_id=proxy_session_id,
                 )
                 target_profile_id = profile.browser_profile_id
+            else:
+                should_update_existing_profile_pin = credential_has_proxy_pin
+                existing_profile_proxy_session_id = getattr(existing_profile, "proxy_session_id", None)
+                if (
+                    existing_profile_proxy_session_id
+                    and proxy_session_id
+                    and existing_profile_proxy_session_id != proxy_session_id
+                ):
+                    should_update_existing_profile_pin = False
+                    LOG.warning(
+                        "Skipping credential proxy pin mirror because linked browser profile already has a different pin",
+                        credential_id=credential_id,
+                        browser_profile_id=target_profile_id,
+                        organization_id=organization_id,
+                        credential_proxy_session_id=redact_proxy_session_id(proxy_session_id),
+                        browser_profile_proxy_session_id=redact_proxy_session_id(existing_profile_proxy_session_id),
+                    )
 
             # Overwrites in place when reusing an existing id.
             await app.STORAGE.store_browser_profile(
@@ -1264,6 +1517,13 @@ async def _create_browser_profile_after_workflow(
                 directory=session_dir,
             )
             if reused_existing:
+                if should_update_existing_profile_pin:
+                    await app.DATABASE.browser_sessions.update_browser_profile(
+                        profile_id=target_profile_id,
+                        organization_id=organization_id,
+                        proxy_location=proxy_location,
+                        proxy_session_id=proxy_session_id,
+                    )
                 # Bump modified_at so the status poll can tell this run's re-save actually landed.
                 await app.DATABASE.browser_sessions.touch_browser_profile(
                     profile_id=target_profile_id,
@@ -1379,6 +1639,12 @@ async def update_credential(
     if not existing_credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
+    if isinstance(data.credential, NonEmptyPasswordCredential):
+        await _normalize_authenticator_totp_for_organization_or_raise(
+            data.credential,
+            organization_id=current_org.organization_id,
+        )
+
     vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
     if not credential_service:
@@ -1409,6 +1675,8 @@ async def update_credential(
 
     if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
         background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
+
+    _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
 
     return _convert_to_response(updated_credential)
 
@@ -1477,7 +1745,101 @@ async def delete_credential(
             credential.organization_id,
         )
 
+    _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
+
     return None
+
+
+@base_router.get(
+    "/credentials/{credential_id}/totp-code",
+    response_model=CredentialTotpCodeResponse,
+    summary="Get current credential TOTP code",
+    description="Returns the current generated authenticator code for a password credential.",
+    tags=["Credentials"],
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/{credential_id}/totp-code/",
+    response_model=CredentialTotpCodeResponse,
+    include_in_schema=False,
+)
+async def get_credential_totp_code(
+    response: Response,
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential",
+        examples=["cred_1234567890"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialTotpCodeResponse:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+    credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    if credential.credential_type != CredentialType.PASSWORD or credential.totp_type != TotpType.AUTHENTICATOR:
+        raise HTTPException(status_code=400, detail="This credential does not have an authenticator app configured.")
+
+    now = int(time.time())
+    cached_response = _get_cached_totp_code_preview(
+        organization_id=current_org.organization_id,
+        credential_id=credential_id,
+        now=now,
+    )
+    if cached_response is not None:
+        return cached_response
+
+    credential_service = await _get_credential_vault_service(vault_type_override=credential.vault_type)
+    try:
+        credential_item = await credential_service.get_credential_item(credential)
+    except SkyvernHttpException as e:
+        detail = (
+            f"Custom credential service returned {e.error_message}"
+            if e.error_message
+            else f"Custom credential service returned HTTP {e.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=detail)
+    except Exception as e:
+        LOG.exception(
+            "Failed to retrieve credential item for TOTP code preview",
+            credential_id=credential_id,
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail="Unable to retrieve credential from vault") from e
+
+    if not isinstance(credential_item.credential, PasswordCredential):
+        raise HTTPException(status_code=400, detail="This credential does not have an authenticator app configured.")
+
+    try:
+        totp = await _build_authenticator_totp_for_organization_or_raise(
+            credential_item.credential.totp,
+            organization_id=current_org.organization_id,
+            missing_detail=_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
+            invalid_detail=_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
+        )
+    except HTTPException:
+        LOG.warning(
+            "Saved authenticator key is invalid for TOTP code preview",
+            credential_id=credential_id,
+            organization_id=current_org.organization_id,
+            vault_type=credential.vault_type,
+        )
+        raise
+
+    expires_at = ((now // totp.interval) + 1) * totp.interval
+    code = totp.at(now)
+    _cache_totp_code_preview(
+        organization_id=current_org.organization_id,
+        credential_id=credential_id,
+        code=code,
+        now=now,
+        expires_at=expires_at,
+    )
+    return CredentialTotpCodeResponse(code=code, seconds_remaining=expires_at - now)
 
 
 @legacy_base_router.get("/credentials/{credential_id}")
@@ -1934,6 +2296,50 @@ async def list_onepassword_items(
             exc_info=True,
         )
         raise HTTPException(status_code=502, detail="Failed to list 1Password items") from e
+
+
+@base_router.get(
+    "/credentials/bitwarden/items",
+    response_model=BitwardenItemsResponse,
+    summary="List Bitwarden item metadata",
+    description="Lists Bitwarden item metadata for the current organization.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/bitwarden/items/",
+    response_model=BitwardenItemsResponse,
+    include_in_schema=False,
+)
+async def list_bitwarden_items(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BitwardenItemsResponse:
+    org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        current_org.organization_id,
+        OrganizationAuthTokenType.bitwarden_credential.value,
+    )
+    # Org-scoped only: never fall back to global Bitwarden credentials here. In a shared deployment that
+    # would let an org without its own Bitwarden credential browse metadata from the instance/global vault.
+    if not org_auth_token:
+        return BitwardenItemsResponse(configured=False, items=[])
+
+    try:
+        items = await BitwardenService.list_item_overviews(
+            client_id=None,
+            client_secret=None,
+            master_password=org_auth_token.credential.master_password,
+            bw_organization_id=current_org.bw_organization_id,
+            bw_collection_ids=current_org.bw_collection_ids,
+            email=str(org_auth_token.credential.email),
+        )
+        return BitwardenItemsResponse(configured=True, items=items)
+    except Exception as e:
+        LOG.error(
+            "Failed to list Bitwarden items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=502, detail="Failed to list Bitwarden items") from e
 
 
 @base_router.post(
@@ -2478,6 +2884,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
             folder_id=credential.folder_id,
+            proxy_location=credential.proxy_location,
+            proxy_session_id=credential.proxy_session_id,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -2495,6 +2903,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
             folder_id=credential.folder_id,
+            proxy_location=credential.proxy_location,
+            proxy_session_id=credential.proxy_session_id,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -2509,6 +2919,8 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
             folder_id=credential.folder_id,
+            proxy_location=credential.proxy_location,
+            proxy_session_id=credential.proxy_session_id,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")

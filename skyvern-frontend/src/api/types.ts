@@ -90,6 +90,9 @@ export type GeoTarget = {
 
 export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
 
+export const PINNED_RESIDENTIAL_ISP_PROXY_LOCATION =
+  "RESIDENTIAL_ISP" satisfies LegacyProxyLocation;
+
 export type ArtifactApiResponse = {
   created_at: string;
   modified_at: string;
@@ -163,8 +166,6 @@ export type FailureCategory = {
   confidence_float: number;
   reasoning: string;
 };
-
-export type WebhookDeliveryStatus = "pending" | "failed";
 
 export type TaskApiResponse = {
   request: CreateTaskRequest;
@@ -263,6 +264,19 @@ export type OnePasswordItemsApiResponse = {
   items: Array<OnePasswordItemApiResponse>;
 };
 
+export type BitwardenItemApiResponse = {
+  item_id: string;
+  title: string;
+  collection_id?: string | null;
+  credential_type: "password" | "credit_card" | "secret";
+  url?: string | null;
+};
+
+export type BitwardenItemsApiResponse = {
+  configured: boolean;
+  items: Array<BitwardenItemApiResponse>;
+};
+
 export type CreateOnePasswordTokenRequest = {
   token: string;
 };
@@ -303,8 +317,12 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
-  scopes: string | null;
-  valid: boolean;
+  provider?: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
   created_at: string;
   modified_at: string;
 }
@@ -321,6 +339,7 @@ export interface GoogleOAuthCredentialListResponse {
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
+  scope_profile?: string;
   app_origin?: string;
 }
 
@@ -493,10 +512,20 @@ export const ReadableActionTypes: {
   execute_js: "Execute JS",
 };
 
+type GetReadableActionTypeOptions = {
+  nullActionLabel?: string;
+};
+
 // Recorded code-block actions can carry an action_type the readable map doesn't
 // list yet (the runtime recorder maps more Playwright calls than the UI enumerates).
 // Humanize unknown types instead of rendering a blank badge.
-export function getReadableActionType(actionType: string): string {
+export function getReadableActionType(
+  actionType: string,
+  options: GetReadableActionTypeOptions = {},
+): string {
+  if (actionType === ActionTypes.NullAction && options.nullActionLabel) {
+    return options.nullActionLabel;
+  }
   const known = ReadableActionTypes[actionType as ActionType];
   if (known) {
     return known;
@@ -647,7 +676,6 @@ export type WorkflowRunStatusApiResponse = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -685,7 +713,6 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -770,6 +797,8 @@ export type BrowserProfileApiResponse = {
   name: string;
   description: string | null;
   source_browser_type: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -779,6 +808,11 @@ export type PasswordCredentialApiResponse = {
   username: string;
   totp_type: "authenticator" | "email" | "text" | "none";
   totp_identifier?: string | null;
+};
+
+export type CredentialTotpCodeResponse = {
+  code: string;
+  seconds_remaining: number;
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -803,6 +837,8 @@ export type CredentialApiResponse = {
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   folder_id?: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
 };
 
 export function isPasswordCredential(
@@ -837,6 +873,9 @@ export type CreateCredentialRequest = {
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
   vault_type?: "custom";
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
+  rotate_proxy_session_id?: boolean;
 };
 
 export type PasswordCredential = {

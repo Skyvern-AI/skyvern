@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -825,6 +826,71 @@ async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> 
 
 
 @pytest.mark.asyncio
+async def test_classify_turn_intent_escapes_code_fences_in_untrusted_inputs() -> None:
+    prompts: list[str] = []
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"mode": "build", "expected_output": "workflow_draft", "reason_codes": []}
+
+    await classify_turn_intent(
+        user_message="build ```INJECT_VIA_USER``` now",
+        workflow_yaml="```INJECT_VIA_YAML```",
+        chat_history=[],
+        global_llm_context="```INJECT_VIA_CONTEXT```",
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    prompt = prompts[0]
+    for sentinel in ("INJECT_VIA_USER", "INJECT_VIA_YAML", "INJECT_VIA_CONTEXT"):
+        assert sentinel in prompt
+        assert f"```{sentinel}" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_sanitizes_loaded_result_context_before_prompt() -> None:
+    prompts: list[str] = []
+    raw_context = json.dumps(
+        {
+            "loaded_result_targets": [
+                {
+                    "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
+                    "is_table": True,
+                    "row_selector": 'tr[data-account="987654321"]',
+                    "row_count": 2,
+                    "structure_signature": "legacy-selector-derived-sig",
+                }
+            ]
+        }
+    )
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"mode": "build", "expected_output": "workflow_draft", "reason_codes": []}
+
+    await classify_turn_intent(
+        user_message="build from the loaded results",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=raw_context,
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    prompt = prompts[0]
+    for value in (
+        "Jane",
+        "Customer",
+        "123456",
+        "987654321",
+        "legacy-selector-derived-sig",
+    ):
+        assert value not in prompt
+    assert '"row_count": 2' in prompt
+
+
+@pytest.mark.asyncio
 async def test_classify_turn_intent_reports_missing_handler_and_empty_message() -> None:
     async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
         raise AssertionError("handler should not be called")
@@ -853,7 +919,6 @@ async def test_classify_turn_intent_reports_missing_handler_and_empty_message() 
 @pytest.mark.asyncio
 async def test_classify_turn_intent_uses_turn_intent_timeout_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS", 0.001)
-    monkeypatch.setattr(settings, "COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS", 30.0)
 
     async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
         await asyncio.sleep(0.05)
@@ -950,3 +1015,190 @@ async def test_classify_turn_intent_reports_prompt_render_error(monkeypatch: pyt
     )
 
     assert result.failure_kind == TurnIntentClassifierFailureKind.PROMPT_RENDER_ERROR
+
+
+def test_structurally_infeasible_with_question_clarifies_and_carries_reason() -> None:
+    intent = build_turn_intent(
+        user_message="download regulatory filings from videostream.example",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classification(
+            TurnIntentMode.CLARIFY,
+            missing_context_question="A video-streaming site has no filings — which source should I use?",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.missing_context_question == "A video-streaming site has no filings — which source should I use?"
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in intent.reason_codes
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+
+
+@pytest.mark.parametrize("classified_mode", [TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DIAGNOSE])
+def test_structurally_infeasible_with_question_but_non_clarify_mode_forces_clarify(
+    classified_mode: TurnIntentMode,
+) -> None:
+    # Routed to CLARIFY so the mode==CLARIFY pre-loop bail can fire instead of entering the loop.
+    intent = build_turn_intent(
+        user_message="download regulatory filings from videostream.example",
+        workflow_yaml="workflow:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classification(
+            classified_mode,
+            confidence=0.9,
+            target_entities={"workflow": ["existing"]},
+            missing_context_question="A video-streaming site has no filings — which source should I use?",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.expected_output == TurnIntentExpectedOutput.CLARIFICATION
+    assert intent.missing_context_question == "A video-streaming site has no filings — which source should I use?"
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in intent.reason_codes
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+    assert intent.target_entities == {"workflow": ["current_workflow"]}
+
+
+def test_structurally_infeasible_without_question_fails_open_to_request_policy_baseline() -> None:
+    baseline = build_turn_intent(
+        user_message="build a workflow",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    intent = build_turn_intent(
+        user_message="build a workflow",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classification(
+            TurnIntentMode.CLARIFY,
+            missing_context_question="   ",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode != TurnIntentMode.CLARIFY
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+    assert intent.missing_context_question is None
+    assert intent.authority.model_dump() == baseline.authority.model_dump()
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+
+
+def test_request_policy_clarification_precedes_structural_infeasibility() -> None:
+    policy = RequestPolicy()
+    policy.user_response_policy = "ask_clarification"
+    policy.clarification_question = "Which saved credential should I use?"
+    intent = build_turn_intent(
+        user_message="log into the portal",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        classifier_result=_classification(
+            TurnIntentMode.CLARIFY,
+            missing_context_question="A different infeasibility question",
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert intent.missing_context_question == "Which saved credential should I use?"
+    assert TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION in intent.reason_codes
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+
+
+def test_classifier_failure_does_not_emit_infeasibility_clarify() -> None:
+    intent = build_turn_intent(
+        user_message="build a workflow on example.test",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=_classifier_failure(TurnIntentClassifierFailureKind.PROVIDER_ERROR),
+    )
+
+    assert intent.mode != TurnIntentMode.CLARIFY
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+
+
+def test_skip_test_bare_value_continuation_classifies_identically_after_fold() -> None:
+    chat_history = [
+        _user_message("Draft a workflow that downloads the monthly invoice PDF — don't run it yet."),
+        _ai_message("Here's a draft workflow with a download block. Want me to adjust anything before you run it?"),
+    ]
+    intent = build_turn_intent(
+        user_message="the second one",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=chat_history,
+        global_llm_context="",
+        request_policy=RequestPolicy(testing_intent="skip_test", allow_update_workflow=True, allow_run_blocks=False),
+        classifier_result=_classification(
+            TurnIntentMode.DRAFT_ONLY,
+            confidence=0.82,
+            target_entities={"workflow_change": ["select_second_proposal"]},
+        ),
+    )
+
+    assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
+    assert intent.mode == TurnIntentMode.DRAFT_ONLY
+    assert intent.mode != TurnIntentMode.CLARIFY
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is False
+    assert RequiredContextKey.LATEST_ASSISTANT_PROPOSAL in intent.required_context
+    assert intent.target_entities["workflow_change"] == ["select_second_proposal"]
+
+
+def _render_turn_intent_prompt() -> str:
+    from skyvern.forge.prompts import prompt_engine
+
+    return prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        mode_values="build, clarify",
+        expected_output_values="workflow_draft, clarification",
+        required_context_values="current_workflow",
+        reason_code_values="structurally_infeasible, llm_classifier",
+        user_message="do this on a video streaming site",
+        request_policy_summary="",
+        workflow_yaml="",
+        earliest_user_turn="download filings",
+        latest_prior_user_turn="download filings",
+        latest_assistant_turn="(none)",
+        retained_history="(none)",
+        global_llm_context="",
+    )
+
+
+def test_turn_intent_prompt_carries_structural_feasibility_contract() -> None:
+    prompt = _render_turn_intent_prompt()
+
+    assert "Structural feasibility:" in prompt
+    assert "structurally_infeasible" in prompt
+    assert "mid-session pivot" in prompt
+    assert "On the fence" in prompt
+
+
+def test_turn_intent_prompt_carries_over_asking_guardrails() -> None:
+    prompt = _render_turn_intent_prompt()
+
+    assert "resolves the target even without a URL" in prompt
+    assert "never ask which website/URL to use" in prompt
+    assert "refinements, corrections, and bare-value replies" in prompt
+    assert "When a concrete URL is present" in prompt
+    assert "default harder away from structurally_infeasible" in prompt
+    assert "On the fence: do not use structurally_infeasible" in prompt

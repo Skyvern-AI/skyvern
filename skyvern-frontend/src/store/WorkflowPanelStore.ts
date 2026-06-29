@@ -53,6 +53,8 @@ const useWorkflowPanelStore = create<WorkflowPanelStore>((set, get) => {
       set({ workflowPanelState });
     },
     closeWorkflowPanel: () => {
+      // Must not clear selectedBlockId: addNode selects the new block, then the
+      // node-library panel closes; the selection has to survive that close.
       set({
         workflowPanelState: {
           ...get().workflowPanelState,

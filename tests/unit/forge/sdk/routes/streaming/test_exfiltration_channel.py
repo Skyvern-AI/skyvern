@@ -123,7 +123,7 @@ class TestExfiltrationChannelEvents:
         message.args = []
         message.text = f"[EXFIL] {json.dumps(event_data)}"
 
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 0)
 
         on_event.assert_called_once()
         assert on_event.call_args.args[0][0].params == event_data
@@ -134,7 +134,7 @@ class TestExfiltrationChannelEvents:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def handle_console_event(_: object) -> None:
+        async def handle_console_event(_: object, __: int) -> None:
             started.set()
             await release.wait()
 
@@ -163,7 +163,7 @@ class TestExfiltrationChannelEvents:
         message.args = [marker, payload]
         message.text = "[EXFIL] JSHandle@object"
 
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 0)
 
         on_event.assert_called_once()
         assert on_event.call_args.args[0][0].params == event_data
@@ -180,14 +180,15 @@ class TestExfiltrationChannelEvents:
         message.text = f"[EXFIL] {json.dumps(event_data)}"
 
         channel._handle_binding_event({"page": page}, event_data)
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 1)
         await channel._handle_runtime_console_event_async(
             {
                 "args": [
                     {"type": "string", "value": "[EXFIL]"},
                     {"type": "string", "value": json.dumps(event_data)},
                 ]
-            }
+            },
+            2,
         )
 
         on_event.assert_called_once()

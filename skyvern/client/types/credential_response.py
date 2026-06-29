@@ -7,6 +7,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .credential_response_credential import CredentialResponseCredential
 from .credential_type_output import CredentialTypeOutput
 from .credential_vault_type import CredentialVaultType
+from .proxy_location import ProxyLocation
 
 
 class CredentialResponse(UniversalBaseModel):
@@ -42,6 +43,16 @@ class CredentialResponse(UniversalBaseModel):
     browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     Browser profile ID linked to this credential
+    """
+
+    proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
+    """
+    Optional proxy location for this credential's pinned proxy identity.
+    """
+
+    proxy_session_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional advanced reuse key for this credential's pinned proxy identity.
     """
 
     tested_url: typing.Optional[str] = pydantic.Field(default=None)

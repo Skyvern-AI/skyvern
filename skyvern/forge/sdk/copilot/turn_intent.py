@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -114,6 +114,7 @@ class TurnIntentReasonCode(StrEnum):
     LOW_CONFIDENCE_CLARIFICATION = "low_confidence_clarification"
     TARGET_ENTITY_RESOLVED = "target_entity_resolved"
     MISSING_EDIT_TARGET = "missing_edit_target"
+    STRUCTURALLY_INFEASIBLE = "structurally_infeasible"
     TRANSIENT_CLASSIFIER_FALLBACK = "transient_classifier_fallback"
 
 
@@ -578,6 +579,7 @@ async def classify_turn_intent(
         return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.MISSING_HANDLER)
 
     safe_user_message = redact_raw_secrets_for_prompt(user_message)
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
     try:
         prompt = prompt_engine.load_prompt(
@@ -596,7 +598,7 @@ async def classify_turn_intent(
             latest_assistant_turn=transcript.latest_assistant_turn,
             retained_history=transcript.retained_history,
             global_llm_context=escape_code_fences(
-                redact_raw_secrets_for_prompt(global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
+                redact_raw_secrets_for_prompt(safe_global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
             ),
         )
     except Exception as exc:
@@ -795,6 +797,33 @@ def build_turn_intent(
 
     classification = classifier_result.classification if classifier_result and classifier_result.is_success else None
     has_prior_run_signal = workflow_run_id is not None or _has_structured_prior_run_signal(global_llm_context)
+
+    if classification is not None and TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in classification.reason_codes:
+        infeasibility_question = (classification.missing_context_question or "").strip()
+        if not infeasibility_question:
+            # Questionless infeasibility fails open: drop the verdict and proceed at request-policy
+            # authority rather than stranding the turn in an answerless CLARIFY.
+            LOG.warning("turn-intent dropped questionless structural-infeasibility verdict, proceeding")
+            classification = classification.model_copy(
+                update={
+                    "mode": TurnIntentMode.UNKNOWN,
+                    "reason_codes": [
+                        code
+                        for code in classification.reason_codes
+                        if code != TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE
+                    ],
+                }
+            )
+        elif classification.mode != TurnIntentMode.CLARIFY:
+            # Force CLARIFY so the pre-loop bail fires; otherwise the turn enters the agent loop with
+            # mutation authority on a blocked request. Clear edit targets that don't belong on a CLARIFY.
+            classification = classification.model_copy(
+                update={
+                    "mode": TurnIntentMode.CLARIFY,
+                    "expected_output": TurnIntentExpectedOutput.CLARIFICATION,
+                    "target_entities": {},
+                }
+            )
 
     if request_policy.raw_secret_detected and request_policy.raw_secret_handling != "redacted_draft":
         mode = TurnIntentMode.REFUSE

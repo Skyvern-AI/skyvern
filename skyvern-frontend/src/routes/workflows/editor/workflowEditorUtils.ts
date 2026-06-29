@@ -1061,6 +1061,8 @@ function convertToNode(
           azureStorageAccountName: block.azure_storage_account_name ?? "",
           azureStorageAccountKey: block.azure_storage_account_key ?? "",
           azureBlobContainerName: block.azure_blob_container_name ?? "",
+          googleCredentialId: block.google_credential_id ?? "",
+          googleDriveFolderId: block.google_drive_folder_id ?? "",
         },
       };
     }
@@ -1982,6 +1984,7 @@ function getElements(
       withWorkflowSettings: true,
       persistBrowserSession: settings.persistBrowserSession,
       browserProfileId: settings.browserProfileId,
+      browserProfileKey: settings.browserProfileKey,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
@@ -3033,6 +3036,8 @@ function getWorkflowBlock(
         azure_storage_account_name: node.data.azureStorageAccountName ?? "",
         azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
+        google_credential_id: node.data.googleCredentialId ?? "",
+        google_drive_folder_id: node.data.googleDriveFolderId ?? "",
       };
     }
     case "fileParser": {
@@ -3396,6 +3401,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
     persistBrowserSession: false,
     browserProfileId: null,
+    browserProfileKey: null,
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
     model: null,
@@ -3424,6 +3430,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     return {
       persistBrowserSession: data.persistBrowserSession,
       browserProfileId: data.browserProfileId,
+      browserProfileKey: data.browserProfileKey,
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
@@ -4070,32 +4077,6 @@ function clone<T>(objectToClone: T): T {
   return JSON.parse(JSON.stringify(objectToClone));
 }
 
-export function upgradeWorkflowBlocksV1toV2(
-  blocks: Array<WorkflowBlock>,
-): Array<WorkflowBlock> {
-  if (!blocks || blocks.length === 0) {
-    return blocks;
-  }
-
-  return blocks.map((block, index) => {
-    const nextBlock = blocks[index + 1];
-    const upgradedBlock = {
-      ...block,
-      next_block_label: nextBlock?.label ?? null,
-    };
-
-    // Recursively handle loop blocks
-    if (isNestedLoopWorkflowBlock(block)) {
-      return {
-        ...upgradedBlock,
-        loop_blocks: upgradeWorkflowBlocksV1toV2(block.loop_blocks),
-      } as WorkflowBlock;
-    }
-
-    return upgradedBlock;
-  });
-}
-
 export function upgradeWorkflowDefinitionToVersionTwo(
   blocks: Array<BlockYAML>,
   currentVersion?: number | null,
@@ -4390,6 +4371,8 @@ function convertBlocksToBlockYAML(
           azure_storage_account_name: block.azure_storage_account_name ?? "",
           azure_storage_account_key: block.azure_storage_account_key ?? "",
           azure_blob_container_name: block.azure_blob_container_name ?? "",
+          google_credential_id: block.google_credential_id ?? "",
+          google_drive_folder_id: block.google_drive_folder_id ?? "",
         };
         return blockYaml;
       }
@@ -4535,6 +4518,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
     browser_profile_id: workflow.browser_profile_id ?? null,
+    browser_profile_key: workflow.browser_profile_key ?? null,
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,

@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
     WorkflowCopilotCompletionCriteriaSetModel,
+    WorkflowModel,
     WorkflowParameterModel,
 )
 from skyvern.forge.sdk.db.utils import (
@@ -37,7 +38,9 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_output_parameter,
     convert_to_workflow_copilot_chat_message,
     convert_to_workflow_parameter,
+    escape_like_term,
     hydrate_action,
+    summarize_copilot_chat_title,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
@@ -47,6 +50,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
+    WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -595,6 +599,80 @@ class WorkflowParametersRepository(BaseRepository):
             if not chat:
                 return None
             return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("get_workflow_copilot_chats")
+    async def get_workflow_copilot_chats(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+        search: str | None = None,
+    ) -> list[WorkflowCopilotChatSummary]:
+        page = max(page, 1)
+        page_size = max(min(page_size, 100), 1)
+        async with self.Session() as session:
+            # Each chat's first message (earliest created_at) is its title source and proves the
+            # chat is non-empty; DISTINCT ON keeps one opening row per chat.
+            first_message = (
+                select(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.label("chat_id"),
+                    WorkflowCopilotChatMessageModel.content.label("title"),
+                )
+                .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
+                .order_by(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
+                    WorkflowCopilotChatMessageModel.created_at.asc(),
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                )
+                .subquery()
+            )
+            query = (
+                select(WorkflowCopilotChatModel, first_message.c.title)
+                .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
+                .where(WorkflowCopilotChatModel.organization_id == organization_id)
+            )
+            if workflow_permanent_id is not None:
+                query = query.where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+            if search and search.strip():
+                # Unindexed substring match over each chat's opening message (one row per chat);
+                # add a pg_trgm index on content if per-org chat counts grow large.
+                escaped = escape_like_term(search.strip())
+                query = query.where(first_message.c.title.ilike(f"%{escaped}%", escape="\\"))
+            query = (
+                query.order_by(WorkflowCopilotChatModel.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            rows = (await session.execute(query)).all()
+
+            workflow_titles: dict[str, str] = {}
+            permanent_ids = {chat.workflow_permanent_id for chat, _ in rows}
+            if permanent_ids:
+                title_rows = (
+                    await session.execute(
+                        select(WorkflowModel.workflow_permanent_id, WorkflowModel.title)
+                        .where(WorkflowModel.organization_id == organization_id)
+                        .where(WorkflowModel.workflow_permanent_id.in_(permanent_ids))
+                        .where(WorkflowModel.deleted_at.is_(None))
+                        .order_by(WorkflowModel.created_at.desc())
+                    )
+                ).all()
+                for permanent_id, title in title_rows:
+                    workflow_titles.setdefault(permanent_id, title)
+
+            return [
+                WorkflowCopilotChatSummary(
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    workflow_permanent_id=chat.workflow_permanent_id,
+                    workflow_title=workflow_titles.get(chat.workflow_permanent_id),
+                    title=summarize_copilot_chat_title(content),
+                    created_at=chat.created_at,
+                    modified_at=chat.modified_at,
+                )
+                for chat, content in rows
+            ]
 
     @db_operation("get_latest_workflow_copilot_completion_criteria_set")
     async def get_latest_workflow_copilot_completion_criteria_set(

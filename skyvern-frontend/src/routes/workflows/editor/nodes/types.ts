@@ -2,6 +2,7 @@ import {
   WorkflowBlockType,
   type WorkflowModel,
 } from "../../types/workflowTypes";
+import type { CodeBlockTitleSource } from "../../types/scriptTypes";
 
 export type NodeBaseData = {
   debuggable: boolean;
@@ -44,11 +45,34 @@ export const dataSchemaExampleForFileExtraction = {
   },
 };
 
+export const CODE_BLOCK_FALLBACK_TITLE = "Code";
+export const CODE_BLOCK_TITLE_MAX_LENGTH = 80;
+
+function normalizeTitle(value: string | null | undefined): string | null {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  return normalized ? normalized : null;
+}
+
+function truncateTitle(value: string): string {
+  if (value.length <= CODE_BLOCK_TITLE_MAX_LENGTH) {
+    return value;
+  }
+  return `${value.slice(0, CODE_BLOCK_TITLE_MAX_LENGTH - 1).trimEnd()}…`;
+}
+
+export function getCodeBlockTitle(source: CodeBlockTitleSource): string {
+  return truncateTitle(
+    normalizeTitle(source.prompt) ??
+      normalizeTitle(source.steps?.[0]?.title) ??
+      CODE_BLOCK_FALLBACK_TITLE,
+  );
+}
+
 export const workflowBlockTitle: {
   [blockType in WorkflowBlockType]: string;
 } = {
   action: "Browser Action",
-  code: "Code",
+  code: CODE_BLOCK_FALLBACK_TITLE,
   conditional: "Conditional",
   download_to_s3: "Download",
   extraction: "Extraction",

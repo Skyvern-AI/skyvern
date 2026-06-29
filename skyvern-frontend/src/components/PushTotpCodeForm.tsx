@@ -1,13 +1,25 @@
 import { type FormEventHandler, useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
+import { OtpType, type OtpType as OtpTypeValue } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useToast } from "@/components/ui/use-toast";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
+import {
+  buildSendTotpCodeRequest,
+  type SendTotpCodeRequest,
+} from "./pushTotpCodeRequest";
 
 type Props = {
   className?: string;
@@ -17,15 +29,6 @@ type Props = {
   defaultTaskId?: string | null;
   showAdvancedFields?: boolean;
   onSuccess?: () => void;
-};
-
-type SendTotpCodeRequest = {
-  totp_identifier: string;
-  content: string;
-  workflow_run_id?: string;
-  workflow_id?: string;
-  task_id?: string;
-  source?: string;
 };
 
 function PushTotpCodeForm({
@@ -44,6 +47,7 @@ function PushTotpCodeForm({
   );
   const [workflowId, setWorkflowId] = useState(defaultWorkflowId?.trim() ?? "");
   const [taskId, setTaskId] = useState(defaultTaskId?.trim() ?? "");
+  const [otpType, setOtpType] = useState<OtpTypeValue>(OtpType.Totp);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const credentialGetter = useCredentialGetter();
@@ -128,21 +132,14 @@ function PushTotpCodeForm({
       return;
     }
 
-    const payload: SendTotpCodeRequest = {
-      totp_identifier: trimmedIdentifier,
+    const payload = buildSendTotpCodeRequest({
+      identifier: trimmedIdentifier,
       content: trimmedContent,
-      source: "manual_ui",
-    };
-
-    if (trimmedWorkflowRunId !== "") {
-      payload.workflow_run_id = trimmedWorkflowRunId;
-    }
-    if (trimmedWorkflowId !== "") {
-      payload.workflow_id = trimmedWorkflowId;
-    }
-    if (trimmedTaskId !== "") {
-      payload.task_id = trimmedTaskId;
-    }
+      otpType,
+      workflowRunId: trimmedWorkflowRunId,
+      workflowId: trimmedWorkflowId,
+      taskId: trimmedTaskId,
+    });
 
     mutation.mutate(payload);
   };
@@ -168,7 +165,11 @@ function PushTotpCodeForm({
         <Label htmlFor="totp-content-input">Verification content</Label>
         <AutoResizingTextarea
           id="totp-content-input"
-          placeholder="Paste the full email/SMS body or the 6-digit code"
+          placeholder={
+            otpType === OtpType.MagicLink
+              ? "Paste the full email body or magic link"
+              : "Paste the full email/SMS body or the 6-digit code"
+          }
           value={content}
           onChange={(event) => setContent(event.target.value)}
           readOnly={mutation.isPending}
@@ -178,6 +179,22 @@ function PushTotpCodeForm({
           We only store this to help the current login. Avoid pasting unrelated
           sensitive data.
         </p>
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="totp-type-input">OTP Type</Label>
+        <Select
+          value={otpType}
+          onValueChange={(value: OtpTypeValue) => setOtpType(value)}
+          disabled={mutation.isPending}
+        >
+          <SelectTrigger id="totp-type-input" className="w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={OtpType.Totp}>Numeric code</SelectItem>
+            <SelectItem value={OtpType.MagicLink}>Magic link</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       {showAdvancedFields && (

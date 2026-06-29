@@ -1,4 +1,8 @@
-from skyvern.forge.sdk.services.credentials import parse_totp_secret
+from urllib.parse import quote
+
+import pyotp
+
+from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config, parse_totp_secret
 
 
 def test_empty_string_returns_empty() -> None:
@@ -22,6 +26,48 @@ def test_valid_otpauth_uri() -> None:
     uri = "otpauth://totp/user@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Example"
     result = parse_totp_secret(uri)
     assert result == "JBSWY3DPEHPK3PXP"
+
+
+def test_normalize_totp_config_preserves_otpauth_uri_params() -> None:
+    uri = (
+        "otpauth://totp/Example:user@example.com"
+        "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+    )
+
+    assert normalize_totp_config(uri) == uri
+
+
+def test_generate_totp_code_uses_otpauth_uri_params() -> None:
+    uri = (
+        "otpauth://totp/Example:user@example.com"
+        "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+    )
+
+    assert generate_totp_code(uri, for_time=0) == pyotp.parse_uri(uri).at(0)
+    assert len(generate_totp_code(uri, for_time=0)) == 8
+
+
+def test_normalize_totp_config_preserves_url_encoded_otpauth_uri() -> None:
+    uri = (
+        "otpauth://totp/Example:user@example.com"
+        "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+    )
+
+    assert normalize_totp_config(quote(uri, safe="")) == uri
+
+
+def test_otpauth_uri_with_unsupported_algorithm_returns_empty() -> None:
+    uri = "otpauth://totp/user@example.com?secret=JBSWY3DPEHPK3PXP&algorithm=NOPE&digits=8&period=45"
+
+    assert parse_totp_secret(uri) == ""
+    assert normalize_totp_config(uri) == ""
+
+
+def test_url_encoded_otpauth_uri_with_unsupported_algorithm_returns_empty() -> None:
+    uri = "otpauth://totp/user@example.com?secret=JBSWY3DPEHPK3PXP&algorithm=NOPE&digits=8&period=45"
+
+    assert parse_totp_secret(quote(uri, safe="")) == ""
+    assert normalize_totp_config(quote(uri, safe="")) == ""
 
 
 def test_regex_extraction_valid_secret() -> None:

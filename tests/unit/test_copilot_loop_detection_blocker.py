@@ -175,11 +175,8 @@ def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
     assert dict(ctx.blocker_signal.extra) == {}
 
 
-def test_consecutive_evaluate_loop_ignores_stale_composition_page_results_without_latest_steer() -> None:
+def test_consecutive_evaluate_loop_without_composition_steer_uses_generic_copy() -> None:
     ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
-    ctx.composition_page_evidence = {
-        "result_containers": [{"tag": "table", "selector": "#old-results", "row_count": 3}],
-    }
     payload = _tool_loop_error(ctx, "evaluate", None)
 
     assert payload is not None

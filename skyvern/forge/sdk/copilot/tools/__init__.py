@@ -175,6 +175,7 @@ from .guardrails import (
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
+from .mcp_hooks import _click_pre_hook as _click_pre_hook
 from .mcp_hooks import (
     _code_only_pre_run_results_error,
 )
@@ -223,6 +224,7 @@ from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
+from .scouting import _capture_scout_role_name as _capture_scout_role_name
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
 from .scouting import (
@@ -232,6 +234,7 @@ from .scouting import _consume_scout_source_url as _consume_scout_source_url
 from .scouting import _mark_page_inspected as _mark_page_inspected
 from .scouting import _mark_pending_browser_interaction_observation as _mark_pending_browser_interaction_observation
 from .scouting import _mark_post_run_page_observed as _mark_post_run_page_observed
+from .scouting import _prenav_role_name_for_selector as _prenav_role_name_for_selector
 from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
@@ -241,7 +244,6 @@ from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
 from .workflow_update import _code_block_safety_errors as _code_block_safety_errors
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
-from .workflow_update import _pre_run_workflow_coverage_error as _pre_run_workflow_coverage_error
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
 from .workflow_update import _update_workflow as _update_workflow
@@ -665,34 +667,6 @@ async def update_and_run_blocks_tool(
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
-    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
-    if coverage_error:
-        user_facing_summary = (
-            "Workflow draft saved; I still need to add the remaining requested actions before testing it."
-        )
-        result = {
-            "ok": False,
-            "error": coverage_error,
-            "data": {
-                "block_count": copilot_ctx.last_update_block_count,
-                "workflow_updated": True,
-                "workflow_run_skipped": True,
-                "control_signal": {
-                    "kind": "intermediate_success",
-                    "user_facing_summary": user_facing_summary,
-                },
-                "user_facing_summary": user_facing_summary,
-            },
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=result,
-            workflow_updated=True,
-        )
-        return json.dumps(result)
-
     if skip_run_after_update:
         skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
@@ -790,8 +764,9 @@ async def discover_workflow_entrypoint_tool(
     Use this BEFORE writing blocks when the user named a website (with a URL,
     a bare domain, or a single brand word) but no specific page. Accepts:
     a URL with or without scheme (``example.com/login`` is fine), a bare
-    domain (``example.com``), or a single brand word (resolved as
-    ``https://www.<word>.com``). English phrases ("the X website") return
+    domain (``example.com``), or a single brand word. Configured aliases resolve
+    first; other single brand words resolve as ``https://www.<word>.com``.
+    English phrases ("the X website") return
     ``failure_reason=could_not_resolve_site_name`` — ASK_QUESTION for a URL.
 
     Returns ``candidate_url`` plus a short ``evidence_trail`` and any

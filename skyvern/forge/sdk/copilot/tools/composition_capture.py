@@ -28,6 +28,9 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    finalize_runtime_authoring_repair_context_from_page_observation,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -650,6 +653,23 @@ async def _capture_composition_evidence(
     return evidence, None
 
 
+def store_post_run_page_evidence(
+    copilot_ctx: Any,
+    evidence: dict[str, Any],
+    *,
+    run_id: str,
+    current_url: str,
+) -> dict[str, Any]:
+    stamped = {**evidence, "workflow_run_id": run_id, "observed_after_workflow_run": True}
+    if current_url and not stamped.get("current_url"):
+        stamped["current_url"] = current_url
+    copilot_ctx.composition_page_evidence = stamped
+    page_title = stamped.get("page_title")
+    if isinstance(page_title, str) and page_title:
+        _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
+    return stamped
+
+
 def _normalized_inspect_url(url: str | None) -> str | None:
     """Normalized full URL for strict same-page comparison, or None when not comparable.
 
@@ -825,21 +845,16 @@ async def _inspect_page_for_composition_impl(
 
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if isinstance(run_id, str) and run_id:
-        evidence = {
-            **evidence,
-            "workflow_run_id": run_id,
-            "observed_after_workflow_run": True,
-        }
+        evidence = store_post_run_page_evidence(copilot_ctx, evidence, run_id=run_id, current_url=current_url)
         _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
-        page_title = evidence.get("page_title")
-        if isinstance(page_title, str) and page_title:
-            _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
+    else:
+        copilot_ctx.composition_page_evidence = evidence
 
     if not bypass_budget_for_post_run_current_page:
         copilot_ctx.page_inspection_calls_this_turn += 1
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
-    copilot_ctx.composition_page_evidence = evidence
+    finalize_runtime_authoring_repair_context_from_page_observation(copilot_ctx)
     if (
         isinstance(run_id, str)
         and run_id

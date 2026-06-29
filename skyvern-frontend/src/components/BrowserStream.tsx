@@ -43,8 +43,18 @@ import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
+import { handleVncClipboardPasteShortcut } from "@/components/browserStreamClipboard";
 
 import "./browser-stream.css";
+
+const MESSAGE_RECONNECT_DELAY_MS = 1000;
+const MESSAGE_MAX_RECONNECT_ATTEMPTS = 20;
+const STREAM_GAVE_UP_DIAGNOSTIC: StreamDiagnostic = {
+  title: "Browser stream connection lost",
+  detail:
+    "The browser session stopped responding after several reconnect attempts.",
+  hint: "Refresh the page to try again.",
+};
 
 interface BrowserSession {
   browser_session_id: string;
@@ -216,7 +226,12 @@ function BrowserStream({
     setCanvasContainer(node);
   }, []);
   const rfbRef = useRef<RFB | null>(null);
+  const userCanSendVncInputRef = useRef(false);
   const observerRef = useRef<MutationObserver | null>(null);
+  const messageReconnectAttemptsRef = useRef(0);
+  const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const clientId = useClientIdStore((state) => state.clientId);
   const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
@@ -234,6 +249,11 @@ function BrowserStream({
     setIsMessageConnected(false);
     setHasBrowserSession(true);
     setTerminalDiagnostic(null);
+    messageReconnectAttemptsRef.current = 0;
+    if (messageReconnectTimerRef.current) {
+      clearTimeout(messageReconnectTimerRef.current);
+      messageReconnectTimerRef.current = null;
+    }
     if (rfbRef.current) {
       rfbRef.current.disconnect();
       rfbRef.current = null;
@@ -295,13 +315,54 @@ function BrowserStream({
     prevVncConnectedRef.current = isVncConnected;
   }, [isVncConnected, onClose]);
 
-  // effect for message disconnects only
+  // message channel reconnect policy
   useEffect(() => {
-    if (prevMessageConnectedRef.current && !isMessageConnected) {
-      setMessagesDisconnectedTrigger((x) => x + 1);
-    }
+    const messageJustClosed =
+      prevMessageConnectedRef.current && !isMessageConnected;
     prevMessageConnectedRef.current = isMessageConnected;
-  }, [isMessageConnected]);
+
+    if (isMessageConnected) {
+      return;
+    }
+
+    // A live VNC stream proves the session is real: reconnect now and drop the cap (also recovers a late VNC connect).
+    if (isVncConnected) {
+      messageReconnectAttemptsRef.current = 0;
+      if (messageReconnectTimerRef.current) {
+        clearTimeout(messageReconnectTimerRef.current);
+        messageReconnectTimerRef.current = null;
+      }
+      setMessagesDisconnectedTrigger((x) => x + 1);
+      return;
+    }
+
+    if (!messageJustClosed) {
+      return;
+    }
+
+    // No stream is live; a session the backend can't find would respin forever, so cap it.
+    if (messageReconnectAttemptsRef.current >= MESSAGE_MAX_RECONNECT_ATTEMPTS) {
+      setTerminalDiagnostic((prev) => prev ?? STREAM_GAVE_UP_DIAGNOSTIC);
+      return;
+    }
+
+    messageReconnectAttemptsRef.current += 1;
+    if (messageReconnectTimerRef.current) {
+      clearTimeout(messageReconnectTimerRef.current);
+    }
+    messageReconnectTimerRef.current = setTimeout(() => {
+      messageReconnectTimerRef.current = null;
+      setMessagesDisconnectedTrigger((x) => x + 1);
+    }, MESSAGE_RECONNECT_DELAY_MS);
+  }, [isMessageConnected, isVncConnected]);
+
+  useEffect(() => {
+    return () => {
+      if (messageReconnectTimerRef.current) {
+        clearTimeout(messageReconnectTimerRef.current);
+      }
+    };
+  }, []);
 
   // vnc socket
   useEffect(
@@ -383,6 +444,7 @@ function BrowserStream({
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
           setTerminalDiagnostic(null);
+          messageReconnectAttemptsRef.current = 0;
         });
 
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
@@ -562,18 +624,23 @@ function BrowserStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interactive, isMessageConnected, userIsControlling]);
 
-  // Effect to handle window resize trigger for NoVNC canvas
+  // noVNC (1.5.0) only rescales via its own observer, which gets swallowed on
+  // re-parent; re-asserting scaleViewport on resize forces a recompute (skip 0×0).
   useEffect(() => {
-    if (!resizeTrigger || !canvasContainer || !rfbRef.current) {
+    if (!canvasContainer || typeof ResizeObserver === "undefined") {
       return;
     }
-
-    // const originalDisplay = canvasContainer.style.display;
-    // canvasContainer.style.display = "none";
-    // canvasContainer.offsetHeight;
-    // canvasContainer.style.display = originalDisplay;
-    // window.dispatchEvent(new Event("resize"));
-  }, [resizeTrigger, canvasContainer]);
+    const rescale = () => {
+      const rect = canvasContainer.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0 && rfbRef.current) {
+        rfbRef.current.scaleViewport = true;
+      }
+    };
+    rescale();
+    const observer = new ResizeObserver(rescale);
+    observer.observe(canvasContainer);
+    return () => observer.disconnect();
+  }, [canvasContainer, resizeTrigger]);
 
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
@@ -627,6 +694,32 @@ function BrowserStream({
       setUserIsControlling(false);
     }
   }, [interactive]);
+
+  const theUserIsControlling =
+    userIsControlling || (interactive && !showControlButtons);
+
+  useEffect(() => {
+    userCanSendVncInputRef.current = theUserIsControlling;
+  }, [theUserIsControlling]);
+
+  useEffect(() => {
+    if (!canvasContainer) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!userCanSendVncInputRef.current) {
+        return;
+      }
+
+      void handleVncClipboardPasteShortcut(event, rfbRef.current);
+    };
+
+    canvasContainer.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      canvasContainer.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [canvasContainer]);
 
   // effect to ensure the recordingStore is reset when the component unmounts
   useEffect(() => {
@@ -762,7 +855,7 @@ function BrowserStream({
             toast({
               title: "Pasting Into Browser",
               description:
-                "Pasting your current clipboard text into the web page. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+                "Pasting your current clipboard text into the browser.",
             });
 
             const response: MessageOutAskForClipboardResponse = {
@@ -786,8 +879,7 @@ function BrowserStream({
             if (success) {
               toast({
                 title: "Copied to Clipboard",
-                description:
-                  "The text has been copied to your clipboard. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+                description: "The text has been copied to your clipboard.",
               });
             } else {
               toast({
@@ -820,8 +912,6 @@ function BrowserStream({
     }
   };
 
-  const theUserIsControlling =
-    userIsControlling || (interactive && !showControlButtons);
   const streamDiagnostic: StreamDiagnostic =
     !showStream || !runId
       ? {

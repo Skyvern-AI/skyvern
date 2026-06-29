@@ -238,6 +238,9 @@ class ExfiltratedCdpEvent(BaseModel):
     params: ExfiltratedEventCdpParams
     source: Literal["cdp"]
     timestamp: float
+    # Monotonic server-receipt order, assigned before async materialization can
+    # reorder events. -1 for payloads that predate the field (legacy/batch replay).
+    capture_seq: int = -1
 
 
 class ExfiltratedConsoleEvent(BaseModel):
@@ -246,6 +249,7 @@ class ExfiltratedConsoleEvent(BaseModel):
     params: ExfiltratedEventConsoleParams
     source: Literal["console"]
     timestamp: float
+    capture_seq: int = -1
 
 
 ExfiltratedEvent = ExfiltratedCdpEvent | ExfiltratedConsoleEvent

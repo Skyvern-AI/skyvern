@@ -28,7 +28,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
-from skyvern.forge.sdk.copilot.enforcement import terminal_challenge_blocker_signal_from_current_page_evidence
+from skyvern.forge.sdk.copilot.enforcement import (
+    register_no_progress_interaction_click,
+    terminal_challenge_blocker_signal_from_current_page_evidence,
+)
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -57,6 +60,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "scout_trajectory",
     "pending_scout_source_url",
     "pending_scout_typed_value",
+    "pending_scout_role_name",
     "post_budget_page_inspection_required",
     "post_budget_page_inspection_url",
     "post_budget_page_inspection_run_id",
@@ -71,6 +75,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "reached_download_target",
     "synthesized_block_offered",
     "synthesized_block_offered_trajectory_len",
+    "consecutive_no_progress_interaction_count",
 )
 
 
@@ -358,6 +363,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 exc_info=True,
             )
             err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
+            if tool_name == "click":
+                register_no_progress_interaction_click(copilot_ctx, outcome="click_failed")
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 

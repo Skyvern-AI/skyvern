@@ -48,6 +48,10 @@ CRITICAL - The agent's own final answer is composed at completion, not by a task
 - Once the underlying DATA each required part needs has been captured by extract tasks, set user_goal_achieved to true. Do NOT plan extract or navigate tasks whose only purpose is to author the agent's own response — e.g. "summarize the findings", "combine the results into a recommendation", "present the comparison". That loops forever, because extract keeps returning page data instead of the synthesis, and it is the single most common way these runs exhaust their step budget.
 - Exception — required on-page actions still count: entering content INTO a web page the goal asks you to fill (a form, document, or post), and completing terminal actions the goal requires (submit, confirm, place order, send), are real navigate tasks and must still be done. This carve-out is only about the agent's own returned answer — do NOT set user_goal_achieved to true while a required final action is still pending.
 
+CRITICAL - Honor explicit count, selection, and kept-open-tab constraints in the goal:
+- When the goal fixes an exact count or a specific selection (e.g. "exactly N", "the N best/strongest", "top N", a required mix like "at least one X and one Y", or one specifically described item), matching that count and mix is a required subgoal. Do NOT set user_goal_achieved to true while the captured result is a superset, the wrong count, or missing a required category.
+- When the goal limits how many browser tabs should stay open, compare that limit against the live "Open browser tabs" list shown below. If more tabs are open than allowed, plan a navigate task to close the extra tabs down to exactly the requested set and mix (keeping the strongest/required ones). Closing tabs is a real browser action, so this is a valid navigate task — it is NOT the forbidden "only authors the answer" kind of task described above. Judge the count from the open-tabs list, not from how many tabs you intended to open — sub-tasks may have opened more. If you have already attempted a close-tabs task and the open tabs still do not match, do not keep retrying it — set user_goal_achieved to true and finish with the best result.
+
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:
@@ -74,6 +78,13 @@ Reply in JSON format with the following keys:
 }
 
 The URL of the page you're on right now is `{{ current_url }}`.
+{% if open_tabs_context %}
+
+Open browser tabs right now (the live set of tabs the agent has open; the tab marked [current] is the page shown above). Sub-tasks may have opened more tabs than planned, so when the goal limits how many tabs may stay open, treat this list — not the number you intended to open — as the true open-tab state:
+```
+{{ open_tabs_context }}
+```
+{% endif %}
 
 Clickable elements from the page:
 ```

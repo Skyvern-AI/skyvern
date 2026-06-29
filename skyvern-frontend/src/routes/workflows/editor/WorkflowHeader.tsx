@@ -2,7 +2,6 @@ import {
   CalendarIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  CopyIcon,
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
@@ -20,7 +19,7 @@ import {
 } from "@/components/ui/tooltip";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
-import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
+import { MakeACopyButton } from "./MakeACopyButton";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
@@ -38,7 +37,6 @@ import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
-import { convert } from "./workflowEditorUtils";
 
 function useIsGlobalWorkflow(): boolean {
   const { workflowPermanentId } = useParams();
@@ -61,33 +59,6 @@ function GeneratingCodeButton() {
     >
       <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
       Code
-    </Button>
-  );
-}
-
-function MakeACopyButton() {
-  const { workflowPermanentId } = useParams();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  const createWorkflowMutation = useCreateWorkflowMutation();
-
-  const handleClick = () => {
-    const workflow = globalWorkflows?.find(
-      (w) => w.workflow_permanent_id === workflowPermanentId,
-    );
-    if (!workflow) {
-      return;
-    }
-    createWorkflowMutation.mutate(convert(workflow));
-  };
-
-  return (
-    <Button size="lg" onClick={handleClick}>
-      {createWorkflowMutation.isPending ? (
-        <ReloadIcon className="mr-3 h-6 w-6 animate-spin" />
-      ) : (
-        <CopyIcon className="mr-3 h-6 w-6" />
-      )}
-      Make a Copy to Edit
     </Button>
   );
 }

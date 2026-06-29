@@ -616,6 +616,7 @@ _CANONICAL_WORKFLOW_SETTING_FIELDS: tuple[str, ...] = (
     "totp_identifier",
     "persist_browser_session",
     "browser_profile_id",
+    "browser_profile_key",
     "model",
     "max_screenshot_scrolls",
     "extra_http_headers",

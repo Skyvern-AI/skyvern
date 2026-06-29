@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
     CompletionCriterion,
+    _classifier_fallback_policy,
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
+    _render_active_criteria_for_prompt,
     contains_email_password_pair,
+    is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -23,6 +28,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 
 def _render(**overrides: str) -> str:
+    active_completion_criteria = overrides.get("active_completion_criteria", "")
     return prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=overrides.get("user_message", ""),
@@ -32,6 +38,8 @@ def _render(**overrides: str) -> str:
         latest_assistant_turn=overrides.get("latest_assistant_turn", "(none)"),
         retained_history=overrides.get("retained_history", "(none)"),
         global_llm_context=overrides.get("global_llm_context", ""),
+        raw_secret_present=overrides.get("raw_secret_present", "false"),
+        active_completion_criteria=active_completion_criteria,
     )
 
 
@@ -76,6 +84,33 @@ class TestRequestPolicyPromptStructure:
         assert "raw_secret_evidence" in rendered
         assert "verbatim substring of the LATEST user message" in rendered
         assert "Do not cite a token that appears only in prior turns" in rendered
+
+    def test_completion_criteria_schema_includes_typed_terminal_action_fields(self) -> None:
+        rendered = _render()
+        assert (
+            "{outcome, contingent_on, contingent_antecedent_output_path, "
+            "deliverable_kind, implicit, method_mandated, level, kind, terminal_action_family}"
+        ) in rendered
+        assert "kind=outcome|terminal_action" in rendered
+        assert "terminal_action_family=request|application|form|order|null" in rendered
+        assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="a commercial water service request is started",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"kind": "terminal_action"' in rendered
+        assert '"terminal_action_family": "request"' in rendered
 
 
 class TestRawSecretBackstop:
@@ -364,3 +399,148 @@ class TestActiveCriteriaPromptAnchor:
             handler=_capture_handler(captured),
         )
         assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]
+
+
+class TestLoadedResultContextPromptSanitization:
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_sanitizes_loaded_result_context_before_prompt(self) -> None:
+        captured: dict[str, str] = {}
+        raw_context = json.dumps(
+            {
+                "loaded_result_targets": [
+                    {
+                        "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
+                        "is_table": True,
+                        "row_selector": 'tr[data-account="987654321"]',
+                        "row_count": 2,
+                        "structure_signature": "legacy-selector-derived-sig",
+                    }
+                ]
+            }
+        )
+
+        await _classify_request(
+            user_message="build from the loaded results",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=raw_context,
+            handler=_capture_handler(captured),
+        )
+
+        prompt = captured["prompt"]
+        for value in (
+            "Jane",
+            "Customer",
+            "123456",
+            "987654321",
+            "legacy-selector-derived-sig",
+        ):
+            assert value not in prompt
+        assert '"row_count": 2' in prompt
+
+
+class TestClassifierFallbackCompletionCriteria:
+    @pytest.mark.parametrize(
+        ("user_message", "expected_status", "expected_output_paths"),
+        [
+            (
+                (
+                    "I want to build a reusable workflow that checks record status. "
+                    "Capture the identifier and the list of practice items with each location's status, "
+                    "and the result should come out as a record with the entity name, identifier, items, "
+                    "and an overall status."
+                ),
+                "present",
+                {"output.identifier", "output.location_status", "output.name", "output.overall_status"},
+            ),
+            (
+                (
+                    "Build a reusable fixture directory lookup workflow for Jordan Example. Return a record with "
+                    "the entity name, identifier 1234567890, items, per-location status, overall status, and "
+                    "no-results behavior."
+                ),
+                "present",
+                {"output.name", "output.identifier", "output.per_location_status", "output.overall_status"},
+            ),
+            (
+                "Extract the user's name, id, address, and status from the portal.",
+                "present",
+                {"output.user_name", "output.id", "output.address", "output.status"},
+            ),
+            ("Open https://example.com and click the pricing link.", "present", set()),
+            # Substring matches ("read" in "already", "name" in "filename", "id" in "decided")
+            # must not satisfy the whole-word gate.
+            ("I already decided the filename and reviewed the status of locations.", "present", set()),
+            # Generic structural group term ("entries") satisfies the group gate.
+            (
+                "Return a record with the entity name, identifier 1234567890, status, and the grouped entries.",
+                "present",
+                {"output.name", "output.identifier", "output.status"},
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_classifier_fallback_structured_record_criteria(
+        self, user_message: str, expected_status: str, expected_output_paths: set[str]
+    ) -> None:
+        policy = await _classify_request(
+            user_message=user_message,
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=None,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.completion_contract_status == expected_status
+        if expected_status == "unknown":
+            assert policy.completion_criteria
+            assert all(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
+            return
+
+        assert {
+            criterion.output_path for criterion in policy.completion_criteria if criterion.output_path
+        } == expected_output_paths
+        assert policy.graded_completion_criteria()
+        assert policy.requires_user_clarification is False
+        assert policy.user_response_policy == "proceed"
+        assert all(
+            criterion.implicit for criterion in policy.completion_criteria if criterion.id.startswith("fallback_")
+        )
+        assert all(criterion.level == "run" for criterion in policy.completion_criteria)
+
+    def test_classifier_fallback_logs_synthesized_structured_record_criteria(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeLogger:
+            def info(self, event: str, **kwargs: object) -> None:
+                calls.append((event, kwargs))
+
+        monkeypatch.setattr(request_policy_module, "LOG", FakeLogger())
+
+        policy = _classifier_fallback_policy(
+            [],
+            raw_secret_present=False,
+            failure_kind="missing_handler",
+            user_message=(
+                "Return a record with the entity name, identifier, items, per-location status, and overall status."
+            ),
+        )
+
+        assert policy.completion_contract_status == "present"
+        assert calls == [
+            (
+                "copilot request policy synthesized fallback structured-record criteria",
+                {
+                    "classifier_failure_kind": "missing_handler",
+                    "completion_criterion_ids": [
+                        "fallback_record_identity",
+                        "fallback_record_identifier",
+                        "fallback_record_groups",
+                        "fallback_record_status",
+                    ],
+                },
+            )
+        ]

@@ -9,6 +9,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import (
     _FALLBACK_BLOCKER_REPLY,
     _RAW_SECRET_LEAK_REFUSAL,
+    _VERIFIED_WORKFLOW_SUCCESS_REPLY,
     _build_output_policy_blocked_result,
     _build_turn_halt_exit_result,
     _finalize_result_with_blocker_override,
@@ -16,14 +17,16 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
+    CREDENTIAL_SCOUT_VERIFY_REPLY,
     BlockerKind,
     CopilotToolBlockerSignal,
     RecoveryHint,
 )
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPolicyReason, OutputPolicyVerdict
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
@@ -511,3 +514,164 @@ def test_turn_halt_exit_keeps_halt_signal_when_context_signal_is_cleared() -> No
     result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
 
     assert result.user_response == signal.user_facing_reason
+
+
+def test_turn_halt_exit_renders_code_authoring_churn_reason() -> None:
+    ctx = _ctx()
+    signal = _signal(
+        kind="loop_detected",
+        user_facing="I kept rewriting the generated code, but the safety checks rejected each version.",
+        internal_reason_code="code_authoring_guardrail_churn",
+        blocked_tool="update_workflow",
+    )
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert "safety checks rejected" in result.user_response
+    assert "update_workflow" not in result.user_response
+
+
+def test_turn_halt_exit_renders_no_forward_progress_interaction_reason() -> None:
+    ctx = _ctx()
+    signal = _signal(
+        kind="loop_detected",
+        user_facing="I couldn't get past this step. Tell me what to change and I'll try a different approach.",
+        internal_reason_code="loop_detected_no_forward_progress_interaction",
+        blocked_tool="click",
+    )
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert "couldn't get past this step" in result.user_response
+    assert "click" not in result.user_response
+
+
+def test_turn_halt_exit_keeps_credential_scout_reply_through_refresh_with_draft() -> None:
+    ctx = _ctx()
+    ctx.last_workflow_yaml = "title: Draft\nworkflow_definition:\n  blocks: []\n"
+    signal = _signal(
+        kind="loop_detected",
+        user_facing=CREDENTIAL_SCOUT_VERIFY_REPLY,
+        internal_reason_code="credential_priority_authoring_churn",
+        blocked_tool="update_workflow",
+    )
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == CREDENTIAL_SCOUT_VERIFY_REPLY
+    assert "update_workflow" not in result.user_response
+
+
+def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> None:
+    ctx = _ctx()
+    terminal = _signal(
+        kind="tool_error",
+        user_facing="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="tool_error_terminal_challenge_blocker",
+        blocked_tool="update_and_run_blocks",
+    )
+    ctx.blocker_signal = terminal
+    halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=terminal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == terminal.user_facing_reason
+
+
+def _fully_satisfied_result() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+
+
+def _seed_verified_outcome(ctx: CopilotContext) -> None:
+    ctx.completion_verification_result = _fully_satisfied_result()
+    ctx.last_artifact_health_blocker_reason = None
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "title: built\nblocks: []\n"
+
+
+def test_verified_outcome_preserves_tested_proposal_over_blocker() -> None:
+    ctx = _ctx()
+    _seed_verified_outcome(ctx)
+    ctx.blocker_signal = _signal(
+        kind="loop_detected",
+        user_facing="I'm stuck retrying the same step.",
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_and_run_blocks",
+    )
+    result = _agent_result()
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    assert overridden.updated_workflow is ctx.last_workflow
+    assert overridden.workflow_yaml == ctx.last_workflow_yaml
+    assert overridden.clear_proposed_workflow is False
+    assert overridden.proposal_disposition == "review_tested"
+    assert overridden.response_type == "REPLY"
+    assert "stuck retrying" not in overridden.user_response
+
+
+def test_verified_outcome_preserve_sets_verified_success_payload() -> None:
+    ctx = _ctx()
+    ctx.turn_id = "turn-verified"
+    _seed_verified_outcome(ctx)
+    ctx.blocker_signal = _signal(
+        kind="loop_detected",
+        user_facing="I'm stuck retrying the same step.",
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_and_run_blocks",
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert overridden.narrative_payload is not None
+    assert overridden.narrative_payload["verifiedSuccess"] is True
+    assert overridden.narrative_payload["proposalDisposition"] == "review_tested"
+
+
+def test_unverified_blocker_still_renders_blocker_text() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = None
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "title: built\nblocks: []\n"
+    ctx.blocker_signal = _signal(
+        kind="loop_detected",
+        user_facing="I'm stuck retrying the same step.",
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_and_run_blocks",
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    assert overridden.proposal_disposition != "review_tested"
+
+
+def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:
+    ctx = _ctx()
+    _seed_verified_outcome(ctx)
+    challenge_text = "The site requires a verification challenge I can't complete on my own."
+    ctx.blocker_signal = _signal(
+        kind="tool_error",
+        user_facing=challenge_text,
+        recovery_hint="stop",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert overridden.user_response == challenge_text
+    assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    assert overridden.proposal_disposition != "review_tested"

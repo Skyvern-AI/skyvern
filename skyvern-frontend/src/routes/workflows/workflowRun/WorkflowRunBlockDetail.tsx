@@ -1,6 +1,8 @@
 import type { ActionsApiResponse } from "@/api/types";
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { FileIcon } from "@radix-ui/react-icons";
 import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
   isObserverThought,
@@ -9,6 +11,10 @@ import {
   type WorkflowRunBlock,
   type WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
+import {
+  getBlockDownloadedFileUrls,
+  pickDownloadedFileFilename,
+} from "./blockDownloadedFiles";
 import type { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 import {
   findBlockSurroundingAction,
@@ -37,6 +43,8 @@ type Props = {
   activeIteration?: number | null;
   timeline: Array<WorkflowRunTimelineItem>;
   timelineReady?: boolean;
+  showDownloadedFiles?: boolean;
+  workflowRunId?: string;
   onActionSelect?: (payload: {
     block: WorkflowRunBlock;
     action: ActionsApiResponse;
@@ -46,6 +54,64 @@ type Props = {
 
 function isLoopBlock(block: WorkflowRunBlock): boolean {
   return block.block_type === "for_loop" || block.block_type === "while_loop";
+}
+
+function BlockDownloadedFiles({
+  block,
+  workflowRunId,
+}: {
+  block: WorkflowRunBlock;
+  workflowRunId?: string;
+}) {
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    workflowRunId ? { workflowRunId } : undefined,
+  );
+  const files = useMemo(() => {
+    const freshUrls = workflowRun?.downloaded_file_urls ?? [];
+    const urls = getBlockDownloadedFileUrls(block.output, freshUrls);
+    if (urls.length === 0) {
+      return [];
+    }
+    const filenameByUrl = new Map<string, string>();
+    for (const file of workflowRun?.downloaded_files ?? []) {
+      if (file.filename) {
+        filenameByUrl.set(file.url, file.filename);
+      }
+    }
+    return urls.map((url) => ({
+      url,
+      filename: pickDownloadedFileFilename(url, filenameByUrl),
+    }));
+  }, [block.output, workflowRun]);
+
+  if (files.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-3">
+      <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        Downloaded files
+      </div>
+      <div className="flex flex-col gap-2">
+        {files.map((file) => (
+          <div
+            key={file.url}
+            title={file.url}
+            className="flex items-center gap-2 text-sm"
+          >
+            <FileIcon className="size-4 shrink-0 text-slate-400" />
+            <a
+              href={file.url}
+              className="truncate underline underline-offset-4"
+            >
+              {file.filename}
+            </a>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function SelectedActionHeader({
@@ -144,6 +210,8 @@ function WorkflowRunBlockDetail({
   activeIteration = null,
   timeline,
   timelineReady = true,
+  showDownloadedFiles = false,
+  workflowRunId,
   onActionSelect,
   onThoughtSelect,
 }: Props) {
@@ -263,6 +331,12 @@ function WorkflowRunBlockDetail({
             />
           )}
           {resolvedBlock && <BlockInspector block={resolvedBlock} />}
+          {resolvedBlock && showDownloadedFiles && (
+            <BlockDownloadedFiles
+              block={resolvedBlock}
+              workflowRunId={workflowRunId}
+            />
+          )}
           {body}
         </div>
       </div>

@@ -14,8 +14,10 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
+  ChevronLeftIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
+import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -41,10 +43,12 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
+  WorkflowCopilotChatSummary,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
   WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
+import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
   QueuedPromptReason,
@@ -53,6 +57,8 @@ import {
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
+import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
+import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import {
   EMPTY_NARRATIVE,
   NarrativeEvent,
@@ -334,6 +340,13 @@ interface WorkflowCopilotChatProps {
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
   onInitialMessageConsumed?: () => void;
+  // Render as a docked panel (no float/drag/resize) instead of a floating window.
+  docked?: boolean;
+  // Collapse the docked panel to a rail. Only used when `docked`.
+  onCollapse?: () => void;
+  // When docked, render into this element via a portal (keeps the component in
+  // its parent's React tree so canvas callbacks stay wired) instead of inline.
+  portalTarget?: HTMLElement | null;
 }
 
 // Snap-back state keyed by turn_id so rapid resubmits don't clobber a prior
@@ -402,6 +415,9 @@ export function WorkflowCopilotChat({
   isLiveBrowserReady = false,
   initialMessage,
   onInitialMessageConsumed,
+  docked = false,
+  onCollapse,
+  portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
@@ -666,6 +682,91 @@ export function WorkflowCopilotChat({
     repin();
   };
 
+  const applyHistoryResponse = useCallback(
+    (data: WorkflowCopilotChatHistoryResponse) => {
+      const historyMessages = data.chat_history.map((message, index) => ({
+        id: `${index}-${Date.now()}`,
+        sender: message.sender,
+        content: message.content,
+        timestamp: message.created_at,
+        narrative: (() => {
+          const hydrated = hydrateHistoryNarrative(
+            message.narrative_payload,
+            message.turn_outcome,
+          );
+          if (!hydrated) return undefined;
+          // Fall back to the legacy message body when the persisted payload
+          // predates terminal-text capture.
+          if (!hydrated.terminalMessage && message.content) {
+            return {
+              ...hydrated,
+              terminalMessage: message.content,
+              narrativeSummary: hydrated.narrativeSummary ?? message.content,
+            };
+          }
+          return hydrated;
+        })(),
+      }));
+      setMessages(historyMessages);
+      setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
+      setProposedWorkflow(data.proposed_workflow ?? null);
+      setAutoAccept(data.auto_accept ?? false);
+    },
+    // Only stable state setters are referenced, so the callback never needs to change.
+    [],
+  );
+
+  const loadChatInPlace = useCallback(
+    async (chatId: string) => {
+      if (!workflowPermanentId) return;
+      setIsLoadingHistory(true);
+      updateQueuedPrompt(null);
+      setNarrative(EMPTY_NARRATIVE);
+      turnSnapshots.current.clear();
+      pendingSubmitSnapshot.current = null;
+      latestTurnId.current = null;
+      repin();
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+          "/workflow/copilot/chat-history",
+          {
+            params: {
+              workflow_permanent_id: workflowPermanentId,
+              workflow_copilot_chat_id: chatId,
+            },
+          },
+        );
+        applyHistoryResponse(response.data);
+        // Mark history loaded for this workflow so the mount effect won't reload
+        // the latest chat over the one the user just selected.
+        historyLoadedForRef.current = workflowPermanentId;
+      } catch (error) {
+        console.error("Failed to load chat:", error);
+        toast({ title: "Failed to load chat", variant: "destructive" });
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    },
+    [
+      credentialGetter,
+      workflowPermanentId,
+      applyHistoryResponse,
+      updateQueuedPrompt,
+      repin,
+    ],
+  );
+
+  const handleSelectHistoryChat = useCallback(
+    (chat: WorkflowCopilotChatSummary) => {
+      if (chat.workflow_copilot_chat_id === workflowCopilotChatIdRef.current) {
+        return;
+      }
+      void loadChatInPlace(chat.workflow_copilot_chat_id);
+    },
+    [loadChatInPlace],
+  );
+
   const applyWorkflowUpdate = useCallback(
     (
       workflow: WorkflowApiResponse,
@@ -923,36 +1024,7 @@ export function WorkflowCopilotChat({
 
         if (!isMounted) return;
 
-        const historyMessages = response.data.chat_history.map(
-          (message, index) => ({
-            id: `${index}-${Date.now()}`,
-            sender: message.sender,
-            content: message.content,
-            timestamp: message.created_at,
-            narrative: (() => {
-              const hydrated = hydrateHistoryNarrative(
-                message.narrative_payload,
-                message.turn_outcome,
-              );
-              if (!hydrated) return undefined;
-              // Fall back to the legacy message body when the persisted
-              // payload predates terminal-text capture.
-              if (!hydrated.terminalMessage && message.content) {
-                return {
-                  ...hydrated,
-                  terminalMessage: message.content,
-                  narrativeSummary:
-                    hydrated.narrativeSummary ?? message.content,
-                };
-              }
-              return hydrated;
-            })(),
-          }),
-        );
-        setMessages(historyMessages);
-        setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
-        setProposedWorkflow(response.data.proposed_workflow ?? null);
-        setAutoAccept(response.data.auto_accept ?? false);
+        applyHistoryResponse(response.data);
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
@@ -968,7 +1040,13 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, repin, updateQueuedPrompt, workflowPermanentId]);
+  }, [
+    credentialGetter,
+    repin,
+    updateQueuedPrompt,
+    workflowPermanentId,
+    applyHistoryResponse,
+  ]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -1215,6 +1293,7 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
             max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
             max_elapsed_time_minutes:
@@ -1248,6 +1327,12 @@ export function WorkflowCopilotChat({
           pendingSubmitSnapshot.current = {
             ...saveData.workflow,
             title: saveData.title,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
+            model: saveData.settings.model,
             workflow_definition: {
               ...saveData.workflow.workflow_definition,
               parameters: saveData.parameters,
@@ -1906,25 +1991,49 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
 
-  return (
+  const content = (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
-      style={{
-        left: `${position.x}px`,
-        top: `${position.y}px`,
-        width: `${size.width}px`,
-        height: `${size.height}px`,
-      }}
+      className={
+        docked
+          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
+      }
+      style={
+        docked
+          ? undefined
+          : {
+              left: `${position.x}px`,
+              top: `${position.y}px`,
+              width: `${size.width}px`,
+              height: `${size.height}px`,
+            }
+      }
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-border px-4 py-2"
-        onMouseDown={handleMouseDown}
+        className={
+          "flex items-center justify-between border-b border-border px-4" +
+          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+        }
+        onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-foreground">
-          Agent Copilot (Beta)
-        </h3>
         <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-foreground">
+            {docked ? "Copilot" : "Agent Copilot (Beta)"}
+          </h3>
+          {docked ? (
+            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+              Beta
+            </span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <WorkflowCopilotHistory
+            workflowPermanentId={workflowPermanentId}
+            currentChatId={workflowCopilotChatId}
+            onSelect={handleSelectHistoryChat}
+            disabled={isLoading || isLoadingHistory}
+          />
           <button
             type="button"
             onClick={handleNewChat}
@@ -1935,15 +2044,28 @@ export function WorkflowCopilotChat({
           </button>
           <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
           <span className="text-xs text-muted-foreground">Active</span>
-          <button
-            type="button"
-            onClick={() => onClose?.()}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            title="Close"
-          >
-            <Cross2Icon className="h-4 w-4" />
-          </button>
+          {docked ? (
+            onCollapse ? (
+              <button
+                type="button"
+                onClick={onCollapse}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Collapse Copilot"
+              >
+                <ChevronLeftIcon className="h-4 w-4" />
+              </button>
+            ) : null
+          ) : (
+            <button
+              type="button"
+              onClick={() => onClose?.()}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              title="Close"
+            >
+              <Cross2Icon className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -2029,6 +2151,21 @@ export function WorkflowCopilotChat({
                           Reject
                         </button>
                       </div>
+                    ) : null}
+                    {docked && shouldShowDiffCard(message.narrative) ? (
+                      <DiffCard turn={message.narrative} />
+                    ) : null}
+                    {docked &&
+                    isLastMessage &&
+                    shouldShowFixCard(message.narrative) ? (
+                      <FixCard
+                        turn={message.narrative}
+                        onFix={() =>
+                          handleSend(
+                            "The last run failed — diagnose the failure and fix it, then re-run.",
+                          )
+                        }
+                      />
                     ) : null}
                   </div>
                 );
@@ -2251,7 +2388,10 @@ export function WorkflowCopilotChat({
                       setCodeWorkflow(false);
                       setCodeBlockRequestOverride(null);
                     }}
-                    className="flex items-start gap-2.5"
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      !isBuild && "bg-accent",
+                    )}
                   >
                     <ModeGlyph mode="ask" />
                     <span className="flex flex-1 flex-col">
@@ -2271,7 +2411,10 @@ export function WorkflowCopilotChat({
                       setCodeWorkflow(false);
                       setCodeBlockRequestOverride(false);
                     }}
-                    className="flex items-start gap-2.5"
+                    className={cn(
+                      "flex items-start gap-2.5",
+                      isBuild && !codeWorkflow && "bg-accent",
+                    )}
                   >
                     <ModeGlyph mode="build" />
                     <span className="flex flex-1 flex-col">
@@ -2287,18 +2430,21 @@ export function WorkflowCopilotChat({
                   </DropdownMenuItem>
                   {codeOptionAvailable ? (
                     <DropdownMenuItem
-                      aria-label="Build with code"
+                      aria-label="Build workflow as code"
                       onSelect={() => {
                         setComposerMode("build");
                         setCodeWorkflow(true);
                         setCodeBlockRequestOverride(true);
                       }}
-                      className="flex items-start gap-2.5"
+                      className={cn(
+                        "flex items-start gap-2.5",
+                        isBuild && codeWorkflow && "bg-accent",
+                      )}
                     >
                       <ModeGlyph mode="build" glow />
                       <span className="flex flex-1 flex-col">
                         <span className="text-sm font-medium">
-                          Build with code
+                          Build workflow as code
                         </span>
                         <span className="text-xs leading-snug text-muted-foreground">
                           Build the workflow as code. Faster and more flexible,
@@ -2318,48 +2464,57 @@ export function WorkflowCopilotChat({
       </div>
 
       {/* Resize Handles */}
-      {/* Corners */}
-      <div
-        className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "se")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
-        title="Resize"
-      />
-      <div
-        className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
-        title="Resize"
-      />
-      <div
-        className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
-        title="Resize"
-      />
-      {/* Edges */}
-      <div
-        className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "n")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "s")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "w")}
-        title="Resize"
-      />
-      <div
-        className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
-        onMouseDown={(e) => handleResizeMouseDown(e, "e")}
-        title="Resize"
-      />
+      {!docked && (
+        <>
+          {/* Corners */}
+          <div
+            className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "se")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
+            title="Resize"
+          />
+          <div
+            className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
+            title="Resize"
+          />
+          <div
+            className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
+            title="Resize"
+          />
+          {/* Edges */}
+          <div
+            className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "n")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "s")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "w")}
+            title="Resize"
+          />
+          <div
+            className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
+            onMouseDown={(e) => handleResizeMouseDown(e, "e")}
+            title="Resize"
+          />
+        </>
+      )}
     </div>
   );
+
+  if (docked) {
+    return portalTarget ? createPortal(content, portalTarget) : null;
+  }
+  return content;
 }

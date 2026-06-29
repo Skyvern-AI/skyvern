@@ -5,14 +5,28 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
+from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    grade_requested_output_criteria,
+    split_requested_output_criteria,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
+    _STRUCTURED_RECORD_CRITERION_IDS,
     CompletionVerificationResult,
     CriterionVerdict,
     RunEvidenceSnapshot,
+    _contingent_metadata_for_criteria,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
+    grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
+    grade_record_semantic_consistency,
+    grade_registered_download_criteria,
+    grade_structured_record_criteria,
+    grade_terminal_goal_record_criteria,
+    is_registered_download_completion_criterion,
+    registered_download_completion_criterion,
+    structural_unfired_contingent_criterion_ids,
     summarize_unsatisfied_outcomes,
     verdict_missing_evidence,
 )
@@ -20,7 +34,14 @@ from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    DOWNLOAD_KIND_ATTRIBUTE,
+    DOWNLOAD_KIND_EXTENSION,
+    DOWNLOAD_KIND_REGISTERED,
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    ReachedDownloadTarget,
+    derive_from_block_outputs,
+)
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -31,28 +52,137 @@ from ._shared import (
     _current_workflow_has_evidence_block,
     _failed_run_block_labels,
     _is_meaningful_extracted_data,
+    _registered_output_parameter_payloads,
     _valid_runtime_anchor_url,
+    _workflow_output_parameter_payloads,
 )
 from .blockers import (
     _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
+    _looks_like_anti_bot_blocker,
     _run_blocks_structured_blocker_message,
 )
 
 LOG = structlog.get_logger()
 
+_TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
-def _completion_verification_criteria(copilot_ctx: Any) -> list[Any]:
-    policy = getattr(copilot_ctx, "request_policy", None)
+
+def _completion_request_policy(copilot_ctx: Any) -> Any | None:
+    try:
+        return copilot_ctx.request_policy
+    except AttributeError:
+        return None
+
+
+def _is_typed_download_target(value: object) -> bool:
+    if isinstance(value, ReachedDownloadTarget):
+        return value.download_kind in _TYPED_DOWNLOAD_KINDS
+    if not isinstance(value, dict):
+        return False
+    download_kind = value.get("download_kind")
+    return isinstance(download_kind, str) and download_kind in _TYPED_DOWNLOAD_KINDS
+
+
+def _ctx_reached_download_target(copilot_ctx: Any) -> object | None:
+    try:
+        return copilot_ctx.reached_download_target
+    except AttributeError:
+        return None
+
+
+def _result_data(result: dict[str, Any]) -> dict[str, Any]:
+    data = result.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _result_block_outputs_by_label(result: dict[str, Any]) -> dict[str, Any]:
+    data = _result_data(result)
+    blocks = data.get("blocks")
+    block_outputs: dict[str, Any] = {}
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            output = block.get("extracted_data")
+            if isinstance(label, str) and isinstance(output, dict):
+                block_outputs[label] = output
+    # Signal detection reads raw download keys; evidence snapshots normalize/redact payloads before grading.
+    for registered in _registered_output_parameter_payloads(data):
+        label = registered.get("output_parameter_key") or registered.get("block_label")
+        value = registered.get("value")
+        if isinstance(label, str) and isinstance(value, dict):
+            block_outputs[label] = value
+    return block_outputs
+
+
+def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool:
+    return derive_from_block_outputs(_result_block_outputs_by_label(result)) is not None
+
+
+def _registered_download_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.output_path is not None
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+    )
+
+
+def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool:
+    if _is_typed_download_target(_ctx_reached_download_target(copilot_ctx)):
+        return True
+    if _is_typed_download_target(_result_data(result).get("reached_download_target")):
+        return True
+    return _result_has_registered_download_block_output(result)
+
+
+def _reconcile_download_completion_criterion(
+    copilot_ctx: Any, result: dict[str, Any], criteria: list[CompletionCriterion]
+) -> list[CompletionCriterion]:
+    has_registered_download_evidence = _result_has_registered_download_block_output(result)
+    reconciled = (
+        [criterion for criterion in criteria if not _registered_download_requested_output_criterion(criterion)]
+        if has_registered_download_evidence
+        else criteria
+    )
+    if any(is_registered_download_completion_criterion(criterion) for criterion in reconciled):
+        return reconciled
+    if not _has_typed_download_signal(copilot_ctx, result):
+        return reconciled
+    return [*reconciled, registered_download_completion_criterion()]
+
+
+def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
+    policy = _completion_request_policy(copilot_ctx)
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
-    return [c for c in (policy.completion_criteria if policy is not None else []) if not c.method_mandated]
+    return policy.graded_completion_criteria() if policy is not None else []
 
 
 def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
     run_criteria = [c for c in criteria if getattr(c, "level", "run") != "definition"]
     definition_criteria = [c for c in criteria if getattr(c, "level", "run") == "definition"]
     return run_criteria, definition_criteria
+
+
+def _classifier_status(copilot_ctx: Any) -> str:
+    policy = getattr(copilot_ctx, "request_policy", None)
+    return policy.classifier_status if policy is not None else "not_run"
+
+
+def _no_gradeable_run_plane_result(criterion_ids: list[str]) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=list(criterion_ids),
+        verdicts=[
+            CriterionVerdict(criterion_id=criterion_id, state="unknown", reason_code="unknown")
+            for criterion_id in criterion_ids
+        ],
+        no_gradeable_run_plane=True,
+    )
 
 
 def _definition_plane_workflow_yaml(copilot_ctx: Any) -> str | None:
@@ -127,48 +257,137 @@ async def _maybe_run_completion_verification_from_page_observation(
     if getattr(copilot_ctx, "post_run_page_observation_after_failed_test", False) is not True:
         return None
     criteria = _completion_verification_criteria(copilot_ctx)
-    if not criteria:
-        return None
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
+    run_contingent_ids, run_contingent_on_by_id, run_contingent_path_by_id = _contingent_metadata_for_criteria(
+        run_criteria
+    )
+    if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
+        verification = _no_gradeable_run_plane_result(criterion_ids)
+        copilot_ctx.completion_verification_result = verification
+        record_completion_verification(copilot_ctx, verification)
+        _record_adjudication_on_turn_state(copilot_ctx, verification)
+        _emit_completion_verification_trace(copilot_ctx, verification)
+        return verification
+    if not criteria:
+        return None
     definition_verdicts = (
         grade_definition_criteria(definition_criteria, _definition_plane_workflow_yaml(copilot_ctx))
         if definition_criteria
         else []
     )
     if not run_criteria:
-        verification = combine_verification_results(criterion_ids, None, definition_verdicts)
+        verification = combine_verification_results(
+            criterion_ids,
+            None,
+            definition_verdicts,
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        )
     else:
-        handler = await _completion_verification_handler(copilot_ctx)
-        if handler is None:
-            return None
+        snapshot = _build_page_observation_evidence_snapshot(
+            copilot_ctx,
+            url=url,
+            title=title,
+            observed_data=observed_data,
+        )
+        run_structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
+        requested_output_criteria, judgeable_run_criteria = split_requested_output_criteria(run_criteria)
+        requested_output_verdicts = (
+            grade_requested_output_criteria(copilot_ctx, requested_output_criteria, snapshot)
+            if requested_output_criteria
+            else []
+        )
         remaining = _copilot_seconds_remaining(copilot_ctx)
         if (
             remaining is not None
             and remaining
             <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
         ):
-            verification = CompletionVerificationResult(status="unavailable")
-        else:
-            snapshot = _build_page_observation_evidence_snapshot(
-                copilot_ctx,
-                url=url,
-                title=title,
-                observed_data=observed_data,
+            run_result = _merge_run_verdicts_if_requested_output_exists(
+                run_criteria,
+                requested_output_verdicts,
+                structural_unfired_criterion_ids=run_structural_unfired_ids,
             )
+            verification = (
+                combine_verification_results(
+                    criterion_ids,
+                    run_result,
+                    definition_verdicts,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                )
+                if run_result is not None
+                else CompletionVerificationResult(
+                    status="unavailable",
+                    criterion_ids=criterion_ids,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+            )
+        else:
             if not snapshot.has_evidence():
                 run_result = CompletionVerificationResult(
                     status="evaluated",
                     criterion_ids=[criterion.id for criterion in run_criteria],
-                    verdicts=[
+                    verdicts=requested_output_verdicts
+                    + [
                         CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
-                        for criterion in run_criteria
+                        for criterion in judgeable_run_criteria
                     ],
+                    contingent_criterion_ids=run_contingent_ids,
+                    contingent_on_by_criterion_id=run_contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+            elif not judgeable_run_criteria:
+                run_result = _merge_run_verdicts(
+                    run_criteria,
+                    requested_output_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
             else:
-                run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
-                run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
-            verification = combine_verification_results(criterion_ids, run_result, definition_verdicts)
+                handler = await _completion_verification_handler(copilot_ctx)
+                if handler is None:
+                    run_result = _merge_run_verdicts_if_requested_output_exists(
+                        run_criteria,
+                        requested_output_verdicts,
+                        structural_unfired_criterion_ids=run_structural_unfired_ids,
+                    )
+                    if run_result is None:
+                        return None
+                else:
+                    judgeable_result = await evaluate_completion_criteria(judgeable_run_criteria, snapshot, handler)
+                    judgeable_result = _apply_present_value_upgrades(judgeable_result, judgeable_run_criteria, snapshot)
+                    if judgeable_result.status != "evaluated":
+                        run_result = (
+                            _merge_run_verdicts_if_requested_output_exists(
+                                run_criteria,
+                                requested_output_verdicts,
+                                structural_unfired_criterion_ids=run_structural_unfired_ids,
+                            )
+                            or judgeable_result
+                        )
+                    else:
+                        run_result = _merge_run_verdicts(
+                            run_criteria,
+                            requested_output_verdicts,
+                            judgeable_result.verdicts,
+                            structural_unfired_criterion_ids=run_structural_unfired_ids,
+                        )
+            verification = combine_verification_results(
+                criterion_ids,
+                run_result,
+                definition_verdicts,
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            )
 
     if (
         isinstance(existing, CompletionVerificationResult)
@@ -261,18 +480,18 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
     """A clean ok=True run worth judging on its whole-workflow outcome.
 
     Recognition is governed by the outcome evidence the user can observe, not by
-    whether every block was verified as an end-to-end prefix (SKY-10576). The judge
-    requires positive evidence for every criterion, and ``empty_data_blocks`` rejects
-    a run whose outcome block produced nothing, so an incomplete run never passes --
-    this only lets an already-reached goal be recognized without a redundant
-    full-prefix re-run.
+    whether the run produced any data. The judge requires positive evidence for
+    every criterion, so a genuinely-empty run still grades unsatisfied; only a
+    terminal anti-bot blocker keeps a completed run out of the judge, because that
+    evidence makes the apparent success unusable.
     """
     if not bool(result.get("ok", False)):
         return False
-    if _run_blocks_structured_blocker_message(result, copilot_ctx):
+    structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
+    anti_bot, _empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
+    if structured_blocker and (anti_bot or _looks_like_anti_bot_blocker(structured_blocker)):
         return False
-    _anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
-    return not empty_data_blocks
+    return True
 
 
 def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str, Any]) -> bool:
@@ -373,6 +592,25 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             evidence_output = _completion_evidence_payload(output)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
+            for output_key, output_value in _workflow_output_parameter_payloads(output).items():
+                block_outputs[output_key] = output_value
+    for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
+        block_outputs[output_key] = output_value
+    for registered in _registered_output_parameter_payloads(data):
+        registered_output_key = registered.get("output_parameter_key")
+        registered_output_value = _completion_evidence_payload(registered.get("value"))
+        registered_block_label = registered.get("block_label")
+        if isinstance(registered_output_key, str) and registered_output_key:
+            block_outputs[registered_output_key] = registered_output_value
+        if isinstance(registered_block_label, str) and registered_block_label in current_labels:
+            if isinstance(registered_output_key, str) and registered_output_key:
+                existing = block_outputs.get(registered_block_label)
+                if isinstance(existing, dict):
+                    existing.setdefault(registered_output_key, registered_output_value)
+                else:
+                    block_outputs[registered_block_label] = {registered_output_key: registered_output_value}
+            else:
+                block_outputs[registered_block_label] = registered_output_value
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
@@ -408,6 +646,8 @@ def _apply_present_value_upgrades(
     run_result: CompletionVerificationResult,
     run_criteria: list[CompletionCriterion],
     snapshot: RunEvidenceSnapshot,
+    *,
+    include_terminal_goal_records: bool = False,
 ) -> CompletionVerificationResult:
     """Upgrade a ``no_evidence``/``unknown`` run verdict to a deterministic present-value
     ``satisfied``. An ``evidence_contradicts`` verdict is left to the judge, a judge
@@ -416,16 +656,175 @@ def _apply_present_value_upgrades(
     if run_result.status != "evaluated":
         return run_result
     upgrades = {verdict.criterion_id: verdict for verdict in grade_present_value_criteria(run_criteria, snapshot)}
-    if not upgrades:
+    upgrades.update(
+        {verdict.criterion_id: verdict for verdict in grade_structured_record_criteria(run_criteria, snapshot)}
+    )
+    if include_terminal_goal_records:
+        upgrades.update(
+            {
+                verdict.criterion_id: verdict
+                for verdict in grade_fallback_floor_reached_end_state_criteria(run_criteria, snapshot)
+            }
+        )
+        upgrades.update(
+            {verdict.criterion_id: verdict for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot)}
+        )
+    semantic_verdicts = {
+        verdict.criterion_id: verdict for verdict in grade_record_semantic_consistency(run_criteria, snapshot)
+    }
+    if not upgrades and not semantic_verdicts:
         return run_result
-    verdicts = [
-        upgrades[verdict.criterion_id]
-        if verdict.criterion_id in upgrades and not verdict.satisfied and verdict.reason_code != "evidence_contradicts"
-        else verdict
-        for verdict in run_result.verdicts
-    ]
+
+    def _merged(verdict: CriterionVerdict) -> CriterionVerdict:
+        # Semantic contradictions are stronger than earlier satisfied verdicts:
+        # a row-mixing/status contradiction means the record evidence is invalid.
+        if verdict.criterion_id in semantic_verdicts:
+            return semantic_verdicts[verdict.criterion_id]
+        if verdict.criterion_id in upgrades and not verdict.satisfied and verdict.reason_code != "evidence_contradicts":
+            return upgrades[verdict.criterion_id]
+        return verdict
+
+    verdicts = [_merged(verdict) for verdict in run_result.verdicts]
     return CompletionVerificationResult(
-        status="evaluated", criterion_ids=list(run_result.criterion_ids), verdicts=verdicts
+        status="evaluated",
+        criterion_ids=list(run_result.criterion_ids),
+        verdicts=verdicts,
+        contingent_criterion_ids=list(run_result.contingent_criterion_ids),
+        contingent_on_by_criterion_id=dict(run_result.contingent_on_by_criterion_id),
+        contingent_antecedent_output_path_by_criterion_id=dict(
+            run_result.contingent_antecedent_output_path_by_criterion_id
+        ),
+        structural_unfired_criterion_ids=list(run_result.structural_unfired_criterion_ids),
+    )
+
+
+def _merge_run_verdicts(
+    run_criteria: list[CompletionCriterion],
+    *verdict_groups: list[CriterionVerdict],
+    contingent_criterion_ids: list[str] | None = None,
+    contingent_on_by_criterion_id: dict[str, str] | None = None,
+    contingent_antecedent_output_path_by_criterion_id: dict[str, str] | None = None,
+    structural_unfired_criterion_ids: list[str] | None = None,
+) -> CompletionVerificationResult:
+    verdict_by_id: dict[str, CriterionVerdict] = {}
+    for verdicts in verdict_groups:
+        verdict_by_id.update({verdict.criterion_id: verdict for verdict in verdicts})
+    default_contingent_ids, default_contingent_on_by_id, default_contingent_path_by_id = (
+        _contingent_metadata_for_criteria(run_criteria)
+    )
+    criterion_ids = [criterion.id for criterion in run_criteria]
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=criterion_ids,
+        verdicts=[
+            verdict_by_id.get(criterion_id, CriterionVerdict(criterion_id, "unknown", "unknown"))
+            for criterion_id in criterion_ids
+        ],
+        contingent_criterion_ids=contingent_criterion_ids or default_contingent_ids,
+        contingent_on_by_criterion_id=contingent_on_by_criterion_id or default_contingent_on_by_id,
+        contingent_antecedent_output_path_by_criterion_id=(
+            contingent_antecedent_output_path_by_criterion_id or default_contingent_path_by_id
+        ),
+        structural_unfired_criterion_ids=structural_unfired_criterion_ids or [],
+    )
+
+
+def _merge_run_verdicts_if_requested_output_exists(
+    run_criteria: list[CompletionCriterion],
+    requested_output_verdicts: list[CriterionVerdict],
+    *verdict_groups: list[CriterionVerdict],
+    structural_unfired_criterion_ids: list[str] | None = None,
+) -> CompletionVerificationResult | None:
+    if not requested_output_verdicts:
+        return None
+    return _merge_run_verdicts(
+        run_criteria,
+        requested_output_verdicts,
+        *verdict_groups,
+        structural_unfired_criterion_ids=structural_unfired_criterion_ids,
+    )
+
+
+def _run_criteria_for_verdicts(
+    run_criteria: list[CompletionCriterion], *verdict_groups: list[CriterionVerdict]
+) -> list[CompletionCriterion]:
+    # Drops verdict-less value-agnostic fallback criteria in the structured-record fast path.
+    verdict_ids = {verdict.criterion_id for verdicts in verdict_groups for verdict in verdicts}
+    return [criterion for criterion in run_criteria if criterion.id in verdict_ids]
+
+
+def _deterministic_run_verification_result(
+    run_criteria: list[CompletionCriterion],
+    snapshot: RunEvidenceSnapshot,
+) -> tuple[CompletionVerificationResult | None, list[CompletionCriterion]]:
+    """Return a deterministic run-plane verdict when the typed graders cover it.
+
+    Provider-record and present-value graders are exact enough to bypass the LLM
+    judge only when they satisfy every run-plane criterion. Contradictions also
+    bypass the judge, because the output is already semantically invalid. Any
+    remaining criterion stays fail-closed through the normal judge path.
+    """
+    criterion_ids = [criterion.id for criterion in run_criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(run_criteria)
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
+    semantic_verdicts = grade_record_semantic_consistency(run_criteria, snapshot)
+    if any(not verdict.satisfied for verdict in semantic_verdicts):
+        return (
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=criterion_ids,
+                verdicts=list(semantic_verdicts),
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                structural_unfired_criterion_ids=structural_unfired_ids,
+            ),
+            [],
+        )
+
+    deterministic_by_id: dict[str, CriterionVerdict] = {}
+    for verdict in grade_present_value_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_structured_record_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_fallback_floor_reached_end_state_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in grade_registered_download_criteria(run_criteria, snapshot):
+        deterministic_by_id[verdict.criterion_id] = verdict
+    for verdict in semantic_verdicts:
+        deterministic_by_id[verdict.criterion_id] = verdict
+
+    deterministic_verdicts = [deterministic_by_id.get(criterion_id) for criterion_id in criterion_ids]
+    if criterion_ids and all(verdict is not None and verdict.satisfied for verdict in deterministic_verdicts):
+        return (
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=criterion_ids,
+                verdicts=[deterministic_by_id[criterion_id] for criterion_id in criterion_ids],
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                structural_unfired_criterion_ids=structural_unfired_ids,
+            ),
+            [],
+        )
+
+    remaining_criteria = [criterion for criterion in run_criteria if criterion.id not in deterministic_by_id]
+    if not deterministic_by_id:
+        return None, remaining_criteria
+    return (
+        CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=criterion_ids,
+            verdicts=list(deterministic_by_id.values()),
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            structural_unfired_criterion_ids=structural_unfired_ids,
+        ),
+        remaining_criteria,
     )
 
 
@@ -434,47 +833,215 @@ async def _maybe_run_completion_verification(
 ) -> CompletionVerificationResult | None:
     if getattr(copilot_ctx, "copilot_total_timeout_exceeded", False):
         return None
-    criteria = _completion_verification_criteria(copilot_ctx)
-    if not criteria:
-        return None
     if not (
         _is_outcome_evidence_candidate(copilot_ctx, result)
         or _is_unfinished_run_verification_candidate(copilot_ctx, result)
     ):
         return None
+    criteria = _completion_verification_criteria(copilot_ctx)
+    criteria = _reconcile_download_completion_criterion(copilot_ctx, result, criteria)
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
+    contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
+    run_contingent_ids, run_contingent_on_by_id, run_contingent_path_by_id = _contingent_metadata_for_criteria(
+        run_criteria
+    )
+    if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
+        return _no_gradeable_run_plane_result(criterion_ids)
+    if not criteria:
+        return None
     definition_verdicts = (
         grade_definition_criteria(definition_criteria, _definition_plane_workflow_yaml(copilot_ctx))
         if definition_criteria
         else []
     )
     if not run_criteria:
-        return combine_verification_results(criterion_ids, None, definition_verdicts)
-    # A missing judge handler is an infra/config state, not a transient failure:
-    # fall back to the prior gate rather than fail closed on every run.
-    handler = await _completion_verification_handler(copilot_ctx)
-    if handler is None:
-        return None
-    # Too little budget to verify a candidate run: fail closed (unavailable) rather
-    # than let the run-status proxy claim an unverified outcome as success.
-    remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
-    if remaining <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS:
-        return CompletionVerificationResult(status="unavailable")
+        return combine_verification_results(
+            criterion_ids,
+            None,
+            definition_verdicts,
+            contingent_criterion_ids=contingent_ids,
+            contingent_on_by_criterion_id=contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        )
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
+    run_structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
+    requested_output_criteria, judgeable_run_criteria = split_requested_output_criteria(run_criteria)
+    requested_output_verdicts = (
+        grade_requested_output_criteria(copilot_ctx, requested_output_criteria, snapshot)
+        if requested_output_criteria
+        else []
+    )
+    if judgeable_run_criteria and all(
+        criterion.id in _STRUCTURED_RECORD_CRITERION_IDS for criterion in judgeable_run_criteria
+    ):
+        # Classifier-fallback criteria are value-agnostic (graded on record shape, not the
+        # requested entity) and the judge cannot disambiguate them either, so a well-shaped record
+        # for the wrong entity must not read as verified. Treat the run plane as criteria-less and
+        # surface only a structural contradiction as a suspicious-success signal.
+        contradictions = [
+            verdict
+            for verdict in grade_structured_record_criteria(judgeable_run_criteria, snapshot)
+            if not verdict.satisfied
+        ]
+        if contradictions or requested_output_verdicts:
+            scoped_run_criteria = _run_criteria_for_verdicts(run_criteria, requested_output_verdicts, contradictions)
+            return combine_verification_results(
+                [criterion.id for criterion in scoped_run_criteria]
+                + [criterion.id for criterion in definition_criteria],
+                _merge_run_verdicts(
+                    scoped_run_criteria,
+                    requested_output_verdicts,
+                    contradictions,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                ),
+                definition_verdicts,
+                contingent_criterion_ids=contingent_ids,
+                contingent_on_by_criterion_id=contingent_on_by_id,
+                contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+            )
+        if not definition_verdicts:
+            return None
+        definition_contingent_ids, definition_contingent_on_by_id, definition_contingent_path_by_id = (
+            _contingent_metadata_for_criteria(definition_criteria)
+        )
+        return combine_verification_results(
+            [criterion.id for criterion in definition_criteria],
+            None,
+            definition_verdicts,
+            contingent_criterion_ids=definition_contingent_ids,
+            contingent_on_by_criterion_id=definition_contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=definition_contingent_path_by_id,
+        )
     if not snapshot.has_evidence():
-        run_result = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=[criterion.id for criterion in run_criteria],
-            verdicts=[
+        run_result = _merge_run_verdicts(
+            run_criteria,
+            requested_output_verdicts,
+            [
                 CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
-                for criterion in run_criteria
+                for criterion in judgeable_run_criteria
             ],
+            contingent_criterion_ids=run_contingent_ids,
+            contingent_on_by_criterion_id=run_contingent_on_by_id,
+            contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
+            structural_unfired_criterion_ids=run_structural_unfired_ids,
+        )
+    elif not judgeable_run_criteria:
+        run_result = _merge_run_verdicts(
+            run_criteria,
+            requested_output_verdicts,
+            structural_unfired_criterion_ids=run_structural_unfired_ids,
         )
     else:
-        run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
-        run_result = _apply_present_value_upgrades(run_result, run_criteria, snapshot)
-    return combine_verification_results(criterion_ids, run_result, definition_verdicts)
+        deterministic_result, remaining_criteria = _deterministic_run_verification_result(
+            judgeable_run_criteria, snapshot
+        )
+        if deterministic_result is not None and not remaining_criteria:
+            run_result = _merge_run_verdicts(
+                run_criteria,
+                requested_output_verdicts,
+                deterministic_result.verdicts,
+                structural_unfired_criterion_ids=run_structural_unfired_ids,
+            )
+        else:
+            handler = await _completion_verification_handler(copilot_ctx)
+            if handler is None:
+                requested_output_result = _merge_run_verdicts_if_requested_output_exists(
+                    run_criteria,
+                    requested_output_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+                if requested_output_result is not None:
+                    return combine_verification_results(
+                        criterion_ids,
+                        requested_output_result,
+                        definition_verdicts,
+                        contingent_criterion_ids=contingent_ids,
+                        contingent_on_by_criterion_id=contingent_on_by_id,
+                        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    )
+                return CompletionVerificationResult(
+                    status="unavailable",
+                    criterion_ids=criterion_ids,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+            # Too little budget to verify a candidate run: fail closed (unavailable)
+            # rather than let the run-status proxy claim an unverified outcome as success.
+            remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
+            if (
+                remaining
+                <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+            ):
+                requested_output_result = _merge_run_verdicts_if_requested_output_exists(
+                    run_criteria,
+                    requested_output_verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+                if requested_output_result is not None:
+                    return combine_verification_results(
+                        criterion_ids,
+                        requested_output_result,
+                        definition_verdicts,
+                        contingent_criterion_ids=contingent_ids,
+                        contingent_on_by_criterion_id=contingent_on_by_id,
+                        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    )
+                return CompletionVerificationResult(
+                    status="unavailable",
+                    criterion_ids=criterion_ids,
+                    contingent_criterion_ids=contingent_ids,
+                    contingent_on_by_criterion_id=contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+            judged_result = await evaluate_completion_criteria(remaining_criteria, snapshot, handler)
+            if judged_result.status != "evaluated":
+                # Deterministic requested-output verdicts can still ground completion when the judge abstains.
+                run_result = (
+                    _merge_run_verdicts_if_requested_output_exists(
+                        run_criteria,
+                        requested_output_verdicts,
+                        structural_unfired_criterion_ids=run_structural_unfired_ids,
+                    )
+                    or judged_result
+                )
+            else:
+                verdicts = list(requested_output_verdicts)
+                if deterministic_result is not None:
+                    verdicts.extend(deterministic_result.verdicts)
+                verdicts.extend(judged_result.verdicts)
+                run_result = CompletionVerificationResult(
+                    status="evaluated",
+                    criterion_ids=[criterion.id for criterion in run_criteria],
+                    verdicts=verdicts,
+                    contingent_criterion_ids=run_contingent_ids,
+                    contingent_on_by_criterion_id=run_contingent_on_by_id,
+                    contingent_antecedent_output_path_by_criterion_id=run_contingent_path_by_id,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+                run_result = _apply_present_value_upgrades(
+                    run_result,
+                    judgeable_run_criteria,
+                    snapshot,
+                    include_terminal_goal_records=True,
+                )
+                run_result = _merge_run_verdicts(
+                    run_criteria,
+                    requested_output_verdicts,
+                    run_result.verdicts,
+                    structural_unfired_criterion_ids=run_structural_unfired_ids,
+                )
+    return combine_verification_results(
+        criterion_ids,
+        run_result,
+        definition_verdicts,
+        contingent_criterion_ids=contingent_ids,
+        contingent_on_by_criterion_id=contingent_on_by_id,
+        contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+    )
 
 
 def _outcome_unverified_reason(
@@ -485,6 +1052,11 @@ def _outcome_unverified_reason(
     if completion_verification.status == "evaluated":
         if completion_verification.is_fully_satisfied():
             return None
+        if completion_verification.no_gradeable_run_plane:
+            return (
+                "The run completed but the goal outcome could not be independently verified "
+                "(no run-gradeable outcome in this contract). Review the draft before using it."
+            )
         policy = getattr(copilot_ctx, "request_policy", None)
         criteria: list[CompletionCriterion] = list(policy.completion_criteria) if policy is not None else []
         known_good = _known_good_revision_hint(copilot_ctx)
@@ -527,7 +1099,7 @@ def _missing_evidence_detail(
     outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
     parts: list[str] = []
     for verdict in completion_verification.verdicts:
-        if verdict.satisfied:
+        if verdict.satisfied or completion_verification.is_structural_contingent_abstention(verdict):
             continue
         missing_evidence = verdict_missing_evidence(verdict)
         if not missing_evidence:
