@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections.abc import Awaitable, Callable
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -70,6 +71,21 @@ class RealBrowserState(BrowserState):
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
+        # One-shot callbacks fired first inside ``close()``. Cleared after
+        # firing so re-entry into ``close()`` is safe.
+        self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
+
+    def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._on_close_callbacks.append(callback)
+
+    async def _run_on_close_callbacks(self) -> None:
+        callbacks = self._on_close_callbacks
+        self._on_close_callbacks = []
+        for callback in callbacks:
+            try:
+                await callback()
+            except Exception:
+                LOG.debug("on-close callback raised; ignored", exc_info=True)
 
     async def __assert_page(self) -> Page:
         page = await self.get_working_page()
@@ -536,6 +552,12 @@ class RealBrowserState(BrowserState):
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
         LOG.info("Closing browser state", sampling=True)
+        # Only fire on-close observers on a real teardown. Shared / parent-child
+        # close calls pass ``close_browser_on_completion=False`` to leave the
+        # browser alive for another run; firing callbacks then would stop the
+        # surviving run's publisher and freeze its livestream.
+        if close_browser_on_completion:
+            await self._run_on_close_callbacks()
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
