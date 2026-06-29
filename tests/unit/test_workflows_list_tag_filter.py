@@ -313,6 +313,7 @@ def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock.WORKFLOW_SERVICE = service_mock
     # template=true path: empty global list short-circuits to [] before any service call.
     app_mock.STORAGE.retrieve_global_workflows = AsyncMock(return_value=[])
+    app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
     monkeypatch.setattr(ap, "app", app_mock)
 
     test_app = FastAPI()
