@@ -1100,30 +1100,45 @@ function FlowRenderer({
     [onRequestDeleteNode, readOnly],
   );
 
-  function duplicateNode(id: string) {
-    const result = duplicateBlockBelow({
+  const duplicateNode = useCallback(
+    (id: string) => {
+      const result = duplicateBlockBelow({
+        nodes,
+        edges,
+        nodeId: id,
+        generateId: nanoid,
+        generateLabel: generateNodeLabel,
+      });
+
+      if (!result) {
+        return;
+      }
+
+      workflowChangesStore.setHasChanges(true);
+      postHog.capture("builder.block.duplicated", {
+        org_id: workflow.organization_id,
+        position: result.position,
+        source_block_id: id,
+      });
+      doLayout(result.nodes, result.edges);
+      useWorkflowPanelStore
+        .getState()
+        .setSelectedBlockId(result.duplicatedNodeId);
+    },
+    [
       nodes,
       edges,
-      nodeId: id,
-      generateId: nanoid,
-      generateLabel: generateNodeLabel,
-    });
+      doLayout,
+      workflowChangesStore,
+      postHog,
+      workflow.organization_id,
+    ],
+  );
 
-    if (!result) {
-      return;
-    }
-
-    workflowChangesStore.setHasChanges(true);
-    postHog.capture("builder.block.duplicated", {
-      org_id: workflow.organization_id,
-      position: result.position,
-      source_block_id: id,
-    });
-    doLayout(result.nodes, result.edges);
-    useWorkflowPanelStore
-      .getState()
-      .setSelectedBlockId(result.duplicatedNodeId);
-  }
+  const duplicateNodeCallback = useCallback(
+    (id: string) => setTimeout(() => duplicateNode(id), 0),
+    [duplicateNode],
+  );
 
   function transmuteNode(id: string, nodeType: string) {
     const nodeToTransmute = nodes.find((node) => node.id === id);
@@ -1844,9 +1859,7 @@ function FlowRenderer({
             // and flip `setHasChanges(true)` on the main editor's store
             // while the user is only inspecting versions.
             requestDeleteNodeCallback: readOnly ? () => {} : requestDeleteNode,
-            duplicateNodeCallback: readOnly
-              ? () => {}
-              : (id: string) => setTimeout(() => duplicateNode(id), 0),
+            duplicateNodeCallback: readOnly ? () => {} : duplicateNodeCallback,
             // setTimeout(..., 0) escapes the Radix dropdown's pointer-event
             // lockout: a synchronous mutation inside the menu's onSelect
             // races the menu's close animation and re-renders nodes while
