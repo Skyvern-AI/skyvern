@@ -9999,6 +9999,12 @@
             ],
             "title": "Proxy Session Id",
             "description": "Optional advanced reuse key for this credential's pinned proxy identity."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
+            "default": false
           }
         },
         "type": "object",
@@ -12276,7 +12282,8 @@
         "type": "string",
         "enum": [
           "s3",
-          "azure"
+          "azure",
+          "google_drive"
         ],
         "title": "FileStorageType"
       },
@@ -12432,6 +12439,28 @@
               }
             ],
             "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [
@@ -12601,6 +12630,28 @@
               }
             ],
             "title": "Azure Folder Path"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [
@@ -21581,6 +21632,12 @@
             ],
             "title": "Proxy Session Id",
             "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id for this profile.",
+            "default": false
           }
         },
         "type": "object",
