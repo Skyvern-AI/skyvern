@@ -81,4 +81,20 @@ describe("FolderPickerCommand", () => {
 
     expect(onSelect).toHaveBeenCalledWith(null);
   });
+
+  it("does not select while disabled (guards an in-flight bulk move)", () => {
+    foldersResult.data = [folder("f1", "Prospects")];
+    const onSelect = vi.fn();
+    render(
+      <FolderPickerCommand
+        currentFolderId={null}
+        disabled
+        onSelect={onSelect}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Prospects"));
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
 });
