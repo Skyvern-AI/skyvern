@@ -89,8 +89,11 @@ class TestRequestPolicyPromptStructure:
         rendered = _render()
         assert (
             "{outcome, contingent_on, contingent_antecedent_output_path, "
-            "deliverable_kind, implicit, method_mandated, level, kind, terminal_action_family}"
+            "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
+            "expected_output_shape, kind, terminal_action_family}"
         ) in rendered
+        assert "never hide it in outcome prose" in rendered
+        assert "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label" in rendered
         assert "kind=outcome|terminal_action" in rendered
         assert "terminal_action_family=request|application|form|order|null" in rendered
         assert 'The only supported non-null value is "registered_download"' in rendered
@@ -101,6 +104,8 @@ class TestRequestPolicyPromptStructure:
                 CompletionCriterion(
                     id="c0",
                     outcome="a commercial water service request is started",
+                    expected_output_value="WTR-1842-DEMO",
+                    expected_output_shape="reference_code",
                     kind="terminal_action",
                     terminal_action_family="request",
                 )
@@ -111,6 +116,8 @@ class TestRequestPolicyPromptStructure:
 
         assert '"kind": "terminal_action"' in rendered
         assert '"terminal_action_family": "request"' in rendered
+        assert '"expected_output_value": "WTR-1842-DEMO"' in rendered
+        assert '"expected_output_shape": "reference_code"' in rendered
 
 
 class TestRawSecretBackstop:
