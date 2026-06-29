@@ -416,7 +416,7 @@ export type UploadToS3Block = WorkflowBlockBase & {
 export type FileUploadBlock = WorkflowBlockBase & {
   block_type: "file_upload";
   path: string;
-  storage_type: "s3" | "azure";
+  storage_type: "s3" | "azure" | "google_drive";
   s3_bucket: string | null;
   region_name: string | null;
   aws_access_key_id: string | null;
@@ -424,6 +424,8 @@ export type FileUploadBlock = WorkflowBlockBase & {
   azure_storage_account_name: string | null;
   azure_storage_account_key: string | null;
   azure_blob_container_name: string | null;
+  google_credential_id: string | null;
+  google_drive_folder_id: string | null;
 };
 
 export type SendEmailBlock = WorkflowBlockBase & {

@@ -36,6 +36,8 @@ function FileUploadBlockFormBody({
     azureStorageAccountName,
     azureStorageAccountKey,
     azureBlobContainerName,
+    googleCredentialId,
+    googleDriveFolderId,
   } = node.data;
 
   const value = useMemo(
@@ -49,6 +51,8 @@ function FileUploadBlockFormBody({
       azureStorageAccountName,
       azureStorageAccountKey,
       azureBlobContainerName,
+      googleCredentialId,
+      googleDriveFolderId,
     }),
     [
       storageType,
@@ -60,6 +64,8 @@ function FileUploadBlockFormBody({
       azureStorageAccountName,
       azureStorageAccountKey,
       azureBlobContainerName,
+      googleCredentialId,
+      googleDriveFolderId,
     ],
   );
   const { commit } = useDebouncedSidebarSave({
