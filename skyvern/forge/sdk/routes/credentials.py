@@ -112,7 +112,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCrea
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.credentials import parse_totp_config
+from skyvern.forge.sdk.services.credentials import normalize_totp_config, parse_totp_config
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -194,11 +194,10 @@ def _parse_authenticator_totp_config_or_raise(
     if raw_totp_secret == "":
         raise HTTPException(status_code=400, detail=missing_detail)
 
-    normalized_input = "".join(raw_totp_secret.split())
-    totp = parse_totp_config(normalized_input)
+    normalized_totp_secret = normalize_totp_config(raw_totp_secret)
+    totp = parse_totp_config(normalized_totp_secret)
     if not totp:
         raise HTTPException(status_code=400, detail=invalid_detail)
-    normalized_totp_secret = normalized_input if normalized_input.lower().startswith("otpauth://") else totp.secret
     return totp, normalized_totp_secret
 
 
@@ -214,6 +213,40 @@ def _build_authenticator_totp_or_raise(
         invalid_detail=invalid_detail,
     )
     return totp
+
+
+async def _parse_enterprise_totp_secret_or_raise(
+    totp_secret: str | None,
+    *,
+    organization_id: str,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> str | None:
+    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+        totp_secret or "",
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret == "":
+        raise HTTPException(status_code=400, detail=invalid_detail)
+    return enterprise_totp_secret
+
+
+async def _build_authenticator_totp_for_organization_or_raise(
+    totp_secret: str | None,
+    *,
+    organization_id: str,
+    missing_detail: str = _AUTHENTICATOR_SECRET_REQUIRED_DETAIL,
+    invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
+) -> pyotp.TOTP:
+    parsed_totp_secret = await _parse_enterprise_totp_secret_or_raise(
+        totp_secret,
+        organization_id=organization_id,
+        invalid_detail=invalid_detail,
+    )
+    return _build_authenticator_totp_or_raise(
+        parsed_totp_secret if parsed_totp_secret is not None else totp_secret,
+        missing_detail=missing_detail,
+        invalid_detail=invalid_detail,
+    )
 
 
 def _parse_authenticator_totp_or_raise(
@@ -235,6 +268,26 @@ def _normalize_authenticator_totp_or_raise(credential: PasswordCredential | Test
         return
 
     credential.totp = _parse_authenticator_totp_or_raise(credential.totp)
+
+
+async def _normalize_authenticator_totp_for_organization_or_raise(
+    credential: PasswordCredential | TestLoginRequest,
+    *,
+    organization_id: str,
+) -> None:
+    if credential.totp_type != TotpType.AUTHENTICATOR:
+        return
+
+    enterprise_totp_secret = await _parse_enterprise_totp_secret_or_raise(
+        credential.totp,
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret is not None:
+        # Keep enterprise payloads raw in credential.totp; runtime paths re-parse
+        # them through the cloud parser before generating codes.
+        return
+
+    _normalize_authenticator_totp_or_raise(credential)
 
 
 def _get_cached_totp_code_preview(
@@ -501,7 +554,10 @@ async def create_credential(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
     if isinstance(data.credential, NonEmptyPasswordCredential):
-        _normalize_authenticator_totp_or_raise(data.credential)
+        await _normalize_authenticator_totp_for_organization_or_raise(
+            data.credential,
+            organization_id=current_org.organization_id,
+        )
 
     credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
 
@@ -697,7 +753,10 @@ async def test_login(
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
     organization_id = current_org.organization_id
-    _normalize_authenticator_totp_or_raise(data)
+    await _normalize_authenticator_totp_for_organization_or_raise(
+        data,
+        organization_id=organization_id,
+    )
 
     # Create a temporary credential
     create_request = CreateCredentialRequest(
@@ -1581,7 +1640,10 @@ async def update_credential(
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
     if isinstance(data.credential, NonEmptyPasswordCredential):
-        _normalize_authenticator_totp_or_raise(data.credential)
+        await _normalize_authenticator_totp_for_organization_or_raise(
+            data.credential,
+            organization_id=current_org.organization_id,
+        )
 
     vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
@@ -1753,8 +1815,9 @@ async def get_credential_totp_code(
         raise HTTPException(status_code=400, detail="This credential does not have an authenticator app configured.")
 
     try:
-        totp = _build_authenticator_totp_or_raise(
+        totp = await _build_authenticator_totp_for_organization_or_raise(
             credential_item.credential.totp,
+            organization_id=current_org.organization_id,
             missing_detail=_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
             invalid_detail=_SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
         )

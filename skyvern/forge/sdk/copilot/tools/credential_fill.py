@@ -16,7 +16,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential, TotpType
-from skyvern.forge.sdk.services.credentials import generate_totp_code
+from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 
 from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import _tool_loop_error
@@ -38,6 +38,16 @@ LOG = structlog.get_logger()
 
 _CREDENTIAL_FILL_FIELDS = frozenset({"username", "password", "totp"})
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
+
+
+async def _normalize_totp_config_for_organization(totp_secret: str, organization_id: str) -> str:
+    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+        totp_secret,
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret is not None:
+        return enterprise_totp_secret
+    return normalize_totp_config(totp_secret)
 
 
 def _runtime_otp_steering_error(credential_id: str) -> str:
@@ -134,7 +144,12 @@ async def _resolve_credential_fill_value(
                 return None, "", _runtime_otp_steering_error(credential_id)
             return None, "", f"Credential `{credential_id}` has no TOTP secret configured."
         try:
-            value = generate_totp_code(credential.totp)
+            value = generate_totp_code(
+                await _normalize_totp_config_for_organization(
+                    credential.totp,
+                    copilot_ctx.organization_id,
+                )
+            )
         except Exception:
             LOG.warning(
                 "fill_credential_field could not generate a TOTP code",

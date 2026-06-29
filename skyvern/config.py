@@ -145,6 +145,9 @@ class Settings(BaseSettings):
     # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
     # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
     FAIL_FAST_SHADOW: bool = False
+    # Global kill-switch for select/autocomplete shadow-match observability (LLM-vs-deterministic
+    # agreement logging). Not per-org; set false to silence the logs everywhere.
+    SKYVERN_SELECT_SHADOW_MATCH: bool = True
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None

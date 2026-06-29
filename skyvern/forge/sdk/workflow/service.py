@@ -621,6 +621,7 @@ class WorkflowService:
         cached_groups: list[CachedScriptBlocks] = []
         published_groups: list[CachedScriptBlocks] = []
         target_labels = set(block_labels_to_disable)
+        seen_group_keys: set[tuple[ScriptStatus | str, str, tuple[str, ...]]] = set()
 
         scripts_by_id = await app.DATABASE.scripts.get_latest_scripts_by_ids(
             organization_id=organization_id,
@@ -643,6 +644,15 @@ class WorkflowService:
             if not blocks_to_clear:
                 continue
 
+            group_key = (
+                candidate.status,
+                script.script_revision_id,
+                tuple(block.script_block_id for block in blocks_to_clear),
+            )
+            if group_key in seen_group_keys:
+                continue
+            seen_group_keys.add(group_key)
+
             group = CachedScriptBlocks(workflow_script=candidate, script=script, blocks_to_clear=blocks_to_clear)
             if candidate.status == ScriptStatus.published:
                 published_groups.append(group)
@@ -661,30 +671,33 @@ class WorkflowService:
         groups: Sequence[CachedScriptBlocks],
     ) -> None:
         """Remove cached run signatures for the supplied block groups to force regeneration."""
-        for group in groups:
-            for block in group.blocks_to_clear:
-                await app.DATABASE.scripts.update_script_block(
-                    script_block_id=block.script_block_id,
-                    organization_id=organization_id,
-                    clear_run_signature=True,
-                )
+        blocks_by_id = {block.script_block_id: block for group in groups for block in group.blocks_to_clear}
+        if not blocks_by_id:
+            return
 
-            LOG.info(
-                "Cleared cached script blocks after workflow block change",
-                workflow_id=workflow.workflow_id,
-                workflow_permanent_id=previous_workflow.workflow_permanent_id,
-                organization_id=organization_id,
-                previous_version=previous_workflow.version,
-                new_version=workflow.version,
-                invalidate_reason=plan.reason,
-                invalidate_label=plan.label,
-                invalidate_index_prev=plan.previous_index,
-                invalidate_index_new=plan.new_index,
-                script_id=group.script.script_id,
-                script_revision_id=group.script.script_revision_id,
-                cleared_block_labels=[block.script_block_label for block in group.blocks_to_clear],
-                cleared_block_count=len(group.blocks_to_clear),
-            )
+        cleared_count = await app.DATABASE.scripts.clear_script_block_run_signatures(
+            organization_id=organization_id,
+            script_block_ids=list(blocks_by_id),
+        )
+
+        LOG.info(
+            "Cleared cached script blocks after workflow block change",
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=previous_workflow.workflow_permanent_id,
+            organization_id=organization_id,
+            previous_version=previous_workflow.version,
+            new_version=workflow.version,
+            invalidate_reason=plan.reason,
+            invalidate_label=plan.label,
+            invalidate_index_prev=plan.previous_index,
+            invalidate_index_new=plan.new_index,
+            cached_group_count=len(groups),
+            script_count=len({group.script.script_id for group in groups}),
+            script_revision_count=len({group.script.script_revision_id for group in groups}),
+            cleared_block_labels=list(dict.fromkeys(block.script_block_label for block in blocks_by_id.values())),
+            cleared_block_count=cleared_count,
+            deduped_block_count=len(blocks_by_id),
+        )
 
     @staticmethod
     def _collect_extracted_information(value: Any) -> list[Any]:
