@@ -5,7 +5,7 @@ import json
 import re
 import textwrap
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import yaml
 
@@ -19,6 +19,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 _GOAL_PATH_INDEX_PATTERN = re.compile(r"\[\d+\]")
 _REQUESTED_OUTPUT_PREFIX = "output."
+_STRUCTURAL_ABSTENTION_REASON_CODE = "structurally_abstained"
 # Ignored at any requested-output traversal depth, including schema-declared nested fields.
 _IGNORED_RUNTIME_FIELD_NAMES = frozenset({"evidence_text"})
 
@@ -67,14 +68,83 @@ def grade_requested_output_criteria(
                 )
             )
             continue
-        evidence_ref = _runtime_output_path_evidence_ref(snapshot.block_outputs, path)
-        if evidence_ref is not None:
+        expected_value = criterion.expected_output_value
+        expected_shape = criterion.expected_output_shape
+        grounding_mode = _criterion_grounding_mode(criterion)
+        trace_fields = _criterion_trace_fields(criterion, grounding_mode)
+        if expected_value is not None:
+            match_state, evidence_ref = _runtime_output_path_match(snapshot.block_outputs, path, expected_value)
+        elif expected_shape is not None:
+            match_state, evidence_ref = _runtime_output_path_presence(snapshot.block_outputs, path)
+        else:
+            match_state, evidence_ref = _runtime_output_path_presence(snapshot.block_outputs, path)
+            if match_state == "present" and evidence_ref is not None:
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="unsatisfied",
+                        reason_code=_STRUCTURAL_ABSTENTION_REASON_CODE,
+                        evidence_ref=evidence_ref,
+                        missing_evidence=(
+                            "requested-output field is present, but the criterion has no typed expected_output_value "
+                            "that can prove or refute the value"
+                        ),
+                        **trace_fields,
+                    )
+                )
+                continue
+            verdicts.append(
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unsatisfied",
+                    reason_code="no_evidence",
+                    missing_evidence=(
+                        "requested-output criterion lacks typed expected_output_value or expected_output_shape; "
+                        "presence-only output cannot confirm value-grounded criterion"
+                    ),
+                    **trace_fields,
+                )
+            )
+            continue
+        if match_state == "present" and evidence_ref is not None:
+            verdicts.append(
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unsatisfied",
+                    reason_code=_STRUCTURAL_ABSTENTION_REASON_CODE,
+                    evidence_ref=evidence_ref,
+                    missing_evidence=(
+                        "requested-output field is present with a typed expected_output_shape, but no exact "
+                        "expected_output_value can prove or refute the value"
+                    ),
+                    **trace_fields,
+                )
+            )
+            continue
+        if match_state == "satisfied" and evidence_ref is not None:
             verdicts.append(
                 CriterionVerdict(
                     criterion_id=criterion.id,
                     state="satisfied",
                     reason_code="evidence_confirms",
                     evidence_ref=evidence_ref,
+                    **trace_fields,
+                )
+            )
+            continue
+        if match_state == "contradicted":
+            verdicts.append(
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unsatisfied",
+                    reason_code="evidence_contradicts",
+                    evidence_ref=evidence_ref,
+                    missing_evidence=(
+                        f"run output included output.{path} but it did not match the expected value"
+                        if expected_value is not None
+                        else f"run output included output.{path} but it could not be value-grounded"
+                    ),
+                    **trace_fields,
                 )
             )
             continue
@@ -84,9 +154,27 @@ def grade_requested_output_criteria(
                 state="unsatisfied",
                 reason_code="missing_exact_field",
                 missing_evidence=f"run output did not include exact structured field output.{path}",
+                **trace_fields,
             )
         )
     return verdicts
+
+
+def _criterion_grounding_mode(criterion: CompletionCriterion) -> Literal["exact_value", "shape", "missing"]:
+    if criterion.expected_output_value is not None:
+        return "exact_value"
+    if criterion.expected_output_shape is not None:
+        return "shape"
+    return "missing"
+
+
+def _criterion_trace_fields(criterion: CompletionCriterion, grounding_mode: str) -> dict[str, Any]:
+    return {
+        "output_path": criterion.output_path,
+        "grounding_mode": grounding_mode,
+        "expected_output_shape": criterion.expected_output_shape,
+        "has_exact_value": criterion.expected_output_value is not None,
+    }
 
 
 def _authored_output_contract_paths(copilot_ctx: _GroundingCtx, aliases: dict[str, str] | None = None) -> set[str]:
@@ -244,40 +332,85 @@ def _dict_keys(node: ast.Dict) -> set[str]:
     return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
 
 
-def _runtime_output_path_evidence_ref(block_outputs: Mapping[str, Any], path: str) -> str | None:
+def _runtime_output_path_match(
+    block_outputs: Mapping[str, Any], path: str, expected_value: str | None
+) -> tuple[str, str | None]:
+    parts = _path_parts(path)
+    if not parts or expected_value is None:
+        return "missing", None
+    contradicted_ref: str | None = None
+    for label, payload in block_outputs.items():
+        values, source_path = _runtime_path_values(payload, parts, path)
+        if not values:
+            continue
+        evidence_ref = f"block_outputs:{label}.{source_path}"
+        if any(_value_matches_expected(value, expected_value) for value in values):
+            return "satisfied", evidence_ref
+        contradicted_ref = contradicted_ref or evidence_ref
+    if contradicted_ref is not None:
+        return "contradicted", contradicted_ref
+    return "missing", None
+
+
+def _runtime_output_path_presence(block_outputs: Mapping[str, Any], path: str) -> tuple[str, str | None]:
     parts = _path_parts(path)
     if not parts:
-        return None
+        return "missing", None
     for label, payload in block_outputs.items():
-        if _path_has_meaningful_value(payload, parts):
-            return f"block_outputs:{label}.{path}"
-    return None
+        values, source_path = _runtime_present_path_values(payload, parts, path)
+        if not values:
+            continue
+        evidence_ref = f"block_outputs:{label}.{source_path}"
+        return "present", evidence_ref
+    return "missing", None
 
 
-def _path_has_meaningful_value(value: Any, parts: list[str]) -> bool:
+def _runtime_path_values(payload: Any, parts: list[str], path: str) -> tuple[list[Any], str]:
+    canonical_values = _path_values(payload, parts)
+    if canonical_values:
+        filtered_canonical_values = [value for value in canonical_values if _is_meaningful_requested_value(value)]
+        return filtered_canonical_values or canonical_values, path
+    wrapped_parts = ["output", *parts]
+    wrapped_path = ".".join(wrapped_parts)
+    wrapped_values = [value for value in _path_values(payload, wrapped_parts) if _is_meaningful_requested_value(value)]
+    return wrapped_values, wrapped_path
+
+
+def _runtime_present_path_values(payload: Any, parts: list[str], path: str) -> tuple[list[Any], str]:
+    raw_canonical_values = _path_values(payload, parts)
+    if raw_canonical_values:
+        canonical_values = [value for value in raw_canonical_values if _is_meaningful_requested_value(value)]
+        return canonical_values, path
+    wrapped_parts = ["output", *parts]
+    wrapped_path = ".".join(wrapped_parts)
+    wrapped_values = [value for value in _path_values(payload, wrapped_parts) if _is_meaningful_requested_value(value)]
+    return wrapped_values, wrapped_path
+
+
+def _path_values(value: Any, parts: list[str]) -> list[Any]:
     if not parts:
-        return _is_meaningful_requested_value(value)
+        return [value]
     part = parts[0]
     if part == "[]":
         if not isinstance(value, list):
-            return False
-        return any(_path_has_meaningful_value(item, parts[1:]) for item in value)
+            return []
+        return [matched for item in value for matched in _path_values(item, parts[1:])]
     expects_array = part.endswith("[]")
     key = part[:-2] if expects_array else part
     if key in _IGNORED_RUNTIME_FIELD_NAMES:
-        return False
+        return []
     if isinstance(value, Mapping):
         if key not in value:
-            return False
+            return []
         child = value[key]
         if expects_array:
             if not isinstance(child, list):
-                return False
-            return any(_path_has_meaningful_value(item, parts[1:]) for item in child)
-        return _path_has_meaningful_value(child, parts[1:])
+                return []
+            return [matched for item in child for matched in _path_values(item, parts[1:])]
+        return _path_values(child, parts[1:])
     if isinstance(value, list):
-        return any(_path_has_meaningful_value(item, parts) for item in value)
-    return False
+        return [matched for item in value for matched in _path_values(item, parts)]
+    return []
 
 
 def _is_meaningful_requested_value(value: Any) -> bool:
@@ -290,6 +423,26 @@ def _is_meaningful_requested_value(value: Any) -> bool:
     if isinstance(value, list):
         return any(_is_meaningful_requested_value(item) for item in value)
     return True
+
+
+def _value_matches_expected(value: Any, expected: str) -> bool:
+    if isinstance(value, Mapping):
+        return any(_value_matches_expected(item, expected) for item in value.values())
+    if isinstance(value, list):
+        return any(_value_matches_expected(item, expected) for item in value)
+    observed = _normalized_expected_text(value)
+    target = _normalized_expected_text(expected)
+    if not observed or not target:
+        return False
+    return observed == target or _compact_expected_text(observed) == _compact_expected_text(target)
+
+
+def _normalized_expected_text(value: Any) -> str:
+    return " ".join(str(value).casefold().split())
+
+
+def _compact_expected_text(value: str) -> str:
+    return "".join(char for char in value if char.isalnum())
 
 
 def _normalize_output_path(path: str | None) -> str:
