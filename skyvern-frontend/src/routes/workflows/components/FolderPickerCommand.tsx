@@ -16,6 +16,9 @@ type Props = {
   currentFolderId: string | null;
   // Force-show "Remove from folder" independent of currentFolderId (bulk: any selected has a folder).
   showRemove?: boolean;
+  // While a bulk move is in flight, freeze the picker so a second pick can't
+  // start a competing move for the same selection.
+  disabled?: boolean;
   onSelect: (folderId: string | null) => void;
 };
 
@@ -23,7 +26,12 @@ const FOLDER_PICKER_PAGE_SIZE = 50;
 
 // Compact cmdk folder list for the row context menu. Server-side search keeps it
 // usable past the page cap; "Remove from folder" shows only when the agent has one.
-function FolderPickerCommand({ currentFolderId, showRemove, onSelect }: Props) {
+function FolderPickerCommand({
+  currentFolderId,
+  showRemove,
+  disabled,
+  onSelect,
+}: Props) {
   const [query, setQuery] = React.useState("");
   const [debouncedQuery] = useDebounce(query, 300);
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -60,7 +68,11 @@ function FolderPickerCommand({ currentFolderId, showRemove, onSelect }: Props) {
       <CommandList>
         {(showRemove ?? currentFolderId !== null) ? (
           <CommandGroup>
-            <CommandItem value="__remove__" onSelect={() => onSelect(null)}>
+            <CommandItem
+              value="__remove__"
+              disabled={disabled}
+              onSelect={() => onSelect(null)}
+            >
               <Cross2Icon className="mr-2 h-4 w-4 text-destructive" />
               Remove from folder
             </CommandItem>
@@ -78,7 +90,7 @@ function FolderPickerCommand({ currentFolderId, showRemove, onSelect }: Props) {
                 <CommandItem
                   key={folder.folder_id}
                   value={`folder-${folder.folder_id}`}
-                  disabled={isCurrent}
+                  disabled={isCurrent || disabled}
                   onSelect={() => onSelect(folder.folder_id)}
                 >
                   <FolderIcon className="mr-2 h-4 w-4 shrink-0 text-blue-400" />
