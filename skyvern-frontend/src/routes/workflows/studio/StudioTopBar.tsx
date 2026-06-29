@@ -11,6 +11,7 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
+import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,7 +43,7 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { studioPanelId, studioTabId } from "./constants";
-import { runOutcomeFromStatus } from "./runProjections";
+import { finalizedRunStatus, runOutcomeFromStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
 
 function useIsGlobalWorkflow(): boolean {
@@ -103,18 +104,9 @@ function StudioTabs() {
   });
   const latestRun = runs?.[0];
   const hasRun = Boolean(urlRunId) || (runs?.length ?? 0) > 0;
-  const outcome = runOutcomeFromStatus(
+  const runStatus = finalizedRunStatus(
     urlRunId ? urlRun?.status : latestRun?.status,
   );
-
-  // Live status lives in the Run view header (one source of truth); the tab keeps
-  // only the terminal outcome.
-  const runBadge =
-    outcome === "failed"
-      ? { label: "failed", cls: "bg-destructive/20 text-destructive" }
-      : outcome === "success"
-        ? { label: "passed", cls: "bg-success/20 text-success" }
-        : null;
 
   const tabs: Array<{ id: StudioTab; label: string; disabled: boolean }> = [
     { id: "editor", label: "Editor", disabled: false },
@@ -178,15 +170,13 @@ function StudioTabs() {
             )}
           >
             {t.label}
-            {t.id === "run" && runBadge ? (
-              <span
-                className={cn(
-                  "rounded px-1.5 py-0.5 text-[10px] font-semibold",
-                  runBadge.cls,
-                )}
-              >
-                {runBadge.label}
-              </span>
+            {t.id === "run" && runStatus ? (
+              <StatusBadge
+                status={runStatus}
+                alwaysShowLabel
+                // overrides StatusBadge's md:px-2.5 to keep the chip compact in the tab bar
+                className="h-5 gap-1 px-1.5 py-0 text-[10px] md:w-auto md:px-1.5"
+              />
             ) : null}
           </button>
         );
