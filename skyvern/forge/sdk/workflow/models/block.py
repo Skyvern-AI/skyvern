@@ -82,6 +82,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
@@ -411,6 +412,9 @@ class Block(BaseModel, abc.ABC):
 
     @property
     def override_llm_key(self) -> str | None:
+        return self.override_llm_key_for_organization(None)
+
+    def override_llm_key_for_organization(self, organization_id: str | None) -> str | None:
         """
         If the `Block` has a `model` defined, then return the mapped llm_key for it.
 
@@ -419,8 +423,12 @@ class Block(BaseModel, abc.ABC):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
-                return mapping.get(model_name, {}).get("llm_key")
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key(organization_id=organization_id)
+                llm_key = mapping.get(model_name, {}).get("llm_key")
+                if llm_key:
+                    return llm_key
+                if is_custom_llm_model_name(model_name):
+                    raise ValueError("Custom LLM model not found for organization")
 
         return None
 
@@ -4425,7 +4433,7 @@ class TextPromptBlock(Block):
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key or self.llm_key, default=default_llm_handler
+            self.override_llm_key_for_organization(organization_id) or self.llm_key, default=default_llm_handler
         )
         if not self.json_schema:
             self.json_schema = {
@@ -4571,11 +4579,15 @@ class TextPromptBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
             )
         except Exception as e:
+            try:
+                resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
+            except Exception:
+                resolved_llm_key = self.llm_key
             LOG.exception(
                 "TextPromptBlock LLM call failed",
                 block_label=self.label,
                 workflow_run_id=workflow_run_id,
-                llm_key=self.override_llm_key or self.llm_key,
+                llm_key=resolved_llm_key,
             )
             return await self.build_block_result(
                 success=False,
@@ -6082,7 +6094,7 @@ class FileParserBlock(Block):
             "extract-text-from-image", workflow_run_block_id, organization_id
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=default_handler
+            self.override_llm_key_for_organization(organization_id), default=default_handler
         )
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
@@ -6157,7 +6169,7 @@ class FileParserBlock(Block):
                 "extract-text-from-image", workflow_run_block_id, organization_id
             )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                self.override_llm_key, default=default_handler
+                self.override_llm_key_for_organization(organization_id), default=default_handler
             )
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
@@ -6273,7 +6285,7 @@ class FileParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
         )
 
-        llm_key = self.override_llm_key
+        llm_key = self.override_llm_key_for_organization(organization_id)
         default_handler = await self._resolve_file_parser_handler(
             "extract-information-from-file-text", workflow_run_block_id, organization_id
         )

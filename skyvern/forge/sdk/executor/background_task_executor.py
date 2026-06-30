@@ -5,6 +5,7 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
@@ -70,6 +71,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.max_screenshot_scrolls = task.max_screenshot_scrolls
 
         if background_tasks:
+            await load_custom_llm_configs_for_organization(app.DATABASE, organization_id)
             await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
             background_tasks.add_task(
                 app.agent.execute_step,
@@ -106,6 +108,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
             await initialize_skyvern_state_file(
                 workflow_run_id=workflow_run_id, organization_id=organization.organization_id
             )
+            await load_custom_llm_configs_for_organization(app.DATABASE, organization.organization_id)
 
             background_tasks.add_task(
                 app.WORKFLOW_SERVICE.execute_workflow,

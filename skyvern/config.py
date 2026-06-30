@@ -345,6 +345,9 @@ class Settings(BaseSettings):
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
     LLM_CONFIG_ADD_ASSISTANT_PREFIX: bool = False  # Whether to add assistant prefix
+    # Self-hosted users commonly run Ollama on localhost/private networks. Cloud
+    # overrides this to False so user-defined LLM API bases use SSRF protections.
+    ALLOW_CUSTOM_LLM_LOCAL_API_BASES: bool = True
     # LLM PROVIDER SPECIFIC
     ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
@@ -707,7 +710,7 @@ class Settings(BaseSettings):
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
-    def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
+    def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
@@ -828,6 +831,16 @@ class Settings(BaseSettings):
                 "llm_key": "ANTHROPIC_CLAUDE5_FABLE",
                 "label": "Anthropic Claude Fable 5",
             }
+
+        try:
+            from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415
+                get_custom_llm_model_mappings,
+            )
+
+            mapping.update(get_custom_llm_model_mappings(organization_id=organization_id))
+        except Exception:
+            # Settings is used by scripts and import-time paths before the API app is fully initialized.
+            pass
 
         return mapping
 
