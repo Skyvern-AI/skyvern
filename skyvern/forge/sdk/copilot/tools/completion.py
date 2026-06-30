@@ -45,6 +45,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_block_outputs,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -1234,6 +1235,8 @@ def _tool_visible_result_after_completion_verification(
     result: dict[str, Any],
     completion_verification: CompletionVerificationResult | None,
 ) -> dict[str, Any]:
+    if outcome_fully_verified(copilot_ctx):
+        return result
     outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
     if outcome_unverified_reason is None:
         return result
