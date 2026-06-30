@@ -1519,6 +1519,24 @@
               "title": "Key"
             },
             "description": "Tag key to delete"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1547,6 +1565,290 @@
           }
         },
         "x-fern-sdk-method-name": "delete_tag_key"
+      }
+    },
+    "/v1/tag-values": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List tag values",
+        "description": "List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
+        "operationId": "list_tag_values_v1_tag_values_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TagValue"
+                  },
+                  "title": "Response List Tag Values V1 Tag Values Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_tag_values"
+      }
+    },
+    "/v1/tag-values/{key}": {
+      "patch": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Update tag value color",
+        "description": "Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.",
+        "operationId": "update_tag_value_v1_tag_values__key__patch",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully recolored tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValue"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "422": {
+            "description": "Invalid palette color"
+          }
+        },
+        "x-fern-sdk-method-name": "update_tag_value"
+      },
+      "delete": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Delete tag value",
+        "description": "Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.",
+        "operationId": "delete_tag_value_v1_tag_values__key__delete",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueDelete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValueDeleteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_tag_value"
+      }
+    },
+    "/v1/tag-values/{key}/rename": {
+      "patch": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Rename tag value",
+        "description": "Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
+        "operationId": "rename_tag_value_v1_tag_values__key__rename_patch",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key (group)",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key (group)"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueRename"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully renamed tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValueRenameResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag value not found"
+          },
+          "409": {
+            "description": "Target value already exists for this key"
+          },
+          "422": {
+            "description": "Invalid value"
+          }
+        },
+        "x-fern-sdk-method-name": "rename_tag_value"
       }
     },
     "/v1/workflow-tags": {
@@ -1989,11 +2291,11 @@
               }
             }
           },
-          "404": {
-            "description": "Run not found"
-          },
           "400": {
             "description": "Timeline not available for this run type"
+          },
+          "404": {
+            "description": "Run not found"
           },
           "422": {
             "description": "Validation Error",
@@ -3000,11 +3302,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "409": {
             "description": "Conflict - browser session has already ended and can no longer be updated"
@@ -3074,11 +3376,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "422": {
             "description": "Validation Error",
@@ -3270,7 +3572,7 @@
               },
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.create_credential(\n    name=\"My Credit Card\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.create_credential(\n    name=\"My Credit Card\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n        \"billing_address\": {\n            \"line1\": \"123 Main St\",\n            \"city\": \"San Francisco\",\n            \"state_code\": \"CA\",\n            \"postal_code\": \"94105\",\n            \"country_code\": \"US\",\n        },\n        \"billing_email\": \"billing@example.com\",\n        \"metadata\": {\"checkout_profile\": \"default\"},\n    },\n)\n"
               },
               {
                 "sdk": "typescript",
@@ -3278,7 +3580,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.createCredential({\n    name: \"My Credit Card\",\n    credential_type: \"credit_card\",\n    credential: {\n        card_number: \"4242424242424242\",\n        card_cvv: \"424\",\n        card_exp_month: \"12\",\n        card_exp_year: \"2028\",\n        card_brand: \"visa\",\n        card_holder_name: \"John Doe\"\n    }\n});\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.createCredential({\n    name: \"My Credit Card\",\n    credential_type: \"credit_card\",\n    credential: {\n        card_number: \"4242424242424242\",\n        card_cvv: \"424\",\n        card_exp_month: \"12\",\n        card_exp_year: \"2028\",\n        card_brand: \"visa\",\n        card_holder_name: \"John Doe\",\n        billing_address: {\n            line1: \"123 Main St\",\n            city: \"San Francisco\",\n            state_code: \"CA\",\n            postal_code: \"94105\",\n            country_code: \"US\",\n        },\n        billing_email: \"billing@example.com\",\n        metadata: { checkout_profile: \"default\" }\n    }\n});\n"
               }
             ]
           }
@@ -4521,11 +4823,11 @@
               }
             }
           },
-          "404": {
-            "description": "Workflow not found"
-          },
           "400": {
             "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
           },
           "422": {
             "description": "Validation Error",
@@ -4563,6 +4865,24 @@
               "title": "Workflow Permanent Id"
             },
             "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -4700,6 +5020,24 @@
               "title": "Key"
             },
             "description": "Tag key to delete"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5481,9 +5819,6 @@
           "404": {
             "description": "Workflow not found"
           },
-          "500": {
-            "description": "Storage deletion failed; retry"
-          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -5493,6 +5828,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Storage deletion failed; retry"
           }
         },
         "x-hidden": true
@@ -8108,7 +8446,8 @@
           "print_page",
           "workflow_trigger",
           "google_sheets_read",
-          "google_sheets_write"
+          "google_sheets_write",
+          "pdf_fill"
         ],
         "title": "BlockType"
       },
@@ -8300,6 +8639,35 @@
               }
             ],
             "title": "Source Browser Type"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id"
           },
           "created_at": {
             "type": "string",
@@ -8692,7 +9060,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -8848,6 +9216,31 @@
             "type": "array",
             "title": "Parameters",
             "default": []
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeBlockStep"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
           }
         },
         "type": "object",
@@ -8857,6 +9250,115 @@
           "code"
         ],
         "title": "CodeBlock"
+      },
+      "CodeBlockStep": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType",
+            "default": "null_action"
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start"
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End"
+          }
+        },
+        "type": "object",
+        "title": "CodeBlockStep"
+      },
+      "CodeBlockStepYAML": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "action_type": {
+            "type": "string",
+            "title": "Action Type",
+            "default": "null_action"
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start"
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End"
+          }
+        },
+        "type": "object",
+        "title": "CodeBlockStepYAML"
       },
       "CodeBlockYAML": {
         "properties": {
@@ -8927,6 +9429,31 @@
               }
             ],
             "title": "Parameter Keys"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeBlockStepYAML"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
           }
         },
         "type": "object",
@@ -9255,6 +9782,37 @@
             ],
             "title": "Workflow Run Id",
             "description": "Workflow run whose persisted session should be captured. Omit for a blank profile."
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Explicit sticky-session id for this profile's pinned proxy identity."
           }
         },
         "type": "object",
@@ -9269,8 +9827,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440.0,
-                "minimum": 5.0
+                "maximum": 1440,
+                "minimum": 5
               },
               {
                 "type": "null"
@@ -9298,6 +9856,18 @@
             ],
             "title": "Proxy Location",
             "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}, or a custom proxy URL dict for self-hosted deployments: {\"url\": \"http://user:password@proxy.example.com:8080\"}"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions."
           },
           "extensions": {
             "anyOf": [
@@ -9398,6 +9968,43 @@
               "azure_vault",
               "bitwarden"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Optional advanced reuse key for this credential's pinned proxy identity."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
+            "default": false
           }
         },
         "type": "object",
@@ -9742,6 +10349,37 @@
             "examples": [
               "cfld_1234567890"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location used for the credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
           }
         },
         "type": "object",
@@ -9774,6 +10412,133 @@
         ],
         "title": "CredentialVaultType"
       },
+      "CreditCardBillingAddress": {
+        "properties": {
+          "line1": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line1",
+            "description": "Billing address line 1",
+            "examples": [
+              "123 Main St"
+            ]
+          },
+          "line2": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line2",
+            "description": "Billing address line 2",
+            "examples": [
+              "Apt 4B"
+            ]
+          },
+          "city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City",
+            "description": "Billing city",
+            "examples": [
+              "San Francisco"
+            ]
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State",
+            "description": "Billing state or region",
+            "examples": [
+              "California"
+            ]
+          },
+          "state_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Code",
+            "description": "Billing state or region code",
+            "examples": [
+              "CA"
+            ]
+          },
+          "postal_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Postal Code",
+            "description": "Billing postal code",
+            "examples": [
+              "94105"
+            ]
+          },
+          "country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country",
+            "description": "Billing country",
+            "examples": [
+              "United States"
+            ]
+          },
+          "country_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country Code",
+            "description": "ISO 3166-1 alpha-2 billing country code",
+            "examples": [
+              "US"
+            ]
+          }
+        },
+        "type": "object",
+        "title": "CreditCardBillingAddress",
+        "description": "Optional billing address fields associated with a credit card credential."
+      },
       "CreditCardCredentialResponse": {
         "properties": {
           "last_four": {
@@ -9799,7 +10564,7 @@
           "brand"
         ],
         "title": "CreditCardCredentialResponse",
-        "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name."
+        "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,\nbilling fields, or metadata."
       },
       "DeleteScheduleResponse": {
         "properties": {
@@ -11707,6 +12472,12 @@
               }
             ],
             "title": "Path"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
+            "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
+            "default": false
           }
         },
         "type": "object",
@@ -12162,6 +12933,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PdfFillBlock"
                 }
               ],
               "discriminator": {
@@ -12183,6 +12957,7 @@
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
+                  "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
@@ -12427,6 +13202,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PdfFillBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
@@ -14181,7 +14959,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -15584,6 +16362,56 @@
             "examples": [
               "John Doe"
             ]
+          },
+          "billing_address": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CreditCardBillingAddress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional billing address associated with the card"
+          },
+          "billing_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Billing Email",
+            "description": "Optional billing email address"
+          },
+          "billing_phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Billing Phone",
+            "description": "Optional billing phone number"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Optional additional credit card metadata fields"
           }
         },
         "type": "object",
@@ -16228,6 +17056,285 @@
         ],
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include password or TOTP secret."
+      },
+      "PdfFillBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "pdf_fill",
+            "title": "Block Type",
+            "default": "pdf_fill"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "file_url": {
+            "type": "string",
+            "title": "File Url"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "llm_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "file_url",
+          "prompt"
+        ],
+        "title": "PdfFillBlock"
+      },
+      "PdfFillBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "pdf_fill",
+            "title": "Block Type",
+            "default": "pdf_fill"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "file_url": {
+            "type": "string",
+            "title": "File Url"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "llm_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "file_url",
+          "prompt"
+        ],
+        "title": "PdfFillBlockYAML"
       },
       "PersistentBrowserType": {
         "type": "string",
@@ -17179,7 +18286,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -17719,6 +18826,21 @@
             "type": "array",
             "title": "Tags To Delete",
             "description": "Tags to soft-delete. List of {key?, value?} targets."
+          },
+          "colors": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Colors",
+            "description": "Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color."
           }
         },
         "type": "object",
@@ -18008,6 +19130,146 @@
         ],
         "title": "TagResponse",
         "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row).\n``key`` is null for a standalone label."
+      },
+      "TagValue": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "color": {
+            "type": "string",
+            "title": "Color"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "description": "Number of non-deleted workflows currently carrying this (key, value) label.",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "color"
+        ],
+        "title": "TagValue",
+        "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
+      },
+      "TagValueDelete": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) under the key to soft-delete."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "TagValueDelete",
+        "description": "Body for ``DELETE /v1/tag-values/{key}``. The value rides in the body, not the\npath, so values containing ``/`` stay addressable."
+      },
+      "TagValueDeleteResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "removed_from_workflow_count": {
+            "type": "integer",
+            "title": "Removed From Workflow Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "removed_from_workflow_count"
+        ],
+        "title": "TagValueDeleteResponse",
+        "description": "Response for ``DELETE /v1/tag-values/{key}``."
+      },
+      "TagValueRename": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Current tag value (label) under the key to rename."
+          },
+          "new_value": {
+            "type": "string",
+            "title": "New Value",
+            "description": "New tag value (label) to rename it to."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "new_value"
+        ],
+        "title": "TagValueRename",
+        "description": "Body for ``PATCH /v1/tag-values/{key}/rename``. Both the current and the new\nvalue ride in the body so values containing ``/`` stay addressable."
+      },
+      "TagValueRenameResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "color": {
+            "type": "string",
+            "title": "Color"
+          },
+          "renamed_workflow_count": {
+            "type": "integer",
+            "title": "Renamed Workflow Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "color",
+          "renamed_workflow_count"
+        ],
+        "title": "TagValueRenameResponse",
+        "description": "Response for ``PATCH /v1/tag-values/{key}/rename``: the renamed label with its\ncarried-over color and the number of workflows re-tagged."
+      },
+      "TagValueUpdate": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) under the key to recolor."
+          },
+          "color": {
+            "type": "string",
+            "title": "Color",
+            "description": "Palette color name to assign to this (key, value)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "color"
+        ],
+        "title": "TagValueUpdate",
+        "description": "Body for ``PATCH /v1/tag-values/{key}``. The value rides in the body, not the\npath, so values containing ``/`` stay addressable."
       },
       "TagsResponse": {
         "properties": {
@@ -20339,6 +21601,43 @@
             ],
             "title": "Description",
             "description": "New description for the browser profile"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id for this profile.",
+            "default": false
           }
         },
         "type": "object",
@@ -20437,7 +21736,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -20991,8 +22290,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1.0,
-            "minimum": 0.0,
+            "maximum": 1,
+            "minimum": 0,
             "title": "Confidence Float"
           },
           "error_type": {
@@ -21844,6 +23143,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PdfFillBlock"
                 }
               ],
               "discriminator": {
@@ -21865,6 +23167,7 @@
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
+                  "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
@@ -22039,6 +23342,9 @@
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/PdfFillBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 },
                 {
@@ -22175,6 +23481,17 @@
               }
             ],
             "title": "Browser Profile Id"
+          },
+          "browser_profile_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key"
           },
           "model": {
             "anyOf": [
@@ -22478,6 +23795,17 @@
             ],
             "title": "Browser Profile Id"
           },
+          "browser_profile_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key"
+          },
           "model": {
             "anyOf": [
               {
@@ -22513,8 +23841,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 480.0,
-                "minimum": 1.0
+                "maximum": 480,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -22585,8 +23913,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 2.0,
-                "minimum": 1.0
+                "maximum": 2,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -22781,6 +24109,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/PdfFillBlock"
                 }
               ],
               "discriminator": {
@@ -22802,6 +24133,7 @@
                   "human_interaction": "#/components/schemas/HumanInteractionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
+                  "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
@@ -22866,9 +24198,15 @@
       "WorkflowDefinitionYAML": {
         "properties": {
           "version": {
-            "type": "integer",
-            "title": "Version",
-            "default": 1
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
           },
           "parameters": {
             "items": {
@@ -22999,6 +24337,9 @@
                   "$ref": "#/components/schemas/PrintPageBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/PdfFillBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 },
                 {
@@ -23027,6 +24368,7 @@
                   "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
+                  "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
                   "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
@@ -24140,6 +25482,17 @@
                 "type": "null"
               }
             ]
+          },
+          "downloaded_file_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloaded File Count"
           }
         },
         "type": "object",
@@ -24292,8 +25645,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 480.0,
-                "minimum": 1.0
+                "maximum": 480,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -24537,8 +25890,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 480.0,
-                "minimum": 1.0
+                "maximum": 480,
+                "minimum": 1
               },
               {
                 "type": "null"
