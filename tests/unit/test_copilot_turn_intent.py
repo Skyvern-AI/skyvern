@@ -410,6 +410,172 @@ def test_build_turn_intent_allows_clear_workflow_change_edit_classification() ->
     assert intent.target_entities["workflow_change"] == ["add_invoice_download_step"]
 
 
+def test_build_turn_intent_fix_origin_forces_diagnose_over_classifier_edit() -> None:
+    intent = build_turn_intent(
+        user_message="Diagnose why this run failed, then fix the workflow so it succeeds.",
+        workflow_yaml=(
+            "title: Existing\nworkflow_definition:\n  blocks:\n    - block_type: code\n      label: find_top_country\n"
+        ),
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(
+            TurnIntentMode.EDIT,
+            confidence=0.93,
+            target_entities={"workflow_change": ["fix_find_top_country"]},
+        ),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_read_run_context is True
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE in intent.reason_codes
+    # The DIAGNOSE force drops the classifier's edit target (mirrors the CLARIFY force) but keeps the run.
+    assert "workflow_change" not in intent.target_entities
+    assert intent.target_entities.get("run") == ["wr_123"]
+
+
+def test_build_turn_intent_fix_origin_forces_diagnose_over_classifier_build() -> None:
+    intent = build_turn_intent(
+        user_message="Diagnose why this run failed, then fix the workflow so it succeeds.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.BUILD, confidence=0.9),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE in intent.reason_codes
+
+
+def test_build_turn_intent_fix_origin_yields_to_raw_secret_refusal() -> None:
+    policy = RequestPolicy(
+        credential_input_kind="raw_secret",
+        raw_secret_detected=True,
+        clarification_question="Store the credential in the Credentials UI.",
+    )
+    intent = build_turn_intent(
+        user_message="Fix the run; the password is hunter2.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.EDIT, target_entities={"workflow_change": ["x"]}),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE not in intent.reason_codes
+
+
+def test_build_turn_intent_fix_origin_without_run_signal_does_not_force_diagnose() -> None:
+    intent = build_turn_intent(
+        user_message="Add a step that downloads the invoice PDF.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+        classifier_result=_classification(
+            TurnIntentMode.EDIT,
+            confidence=0.82,
+            target_entities={"workflow_change": ["add_invoice_download_step"]},
+        ),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE not in intent.reason_codes
+
+
+def test_build_turn_intent_without_fix_origin_keeps_classifier_edit_on_run() -> None:
+    intent = build_turn_intent(
+        user_message="Add a step that downloads the invoice PDF.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(
+            TurnIntentMode.EDIT,
+            confidence=0.82,
+            target_entities={"workflow_change": ["add_invoice_download_step"]},
+        ),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+    assert intent.authority.may_update_workflow is True
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE not in intent.reason_codes
+
+
+def test_build_turn_intent_fix_origin_overrides_low_confidence_clarify() -> None:
+    # A low-confidence classifier EDIT would normally degrade to CLARIFY; an explicit Fix click must
+    # still diagnose-first rather than ask "what change should I make?".
+    intent = build_turn_intent(
+        user_message="Diagnose why this run failed, then fix it.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.EDIT, confidence=0.35),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE in intent.reason_codes
+    assert TurnIntentReasonCode.LOW_CONFIDENCE_CLARIFICATION not in intent.reason_codes
+
+
+def test_build_turn_intent_fix_origin_overrides_missing_edit_target_clarify() -> None:
+    # A confident EDIT with no specific change target would normally degrade to CLARIFY (MISSING_EDIT_TARGET);
+    # an explicit Fix click must diagnose-first instead, and the workflow_change pop is a no-op (no entry).
+    intent = build_turn_intent(
+        user_message="Fix the workflow so this run succeeds.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.EDIT, confidence=0.9),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE in intent.reason_codes
+    assert TurnIntentReasonCode.MISSING_EDIT_TARGET not in intent.reason_codes
+    assert "workflow_change" not in intent.target_entities
+
+
+def test_build_turn_intent_fix_origin_yields_to_request_policy_clarify() -> None:
+    # A genuine clarification request (request policy) still wins over the fix-origin diagnose force.
+    policy = RequestPolicy(
+        user_response_policy="ask_clarification",
+        clarification_question="Which run should I diagnose?",
+    )
+    intent = build_turn_intent(
+        user_message="Fix this run.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.EDIT),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.CLARIFY
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE not in intent.reason_codes
+
+
 @pytest.mark.parametrize(
     ("block_ref", "expected_label"),
     [
