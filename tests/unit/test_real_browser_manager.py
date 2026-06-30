@@ -387,6 +387,22 @@ async def test_get_video_artifacts_finalize_false_skips_ffmpeg(tmp_path) -> None
     assert artifacts[0].video_data == b"partial-webm-bytes"
 
 
+@pytest.mark.asyncio
+async def test_get_video_artifacts_non_webm_skips_ffmpeg(tmp_path) -> None:
+    """Non-WebM container files (e.g. fully-formed MP4 from a remote source)
+    are container-valid already; remuxing them through ``finalize_webm`` would
+    corrupt the file. The extension-based short-circuit reads them raw."""
+    src = tmp_path / "recording.mp4"
+    src.write_bytes(b"mp4-bytes")
+    browser_state = _make_browser_state_with_video(str(src))
+
+    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock()) as m:
+        artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
+
+    m.assert_not_awaited()
+    assert artifacts[0].video_data == b"mp4-bytes"
+
+
 def _make_page_mock(video_path: str | None) -> MagicMock:
     page = MagicMock()
     if video_path is None:
@@ -659,3 +675,293 @@ async def test_non_pbs_workflow_run_does_not_rebind() -> None:
 
     assert result is parent_state
     mock_rebind.assert_not_awaited()
+
+
+def _stale_pbs_browser_state(*, navigate_exc: Exception) -> MagicMock:
+    state = MagicMock()
+    page = MagicMock()
+    state.get_working_page = AsyncMock(return_value=page)
+    state.navigate_to_url = AsyncMock(side_effect=navigate_exc)
+    state.browser_context = MagicMock()
+    state.browser_context.browser = MagicMock()
+    return state
+
+
+def _fresh_pbs_browser_state() -> MagicMock:
+    state = MagicMock()
+    page = MagicMock()
+    state.get_working_page = AsyncMock(return_value=page)
+    state.navigate_to_url = AsyncMock()
+    state.get_or_create_page = AsyncMock()
+    state.browser_context = MagicMock()
+    state.browser_context.browser = MagicMock()
+    return state
+
+
+@pytest.mark.asyncio
+async def test_pbs_navigate_evicts_and_retries_on_connection_closed_driver_error() -> None:
+    """When the cached PBS BrowserState's first ``Page.goto`` raises
+    ``FailedToNavigateToUrl`` with ``Connection closed while reading from the driver``,
+    the manager must evict the cached entry, re-fetch a fresh BrowserState from
+    ``PERSISTENT_SESSIONS_MANAGER``, and retry navigation once before surfacing the
+    failure to the workflow run."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Connection closed while reading from the driver",
+        )
+    )
+    fresh = _fresh_pbs_browser_state()
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id="pbs_abc",
+        )
+
+    assert result is fresh
+    mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_abc",
+        organization_id=workflow_run.organization_id,
+        expected=stale,
+    )
+    assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_count == 2
+    fresh.navigate_to_url.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pbs_navigate_does_not_retry_on_unrelated_error() -> None:
+    """The evict-and-reconnect path is scoped to the cached-dead-CDP signal. A generic
+    navigation failure (e.g. DNS error) must still bubble up so callers can route the
+    real failure without an additional evict+reconnect cycle."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="net::ERR_NAME_NOT_RESOLVED",
+        )
+    )
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=stale)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with pytest.raises(FailedToNavigateToUrl):
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_abc",
+            )
+
+    mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state.assert_not_awaited()
+    assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pbs_navigate_does_not_evict_on_page_only_close() -> None:
+    """``Target page, context or browser has been closed`` is overloaded — Playwright
+    surfaces it for page-only or context-only closes too, not just a dead CDP transport.
+    The recovery path must NOT evict the cached PBS on this signal; doing so would tear
+    down a healthy remote BrowserContext over a recoverable page-level state. Only the
+    explicit driver-level ``Connection closed while reading from the driver`` should
+    trigger the evict + reconnect path."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Target page, context or browser has been closed",
+        )
+    )
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=stale)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with pytest.raises(FailedToNavigateToUrl, match="Target page, context or browser"):
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_abc",
+            )
+
+    mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state.assert_not_awaited()
+    # Single get_browser_state — no refetch, since the page-only close did not trigger
+    # the evict + reconnect path.
+    assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pbs_recovery_path_passes_expected_state_to_public_evict() -> None:
+    """The cached-CDP recovery path's evict must pass the stale ``BrowserState`` so the
+    manager can skip closing a fresh wrapper that a parallel coroutine just stored.
+    Without the ``expected`` argument, the public evict would unconditionally pop and
+    close whatever sits in the cache."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Connection closed while reading from the driver",
+        )
+    )
+    fresh = _fresh_pbs_browser_state()
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock),
+    ):
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id="pbs_abc",
+        )
+
+    mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state.assert_awaited_once_with(
+        "pbs_abc",
+        organization_id=workflow_run.organization_id,
+        expected=stale,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pbs_recovery_path_rebinds_download_dir_on_fresh_browser() -> None:
+    """The cached-CDP recovery path replaces ``browser_state`` with a fresh CDP
+    connection from ``PERSISTENT_SESSIONS_MANAGER``. The fresh state inherits the
+    persistent-session download path, so artifacts would otherwise be saved under the
+    session binding instead of the workflow-run directory. The manager must rerun
+    ``rebind_download_dir`` on the fresh browser before retrying navigation."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Connection closed while reading from the driver",
+        )
+    )
+    fresh = _fresh_pbs_browser_state()
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id="pbs_abc",
+        )
+
+    assert mock_rebind.await_count == 2
+    rebind_browsers = [call.args[0] for call in mock_rebind.await_args_list]
+    assert stale.browser_context.browser in rebind_browsers
+    assert fresh.browser_context.browser in rebind_browsers
+
+
+@pytest.mark.asyncio
+async def test_pbs_navigate_skips_recovery_when_manager_cannot_reconnect() -> None:
+    """The cached-CDP evict+reconnect path only works against managers whose
+    ``get_browser_state`` reconnects after an evict. ``DefaultPersistentSessionsManager``'s
+    ``get_browser_state`` is a pure in-memory dict lookup — evicting drops the only
+    BrowserState, the refetch returns None, and the recovery path re-raises with the
+    cache already torn down (so ``close_session`` profile/video cleanup later finds
+    nothing). Skip the evict when the manager reports it cannot reconnect; the original
+    ``FailedToNavigateToUrl`` bubbles up unchanged and the cache is preserved."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Connection closed while reading from the driver",
+        )
+    )
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=stale)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+        # Manager reports it cannot reconnect after evict (OSS default impl shape).
+        mock_app.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=False)
+
+        with pytest.raises(FailedToNavigateToUrl, match="Connection closed"):
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_abc",
+            )
+
+    mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state.assert_not_awaited()
+    # Single get_browser_state call — no refetch, since recovery was skipped.
+    assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pbs_recovery_falls_through_to_get_or_create_page_when_fresh_state_has_no_page() -> None:
+    """When evict+reconnect succeeds but the fresh ``BrowserState`` has no working
+    page (e.g. the prior context closed its last tab during the dead-CDP window, or
+    the new connection landed on an empty target), the recovery path must NOT re-raise
+    the original navigation error. The normal-path ``get_or_create_page`` below the
+    PBS branch can produce a page and navigate to the URL — mirror that so a
+    recoverable session is not failed."""
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    manager = RealBrowserManager()
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Connection closed while reading from the driver",
+        )
+    )
+    fresh = _fresh_pbs_browser_state()
+    # Fresh CDP connection has no current page.
+    fresh.get_working_page = AsyncMock(return_value=None)
+    workflow_run = make_workflow_run("wfr_pbs")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id="pbs_abc",
+        )
+
+    assert result is fresh
+    # The outer normal-path get_or_create_page must run with the URL so the
+    # fresh CDP connection acquires a page and lands on the target.
+    fresh.get_or_create_page.assert_awaited_once()
+    create_call = fresh.get_or_create_page.await_args
+    assert create_call.kwargs.get("url") == "https://example.com"
+    # We never re-attempted navigate_to_url on the fresh state (no page to use).
+    fresh.navigate_to_url.assert_not_awaited()
