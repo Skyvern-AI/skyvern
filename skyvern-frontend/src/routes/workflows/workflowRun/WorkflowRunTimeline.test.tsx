@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ReactNode } from "react";
 
@@ -285,8 +285,30 @@ describe("WorkflowRunTimeline", () => {
       created_at: "2026-06-10T07:16:29Z",
       output: {
         evaluations: [
-          { is_matched: true, next_block_label: "block_8" },
-          { is_matched: false, next_block_label: "other_path" },
+          {
+            branch_id: "br_taken",
+            branch_index: 0,
+            criteria_type: "jinja2_template",
+            original_expression: "{{ found }}",
+            rendered_expression: "true",
+            result: true,
+            is_matched: true,
+            is_default: false,
+            next_block_label: "block_8",
+            error: null,
+          },
+          {
+            branch_id: "br_other",
+            branch_index: 1,
+            criteria_type: "jinja2_template",
+            original_expression: "{{ needs_other_path }}",
+            rendered_expression: "false",
+            result: false,
+            is_matched: false,
+            is_default: false,
+            next_block_label: "other_path",
+            error: null,
+          },
         ],
       } as WorkflowRunBlock["output"],
     });
@@ -319,8 +341,12 @@ describe("WorkflowRunTimeline", () => {
                 },
                 {
                   id: "br_other",
+                  description: "Use alternate path",
+                  criteria: {
+                    description: "Alternate path needed",
+                  },
                   next_block_label: "other_path",
-                  is_default: true,
+                  is_default: false,
                 },
               ],
             },
@@ -341,13 +367,29 @@ describe("WorkflowRunTimeline", () => {
 
     renderTimeline(null);
 
-    const skippedBadge = screen.getByText("skipped");
-    expect(skippedBadge.closest("div.min-w-0")?.textContent).toContain(
-      "other_path",
-    );
+    expect(screen.getByText("B • Else If")).toBeDefined();
+    expect(screen.getByText("· Use alternate path")).toBeDefined();
+    expect(screen.getByText("condition false")).toBeDefined();
+    expect(screen.getByText("1 block")).toBeDefined();
+    expect(screen.queryByText("skipped")).toBeNull();
     const notReachedBadge = screen.getByText("did not execute");
     expect(notReachedBadge.closest("div.min-w-0")?.textContent).toContain(
       "tail_block",
     );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expand skipped branch" }),
+    );
+    const skippedBadge = screen.getByText("skipped");
+    expect(skippedBadge.closest("div.min-w-0")?.textContent).toContain(
+      "other_path",
+    );
+    expectDomOrder([
+      "branch_check",
+      "B • Else If",
+      "other_path",
+      "block_8",
+      "tail_block",
+    ]);
   });
 });
