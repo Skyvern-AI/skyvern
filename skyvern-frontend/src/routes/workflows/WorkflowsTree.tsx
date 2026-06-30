@@ -90,6 +90,8 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
 import { getUniqueSlugForFolder } from "@/util/folderSlug";
 import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 
 const FOLDERS_PAGE_SIZE = 25;
 const AGENTS_PAGE_SIZE = 20;
@@ -122,7 +124,12 @@ function WorkflowsTree() {
     () => parseTagFilter(tagFilterParam),
     [tagFilterParam],
   );
-  const serializedTagFilter = serializeTagFilter(tagFilters);
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  // While tagging is hidden, ignore stale `?tags=` so the backend list isn't tag-filtered.
+  const serializedTagFilter = taggingEnabled
+    ? serializeTagFilter(tagFilters)
+    : "";
 
   const setTagFilters = useCallback(
     (terms: TagFilterTerm[]) => {
@@ -363,7 +370,7 @@ function WorkflowsTree() {
   const onboarding = useOnboardingStateOptional();
 
   // Tag-key registry: supplies chip-hover descriptions and the filter's key list.
-  const { data: tagKeys = [] } = useTagKeysQuery();
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
   const tagDescriptions = useMemo(
     () =>
       new Map(
@@ -374,7 +381,7 @@ function WorkflowsTree() {
       ),
     [tagKeys],
   );
-  const { data: tagColors } = useTagValuesQuery();
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   // One batch fetch of current tags for every workflow on screen (no N+1) -
   // the main page list plus the contents of every expanded folder.
@@ -390,7 +397,12 @@ function WorkflowsTree() {
     }
     return Array.from(ids);
   }, [workflows, folderContents]);
-  const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(workflowIds);
+  const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
+    workflowIds,
+    {
+      enabled: taggingEnabled,
+    },
+  );
 
   // Tags observed on the page for editor/filter suggestions: grouped values per
   // key plus standalone labels. Maps avoid prototype-key collisions.
@@ -701,6 +713,12 @@ function WorkflowsTree() {
     matchesParameter,
     handleRowClick,
     handleIconClick,
+    onRowDeleted: (id) => {
+      if (!selected.has(id)) return;
+      const next = new Set(selected);
+      next.delete(id);
+      replaceSelection(next);
+    },
   };
 
   const showFlatInitialSkeleton =
@@ -920,14 +938,16 @@ function WorkflowsTree() {
               placeholder="Search by title or input..."
               className="w-48 lg:w-72"
             />
-            <WorkflowTagFilter
-              tagKeys={tagKeys}
-              value={tagFilters}
-              onChange={setTagFilters}
-              labelSuggestions={labelSuggestions}
-              valueSuggestionsByKey={valueSuggestionsByKey}
-              colors={tagColors}
-            />
+            {taggingEnabled ? (
+              <WorkflowTagFilter
+                tagKeys={tagKeys}
+                value={tagFilters}
+                onChange={setTagFilters}
+                labelSuggestions={labelSuggestions}
+                valueSuggestionsByKey={valueSuggestionsByKey}
+                colors={tagColors}
+              />
+            ) : null}
           </div>
           <div className="flex items-center gap-4">
             <Link
@@ -984,7 +1004,7 @@ function WorkflowsTree() {
         </div>
         <WorkflowsListContext.Provider value={listContextValue}>
           <div className="overflow-hidden rounded-lg border border-border">
-            <Table className="table-fixed">
+            <Table className="table-fixed [&_td:last-child]:pr-6 [&_th:last-child]:pr-6">
               <TableHeader>
                 <TableRow className="group/header">
                   {showCheckbox && (
@@ -1031,6 +1051,7 @@ function WorkflowsTree() {
             tagKeys={tagKeys}
             labelSuggestions={labelSuggestions}
             valueSuggestionsByKey={valueSuggestionsByKey}
+            taggingEnabled={taggingEnabled}
           />
         )}
 

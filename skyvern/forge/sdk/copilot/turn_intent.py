@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -579,6 +579,7 @@ async def classify_turn_intent(
         return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.MISSING_HANDLER)
 
     safe_user_message = redact_raw_secrets_for_prompt(user_message)
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
     try:
         prompt = prompt_engine.load_prompt(
@@ -597,7 +598,7 @@ async def classify_turn_intent(
             latest_assistant_turn=transcript.latest_assistant_turn,
             retained_history=transcript.retained_history,
             global_llm_context=escape_code_fences(
-                redact_raw_secrets_for_prompt(global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
+                redact_raw_secrets_for_prompt(safe_global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
             ),
         )
     except Exception as exc:

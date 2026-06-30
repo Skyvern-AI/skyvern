@@ -90,6 +90,9 @@ export type GeoTarget = {
 
 export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
 
+export const PINNED_RESIDENTIAL_ISP_PROXY_LOCATION =
+  "RESIDENTIAL_ISP" satisfies LegacyProxyLocation;
+
 export type ArtifactApiResponse = {
   created_at: string;
   modified_at: string;
@@ -794,6 +797,8 @@ export type BrowserProfileApiResponse = {
   name: string;
   description: string | null;
   source_browser_type: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -832,6 +837,8 @@ export type CredentialApiResponse = {
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   folder_id?: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
 };
 
 export function isPasswordCredential(
@@ -866,6 +873,9 @@ export type CreateCredentialRequest = {
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
   vault_type?: "custom";
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
+  rotate_proxy_session_id?: boolean;
 };
 
 export type PasswordCredential = {

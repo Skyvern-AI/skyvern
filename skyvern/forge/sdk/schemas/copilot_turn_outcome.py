@@ -39,3 +39,8 @@ class TurnOutcome(BaseModel):
     copilot_repair_ceiling_hit: bool = False
     copilot_pending_capability: str | None = None
     copilot_turn_id: str | None = None
+    # Structured summary of an edited-schema-incompatibility terminal outcome
+    # (incompatible_paths, known_output_paths, next_actions, ...), persisted so a
+    # later "what was the problem?" turn can report it. None unless the turn ended
+    # on a schema-incompatibility halt.
+    copilot_schema_incompatibility: dict[str, Any] | None = None

@@ -4,6 +4,7 @@ import { ReactFlowProvider } from "@xyflow/react";
 
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
+import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { getElements } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getInitialParameters } from "@/routes/workflows/editor/utils";
@@ -14,6 +15,7 @@ import { useBlockOutputStore } from "@/store/BlockOutputStore";
 
 function Debugger() {
   const { workflowPermanentId } = useParams();
+  useViaEntryPointCapture();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -69,6 +71,7 @@ function Debugger() {
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
     browserProfileId: workflow.browser_profile_id ?? null,
+    browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,

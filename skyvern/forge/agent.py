@@ -162,7 +162,7 @@ from skyvern.webeye.actions.parse_actions import (
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
 
@@ -334,35 +334,6 @@ async def _cancel_pending_prefetch_task(task: asyncio.Task | None) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-
-
-async def _build_open_tabs_context(
-    browser_state: BrowserState,
-    working_page: Page | None,
-) -> str | None:
-    if working_page is None:
-        return None
-    pages = await browser_state.list_valid_pages()
-    if len(pages) <= 1:
-        return None
-    lines: list[str] = []
-    for i, p in enumerate(pages):
-        marker = " [current]" if p == working_page else ""
-        url = p.url
-        try:
-            title = await asyncio.wait_for(p.title(), timeout=1.0)
-        except Exception:
-            LOG.debug("tab_title_fetch_failed", url=url)
-            title = ""
-        if len(url) > 120:
-            url = url[:117] + "..."
-        if len(title) > 80:
-            title = title[:77] + "..."
-        entry = f"Tab {i}{marker}: {url}"
-        if title:
-            entry += f" ({title})"
-        lines.append(entry)
-    return "\n".join(lines)
 
 
 def _build_totp_timeout_reasoning(task: Task) -> str:
@@ -2006,8 +1977,13 @@ class ForgeAgent:
             if self._is_multi_field_totp_sequence(actions):
                 context = skyvern_context.ensure_context()
                 cache_key = f"{task.task_id}_totp_cache"
-                if cache_key in context.totp_codes:
-                    context.totp_codes.pop(cache_key)
+                removed_totp_cache = False
+                for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
+                    if key in context.totp_codes:
+                        context.totp_codes.pop(key)
+                        removed_totp_cache = True
+
+                if removed_totp_cache:
                     LOG.debug(
                         "Cleaned up TOTP cache after multi-field sequence completion",
                         task_id=task.task_id,
@@ -3849,7 +3825,7 @@ class ForgeAgent:
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
-        open_tabs_context = await _build_open_tabs_context(browser_state, page)
+        open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
         # NEW_TAB/SWITCH_TAB are gated behind a flag (default off) so single-tab tasks are
         # unaffected. SWITCH_TAB additionally requires >= 2 open tabs, like CLOSE_PAGE.
@@ -4755,10 +4731,23 @@ class ForgeAgent:
             )
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
-                await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
-                    organization_id=task.organization_id,
-                    data=video_artifact.video_data,
+                if video_artifact.video_artifact_id:
+                    await app.ARTIFACT_MANAGER.update_artifact_data(
+                        artifact_id=video_artifact.video_artifact_id,
+                        organization_id=task.organization_id,
+                        data=video_artifact.video_data,
+                    )
+                    continue
+                # No pre-registered artifact row: a recording attached at browser teardown
+                # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
+                # Upload by path so the bytes stream straight from disk to storage.
+                video_path = video_artifact.video_path
+                if not video_path or not os.path.exists(video_path):
+                    continue
+                video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                    step=last_step,
+                    artifact_type=ArtifactType.RECORDING,
+                    path=video_path,
                 )
 
             _ctx = skyvern_context.current()

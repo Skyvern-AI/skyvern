@@ -764,8 +764,9 @@ async def discover_workflow_entrypoint_tool(
     Use this BEFORE writing blocks when the user named a website (with a URL,
     a bare domain, or a single brand word) but no specific page. Accepts:
     a URL with or without scheme (``example.com/login`` is fine), a bare
-    domain (``example.com``), or a single brand word (resolved as
-    ``https://www.<word>.com``). English phrases ("the X website") return
+    domain (``example.com``), or a single brand word. Configured aliases resolve
+    first; other single brand words resolve as ``https://www.<word>.com``.
+    English phrases ("the X website") return
     ``failure_reason=could_not_resolve_site_name`` — ASK_QUESTION for a URL.
 
     Returns ``candidate_url`` plus a short ``evidence_trail`` and any

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
+import urllib.parse
 from enum import StrEnum
 from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -21,7 +23,46 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_state import BrowserState
+
 LOG = structlog.get_logger()
+
+
+async def _safe_tab_title(page: Page) -> str:
+    try:
+        return await asyncio.wait_for(page.title(), timeout=1.0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("tab_title_fetch_failed", url=page.url)
+        return ""
+
+
+async def build_open_tabs_context(
+    browser_state: BrowserState,
+    working_page: Page | None,
+) -> str | None:
+    if working_page is None:
+        return None
+    pages = await browser_state.list_valid_pages()
+    if len(pages) <= 1:
+        return None
+    # Fetch titles concurrently so a few slow tabs don't add N×timeout latency to every iteration.
+    titles = await asyncio.gather(*(_safe_tab_title(p) for p in pages))
+    lines: list[str] = []
+    for i, (p, title) in enumerate(zip(pages, titles)):
+        marker = " [current]" if p == working_page else ""
+        url = p.url
+        if len(url) > 120:
+            url = url[:117] + "..."
+        if len(title) > 80:
+            title = title[:77] + "..."
+        entry = f"Tab {i}{marker}: {url}"
+        if title:
+            entry += f" ({title})"
+        lines.append(entry)
+    return "\n".join(lines)
 
 
 def load_js_script() -> str:
@@ -319,6 +360,76 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
     return merged_img
 
 
+# FileReader keeps the payload binary-safe without arrayBuffer/Uint8Array
+# transcoding back across CDP.
+_BLOB_FETCH_JS = """
+async (blobUrl) => {
+    try {
+        const response = await fetch(blobUrl);
+        if (!response.ok) {
+            return { ok: false, status: response.status };
+        }
+        const blob = await response.blob();
+        return await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const result = reader.result || '';
+                const comma = result.indexOf(',');
+                if (comma === -1) {
+                    resolve({ ok: false, error: 'no_data_url_payload' });
+                    return;
+                }
+                resolve({ ok: true, base64: result.substring(comma + 1) });
+            };
+            reader.onerror = () => resolve({ ok: false, error: 'file_reader_error' });
+            reader.readAsDataURL(blob);
+        });
+    } catch (err) {
+        return { ok: false, error: String(err) };
+    }
+}
+"""
+
+
+def _blob_url_origin(blob_url: str) -> str | None:
+    if not blob_url.startswith("blob:"):
+        return None
+    parsed = urllib.parse.urlparse(blob_url[len("blob:") :])
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _frame_origin(frame_url: str | None) -> str | None:
+    if not frame_url:
+        return None
+    if frame_url.startswith("blob:"):
+        return _blob_url_origin(frame_url)
+    parsed = urllib.parse.urlparse(frame_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
+    """Return frames whose origin matches the blob's origin, main frame first."""
+    seen: set[int] = set()
+    matches: list[Frame] = []
+    candidates: list[Frame] = [page.main_frame, *page.frames]
+    for frame in candidates:
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        try:
+            frame_url = frame.url
+        except Exception:
+            continue
+        if _frame_origin(frame_url) == blob_origin:
+            matches.append(frame)
+    return matches
+
+
 class SkyvernFrame:
     @staticmethod
     async def evaluate(
@@ -448,6 +559,75 @@ class SkyvernFrame:
     @staticmethod
     async def get_url(frame: Page | Frame) -> str:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
+
+    @staticmethod
+    async def read_blob_url_bytes(
+        page: Page,
+        blob_url: str,
+        workflow_run_id: str | None = None,
+    ) -> bytes | None:
+        blob_origin = _blob_url_origin(blob_url)
+        if blob_origin is None:
+            LOG.error(
+                "blob URL read aborted: unparseable origin",
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+
+        frames = _frames_for_blob_origin(page, blob_origin)
+        if not frames:
+            LOG.error(
+                "blob URL read found no frame at the blob origin",
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+
+        main_frame = page.main_frame
+        for frame in frames:
+            try:
+                # Main-frame routes through evaluate_in_main_world so any
+                # context-level main-world prefix stays attached; sub-frames use
+                # frame.evaluate (main-world prefixes are page-scoped).
+                if frame is main_frame:
+                    result = await evaluate_in_main_world(page, _BLOB_FETCH_JS, blob_url)
+                else:
+                    result = await frame.evaluate(_BLOB_FETCH_JS, blob_url)
+            except Exception:
+                LOG.warning(
+                    "blob URL in-frame fetch raised; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                continue
+            if not isinstance(result, dict) or not result.get("ok"):
+                LOG.warning(
+                    "blob URL in-frame fetch returned not-ok; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    result=result if isinstance(result, dict) else None,
+                )
+                continue
+            b64_payload = result.get("base64")
+            if not isinstance(b64_payload, str) or not b64_payload:
+                LOG.warning(
+                    "blob URL in-frame fetch returned empty payload; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                )
+                continue
+            try:
+                return base64.b64decode(b64_payload, validate=True)
+            except Exception:
+                LOG.warning(
+                    "blob URL in-frame fetch payload was not valid base64; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                continue
+
+        LOG.error(
+            "blob URL read could not retrieve bytes from any matching frame",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
 
     # -- cursor overlay helpers ------------------------------------------------
 
@@ -877,7 +1057,7 @@ class SkyvernFrame:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 loading_indicator_result = "timeout"
-                LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+                LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
             except Exception:
                 loading_indicator_result = "error"
                 LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
@@ -893,7 +1073,7 @@ class SkyvernFrame:
                 await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 network_idle_result = "timeout"
-                LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+                LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 

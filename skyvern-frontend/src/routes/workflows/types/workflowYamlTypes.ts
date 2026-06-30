@@ -12,6 +12,7 @@ export type WorkflowCreateYAMLRequest = {
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model?: WorkflowModel | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
@@ -347,6 +348,8 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   azure_storage_account_name?: string | null;
   azure_storage_account_key?: string | null;
   azure_blob_container_name?: string | null;
+  google_credential_id?: string | null;
+  google_drive_folder_id?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {

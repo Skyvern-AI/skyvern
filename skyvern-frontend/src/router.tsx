@@ -12,6 +12,7 @@ import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";
 import { RootLayout } from "./routes/root/RootLayout";
 import { Settings } from "./routes/settings/Settings";
+import { LabelManagement } from "./routes/settings/LabelManagement";
 import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPage";
 import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
 import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
@@ -355,6 +356,10 @@ const router = createBrowserRouter([
           {
             index: true,
             element: <Settings />,
+          },
+          {
+            path: "labels",
+            element: <LabelManagement />,
           },
         ],
       },

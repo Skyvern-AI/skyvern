@@ -8,6 +8,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { useDebouncedCallback } from "use-debounce";
 
+import { isOversizedDocument } from "./oversizedDocument";
 import "./code-mirror-overrides.css";
 
 function getLanguageExtension(language: "python" | "json" | "html") {
@@ -65,9 +66,14 @@ function CodeEditorImpl({
   extraExtensions,
   ...restProps
 }: Props) {
+  // `value` is typed `string`, but workflow document panels can pass an
+  // absent/incomplete payload at runtime (SKY-11567). Normalize to a string so
+  // the editor and the oversized-document guard never read `.length` of
+  // undefined.
+  const safeValue = value ?? "";
   const viewRef = useRef<EditorView | null>(null);
-  const [internalValue, setInternalValue] = useState(value);
-  const latestValueRef = useRef(value);
+  const [internalValue, setInternalValue] = useState(safeValue);
+  const latestValueRef = useRef(safeValue);
 
   // Defer EditorView creation until the container is in (or near) the
   // viewport. Block editors mount many CodeEditors at once (script-mode
@@ -102,9 +108,9 @@ function CodeEditorImpl({
   }, [shouldMount]);
 
   useEffect(() => {
-    setInternalValue(value);
-    latestValueRef.current = value;
-  }, [value]);
+    setInternalValue(safeValue);
+    latestValueRef.current = safeValue;
+  }, [safeValue]);
 
   // Capture the latest onChange in a ref so the debounced callback below
   // (and the React.memo wrapper export) stay referentially stable across
@@ -144,17 +150,24 @@ function CodeEditorImpl({
     if (!viewRef.current) viewRef.current = viewUpdate.view;
   }, []);
 
+  const oversized = useMemo(
+    () => isOversizedDocument(internalValue),
+    [internalValue],
+  );
+  const effectiveLineWrap = lineWrap && !oversized;
+
   // Memoize the extension tuple so React hands CodeMirror a stable
   // reference across renders. Without this, a parent re-render would
   // rebuild the array (and anything spread in) every cycle and trigger
   // unnecessary editor state reconfiguration.
   const extensions = useMemo<Extension[]>(() => {
-    const exts: Extension[] = language
-      ? [
-          getLanguageExtension(language),
-          lineWrap ? EditorView.lineWrapping : [],
-        ]
-      : [lineWrap ? EditorView.lineWrapping : []];
+    const exts: Extension[] = [];
+    if (language && !oversized) {
+      exts.push(getLanguageExtension(language));
+    }
+    if (effectiveLineWrap) {
+      exts.push(EditorView.lineWrapping);
+    }
     if (extraExtensions) {
       exts.push(...extraExtensions);
     }
@@ -162,7 +175,7 @@ function CodeEditorImpl({
       exts.push(fullHeightExtension);
     }
     return exts;
-  }, [language, lineWrap, extraExtensions, fullHeight]);
+  }, [language, oversized, effectiveLineWrap, extraExtensions, fullHeight]);
 
   const style: React.CSSProperties = { fontSize };
   if (fullHeight) {

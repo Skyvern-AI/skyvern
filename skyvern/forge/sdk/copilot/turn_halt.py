@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_REASON_CODE
 
 LOG = structlog.get_logger()
 
@@ -26,6 +27,7 @@ class TurnHaltKind(StrEnum):
     ACTIVE_TERMINAL_CHALLENGE = "active_terminal_challenge"
     PROBABLE_SITE_BLOCK = "probable_site_block"
     REPAIR_CEILING_REACHED = "repair_ceiling_reached"
+    SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -40,6 +42,7 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "loop_detected_generic",
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
+        "loop_detected_no_forward_progress_interaction",
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
@@ -53,12 +56,16 @@ _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     }
 )
 _PROBABLE_SITE_BLOCK_REASON_CODES = frozenset({"probable_site_block_stop"})
+_SCHEMA_INCOMPATIBILITY_REASON_CODES = frozenset({SCHEMA_INCOMPATIBILITY_REASON_CODE})
 
 # A held blocker whose reason code is in this set must win both the rendered
 # reply and the typed halt kind over a later non-terminal trip (e.g. the
 # code-authoring churn backstop), which defers entirely when one is present.
 GENUINELY_TERMINAL_BLOCKER_REASON_CODES = (
-    _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES | _PROBABLE_SITE_BLOCK_REASON_CODES | frozenset({"repair_ceiling_reached"})
+    _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES
+    | _PROBABLE_SITE_BLOCK_REASON_CODES
+    | _SCHEMA_INCOMPATIBILITY_REASON_CODES
+    | frozenset({"repair_ceiling_reached"})
 )
 
 
@@ -74,10 +81,14 @@ _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
         TurnHaltKind.LOOP_DETECTED,
         TurnHaltKind.PROBABLE_SITE_BLOCK,
         TurnHaltKind.REPAIR_CEILING_REACHED,
+        TurnHaltKind.SCHEMA_INCOMPATIBILITY,
     }
 )
 _INVOLUNTARY_BLOCKER_REASON_CODES = (
-    _LOOP_TERMINAL_REASON_CODES | _PROBABLE_SITE_BLOCK_REASON_CODES | frozenset({REPAIR_CEILING_REASON_CODE})
+    _LOOP_TERMINAL_REASON_CODES
+    | _PROBABLE_SITE_BLOCK_REASON_CODES
+    | _SCHEMA_INCOMPATIBILITY_REASON_CODES
+    | frozenset({REPAIR_CEILING_REASON_CODE})
 )
 
 
@@ -105,6 +116,8 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
     if reason in _PROBABLE_SITE_BLOCK_REASON_CODES:
         return TurnHaltKind.PROBABLE_SITE_BLOCK
+    if reason in _SCHEMA_INCOMPATIBILITY_REASON_CODES:
+        return TurnHaltKind.SCHEMA_INCOMPATIBILITY
     return None
 
 

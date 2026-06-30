@@ -5,7 +5,7 @@ import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowT
 export type FileUploadNodeData = NodeBaseData & {
   path: string;
   editable: boolean;
-  storageType: "s3" | "azure";
+  storageType: "s3" | "azure" | "google_drive";
   s3Bucket: string | null;
   awsAccessKeyId: string | null;
   awsSecretAccessKey: string | null;
@@ -13,6 +13,8 @@ export type FileUploadNodeData = NodeBaseData & {
   azureStorageAccountName: string | null;
   azureStorageAccountKey: string | null;
   azureBlobContainerName: string | null;
+  googleCredentialId: string | null;
+  googleDriveFolderId: string | null;
 };
 
 export type FileUploadNode = Node<FileUploadNodeData, "fileUpload">;
@@ -30,6 +32,8 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   azureStorageAccountName: null,
   azureStorageAccountKey: null,
   azureBlobContainerName: null,
+  googleCredentialId: null,
+  googleDriveFolderId: null,
   continueOnFailure: false,
   model: null,
 } as const;

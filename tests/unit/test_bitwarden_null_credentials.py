@@ -148,6 +148,37 @@ async def test_get_secret_value_by_item_id_preserves_real_values(
 
 
 @pytest.mark.asyncio
+async def test_get_secret_value_by_item_id_preserves_raw_totp_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    totp_uri = "otpauth://totp/user@example.test?secret=JBSWY3DPEHPK3PXP&issuer=Example"
+    item_payload = {
+        "id": "55555555-5555-5555-5555-555555555555",
+        "login": {
+            "username": "alice@example.test",
+            "password": "hunter2",
+            "totp": totp_uri,
+        },
+    }
+
+    async def fake_run_command(command: list[str], **_: object) -> RunCommandResult:
+        return RunCommandResult(stdout=json.dumps(item_payload), stderr="", returncode=0)
+
+    monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
+
+    result = await BitwardenService.get_secret_value_from_url(
+        client_id="client-id",
+        client_secret="client-secret",
+        master_password="master-password",
+        bw_organization_id="org-id",
+        bw_collection_ids=None,
+        item_id="55555555-5555-5555-5555-555555555555",
+    )
+
+    assert result[BitwardenConstants.TOTP] == totp_uri
+
+
+@pytest.mark.asyncio
 async def test_get_credit_card_data_includes_billing_custom_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -55,6 +55,7 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.repositories.tags import TagValueRenameCollision, TagValueRenameResult
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
@@ -156,6 +157,10 @@ from skyvern.schemas.tags import (
     TagResponse,
     TagsResponse,
     TagValue,
+    TagValueDelete,
+    TagValueDeleteResponse,
+    TagValueRename,
+    TagValueRenameResponse,
     TagValueUpdate,
     WorkflowTagsBatchRequest,
     WorkflowTagsBatchResponse,
@@ -1596,6 +1601,39 @@ async def _apply_tag_changes_with_retry(
             )
 
 
+async def _rename_tag_value_with_retry(
+    *,
+    organization_id: str,
+    key: str,
+    old_value: str,
+    new_value: str,
+    context: TagWriteContext,
+) -> TagValueRenameResult | None:
+    """Wrap ``rename_tag_value`` with one IntegrityError retry: a concurrent SET on
+    ``(key, new_value)`` can race the active-SET partial UNIQUE between the rename's
+    collision check and its new SET inserts; last-write-wins on retry, else 409
+    (mirrors ``_apply_tag_changes_with_retry``). ``TagValueRenameCollision`` is a
+    deterministic conflict and is mapped to 409 by the caller, not retried here."""
+    for attempt in range(2):
+        try:
+            return await app.DATABASE.tags.rename_tag_value(
+                organization_id=organization_id,
+                key=key,
+                old_value=old_value,
+                new_value=new_value,
+                context=context,
+            )
+        except IntegrityError:
+            if attempt == 0:
+                await asyncio.sleep(random.uniform(0.01, 0.05))
+                continue
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="Tag value rename conflicted with a concurrent update; please retry",
+            )
+    return None
+
+
 async def require_workflow_tagging(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
@@ -1916,8 +1954,9 @@ async def delete_tag_key(
     response_model=list[TagValue],
     tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "list_tag_values"},
-    description="List the palette color assigned to each grouped tag (key, value) for the organization. "
-    "The frontend joins these onto tags by (key, value).",
+    description="List the palette color and current workflow usage count for each grouped tag (key, value) "
+    "for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number "
+    "of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
     summary="List tag values",
     responses={200: {"description": "Successfully retrieved tag values"}},
 )
@@ -1928,7 +1967,16 @@ async def list_tag_values(
 ) -> list[TagValue]:
     organization_id = current_org.organization_id
     rows = await app.DATABASE.tags.list_tag_values(organization_id=organization_id)
-    return [TagValue(key=row.key, value=row.value, color=row.color) for row in rows]
+    counts = await app.DATABASE.tags.count_active_workflows_per_value(organization_id=organization_id)
+    return [
+        TagValue(
+            key=row.key,
+            value=row.value,
+            color=row.color,
+            workflow_count=counts.get((row.key, row.value), 0),
+        )
+        for row in rows
+    ]
 
 
 @legacy_base_router.patch("/tag-values/{key}", response_model=TagValue, tags=["agent"], include_in_schema=False)
@@ -1967,7 +2015,109 @@ async def update_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
-    return TagValue(key=row.key, value=row.value, color=row.color)
+    count = await app.DATABASE.tags.count_active_workflows_for_value(
+        organization_id=organization_id, key=row.key, value=row.value
+    )
+    return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=count)
+
+
+@legacy_base_router.patch("/tag-values/{key}/rename", response_model=TagValueRenameResponse, include_in_schema=False)
+@legacy_base_router.patch("/tag-values/{key}/rename/", response_model=TagValueRenameResponse, include_in_schema=False)
+@base_router.patch(
+    "/tag-values/{key}/rename",
+    response_model=TagValueRenameResponse,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "rename_tag_value"},
+    description="Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow "
+    "carrying the old label; the new label inherits the old color. Both values ride in the body so values "
+    "containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
+    summary="Rename tag value",
+    responses={
+        200: {"description": "Successfully renamed tag value"},
+        404: {"description": "Tag value not found"},
+        409: {"description": "Target value already exists for this key"},
+        422: {"description": "Invalid value"},
+    },
+)
+@base_router.patch("/tag-values/{key}/rename/", response_model=TagValueRenameResponse, include_in_schema=False)
+async def rename_tag_value(
+    key: str = Path(..., description="Tag key (group)", examples=["env"]),
+    data: TagValueRename = Body(...),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValueRenameResponse:
+    analytics.capture("skyvern-oss-tag-value-rename")
+    _validate_path_key(key)
+    context = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    try:
+        result = await _rename_tag_value_with_retry(
+            organization_id=caller.organization.organization_id,
+            key=key,
+            old_value=data.value,
+            new_value=data.new_value,
+            context=context,
+        )
+    except TagValueRenameCollision as e:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    if result is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Tag value '{key}:{data.value}' not found",
+        )
+    return TagValueRenameResponse(
+        key=result.key,
+        value=result.value,
+        color=result.color,
+        renamed_workflow_count=result.renamed_workflow_count,
+    )
+
+
+@legacy_base_router.delete("/tag-values/{key}", tags=["agent"], include_in_schema=False)
+@legacy_base_router.delete("/tag-values/{key}/", include_in_schema=False)
+@base_router.delete(
+    "/tag-values/{key}",
+    response_model=TagValueDeleteResponse,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "delete_tag_value"},
+    description="Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it "
+    "(cascade). The value rides in the body so values containing '/' stay addressable. Returns how many "
+    "workflows the label was removed from.",
+    summary="Delete tag value",
+    responses={
+        200: {"description": "Successfully deleted tag value"},
+        404: {"description": "Tag value not found"},
+    },
+)
+@base_router.delete("/tag-values/{key}/", response_model=TagValueDeleteResponse, include_in_schema=False)
+async def delete_tag_value(
+    key: str = Path(..., description="Tag key (group)", examples=["env"]),
+    data: TagValueDelete = Body(...),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValueDeleteResponse:
+    analytics.capture("skyvern-oss-tag-value-delete")
+    _validate_path_key(key)
+    context = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    removed_count = await app.DATABASE.tags.delete_tag_value(
+        organization_id=caller.organization.organization_id,
+        key=key,
+        value=data.value,
+        context=context,
+    )
+    if removed_count is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Tag value '{key}:{data.value}' not found",
+        )
+    return TagValueDeleteResponse(key=key, value=data.value, removed_from_workflow_count=removed_count)
 
 
 # Keep in sync with BATCH_TAGS_MAX_WPIDS in the frontend
@@ -4091,6 +4241,12 @@ async def get_workflows(
                 )
             else:
                 workflow_tags.append((tag_key, tag_value))
+
+    if workflow_tags and not await app.AGENT_FUNCTION.is_workflow_tagging_enabled(current_org.organization_id):
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Workflow tagging is not enabled for this organization.",
+        )
 
     if template and workflow_tags:
         # Templates are global; tags are org-scoped, so the two can't combine.

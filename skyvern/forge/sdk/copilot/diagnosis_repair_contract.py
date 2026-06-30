@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_FAILURE_TYPE
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
@@ -50,6 +51,7 @@ class DiagnosisFailureType(StrEnum):
     REPAIRABLE_BLOCK_FAILURE = "repairable_block_failure"
     ACTIVE_RUN_TERMINAL_EVIDENCE = "active_run_terminal_evidence"
     UNRECOVERABLE_TOOL_ERROR = "unrecoverable_tool_error"
+    SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
     UNKNOWN = "unknown"
 
 
@@ -189,6 +191,7 @@ def build_diagnosis_repair_contract(
     if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
         target_blocks = [repair_context.block_label]
     user_goal_satisfied, completion_contract_satisfied = _verification_satisfaction(
+        ctx,
         run_ok,
         suspicious,
         run_status,
@@ -234,6 +237,11 @@ def build_diagnosis_repair_contract(
         decision_summary = (
             "Stop the current retry loop: the active run reached the requested browser state, "
             "but the reusable workflow is not verified end-to-end."
+        )
+    elif failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY:
+        decision_summary = (
+            "Stop re-authoring: the edited extraction schema declares fields that map to no output the "
+            "workflow produces, so the mismatch is not repairable without user input."
         )
     completion_check = {
         RepairNextAction.NO_CHANGE: "Current run already satisfies the goal.",
@@ -343,15 +351,31 @@ def _repair_context_root_cause_identity(
         payload["selector"] = selector
         payload["refiner_selector"] = refiner_selector
         selector_kind = "selector" if selector else ""
+    elif reason_code == "runtime_block_failure":
+        runtime_failure_class = _safe_text(repair_context.runtime_failure_class, 80)
+        payload["runtime_failure_class"] = runtime_failure_class
+        payload["failed_block_status"] = _safe_text(repair_context.failed_block_status, 80)
+        payload["current_origin"] = _safe_text(repair_context.current_origin, 120)
+        payload["current_url_present"] = repair_context.current_url_present
+        payload["current_title_present"] = repair_context.current_title_present
+        payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
+        payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
+        payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
+        payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
+        payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
+        payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
     elif repair_context.unresolved_names:
         payload["unresolved_names"] = _safe_identity_list(repair_context.unresolved_names)
 
+    error_class_suffix = _identity_token(reason_code)
+    if reason_code == "runtime_block_failure" and repair_context.runtime_failure_class:
+        error_class_suffix = f"{error_class_suffix}_{_identity_token(repair_context.runtime_failure_class)}"
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return RepairRootCauseIdentity(
         root_cause_signature=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         primary_category=_AUTHORING_REPAIR_CATEGORY,
         failure_categories=(_AUTHORING_REPAIR_CATEGORY,),
-        error_class=f"code_authoring_{_identity_token(reason_code)}",
+        error_class=f"code_authoring_{error_class_suffix}",
         selector_kind=selector_kind,
         selector=selector,
     )
@@ -482,6 +506,8 @@ def _failure_type(
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     if _safe_str(data.get("failure_type")) == "missing_credential_or_init":
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    if _safe_str(data.get("failure_type")) == SCHEMA_INCOMPATIBILITY_FAILURE_TYPE:
+        return DiagnosisFailureType.SCHEMA_INCOMPATIBILITY
     if repair_context is not None:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if outcome_verified:
@@ -510,6 +536,8 @@ def _next_action(
     if failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
         return RepairNextAction.STOP
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
+        return RepairNextAction.STOP
+    if failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY:
         return RepairNextAction.STOP
     if ctx.last_test_non_retriable_nav_error:
         return RepairNextAction.STOP
@@ -585,6 +613,7 @@ def _last_test_anti_bot_is_terminal(ctx: CopilotContext, data: dict[str, Any]) -
 
 
 def _verification_satisfaction(
+    ctx: CopilotContext,
     run_ok: bool,
     suspicious: bool,
     run_status: str | None,
@@ -600,6 +629,8 @@ def _verification_satisfaction(
         return fully_satisfied, fully_satisfied
     if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
         return False, False
+    if outcome_fully_verified(ctx):
+        return True, True
     if (
         failure_type == DiagnosisFailureType.NO_FAILURE
         and completion_verification is not None

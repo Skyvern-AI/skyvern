@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -52,6 +53,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
     fake_app = SimpleNamespace(
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
+        AGENT_FUNCTION=SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
     )
     monkeypatch.setattr(cm, "app", fake_app)
 
@@ -98,6 +100,7 @@ async def _register_with_credential(monkeypatch: pytest.MonkeyPatch, credential:
     fake_app = SimpleNamespace(
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
+        AGENT_FUNCTION=SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
     )
     monkeypatch.setattr(cm, "app", fake_app)
 

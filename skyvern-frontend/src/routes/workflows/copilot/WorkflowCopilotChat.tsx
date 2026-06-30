@@ -14,7 +14,7 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
-  ChevronRightIcon,
+  ChevronLeftIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
@@ -336,6 +336,7 @@ interface WorkflowCopilotChatProps {
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
+  workflowRunId?: string | null;
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
@@ -411,6 +412,7 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
   liveBrowserSessionId,
+  workflowRunId: workflowRunIdProp,
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
@@ -565,7 +567,11 @@ export function WorkflowCopilotChat({
     posY: 0,
   });
   const credentialGetter = useCredentialGetter();
-  const { workflowRunId, workflowPermanentId } = useParams();
+  const { workflowRunId: routeWorkflowRunId, workflowPermanentId } =
+    useParams();
+  // The studio focuses a run via ?wr= (not a path param), so the route param is
+  // empty there; an explicit prop grounds the chat in that run and wins.
+  const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -1293,6 +1299,7 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
             max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
             max_elapsed_time_minutes:
@@ -1326,6 +1333,12 @@ export function WorkflowCopilotChat({
           pendingSubmitSnapshot.current = {
             ...saveData.workflow,
             title: saveData.title,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            browser_profile_id: saveData.settings.browserProfileId,
+            browser_profile_key: saveData.settings.browserProfileKey,
+            model: saveData.settings.model,
             workflow_definition: {
               ...saveData.workflow.workflow_definition,
               parameters: saveData.parameters,
@@ -1785,7 +1798,12 @@ export function WorkflowCopilotChat({
     if (!initialMessage || hasAutoSentRef.current) {
       return;
     }
-    if (isLoadingHistory || isWaitingForLiveBrowser || queuedPrompt) {
+    if (
+      isLoadingHistory ||
+      isLoading ||
+      isWaitingForLiveBrowser ||
+      queuedPrompt
+    ) {
       return;
     }
     const saveData = getSaveData();
@@ -1809,6 +1827,7 @@ export function WorkflowCopilotChat({
   }, [
     initialMessage,
     isLoadingHistory,
+    isLoading,
     isWaitingForLiveBrowser,
     queuedPrompt,
     getSaveData,
@@ -2045,7 +2064,7 @@ export function WorkflowCopilotChat({
                 className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                 title="Collapse Copilot"
               >
-                <ChevronRightIcon className="h-4 w-4" />
+                <ChevronLeftIcon className="h-4 w-4" />
               </button>
             ) : null
           ) : (

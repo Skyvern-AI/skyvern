@@ -11,6 +11,7 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
+import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,7 +43,7 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { studioPanelId, studioTabId } from "./constants";
-import { runOutcomeFromStatus } from "./runProjections";
+import { finalizedRunStatus, runOutcomeFromStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
 
 function useIsGlobalWorkflow(): boolean {
@@ -79,7 +80,7 @@ function GeneratingCodeIndicator() {
 
   return (
     <span
-      className="inline-flex items-center gap-2 rounded-md bg-slate-elevation3 px-3 py-1.5 text-sm font-medium text-muted-foreground"
+      className="inline-flex h-9 items-center gap-2 rounded-md bg-slate-elevation3 px-3 text-sm font-medium text-muted-foreground"
       title="Generating cached code for this run"
     >
       <ReloadIcon className="size-4 animate-spin" />
@@ -103,18 +104,9 @@ function StudioTabs() {
   });
   const latestRun = runs?.[0];
   const hasRun = Boolean(urlRunId) || (runs?.length ?? 0) > 0;
-  const outcome = runOutcomeFromStatus(
+  const runStatus = finalizedRunStatus(
     urlRunId ? urlRun?.status : latestRun?.status,
   );
-
-  const runBadge =
-    outcome === "running"
-      ? { label: "live", cls: "bg-studio-accent/20 text-studio-accent-2" }
-      : outcome === "failed"
-        ? { label: "failed", cls: "bg-destructive/20 text-destructive" }
-        : outcome === "success"
-          ? { label: "passed", cls: "bg-success/20 text-success" }
-          : null;
 
   const tabs: Array<{ id: StudioTab; label: string; disabled: boolean }> = [
     { id: "editor", label: "Editor", disabled: false },
@@ -171,22 +163,20 @@ function StudioTabs() {
               "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
               selected
-                ? "bg-studio-accent/15 text-studio-accent-2 ring-1 ring-inset ring-studio-accent/40"
+                ? "bg-studio-accent/15 text-foreground ring-1 ring-inset ring-studio-accent/40"
                 : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
               t.disabled &&
                 "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
             )}
           >
             {t.label}
-            {t.id === "run" && runBadge ? (
-              <span
-                className={cn(
-                  "rounded px-1.5 py-0.5 text-[10px] font-semibold",
-                  runBadge.cls,
-                )}
-              >
-                {runBadge.label}
-              </span>
+            {t.id === "run" && runStatus ? (
+              <StatusBadge
+                status={runStatus}
+                alwaysShowLabel
+                // overrides StatusBadge's md:px-2.5 to keep the chip compact in the tab bar
+                className="h-5 gap-1 px-1.5 py-0 text-[10px] md:w-auto md:px-1.5"
+              />
             ) : null}
           </button>
         );
@@ -255,9 +245,13 @@ function PanelToggle({
   return (
     <Button
       variant="tertiary"
-      size={icon ? "icon" : "lg"}
-      className={icon ? "size-9" : undefined}
+      size={icon ? "icon" : "default"}
       disabled={isRecording}
+      aria-pressed={isOpen}
+      className={cn(
+        isOpen &&
+          "border-studio-accent/40 bg-studio-accent/15 text-foreground hover:bg-studio-accent/20",
+      )}
       onClick={() => (isOpen ? close() : setState({ active: true, content }))}
       title={label}
       aria-label={label}
@@ -314,7 +308,7 @@ function RunStopButton() {
         <DialogTrigger asChild>
           <Button
             variant="destructive"
-            size="lg"
+            size="default"
             disabled={cancelRun.isPending || isRecording}
           >
             {cancelRun.isPending ? (
@@ -349,8 +343,7 @@ function RunStopButton() {
   }
   return (
     <Button
-      size="lg"
-      className="bg-studio-accent text-studio-accent-foreground hover:bg-studio-accent/90"
+      size="default"
       disabled={isRecording}
       onClick={() => navigate(`/workflows/${workflowPermanentId}/run`)}
     >
@@ -364,23 +357,28 @@ export function StudioTopBar() {
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow} />
+      <div className="h-6 w-px bg-border" aria-hidden />
       <StudioTabs />
       <div className="flex-1" />
       <GeneratingCodeIndicator />
       {isGlobalWorkflow ? (
         <MakeACopyButton />
       ) : (
-        <div data-tour="editor-actions" className="flex items-center gap-3">
-          <SaveButton />
-          <PanelToggle
-            content="schedules"
-            label="Schedule"
-            icon={<CalendarIcon className="size-5" />}
-          />
-          <EditorOverflowMenu />
-          <div className="mx-1 h-6 w-px bg-border" />
-          <PanelToggle content="parameters" label="Inputs" />
-          <RunStopButton />
+        <div data-tour="editor-actions" className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
+            <SaveButton />
+            <PanelToggle
+              content="schedules"
+              label="Schedule"
+              icon={<CalendarIcon className="size-5" />}
+            />
+            <EditorOverflowMenu triggerClassName="size-9" />
+          </div>
+          <div className="h-6 w-px bg-border" aria-hidden />
+          <div className="flex items-center gap-2">
+            <PanelToggle content="parameters" label="Inputs" />
+            <RunStopButton />
+          </div>
         </div>
       )}
     </div>

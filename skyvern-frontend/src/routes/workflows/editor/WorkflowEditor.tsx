@@ -1,7 +1,6 @@
 import { ReactFlowProvider } from "@xyflow/react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { useEffect } from "react";
-import { usePostHog } from "posthog-js/react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
@@ -16,11 +15,10 @@ import { ProductTour } from "@/components/onboarding/ProductTour";
 import { useProductTourShortcut } from "@/hooks/useProductTourShortcut";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
-  const [searchParams] = useSearchParams();
-  const posthog = usePostHog();
   const studioEnabled = useWorkflowStudioEnabled();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -39,12 +37,7 @@ function WorkflowEditor() {
 
   useMountEffect(() => blockOutputStore.reset());
 
-  useMountEffect(() => {
-    const via = searchParams.get("via");
-    if (via) {
-      posthog?.capture("copilot.discover.started", { entry_point: via });
-    }
-  });
+  useViaEntryPointCapture();
 
   useEffect(() => {
     if (workflow) {
@@ -78,6 +71,7 @@ function WorkflowEditor() {
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
     browserProfileId: workflow.browser_profile_id ?? null,
+    browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,

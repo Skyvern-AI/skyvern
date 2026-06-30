@@ -22,7 +22,10 @@ from typing import Any
 
 import pytest
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    maybe_clear_blocker_signal_on_tool_success,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -35,6 +38,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
+    MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
     MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES,
     POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     POST_FAILED_TEST_NUDGE,
@@ -52,6 +56,8 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _prune_input_list,
     _recover_from_context_overflow,
     _strip_input_images,
+    register_no_progress_interaction_click,
+    reset_no_progress_interaction_count,
 )
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
@@ -511,3 +517,146 @@ def test_credential_priority_churn_defers_to_repair_ceiling() -> None:
     signal = ctx.blocker_signal
     assert isinstance(signal, CopilotToolBlockerSignal)
     assert signal.internal_reason_code == "repair_ceiling_reached"
+
+
+def test_no_progress_interaction_floor_raises_at_ceiling() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "loop_detected_no_forward_progress_interaction"
+    assert signal.renders_final_reply is True
+    assert signal.recovery_hint == "report_blocker_to_user"
+
+
+def test_no_progress_interaction_floor_does_not_raise_below_ceiling() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
+
+    assert _check_enforcement(ctx) is None
+    assert ctx.blocker_signal is None
+
+
+def test_no_progress_interaction_floor_defers_to_repair_ceiling() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+    ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.REPAIR_CEILING_REACHED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "repair_ceiling_reached"
+
+
+def test_no_progress_interaction_floor_yields_to_non_retriable_nav_error() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+    ctx.last_test_ok = False
+    ctx.last_test_non_retriable_nav_error = (
+        "Failed to navigate to url https://does-not-resolve.example. Error message: net::ERR_NAME_NOT_RESOLVED"
+    )
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge is not None
+    assert ctx.blocker_signal is None
+    with pytest.raises(CopilotNonRetriableNavError):
+        _maybe_raise_non_retriable_nav(ctx)
+
+
+def test_register_no_progress_interaction_click_stashes_blocker_at_cap() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
+
+    register_no_progress_interaction_click(ctx, outcome="click_failed")
+
+    assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "loop_detected_no_forward_progress_interaction"
+
+
+def test_register_no_progress_interaction_click_below_cap_does_not_stash() -> None:
+    ctx = _fresh_context()
+
+    register_no_progress_interaction_click(ctx, outcome="hollow")
+
+    assert ctx.consecutive_no_progress_interaction_count == 1
+    assert ctx.blocker_signal is None
+
+
+def test_register_no_progress_interaction_click_defers_to_terminal_held_blocker() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
+    terminal = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="The repair made no progress.",
+        user_facing_reason="I couldn't get past the same problem after several attempts.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="repair_ceiling_reached",
+        blocked_tool="update_and_run_blocks",
+    )
+    ctx.blocker_signal = terminal
+
+    register_no_progress_interaction_click(ctx, outcome="click_failed")
+
+    assert ctx.blocker_signal is terminal
+
+
+def test_reset_no_progress_interaction_count_clears_counter() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = 3
+
+    reset_no_progress_interaction_count(ctx)
+
+    assert ctx.consecutive_no_progress_interaction_count == 0
+
+
+def _hit_no_progress_cap(ctx: CopilotContext) -> CopilotToolBlockerSignal:
+    for _ in range(MAX_NO_PROGRESS_INTERACTION_ATTEMPTS):
+        register_no_progress_interaction_click(ctx, outcome="hollow")
+    held = ctx.blocker_signal
+    assert isinstance(held, CopilotToolBlockerSignal)
+    assert held.internal_reason_code == "loop_detected_no_forward_progress_interaction"
+    assert held.renders_final_reply is True
+    return held
+
+
+def test_no_progress_reset_clears_held_blocker_after_cap() -> None:
+    ctx = _fresh_context()
+    _hit_no_progress_cap(ctx)
+
+    reset_no_progress_interaction_count(ctx)
+
+    assert ctx.consecutive_no_progress_interaction_count == 0
+    assert ctx.blocker_signal is None
+    assert ctx.latest_tool_blocker_signal is None
+
+
+def test_no_progress_reset_at_progress_seam_stops_re_halt() -> None:
+    ctx = _fresh_context()
+    _hit_no_progress_cap(ctx)
+
+    reset_no_progress_interaction_count(ctx)
+
+    assert ctx.consecutive_no_progress_interaction_count == 0
+    assert ctx.blocker_signal is None
+    assert _check_enforcement(ctx) is None
+
+
+@pytest.mark.parametrize("recovery_tool", ["evaluate", "inspect_page_for_composition"])
+def test_no_progress_held_blocker_survives_progress_tool_success(recovery_tool: str) -> None:
+    ctx = _fresh_context()
+    held = _hit_no_progress_cap(ctx)
+
+    maybe_clear_blocker_signal_on_tool_success(ctx, recovery_tool)
+
+    assert ctx.blocker_signal is held

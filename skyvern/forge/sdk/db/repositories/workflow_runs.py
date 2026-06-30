@@ -264,6 +264,7 @@ class WorkflowRunsRepository(BaseRepository):
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        proxy_location: ProxyLocationInput | object = _UNSET,
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
@@ -327,6 +328,10 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.verification_code_polling_started_at = None
                 if browser_profile_id is not _UNSET:
                     workflow_run.browser_profile_id = browser_profile_id
+                if proxy_location is not _UNSET:
+                    workflow_run.proxy_location = serialize_proxy_location(
+                        typing_cast(ProxyLocationInput, proxy_location)
+                    )
                 if failure_category is not None:
                     workflow_run.failure_category = failure_category
                 # Explicit timestamp overrides (used when resetting workflow runs)

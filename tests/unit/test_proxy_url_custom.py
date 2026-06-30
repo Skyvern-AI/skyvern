@@ -1,7 +1,10 @@
 import pytest
+from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_proxy_location
+from skyvern.forge.sdk.schemas.browser_profiles import UpdateBrowserProfileRequest
+from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_proxy_url, _redact_url_query
 
@@ -77,6 +80,12 @@ def test_proxy_location_db_round_trip_custom_url() -> None:
     serialized = serialize_proxy_location(original)
     assert serialized is not None
     assert deserialize_proxy_location(serialized) == original
+
+
+@pytest.mark.parametrize("request_model", [UpdateCredentialRequest, UpdateBrowserProfileRequest])
+def test_proxy_pin_requests_reject_custom_proxy_urls(request_model: type) -> None:
+    with pytest.raises(ValidationError, match="Custom proxy URLs are not supported"):
+        request_model(proxy_location={"url": "http://user:pass@proxy.example.com:8080"})
 
 
 def test_proxy_location_db_round_trip_geo_target() -> None:

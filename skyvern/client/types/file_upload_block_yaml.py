@@ -33,6 +33,8 @@ class FileUploadBlockYaml(UniversalBaseModel):
     azure_storage_account_key: typing.Optional[str] = None
     azure_blob_container_name: typing.Optional[str] = None
     azure_folder_path: typing.Optional[str] = None
+    google_credential_id: typing.Optional[str] = None
+    google_drive_folder_id: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:

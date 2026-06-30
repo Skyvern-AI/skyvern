@@ -14,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection degrades gracefully.
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.reached_download_target import (
     NAV_TARGET_DOWNLOAD_KIND_KEY,
@@ -52,6 +53,7 @@ _MAX_MODAL_OVERLAYS = 5
 _MAX_MODAL_DISMISS_CONTROLS = 6
 _MAX_PAGE_OBSTRUCTIONS = 5
 _MAX_VISIBLE_CONTROLS = 6
+_MAX_CLICKABLE_CONTROLS = 12
 _MODAL_IDENTITY_PATTERNS: frozenset[str] = frozenset({"modal", "popup", "overlay", "dialog", "drawer", "lightbox"})
 _MODAL_ROLE_VALUES: frozenset[str] = frozenset({"dialog", "alertdialog"})
 _MODAL_DISMISS_HINTS: frozenset[str] = frozenset(
@@ -635,6 +637,17 @@ def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
     return evidence.get("observed_empty_page") is True
 
 
+def has_actionable_steer_content(evidence: dict[str, Any]) -> bool:
+    """Steer gate wider than has_bounded_page_schema: it also passes pages whose only
+    affordances are standalone clickable controls, which stay steer-able yet must never
+    feed has_bounded_page_schema or the no-progress reset.
+    """
+    if has_bounded_page_schema(evidence):
+        return True
+    clickable_controls = evidence.get("clickable_controls")
+    return isinstance(clickable_controls, list) and bool(clickable_controls)
+
+
 def _is_scout_interaction_evidence(evidence: dict[str, Any]) -> bool:
     # A scout interaction that resolved a concrete selector proves the page rendered
     # and the element was actionable, so it is non-hollow evidence of the reached
@@ -1118,6 +1131,7 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "forms": [],
         "navigation_targets": [],
         "result_containers": [],
+        **_clickable_controls_channel([]),
         "visible_text_excerpt": "",
         "anti_bot_indicators": [],
         "challenge_controls": [],
@@ -1295,6 +1309,87 @@ def _selector_for(node: Any) -> str:
     if class_selector:
         return f"{tag_name}{class_selector}"
     return str(tag_name)
+
+
+def _clickable_controls_channel(controls: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if not settings.COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED:
+        return {}
+    return {"clickable_controls": controls or []}
+
+
+def _clickable_control_selector(node: Any) -> str:
+    """Build a selector for a standalone clickable control, preferring attributes _selector_for
+    never emits (data-action/aria-label) so a tile authored against [data-action=...] can be grounded."""
+    tag_name = getattr(node, "name", None) or "*"
+    node_id = _attr_value(node, "id")
+    if node_id:
+        return f"#{node_id}"
+    data_action = _attr_value(node, "data-action")
+    if data_action:
+        return f'{tag_name}[data-action="{_css_attr(data_action)}"]'
+    aria_label = _attr_value(node, "aria-label")
+    if aria_label:
+        return f'{tag_name}[aria-label="{_css_attr(aria_label)}"]'
+    node_name = _attr_value(node, "name")
+    node_value = _attr_value(node, "value")
+    if node_name and node_value:
+        return f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]'
+    class_selector = _class_selector(_classes_for(node))
+    if class_selector:
+        return f"{tag_name}{class_selector}"
+    return ""
+
+
+def _clickable_control_text(node: Any) -> str:
+    for value in (
+        _node_text(node),
+        _attr_value(node, "aria-label"),
+        _attr_value(node, "value"),
+        _attr_value(node, "title"),
+    ):
+        if value:
+            return value
+    return ""
+
+
+def _selector_is_live_unique_in_soup(soup: Any, selector: str) -> bool:
+    if not selector:
+        return False
+    try:
+        return len(soup.select(selector)) == 1
+    except Exception:
+        return False
+
+
+def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    seen_selectors = set(used_selectors)
+    seen_text: set[str] = set()
+    try:
+        candidates = soup.select('button, [role="button"], [data-action]')
+    except Exception:
+        candidates = soup.find_all("button")
+    for node in candidates:
+        if len(controls) >= _MAX_CLICKABLE_CONTROLS:
+            break
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if tag_name in {"script", "style", "noscript"}:
+            continue
+        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
+            continue
+        text = _schema_text(_clickable_control_text(node), 120)
+        selector = _clickable_control_selector(node)
+        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
+            controls.append({"text": text, "selector": selector[:160], "tag": tag_name})
+            seen_selectors.add(selector)
+            if text:
+                seen_text.add(text)
+            continue
+        if not text or text in seen_text:
+            continue
+        controls.append({"text": text, "tag": tag_name})
+        seen_text.add(text)
+    return controls
 
 
 def _adjacent_text(field: Any) -> str:
@@ -1716,6 +1811,18 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         if tag_name == "table" or any(hint in result_identity for hint in _RESULT_CONTAINER_HINTS):
             result_containers.append(_result_container_entry(node))
 
+    used_selectors: set[str] = set()
+    for form in forms:
+        for control in form.get("submit_controls") or []:
+            selector = control.get("selector")
+            if isinstance(selector, str) and selector:
+                used_selectors.add(selector)
+    for target in navigation_targets:
+        selector = target.get("selector")
+        if isinstance(selector, str) and selector:
+            used_selectors.add(selector)
+    clickable_controls = _clickable_controls_html(soup, used_selectors=used_selectors)
+
     field_count = sum(len(form.get("fields") or []) for form in forms)
     control_count = sum(len(form.get("submit_controls") or []) for form in forms)
     body_text = _node_text(soup.body if soup.body is not None else soup).strip()
@@ -1737,6 +1844,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        **_clickable_controls_channel(clickable_controls),
         "visible_text_excerpt": _schema_text(visible_text, _MAX_VISIBLE_TEXT_EXCERPT_CHARS),
         "anti_bot_indicators": anti_bot_indicators,
         "challenge_controls": challenge_controls,
@@ -1905,6 +2013,28 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
     return containers
 
 
+def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return controls
+    for item in value[:_MAX_CLICKABLE_CONTROLS]:
+        if not isinstance(item, dict):
+            continue
+        text = _schema_text(_structured_str(item.get("text")), 120)
+        selector = _structured_str(item.get("selector"))[:160]
+        entry: dict[str, Any] = {}
+        if text:
+            entry["text"] = text
+        if selector:
+            entry["selector"] = selector
+        tag = (_structured_str(item.get("tag")) or "").lower()[:40]
+        if tag:
+            entry["tag"] = tag
+        if entry.get("selector") or entry.get("text"):
+            controls.append(entry)
+    return controls
+
+
 def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     if not isinstance(value, list):
@@ -2004,6 +2134,7 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
     forms = forms[:_MAX_FORMS]
     navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
     result_containers = _structured_result_containers(data.get("result_containers"))
+    clickable_controls = _structured_clickable_controls(data.get("clickable_controls"))
     challenge_controls = _structured_challenge_controls(data.get("challenge_controls"))
     modal_overlays = _structured_modal_overlays(data.get("modal_overlays"))
     page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
@@ -2035,6 +2166,7 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        **_clickable_controls_channel(clickable_controls),
         "visible_text_excerpt": visible_text,
         "anti_bot_indicators": anti_bot_indicators,
         "challenge_controls": challenge_controls,

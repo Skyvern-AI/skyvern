@@ -18,6 +18,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
+from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -38,7 +39,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
@@ -51,6 +52,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
 
@@ -92,6 +94,21 @@ class TOTPVerificationResponse:
     status_code: int
     body: str
     headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CopilotAliasResolution:
+    url: str
+    kind: str = "canonical_alias"
+
+
+@dataclass(frozen=True)
+class FieldOptionResolution:
+    matched_index: int | None
+    matched_label: str | None
+    matched_value: str | None
+    confidence: float
+    fallback_to_llm: bool
 
 
 def _remove_rect(element: dict) -> None:
@@ -660,6 +677,26 @@ class AgentFunction:
     workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the API process should run the built-in local scheduler loop."""
 
+    def build_proxy_session_extra_http_headers(self, proxy_session_id: str | None) -> dict[str, str] | None:
+        return None
+
+    def has_proxy_session_extra_http_headers(self, extra_http_headers: dict[str, str] | None) -> bool:
+        return False
+
+    def merge_proxy_session_extra_http_headers(
+        self,
+        extra_http_headers: dict[str, str] | None,
+        proxy_session_id: str | None,
+    ) -> dict[str, str] | None:
+        proxy_session_headers = self.build_proxy_session_extra_http_headers(proxy_session_id)
+        if not proxy_session_headers:
+            return extra_http_headers
+
+        headers = dict(extra_http_headers or {})
+        for key, value in proxy_session_headers.items():
+            headers.setdefault(key, value)
+        return headers
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 
@@ -698,6 +735,45 @@ class AgentFunction:
         workflow_run: "WorkflowRun",
     ) -> bool:
         return True
+
+    async def should_use_codeblock_runner(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: "WorkflowRunContext",
+        organization_id: str | None,
+        block_label: str | None,
+        browser_session_id: str | None,
+    ) -> bool:
+        """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
+
+        Gating lives here, at the block-execution call site, rather than inside
+        execute_code_block_override so the override only runs the runner. OSS has no
+        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
+        only routes runs that have a browser session for the runner to broker against.
+        """
+        return False
+
+    async def execute_code_block_override(
+        self,
+        *,
+        block: Any,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        workflow_run_context: "WorkflowRunContext",
+        parameter_values: dict[str, Any],
+        credential_parameter_keys: set[str],
+    ) -> Any | None:
+        """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
+
+        OSS no-op returns None so callers fall through to in-process execution. Cloud
+        overrides to dispatch to the runner. Callers must gate on
+        should_use_codeblock_runner first.
+        """
+        return None
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
@@ -841,6 +917,13 @@ class AgentFunction:
         feature_names: set[str] | None = None,
     ) -> None:
         return
+
+    async def parse_enterprise_totp_secret(
+        self,
+        totp_secret: str,
+        organization_id: str | None = None,
+    ) -> str | None:
+        return None
 
     async def prepare_step_execution(
         self,
@@ -1328,7 +1411,7 @@ class AgentFunction:
         organization_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Upload a single file to customer-specified S3 or Azure storage.
+        """Upload a single file to customer-specified cloud storage.
 
         Returns the customer-facing URI (``destination.customer_uri``).  The
         cloud override routes NAT-org traffic through the egress proxy so it
@@ -1364,6 +1447,16 @@ class AgentFunction:
             await azure_client.upload_file_from_path(destination.sdk_uri, file_path)
             return destination.customer_uri
 
+        if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not destination.google_access_token or not destination.google_drive_folder_id:
+                raise ValueError("Google Drive destination is missing required fields")
+            uploaded_file = await google_drive_service.upload_file(
+                access_token=destination.google_access_token,
+                file_path=file_path,
+                folder_id=destination.google_drive_folder_id,
+            )
+            return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
+
         raise ValueError(f"Unsupported storage type: {destination.storage_type}")
 
     @staticmethod
@@ -1388,6 +1481,14 @@ class AgentFunction:
         OSS returns empty string (no hardening).
         """
         return ""
+
+    def resolve_copilot_entrypoint_alias(
+        self,
+        *,
+        site_or_url: str,
+        normalized_alias: str,
+    ) -> CopilotAliasResolution | None:
+        return None
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
@@ -1497,6 +1598,41 @@ class AgentFunction:
         Override in cloud to inject platform-specific passes.
         """
         return None
+
+    async def resolve_field_option(
+        self,
+        *,
+        target_value: str,
+        option_labels: list[str],
+        option_values: list[str | None],
+        field_context: Any,
+        url: str | None,
+        organization_id: str | None,
+    ) -> FieldOptionResolution:
+        """Resolve a requested field value against option labels.
+
+        Only high-precision exact or whole-stem singular/plural matches are
+        resolvable. A ``None`` match or ``fallback_to_llm=True`` means the
+        caller must defer to the LLM path.
+        """
+        matched_index = match_option_exact_or_stem(target_value, option_labels)
+        if matched_index is None:
+            return FieldOptionResolution(
+                matched_index=None,
+                matched_label=None,
+                matched_value=None,
+                confidence=0.0,
+                fallback_to_llm=True,
+            )
+
+        matched_value = option_values[matched_index] if matched_index < len(option_values) else None
+        return FieldOptionResolution(
+            matched_index=matched_index,
+            matched_label=option_labels[matched_index],
+            matched_value=matched_value,
+            confidence=1.0,
+            fallback_to_llm=False,
+        )
 
     async def fill_custom_widget(
         self,

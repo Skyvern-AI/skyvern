@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_serializer, field_validator, model_
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
@@ -502,6 +503,7 @@ class PDFFormat(StrEnum):
 class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
 
 
 class FileUploadDestination(BaseModel):
@@ -526,6 +528,9 @@ class FileUploadDestination(BaseModel):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_blob_name: str | None = None
+
+    google_access_token: str | None = None
+    google_drive_folder_id: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -905,6 +910,8 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
     path: str | None = None
 
 
@@ -1299,6 +1306,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_identifier: str | None = None
     persist_browser_session: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
@@ -1326,6 +1334,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_profile_key", mode="before")
+    @classmethod
+    def _normalize_browser_profile_key(cls, v: str | None) -> str | None:
+        return validate_browser_profile_key(v)
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:

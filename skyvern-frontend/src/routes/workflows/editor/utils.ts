@@ -21,6 +21,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
             key: parameter.key,
             parameterType: WorkflowEditorParameterTypes.Credential,
             credentialId: parameter.default_value as string,
+            dataType: WorkflowParameterValueType.CredentialId,
             description: parameter.description,
           };
         }

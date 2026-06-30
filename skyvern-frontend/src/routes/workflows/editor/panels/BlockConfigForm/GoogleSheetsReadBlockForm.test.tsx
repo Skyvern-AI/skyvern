@@ -161,6 +161,11 @@ vi.mock("@/routes/workflows/components/SheetTabCombobox", () => ({
 }));
 
 vi.mock("@/hooks/useGoogleOAuthCredentials", () => ({
+  GOOGLE_SHEETS_REQUIRED_SCOPES: [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+  ],
   useGoogleOAuthCredentials: () => ({
     credentials: [{ id: "cred_42", valid: true }],
     isLoading: false,

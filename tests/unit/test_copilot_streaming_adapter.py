@@ -11,7 +11,7 @@ from agents.items import RunItem
 from agents.stream_events import RunItemStreamEvent
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.streaming_adapter import _sanitize_input, stream_to_sse
+from skyvern.forge.sdk.copilot.streaming_adapter import _sanitize_input, _update_enforcement_from_tool, stream_to_sse
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 
 
@@ -644,6 +644,7 @@ class TestEnforcementStateUpdates:
         ctx.post_update_nudge_count = 0
         ctx.navigate_called = False
         ctx.observation_after_navigate = False
+        ctx.synthesized_block_reopened_after_failed_run = False
         return ctx
 
     def test_update_workflow_sets_flags(self) -> None:
@@ -681,6 +682,16 @@ class TestEnforcementStateUpdates:
         )
         assert ctx.update_workflow_called is True
         assert ctx.test_after_update_done is True
+
+    def test_persisted_blocks_clear_reopened_synthesized_offer_latch(self) -> None:
+        ctx = self._make_ctx()
+        ctx.synthesized_block_reopened_after_failed_run = True
+        _update_enforcement_from_tool(
+            ctx,
+            "update_and_run_blocks",
+            {"ok": False, "data": {"block_count": 2}},
+        )
+        assert ctx.synthesized_block_reopened_after_failed_run is False
 
     def test_navigate_sets_flags(self) -> None:
         from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool

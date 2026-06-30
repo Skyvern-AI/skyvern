@@ -71,6 +71,10 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.browser_profile_key import (
+    build_workflow_browser_session_storage_key,
+    render_browser_profile_key,
+)
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     WorkflowVersionConflict,
@@ -129,6 +133,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
+    ProxyLocation,
     ProxyLocationInput,
     RunStatus,
     RunType,
@@ -616,6 +621,7 @@ class WorkflowService:
         cached_groups: list[CachedScriptBlocks] = []
         published_groups: list[CachedScriptBlocks] = []
         target_labels = set(block_labels_to_disable)
+        seen_group_keys: set[tuple[ScriptStatus | str, str, tuple[str, ...]]] = set()
 
         scripts_by_id = await app.DATABASE.scripts.get_latest_scripts_by_ids(
             organization_id=organization_id,
@@ -638,6 +644,15 @@ class WorkflowService:
             if not blocks_to_clear:
                 continue
 
+            group_key = (
+                candidate.status,
+                script.script_revision_id,
+                tuple(block.script_block_id for block in blocks_to_clear),
+            )
+            if group_key in seen_group_keys:
+                continue
+            seen_group_keys.add(group_key)
+
             group = CachedScriptBlocks(workflow_script=candidate, script=script, blocks_to_clear=blocks_to_clear)
             if candidate.status == ScriptStatus.published:
                 published_groups.append(group)
@@ -656,30 +671,33 @@ class WorkflowService:
         groups: Sequence[CachedScriptBlocks],
     ) -> None:
         """Remove cached run signatures for the supplied block groups to force regeneration."""
-        for group in groups:
-            for block in group.blocks_to_clear:
-                await app.DATABASE.scripts.update_script_block(
-                    script_block_id=block.script_block_id,
-                    organization_id=organization_id,
-                    clear_run_signature=True,
-                )
+        blocks_by_id = {block.script_block_id: block for group in groups for block in group.blocks_to_clear}
+        if not blocks_by_id:
+            return
 
-            LOG.info(
-                "Cleared cached script blocks after workflow block change",
-                workflow_id=workflow.workflow_id,
-                workflow_permanent_id=previous_workflow.workflow_permanent_id,
-                organization_id=organization_id,
-                previous_version=previous_workflow.version,
-                new_version=workflow.version,
-                invalidate_reason=plan.reason,
-                invalidate_label=plan.label,
-                invalidate_index_prev=plan.previous_index,
-                invalidate_index_new=plan.new_index,
-                script_id=group.script.script_id,
-                script_revision_id=group.script.script_revision_id,
-                cleared_block_labels=[block.script_block_label for block in group.blocks_to_clear],
-                cleared_block_count=len(group.blocks_to_clear),
-            )
+        cleared_count = await app.DATABASE.scripts.clear_script_block_run_signatures(
+            organization_id=organization_id,
+            script_block_ids=list(blocks_by_id),
+        )
+
+        LOG.info(
+            "Cleared cached script blocks after workflow block change",
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=previous_workflow.workflow_permanent_id,
+            organization_id=organization_id,
+            previous_version=previous_workflow.version,
+            new_version=workflow.version,
+            invalidate_reason=plan.reason,
+            invalidate_label=plan.label,
+            invalidate_index_prev=plan.previous_index,
+            invalidate_index_new=plan.new_index,
+            cached_group_count=len(groups),
+            script_count=len({group.script.script_id for group in groups}),
+            script_revision_count=len({group.script.script_revision_id for group in groups}),
+            cleared_block_labels=list(dict.fromkeys(block.script_block_label for block in blocks_by_id.values())),
+            cleared_block_count=cleared_count,
+            deduped_block_count=len(blocks_by_id),
+        )
 
     @staticmethod
     def _collect_extracted_information(value: Any) -> list[Any]:
@@ -1233,6 +1251,14 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
 
+                browser_profile_key = getattr(workflow, "browser_profile_key", None)
+                if getattr(workflow, "persist_browser_session", False) and browser_profile_key:
+                    await self.get_workflow_browser_session_storage_key(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        parameter_values={param.key: value for param, value in workflow_parameter_values},
+                    )
+
                 await self._validate_credential_ids(
                     [
                         value
@@ -1300,6 +1326,51 @@ class WorkflowService:
         if isinstance(error, IntegrityError):
             return "value cannot be null"
         return "database error while saving parameter value"
+
+    async def get_workflow_browser_session_storage_key(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any] | None = None,
+    ) -> str:
+        if not workflow.browser_profile_key:
+            return workflow.workflow_permanent_id
+
+        if parameter_values is None:
+            try:
+                parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                parameter_values = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+            except Exception as exc:
+                raise SkyvernHTTPException(
+                    message=("Failed to read workflow run parameters while resolving the browser profile segment key")
+                ) from exc
+
+        try:
+            rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
+        except Exception as exc:
+            raise SkyvernHTTPException(
+                message=f"Failed to render browser profile segment key: {get_user_facing_exception_message(exc)}"
+            ) from exc
+
+        if not rendered_key:
+            raise MissingValueForParameter(
+                parameter_key=workflow.browser_profile_key,
+                workflow_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
+        storage_key = build_workflow_browser_session_storage_key(workflow.workflow_permanent_id, rendered_key)
+        LOG.info(
+            "Resolved workflow browser session storage key",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_profile_key=workflow.browser_profile_key,
+            storage_key=storage_key,
+        )
+        return storage_key
 
     @staticmethod
     def _is_schedule_input_parameter(workflow_parameter: Any) -> bool:
@@ -2738,6 +2809,12 @@ class WorkflowService:
             )
 
             if block.block_type == BlockType.LOGIN:
+                await self._apply_login_block_credential_proxy_pin(
+                    block=block,
+                    workflow_run=workflow_run,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
                 resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
                     block=block,
                     workflow_run_id=workflow_run_id,
@@ -3427,10 +3504,60 @@ class WorkflowService:
         # so it must not reuse (and boot read-only from) the credential's saved profile.
         if isinstance(block, LoginBlock) and block.skip_saved_profile:
             return None
+        credential_ids = await self._resolve_login_block_credential_ids(
+            block=block,
+            workflow_run_id=workflow_run_id,
+        )
+
+        for credential_id in credential_ids:
+            if not organization_id:
+                continue
+            try:
+                db_cred = await app.DATABASE.credentials.get_credential(
+                    credential_id=credential_id,
+                    organization_id=organization_id,
+                )
+                if db_cred and db_cred.browser_profile_id:
+                    # Verify the browser profile still exists before using it
+                    profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                        profile_id=db_cred.browser_profile_id,
+                        organization_id=organization_id,
+                    )
+                    if not profile:
+                        LOG.warning(
+                            "Credential has browser_profile_id but profile not found, ignoring",
+                            credential_id=credential_id,
+                            browser_profile_id=db_cred.browser_profile_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                        continue
+                    LOG.info(
+                        "Resolved browser_profile_id from LoginBlock credential",
+                        credential_id=credential_id,
+                        browser_profile_id=db_cred.browser_profile_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return db_cred.browser_profile_id
+            except Exception:
+                LOG.warning(
+                    "Failed to look up credential for browser profile",
+                    credential_id=credential_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+        return None
+
+    async def _resolve_login_block_credential_ids(
+        self,
+        block: Block,
+        workflow_run_id: str | None,
+    ) -> list[str]:
+        """Return credential ids bound to this block, preserving parameter order."""
         params = block.parameters
 
         # Pre-fetch run parameters once (used by WorkflowParameter/CREDENTIAL_ID style).
         run_param_tuples: list[tuple[Any, Any]] | None = None
+        credential_ids: list[str] = []
 
         for param in params:
             credential_id: str | None = None
@@ -3475,8 +3602,29 @@ class WorkflowService:
 
             if not credential_id:
                 continue
+            credential_ids.append(credential_id)
 
-            # Look up the credential and check for a browser_profile_id
+        return credential_ids
+
+    async def _apply_login_block_credential_proxy_pin(
+        self,
+        *,
+        block: Block,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        organization_id: str | None,
+    ) -> None:
+        if not organization_id:
+            return
+        headers = dict(workflow_run.extra_http_headers or {})
+        if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(headers):
+            return
+
+        credential_ids = await self._resolve_login_block_credential_ids(
+            block=block,
+            workflow_run_id=workflow_run_id,
+        )
+        for credential_id in credential_ids:
             if not organization_id:
                 continue
             try:
@@ -3484,35 +3632,67 @@ class WorkflowService:
                     credential_id=credential_id,
                     organization_id=organization_id,
                 )
-                if db_cred and db_cred.browser_profile_id:
-                    # Verify the browser profile still exists before using it
+                if not db_cred:
+                    continue
+                proxy_session_id = db_cred.proxy_session_id
+                proxy_location = db_cred.proxy_location
+                browser_profile_id = getattr(db_cred, "browser_profile_id", None)
+                if browser_profile_id:
                     profile = await app.DATABASE.browser_sessions.get_browser_profile(
-                        profile_id=db_cred.browser_profile_id,
+                        profile_id=browser_profile_id,
                         organization_id=organization_id,
                     )
-                    if not profile:
-                        LOG.warning(
-                            "Credential has browser_profile_id but profile not found, ignoring",
+                    if profile:
+                        if not profile.proxy_session_id:
+                            LOG.info(
+                                "Skipping LoginBlock credential proxy pin because linked browser profile is unpinned",
+                                credential_id=credential_id,
+                                browser_profile_id=browser_profile_id,
+                                workflow_run_id=workflow_run_id,
+                            )
+                            return
+                        proxy_session_id = profile.proxy_session_id
+                        proxy_location = profile.proxy_location or ProxyLocation.RESIDENTIAL_ISP
+                        LOG.info(
+                            "Using linked browser profile proxy pin for LoginBlock",
                             credential_id=credential_id,
-                            browser_profile_id=db_cred.browser_profile_id,
+                            browser_profile_id=browser_profile_id,
                             workflow_run_id=workflow_run_id,
                         )
-                        continue
-                    LOG.info(
-                        "Resolved browser_profile_id from LoginBlock credential",
-                        credential_id=credential_id,
-                        browser_profile_id=db_cred.browser_profile_id,
-                        workflow_run_id=workflow_run_id,
+                if proxy_session_id:
+                    updated_headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
+                        headers, proxy_session_id
                     )
-                    return db_cred.browser_profile_id
+                    # The OSS AgentFunction stub returns the original headers; only persist when cloud injected a pin.
+                    if updated_headers == headers:
+                        return
+                    proxy_location_update: ProxyLocationInput | None = None
+                    if workflow_run.proxy_location is None:
+                        proxy_location_update = proxy_location or ProxyLocation.RESIDENTIAL_ISP
+                    update_kwargs: dict[str, Any] = {
+                        "workflow_run_id": workflow_run_id,
+                        "extra_http_headers": updated_headers,
+                    }
+                    if proxy_location_update is not None:
+                        update_kwargs["proxy_location"] = proxy_location_update
+                    await app.DATABASE.workflow_runs.update_workflow_run(**update_kwargs)
+                    workflow_run.extra_http_headers = updated_headers
+                    if proxy_location_update is not None:
+                        workflow_run.proxy_location = proxy_location_update
+                    LOG.info(
+                        "Applied LoginBlock credential proxy pin to workflow run",
+                        credential_id=credential_id,
+                        workflow_run_id=workflow_run_id,
+                        proxy_location=str(workflow_run.proxy_location),
+                    )
+                    return
             except Exception:
-                LOG.warning(
-                    "Failed to look up credential for browser profile",
+                LOG.error(
+                    "Failed to apply LoginBlock credential proxy pin",
                     credential_id=credential_id,
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
-        return None
 
     async def _evaluate_debug_session_profile_decision(
         self,
@@ -3924,6 +4104,7 @@ class WorkflowService:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         browser_profile_id: str | None = None,
+        browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -3957,6 +4138,7 @@ class WorkflowService:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 workflow_permanent_id=workflow_permanent_id,
                 version=version,
@@ -4348,6 +4530,7 @@ class WorkflowService:
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
@@ -4376,6 +4559,7 @@ class WorkflowService:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -4404,6 +4588,7 @@ class WorkflowService:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 max_elapsed_time_minutes=max_elapsed_time_minutes,
@@ -5870,6 +6055,10 @@ class WorkflowService:
                 and not workflow_run.browser_profile_id
             ):
                 if workflow_run.status == WorkflowRunStatus.completed:
+                    browser_session_storage_key = await self.get_workflow_browser_session_storage_key(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                     if not close_browser_on_completion:
                         # Browser stays alive here, so close()'s cookie snapshot never ran; capture
                         # session cookies now or they're missing from the archived profile on reuse.
@@ -5879,12 +6068,13 @@ class WorkflowService:
                         )
                     await app.STORAGE.store_browser_session(
                         workflow_run.organization_id,
-                        workflow.workflow_permanent_id,
+                        browser_session_storage_key,
                         browser_state.browser_artifacts.browser_session_dir,
                     )
                     LOG.info(
                         "Persisted browser session for workflow run",
                         workflow_run_id=workflow_run.workflow_run_id,
+                        browser_session_storage_key=browser_session_storage_key,
                     )
                 else:
                     LOG.info(
@@ -6172,14 +6362,46 @@ class WorkflowService:
         LOG.debug("Persisting video data", number_of_video_artifacts=len(video_artifacts))
         # Flush here: code-block recordings key on the block/run id, which clean_up_workflow's task-id drain skips.
         upload_keys: set[str] = set()
+        last_step: Step | None = None
+        last_step_resolved = False
         for video_artifact in video_artifacts:
-            upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
-                artifact_id=video_artifact.video_artifact_id,
-                organization_id=workflow_run.organization_id,
-                data=video_artifact.video_data,
+            if video_artifact.video_artifact_id:
+                upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
+                    artifact_id=video_artifact.video_artifact_id,
+                    organization_id=workflow_run.organization_id,
+                    data=video_artifact.video_data,
+                )
+                if upload_key:
+                    upload_keys.add(upload_key)
+                continue
+
+            # No pre-registered artifact row: a recording attached at browser teardown
+            # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
+            # Upload by path so the bytes stream straight from disk to storage.
+            video_path = video_artifact.video_path
+            if not video_path or not os.path.exists(video_path):
+                continue
+            if not last_step_resolved:
+                last_step_resolved = True
+                tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
+                if tasks:
+                    last_step = await app.DATABASE.tasks.get_latest_step(
+                        task_id=tasks[-1].task_id, organization_id=workflow_run.organization_id
+                    )
+            if last_step is None:
+                LOG.warning(
+                    "Cannot persist path-based recording: no latest step for workflow run",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    video_path=video_path,
+                )
+                continue
+            artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                step=last_step,
+                artifact_type=ArtifactType.RECORDING,
+                path=video_path,
             )
-            if upload_key:
-                upload_keys.add(upload_key)
+            video_artifact.video_artifact_id = artifact_id
+            upload_keys.add(last_step.task_id)
         if upload_keys:
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(list(upload_keys))
 
@@ -6391,6 +6613,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     browser_profile_id=request.browser_profile_id,
+                    browser_profile_key=request.browser_profile_key,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
@@ -6431,6 +6654,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     browser_profile_id=request.browser_profile_id,
+                    browser_profile_key=request.browser_profile_key,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=request.max_elapsed_time_minutes,
