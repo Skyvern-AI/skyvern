@@ -427,6 +427,18 @@ async def _save_adopted_session_download(
             exc_info=True,
         )
 
+    # Ordering: ``save_as`` above has already run and failed (empty or raised).
+    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
+    # the scheme), so route them through an in-page fetch from a same-origin frame.
+    if download.url.startswith("blob:"):
+        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+            page=page, blob_url=download.url, workflow_run_id=workflow_run_id
+        )
+        if blob_bytes is None:
+            return None
+        download_target.write_bytes(blob_bytes)
+        return download_target
+
     try:
         response = await page.context.request.get(download.url)
         if response.status != 200:
@@ -1344,6 +1356,37 @@ class ActionHandler:
                 files = files + files_in_browser_session
             return files
 
+        async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str]) -> bool:
+            await xhr_capture.drain()
+            if not staging_dir.exists():
+                return False
+            staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
+            if not staged_files:
+                return False
+            moved_count = 0
+            for sf in staged_files:
+                target = download_dir / sf.name
+                if not target.exists():
+                    try:
+                        shutil.move(sf, target)
+                        xhr_fallback_moved_paths.add(str(target))
+                        moved_count += 1
+                    except OSError:
+                        LOG.warning(
+                            "Failed to move staged XHR file to download dir",
+                            file=sf.name,
+                            workflow_run_id=task.workflow_run_id,
+                            exc_info=True,
+                        )
+            if moved_count > 0:
+                LOG.info(
+                    "XHR staging fallback: moved staged files to download dir",
+                    staged_count=moved_count,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                return True
+            return False
+
         initial_page_count = 0
         page_url_before_download = page.url
         # get the initial page count
@@ -1360,6 +1403,7 @@ class ActionHandler:
         staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
         xhr_capture = ScopedXhrDownloadCapture(page, staging_dir)
         download_triggered = False
+        xhr_fallback_moved_paths: set[str] = set()
         transient_text_observer = TransientPageTextObserver(
             page,
             task_id=task.task_id,
@@ -1397,7 +1441,6 @@ class ActionHandler:
                 download_event_fallback_attempted = False
                 download_event_fallback_used = False
                 download_event_fallback_failed = False
-                xhr_fallback_moved_paths: set[str] = set()
                 download_signal_observed = False
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
@@ -1463,11 +1506,14 @@ class ActionHandler:
                                     break
                                 download_event_fallback_failed = True
                                 LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched",
+                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
                                     download_dir=download_dir,
                                     workflow_run_id=task.workflow_run_id,
                                 )
-                                break
+                                # Keep polling: the shared browser may still land the file in the session folder.
+                                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths):
+                                    download_triggered = True
+                                    break
 
                             list_files_after = await _list_observed_download_files()
 
@@ -1592,33 +1638,9 @@ class ActionHandler:
                             ",".join(error.error_code for error in download_wait_matched_errors),
                         )
 
-            await xhr_capture.drain()
-
-            if not download_triggered and staging_dir.exists():
-                staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
-                if staged_files:
-                    moved_count = 0
-                    for sf in staged_files:
-                        target = download_dir / sf.name
-                        if not target.exists():
-                            try:
-                                shutil.move(sf, target)
-                                xhr_fallback_moved_paths.add(str(target))
-                                moved_count += 1
-                            except OSError:
-                                LOG.warning(
-                                    "Failed to move staged XHR file to download dir",
-                                    file=sf.name,
-                                    workflow_run_id=task.workflow_run_id,
-                                    exc_info=True,
-                                )
-                    if moved_count > 0:
-                        download_triggered = True
-                        LOG.info(
-                            "XHR staging fallback: moved staged files to download dir",
-                            staged_count=moved_count,
-                            workflow_run_id=task.workflow_run_id,
-                        )
+            if not download_triggered:
+                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths):
+                    download_triggered = True
 
             if not download_triggered:
                 if action.errors:
@@ -2692,14 +2714,27 @@ async def handle_input_text_action(
     if not await skyvern_element.is_spinbtn_input() and (
         current_text or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
     ):
+        is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
             LOG.info("None input tag clear timeout", action=action)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
 
     # wait for blocking element to show up
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")

@@ -1177,6 +1177,8 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
 def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
     if artifact_health_blocked(ctx):
         return False
+    if outcome_fully_verified(ctx):
+        return True
     result = ctx.completion_verification_result
     if result is None:
         return True

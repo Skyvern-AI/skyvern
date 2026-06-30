@@ -104,6 +104,9 @@ class CompletionVerificationResult:
         if self.status != "evaluated" or not self.criterion_ids:
             return False
         verdict_by_id = {verdict.criterion_id: verdict for verdict in self.verdicts}
+        has_observed_reach_state = any(
+            _is_satisfied_observed_end_state_verdict(verdict) for verdict in verdict_by_id.values()
+        )
         satisfied_run_plane_count = 0
         for criterion_id in self.criterion_ids:
             verdict = verdict_by_id.get(criterion_id)
@@ -125,6 +128,8 @@ class CompletionVerificationResult:
             ):
                 continue
             if verdict is not None and _is_structural_requested_output_abstention(verdict):
+                continue
+            if has_observed_reach_state and verdict is not None and _is_reperception_contradiction(verdict):
                 continue
             return False
         return satisfied_run_plane_count > 0
@@ -1835,6 +1840,24 @@ def _is_meaningful_contingent_antecedent_value(value: Any) -> bool:
 
 
 _DEFINITION_REASON_PREFIX = "definition_"
+_OBSERVED_END_STATE_EVIDENCE_REF = "observed_end_state_url"
+_REPERCEPTION_CONTRADICTION_EVIDENCE_REFS = frozenset({"scout_synthesized_browser_steps_output"})
+
+
+def _is_satisfied_observed_end_state_verdict(verdict: CriterionVerdict) -> bool:
+    return (
+        verdict.state == "satisfied"
+        and verdict.reason_code == "evidence_confirms"
+        and verdict.evidence_ref == _OBSERVED_END_STATE_EVIDENCE_REF
+    )
+
+
+def _is_reperception_contradiction(verdict: CriterionVerdict) -> bool:
+    return (
+        verdict.state == "unsatisfied"
+        and verdict.reason_code == "evidence_contradicts"
+        and verdict.evidence_ref in _REPERCEPTION_CONTRADICTION_EVIDENCE_REFS
+    )
 
 
 def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:

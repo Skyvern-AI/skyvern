@@ -34,7 +34,11 @@ import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
 import { CodeSubmenu } from "./CodeSubmenu";
 
-export function EditorOverflowMenu() {
+export function EditorOverflowMenu({
+  triggerClassName = "size-10 min-w-[2.5rem]",
+}: {
+  triggerClassName?: string;
+} = {}) {
   const { workflowPermanentId } = useParams();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -99,7 +103,7 @@ export function EditorOverflowMenu() {
                 disabled={isRecording}
                 size="icon"
                 variant="tertiary"
-                className="size-10 min-w-[2.5rem]"
+                className={triggerClassName}
                 aria-label="More actions"
               >
                 <DotsHorizontalIcon className="size-5" />

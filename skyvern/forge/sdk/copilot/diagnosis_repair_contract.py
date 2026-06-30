@@ -191,6 +191,7 @@ def build_diagnosis_repair_contract(
     if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
         target_blocks = [repair_context.block_label]
     user_goal_satisfied, completion_contract_satisfied = _verification_satisfaction(
+        ctx,
         run_ok,
         suspicious,
         run_status,
@@ -612,6 +613,7 @@ def _last_test_anti_bot_is_terminal(ctx: CopilotContext, data: dict[str, Any]) -
 
 
 def _verification_satisfaction(
+    ctx: CopilotContext,
     run_ok: bool,
     suspicious: bool,
     run_status: str | None,
@@ -627,6 +629,8 @@ def _verification_satisfaction(
         return fully_satisfied, fully_satisfied
     if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
         return False, False
+    if outcome_fully_verified(ctx):
+        return True, True
     if (
         failure_type == DiagnosisFailureType.NO_FAILURE
         and completion_verification is not None
