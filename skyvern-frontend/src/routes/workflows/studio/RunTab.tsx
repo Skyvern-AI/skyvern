@@ -1,4 +1,9 @@
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 
 import { useStudioShellStore } from "@/store/StudioShellStore";
 
@@ -12,6 +17,7 @@ import { useStudioRunId } from "./useStudioRunId";
  */
 export function RunTab() {
   const navigate = useNavigate();
+  const location = useLocation();
   const urlRunId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
@@ -29,7 +35,15 @@ export function RunTab() {
   return (
     <RunView
       workflowRunId={runId}
-      onFix={() => setCopilotCollapsed(false)}
+      onFix={(seedMessage) => {
+        // Seed via location.state (Workspace reads it as the copilot's initialMessage);
+        // replace so Fix adds no Back-able entry and the message can't re-fire on Back.
+        navigate(`${location.pathname}${location.search}`, {
+          state: { copilotMessage: seedMessage },
+          replace: true,
+        });
+        setCopilotCollapsed(false);
+      }}
       onRetry={
         isBlockRun
           ? undefined

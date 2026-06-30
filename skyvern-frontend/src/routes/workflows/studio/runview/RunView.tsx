@@ -31,12 +31,13 @@ import {
 } from "../runProjections";
 import { RunDetailsButton } from "./RunDetailsButton";
 import { RunHero } from "./RunHero";
+import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsButton, type RunInputMeta } from "./RunInputsButton";
 import { RunOutputsButton, type RunOutputFile } from "./RunOutputsButton";
 
 type RunViewProps = {
   workflowRunId?: string;
-  onFix?: () => void;
+  onFix?: (seedMessage?: string) => void;
   onRetry?: () => void;
 };
 
@@ -168,6 +169,10 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
     searchParams.has("bl") &&
     workflowRun?.browser_session_id != null &&
     workflowRun.browser_session_id === debugSession?.browser_session_id;
+  const fixSeedMessage = useMemo(
+    () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
+    [workflowRun?.failure_reason],
+  );
 
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
   const shownFrame =
@@ -358,7 +363,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
               </>
             }
             onRecordingPlay={onRecordingPlay}
-            onFix={onFix}
+            onFix={onFix ? () => onFix(fixSeedMessage) : undefined}
             onRetry={onRetry}
           />
         </div>
