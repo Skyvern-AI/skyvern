@@ -346,6 +346,10 @@ async def test_first_loaded_result_table_sheds_large_payload_but_keeps_compositi
     serialized = json.dumps(result, default=str)
     assert result["data"].get("next_action") == "compose_extraction"
     assert result["data"].get("composition_targets")
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.phase == "scout_evaluate"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "loaded_result_targets_observed"
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
     assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
     assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
     assert "compose_extraction" in serialized

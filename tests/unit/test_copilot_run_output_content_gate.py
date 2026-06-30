@@ -772,6 +772,56 @@ def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_failure_reason is None
     assert verified_goal_satisfied_context(ctx) is True
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.verdict == "progress_observed"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "verified_success"
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+
+
+def test_unverified_success_records_goal_relative_build_test_outcome() -> None:
+    result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
+    ctx = _ctx(result["data"]["blocks"])
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_demonstrated"
+    assert recorded.reason_code == "outcome_not_demonstrated"
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.phase == "persisted_block_run"
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.structural_key is not None
+
+
+def test_changed_output_structure_changes_unverified_success_structural_key() -> None:
+    first_result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
+    second_result = _run_result(
+        [_code_block("search_registry_person", {"records": [{"status_present": True}], "result_count": 1})]
+    )
+    ctx = _ctx(first_result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, first_result, completion_verification=_no_evidence("c0"))
+    first_key = ctx.latest_recorded_build_test_outcome.structural_key
+    _record_run_blocks_result(ctx, second_result, completion_verification=_no_evidence("c0"))
+
+    assert first_key is not None
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+    assert ctx.latest_recorded_build_test_outcome.structural_key != first_key
+
+
+def test_terminal_blocker_does_not_leave_authoritative_prompt_outcome() -> None:
+    result = _blocked_flag_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.blocker_signal is not None
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.reason_code == "terminal_challenge_blocker"
+    assert outcome.is_authoritative is False
 
 
 def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
