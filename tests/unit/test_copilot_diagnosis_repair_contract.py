@@ -18,9 +18,11 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
+from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+    RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -54,6 +56,14 @@ def _satisfied_completion_verification() -> CompletionVerificationResult:
         status="evaluated",
         criterion_ids=["c0"],
         verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+
+
+def _contradictory_completion_verification() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts")],
     )
 
 
@@ -967,6 +977,46 @@ def test_clean_run_with_satisfied_completion_verification_has_no_repair_or_block
     assert contract.verification_result.user_goal_satisfied is True
     assert contract.verification_result.completion_contract_satisfied is True
     assert contract.verification_result.remaining_blocker is None
+
+
+def test_committed_same_run_outcome_satisfies_diagnosis_after_later_contradiction() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_clean"
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_clean")
+    ctx.completion_verification_result = _contradictory_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+    ctx.latest_diagnosis_repair_contract = contract
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is True
+
+
+def test_first_pass_contradiction_does_not_satisfy_latest_diagnosis_contract() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = _contradictory_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+    ctx.latest_diagnosis_repair_contract = contract
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is False
 
 
 def test_no_change_contracts_do_not_carry_remaining_blocker() -> None:
