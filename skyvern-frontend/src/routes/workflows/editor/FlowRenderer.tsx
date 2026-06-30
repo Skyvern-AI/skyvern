@@ -92,6 +92,7 @@ import {
   WorkflowBlockNode,
 } from "./nodes";
 import { GlobalCollapseControl } from "./collapse/GlobalCollapseControl";
+import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { RedoControl } from "./controls/RedoControl";
@@ -1318,6 +1319,41 @@ function FlowRenderer({
   }, [recordedBlocks, recordedInsertionPoint]);
 
   const editorElementRef = useRef<HTMLDivElement>(null);
+
+  // A collapse/accordion animation settles the node at a new height; the layout
+  // budget can drop its final relayout, so force one (delegated via animationend).
+  useEffect(() => {
+    const root = editorElementRef.current;
+    if (!root) {
+      return;
+    }
+    let relayoutFrame: number | null = null;
+    const handleAnimationEnd = (event: AnimationEvent) => {
+      if (!isHeightCollapseAnimation(event.animationName)) {
+        return;
+      }
+      // Defer two frames so React Flow commits the post-animation measurement
+      // (Radix resolves the height back to `auto`) before we read it.
+      if (relayoutFrame !== null) {
+        cancelAnimationFrame(relayoutFrame);
+      }
+      relayoutFrame = requestAnimationFrame(() => {
+        relayoutFrame = requestAnimationFrame(() => {
+          relayoutFrame = null;
+          const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+          const currentEdges = reactFlowInstance.getEdges();
+          debouncedLayoutForDimensions(currentNodes, currentEdges);
+        });
+      });
+    };
+    root.addEventListener("animationend", handleAnimationEnd);
+    return () => {
+      root.removeEventListener("animationend", handleAnimationEnd);
+      if (relayoutFrame !== null) {
+        cancelAnimationFrame(relayoutFrame);
+      }
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
 
   // Ordered ids of the top-level sortable siblings. M2 extends this with a
   // scope per loop container and per conditional branch
