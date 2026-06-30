@@ -6,7 +6,7 @@ import os
 import structlog
 from playwright.async_api import async_playwright
 
-from skyvern.exceptions import MissingBrowserState
+from skyvern.exceptions import FailedToNavigateToUrl, MissingBrowserState
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
@@ -28,6 +28,38 @@ from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import finalize_webm
 
 LOG = structlog.get_logger()
+
+# Only driver/transport-level CDP drops trigger the cached-PBS evict + reconnect path.
+# Playwright also surfaces page/context-only closes ("Target page, context or browser
+# has been closed") with text that overlaps a transport drop; treating those as cached
+# CDP drops would tear down a healthy PBS over a recoverable page-level state.
+_CACHED_CDP_DROP_ERROR_SUBSTRINGS = ("Connection closed while reading from the driver",)
+
+
+def _is_cached_cdp_drop_error(exc: FailedToNavigateToUrl) -> bool:
+    message = exc.error_message or ""
+    return any(needle in message for needle in _CACHED_CDP_DROP_ERROR_SUBSTRINGS)
+
+
+async def _rebind_pbs_download_dir(
+    browser_state: BrowserState,
+    workflow_run: WorkflowRun,
+    browser_session_id: str,
+) -> None:
+    browser_context = browser_state.browser_context
+    adopted_browser = browser_context.browser if browser_context else None
+    if adopted_browser is None:
+        return
+    try:
+        rebind_run_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run.workflow_run_id)
+        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
+    except Exception:
+        LOG.warning(
+            "Failed to rebind download dir on adopted browser session",
+            browser_session_id=browser_session_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            exc_info=True,
+        )
 
 
 def _merge_proxy_session_headers(
@@ -353,25 +385,55 @@ class RealBrowserManager(BrowserManager):
                 )
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
-                browser_context = browser_state.browser_context
-                adopted_browser = browser_context.browser if browser_context else None
-                if adopted_browser is not None:
-                    try:
-                        rebind_run_id = resolve_run_download_id(
-                            skyvern_context.current(), fallback_run_id=workflow_run.workflow_run_id
-                        )
-                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
-                    except Exception:
-                        LOG.warning(
-                            "Failed to rebind download dir on adopted browser session",
-                            browser_session_id=browser_session_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            exc_info=True,
-                        )
+                await _rebind_pbs_download_dir(browser_state, workflow_run, browser_session_id)
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
-                        await browser_state.navigate_to_url(page=page, url=url)
+                        try:
+                            await browser_state.navigate_to_url(page=page, url=url)
+                        except FailedToNavigateToUrl as nav_exc:
+                            if not _is_cached_cdp_drop_error(nav_exc):
+                                raise
+                            if not app.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect():
+                                # Default OSS impl: ``get_browser_state`` is an in-memory
+                                # dict lookup, so an evict would tear down the only cached
+                                # BrowserState without any way to reconnect — and would
+                                # break profile/video cleanup at ``close_session`` later.
+                                # Re-raise the original navigation error untouched.
+                                raise
+                            LOG.warning(
+                                "Cached browser CDP appears dead at first goto — evicting and reconnecting once",
+                                browser_session_id=browser_session_id,
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                error_message=nav_exc.error_message,
+                            )
+                            await app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state(
+                                browser_session_id,
+                                organization_id=workflow_run.organization_id,
+                                expected=browser_state,
+                            )
+                            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                                browser_session_id,
+                                organization_id=workflow_run.organization_id,
+                            )
+                            if browser_state is None:
+                                raise
+                            await _rebind_pbs_download_dir(browser_state, workflow_run, browser_session_id)
+                            page = await browser_state.get_working_page()
+                            if page is not None:
+                                await browser_state.navigate_to_url(page=page, url=url)
+                            else:
+                                # The fresh CDP connection has no working page (e.g. the
+                                # prior context closed its last tab during the dead-CDP
+                                # window). The outer ``get_or_create_page`` below mirrors
+                                # the normal-path behavior and will produce a page +
+                                # navigate to ``url``, so don't fail a recoverable
+                                # session here — fall through.
+                                LOG.info(
+                                    "Recovered PBS reconnect has no working page — deferring to get_or_create_page",
+                                    browser_session_id=browser_session_id,
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                )
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
