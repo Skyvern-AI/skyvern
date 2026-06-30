@@ -276,6 +276,7 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 )
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
+SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
 
 
 def _should_stash_over_existing(
@@ -292,6 +293,12 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code == "tool_error_post_budget_challenge_blocker"
         and existing.internal_reason_code in _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES
+    ):
+        return True
+    if (
+        existing.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        and not existing.renders_final_reply
+        and incoming.renders_final_reply
     ):
         return True
     return False
@@ -389,6 +396,10 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     ),
     "code_authoring_guardrail_churn": (
         "I kept rewriting the generated code, but the safety checks rejected each version.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
+    "loop_detected_no_forward_progress_interaction": (
+        "I couldn't get past this step.",
         "Tell me what to change and I'll try a different approach.",
     ),
 }

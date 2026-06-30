@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
+    _render_active_criteria_for_prompt,
     contains_email_password_pair,
     is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
@@ -26,6 +28,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 
 def _render(**overrides: str) -> str:
+    active_completion_criteria = overrides.get("active_completion_criteria", "")
     return prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=overrides.get("user_message", ""),
@@ -35,6 +38,8 @@ def _render(**overrides: str) -> str:
         latest_assistant_turn=overrides.get("latest_assistant_turn", "(none)"),
         retained_history=overrides.get("retained_history", "(none)"),
         global_llm_context=overrides.get("global_llm_context", ""),
+        raw_secret_present=overrides.get("raw_secret_present", "false"),
+        active_completion_criteria=active_completion_criteria,
     )
 
 
@@ -79,6 +84,41 @@ class TestRequestPolicyPromptStructure:
         assert "raw_secret_evidence" in rendered
         assert "verbatim substring of the LATEST user message" in rendered
         assert "Do not cite a token that appears only in prior turns" in rendered
+
+    def test_completion_criteria_schema_includes_typed_terminal_action_fields(self) -> None:
+        rendered = _render()
+        assert (
+            "{outcome, contingent_on, contingent_antecedent_output_path, "
+            "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
+            "expected_output_shape, kind, terminal_action_family, classification_output_key, expected_classification}"
+        ) in rendered
+        assert "never hide it in outcome prose" in rendered
+        assert "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label" in rendered
+        assert "kind=outcome|terminal_action|validation_classification" in rendered
+        assert "terminal_action_family=request|application|form|order|null" in rendered
+        assert "classification_output_key=login_only and expected_classification=true" in rendered
+        assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="a commercial water service request is started",
+                    expected_output_value="WTR-1842-DEMO",
+                    expected_output_shape="reference_code",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"kind": "terminal_action"' in rendered
+        assert '"terminal_action_family": "request"' in rendered
+        assert '"expected_output_value": "WTR-1842-DEMO"' in rendered
+        assert '"expected_output_shape": "reference_code"' in rendered
 
 
 class TestRawSecretBackstop:
@@ -367,6 +407,44 @@ class TestActiveCriteriaPromptAnchor:
             handler=_capture_handler(captured),
         )
         assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]
+
+
+class TestLoadedResultContextPromptSanitization:
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_sanitizes_loaded_result_context_before_prompt(self) -> None:
+        captured: dict[str, str] = {}
+        raw_context = json.dumps(
+            {
+                "loaded_result_targets": [
+                    {
+                        "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
+                        "is_table": True,
+                        "row_selector": 'tr[data-account="987654321"]',
+                        "row_count": 2,
+                        "structure_signature": "legacy-selector-derived-sig",
+                    }
+                ]
+            }
+        )
+
+        await _classify_request(
+            user_message="build from the loaded results",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=raw_context,
+            handler=_capture_handler(captured),
+        )
+
+        prompt = captured["prompt"]
+        for value in (
+            "Jane",
+            "Customer",
+            "123456",
+            "987654321",
+            "legacy-selector-derived-sig",
+        ):
+            assert value not in prompt
+        assert '"row_count": 2' in prompt
 
 
 class TestClassifierFallbackCompletionCriteria:

@@ -74,11 +74,15 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     artifact_health_blocked,
     outcome_fully_verified,
+    synthesized_persistence_reopened_after_failed_run,
+    synthesized_trajectory_is_goal_complete,
     verified_goal_claim_authorized,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
@@ -720,7 +724,8 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="policy_not_code_only_browser")
         return ""
-    if ctx.update_workflow_called:
+    reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
+    if ctx.update_workflow_called and not reopened_after_failed_run:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
         return ""
     if not ctx.scout_trajectory:
@@ -728,7 +733,13 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         return ""
     trajectory_len = len(ctx.scout_trajectory)
     previous_offer_len = ctx.synthesized_block_offered_trajectory_len
-    if ctx.synthesized_block_offered and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD:
+    trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    if (
+        ctx.synthesized_block_offered
+        and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+        and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
+        and not reopened_after_failed_run
+    ):
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
             reason="already_offered",
@@ -749,6 +760,9 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         return ""
     ctx.synthesized_block_offered = True
     ctx.synthesized_block_offered_trajectory_len = trajectory_len
+    ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete
+    if reopened_after_failed_run:
+        ctx.synthesized_block_reopened_after_failed_run = True
     LOG.info(
         "copilot_synthesized_block_offer_rendered",
         trajectory_len=trajectory_len,
@@ -829,12 +843,15 @@ def _build_user_context(
     system-level content (the classic code-fence breakout).
     """
     workflow_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
+    global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(global_llm_context)
     return prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         workflow_summary=escape_code_fences(_build_workflow_summary(workflow_yaml)),
         chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history_text)),
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)),
+        loaded_result_context=escape_code_fences(redact_raw_secrets_for_prompt(loaded_result_context)),
         debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
@@ -1160,6 +1177,8 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
 def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
     if artifact_health_blocked(ctx):
         return False
+    if outcome_fully_verified(ctx):
+        return True
     result = ctx.completion_verification_result
     if result is None:
         return True
@@ -1474,7 +1493,7 @@ async def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_cont
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     clean_test = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
     if clean_test and verified_goal_claim_authorized(ctx):
-        user_response = _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        user_response = _verified_workflow_success_reply(ctx)
     elif clean_test:
         user_response = (
             "I built the workflow and the test run completed, but the goal outcome was not "
@@ -1670,6 +1689,120 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
+_VERIFIED_CLASSIFICATION_CONTEXT_KEYS = (
+    "visible_page_path_label",
+    "safest_reachable_next_step",
+    "recommended_next_action",
+)
+_VERIFIED_CLASSIFICATION_GATE_KEYS = (
+    "observed_gate_phrase",
+    "gate_phrase",
+    "gate_summary",
+    "blocked_by",
+)
+_VERIFIED_CLASSIFICATION_GATE_PHRASES = ("Sign in or register to continue",)
+_VERIFIED_TERMINAL_VALUE_MAX_CHARS = 180
+
+
+def _terminal_summary_scalar(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return str(value)
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.strip().split())
+    if not cleaned or contains_internal_machinery_leak(cleaned):
+        return None
+    if len(cleaned) > _VERIFIED_TERMINAL_VALUE_MAX_CHARS:
+        cleaned = cleaned[: _VERIFIED_TERMINAL_VALUE_MAX_CHARS - 1].rstrip() + "..."
+    return cleaned
+
+
+def _verified_output_value(ctx: CopilotContext, output_key: str | None) -> Any:
+    if not output_key:
+        return None
+    block_outputs = ctx.verified_terminal_block_outputs or ctx.verified_block_outputs or {}
+    for output in block_outputs.values():
+        if isinstance(output, dict) and output_key in output:
+            return output.get(output_key)
+    return None
+
+
+def _verified_adjacent_output_parts(ctx: CopilotContext) -> list[str]:
+    parts: list[str] = []
+    block_outputs = ctx.verified_terminal_block_outputs or ctx.verified_block_outputs or {}
+    login_gate_phrase_found = False
+
+    def append_gate_phrase(value: Any) -> None:
+        nonlocal login_gate_phrase_found
+        if isinstance(value, str):
+            for phrase in _VERIFIED_CLASSIFICATION_GATE_PHRASES:
+                if phrase.lower() in value.lower():
+                    login_gate_phrase_found = True
+                    parts.append(f"observed_gate_phrase={phrase}")
+            return
+        if isinstance(value, list | tuple | set):
+            for item in value:
+                append_gate_phrase(item)
+
+    for output in block_outputs.values():
+        if not isinstance(output, dict):
+            continue
+        for key in (*_VERIFIED_CLASSIFICATION_CONTEXT_KEYS, *_VERIFIED_CLASSIFICATION_GATE_KEYS):
+            value = _terminal_summary_scalar(output.get(key))
+            if value is not None:
+                parts.append(f"{key}={value}")
+        for value in output.values():
+            append_gate_phrase(value)
+    if login_gate_phrase_found:
+        parts.append("login-gated")
+    return list(dict.fromkeys(parts))
+
+
+def _verified_classification_summary(ctx: CopilotContext) -> str | None:
+    if not verified_goal_claim_authorized(ctx) or not outcome_fully_verified(ctx):
+        return None
+    result = ctx.completion_verification_result
+    if result is None or not result.is_fully_satisfied():
+        return None
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if policy is None:
+        return None
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    parts: list[str] = []
+    login_gated_confirmed = False
+    for criterion in policy.completion_criteria:
+        if criterion.kind != "validation_classification":
+            continue
+        verdict = verdict_by_id.get(criterion.id)
+        if verdict is None or not verdict.satisfied:
+            continue
+        output_key = criterion.classification_output_key or verdict.output_path
+        actual = _verified_output_value(ctx, output_key)
+        display_value = _terminal_summary_scalar(actual)
+        if output_key and display_value is not None:
+            parts.append(f"{output_key}={display_value}")
+        actual_text = actual.strip().lower() if isinstance(actual, str) else None
+        if (
+            isinstance(output_key, str)
+            and output_key in {"login_only", "login_gated", "path_login_only"}
+            and actual is True
+        ) or actual_text in {"login-gated", "login_gated"}:
+            login_gated_confirmed = True
+    if login_gated_confirmed:
+        parts.append("login-gated")
+    parts.extend(_verified_adjacent_output_parts(ctx))
+    if not parts:
+        return None
+    return "; ".join(dict.fromkeys(parts))
+
+
+def _verified_workflow_success_reply(ctx: CopilotContext) -> str:
+    summary = _verified_classification_summary(ctx)
+    if summary is None:
+        return _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    return f"{_VERIFIED_WORKFLOW_SUCCESS_REPLY} Verified result: {summary}."
 
 
 @dataclass(frozen=True)
@@ -1705,7 +1838,7 @@ def _render_typed_run_outcome_reply(
         if not has_verified_workflow or not verified_goal_claim_authorized(ctx):
             return None
         return _TypedRunOutcomeReply(
-            user_response=f"{_VERIFIED_WORKFLOW_SUCCESS_REPLY} The latest run demonstrated the requested outcome.",
+            user_response=f"{_verified_workflow_success_reply(ctx)} The latest run demonstrated the requested outcome.",
             demonstrated=True,
         )
 
@@ -1768,7 +1901,7 @@ def _verified_terminal_preserve_result(
     if verified_workflow is None:
         return None
     final_text, outcome = apply_repeated_reply_guard(
-        final_text=_VERIFIED_WORKFLOW_SUCCESS_REPLY,
+        final_text=_verified_workflow_success_reply(ctx),
         attempted_kind=derive_response_kind(ctx.turn_intent),
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason="verified_goal_satisfied",
@@ -2698,7 +2831,7 @@ async def _translate_to_agent_result(
     )
     if verified_terminal_ready:
         resp_type = "REPLY"
-        user_response = _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        user_response = _verified_workflow_success_reply(ctx)
         agent_admits_incomplete = False
     else:
         # Default-true preserves backwards-compat with stale prompts and missing fields.
@@ -3550,7 +3683,9 @@ async def _run_copilot_turn_impl(
     chat_history_text = _format_chat_history(chat_history)
     safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
     safe_workflow_yaml = redact_raw_secrets_for_prompt(chat_request.workflow_yaml or "")
-    safe_global_llm_context = redact_raw_secrets_for_prompt(global_llm_context or "")
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(
+        redact_raw_secrets_for_prompt(global_llm_context or "")
+    )
     previous_user_messages = [msg.content for msg in chat_history if msg.sender == "user"]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
 

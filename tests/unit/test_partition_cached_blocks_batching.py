@@ -14,6 +14,7 @@ Saving a large workflow timed out because cache invalidation walked every cached
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,8 @@ class FakeScriptsDB:
         self._scripts_by_id = scripts_by_id
         self._blocks_by_revision = blocks_by_revision
         self.call_log: list[str] = []
+        self.cleared_script_block_ids: list[str] = []
+        self.update_script_block_calls: list[str] = []
 
     async def get_script(self, script_id: str, organization_id: str, version: int | None = None) -> Script | None:
         self.call_log.append("get_script")
@@ -60,6 +63,26 @@ class FakeScriptsDB:
             for rid in dict.fromkeys(script_revision_ids)
             if self._blocks_by_revision.get(rid)
         }
+
+    async def update_script_block(
+        self,
+        script_block_id: str,
+        organization_id: str,
+        clear_run_signature: bool = False,
+    ) -> ScriptBlock | None:
+        self.call_log.append("update_script_block")
+        self.update_script_block_calls.append(script_block_id)
+        return None
+
+    async def clear_script_block_run_signatures(
+        self,
+        *,
+        organization_id: str,
+        script_block_ids: list[str],
+    ) -> int:
+        self.call_log.append("clear_script_block_run_signatures")
+        self.cleared_script_block_ids.extend(script_block_ids)
+        return len(script_block_ids)
 
 
 def _now() -> datetime:
@@ -179,6 +202,83 @@ async def test_partition_cached_blocks_uses_constant_query_count(monkeypatch: py
     # Five candidates must not produce a per-candidate fan-out of queries.
     # The batched implementation makes at most one scripts query + one blocks query.
     assert len(fake.call_log) <= 2, f"expected constant query budget, got {fake.call_log}"
+
+
+@pytest.mark.asyncio
+async def test_partition_cached_blocks_dedupes_duplicate_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    _, fake = _build_fixture()
+    candidates = [
+        _candidate("s1", ScriptStatus.published),
+        _candidate("s1", ScriptStatus.published),
+        _candidate("s3", ScriptStatus.pending),
+        _candidate("s3", ScriptStatus.pending),
+    ]
+    monkeypatch.setattr(app.DATABASE, "scripts", fake)
+
+    svc = WorkflowService()
+    cached_groups, published_groups = await svc._partition_cached_blocks(
+        organization_id=ORG_ID,
+        candidates=candidates,
+        block_labels_to_disable=["block_a", "block_b"],
+    )
+
+    assert [group.workflow_script.script_id for group in published_groups] == ["s1"]
+    assert [group.workflow_script.script_id for group in cached_groups] == ["s3"]
+    assert len(fake.call_log) <= 2, f"expected constant query budget, got {fake.call_log}"
+
+
+@pytest.mark.asyncio
+async def test_clear_cached_block_groups_bulk_clears_deduped_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.workflow.service import CachedScriptBlocks, CacheInvalidationPlan, WorkflowService
+
+    _, fake = _build_fixture()
+    monkeypatch.setattr(app.DATABASE, "scripts", fake)
+
+    script = fake._scripts_by_id["s1"]
+    block = fake._blocks_by_revision["r1"][0]
+    groups = [
+        CachedScriptBlocks(
+            workflow_script=_candidate("s1", ScriptStatus.published),
+            script=script,
+            blocks_to_clear=[block, block],
+        ),
+        CachedScriptBlocks(
+            workflow_script=_candidate("s1", ScriptStatus.published),
+            script=script,
+            blocks_to_clear=[block],
+        ),
+    ]
+
+    svc = WorkflowService()
+    await svc._clear_cached_block_groups(
+        organization_id=ORG_ID,
+        workflow=SimpleNamespace(
+            workflow_id="wf_new",
+            workflow_permanent_id=WPID,
+            organization_id=ORG_ID,
+            version=2,
+        ),
+        previous_workflow=SimpleNamespace(
+            workflow_id="wf_previous",
+            workflow_permanent_id=WPID,
+            organization_id=ORG_ID,
+            version=1,
+        ),
+        plan=CacheInvalidationPlan(
+            reason="updated_block",
+            label="block_a",
+            previous_index=0,
+            new_index=0,
+            block_labels_to_disable=["block_a"],
+        ),
+        groups=groups,
+    )
+
+    assert fake.call_log == ["clear_script_block_run_signatures"]
+    assert fake.cleared_script_block_ids == [block.script_block_id]
+    assert fake.update_script_block_calls == []
 
 
 def test_dedup_into_chunks_preserves_order_and_dedups() -> None:

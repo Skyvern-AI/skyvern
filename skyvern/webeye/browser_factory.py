@@ -1008,6 +1008,9 @@ async def _connect_to_cdp_browser(
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
     )
+    # Single chokepoint for OSS remote-CDP creation; stamp the marker so
+    # RealBrowserManager attaches the CDP frame publisher.
+    browser_artifacts.needs_cdp_frame_publisher = True
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     cdp_headers = merge_cdp_connect_headers(

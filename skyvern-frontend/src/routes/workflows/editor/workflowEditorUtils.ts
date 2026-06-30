@@ -1061,6 +1061,8 @@ function convertToNode(
           azureStorageAccountName: block.azure_storage_account_name ?? "",
           azureStorageAccountKey: block.azure_storage_account_key ?? "",
           azureBlobContainerName: block.azure_blob_container_name ?? "",
+          googleCredentialId: block.google_credential_id ?? "",
+          googleDriveFolderId: block.google_drive_folder_id ?? "",
         },
       };
     }
@@ -3034,6 +3036,8 @@ function getWorkflowBlock(
         azure_storage_account_name: node.data.azureStorageAccountName ?? "",
         azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
+        google_credential_id: node.data.googleCredentialId ?? "",
+        google_drive_folder_id: node.data.googleDriveFolderId ?? "",
       };
     }
     case "fileParser": {
@@ -4367,6 +4371,8 @@ function convertBlocksToBlockYAML(
           azure_storage_account_name: block.azure_storage_account_name ?? "",
           azure_storage_account_key: block.azure_storage_account_key ?? "",
           azure_blob_container_name: block.azure_blob_container_name ?? "",
+          google_credential_id: block.google_credential_id ?? "",
+          google_drive_folder_id: block.google_drive_folder_id ?? "",
         };
         return blockYaml;
       }

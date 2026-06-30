@@ -33,6 +33,9 @@ export interface WorkflowsListContextValue {
     workflowPermanentId: string,
   ) => void;
   handleIconClick: (event: MouseEvent<HTMLButtonElement>, path: string) => void;
+  // Prune a single-row-deleted id from the selection so the header/bulk bar
+  // can't get stuck on a gone row.
+  onRowDeleted: (id: string) => void;
 }
 
 const WorkflowsListContext = createContext<WorkflowsListContextValue | null>(

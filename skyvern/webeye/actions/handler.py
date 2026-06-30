@@ -146,6 +146,7 @@ from skyvern.webeye.utils.dom import (
     DomUtil,
     InteractiveElement,
     SkyvernElement,
+    SkyvernOptionType,
     is_post_dispatch_click_timeout,
 )
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -155,9 +156,238 @@ LOG = structlog.get_logger()
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
+COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
+SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
+SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
+
+
+def _select_shadow_match_enabled() -> bool:
+    return settings.SKYVERN_SELECT_SHADOW_MATCH
+
+
+def _normalize_select_shadow_text(text: Any | None) -> str:
+    if text is None:
+        return ""
+    return " ".join(SELECT_SHADOW_MATCH_APOSTROPHE_RE.sub("", str(text).lower()).split())
+
+
+def _stem_select_shadow_text(normalized_text: str) -> str:
+    stems = []
+    for word in normalized_text.split():
+        if word.endswith("s") and not word.endswith("ss"):
+            stems.append(word[:-1])
+        else:
+            stems.append(word)
+    return " ".join(stems)
+
+
+def _unique_select_shadow_index(indices: list[int]) -> int | None:
+    return indices[0] if len(indices) == 1 else None
+
+
+def _best_select_shadow_index(scored_indices: list[tuple[int, float]]) -> int | None:
+    if not scored_indices:
+        return None
+    best_score = max(score for _, score in scored_indices)
+    best_indices = [index for index, score in scored_indices if score == best_score]
+    return _unique_select_shadow_index(best_indices)
+
+
+def classify_option_match(target_value: str | None, option_labels: list[str]) -> tuple[int | None, str]:
+    target_norm = _normalize_select_shadow_text(target_value)
+    option_norms = [_normalize_select_shadow_text(label) for label in option_labels]
+    if not target_norm or not any(option_norms):
+        return None, "miss"
+
+    exact_indices = [index for index, option_norm in enumerate(option_norms) if option_norm == target_norm]
+    if exact_indices:
+        return _unique_select_shadow_index(exact_indices), "exact"
+
+    target_stem = _stem_select_shadow_text(target_norm)
+    stem_indices = [
+        index
+        for index, option_norm in enumerate(option_norms)
+        if option_norm and _stem_select_shadow_text(option_norm) == target_stem
+    ]
+    if stem_indices:
+        return _unique_select_shadow_index(stem_indices), "stem"
+
+    substring_scores = [
+        (index, float(min(len(target_norm), len(option_norm))))
+        for index, option_norm in enumerate(option_norms)
+        if len(target_norm) >= 3
+        and len(option_norm) >= 3
+        and (target_norm in option_norm or option_norm in target_norm)
+    ]
+    if substring_scores:
+        return _best_select_shadow_index(substring_scores), "fuzzy"
+
+    target_words = set(SELECT_SHADOW_MATCH_WORD_RE.findall(target_norm))
+    overlap_scores: list[tuple[int, float]] = []
+    if target_words:
+        for index, option_norm in enumerate(option_norms):
+            option_words = set(SELECT_SHADOW_MATCH_WORD_RE.findall(option_norm))
+            if option_words and target_words & option_words:
+                overlap_scores.append(
+                    (index, len(target_words & option_words) / max(len(target_words), len(option_words)))
+                )
+    if overlap_scores:
+        return _best_select_shadow_index(overlap_scores), "fuzzy"
+
+    return None, "miss"
+
+
+def _select_shadow_candidate(
+    label: str | None,
+    *,
+    element_id: str | None = None,
+    value: str | None = None,
+    keep_empty: bool = False,
+) -> dict[str, str | None] | None:
+    label_norm = " ".join((label or "").split())
+    value_norm = " ".join((value or "").split())
+    if not keep_empty and not label_norm and not value_norm:
+        return None
+    return {
+        "label": label_norm or value_norm,
+        "element_id": element_id,
+        "value": value_norm or None,
+    }
+
+
+def _select_shadow_candidates_from_select_options(options: list[Any]) -> list[dict[str, str | None]]:
+    candidates: list[dict[str, str | None]] = []
+    for option in options:
+        if isinstance(option, dict):
+            candidate = _select_shadow_candidate(
+                str(option.get("text") or ""),
+                value=str(option.get("value") or ""),
+                keep_empty=True,
+            )
+        else:
+            candidate = _select_shadow_candidate(str(option), keep_empty=True)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _select_shadow_label_from_node(node: dict) -> str | None:
+    attrs = node.get("attributes") or {}
+    for raw_label in (
+        node.get("text"),
+        attrs.get("aria-label"),
+        attrs.get("title"),
+    ):
+        label = " ".join(str(raw_label or "").split())
+        if label:
+            return label
+    return None
+
+
+def _select_shadow_candidates_from_elements(elements: list[dict]) -> list[dict[str, str | None]]:
+    queue: deque[dict] = deque(elements)
+    candidates: list[dict[str, str | None]] = []
+    while queue:
+        node = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+
+        attrs = node.get("attributes") or {}
+        role = str(attrs.get("role") or "").lower()
+        tag = str(node.get("tagName") or "").lower()
+        element_id = str(node.get("id") or "") or None
+        label = _select_shadow_label_from_node(node)
+        if label and (role == "option" or tag in ("li", "option") or bool(node.get("interactable"))):
+            candidate = _select_shadow_candidate(label, element_id=element_id)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        for option in node.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            candidate = _select_shadow_candidate(
+                str(option.get("text") or ""),
+                element_id=element_id,
+                value=str(option.get("value") or ""),
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+        for child in node.get("children") or []:
+            queue.append(child)
+    return candidates
+
+
+def _select_shadow_agrees_with_native_choice(
+    candidates: list[dict[str, str | None]],
+    matched_index: int | None,
+    *,
+    llm_index: int | None,
+    llm_value: str | None,
+) -> bool | None:
+    if matched_index is None:
+        return False
+    if llm_index is not None:
+        return matched_index == llm_index
+    if llm_value is None or matched_index >= len(candidates):
+        return None
+
+    matched_candidate = candidates[matched_index]
+    llm_value_norm = _normalize_select_shadow_text(llm_value)
+    return llm_value_norm in {
+        _normalize_select_shadow_text(matched_candidate.get("label")),
+        _normalize_select_shadow_text(matched_candidate.get("value")),
+    }
+
+
+def _select_shadow_agrees_with_element_choice(
+    candidates: list[dict[str, str | None]],
+    matched_index: int | None,
+    *,
+    llm_element_id: str | None,
+    llm_value: str | None,
+) -> bool | None:
+    if matched_index is None:
+        return False
+    if matched_index >= len(candidates):
+        return None
+
+    matched_candidate = candidates[matched_index]
+    matched_element_id = matched_candidate.get("element_id")
+    if matched_element_id and llm_element_id:
+        return matched_element_id == llm_element_id
+    if llm_value is None:
+        return None
+    return _normalize_select_shadow_text(matched_candidate.get("label")) == _normalize_select_shadow_text(llm_value)
+
+
+def _log_select_shadow_match(
+    *,
+    prompt_name: str,
+    target_value: str | None,
+    get_candidates: Callable[[], list[dict[str, str | None]]],
+    agreement: Callable[[list[dict[str, str | None]], int | None], bool | None],
+) -> None:
+    if not _select_shadow_match_enabled():
+        return
+
+    try:
+        candidates = get_candidates()
+        option_labels = [candidate["label"] or "" for candidate in candidates]
+        matched_index, tier = classify_option_match(target_value, option_labels)
+        LOG.info(
+            "select_shadow_match",
+            prompt_name=prompt_name,
+            option_count=len(option_labels),
+            match_tier=tier,
+            match_found=matched_index is not None,
+            match_agrees_with_llm=agreement(candidates, matched_index),
+        )
+    except Exception:
+        LOG.debug("select_shadow_match failed", exc_info=True)
 
 
 def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
@@ -196,6 +426,18 @@ async def _save_adopted_session_download(
             workflow_run_id=workflow_run_id,
             exc_info=True,
         )
+
+    # Ordering: ``save_as`` above has already run and failed (empty or raised).
+    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
+    # the scheme), so route them through an in-page fetch from a same-origin frame.
+    if download.url.startswith("blob:"):
+        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+            page=page, blob_url=download.url, workflow_run_id=workflow_run_id
+        )
+        if blob_bytes is None:
+            return None
+        download_target.write_bytes(blob_bytes)
+        return download_target
 
     try:
         response = await page.context.request.get(download.url)
@@ -554,6 +796,25 @@ def _phone_digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _nanp_readback_national_digits(digits: str) -> str | None:
+    if len(digits) == 10:
+        return digits
+    if len(digits) in {11, 12} and digits[:-10] == "1" * (len(digits) - 10):
+        return digits[-10:]
+    return None
+
+
+def _phone_readback_digits_match(expected_digits: str, actual_digits: str) -> bool:
+    if actual_digits == expected_digits:
+        return True
+    if len(expected_digits) == 10 and actual_digits == f"1{expected_digits}":
+        return True
+
+    expected_nanp_digits = _nanp_readback_national_digits(expected_digits)
+    actual_nanp_digits = _nanp_readback_national_digits(actual_digits)
+    return expected_nanp_digits is not None and expected_nanp_digits == actual_nanp_digits
+
+
 def _is_plain_nanp_number(value: str | None) -> bool:
     # A 10-digit North American number with no '+'/country-code/extension markers. There is no
     # international handling, so a value carrying a '+' or letters (an extension) is excluded.
@@ -612,12 +873,36 @@ async def _is_tel_digit_fix_enabled(task: Task) -> bool:
         return False
 
 
+async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
+    organization_id = task.organization_id
+    if not organization_id:
+        return False
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+    try:
+        return bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                COLLAPSE_SELECT_FANOUT_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate collapse-select-fanout flag; defaulting to disabled",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+
 async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
-    # Compare digit counts only — never the raw value, which may be a secret.
+    # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator)
     expected_digits = _phone_digits(expected_value)
     actual_digits = _phone_digits(actual_value)
-    if expected_digits != actual_digits:
+    if not _phone_readback_digits_match(expected_digits, actual_digits):
         raise PhoneNumberInputMismatch(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
@@ -630,6 +915,191 @@ async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_n
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
     )
+
+
+def _select_option_target_value(option: SelectOption) -> str | None:
+    if option.label:
+        return option.label
+    if option.value:
+        return option.value
+    return None
+
+
+def _select_option_labels_and_values(options: list[SkyvernOptionType]) -> tuple[list[str], list[str | None]]:
+    labels: list[str] = []
+    values: list[str | None] = []
+    for option in options:
+        labels.append(option.get("text") or option.get("value") or "")
+        values.append(option.get("value"))
+    return labels, values
+
+
+def _normal_select_successful(action_results: list[ActionResult]) -> bool:
+    return any(isinstance(action_result, ActionSuccess) for action_result in action_results)
+
+
+def _select_value_is_ambiguous(options: list[SkyvernOptionType], value: str | None) -> bool:
+    if value is None:
+        return False
+    return sum(1 for option in options if option.get("value") == value) > 1
+
+
+async def _select_deterministic_normal_option(
+    *,
+    action: actions.SelectOptionAction,
+    skyvern_element: SkyvernElement,
+    locator: Locator,
+    matched_label: str | None,
+    matched_value: str | None,
+    matched_index: int | None,
+) -> list[ActionResult]:
+    action_result: list[ActionResult] = []
+    is_success = False
+
+    try:
+        await locator.click(
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.info(
+            "Failed to click before select action",
+            exc_info=True,
+            action=action,
+            locator=locator,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
+
+    value = matched_value if matched_value is not None else matched_label
+    if value is not None and not _select_value_is_ambiguous(skyvern_element.get_options(), value):
+        try:
+            await locator.select_option(
+                value=value,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
+            LOG.info(
+                "Failed to take select action by value",
+                exc_info=True,
+                action=action,
+                locator=locator,
+            )
+
+    if not is_success and matched_label is not None and matched_label != value:
+        try:
+            await locator.select_option(
+                label=matched_label,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
+            LOG.info(
+                "Failed to take select action by label",
+                exc_info=True,
+                action=action,
+                locator=locator,
+            )
+
+    if not is_success and matched_index is not None:
+        if matched_index >= len(skyvern_element.get_options()):
+            action_result.append(ActionFailure(OptionIndexOutOfBound(action.element_id)))
+            LOG.info(
+                "option index is out of bound",
+                action=action,
+                locator=locator,
+            )
+        else:
+            try:
+                await locator.select_option(
+                    index=matched_index,
+                    timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                )
+                is_success = True
+                action_result.append(ActionSuccess())
+            except Exception:
+                action_result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
+                LOG.info(
+                    "Failed to click on the option by index",
+                    exc_info=True,
+                    action=action,
+                    locator=locator,
+                )
+
+    if len(action_result) == 0:
+        action_result.append(ActionFailure(EmptySelect(element_id=action.element_id)))
+
+    return action_result
+
+
+async def _verify_normal_select_option(
+    *,
+    locator: Locator,
+    matched_index: int,
+    matched_label: str | None,
+    matched_value: str | None,
+) -> bool:
+    try:
+        selection = await locator.evaluate(
+            r"""
+            (select) => {
+                const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
+                if (!(select instanceof HTMLSelectElement)) {
+                    return { index: null, label: null, value: normalize(select?.value) };
+                }
+                const option = select.options[select.selectedIndex] ?? null;
+                return {
+                    index: select.selectedIndex,
+                    label: option ? normalize(option.textContent) : null,
+                    value: option ? normalize(option.value) : normalize(select.value),
+                };
+            }
+            """
+        )
+    except Exception:
+        LOG.info(
+            "Failed to read normal select option after deterministic selection",
+            expected_index=matched_index,
+            expected_label=matched_label,
+            expected_value=matched_value,
+            exc_info=True,
+        )
+        return False
+
+    if not isinstance(selection, dict):
+        LOG.info(
+            "Normal select read-back returned unexpected payload",
+            expected_index=matched_index,
+            expected_label=matched_label,
+            expected_value=matched_value,
+            actual_selection=selection,
+        )
+        return False
+
+    actual_index = selection.get("index")
+    actual_value = selection.get("value")
+    actual_label = selection.get("label") or actual_value
+    if (
+        actual_index == matched_index
+        and actual_label == matched_label
+        and (matched_value is None or actual_value == matched_value)
+    ):
+        return True
+
+    LOG.info(
+        "Normal select read-back did not match deterministic option",
+        expected_index=matched_index,
+        expected_label=matched_label,
+        expected_value=matched_value,
+        actual_index=actual_index,
+        actual_label=actual_label,
+        actual_value=actual_value,
+    )
+    return False
 
 
 async def check_date_format(
@@ -886,6 +1356,37 @@ class ActionHandler:
                 files = files + files_in_browser_session
             return files
 
+        async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str]) -> bool:
+            await xhr_capture.drain()
+            if not staging_dir.exists():
+                return False
+            staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
+            if not staged_files:
+                return False
+            moved_count = 0
+            for sf in staged_files:
+                target = download_dir / sf.name
+                if not target.exists():
+                    try:
+                        shutil.move(sf, target)
+                        xhr_fallback_moved_paths.add(str(target))
+                        moved_count += 1
+                    except OSError:
+                        LOG.warning(
+                            "Failed to move staged XHR file to download dir",
+                            file=sf.name,
+                            workflow_run_id=task.workflow_run_id,
+                            exc_info=True,
+                        )
+            if moved_count > 0:
+                LOG.info(
+                    "XHR staging fallback: moved staged files to download dir",
+                    staged_count=moved_count,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                return True
+            return False
+
         initial_page_count = 0
         page_url_before_download = page.url
         # get the initial page count
@@ -902,6 +1403,7 @@ class ActionHandler:
         staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
         xhr_capture = ScopedXhrDownloadCapture(page, staging_dir)
         download_triggered = False
+        xhr_fallback_moved_paths: set[str] = set()
         transient_text_observer = TransientPageTextObserver(
             page,
             task_id=task.task_id,
@@ -939,7 +1441,6 @@ class ActionHandler:
                 download_event_fallback_attempted = False
                 download_event_fallback_used = False
                 download_event_fallback_failed = False
-                xhr_fallback_moved_paths: set[str] = set()
                 download_signal_observed = False
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
@@ -1005,11 +1506,14 @@ class ActionHandler:
                                     break
                                 download_event_fallback_failed = True
                                 LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched",
+                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
                                     download_dir=download_dir,
                                     workflow_run_id=task.workflow_run_id,
                                 )
-                                break
+                                # Keep polling: the shared browser may still land the file in the session folder.
+                                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths):
+                                    download_triggered = True
+                                    break
 
                             list_files_after = await _list_observed_download_files()
 
@@ -1134,33 +1638,9 @@ class ActionHandler:
                             ",".join(error.error_code for error in download_wait_matched_errors),
                         )
 
-            await xhr_capture.drain()
-
-            if not download_triggered and staging_dir.exists():
-                staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
-                if staged_files:
-                    moved_count = 0
-                    for sf in staged_files:
-                        target = download_dir / sf.name
-                        if not target.exists():
-                            try:
-                                shutil.move(sf, target)
-                                xhr_fallback_moved_paths.add(str(target))
-                                moved_count += 1
-                            except OSError:
-                                LOG.warning(
-                                    "Failed to move staged XHR file to download dir",
-                                    file=sf.name,
-                                    workflow_run_id=task.workflow_run_id,
-                                    exc_info=True,
-                                )
-                    if moved_count > 0:
-                        download_triggered = True
-                        LOG.info(
-                            "XHR staging fallback: moved staged files to download dir",
-                            staged_count=moved_count,
-                            workflow_run_id=task.workflow_run_id,
-                        )
+            if not download_triggered:
+                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths):
+                    download_triggered = True
 
             if not download_triggered:
                 if action.errors:
@@ -1800,6 +2280,8 @@ async def _handle_multi_field_totp_sequence(
     """
     action_index = timing_info["action_index"]
     cache_key = f"{task.task_id}_totp_cache"
+    valid_from_key = f"{cache_key}_valid_from"
+    valid_until_key = f"{cache_key}_valid_until"
     current_context = skyvern_context.ensure_context()
 
     if action_index == 0:
@@ -1817,8 +2299,9 @@ async def _handle_multi_field_totp_sequence(
         # If less than threshold seconds until expiry, use the next TOTP
         if seconds_until_expiry < TOTP_EXPIRY_THRESHOLD_SECONDS:
             # Force generation of next TOTP by advancing time
-            next_time = current_totp_valid_until
-            current_totp = totp.at(next_time)
+            totp_valid_from = current_totp_valid_until
+            totp_valid_until = current_totp_valid_until + totp.interval
+            current_totp = totp.at(totp_valid_from)
 
             LOG.debug(
                 "Using multi-field TOTP flow - using NEXT TOTP due to <20s expiry",
@@ -1830,9 +2313,13 @@ async def _handle_multi_field_totp_sequence(
             )
         else:
             # Use current TOTP
+            totp_valid_from = current_totp_valid_until - totp.interval
+            totp_valid_until = current_totp_valid_until
             current_totp = totp.now()
 
         current_context.totp_codes[cache_key] = current_totp
+        current_context.totp_codes[valid_from_key] = str(totp_valid_from)
+        current_context.totp_codes[valid_until_key] = str(totp_valid_until)
     else:
         # Subsequent digits: reuse cached TOTP
         current_totp = current_context.totp_codes.get(cache_key)
@@ -1852,9 +2339,31 @@ async def _handle_multi_field_totp_sequence(
         if not totp:
             raise ValueError("Invalid TOTP secret or otpauth URI")
 
-        # Get current time and calculate TOTP expiry
+        cached_valid_from = current_context.totp_codes.get(valid_from_key)
+        cached_valid_until = current_context.totp_codes.get(valid_until_key)
+        if not cached_valid_from or not cached_valid_until:
+            LOG.error(
+                "TOTP cache metadata missing for subsequent digit",
+                action_idx=action_index,
+                cache_key=cache_key,
+            )
+            return [ActionFailure(TOTPExpiredError())]
+
+        try:
+            totp_valid_from = int(cached_valid_from)
+            totp_valid_until = int(cached_valid_until)
+        except ValueError:
+            LOG.error(
+                "TOTP cache metadata invalid for subsequent digit",
+                action_idx=action_index,
+                cache_key=cache_key,
+                cached_valid_from=cached_valid_from,
+                cached_valid_until=cached_valid_until,
+            )
+            return [ActionFailure(TOTPExpiredError())]
+
+        # Get current time and check against the cached TOTP window.
         current_time = int(time.time())
-        totp_valid_until = ((current_time // totp.interval) + 1) * totp.interval
 
         if current_time >= totp_valid_until:
             LOG.error(
@@ -1876,10 +2385,6 @@ async def _handle_multi_field_totp_sequence(
 
     # Special handling for the 6th digit (action_index=5): wait if TOTP is not yet valid
     if action_index == 5:
-        # Calculate when this TOTP becomes valid (valid_from time)
-        # If we used the next TOTP window, valid_from is the start of that window
-        totp_valid_from = totp_valid_until - totp.interval
-
         if current_time < totp_valid_from:
             # TOTP is not yet valid, wait until it becomes valid
             wait_seconds = totp_valid_from - current_time
@@ -2209,14 +2714,27 @@ async def handle_input_text_action(
     if not await skyvern_element.is_spinbtn_input() and (
         current_text or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
     ):
+        is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
             LOG.info("None input tag clear timeout", action=action)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
 
     # wait for blocking element to show up
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
@@ -4053,8 +4571,10 @@ async def choose_auto_completion_dropdown(
         result.incremental_elements = copy.deepcopy(incremental_element)
         html = ""
         new_interactable_element_ids = []
+        shadow_candidate_elements: list[dict] = []
         if len(incremental_element) > 0:
             cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+            shadow_candidate_elements = cleaned_incremental_element
 
             # Fast path for location inputs: if exactly one option appeared and it contains
             # what the user typed, click it directly without an LLM call.
@@ -4105,6 +4625,7 @@ async def choose_auto_completion_dropdown(
             result.incremental_elements = copy.deepcopy(
                 [scraped_page_after_open.id_to_element_dict[element_id] for element_id in new_interactable_element_ids]
             )
+            shadow_candidate_elements = result.incremental_elements
             html = scraped_page_after_open.build_element_tree()
 
         slim_output = await get_slim_output_template_value("auto-completion-choose-option")
@@ -4126,6 +4647,17 @@ async def choose_auto_completion_dropdown(
         )
         element_id = json_response.get("id", "")
         relevance_float = json_response.get("relevance_float", 0)
+        _log_select_shadow_match(
+            prompt_name="auto-completion-choose-option",
+            target_value=text,
+            get_candidates=lambda: _select_shadow_candidates_from_elements(shadow_candidate_elements),
+            agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+                candidates,
+                matched_index,
+                llm_element_id=element_id or None,
+                llm_value=json_response.get("value"),
+            ),
+        )
         if json_response.get("direct_searching", False):
             LOG.info(
                 "Decided to directly search with the current value",
@@ -4864,6 +5396,7 @@ async def select_from_emerging_elements(
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
     new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    shadow_candidate_elements: list[dict] = []
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     if new_element_subtrees:
@@ -4874,6 +5407,7 @@ async def select_from_emerging_elements(
                 strip_url_query_strings=True,
                 compress_nonnavigable_href=True,
             )
+        shadow_candidate_elements = new_element_subtrees
         incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
     else:
         LOG.warning(
@@ -4891,6 +5425,7 @@ async def select_from_emerging_elements(
                 strip_url_query_strings=True,
                 compress_nonnavigable_href=True,
             )
+        shadow_candidate_elements = fallback_tree
         incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in fallback_tree)
     LOG.debug(
         "Built HTML for emerging-element custom-select",
@@ -4928,6 +5463,17 @@ async def select_from_emerging_elements(
     # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
     raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
+    _log_select_shadow_match(
+        prompt_name="custom-select/emerging",
+        target_value=options.target_value,
+        get_candidates=lambda: _select_shadow_candidates_from_elements(shadow_candidate_elements),
+        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+            candidates,
+            matched_index,
+            llm_element_id=element_id,
+            llm_value=value,
+        ),
+    )
     if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
         raise _no_match_exception_for_dropdown(
             reasoning=json_response.get("reasoning"),
@@ -5073,6 +5619,17 @@ async def select_from_dropdown(
     # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
     raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
+    _log_select_shadow_match(
+        prompt_name="custom-select/dropdown",
+        target_value=target_value,
+        get_candidates=lambda: _select_shadow_candidates_from_elements(trimmed_element_tree),
+        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+            candidates,
+            matched_index,
+            llm_element_id=element_id,
+            llm_value=value,
+        ),
+    )
     if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
         raise _no_match_exception_for_dropdown(
             reasoning=json_response.get("reasoning"),
@@ -5487,7 +6044,10 @@ async def normal_select(
     step: Step,
     builder: ElementTreeBuilder,
 ) -> List[ActionResult]:
-    action.set_has_mini_agent()
+    collapse_select_fanout_enabled = await _is_collapse_select_fanout_enabled(task)
+    if not collapse_select_fanout_enabled:
+        action.set_has_mini_agent()
+
     try:
         current_text = await skyvern_element.get_attr("selected")
         if current_text and (current_text == action.option.label or current_text == action.option.value):
@@ -5510,7 +6070,46 @@ async def normal_select(
         context=input_or_select_context,
     )
 
-    await skyvern_element.refresh_select_options()
+    select_options_result = await skyvern_element.refresh_select_options()
+    select_options = select_options_result[0] if select_options_result else skyvern_element.get_options()
+    target_value = _select_option_target_value(action.option)
+    if target_value and select_options and collapse_select_fanout_enabled:
+        option_labels, option_values = _select_option_labels_and_values(select_options)
+        resolution = await app.AGENT_FUNCTION.resolve_field_option(
+            target_value=target_value,
+            option_labels=option_labels,
+            option_values=option_values,
+            field_context=input_or_select_context.model_dump(),
+            url=task.url,
+            organization_id=task.organization_id,
+        )
+        if not resolution.fallback_to_llm and resolution.matched_index is not None:
+            deterministic_result = await _select_deterministic_normal_option(
+                action=action,
+                skyvern_element=skyvern_element,
+                locator=locator,
+                matched_label=resolution.matched_label,
+                matched_value=resolution.matched_value,
+                matched_index=resolution.matched_index,
+            )
+            if _normal_select_successful(deterministic_result) and await _verify_normal_select_option(
+                locator=locator,
+                matched_index=resolution.matched_index,
+                matched_label=resolution.matched_label,
+                matched_value=resolution.matched_value,
+            ):
+                return deterministic_result
+
+            LOG.info(
+                "Deterministic normal-select failed; falling back to LLM path",
+                action=action,
+                target_value=target_value,
+                matched_index=resolution.matched_index,
+                matched_label=resolution.matched_label,
+            )
+
+    if collapse_select_fanout_enabled:
+        action.set_has_mini_agent()
     options_html = skyvern_element.build_HTML()
     field_information = (
         input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
@@ -5528,6 +6127,17 @@ async def normal_select(
     json_response = await app.NORMAL_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
+    _log_select_shadow_match(
+        prompt_name="normal-select",
+        target_value=action.option.label or action.option.value,
+        get_candidates=lambda: _select_shadow_candidates_from_select_options(select_options),
+        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_native_choice(
+            candidates,
+            matched_index,
+            llm_index=index,
+            llm_value=value,
+        ),
+    )
 
     try:
         await locator.click(

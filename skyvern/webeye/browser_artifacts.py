@@ -22,6 +22,12 @@ class BrowserArtifacts(BaseModel):
     traces_dir: str | None = None
     browser_session_dir: str | None = None
     browser_console_log_path: str | None = None
+    # Set by remote-CDP creators so RealBrowserManager attaches a CDP frame
+    # publisher. Local Playwright contexts leave it False. Type must stay
+    # ``bool`` — the manager guards with ``is True`` identity, not truthiness.
+    needs_cdp_frame_publisher: bool = False
+    # Optional opaque identifier for a remote browser session.
+    remote_browser_session_id: str | None = None
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
     async def append_browser_console_log(self, msg: str) -> int:

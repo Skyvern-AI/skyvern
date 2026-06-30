@@ -11,7 +11,6 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import {
-  GOOGLE_SHEETS_REQUIRED_SCOPES,
   getDefaultGoogleOAuthCredentialId,
   hasGoogleOAuthCredentialScopes,
   useGoogleOAuthCredentials,
@@ -22,6 +21,7 @@ type Props = {
   nodeId: string;
   value: string;
   onChange: (value: string) => void;
+  requiredScopes: readonly string[];
 };
 
 const ADVANCED_OPTION = "__advanced__";
@@ -31,6 +31,7 @@ function GoogleOAuthCredentialSelector({
   nodeId,
   value,
   onChange,
+  requiredScopes,
 }: Readonly<Props>) {
   const {
     credentials: allCredentials,
@@ -39,7 +40,7 @@ function GoogleOAuthCredentialSelector({
   } = useGoogleOAuthCredentials();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const credentials = allCredentials.filter((credential) =>
-    hasGoogleOAuthCredentialScopes(credential, GOOGLE_SHEETS_REQUIRED_SCOPES),
+    hasGoogleOAuthCredentialScopes(credential, requiredScopes),
   );
 
   // Keep latest callback without forcing effect re-runs.

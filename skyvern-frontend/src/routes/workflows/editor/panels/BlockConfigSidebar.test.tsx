@@ -81,6 +81,7 @@ import {
   BLOCK_SIDEBAR_WIDTH_MAX,
   useBlockSidebarWidthStore,
 } from "@/store/BlockSidebarWidthStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { BLOCK_FORMS, type WorkflowBlockNodeType } from "./BlockConfigForm";
@@ -122,6 +123,7 @@ beforeEach(() => {
     content: "parameters",
   });
   useBlockSidebarWidthStore.getState().reset();
+  useStudioShellStore.getState().reset();
   for (const key of BLOCK_FORM_KEYS) {
     BLOCK_FORMS[key] = StubFormForBlockType(key);
   }
@@ -321,9 +323,9 @@ describe("BlockConfigSidebar block library layout (contained drawer)", () => {
         </MemoryRouter>,
       );
 
-      const sidebarRoot = screen.getByTestId(
-        "block-config-sidebar",
-      ).parentElement;
+      // aside → shell wrapper → Resizable root (the element carrying the width).
+      const sidebarRoot = screen.getByTestId("block-config-sidebar")
+        .parentElement?.parentElement;
 
       expect(getContainedBlockSidebarWidth(BLOCK_SIDEBAR_WIDTH_MAX, 500)).toBe(
         452,
@@ -444,5 +446,137 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
 
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(mockLabelChangeHandler).not.toHaveBeenCalled();
+  });
+});
+
+describe("BlockConfigSidebar settings collapse (SKY-11481)", () => {
+  test("embedded studio renders the settings panel collapsed to a rail by default", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("settings-rail")).toBeDefined();
+    expect(useStudioShellStore.getState().settingsCollapsed).toBe(true);
+    // The body stays mounted (so the width animation can clip it) but inert.
+    expect(screen.getByTestId("block-config-sidebar").className).toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("the rail is collapsible for any block, not just Agent Settings", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+
+    const rail = screen.getByTestId("settings-rail");
+    expect(rail.textContent).toContain("Alpha");
+    expect(screen.getByTestId("block-config-sidebar").className).toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("clicking the rail expands to the full settings panel", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Show settings" }));
+
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+    expect(screen.getByText("Agent Settings")).toBeDefined();
+    // Expanded body is interactive again.
+    expect(screen.getByTestId("block-config-sidebar").className).not.toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("the header chevron collapses the panel back to the rail", () => {
+    act(() => {
+      useStudioShellStore.getState().setSettingsCollapsed(false);
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Close block configuration" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse settings" }));
+
+    expect(screen.getByTestId("settings-rail")).toBeDefined();
+    expect(useStudioShellStore.getState().settingsCollapsed).toBe(true);
+    // Body stays mounted (clipped under the rail) but inert.
+    expect(screen.getByTestId("block-config-sidebar").className).toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("the embedded shell uses the 0.75rem top + right inset mirroring the Copilot column", () => {
+    // The 0.75rem inset now lives on the animated shell (Resizable root), not
+    // the rail; collapsed and expanded both anchor there. The top inset matches
+    // the Copilot column's py-3 (0.75rem) so the two rails align below the
+    // workflow header instead of the panel sitting flush against it (SKY-11383).
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+    const railShell =
+      screen.getByTestId("settings-rail").parentElement?.parentElement;
+    expect(railShell?.style.top).toBe("0.75rem");
+    expect(railShell?.style.right).toBe("0.75rem");
+
+    act(() => {
+      useStudioShellStore.getState().setSettingsCollapsed(false);
+    });
+    rerender(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+    const panelShell = screen.getByTestId("block-config-sidebar").parentElement
+      ?.parentElement;
+    expect(panelShell?.style.top).toBe("0.75rem");
+    expect(panelShell?.style.right).toBe("0.75rem");
+  });
+
+  test("legacy (non-embedded) editor does not collapse and keeps the close button", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+    expect(screen.getByTestId("block-config-sidebar")).toBeDefined();
+    expect(
+      screen.getByRole("button", { name: "Close block configuration" }),
+    ).toBeDefined();
   });
 });

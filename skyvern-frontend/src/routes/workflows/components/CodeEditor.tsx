@@ -66,9 +66,14 @@ function CodeEditorImpl({
   extraExtensions,
   ...restProps
 }: Props) {
+  // `value` is typed `string`, but workflow document panels can pass an
+  // absent/incomplete payload at runtime (SKY-11567). Normalize to a string so
+  // the editor and the oversized-document guard never read `.length` of
+  // undefined.
+  const safeValue = value ?? "";
   const viewRef = useRef<EditorView | null>(null);
-  const [internalValue, setInternalValue] = useState(value);
-  const latestValueRef = useRef(value);
+  const [internalValue, setInternalValue] = useState(safeValue);
+  const latestValueRef = useRef(safeValue);
 
   // Defer EditorView creation until the container is in (or near) the
   // viewport. Block editors mount many CodeEditors at once (script-mode
@@ -103,9 +108,9 @@ function CodeEditorImpl({
   }, [shouldMount]);
 
   useEffect(() => {
-    setInternalValue(value);
-    latestValueRef.current = value;
-  }, [value]);
+    setInternalValue(safeValue);
+    latestValueRef.current = safeValue;
+  }, [safeValue]);
 
   // Capture the latest onChange in a ref so the debounced callback below
   // (and the React.memo wrapper export) stay referentially stable across

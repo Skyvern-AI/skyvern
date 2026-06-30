@@ -12282,7 +12282,8 @@
         "type": "string",
         "enum": [
           "s3",
-          "azure"
+          "azure",
+          "google_drive"
         ],
         "title": "FileStorageType"
       },
@@ -12438,6 +12439,28 @@
               }
             ],
             "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [
@@ -12607,6 +12630,28 @@
               }
             ],
             "title": "Azure Folder Path"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -845,6 +846,48 @@ async def test_classify_turn_intent_escapes_code_fences_in_untrusted_inputs() ->
     for sentinel in ("INJECT_VIA_USER", "INJECT_VIA_YAML", "INJECT_VIA_CONTEXT"):
         assert sentinel in prompt
         assert f"```{sentinel}" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_sanitizes_loaded_result_context_before_prompt() -> None:
+    prompts: list[str] = []
+    raw_context = json.dumps(
+        {
+            "loaded_result_targets": [
+                {
+                    "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
+                    "is_table": True,
+                    "row_selector": 'tr[data-account="987654321"]',
+                    "row_count": 2,
+                    "structure_signature": "legacy-selector-derived-sig",
+                }
+            ]
+        }
+    )
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"mode": "build", "expected_output": "workflow_draft", "reason_codes": []}
+
+    await classify_turn_intent(
+        user_message="build from the loaded results",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=raw_context,
+        request_policy=RequestPolicy(),
+        handler=handler,
+    )
+
+    prompt = prompts[0]
+    for value in (
+        "Jane",
+        "Customer",
+        "123456",
+        "987654321",
+        "legacy-selector-derived-sig",
+    ):
+        assert value not in prompt
+    assert '"row_count": 2' in prompt
 
 
 @pytest.mark.asyncio

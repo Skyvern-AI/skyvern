@@ -35,7 +35,6 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     SecretCredential,
 )
-from skyvern.forge.sdk.services.credentials import normalize_totp_config as normalize_credential_totp_config
 from skyvern.utils.strings import is_uuid
 
 LOG = structlog.get_logger()
@@ -522,13 +521,13 @@ class BitwardenService:
     @staticmethod
     def normalize_totp_config(totp_value: str) -> str:
         """
-        Validate the TOTP config from either a raw secret or a TOTP URI.
+        Preserve the raw TOTP value from Bitwarden.
 
         Args:
-            totp_value: Raw TOTP secret or URI (otpauth://totp/...)
+            totp_value: Raw TOTP secret, URI, or provider-specific payload.
 
         Returns:
-            The raw secret or full TOTP URI config
+            The raw TOTP value
 
         Example:
             >>> BitwardenService.normalize_totp_config("AAAAAABBBBBBB")
@@ -536,7 +535,7 @@ class BitwardenService:
             >>> BitwardenService.normalize_totp_config("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
             "otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB"
         """
-        return normalize_credential_totp_config(totp_value)
+        return totp_value.strip()
 
     @staticmethod
     def extract_totp_secret(totp_value: str) -> str:

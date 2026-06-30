@@ -1,4 +1,9 @@
-import { useNavigate, useParams } from "react-router-dom";
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 
 import { useStudioShellStore } from "@/store/StudioShellStore";
 
@@ -12,21 +17,41 @@ import { useStudioRunId } from "./useStudioRunId";
  */
 export function RunTab() {
   const navigate = useNavigate();
+  const location = useLocation();
   const urlRunId = useStudioRunId();
+  const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
   const setCopilotCollapsed = useStudioShellStore((s) => s.setCopilotCollapsed);
-  const { data: runs } = useWorkflowRunsQuery({
+  // isPending (not isLoading) stays true while the query is disabled waiting for
+  // globalWorkflows, so the empty state can't flash before the run lookup settles.
+  const { data: runs, isPending: runsPending } = useWorkflowRunsQuery({
     workflowPermanentId,
     page: 1,
     pageSize: 1,
   });
   const runId = urlRunId ?? runs?.[0]?.workflow_run_id;
+  // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
+  // so suppress that CTA for block runs (the block is rerun from the editor).
+  const isBlockRun = searchParams.has("bl");
 
   return (
     <RunView
       workflowRunId={runId}
-      onFix={() => setCopilotCollapsed(false)}
-      onRetry={() => navigate(`/workflows/${workflowPermanentId}/run`)}
+      runIdPending={!urlRunId && runsPending}
+      onFix={(seedMessage) => {
+        // Seed via location.state (Workspace reads it as the copilot's initialMessage);
+        // replace so Fix adds no Back-able entry and the message can't re-fire on Back.
+        navigate(`${location.pathname}${location.search}`, {
+          state: { copilotMessage: seedMessage },
+          replace: true,
+        });
+        setCopilotCollapsed(false);
+      }}
+      onRetry={
+        isBlockRun
+          ? undefined
+          : () => navigate(`/workflows/${workflowPermanentId}/run`)
+      }
     />
   );
 }

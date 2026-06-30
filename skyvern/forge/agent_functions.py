@@ -18,6 +18,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
+from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -38,7 +39,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
@@ -99,6 +100,15 @@ class TOTPVerificationResponse:
 class CopilotAliasResolution:
     url: str
     kind: str = "canonical_alias"
+
+
+@dataclass(frozen=True)
+class FieldOptionResolution:
+    matched_index: int | None
+    matched_label: str | None
+    matched_value: str | None
+    confidence: float
+    fallback_to_llm: bool
 
 
 def _remove_rect(element: dict) -> None:
@@ -908,6 +918,13 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def parse_enterprise_totp_secret(
+        self,
+        totp_secret: str,
+        organization_id: str | None = None,
+    ) -> str | None:
+        return None
+
     async def prepare_step_execution(
         self,
         organization: Organization | None,
@@ -1394,7 +1411,7 @@ class AgentFunction:
         organization_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Upload a single file to customer-specified S3 or Azure storage.
+        """Upload a single file to customer-specified cloud storage.
 
         Returns the customer-facing URI (``destination.customer_uri``).  The
         cloud override routes NAT-org traffic through the egress proxy so it
@@ -1429,6 +1446,16 @@ class AgentFunction:
             )
             await azure_client.upload_file_from_path(destination.sdk_uri, file_path)
             return destination.customer_uri
+
+        if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not destination.google_access_token or not destination.google_drive_folder_id:
+                raise ValueError("Google Drive destination is missing required fields")
+            uploaded_file = await google_drive_service.upload_file(
+                access_token=destination.google_access_token,
+                file_path=file_path,
+                folder_id=destination.google_drive_folder_id,
+            )
+            return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
 
         raise ValueError(f"Unsupported storage type: {destination.storage_type}")
 
@@ -1571,6 +1598,41 @@ class AgentFunction:
         Override in cloud to inject platform-specific passes.
         """
         return None
+
+    async def resolve_field_option(
+        self,
+        *,
+        target_value: str,
+        option_labels: list[str],
+        option_values: list[str | None],
+        field_context: Any,
+        url: str | None,
+        organization_id: str | None,
+    ) -> FieldOptionResolution:
+        """Resolve a requested field value against option labels.
+
+        Only high-precision exact or whole-stem singular/plural matches are
+        resolvable. A ``None`` match or ``fallback_to_llm=True`` means the
+        caller must defer to the LLM path.
+        """
+        matched_index = match_option_exact_or_stem(target_value, option_labels)
+        if matched_index is None:
+            return FieldOptionResolution(
+                matched_index=None,
+                matched_label=None,
+                matched_value=None,
+                confidence=0.0,
+                fallback_to_llm=True,
+            )
+
+        matched_value = option_values[matched_index] if matched_index < len(option_values) else None
+        return FieldOptionResolution(
+            matched_index=matched_index,
+            matched_label=option_labels[matched_index],
+            matched_value=matched_value,
+            confidence=1.0,
+            fallback_to_llm=False,
+        )
 
     async def fill_custom_widget(
         self,
