@@ -251,6 +251,9 @@ type QueuedPrompt = {
   content: string;
   reason: QueuedPromptReason;
   audioBlob?: Blob | null;
+  // The one-shot fix-origin signal travels with the prompt it was seeded for, so
+  // discarding the queue (new chat, history load, agent switch) drops it too.
+  fixOrigin?: boolean;
 };
 
 type SendOptions = {
@@ -340,6 +343,8 @@ interface WorkflowCopilotChatProps {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
+  // Sent as fix_origin only on the initial turn; does not propagate to subsequent turns.
+  initialMessageFixOrigin?: boolean;
   onInitialMessageConsumed?: () => void;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
@@ -416,6 +421,7 @@ export function WorkflowCopilotChat({
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
+  initialMessageFixOrigin,
   onInitialMessageConsumed,
   docked = false,
   onCollapse,
@@ -1111,8 +1117,11 @@ export function WorkflowCopilotChat({
     }
 
     updateQueuedPrompt(null);
-    // Discard the queued block-build's target so it can't leak into the next normal message.
+    // Drop the queued block-build target so it doesn't leak into the next message.
+    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
+    // a future path set it without queuing.
     blockBuildTargetLabelRef.current = null;
+    fixOriginPendingRef.current = false;
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -1145,6 +1154,7 @@ export function WorkflowCopilotChat({
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
   const blockBuildTargetLabelRef = useRef<string | null>(null);
+  const fixOriginPendingRef = useRef(false);
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
@@ -1185,11 +1195,18 @@ export function WorkflowCopilotChat({
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
         const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        // Move the pending fix-origin signal off the bare ref and onto the
+        // queued prompt so a discard of the queue (new chat, history load)
+        // can't leave it set to leak into the next, unrelated turn. The drain
+        // restores it onto the ref before re-entering handleSend.
+        const queuedFixOrigin = fixOriginPendingRef.current;
+        fixOriginPendingRef.current = false;
         updateQueuedPrompt({
           id: queuedId,
           content: candidate,
           reason,
           audioBlob: messageAudioBlob,
+          fixOrigin: queuedFixOrigin,
         });
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
@@ -1476,6 +1493,10 @@ export function WorkflowCopilotChat({
           }
         };
 
+        // Consume the one-shot fix-origin signal before any awaitable send step so a pre-stream
+        // failure (e.g. getSseClient throwing) can't leave it set to leak into the next turn.
+        const fixOrigin = fixOriginPendingRef.current;
+        fixOriginPendingRef.current = false;
         const client = await getSseClient(credentialGetter);
         const targetBlockLabel = blockBuildTargetLabelRef.current;
         blockBuildTargetLabelRef.current = null;
@@ -1498,6 +1519,7 @@ export function WorkflowCopilotChat({
               isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
             cancel_token: cancelToken,
             target_block_label: targetBlockLabel,
+            fix_origin: fixOrigin,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -1741,6 +1763,9 @@ export function WorkflowCopilotChat({
     // prompt that still needs the browser re-queues under the same id and
     // drains via the live_browser path once the session arrives.
     updateQueuedPrompt(null);
+    // Restore the fix-origin signal the prompt carried so the drained turn
+    // sends it; a re-queue (working → live_browser) re-captures it off the ref.
+    fixOriginPendingRef.current = promptToSend.fixOrigin ?? false;
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
@@ -1781,12 +1806,16 @@ export function WorkflowCopilotChat({
     // live browser isn't ready yet.
     hasAutoSentRef.current = true;
     onInitialMessageConsumedRef.current?.();
+    if (initialMessageFixOrigin) {
+      fixOriginPendingRef.current = true;
+    }
     handleSend(initialMessage).catch((error) => {
       console.error("Auto-send failed:", error);
     });
   }, [
     handleSend,
     initialMessage,
+    initialMessageFixOrigin,
     isLoading,
     isLoadingHistory,
     queuedPrompt,

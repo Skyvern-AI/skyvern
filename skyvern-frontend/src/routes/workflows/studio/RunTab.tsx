@@ -42,7 +42,7 @@ export function RunTab() {
         // Seed via location.state (Workspace reads it as the copilot's initialMessage);
         // replace so Fix adds no Back-able entry and the message can't re-fire on Back.
         navigate(`${location.pathname}${location.search}`, {
-          state: { copilotMessage: seedMessage },
+          state: { copilotMessage: seedMessage, copilotFixOrigin: true },
           replace: true,
         });
         setCopilotCollapsed(false);
