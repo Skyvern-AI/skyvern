@@ -21,12 +21,16 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
 import { ThoughtCard } from "./ThoughtCard";
-import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
+import {
+  type SkippedBranchGroup,
+  WorkflowRunTimelineBlockItem,
+} from "./WorkflowRunTimelineBlockItem";
 import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
 import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
   classifyUnexecutedDefinedBlocks,
   flattenTimelineChronologically,
+  type UnexecutedDefinedBlock,
 } from "./workflowTimelineUtils";
 
 type Props = {
@@ -113,6 +117,76 @@ function WorkflowRunTimeline({
       ),
     [workflowRun],
   );
+  const workflowRunIsNotFinalized = workflowRun
+    ? statusIsNotFinalized(workflowRun)
+    : false;
+  const workflowRunIsFinalized = workflowRun
+    ? statusIsFinalized(workflowRun)
+    : false;
+  const definedBlocks = useMemo(
+    () => workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+    [workflowRun?.workflow?.workflow_definition?.blocks],
+  );
+  const unexecutedBlocks = useMemo(
+    () =>
+      workflowRunIsFinalized
+        ? classifyUnexecutedDefinedBlocks(
+            definedBlocks,
+            workflowRunTimeline ?? [],
+          )
+        : [],
+    [definedBlocks, workflowRunIsFinalized, workflowRunTimeline],
+  );
+  const { skippedBranchBlocksByConditionalId, trailingUnexecutedBlocks } =
+    useMemo(() => {
+      const skippedBranchGroupsByConditionalId = new Map<
+        string,
+        Array<SkippedBranchGroup>
+      >();
+      const trailingBlocks: Array<UnexecutedDefinedBlock> = [];
+
+      unexecutedBlocks.forEach((item) => {
+        if (
+          item.reason === "branch_not_taken" &&
+          item.skippedByWorkflowRunBlockId
+        ) {
+          const skippedBranchGroups =
+            skippedBranchGroupsByConditionalId.get(
+              item.skippedByWorkflowRunBlockId,
+            ) ?? [];
+          const branchKey =
+            item.skippedBranch?.key ?? item.skippedBranch?.nextBlockLabel;
+          const skippedBranch = item.skippedBranch;
+          if (!branchKey || !skippedBranch) {
+            trailingBlocks.push(item);
+            return;
+          }
+          const skippedBranchGroup = skippedBranchGroups.find(
+            (group) => group.key === branchKey,
+          );
+          if (skippedBranchGroup) {
+            skippedBranchGroup.blocks.push(item);
+          } else {
+            skippedBranchGroups.push({
+              key: branchKey,
+              branch: skippedBranch,
+              blocks: [item],
+            });
+          }
+          skippedBranchGroupsByConditionalId.set(
+            item.skippedByWorkflowRunBlockId,
+            skippedBranchGroups,
+          );
+          return;
+        }
+        trailingBlocks.push(item);
+      });
+
+      return {
+        skippedBranchBlocksByConditionalId: skippedBranchGroupsByConditionalId,
+        trailingUnexecutedBlocks: trailingBlocks,
+      };
+    }, [unexecutedBlocks]);
 
   // Track known item IDs so we can animate only newly-arrived items
   const knownItemIdsRef = useRef<Set<string>>(new Set());
@@ -143,20 +217,12 @@ function WorkflowRunTimeline({
     return null;
   }
 
-  // bit redundant but better read
-  const workflowRunIsNotFinalized = statusIsNotFinalized(workflowRun);
-  const workflowRunIsFinalized = statusIsFinalized(workflowRun);
-
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
   const numberOfActions = countActionsInTimeline(workflowRunTimeline);
-  const definedBlocks = workflowRun.workflow?.workflow_definition?.blocks ?? [];
   const totalBlocks = definedBlocks.length;
   const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
-  const unexecutedBlocks = workflowRunIsFinalized
-    ? classifyUnexecutedDefinedBlocks(definedBlocks, workflowRunTimeline)
-    : [];
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
@@ -245,6 +311,9 @@ function WorkflowRunTimeline({
                       block={timelineItem.block}
                       blockOrder={blockOrder}
                       codeStepsByLabel={codeStepsByLabel}
+                      skippedBranchBlocksByConditionalId={
+                        skippedBranchBlocksByConditionalId
+                      }
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
                       onIterationClick={onIterationSelected}
@@ -279,7 +348,7 @@ function WorkflowRunTimeline({
               }
               return null;
             })}
-            {unexecutedBlocks.map(({ block, reason }) => (
+            {trailingUnexecutedBlocks.map(({ block, reason }) => (
               <WorkflowRunTimelineUnexecutedBlockItem
                 key={`unexecuted-${block.label}`}
                 block={block}

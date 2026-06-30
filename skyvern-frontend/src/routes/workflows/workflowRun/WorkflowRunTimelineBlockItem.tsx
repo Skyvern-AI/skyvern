@@ -42,7 +42,18 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
 import { ThoughtCard } from "./ThoughtCard";
-import { aggregateIterationStatus } from "./workflowTimelineUtils";
+import {
+  aggregateIterationStatus,
+  type SkippedBranchMetadata,
+  type UnexecutedDefinedBlock,
+} from "./workflowTimelineUtils";
+import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
+
+type SkippedBranchGroup = {
+  key: string;
+  branch: SkippedBranchMetadata;
+  blocks: Array<UnexecutedDefinedBlock>;
+};
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -52,6 +63,10 @@ type Props = {
   depth?: number;
   blockOrder?: ReadonlyMap<string, number>;
   codeStepsByLabel?: ReadonlyMap<string, Array<CodeBlockStep>>;
+  skippedBranchBlocksByConditionalId?: ReadonlyMap<
+    string,
+    Array<SkippedBranchGroup>
+  >;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onIterationClick?: (
     loopBlock: WorkflowRunBlock,
@@ -71,6 +86,7 @@ type LoopIterationGroup = {
 };
 
 const INDENT_PX = 14;
+const MAX_INDENT_RAIL_DEPTH = 6;
 const RAIL_HIGHLIGHT_OFFSET_PX = INDENT_PX / 2;
 const RAIL_CONTENT_PADDING_PX = INDENT_PX - 1;
 
@@ -82,7 +98,8 @@ const railHighlightStyle = {
 function IndentRails({ depth }: { depth: number }) {
   // Render guide rails only for nested rows. Top-level rows should start with
   // content, not a phantom outer timeline rail.
-  const rails = depth;
+  // Cap rails so deeply nested loops/conditionals do not squeeze row content.
+  const rails = Math.min(depth, MAX_INDENT_RAIL_DEPTH);
   return (
     <>
       {Array.from({ length: rails }).map((_, i) => (
@@ -408,6 +425,10 @@ type TimelineSubItemsProps = {
   depth: number;
   blockOrder?: ReadonlyMap<string, number>;
   codeStepsByLabel?: ReadonlyMap<string, Array<CodeBlockStep>>;
+  skippedBranchBlocksByConditionalId?: ReadonlyMap<
+    string,
+    Array<SkippedBranchGroup>
+  >;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onIterationClick?: (
     loopBlock: WorkflowRunBlock,
@@ -427,6 +448,7 @@ function TimelineSubItems({
   depth,
   blockOrder,
   codeStepsByLabel,
+  skippedBranchBlocksByConditionalId,
   onBlockItemClick,
   onIterationClick,
   onActionClick,
@@ -449,6 +471,9 @@ function TimelineSubItems({
               depth={depth}
               blockOrder={blockOrder}
               codeStepsByLabel={codeStepsByLabel}
+              skippedBranchBlocksByConditionalId={
+                skippedBranchBlocksByConditionalId
+              }
               onActionClick={onActionClick}
               onBlockItemClick={onBlockItemClick}
               onIterationClick={onIterationClick}
@@ -778,12 +803,183 @@ function TimelineSkippedStepRows({
   );
 }
 
+type TimelineSkippedBranchRowsProps = {
+  groups: Array<SkippedBranchGroup>;
+  depth: number;
+};
+
+function getSkippedBranchLabel(branch: SkippedBranchMetadata): string {
+  if (branch.description) {
+    return branch.description;
+  }
+  if (branch.criteriaDescription) {
+    return branch.criteriaDescription;
+  }
+  return branch.isDefault
+    ? `Default target ${branch.nextBlockLabel}`
+    : `Target ${branch.nextBlockLabel}`;
+}
+
+function getExcelStyleLetter(index: number): string {
+  let result = "";
+  let num = index;
+
+  while (num >= 0) {
+    result = String.fromCharCode(65 + (num % 26)) + result;
+    num = Math.floor(num / 26) - 1;
+  }
+
+  return result;
+}
+
+function getSkippedBranchMarker(branch: SkippedBranchMetadata): string {
+  if (branch.branchIndex === null) {
+    return branch.isDefault ? "Else" : "Branch";
+  }
+
+  const letter = getExcelStyleLetter(branch.branchIndex);
+  if (branch.isDefault) {
+    return `${letter} • Else`;
+  }
+  if (branch.branchIndex === 0) {
+    return `${letter} • If`;
+  }
+  return `${letter} • Else If`;
+}
+
+function getSkippedBranchReason(branch: SkippedBranchMetadata): string {
+  if (branch.error) return "eval error";
+  if (branch.result === false) return "condition false";
+  if (branch.wasEvaluated && branch.result === null) return "no match";
+  if (branch.isDefault) return "another branch matched";
+  if (!branch.wasEvaluated) return "not evaluated";
+  return "another branch matched";
+}
+
+function getSkippedBranchTitle(branch: SkippedBranchMetadata): string {
+  const parts = [
+    `Skipped ${getSkippedBranchMarker(branch)}: ${getSkippedBranchLabel(branch)}`,
+    `Reason: ${getSkippedBranchReason(branch)}`,
+    `Target: ${branch.nextBlockLabel}`,
+  ];
+  if (branch.expression) {
+    parts.push(`Expression: ${branch.expression}`);
+  }
+  if (
+    branch.renderedExpression &&
+    branch.renderedExpression !== branch.expression
+  ) {
+    parts.push(`Rendered: ${branch.renderedExpression}`);
+  }
+  if (branch.error) {
+    parts.push(`Error: ${branch.error}`);
+  }
+  return parts.join("\n");
+}
+
+function TimelineSkippedBranchRows({
+  groups,
+  depth,
+}: TimelineSkippedBranchRowsProps) {
+  if (groups.length === 0) return null;
+
+  return (
+    <div className="space-y-1 py-1">
+      {groups.map((group) => (
+        <TimelineSkippedBranchGroup
+          key={group.key}
+          group={group}
+          depth={depth}
+        />
+      ))}
+    </div>
+  );
+}
+
+function TimelineSkippedBranchGroup({
+  group,
+  depth,
+}: {
+  group: SkippedBranchGroup;
+  depth: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const branchMarker = getSkippedBranchMarker(group.branch);
+  const branchLabel = getSkippedBranchLabel(group.branch);
+  const branchReason = getSkippedBranchReason(group.branch);
+  const title = getSkippedBranchTitle(group.branch);
+
+  return (
+    <div>
+      <div className="flex min-h-[24px] items-stretch text-xs opacity-70">
+        <IndentRails depth={depth} />
+        <div
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5 text-slate-400"
+          style={railHighlightStyle}
+          title={title}
+        >
+          <button
+            type="button"
+            className="inline-flex size-4 shrink-0 items-center justify-center rounded text-slate-400 outline-none hover:bg-slate-700 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+            onClick={(event) => {
+              event.stopPropagation();
+              setExpanded((prev) => !prev);
+            }}
+            aria-label={
+              expanded ? "Collapse skipped branch" : "Expand skipped branch"
+            }
+            aria-expanded={expanded}
+          >
+            {expanded ? (
+              <ChevronDownIcon className="size-4" />
+            ) : (
+              <ChevronRightIcon className="size-4" />
+            )}
+          </button>
+          <div className="flex min-w-0 flex-1 items-center gap-1.5">
+            <span
+              className="size-2 shrink-0 rounded-full border border-dashed border-slate-500"
+              aria-hidden="true"
+            />
+            <span className="shrink-0 rounded border border-slate-700 bg-slate-800/50 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+              {branchMarker}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-slate-500">
+              · {branchLabel}
+            </span>
+            <span className="shrink-0 rounded bg-slate-800/60 px-1 text-[10px] text-slate-400">
+              {branchReason}
+            </span>
+            <span className="shrink-0 rounded bg-slate-800 px-1 text-[10px] tabular-nums text-slate-400">
+              {group.blocks.length}{" "}
+              {group.blocks.length === 1 ? "block" : "blocks"}
+            </span>
+          </div>
+        </div>
+      </div>
+      <Collapsible open={expanded}>
+        <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
+          {group.blocks.map(({ block, reason }) => (
+            <WorkflowRunTimelineUnexecutedBlockItem
+              key={`skipped-branch-${block.label}`}
+              block={block}
+              depth={depth + 1}
+              reason={reason}
+            />
+          ))}
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
+  );
+}
+
 function WorkflowRunTimelineBlockItem({
   activeItem,
   activeIteration = null,
   block,
   blockOrder,
   codeStepsByLabel,
+  skippedBranchBlocksByConditionalId,
   subItems,
   depth = 0,
   onBlockItemClick,
@@ -833,6 +1029,12 @@ function WorkflowRunTimelineBlockItem({
       ? getUnfiredCodeSteps(definitionCodeSteps, actions)
       : [];
   const hasSkippedCodeSteps = skippedCodeSteps.length > 0;
+  const skippedBranchGroups =
+    block.block_type === "conditional"
+      ? (skippedBranchBlocksByConditionalId?.get(block.workflow_run_block_id) ??
+        [])
+      : [];
+  const hasSkippedBranchBlocks = skippedBranchGroups.length > 0;
   const isForLoopBlock = block.block_type === "for_loop";
   const isWhileLoopBlock = block.block_type === "while_loop";
   const isLoopBlock = isForLoopBlock || isWhileLoopBlock;
@@ -849,7 +1051,10 @@ function WorkflowRunTimelineBlockItem({
   // whose "next" block is a flat sibling), showing a chevron that reveals
   // nothing is worse than no chevron at all.
   const isContainer =
-    hasRenderableNestedChildren || showsActionRows || hasCodeSteps;
+    hasRenderableNestedChildren ||
+    showsActionRows ||
+    hasCodeSteps ||
+    hasSkippedBranchBlocks;
 
   // The loop block itself is only "active" when no specific iteration is
   // selected — otherwise the iteration row owns the highlight.
@@ -887,6 +1092,7 @@ function WorkflowRunTimelineBlockItem({
     isRunning ||
       isActiveBlock ||
       showsActionRows ||
+      hasSkippedBranchBlocks ||
       hasActiveDescendant ||
       isLoopWithSelectedIteration ||
       !hasRenderableNestedChildren,
@@ -904,6 +1110,7 @@ function WorkflowRunTimelineBlockItem({
     if (userToggledRef.current) return;
     if (
       showsActionRows ||
+      hasSkippedBranchBlocks ||
       hasActiveDescendant ||
       isRunning ||
       isLoopWithSelectedIteration
@@ -912,6 +1119,7 @@ function WorkflowRunTimelineBlockItem({
     }
   }, [
     showsActionRows,
+    hasSkippedBranchBlocks,
     hasActiveDescendant,
     isRunning,
     isLoopWithSelectedIteration,
@@ -1048,6 +1256,12 @@ function WorkflowRunTimelineBlockItem({
                 onBlockItemClick={onBlockItemClick}
               />
             )}
+            {hasSkippedBranchBlocks && (
+              <TimelineSkippedBranchRows
+                groups={skippedBranchGroups}
+                depth={depth + 1}
+              />
+            )}
             {isLoopBlock && loopIterationGroups.length > 0 ? (
               <LoopIterationRows
                 loopBlock={block}
@@ -1057,6 +1271,9 @@ function WorkflowRunTimelineBlockItem({
                 depth={depth + 1}
                 blockOrder={blockOrder}
                 codeStepsByLabel={codeStepsByLabel}
+                skippedBranchBlocksByConditionalId={
+                  skippedBranchBlocksByConditionalId
+                }
                 onBlockItemClick={onBlockItemClick}
                 onIterationClick={onIterationClick}
                 onActionClick={onActionClick}
@@ -1074,6 +1291,9 @@ function WorkflowRunTimelineBlockItem({
                   depth={depth + 1}
                   blockOrder={blockOrder}
                   codeStepsByLabel={codeStepsByLabel}
+                  skippedBranchBlocksByConditionalId={
+                    skippedBranchBlocksByConditionalId
+                  }
                   onActionClick={onActionClick}
                   onBlockItemClick={onBlockItemClick}
                   onIterationClick={onIterationClick}
@@ -1099,6 +1319,10 @@ type LoopIterationRowsProps = {
   depth: number;
   blockOrder?: ReadonlyMap<string, number>;
   codeStepsByLabel?: ReadonlyMap<string, Array<CodeBlockStep>>;
+  skippedBranchBlocksByConditionalId?: ReadonlyMap<
+    string,
+    Array<SkippedBranchGroup>
+  >;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onIterationClick?: (
     loopBlock: WorkflowRunBlock,
@@ -1119,6 +1343,7 @@ function LoopIterationRows({
   depth,
   blockOrder,
   codeStepsByLabel,
+  skippedBranchBlocksByConditionalId,
   onBlockItemClick,
   onIterationClick,
   onActionClick,
@@ -1145,6 +1370,9 @@ function LoopIterationRows({
           depth={depth}
           blockOrder={blockOrder}
           codeStepsByLabel={codeStepsByLabel}
+          skippedBranchBlocksByConditionalId={
+            skippedBranchBlocksByConditionalId
+          }
           onBlockItemClick={onBlockItemClick}
           onIterationClick={onIterationClick}
           onActionClick={onActionClick}
@@ -1168,6 +1396,10 @@ type LoopIterationRowProps = {
   depth: number;
   blockOrder?: ReadonlyMap<string, number>;
   codeStepsByLabel?: ReadonlyMap<string, Array<CodeBlockStep>>;
+  skippedBranchBlocksByConditionalId?: ReadonlyMap<
+    string,
+    Array<SkippedBranchGroup>
+  >;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onIterationClick?: (
     loopBlock: WorkflowRunBlock,
@@ -1190,6 +1422,7 @@ function LoopIterationRow({
   depth,
   blockOrder,
   codeStepsByLabel,
+  skippedBranchBlocksByConditionalId,
   onBlockItemClick,
   onIterationClick,
   onActionClick,
@@ -1300,6 +1533,9 @@ function LoopIterationRow({
             depth={depth + 1}
             blockOrder={blockOrder}
             codeStepsByLabel={codeStepsByLabel}
+            skippedBranchBlocksByConditionalId={
+              skippedBranchBlocksByConditionalId
+            }
             onActionClick={onActionClick}
             onBlockItemClick={onBlockItemClick}
             onIterationClick={onIterationClick}
@@ -1315,3 +1551,4 @@ function LoopIterationRow({
 }
 
 export { WorkflowRunTimelineBlockItem };
+export type { SkippedBranchGroup };
