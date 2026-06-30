@@ -7,6 +7,7 @@ class OrganizationAuthTokenType(StrEnum):
     azure_client_secret_credential = "azure_client_secret_credential"
     custom_credential_service = "custom_credential_service"
     bitwarden_credential = "bitwarden_credential"
+    custom_llm = "custom_llm"
 
 
 class TaskType(StrEnum):

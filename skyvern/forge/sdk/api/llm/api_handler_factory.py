@@ -2205,7 +2205,7 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         params: dict[str, Any] = {}
-        if not llm_config.model_name.startswith("ollama/"):
+        if not llm_config.model_name.startswith(("ollama/", "ollama_chat/")):
             # OLLAMA does not support max_completion_tokens
             if llm_config.max_completion_tokens is not None:
                 params["max_completion_tokens"] = llm_config.max_completion_tokens

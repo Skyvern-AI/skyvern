@@ -289,6 +289,47 @@ export type ClearOrganizationAuthTokenResponse = {
   success: boolean;
 };
 
+export type CustomLLMProvider = "openai_compatible" | "ollama" | "openrouter";
+
+export type CustomLLMConfig = {
+  display_name: string;
+  provider: CustomLLMProvider;
+  model_name: string;
+  api_base?: string | null;
+  api_key?: string | null;
+  api_version?: string | null;
+  supports_vision: boolean;
+  add_assistant_prefix: boolean;
+  max_completion_tokens?: number | null;
+  temperature?: number | null;
+  reasoning_effort?: string | null;
+};
+
+export type CustomLLM = {
+  id: string;
+  organization_id: string;
+  config: CustomLLMConfig;
+  created_at: string;
+  modified_at: string;
+  valid: boolean;
+};
+
+export type CustomLLMListResponse = {
+  custom_llms: Array<CustomLLM>;
+};
+
+export type CustomLLMResponse = {
+  custom_llm: CustomLLM;
+};
+
+export type CustomLLMCreateRequest = {
+  config: CustomLLMConfig;
+};
+
+export type CustomLLMUpdateRequest = {
+  config: CustomLLMConfig;
+};
+
 export interface AzureClientSecretCredential {
   tenant_id: string;
   client_id: string;

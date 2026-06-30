@@ -344,7 +344,7 @@ class PdfFillBlock(Block):
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key or self.llm_key,
+            self.override_llm_key_for_organization(organization_id) or self.llm_key,
             default=default_llm_handler,
         )
         prompt = prompt_engine.load_prompt(
@@ -614,7 +614,7 @@ class PdfFillBlock(Block):
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key or self.llm_key,
+            self.override_llm_key_for_organization(organization_id) or self.llm_key,
             default=default_llm_handler,
         )
         prompt = prompt_engine.load_prompt(
