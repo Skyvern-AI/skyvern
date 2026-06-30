@@ -3419,3 +3419,390 @@ async def test_workflow_update_does_not_duplicate_keys_on_positional_reinjection
     sent_def = request_mock.await_args.kwargs["json"]["json_definition"]
     login_block = sent_def["workflow_definition"]["blocks"][0]
     assert login_block.get("parameter_keys", []).count("credentials") == 1
+
+
+# --- Non-credential parameter detachment (MCP get->edit->update round trip) ---
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_noncredential_parameter_keys_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layer B: a still-declared non-credential parameter that the update drops from a block's
+    parameter_keys (block matched by stable label) is re-attached, and the reattachment is surfaced
+    as a warning. Mirrors the credential reattachment but for plain workflow params."""
+
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "report_url",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://example.com/report",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "build_report",
+                        "parameter_keys": ["report_url"],
+                        "code": "x = report_url",
+                    },
+                ],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    # Keeps the param declared, but the regenerated block dropped it from parameter_keys.
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "report_url",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://example.com/report",
+                },
+            ],
+            "blocks": [
+                {"block_type": "code", "label": "build_report", "code": "x = report_url  # edited"},
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+    sent_def = request_mock.await_args.kwargs["json"]["json_definition"]
+    block = sent_def["workflow_definition"]["blocks"][0]
+    assert block.get("parameter_keys") == ["report_url"]
+    warnings = result.get("data", {}).get("warnings") or []
+    assert any("report_url" in w and "build_report" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_does_not_reinject_intentionally_removed_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layer B guard: if the update removes the parameter DECLARATION too (not just the block link),
+    the link is not re-injected — that is the explicit-removal path."""
+
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {"parameter_type": "workflow", "key": "report_url", "workflow_parameter_type": "string"},
+                ],
+                "blocks": [
+                    {"block_type": "code", "label": "build_report", "parameter_keys": ["report_url"], "code": "x"},
+                ],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [{"block_type": "code", "label": "build_report", "code": "x"}],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+    sent_def = request_mock.await_args.kwargs["json"]["json_definition"]
+    block = sent_def["workflow_definition"]["blocks"][0]
+    assert "report_url" not in (block.get("parameter_keys") or [])
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_emits_parameter_keys_and_strips_runtime_block_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layer A: skyvern_workflow_get returns the authoring shape — derive block parameter_keys from
+    resolved runtime `parameters`, strip `parameters`/`output_parameter`, and drop auto output params
+    from the top-level parameter list."""
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(
+            workflow_definition={
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "report_url",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://e.com",
+                        "workflow_parameter_id": "wp_1",
+                        "workflow_id": "wf_test",
+                    },
+                    {
+                        "parameter_type": "output",
+                        "key": "build_report_output",
+                        "output_parameter_id": "op_1",
+                        "workflow_id": "wf_test",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "build_report",
+                        "code": "x = report_url",
+                        "parameters": [
+                            {
+                                "parameter_type": "workflow",
+                                "key": "report_url",
+                                "workflow_parameter_type": "string",
+                                "default_value": "https://e.com",
+                                "workflow_parameter_id": "wp_1",
+                                "workflow_id": "wf_test",
+                            },
+                        ],
+                        "output_parameter": {
+                            "parameter_type": "output",
+                            "key": "build_report_output",
+                            "output_parameter_id": "op_1",
+                            "workflow_id": "wf_test",
+                        },
+                    },
+                ],
+            }
+        )
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    assert result["ok"] is True
+    wf_def = result["data"]["workflow_definition"]
+    block = wf_def["blocks"][0]
+    assert block.get("parameter_keys") == ["report_url"]
+    assert "parameters" not in block
+    assert "output_parameter" not in block
+    top_keys = [p["key"] for p in wf_def["parameters"]]
+    assert "report_url" in top_keys
+    assert "build_report_output" not in top_keys
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_maps_for_loop_and_context_source_to_authoring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layer A: for-loop runtime `loop_over` object maps to authoring `loop_over_parameter_key`, and a
+    context parameter's runtime `source` object maps to `source_parameter_key`."""
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(
+            workflow_definition={
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "urls",
+                        "workflow_parameter_type": "json",
+                        "default_value": [],
+                    },
+                    {
+                        "parameter_type": "context",
+                        "key": "current_url",
+                        "source": {"parameter_type": "workflow", "key": "urls", "workflow_parameter_type": "json"},
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "for_loop",
+                        "label": "each_url",
+                        "loop_over": {
+                            "parameter_type": "workflow",
+                            "key": "urls",
+                            "workflow_parameter_type": "json",
+                            "workflow_parameter_id": "wp_urls",
+                        },
+                        "loop_blocks": [
+                            {"block_type": "code", "label": "inner", "code": "y", "parameters": []},
+                        ],
+                    },
+                ],
+            }
+        )
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    assert result["ok"] is True
+    wf_def = result["data"]["workflow_definition"]
+    loop_block = wf_def["blocks"][0]
+    assert loop_block.get("loop_over_parameter_key") == "urls"
+    assert "loop_over" not in loop_block
+    context_param = next(p for p in wf_def["parameters"] if p["key"] == "current_url")
+    assert context_param.get("source_parameter_key") == "urls"
+    assert "source" not in context_param
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_noncredential_link_from_runtime_shaped_existing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layer B (prod shape): the existing workflow from GET is in RUNTIME shape — block links live in
+    resolved `parameters` objects, not `parameter_keys`. Step 3 must read that shape to detect the
+    prior link and re-attach the omitted key."""
+
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return {
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "report_url",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://e.com",
+                        "workflow_parameter_id": "wp_1",
+                        "workflow_id": "wf_test",
+                    },
+                ],
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "build_report",
+                        "code": "x = report_url",
+                        "parameters": [
+                            {
+                                "parameter_type": "workflow",
+                                "key": "report_url",
+                                "workflow_parameter_type": "string",
+                                "default_value": "https://e.com",
+                                "workflow_parameter_id": "wp_1",
+                                "workflow_id": "wf_test",
+                            },
+                        ],
+                        "output_parameter": {
+                            "parameter_type": "output",
+                            "key": "build_report_output",
+                            "output_parameter_id": "op_1",
+                            "workflow_id": "wf_test",
+                        },
+                    },
+                ],
+            },
+        }
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    definition = {
+        "title": "Updated workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "report_url",
+                    "workflow_parameter_type": "string",
+                    "default_value": "https://e.com",
+                },
+            ],
+            "blocks": [{"block_type": "code", "label": "build_report", "code": "x = report_url  # edited"}],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+    sent_def = request_mock.await_args.kwargs["json"]["json_definition"]
+    block = sent_def["workflow_definition"]["blocks"][0]
+    assert block.get("parameter_keys") == ["report_url"]
+    warnings = result.get("data", {}).get("warnings") or []
+    assert any("report_url" in w and "build_report" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_get_then_update_round_trip_preserves_block_parameter_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: GET returns the authoring shape; feeding it straight back into update preserves the
+    block<->parameter link with no manual re-add, and leaks no runtime fields to the backend."""
+
+    runtime_definition = {
+        "parameters": [
+            {
+                "parameter_type": "workflow",
+                "key": "report_url",
+                "workflow_parameter_type": "string",
+                "default_value": "https://e.com",
+                "workflow_parameter_id": "wp_1",
+                "workflow_id": "wf_test",
+            },
+        ],
+        "blocks": [
+            {
+                "block_type": "code",
+                "label": "build_report",
+                "code": "x = report_url",
+                "parameters": [
+                    {
+                        "parameter_type": "workflow",
+                        "key": "report_url",
+                        "workflow_parameter_type": "string",
+                        "default_value": "https://e.com",
+                        "workflow_parameter_id": "wp_1",
+                        "workflow_id": "wf_test",
+                    },
+                ],
+                "output_parameter": {
+                    "parameter_type": "output",
+                    "key": "build_report_output",
+                    "output_parameter_id": "op_1",
+                    "workflow_id": "wf_test",
+                },
+            },
+        ],
+    }
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(proxy_location="RESIDENTIAL", workflow_definition=runtime_definition)
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    got = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    assert got["ok"] is True
+    authoring_wf_def = got["data"]["workflow_definition"]
+    echo = {"title": "Round trip", "proxy_location": "RESIDENTIAL", "workflow_definition": authoring_wf_def}
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(echo),
+        format="json",
+    )
+
+    assert result["ok"] is True
+    sent_def = request_mock.await_args.kwargs["json"]["json_definition"]
+    block = sent_def["workflow_definition"]["blocks"][0]
+    assert block.get("parameter_keys") == ["report_url"]
+    assert "parameters" not in block
+    assert "output_parameter" not in block

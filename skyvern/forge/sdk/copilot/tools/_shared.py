@@ -202,8 +202,14 @@ def _registered_output_parameter_payloads(data: Mapping[str, Any]) -> list[Mappi
     accumulated outputs cannot satisfy the current run's completion contract.
     """
     run_id = data.get("workflow_run_id")
-    registered = data.get("registered_output_parameter_values")
-    if not isinstance(registered, list):
+    registered_values = data.get("registered_output_parameter_values")
+    registered_outputs = data.get("workflow_run_output_parameters")
+    registered = []
+    if isinstance(registered_values, list):
+        registered.extend(registered_values)
+    if isinstance(registered_outputs, list):
+        registered.extend(registered_outputs)
+    if not registered:
         return []
     if not isinstance(run_id, str):
         # Without a current run id the payloads can't be attributed to this run;

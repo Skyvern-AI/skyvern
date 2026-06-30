@@ -57,6 +57,7 @@ export function RunOutputsButton({
       </PopoverTrigger>
       <PopoverContent
         align="end"
+        onOpenAutoFocus={(e) => e.preventDefault()}
         className="flex w-[30rem] max-w-[90vw] flex-col gap-4"
       >
         {hasExtracted ? (

@@ -270,13 +270,13 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     expect(imageBitmap.close).toHaveBeenCalled();
   });
 
-  it("rejects QR codes that are not 2FA setup values", async () => {
+  it("imports a non-otpauth QR payload for server-side validation", async () => {
     const onChangeSpy = vi.fn();
     const imageBitmap = { close: vi.fn() } as unknown as ImageBitmap;
     class MockBarcodeDetector {
       detect = vi.fn().mockResolvedValue([
         {
-          rawValue: "https://example.com/account/settings",
+          rawValue: "custom-authenticator://activate?payload=opaque",
         },
       ]);
     }
@@ -309,19 +309,16 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     });
 
     await waitFor(() => {
-      expect(
-        screen.getByText(
-          "This QR code doesn't look like a 2FA setup code. Make sure you're scanning the setup QR from the site's 2FA settings.",
-        ),
-      ).toBeTruthy();
+      const qrCall = onChangeSpy.mock.calls.find((call) => {
+        const next = call[0] as Values;
+        return (
+          next.totp_type === "authenticator" &&
+          next.totp === "custom-authenticator://activate?payload=opaque"
+        );
+      });
+      expect(qrCall).toBeTruthy();
     });
     expect(imageBitmap.close).toHaveBeenCalled();
-    expect(
-      onChangeSpy.mock.calls.some((call) => {
-        const next = call[0] as Values;
-        return next.totp === "https://example.com/account/settings";
-      }),
-    ).toBe(false);
   });
 
   it("shows an inline fallback when the browser cannot scan QR codes", async () => {
@@ -510,5 +507,57 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       );
     });
     expect(reseedCall).toBeTruthy();
+  });
+
+  it("allows QR upload to set the TOTP payload", async () => {
+    const onChangeSpy = vi.fn();
+    const close = vi.fn();
+    const detect = vi
+      .fn()
+      .mockResolvedValue([{ rawValue: "decoded-qr-payload" }]);
+    class BarcodeDetector {
+      detect: typeof detect;
+
+      constructor() {
+        this.detect = detect;
+      }
+    }
+    vi.stubGlobal("BarcodeDetector", BarcodeDetector);
+    vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue({ close }));
+
+    const { container } = render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "Example Login",
+            username: "user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "authenticator",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+    const input = container.querySelector('input[type="file"]');
+    expect(input).toBeTruthy();
+    const file = new File(["qr"], "qr.png", { type: "image/png" });
+
+    await act(async () => {
+      fireEvent.change(input as HTMLInputElement, {
+        target: { files: [file] },
+      });
+    });
+
+    await waitFor(() =>
+      expect(onChangeSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          totp: "decoded-qr-payload",
+          totp_type: "authenticator",
+        }),
+      ),
+    );
+    expect(close).toHaveBeenCalled();
   });
 });

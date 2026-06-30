@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
 import structlog
@@ -9,6 +10,7 @@ from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.routes.streaming.registries import set_deferred_close_params, stream_ref_active
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -16,6 +18,11 @@ from skyvern.webeye.browser_artifacts import VideoArtifact
 from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.cdp_frame_publisher import (
+    CDPFramePublisher,
+    stream_key_for_task,
+    stream_key_for_workflow_run,
+)
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import finalize_webm
@@ -23,9 +30,125 @@ from skyvern.webeye.video_utils import finalize_webm
 LOG = structlog.get_logger()
 
 
+def _merge_proxy_session_headers(
+    extra_http_headers: dict[str, str] | None,
+    proxy_session_id: str | None,
+) -> dict[str, str] | None:
+    if not proxy_session_id:
+        return extra_http_headers
+    return app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(extra_http_headers, proxy_session_id)
+
+
+def _resolve_stream_key(*, workflow_run_id: str | None, task_id: str | None) -> str | None:
+    """Pick the stream key that the API-side WebSocket polls for this entity.
+
+    Workflow-run streams always read ``{workflow_run_id}.png``; task streams use
+    that same key when the task belongs to a workflow run, and fall back to
+    ``{task_id}.png`` only for standalone tasks. See
+    ``skyvern/forge/sdk/routes/streaming/screenshot.py``.
+    """
+    if workflow_run_id:
+        return stream_key_for_workflow_run(workflow_run_id)
+    if task_id:
+        return stream_key_for_task(task_id)
+    return None
+
+
 class RealBrowserManager(BrowserManager):
     def __init__(self) -> None:
         self.pages: dict[str, BrowserState] = {}
+        # CDP frame publishers keyed by stream key (``{wr}.png`` / ``{task}.png``).
+        self._frame_publishers: dict[str, CDPFramePublisher] = {}
+        # Serializes the check/create/start/store/register sequence in
+        # ``_start_frame_publisher`` so concurrent attaches for one stream key
+        # cannot orphan a publisher loop.
+        self._publisher_lock = asyncio.Lock()
+
+    async def _start_frame_publisher(
+        self,
+        *,
+        browser_state: BrowserState,
+        workflow_run_id: str | None = None,
+        task_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> None:
+        """Best-effort start a CDP frame publisher for this entity.
+
+        Gated on ``browser_state.browser_artifacts.needs_cdp_frame_publisher``,
+        which remote-CDP creators stamp. Local Playwright contexts leave it
+        False and skip publishing. Never raises.
+        """
+        # Strict equality; MagicMock attributes are truthy by default.
+        if browser_state.browser_artifacts.needs_cdp_frame_publisher is not True:
+            return
+        stream_key = _resolve_stream_key(workflow_run_id=workflow_run_id, task_id=task_id)
+        if not stream_key or not organization_id:
+            return
+        async with self._publisher_lock:
+            if stream_key in self._frame_publishers:
+                return
+            try:
+                publisher = CDPFramePublisher(
+                    browser_state=browser_state,
+                    stream_key=stream_key,
+                    organization_id=organization_id,
+                )
+                await publisher.start()
+                self._frame_publishers[stream_key] = publisher
+            except Exception:
+                LOG.warning(
+                    "Failed to start CDP frame publisher; livestream may be unavailable",
+                    stream_key=stream_key,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+                return
+            # Tie publisher lifetime to BrowserState.close() so any close path
+            # stops it without needing to know about the publisher registry.
+            captured_stream_key = stream_key
+
+            async def _on_browser_state_close() -> None:
+                # Pop under the same lock that guards ``_start_frame_publisher``
+                # so a concurrent restart cannot slip past the registry check
+                # and orphan a second publisher. ``pub.stop()`` runs outside
+                # the lock — it awaits the task's exit and must not block
+                # other publishers from starting.
+                async with self._publisher_lock:
+                    pub = self._frame_publishers.pop(captured_stream_key, None)
+                if pub is None:
+                    return
+                try:
+                    await pub.stop()
+                except Exception:
+                    LOG.debug(
+                        "CDP frame publisher stop raised during browser-state close; ignored",
+                        stream_key=captured_stream_key,
+                        exc_info=True,
+                    )
+
+            browser_state.add_on_close(_on_browser_state_close)
+
+    async def _stop_frame_publisher(
+        self,
+        *,
+        workflow_run_id: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        """Best-effort: stop the publisher matching this entity. Idempotent."""
+        stream_key = _resolve_stream_key(workflow_run_id=workflow_run_id, task_id=task_id)
+        if not stream_key:
+            return
+        publisher = self._frame_publishers.pop(stream_key, None)
+        if publisher is None:
+            return
+        try:
+            await publisher.stop()
+        except Exception:
+            LOG.debug(
+                "CDP frame publisher stop raised; ignored",
+                stream_key=stream_key,
+                exc_info=True,
+            )
 
     @staticmethod
     async def _create_browser_state(
@@ -120,20 +243,23 @@ class RealBrowserManager(BrowserManager):
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
 
+        proxy_location = task.proxy_location
+        extra_http_headers = task.extra_http_headers
         if browser_state is None:
             LOG.info("Creating browser state for task", task_id=task.task_id)
-            proxy_location = task.proxy_location
             if browser_session_id and task.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
-                if session and session.proxy_location is not None:
-                    proxy_location = session.proxy_location
+                if session:
+                    if session.proxy_location is not None:
+                        proxy_location = session.proxy_location
+                    extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=task.url,
                 task_id=task.task_id,
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
-                extra_http_headers=task.extra_http_headers,
+                extra_http_headers=extra_http_headers,
                 cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
             )
@@ -152,13 +278,19 @@ class RealBrowserManager(BrowserManager):
         # This will make sure browser_state.page is not None.
         await browser_state.get_or_create_page(
             url=task.url,
-            proxy_location=task.proxy_location,
+            proxy_location=proxy_location,
             task_id=task.task_id,
             workflow_permanent_id=task.workflow_permanent_id,
             organization_id=task.organization_id,
-            extra_http_headers=task.extra_http_headers,
+            extra_http_headers=extra_http_headers,
             cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
+        )
+        await self._start_frame_publisher(
+            browser_state=browser_state,
+            workflow_run_id=task.workflow_run_id,
+            task_id=task.task_id,
+            organization_id=task.organization_id,
         )
         return browser_state
 
@@ -197,6 +329,14 @@ class RealBrowserManager(BrowserManager):
                 self.pages[workflow_run_id] = browser_state
                 if parent_workflow_run_id:
                     self.pages[parent_workflow_run_id] = browser_state
+                # The workflow-run streaming endpoint reads ``{workflow_run_id}.png``, so the
+                # child needs its own publisher even when reusing the parent's browser state —
+                # the parent's publisher writes a different key.
+                await self._start_frame_publisher(
+                    browser_state=browser_state,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
                 return browser_state
 
         if browser_session_id:
@@ -235,26 +375,29 @@ class RealBrowserManager(BrowserManager):
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
+        proxy_location = workflow_run.proxy_location
+        extra_http_headers = workflow_run.extra_http_headers
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
                 sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            proxy_location = workflow_run.proxy_location
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
                     browser_session_id, workflow_run.organization_id
                 )
-                if session and session.proxy_location is not None:
-                    proxy_location = session.proxy_location
+                if session:
+                    if session.proxy_location is not None:
+                        proxy_location = session.proxy_location
+                    extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 organization_id=workflow_run.organization_id,
-                extra_http_headers=workflow_run.extra_http_headers,
+                extra_http_headers=extra_http_headers,
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
@@ -281,14 +424,19 @@ class RealBrowserManager(BrowserManager):
         # script) performs the first goto itself, avoiding a redundant page load.
         await browser_state.get_or_create_page(
             url=url if navigate else None,
-            proxy_location=workflow_run.proxy_location,
+            proxy_location=proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,
             organization_id=workflow_run.organization_id,
-            extra_http_headers=workflow_run.extra_http_headers,
+            extra_http_headers=extra_http_headers,
             cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
+        )
+        await self._start_frame_publisher(
+            browser_state=browser_state,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
         )
         return browser_state
 
@@ -396,6 +544,21 @@ class RealBrowserManager(BrowserManager):
 
     async def close(self) -> None:
         LOG.info("Closing BrowserManager")
+        # Stop all streaming frame publishers before closing browsers so CDP
+        # sessions detach cleanly. Cancellation here is best-effort and must
+        # not block manager shutdown.
+        for stream_key in list(self._frame_publishers.keys()):
+            publisher = self._frame_publishers.pop(stream_key, None)
+            if publisher is None:
+                continue
+            try:
+                await publisher.stop()
+            except Exception:
+                LOG.debug(
+                    "CDP frame publisher stop raised during manager close; ignored",
+                    stream_key=stream_key,
+                    exc_info=True,
+                )
         for browser_state in self.pages.values():
             await browser_state.close()
         self.pages = dict()
@@ -420,6 +583,12 @@ class RealBrowserManager(BrowserManager):
                 trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{task_id}.zip"
                 await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
                 LOG.info("Stopped tracing", trace_path=trace_path)
+            # Standalone-task only: a workflow-owned task's publisher is keyed
+            # by ``workflow_run_id`` (see ``_resolve_stream_key``) and is stopped
+            # by ``cleanup_for_workflow_run``. Passing ``task_id`` here is the
+            # honest signal — it hits ``{task_id}.png`` for standalone tasks
+            # and is a deliberate no-op for workflow tasks.
+            await self._stop_frame_publisher(task_id=task_id)
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
         LOG.info("Task is cleaned up")
 
@@ -452,9 +621,15 @@ class RealBrowserManager(BrowserManager):
         if child_workflow_run_ids:
             for child_id in child_workflow_run_ids:
                 self.pages.pop(child_id, None)
+                # Child workflows skip their own cleanup, so the publishers
+                # started for inherited child runs would otherwise leak until
+                # process shutdown. Stop them here.
+                await self._stop_frame_publisher(workflow_run_id=child_id)
 
-        from skyvern.forge.sdk.routes.streaming.registries import set_deferred_close_params, stream_ref_active
-
+        # Dual-stop is intentional and safe: both the explicit
+        # ``_stop_frame_publisher`` above and the ``add_on_close`` callback
+        # registered in ``_start_frame_publisher`` may fire for the same
+        # stream key. ``dict.pop(key, None)`` makes the second pop a no-op.
         streams_active = stream_ref_active(workflow_run_id)
 
         if browser_state_to_close:
@@ -494,7 +669,14 @@ class RealBrowserManager(BrowserManager):
                     workflow_run_id=workflow_run_id,
                 )
                 set_deferred_close_params(workflow_run_id, close_browser_on_completion)
+                # Keep the publisher running while streams are attached. The
+                # eventual ``close(True)`` fires the on-close callback that
+                # stops it; ``close(False)`` is covered by the publisher's
+                # own disconnect-driven self-termination.
             else:
+                # Detach the publisher's CDP session before the Playwright context
+                # closes; otherwise the stale session can race the teardown.
+                await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
                 await browser_state_to_close.close(close_browser_on_completion=effective_close)
 
         if not streams_active:

@@ -322,7 +322,30 @@ class Processor:
                     # of this event through subsequent state machines
                     break
 
+        # NOTE: append-only — the live interpreter calls this each iteration and
+        # tracks emitted actions by index, so collapsing here would shrink the list
+        # and drop a later wait. Collapsing happens in the raw process() path only.
         return actions
+
+    @staticmethod
+    def _collapse_consecutive_waits(actions: list[Action]) -> list[Action]:
+        collapsed: list[Action] = []
+
+        for action in actions:
+            previous = collapsed[-1] if collapsed else None
+            if isinstance(action, ActionWait) and isinstance(previous, ActionWait):
+                collapsed[-1] = ActionWait(
+                    kind=ActionKind.WAIT.value,
+                    target=previous.target,
+                    timestamp_start=previous.timestamp_start,
+                    timestamp_end=action.timestamp_end,
+                    url=action.url,
+                    duration_ms=previous.duration_ms + action.duration_ms,
+                )
+                continue
+            collapsed.append(action)
+
+        return collapsed
 
     def dedupe_block_labels(self, suspects: list[OutputBlock]) -> list[OutputBlock]:
         """
@@ -569,7 +592,7 @@ class Processor:
             **summarize_exfiltrated_recording_events(events),
             **self.identity,
         )
-        actions = self.events_to_actions(events)
+        actions = self._collapse_consecutive_waits(self.events_to_actions(events))
         blocks = await self.actions_to_blocks(actions)
         parameters = self.blocks_to_parameters(blocks)
 

@@ -250,6 +250,13 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     except Exception:
         LOG.exception("Failed to clean up stale browser sessions")
 
+    # Reap idle/abandoned persistent sessions on a timer so their in-process Chromium +
+    # record_video ffmpeg encoders don't leak (nothing else closes a session once it stops renewing).
+    try:
+        forge_app.PERSISTENT_SESSIONS_MANAGER.start_reaper()
+    except Exception:
+        LOG.exception("Failed to start persistent browser session reaper")
+
     # Start cleanup scheduler if enabled
     cleanup_task = start_cleanup_scheduler()
     if cleanup_task:

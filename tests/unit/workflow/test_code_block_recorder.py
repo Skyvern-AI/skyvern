@@ -9,13 +9,18 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    _HIGH_LEVEL_ACTION_MAP,
+    _LOCATOR_ACTION_MAP,
+    _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
     RecordingPage,
@@ -96,6 +101,15 @@ class FakePage:
     async def evaluate(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
         return None
 
+    async def extract(self, prompt, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return {"data": "extracted"}
+
+    async def complete(self, prompt=None, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return None
+
+    async def scroll(self, **kwargs):  # noqa: ANN003, ANN201
+        return None
+
 
 @pytest.mark.asyncio
 async def test_records_goto_click_fill_with_types_and_order() -> None:
@@ -122,6 +136,69 @@ async def test_page_evaluate_records_execute_js_action() -> None:
     assert [a.action_type for a in recorded] == [ActionType.EXECUTE_JS]
     assert recorded[0].description == "page.evaluate () => document.title"
     assert recorded[0].status == ActionStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_extract_high_level_call_records_extract_action_with_prompt() -> None:
+    """page.extract() must surface on the run timeline as an EXTRACT action carrying its
+    prompt, so a navigate+extract code block doesn't render as only repeated 'Goto URL'."""
+    page = RecordingPage(FakePage())
+    await page.goto("https://news.ycombinator.com/")
+    await page.extract(prompt="Extract the URLs of the top 20 posts")
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.GOTO_URL, ActionType.EXTRACT]
+    # The reader-facing prompt is the description verbatim (no "page.extract" prefix), so a
+    # timeline row reads as plain language with or without a matching editor step.
+    assert recorded[1].description == "Extract the URLs of the top 20 posts"
+
+
+@pytest.mark.asyncio
+async def test_extract_positional_prompt_is_recorded_in_description() -> None:
+    """The prompt is positional-or-keyword on extract; a positional prompt is still surfaced."""
+    page = RecordingPage(FakePage())
+    await page.extract("Extract the top visible comment")
+    recorded = page.recorded_actions()
+    assert recorded[0].action_type == ActionType.EXTRACT
+    assert recorded[0].description == "Extract the top visible comment"
+
+
+@pytest.mark.asyncio
+async def test_other_high_level_skyvern_page_calls_are_recorded() -> None:
+    """High-level SkyvernPage methods without a prompt still record their action type."""
+    page = RecordingPage(FakePage())
+    await page.scroll()
+    await page.complete()
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.SCROLL, ActionType.COMPLETE]
+
+
+def test_recorder_maps_cover_every_action_wrapped_skyvern_page_method() -> None:
+    """The recorder and editor-deriver maps are hand-maintained mirrors of SkyvernPage's
+    @action_wrap set. A high-level method added there but absent here would execute
+    unrecorded -- the exact SKY-11463 regression -- so assert every @action_wrap method
+    is mapped (to the same action_type) on both surfaces, or is an explicit no-op exclusion."""
+    live = {}
+    for name in dir(SkyvernPage):
+        action_type = getattr(getattr(SkyvernPage, name), "__skyvern_action_type__", None)
+        if action_type is not None:
+            live[name] = action_type
+    # Guard against a vacuous pass if introspection ever stops finding the decorated surface.
+    assert {"extract", "click", "complete", "scroll"} <= live.keys()
+
+    recorder = {**_PAGE_ACTION_MAP, **_LOCATOR_ACTION_MAP, **_HIGH_LEVEL_ACTION_MAP}
+    excluded = {"null_action"}  # NULL_ACTION is a no-op probe, never a timeline step
+
+    for name, action_type in live.items():
+        if name in excluded:
+            continue
+        assert recorder.get(name) == action_type, (
+            f"SkyvernPage.{name} is @action_wrap({action_type}) but RecordingPage maps it to "
+            f"{recorder.get(name)!r}; add it to code_block_recorder or it executes unrecorded"
+        )
+        assert _METHOD_ACTION_TYPES.get(name) == action_type.value, (
+            f"SkyvernPage.{name} ({action_type}) is missing/mismatched in "
+            f"code_block_steps._METHOD_ACTION_TYPES; the editor step preview will drift from the timeline"
+        )
 
 
 @pytest.mark.asyncio

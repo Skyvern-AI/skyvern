@@ -260,7 +260,18 @@ def parse_action(
         return ScrollAction(**base_action_dict, scroll_x=scroll_x, scroll_y=scroll_y)
 
     if action_type == ActionType.CLOSE_PAGE:
-        return ClosePageAction(**base_action_dict)
+        raw_index = action.get("tab_index")
+        if raw_index is None:
+            return ClosePageAction(**base_action_dict)
+        try:
+            tab_index = int(raw_index)
+        except (TypeError, ValueError):
+            LOG.warning(
+                "CLOSE_PAGE action returned with a non-integer tab_index, closing the current tab instead",
+                raw_action=action,
+            )
+            return ClosePageAction(**base_action_dict)
+        return ClosePageAction(**base_action_dict, tab_index=tab_index)
 
     if action_type == ActionType.EXTRACT:
         # EXTRACT is a global page action, not element-targeted

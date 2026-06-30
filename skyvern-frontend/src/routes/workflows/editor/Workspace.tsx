@@ -31,7 +31,7 @@ import {
   useReactFlow,
   Edge,
 } from "@xyflow/react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
@@ -47,7 +47,14 @@ import {
   StreamModeBadge,
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
+import { type BrowserSession as BrowserSessionData } from "@/routes/workflows/types/browserSessionTypes";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
+import {
+  DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
+  DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS,
+  formatBrowserSessionRemainingTime,
+  getBrowserSessionRemainingMs,
+} from "../hooks/debugSessionLease";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
@@ -142,6 +149,8 @@ import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
+import { useStudioRunId } from "../studio/useStudioRunId";
+import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import {
   STUDIO_COPILOT_RAIL_WIDTH,
@@ -319,6 +328,9 @@ function Workspace({
     (s) => s.setCopilotCollapsed,
   );
   const studioSetTab = useStudioShellStore((s) => s.setTab);
+  const studioSetSettingsCollapsed = useStudioShellStore(
+    (s) => s.setSettingsCollapsed,
+  );
   // The studio canvas sits right of the Copilot column; offset the fit by the
   // column width so the chain centers on the whole page, not just the pane.
   const studioCanvasCenterOffset = embedded
@@ -436,6 +448,7 @@ function Workspace({
 
   const { getNodes, getEdges } = useReactFlow();
   const { data: workflowRun } = useWorkflowRunQuery();
+  const studioRunId = useStudioRunId();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const { browserStreamingMode } = useBrowserStreamingMode();
 
@@ -664,6 +677,7 @@ function Workspace({
     workflowPermanentId,
     enabled: shouldFetchDebugSession && !!workflowPermanentId,
     isRateLimited,
+    keepAliveBrowserSession: true,
   });
 
   const activeDebugSession = debugSession ?? null;
@@ -694,6 +708,28 @@ function Workspace({
     hasBackendSession: Boolean(liveBrowserSessionId),
     headlessTurnDrainEnabled: headlessTurnDrainEnabled || embedded,
   });
+  const debugSessionExpiryWarningKeyRef = useRef<string | null>(null);
+
+  const { data: liveBrowserSession, dataUpdatedAt: liveBrowserSessionNowMs } =
+    useQuery<BrowserSessionData>({
+      queryKey: ["browserSession", liveBrowserSessionId],
+      queryFn: async () => {
+        if (!liveBrowserSessionId) {
+          throw new Error("Cannot fetch browser session without an ID");
+        }
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<BrowserSessionData>(
+          `/browser_sessions/${liveBrowserSessionId}`,
+        );
+        return response.data;
+      },
+      enabled:
+        Boolean(liveBrowserSessionId) &&
+        shouldFetchDebugSession &&
+        !isRateLimited,
+      refetchInterval: DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
+      refetchOnWindowFocus: true,
+    });
 
   const handleLiveBrowserReadyChange = useCallback(
     (ready: boolean, sessionId: string | null) => {
@@ -703,6 +739,50 @@ function Workspace({
   );
 
   useBrowserLoadingFlag(shouldFetchDebugSession, readyBrowserSessionId);
+
+  useEffect(() => {
+    if (!liveBrowserSession || liveBrowserSession.completed_at) {
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    const remainingMs = getBrowserSessionRemainingMs(
+      liveBrowserSession,
+      liveBrowserSessionNowMs,
+    );
+    if (remainingMs !== null && remainingMs <= 0) {
+      if (debugSessionExpiryWarningKeyRef.current) {
+        toast({
+          variant: "destructive",
+          title: "Browser session expired",
+          description: "Start a new debug browser to continue.",
+        });
+      }
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    if (
+      remainingMs === null ||
+      remainingMs > DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS
+    ) {
+      debugSessionExpiryWarningKeyRef.current = null;
+      return;
+    }
+
+    const warningKey = `${liveBrowserSession.browser_session_id}:${liveBrowserSession.started_at}:${liveBrowserSession.timeout}`;
+    if (debugSessionExpiryWarningKeyRef.current === warningKey) {
+      return;
+    }
+
+    debugSessionExpiryWarningKeyRef.current = warningKey;
+    const remainingTime = formatBrowserSessionRemainingTime(remainingMs);
+    toast({
+      variant: "warning",
+      title: "Browser session expiring soon",
+      description: `This debug browser expires in ${remainingTime}. Skyvern renews it automatically while this view is open, but may open a replacement browser if this lease can no longer be renewed.`,
+    });
+  }, [liveBrowserSession, liveBrowserSessionNowMs]);
 
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
@@ -770,6 +850,11 @@ function Workspace({
       ? (initialNodes.find((node) => node.type === "start")?.id ?? null)
       : null;
     useWorkflowPanelStore.getState().setSelectedBlockId(startNodeId);
+    // The collapse flag is a module-level store, so it survives an in-session
+    // A→B workflow nav; re-collapse here so every workflow opens to the rail.
+    if (embedded) {
+      studioSetSettingsCollapsed(true);
+    }
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     cacheKeyInitWpidRef.current = null;
@@ -1309,6 +1394,12 @@ function Workspace({
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
+    useWorkflowPanelStore.getState().setSelectedBlockId(id);
+    // Adding a block is a deliberate action: expand the studio settings panel
+    // to the new block (the library flow doesn't go through onNodeClick).
+    if (embedded) {
+      studioSetSettingsCollapsed(false);
+    }
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -1704,6 +1795,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 centerOffsetX={studioCanvasCenterOffset}
+                embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
@@ -2270,6 +2362,7 @@ function Workspace({
         liveBrowserSessionId={
           copilotLiveBrowserReady ? liveBrowserSessionId : null
         }
+        workflowRunId={copilotRunId({ embedded, studioRunId })}
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}

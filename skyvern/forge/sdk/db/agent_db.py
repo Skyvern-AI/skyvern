@@ -746,6 +746,9 @@ class AgentDB(BaseAlchemyDB):
     async def delete_browser_profile(self, *args: Any, **kwargs: Any) -> Any:
         return await self.browser_sessions.delete_browser_profile(*args, **kwargs)
 
+    async def hard_delete_browser_profile(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.browser_sessions.hard_delete_browser_profile(*args, **kwargs)
+
     async def get_active_persistent_browser_sessions(self, *args: Any, **kwargs: Any) -> Any:
         return await self.browser_sessions.get_active_persistent_browser_sessions(*args, **kwargs)
 
@@ -869,6 +872,9 @@ class AgentDB(BaseAlchemyDB):
 
     async def update_script_block(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.update_script_block(*args, **kwargs)
+
+    async def clear_script_block_run_signatures(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.scripts.clear_script_block_run_signatures(*args, **kwargs)
 
     async def get_script_files(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.get_script_files(*args, **kwargs)

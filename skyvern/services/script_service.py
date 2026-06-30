@@ -2850,6 +2850,8 @@ async def upload_file(
     azure_storage_account_name: str | None = None,
     azure_storage_account_key: str | None = None,
     azure_blob_container_name: str | None = None,
+    google_credential_id: str | None = None,
+    google_drive_folder_id: str | None = None,
     path: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
@@ -2867,6 +2869,10 @@ async def upload_file(
         azure_storage_account_key = _render_template_with_label(azure_storage_account_key, label)
     if azure_blob_container_name:
         azure_blob_container_name = _render_template_with_label(azure_blob_container_name, label)
+    if google_credential_id:
+        google_credential_id = _render_template_with_label(google_credential_id, label)
+    if google_drive_folder_id:
+        google_drive_folder_id = _render_template_with_label(google_drive_folder_id, label)
     if path:
         path = _render_template_with_label(path, label)
     file_upload_block = FileUploadBlock(
@@ -2881,6 +2887,8 @@ async def upload_file(
         azure_storage_account_name=azure_storage_account_name,
         azure_storage_account_key=azure_storage_account_key,
         azure_blob_container_name=azure_blob_container_name,
+        google_credential_id=google_credential_id,
+        google_drive_folder_id=google_drive_folder_id,
         path=path,
     )
     await file_upload_block.execute_safe(

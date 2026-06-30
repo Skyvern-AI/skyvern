@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -723,6 +724,30 @@ workflow_definition:
         assert "do not hardcode the eval value" in prompt
         assert "rerun via update_and_run_blocks" in prompt
 
+    def test_synthesized_parameter_binding_prompt_uses_exact_key(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="synthesized_parameter_binding_ambiguous",
+            unresolved_names=["enter_confirmation"],
+            parameter_keys=["enter_confirmation"],
+            available_parameter_keys=["confirmation_number"],
+            binding_candidates=["enter_confirmation", "confirmation_number"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "reason_code: synthesized_parameter_binding_ambiguous" in prompt
+        assert "binding_candidates: enter_confirmation, confirmation_number" in prompt
+        assert "declare and use the exact workflow input key" in prompt
+        assert "include that exact key in the code block's parameter_keys" in prompt
+        assert "reference it as a bare Python variable in code" in prompt
+        assert "do not guess or hardcode the runtime value" in prompt
+        assert "rerun via update_and_run_blocks" in prompt
+
     def test_ambiguous_selector_repair_context_prompt_includes_selector_details(self) -> None:
         repair_context = CodeAuthoringRepairContext(
             block_label="order_status",
@@ -773,6 +798,43 @@ workflow_definition:
         assert "stable role/name/data attribute" in prompt
         assert "button:nth-of-type" not in prompt
         assert "secret-token" not in prompt
+
+    def test_runtime_repair_context_prompt_includes_failure_and_page_state(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="search_registry",
+            reason_code="runtime_block_failure",
+            runtime_failure_reason='Timeout waiting for locator("#results")',
+            runtime_failure_class="timeout_waiting_for_selector",
+            failed_block_status="failed",
+            workflow_run_id="wr_failed",
+            current_origin="https://example.test",
+            current_url_present=True,
+            current_title_present=True,
+            page_evidence_source="inspect_page_for_composition",
+            observed_after_workflow_run=True,
+            page_form_summaries=["Search #search"],
+            page_result_summaries=["No results No matching records"],
+            page_action_summaries=["Search button.search disabled"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert 'runtime_failure_reason: Timeout waiting for locator("#results")' in prompt
+        assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
+        assert "failed_block_status: failed" in prompt
+        assert "current_origin: https://example.test" in prompt
+        assert "current_url_present: true" in prompt
+        assert "current_title_present: true" in prompt
+        assert "observed_after_workflow_run: true" in prompt
+        assert "page_forms: Search #search" in prompt
+        assert "page_results: No results No matching records" in prompt
+        assert "page_actions: Search button.search disabled" in prompt
+        assert "adapt the next code block to the observed page state" in prompt
+        assert "do not re-emit the same failing selector or name path" in prompt
 
 
 class TestVerifiedWorkflowOrNone:
@@ -1249,6 +1311,7 @@ class TestRequestPolicyInputGuardrail:
             organization_id="org-1",
             handler=policy_inputs.handler,
             active_criteria=None,
+            config=None,
         )
 
     @pytest.mark.asyncio
@@ -1744,7 +1807,7 @@ class TestTranslateToAgentResultGating:
                 completion_criteria=[
                     CompletionCriterion(id="provider", outcome="The returned record identifies the provider."),
                 ],
-            )
+            ),
         )
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which saved credential should I use?"})
 
@@ -2805,6 +2868,73 @@ class TestCredentialRefusalReachesAgent:
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
 
+    @pytest.mark.asyncio
+    async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        def fake_resolve_model_config(_handler, *, copilot_config=None, llm_key_override=None):
+            del copilot_config, llm_key_override
+            return "model-primary", object(), "PRIMARY", True
+
+        run_with_enforcement = AsyncMock(
+            return_value=_fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True})
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        with capture_logs() as logs:
+            result = await agent_module.run_copilot_agent(
+                stream=MagicMock(),
+                organization_id="org-1",
+                chat_request=SimpleNamespace(
+                    message="build it",
+                    workflow_id="wf-1",
+                    workflow_permanent_id="wfp-1",
+                    workflow_copilot_chat_id="chat-1",
+                    workflow_yaml="",
+                    browser_session_id=None,
+                ),
+                chat_history=[],
+                global_llm_context=None,
+                debug_run_info_text="",
+                llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+                api_key="sk-test",
+                config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
+                turn_id="turn-1",
+            )
+
+        policy_event = next(log for log in logs if log["event"] == "copilot_block_authoring_policy_resolved")
+
+        assert result.user_response == "ok"
+        assert policy_event["block_authoring_policy"] == "CODE_ONLY_BROWSER"
+        assert policy_event["block_authoring_policy_value"] == BlockAuthoringPolicy.CODE_ONLY_BROWSER.value
+        assert policy_event["workflow_permanent_id"] == "wfp-1"
+        assert policy_event["workflow_id"] == "wf-1"
+        assert policy_event["workflow_copilot_chat_id"] == "chat-1"
+        assert policy_event["turn_id"] == "turn-1"
+
     def test_native_tools_carry_refusal_reference(self) -> None:
         import re
 
@@ -2872,6 +3002,44 @@ class TestNativeToolSurface:
 
 class TestRequestPolicyCredentialResolution:
     @pytest.mark.asyncio
+    async def test_request_policy_classifier_uses_configured_default_timeout_budget(self, monkeypatch) -> None:
+        from skyvern.config import Settings, settings
+        from skyvern.forge.sdk.copilot import request_policy as rp
+
+        default_timeout = Settings.model_fields["COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS"].default
+        assert default_timeout == 12.0
+
+        observed_timeouts: list[float | None] = []
+        real_wait_for = rp.asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout=None):
+            observed_timeouts.append(timeout)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", default_timeout)
+        monkeypatch.setattr(rp.time, "monotonic", lambda: 1000.0)
+        monkeypatch.setattr(rp.asyncio, "wait_for", recording_wait_for)
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "success"
+        assert observed_timeouts == [default_timeout]
+
+    @pytest.mark.asyncio
     async def test_request_policy_classifier_timeout_does_not_retry(self, monkeypatch) -> None:
         from skyvern.config import settings
 
@@ -2896,7 +3064,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "timeout"
         assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_slow_but_within_budget_returns_real_policy(self, monkeypatch) -> None:
@@ -2951,7 +3119,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_retries_transient_error_then_succeeds(self) -> None:
@@ -3009,7 +3177,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_non_retriable_error_does_not_retry(self) -> None:
@@ -3032,7 +3200,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_transient_error_exhausting_budget_labels_transient(
@@ -3066,7 +3234,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "transient_error"
         assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
     async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
@@ -3554,7 +3722,7 @@ workflow_definition:
 
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
         assert policy.credential_input_kind == "credential_name"
         assert policy.credential_refs == ["mock-portal-login"]
         assert policy.resolved_credentials == [credential]
@@ -3581,7 +3749,7 @@ workflow_definition:
         )
 
         assert policy.classifier_status == "fallback"
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
         assert policy.credential_input_kind == "none"
         assert policy.credential_refs == []
         credentials.get_credentials.assert_not_called()
@@ -4788,6 +4956,24 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
 
 
+class TestValidationClassificationOutputContractRule:
+    def test_build_system_prompt_requires_exact_top_level_classification_contract_keys(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
+
+        assert "validation_classification_output_contracts" in prompt
+        assert "explicitly `return` a dict" in prompt
+        assert "Do not rely on schema defaults or exposed top-level locals" in prompt
+        assert "exact `return_key` as a top-level key" in prompt
+        assert "goal_value_paths" in prompt
+        assert "extraction_schema" in prompt
+        assert "reject code-only output blocks without that metadata" in prompt
+        assert "observed_gate_phrase" in prompt
+        assert "Synonyms such as `path_login_only`, `classification`, or prose in `evidence_text`" in prompt
+        assert "do not replace the required key" in prompt
+
+
 class TestCopilotConfig:
     def test_system_prompt_uses_custom_security_rules(self) -> None:
         prompt = agent_module._build_system_prompt(
@@ -5493,7 +5679,7 @@ class TestStructuralInfeasibilityQuestion:
 
 class TestClassifierFallbackCompletionFloor:
     @pytest.mark.asyncio
-    async def test_timeout_fallback_emits_method_mandated_run_floor(self, monkeypatch) -> None:
+    async def test_timeout_fallback_emits_gradeable_run_floor(self, monkeypatch) -> None:
         monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
 
         async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
@@ -5513,22 +5699,22 @@ class TestClassifierFallbackCompletionFloor:
         assert policy.completion_criteria
         assert all(c.level == "run" for c in policy.completion_criteria)
         assert all(c.implicit for c in policy.completion_criteria)
-        assert all(c.method_mandated for c in policy.completion_criteria)
+        assert policy.completion_criteria[0].method_mandated is False
         assert all(is_fallback_floor_criterion(c) for c in policy.completion_criteria)
         assert policy.completion_contract is None
-        assert policy.completion_contract_status == "unknown"
+        assert policy.completion_contract_status == "present"
 
         trace = policy.to_trace_data()
-        assert trace["completion_criteria_count"] == 0
-        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria)
+        assert trace["completion_criteria_count"] == 1
+        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria) - 1
         assert trace["has_completion_contract"] is False
 
-    def test_floor_is_excluded_from_judge_satisfaction_set(self) -> None:
+    def test_floor_base_reaches_judge_satisfaction_set(self) -> None:
         policy = _classifier_fallback_policy([], raw_secret_present=False, failure_kind="timeout")
         ctx = SimpleNamespace(request_policy=policy)
 
         assert policy.completion_criteria
-        assert _completion_verification_criteria(ctx) == []
+        assert _completion_verification_criteria(ctx) == [policy.completion_criteria[0]]
 
     def test_credential_aware_floor_adds_one_run_plane_criterion(self) -> None:
         base = build_classifier_fallback_floor([])
@@ -5536,7 +5722,9 @@ class TestClassifierFallbackCompletionFloor:
 
         assert len(credentialed) == len(base) + 1
         assert all(c.level == "run" for c in credentialed)
-        assert all(c.implicit and c.method_mandated for c in credentialed)
+        assert all(c.implicit for c in credentialed)
+        assert credentialed[0].method_mandated is False
+        assert credentialed[1].method_mandated is True
         assert len({c.id for c in credentialed}) == len(credentialed)
 
     def test_floor_respects_max_criteria_cap(self) -> None:

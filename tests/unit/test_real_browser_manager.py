@@ -154,10 +154,20 @@ def make_task(
     return task
 
 
-def make_session(proxy_location: object = None) -> MagicMock:
+def make_session(proxy_location: object = None, proxy_session_id: str | None = None) -> MagicMock:
     session = MagicMock()
     session.proxy_location = proxy_location
+    session.proxy_session_id = proxy_session_id
     return session
+
+
+def _merge_cloud_proxy_session_headers(
+    extra_http_headers: dict[str, str] | None,
+    proxy_session_id: str,
+) -> dict[str, str]:
+    headers = dict(extra_http_headers or {})
+    headers.setdefault("dedicated-ip", proxy_session_id)
+    return headers
 
 
 @pytest.mark.asyncio
@@ -172,6 +182,7 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
     session = make_session(proxy_location=session_proxy)
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -184,6 +195,33 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
         mock_create.assert_awaited_once()
         _, kwargs = mock_create.call_args
         assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -> None:
+    manager = RealBrowserManager()
+    task = make_task("tsk_1", proxy_location="RESIDENTIAL")
+    task.extra_http_headers = {"X-Test": "1"}
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session = make_session(proxy_location="RESIDENTIAL_ISP", proxy_session_id="abc1234567")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_123")
+
+    expected_headers = {"X-Test": "1", "dedicated-ip": "abc1234567"}
+    assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert task.extra_http_headers == {"X-Test": "1"}
 
 
 @pytest.mark.asyncio
@@ -242,6 +280,38 @@ async def test_workflow_run_browser_inherits_session_proxy_when_no_browser_state
         mock_create.assert_awaited_once()
         _, kwargs = mock_create.call_args
         assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_browser_inherits_session_proxy_pin_when_no_browser_state() -> None:
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_1")
+    workflow_run.extra_http_headers = {"X-Test": "1"}
+
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session = make_session(proxy_location="RESIDENTIAL_ISP", proxy_session_id="abc1234567")
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_456",
+            )
+
+    expected_headers = {"X-Test": "1", "dedicated-ip": "abc1234567"}
+    assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert workflow_run.extra_http_headers == {"X-Test": "1"}
 
 
 @pytest.mark.asyncio
@@ -507,12 +577,8 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
 
     persist_mock = AsyncMock()
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", persist_mock)
-    # streaming is a namespace package; patch the module object so resolution does not depend on the
-    # parent binding the submodule, which varies with import order across the suite.
-    from skyvern.forge.sdk.routes.streaming import registries as streaming_registries
-
-    monkeypatch.setattr(streaming_registries, "stream_ref_active", lambda wrid: True)
-    monkeypatch.setattr(streaming_registries, "set_deferred_close_params", lambda *a, **k: None)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", lambda *a, **k: None)
 
     await manager.cleanup_for_workflow_run("wfr_streamed", task_ids=[], close_browser_on_completion=True)
 

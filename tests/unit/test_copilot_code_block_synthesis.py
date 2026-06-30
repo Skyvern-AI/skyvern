@@ -1730,6 +1730,11 @@ class TestSynthesizedArtifactMetadata:
         assert metadata["completion_criteria"][0]["text"].startswith("<fill:")
         assert metadata["claimed_outcomes"][0]["text"].startswith("<fill:")
 
+    def test_skeleton_marks_placeholder_schema_self_authored(self) -> None:
+        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
+        assert metadata["claimed_outcomes"][0]["extraction_schema"].startswith("<fill:")
+        assert metadata["claimed_outcomes"][0]["extraction_schema_provenance"] == "self_authored"
+
     def test_skeleton_is_byte_identical_per_trajectory(self) -> None:
         first = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
         second = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)

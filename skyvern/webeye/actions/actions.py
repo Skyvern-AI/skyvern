@@ -257,9 +257,10 @@ class ReloadPageAction(Action):
     action_type: ActionType = ActionType.RELOAD_PAGE
 
 
-# TODO: right now, it's only enabled when there's magic link during login
 class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
+    # When set, close the open tab at this index in the open-tabs list instead of the current tab.
+    tab_index: int | None = None
 
 
 class NewTabAction(Action):

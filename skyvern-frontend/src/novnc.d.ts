@@ -33,7 +33,9 @@ declare module "@novnc/novnc/lib/rfb.js" {
 
     addEventListener(event: string, listener: (e: RfbEvent) => void): void;
     removeEventListener(event: string, listener: (e: RfbEvent) => void): void;
+    clipboardPasteFrom(text: string): void;
     disconnect(): void;
+    sendKey(keysym: number, code: string, down?: boolean): void;
     viewportChange(): void;
   }
 }

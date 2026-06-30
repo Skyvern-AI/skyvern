@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from typing import Awaitable, Callable, Literal, Protocol
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
@@ -17,6 +17,8 @@ class BrowserState(Protocol):
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
     pw: Playwright
+
+    def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 
     async def check_and_fix_state(
         self,

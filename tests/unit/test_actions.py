@@ -20,6 +20,7 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ClickAction,
+    ClosePageAction,
     ExtractAction,
     GotoUrlAction,
     InputTextAction,
@@ -357,6 +358,33 @@ def test_parse_keypress_invalid_key_returns_null_action() -> None:
         scraped_page=_mock_scraped_page(),
     )
     assert isinstance(action, NullAction)
+
+
+def test_parse_close_page_with_tab_index() -> None:
+    action = parse_action(
+        action={"action_type": "CLOSE_PAGE", "tab_index": 3, "reasoning": "drop the extra tab"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClosePageAction)
+    assert action.tab_index == 3
+
+
+def test_parse_close_page_without_tab_index_defaults_to_current() -> None:
+    action = parse_action(
+        action={"action_type": "CLOSE_PAGE", "reasoning": "close current"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClosePageAction)
+    assert action.tab_index is None
+
+
+def test_parse_close_page_non_integer_tab_index_falls_back_to_current() -> None:
+    action = parse_action(
+        action={"action_type": "CLOSE_PAGE", "tab_index": "not-a-number", "reasoning": "bad index"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClosePageAction)
+    assert action.tab_index is None
 
 
 def test_parse_keypress_backward_compat_press_enter() -> None:

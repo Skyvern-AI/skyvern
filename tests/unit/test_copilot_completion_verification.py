@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import textwrap
 import time
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
@@ -14,16 +15,32 @@ from skyvern.forge.sdk.copilot.agent import (
     _rewrite_failed_test_response,
     _verified_workflow_or_none,
 )
+from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criteria_to_json
+from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    grade_requested_output_criteria,
+    split_requested_output_criteria,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionVerificationResult,
     CriterionVerdict,
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
+    combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
+    grade_fallback_floor_reached_end_state_criteria,
+    grade_present_value_criteria,
     grade_record_semantic_consistency,
+    grade_registered_download_criteria,
     grade_structured_record_criteria,
+    grade_terminal_goal_record_criteria,
+    grade_validation_classification_criteria,
+    registered_download_completion_criterion,
+    run_plane_all_no_evidence,
+    structural_unfired_contingent_criterion_ids,
+    structured_record_has_goal_content,
     structured_record_has_identity,
     summarize_unsatisfied_outcomes,
 )
@@ -42,7 +59,13 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy, _parse_completion_criteria
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    RequestPolicy,
+    _parse_completion_criteria,
+    build_classifier_fallback_floor,
+)
 from skyvern.forge.sdk.copilot.tools import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     _active_run_terminal_evidence_needs_visual_fallback,
@@ -63,11 +86,43 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_visible_result_after_completion_verification,
     _watchdog_exit_allows_terminal_promotion,
 )
-from skyvern.forge.sdk.copilot.tools.completion import _artifact_health_blocker_from_result
+from skyvern.forge.sdk.copilot.tools.completion import (
+    _artifact_health_blocker_from_result,
+    _reconcile_download_completion_criterion,
+)
 
 
-def _criterion(cid: str, outcome: str, *, method_mandated: bool = False) -> CompletionCriterion:
-    return CompletionCriterion(id=cid, outcome=outcome, method_mandated=method_mandated)
+def _criterion(
+    cid: str,
+    outcome: str,
+    *,
+    method_mandated: bool = False,
+    output_path: str | None = None,
+    contingent_on: str | None = None,
+    contingent_antecedent_output_path: str | None = None,
+    kind: str = "outcome",
+    terminal_action_family: str | None = None,
+    deliverable_kind: str | None = None,
+    expected_output_value: str | None = None,
+    expected_output_shape: str | None = None,
+    classification_output_key: str | None = None,
+    expected_classification: str | bool | None = None,
+) -> CompletionCriterion:
+    return CompletionCriterion(
+        id=cid,
+        outcome=outcome,
+        method_mandated=method_mandated,
+        output_path=output_path,
+        contingent_on=contingent_on,
+        contingent_antecedent_output_path=contingent_antecedent_output_path,
+        kind=kind,
+        terminal_action_family=terminal_action_family,
+        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
+        expected_output_value=expected_output_value,
+        expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
+        classification_output_key=classification_output_key,
+        expected_classification=expected_classification,
+    )
 
 
 _STRUCTURED_RECORD_CRITERIA = (
@@ -131,6 +186,124 @@ def _record_payload(**overrides: Any) -> dict[str, Any]:
         ],
         "overall_status": "Active",
         "evidence_text": "Opened Details page; read Overview/Affiliations items and More Details identifier.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _terminal_goal_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "submitted": True,
+        "blocker": None,
+        "confirmation_number": "WTR-1842-DEMO",
+        "account_number": "100245",
+        "selected_start_date": "2026-06-22",
+        "deposit_amount": "$41.00 plus initiation fee",
+        "next_owner": "Provider",
+        "evidence_text": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "all_checks_passed": True,
+        "validation_only": True,
+        "review_page_visible": True,
+        "submit_or_finalize_clicked": False,
+        "submitted_request": False,
+        "confirmation_page_visible": False,
+        "review_values": {
+            "visible_service_address": "1234 Sample Utility Way, Testville, CA 94016",
+            "visible_requested_start_date": "2026-06-22",
+            "visible_account_holder": "EXAMPLE REALTY LABS INC",
+        },
+        "evidence_text": (
+            "Visible Review page showed service address 1234 Sample Utility Way, Testville, CA 94016, "
+            "start date 2026-06-22, and account holder EXAMPLE REALTY LABS INC. "
+            "No Submit Request or final confirmation control was clicked."
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _generated_validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "pre_submit_review_reached": True,
+        "exact_service_address_verified": True,
+        "requested_start_date_verified": True,
+        "business_name_verified": True,
+        "account_holder_verified": True,
+        "safe_mailing_address_verified": True,
+        "no_payment_or_deposit_gate": True,
+        "validation_only": True,
+        "submit_or_finalize_clicked": False,
+        "terminal_summary": "Pre-submit review reached: True; submit/finalize control clicked: False.",
+        "final_controls_visible": ["Submit Request", "Back"],
+        "review_fields": {
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Requested Start Date": "2026-06-22",
+            "Business Name": "Example Realty Labs Inc",
+            "Account Holder": "EXAMPLE REALTY LABS INC",
+        },
+        "evidence_text": (
+            "Start Service - Review\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Business Name\nExample Realty Labs Inc\n"
+            "Account Holder\nEXAMPLE REALTY LABS INC\n"
+            "Submit Request\nBack"
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _live_validation_review_output_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "all_validations_passed": True,
+        "evidence_text": (
+            "Step 1 Find Address\n"
+            "Step 2 About Business\n"
+            "Step 3 Account Information\n"
+            "Step 4 Review\n"
+            "Step 5 Confirmation\n"
+            "Start Service - Review\n\n"
+            "Review all request details before final submission.\n\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Business Name\nExample Realty Labs Inc\n"
+            "Account Holder\nEXAMPLE REALTY LABS INC\n"
+            "Mailing Address\nPO Box 4300, Harbor City, CA 90210\n"
+            "Tax Identifier\nMasked ending in 4321\n"
+            "Payment / Deposit\nNo payment, deposit, autopay, or unsafe attestation required before review.\n"
+            "Submit Request\nBack"
+        ),
+        "final_submit_controls_present": 1,
+        "pre_submit_review_reached": True,
+        "review_page_label": "Start Service - Review",
+        "submit_mode": "validation_only",
+        "review_values": {
+            "Account Holder": "EXAMPLE REALTY LABS INC",
+            "Business Name": "Example Realty Labs Inc",
+            "Mailing Address": "PO Box 4300, Harbor City, CA 90210",
+            "Payment / Deposit": "No payment, deposit, autopay, or unsafe attestation required before review.",
+            "Requested Start Date": "2026-06-22",
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Tax Identifier": "Masked ending in 4321",
+        },
+        "submit_finalize_control_clicked": False,
+        "terminal_summary": "Pre-submit review reached: True; submit/finalize control clicked: False",
+        "validations": {
+            "account_holder_verified": True,
+            "business_name_verified": True,
+            "exact_service_address_verified": True,
+            "no_payment_deposit_gate_verified": True,
+            "requested_start_date_verified": True,
+            "safe_mailing_address_verified": True,
+        },
     }
     payload.update(overrides)
     return payload
@@ -213,6 +386,326 @@ def test_definition_plane_unsatisfied_still_blocks() -> None:
     unreferenced = CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="definition_parameters_missing")
     confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
     assert _mixed(unreferenced, confirmed).is_fully_satisfied() is False
+
+
+def test_unfired_contingent_abstention_does_not_sink_evidence_confirmed_run() -> None:
+    contingent_unknown = CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")
+    confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_on_by_criterion_id={"c0": "the provider site blocks online submission"},
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[contingent_unknown, confirmed],
+    )
+
+    assert result.is_fully_satisfied() is True
+    trace = result.to_trace_data()
+    assert trace["contingent_criterion_ids"] == ["c0"]
+    assert trace["structural_unfired_criterion_ids"] == ["c0"]
+    assert trace["verdict_0_state"] == "unknown"
+    assert trace["verdict_0_contingent_on"] == "the provider site blocks online submission"
+    assert trace["verdict_0_contingent_antecedent_output_path"] == "output.blocker"
+    assert trace["verdict_0_structural_unfired"] is True
+    assert trace["unmet_criterion_ids"] == []
+    assert trace["missing_evidence"] == []
+    assert "verdict_0_missing_evidence" not in trace
+
+
+@pytest.mark.parametrize(
+    "reason_code,state",
+    [("unknown", "unknown"), ("no_evidence", "unsatisfied"), ("evidence_contradicts", "unsatisfied")],
+)
+def test_structural_unfired_contingent_abstention_accepts_non_satisfied_verdicts(reason_code: str, state: str) -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state=state, reason_code=reason_code),  # type: ignore[arg-type]
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_all_contingent_abstentions_do_not_vacuously_satisfy() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_contingent_reason_does_not_abstain_for_non_contingent_criterion() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+        structural_unfired_criterion_ids=["c0"],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_judge_contingent_reason_cannot_authorize_structural_abstention() -> None:
+    raw = {
+        "verdicts": [
+            {"criterion_id": "c0", "satisfied": False, "reason_code": "contingent_unfired"},
+            {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+        ]
+    }
+
+    result = _coerce_result(
+        raw,
+        ["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+    )
+
+    assert result.verdicts[0].reason_code == "unknown"
+    assert result.verdicts[0].state == "unknown"
+    assert result.is_fully_satisfied() is False
+
+
+def test_fired_contingent_criterion_without_blocker_evidence_fails() -> None:
+    raw = {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    result = _coerce_result(
+        raw,
+        ["c0"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_contingent_criterion_ids(
+            criteria,
+            RunEvidenceSnapshot(block_outputs={"terminal_result": {"blocker": "Provider requires a phone call."}}),
+        ),
+    )
+
+    assert result.verdicts[0].reason_code == "no_evidence"
+    assert result.structural_unfired_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_fired_contingent_criterion_with_blocker_evidence_can_satisfy() -> None:
+    raw = {
+        "verdicts": [
+            {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
+            {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+        ]
+    }
+    result = _coerce_result(
+        raw,
+        ["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_combine_verification_results_preserves_contingent_ids() -> None:
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c1"],
+        contingent_on_by_criterion_id={"c1": "the provider site blocks online submission"},
+        contingent_antecedent_output_path_by_criterion_id={"c1": "output.blocker"},
+        structural_unfired_criterion_ids=["c1"],
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms"),
+            CriterionVerdict(criterion_id="c1", state="unknown", reason_code="unknown"),
+        ],
+    )
+
+    result = combine_verification_results(["c0", "c1"], run_result, [])
+
+    assert result.contingent_criterion_ids == ["c1"]
+    assert result.contingent_on_by_criterion_id == {"c1": "the provider site blocks online submission"}
+    assert result.contingent_antecedent_output_path_by_criterion_id == {"c1": "output.blocker"}
+    assert result.structural_unfired_criterion_ids == ["c1"]
+    assert result.is_fully_satisfied() is True
+
+
+def test_structural_unfired_ids_derive_from_empty_output_path() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"blocker_output": None})
+
+    assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == ["c0"]
+
+
+def test_p7_manual_service_no_blocker_abstains() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "Any manual service blocker is reported to the user.",
+            contingent_on="a manual service blocker exists",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": {"manual_service_blocker": None}})
+
+    assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == ["c0"]
+
+
+@pytest.mark.parametrize("reason_code,state", [("evidence_contradicts", "unsatisfied"), ("unknown", "unknown")])
+def test_false_contingent_antecedent_output_abstains(reason_code: str, state: str) -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"terminal_result": {"blocker": False}}),
+    )
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_ids,
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state=state, reason_code=reason_code),  # type: ignore[arg-type]
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert structural_unfired_ids == ["c0"]
+    assert result.is_fully_satisfied() is True
+
+
+def test_true_contingent_antecedent_output_fires_and_requires_consequent_evidence() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"terminal_result": {"blocker": True}}),
+    )
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_ids,
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert structural_unfired_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_missing_contingent_antecedent_output_path_fails_closed() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"confirmation_output": "submitted"})
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_contingent_criterion_ids(criteria, snapshot),
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert result.structural_unfired_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_structural_fired_evidence_overrides_empty_output_path() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "blocker_output": None,
+            "blocker_detector": {"blocker": "Provider site requires a phone call."},
+        }
+    )
+
+    assert structural_unfired_contingent_criterion_ids(criteria, snapshot) == []
+
+
+def test_real_blocker_family_evidence_overrides_primary_no_blocker_marker() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "A provider blocker is reported to the user.",
+            contingent_on="the provider site blocks online submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"terminal_result": {"blocker": None, "manual_service_blocker": "Provider requires phone call"}}
+    )
+    structural_unfired_ids = structural_unfired_contingent_criterion_ids(criteria, snapshot)
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=structural_unfired_ids,
+        verdicts=[
+            CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts"),
+            CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+
+    assert structural_unfired_ids == []
+    assert result.is_fully_satisfied() is False
 
 
 def test_empty_verdicts_with_criteria_is_not_vacuously_satisfied() -> None:
@@ -437,6 +930,867 @@ def test_structured_record_criteria_satisfy_structured_record_outputs(block_outp
     verdicts = grade_structured_record_criteria(_structured_record_criteria(), snapshot)
 
     assert _satisfied_criterion_ids(verdicts) == _STRUCTURED_RECORD_CRITERION_IDS
+
+
+def test_terminal_goal_record_satisfies_flat_submit_payload() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": _terminal_goal_payload()})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
+    )
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="c0",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:submit_water_request",
+        )
+    ]
+
+
+def test_terminal_goal_record_accepts_family_artifact_without_self_asserted_boolean() -> None:
+    payload = _terminal_goal_payload(submitted=None)
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": payload})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
+    )
+
+    assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+def test_terminal_goal_record_accepts_started_request_when_typed_with_artifact() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": _terminal_goal_payload()})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [
+            _criterion(
+                "c0",
+                "a commercial water service request is started",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
+    )
+
+    assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+def test_terminal_goal_record_accepts_typed_create_or_verify_with_identifier() -> None:
+    payload = _terminal_goal_payload(
+        submitted=None,
+        confirmation_number=None,
+        request_id="QC-2002-DEMO",
+        submission_result="already_present",
+    )
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [
+            _criterion(
+                "c0",
+                "the service request is created or verified",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ],
+        snapshot,
+    )
+
+    assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+def test_terminal_goal_record_submission_result_is_not_credit_source() -> None:
+    payload = _terminal_goal_payload(
+        submitted=None,
+        confirmation_number=None,
+        request_id=None,
+        submission_result="already_present",
+    )
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "the service request is created or verified",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_terminal_goal_record_requires_typed_terminal_action_family() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": _terminal_goal_payload()})
+
+    assert grade_terminal_goal_record_criteria([_criterion("c0", "a request is submitted")], snapshot) == []
+    assert (
+        grade_terminal_goal_record_criteria(
+            [_criterion("c1", "a request is submitted", kind="terminal_action")], snapshot
+        )
+        == []
+    )
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c2",
+                    "a request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="invoice",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_terminal_goal_record_self_asserted_boolean_without_identifier_remains_uncredited() -> None:
+    payload = _terminal_goal_payload(submitted=True, confirmation_number=None)
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _terminal_goal_payload(confirmation_number=None),
+        _terminal_goal_payload(confirmation_number=True),
+        _terminal_goal_payload(confirmation_number="", account_number="100245"),
+        _terminal_goal_payload(confirmation_number=None, record_number="RN-100245"),
+        _terminal_goal_payload(confirmation_number=None, customer_id="cus_123456"),
+    ],
+)
+def test_terminal_goal_record_rejects_ordinary_identifiers(payload: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "outcome", "family"),
+    [
+        (
+            _terminal_goal_payload(confirmation_number="WTR-1842-DEMO"),
+            "a commercial water service request is submitted",
+            "request",
+        ),
+        (
+            _terminal_goal_payload(order_placed=True, submitted=None, order_number="ORD-1842"),
+            "an order is placed",
+            "order",
+        ),
+        (
+            _terminal_goal_payload(application_submitted=True, submitted=None, application_id="APP-1842"),
+            "an application is submitted",
+            "application",
+        ),
+        (
+            _terminal_goal_payload(form_submitted=True, submitted=None, submission_id="SUB-1842"),
+            "the form is submitted",
+            "form",
+        ),
+        (
+            _terminal_goal_payload(request_submitted=True, submitted=None, request_id="REQ-1842"),
+            "a service request is submitted",
+            "request",
+        ),
+    ],
+)
+def test_terminal_goal_record_accepts_narrow_terminal_artifacts(
+    payload: dict[str, Any], outcome: str, family: str
+) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    verdicts = grade_terminal_goal_record_criteria(
+        [_criterion("c0", outcome, kind="terminal_action", terminal_action_family=family)], snapshot
+    )
+
+    assert _satisfied_criterion_ids(verdicts) == {"c0"}
+
+
+@pytest.mark.parametrize(
+    ("payload", "outcome", "family"),
+    [
+        (_terminal_goal_payload(), "an order is placed", "order"),
+        (
+            _terminal_goal_payload(order_placed=True, submitted=None, order_number="ORD-1842"),
+            "a request is submitted",
+            "request",
+        ),
+        (
+            _terminal_goal_payload(application_submitted=True, submitted=None, application_id="APP-1842"),
+            "an order is placed",
+            "order",
+        ),
+    ],
+)
+def test_terminal_goal_record_rejects_mismatched_families(payload: dict[str, Any], outcome: str, family: str) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [_criterion("c0", outcome, kind="terminal_action", terminal_action_family=family)], snapshot
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _terminal_goal_payload(submitted=None, completed=True),
+        _terminal_goal_payload(submitted=None, succeeded=True),
+        _terminal_goal_payload(submitted=None, success=True),
+        _terminal_goal_payload(submitted=None, status="completed"),
+    ],
+)
+def test_terminal_goal_record_rejects_generic_success_synonyms(payload: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "the account status is retrieved",
+        "the record lookup result is returned",
+        "the water request status is shown",
+    ],
+)
+def test_terminal_goal_record_abstains_for_lookup_and_status_criteria(outcome: str) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": _terminal_goal_payload()})
+
+    assert grade_terminal_goal_record_criteria([_criterion("c0", outcome)], snapshot) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _terminal_goal_payload(blocker="provider requires a phone call"),
+        _terminal_goal_payload(error="submission failed"),
+        _terminal_goal_payload(failure_reason="network failure"),
+        _terminal_goal_payload(challenge_detected=True),
+        _terminal_goal_payload(submitted=False),
+        _terminal_goal_payload(status="failed"),
+        _terminal_goal_payload(status="denied"),
+        _terminal_goal_payload(status="cancelled"),
+        _terminal_goal_payload(status="canceled"),
+        _terminal_goal_payload(status="incomplete"),
+        _terminal_goal_payload(status="timeout"),
+        _terminal_goal_payload(status="captcha required"),
+        _terminal_goal_payload(status="not submitted"),
+        _terminal_goal_payload(status="unable to submit"),
+    ],
+)
+def test_terminal_goal_record_negative_guards_abstain(payload: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("key", ["not_submitted", "previously_submitted"])
+def test_terminal_goal_record_rejects_negated_or_temporal_action_keys(key: str) -> None:
+    payload = _terminal_goal_payload(submitted=None)
+    payload[key] = True
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": payload})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_terminal_goal_record_does_not_take_literal_criteria_from_present_value() -> None:
+    criteria = [_criterion("c0", "the confirmation number WTR-1842-DEMO is reported")]
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": _terminal_goal_payload()})
+
+    assert grade_terminal_goal_record_criteria(criteria, snapshot) == []
+    assert _satisfied_criterion_ids(grade_present_value_criteria(criteria, snapshot)) == {"c0"}
+
+
+def _validation_classification_criterion(
+    expected_classification: str | bool = "login_gated",
+    *,
+    key: str = "path_classification",
+) -> CompletionCriterion:
+    return _criterion(
+        "c_validation",
+        "The run classifies whether the path is login gated.",
+        kind="validation_classification",
+        classification_output_key=key,
+        expected_classification=expected_classification,
+    )
+
+
+def test_validation_classification_grader_credits_matching_string_value() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    assert grade_validation_classification_criteria([criterion], snapshot) == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:classify_path.path_classification",
+            output_path="path_classification",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        )
+    ]
+
+
+def test_validation_classification_grader_credits_matching_boolean_value() -> None:
+    criterion = _validation_classification_criterion(True, key="login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"login_gated": True}})
+
+    assert _satisfied_criterion_ids(grade_validation_classification_criteria([criterion], snapshot)) == {"c_validation"}
+
+
+def test_validation_classification_grader_credits_repeated_matching_boolean_values() -> None:
+    criterion = _validation_classification_criterion(True, key="login_only")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path": {"login_only": True},
+            "classify_path_output": {"login_only": True},
+        }
+    )
+
+    assert grade_validation_classification_criteria([criterion], snapshot) == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:classify_path.login_only",
+            output_path="login_only",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            expected_classification="login_gated",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+        ),
+    ],
+)
+def test_validation_classification_grader_fails_closed_for_incomplete_contract(
+    criterion: CompletionCriterion,
+) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].criterion_id == "c_validation"
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "no_evidence"
+    assert verdicts[0].missing_evidence == "incomplete typed classification contract"
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason_code"),
+    [
+        ({}, "no_evidence"),
+        ({"path_classification": None}, "no_evidence"),
+        ({"path_classification": ""}, "no_evidence"),
+        ({"path_classification": []}, "no_evidence"),
+        ({"path_classification": {}}, "no_evidence"),
+        ({"path_classification": "public"}, "evidence_contradicts"),
+        ({"path_classification": ["login_gated"]}, "evidence_contradicts"),
+        ({"path_classification": True}, "evidence_contradicts"),
+        ({"success": True}, "no_evidence"),
+        ({"evidence_text": "The path is login_gated."}, "no_evidence"),
+    ],
+)
+def test_validation_classification_grader_fails_closed_for_non_matching_values(
+    payload: Any,
+    reason_code: str,
+) -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": payload})
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].criterion_id == "c_validation"
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == reason_code
+
+
+def test_validation_classification_grader_credits_repeated_matching_string_values() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path_a": {"path_classification": "login_gated"},
+            "classify_path_b": {"path_classification": "login_gated"},
+        }
+    )
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0] == CriterionVerdict(
+        criterion_id="c_validation",
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref="block_outputs:classify_path_a.path_classification",
+        output_path="path_classification",
+        grounding_mode="exact_value",
+        has_exact_value=True,
+    )
+
+
+def test_validation_classification_grader_fails_closed_for_conflicting_candidates() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path_a": {"path_classification": "login_gated"},
+            "classify_path_b": {"path_classification": "public"},
+        }
+    )
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+@pytest.mark.parametrize(
+    "mixed_value",
+    [
+        None,
+        "",
+        [],
+        {},
+        "true",
+        False,
+    ],
+)
+def test_validation_classification_grader_fails_closed_for_mixed_repeated_boolean_candidates(
+    mixed_value: Any,
+) -> None:
+    criterion = _validation_classification_criterion(True, key="login_only")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "classify_path": {"login_only": True},
+            "classify_path_output": {"login_only": mixed_value},
+        }
+    )
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+def test_validation_classification_grader_rejects_same_named_scalar_block_label() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"path_classification": "login_gated"})
+
+    verdicts = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "no_evidence"
+
+
+def test_validation_classification_is_not_requested_output_criterion() -> None:
+    criterion = _criterion(
+        "c_validation",
+        "The run classifies whether the path is login gated.",
+        kind="validation_classification",
+        output_path="output.path_classification",
+        expected_output_value="login_gated",
+    )
+
+    requested, remaining = split_requested_output_criteria([criterion])
+
+    assert requested == []
+    assert remaining == [criterion]
+
+
+def test_validation_classification_grader_does_not_cross_credit_outcome_or_terminal_action() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    assert (
+        grade_validation_classification_criteria(
+            [
+                _criterion(
+                    "c_outcome",
+                    "The run classifies whether the path is login gated.",
+                    classification_output_key="path_classification",
+                    expected_classification="login_gated",
+                ),
+                _criterion(
+                    "c_terminal",
+                    "The run classifies whether the path is login gated.",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    classification_output_key="path_classification",
+                    expected_classification="login_gated",
+                ),
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
+def test_validation_classification_grader_repeats_same_verdict_for_same_output() -> None:
+    criterion = _validation_classification_criterion("login_gated")
+    snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
+
+    first = grade_validation_classification_criteria([criterion], snapshot)
+    second = grade_validation_classification_criteria([criterion], snapshot)
+
+    assert first == second
+
+
+def test_fallback_floor_accepts_validation_review_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload()})
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:submit_request",
+        )
+    ]
+
+
+def test_fallback_floor_accepts_generated_validation_review_fields_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"validate_business_start_service": _generated_validation_review_payload()}
+    )
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service",
+        )
+    ]
+
+
+def test_fallback_floor_accepts_live_validation_review_output_parameter_shape() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"validate_business_start_service_review_output": _live_validation_review_output_payload()}
+    )
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service_review_output",
+        )
+    ]
+
+
+def test_fallback_floor_rejects_generated_validation_review_after_final_click() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service": _generated_validation_review_payload(
+                submit_or_finalize_clicked=True,
+                terminal_summary="Pre-submit review reached: True; submit/finalize control clicked: True.",
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_live_validation_review_confirmation_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service_review_output": _live_validation_review_output_payload(
+                confirmation_page_visible=True,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_generated_validation_review_confirmation_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service": _generated_validation_review_payload(
+                confirmation_page_visible=True,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_bare_all_checks_passed() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": {"all_checks_passed": True}})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_normal_submit_review_without_validation_only_marker() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                validation_only=None,
+                submit_mode=None,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+@pytest.mark.parametrize("marker", ["not_validation_only", "validation_only_disabled", "previous_validation_only"])
+def test_fallback_floor_rejects_validation_only_marker_prefix_suffix_matches(marker: str) -> None:
+    payload = _validation_review_payload(validation_only=None)
+    payload[marker] = True
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_boolean_only_validation_review_evidence() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "validate_business_start_service_review": _live_validation_review_output_payload(
+                all_validations_passed=None,
+                review_values=None,
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_submitted_request() -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(submitted_request=True)})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_confirmation_page_visible() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"submit_request": _validation_review_payload(confirmation_page_visible=True)}
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_submit_or_finalize_click() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"submit_request": _validation_review_payload(submit_or_finalize_clicked=True)}
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_review_text_without_structured_review_page() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                review_page_visible=False,
+                evidence_text=(
+                    "No review page was necessary, but values 1234 Sample Utility Way, Testville, CA 94016, "
+                    "2026-06-22, and EXAMPLE REALTY LABS INC were checked."
+                ),
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_review_values_without_corroborating_text() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                evidence_text="Visible Review page showed safe values and no final click."
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_values_contradicting_requested_literals() -> None:
+    criteria = [
+        *build_classifier_fallback_floor([]),
+        _criterion(
+            "c_requested_values",
+            'Review shows service address "1234 Sample Utility Way, Testville, CA 94016" and start date "2026-06-22".',
+        ),
+    ]
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                review_values={
+                    "visible_service_address": "100 Wrong Way, Atlanta, GA 30318",
+                    "visible_requested_start_date": "2026-07-01",
+                    "visible_account_holder": "EXAMPLE REALTY LABS INC",
+                },
+                evidence_text=(
+                    "Visible Review page showed service address 100 Wrong Way, Atlanta, GA 30318, "
+                    "start date 2026-07-01, and account holder EXAMPLE REALTY LABS INC. "
+                    "No Submit Request or final confirmation control was clicked."
+                ),
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(criteria, snapshot) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"error": "review mismatch"},
+        {"failure_reason": "submit disabled"},
+        {"status": "failed"},
+        {"all_checks_passed": False},
+    ],
+)
+def test_fallback_floor_rejects_validation_review_negative_guards(overrides: dict[str, Any]) -> None:
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(**overrides)})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_structured_contradiction() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "submit_request": _validation_review_payload(
+                items=[{"item_name": "Service Review Active", "status": "Expired"}],
+                overall_status="Expired",
+            )
+        }
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_validation_review_nested_under_failed_parent() -> None:
+    payload = {"status": "failed", "error": "submit blocked", "validate_review_output": _validation_review_payload()}
+    snapshot = RunEvidenceSnapshot(block_outputs={"validate_review": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_structured_record_goal_content_remains_strict_for_flat_terminal_payload() -> None:
+    assert structured_record_has_goal_content(_terminal_goal_payload()) is False
 
 
 def test_structured_record_partial_matches_do_not_combine_across_blocks() -> None:
@@ -771,6 +2125,83 @@ def test_outcome_unverified_reason_uses_typed_missing_evidence_not_confirmation_
     assert "previously tested revision" in known_good_reason
     assert "prefer restoring that revision" in known_good_reason
 
+
+def test_outcome_unverified_reason_guides_fallback_floor_review_output_contract() -> None:
+    policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    floor_id = policy.completion_criteria[0].id
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[floor_id],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id=floor_id,
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="run output did not include evidence for this criterion",
+            )
+        ],
+    )
+    ctx = SimpleNamespace(request_policy=policy)
+
+    reason = _outcome_unverified_reason(ctx, verification)
+
+    assert reason is not None
+    assert "review_values" in reason
+    assert "review_fields" in reason
+    assert "evidence_text" in reason
+    assert "validation_only" in reason
+    assert "submit_mode" in reason
+    assert "visible Review-page label/value strings" in reason
+    assert "do not click Submit/Finalize" in reason
+
+
+def test_outcome_unverified_reason_excludes_structurally_abstained_contingent_missing_evidence() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c1", "The confirmation number is extracted."),
+        ]
+    )
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1", "c2"],
+        contingent_criterion_ids=["c0"],
+        contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        structural_unfired_criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                missing_evidence="blocker report",
+            ),
+            CriterionVerdict(
+                criterion_id="c1",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="confirmation output",
+            ),
+            CriterionVerdict(criterion_id="c2", state="satisfied", reason_code="evidence_confirms"),
+        ],
+    )
+    ctx = SimpleNamespace(request_policy=policy)
+
+    reason = _outcome_unverified_reason(ctx, verification)
+
+    assert reason is not None
+    assert "confirmation output" in reason
+    assert "confirmation number" in reason
+    assert "provider blocker" not in reason
+    assert "blocker report" not in reason
+
     missing_metadata = CompletionVerificationResult(
         status="evaluated",
         criterion_ids=["c_missing"],
@@ -839,6 +2270,120 @@ def _structured_record_top_level_output_result() -> dict:
                 "extracted_information": [],
             },
         },
+    }
+
+
+def _terminal_goal_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_terminal_goal",
+            "overall_status": "completed",
+            "executed_block_labels": ["submit_water_request"],
+            "current_url": "https://example.test/confirmation",
+            "blocks": [
+                {
+                    "label": "submit_water_request",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": _terminal_goal_payload(**payload_overrides),
+                }
+            ],
+        },
+    }
+
+
+def _validation_review_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_review",
+            "overall_status": "completed",
+            "executed_block_labels": ["submit_request"],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [
+                {
+                    "label": "submit_request",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": _validation_review_payload(**payload_overrides),
+                }
+            ],
+        },
+    }
+
+
+def _validation_classification_output_result(value: Any) -> dict:
+    return _validation_classification_payload_result({"path_classification": value})
+
+
+def _validation_classification_payload_result(payload: dict[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_classification",
+            "overall_status": "completed",
+            "executed_block_labels": ["classify_path"],
+            "current_url": "https://example.test/login",
+            "blocks": [
+                {
+                    "label": "classify_path",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": payload,
+                }
+            ],
+        },
+    }
+
+
+def _live_validation_review_output_result(**payload_overrides: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_validation_review",
+            "overall_status": "completed",
+            "executed_block_labels": ["validate_business_start_service_review"],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [],
+            "output": {
+                "extracted_information": [],
+                "validate_business_start_service_review_output": _live_validation_review_output_payload(
+                    **payload_overrides
+                ),
+            },
+        },
+    }
+
+
+def _requested_output_result(output: Any) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_requested_output",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_profile"],
+            "current_url": "https://example.test/profile",
+            "blocks": [
+                {
+                    "label": "extract_profile",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": output,
+                }
+            ],
+        },
+    }
+
+
+def _metadata_for_requested_paths(*paths: str) -> dict[str, Any]:
+    return {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": list(paths)}],
+            "terminal_verifier_expectations": [{"goal_value_paths": list(paths)}],
+        }
     }
 
 
@@ -1084,6 +2629,249 @@ async def test_non_fallback_judge_confirmed_run_still_fires_barrier(monkeypatch:
     _record_run_blocks_result(ctx, result, completion_verification=verification)
     assert outcome_fully_verified(ctx) is True
     assert verified_goal_satisfied_context(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_validation_classification_block_output_satisfies_without_judge_unknown_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("typed validation classification should be graded deterministically")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_validation_classification_criterion("login_gated")])
+
+    first = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_output_result("login_gated"),
+        time.monotonic(),
+    )
+    second = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_output_result("login_gated"),
+        time.monotonic(),
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.is_fully_satisfied() is True
+    assert second.is_fully_satisfied() is True
+    assert first.verdicts == second.verdicts
+
+
+@pytest.mark.asyncio
+async def test_validation_classification_duplicate_registered_output_surfaces_satisfy_without_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("repeated coherent typed classification evidence should not require judge authority")
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_validation_classification_criterion(True, key="login_only")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_validation_classification",
+                "overall_status": "completed",
+                "executed_block_labels": ["classify_path"],
+                "current_url": "https://example.test/login",
+                "blocks": [
+                    {
+                        "label": "classify_path",
+                        "block_type": "CODE",
+                        "status": "completed",
+                        "extracted_data": {"login_only": True},
+                    }
+                ],
+                "registered_output_parameter_values": [
+                    {
+                        "workflow_run_id": "wr_validation_classification",
+                        "output_parameter_id": "op_login_only",
+                        "output_parameter_key": "classify_path_output",
+                        "block_label": "classify_path",
+                        "block_type": "CODE",
+                        "value": {"login_only": True},
+                    }
+                ],
+            },
+        },
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:classify_path.login_only",
+            output_path="login_only",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_validation_classification_is_not_satisfied_by_fallback_floor_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_validation",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                    "missing_evidence": "matching classification output at path_classification",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "submit_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _validation_classification_criterion("login_gated"),
+            *build_classifier_fallback_floor([]),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _validation_review_output_result(),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert "c_validation" in {verdict.criterion_id for verdict in verification.verdicts if not verdict.satisfied}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"evidence_text": "The path is login_gated."},
+        {"success": True},
+    ],
+)
+@pytest.mark.asyncio
+async def test_validation_classification_missing_or_prose_only_evidence_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"verdicts": [{"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_validation_classification_criterion("login_gated")])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_payload_result(payload),
+        time.monotonic(),
+    )
+
+    assert calls == 0
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id="c_validation",
+            state="unsatisfied",
+            reason_code="no_evidence",
+            output_path="path_classification",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+            missing_evidence="missing classification output key path_classification",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            expected_classification="login_gated",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            output_path="output.path_classification",
+            expected_output_value="login_gated",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validation_classification_incomplete_contract_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    criterion: CompletionCriterion,
+) -> None:
+    calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "verdicts": [
+                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c_other", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "classify_path")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("path_classification")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            criterion,
+            _criterion("c_other", "The run produced ordinary page evidence."),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _validation_classification_output_result("login_gated"),
+        time.monotonic(),
+    )
+
+    assert calls == 1
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdict_by_id["c_validation"].state == "unsatisfied"
+    assert verdict_by_id["c_validation"].reason_code == "no_evidence"
+    assert verdict_by_id["c_validation"].missing_evidence == "incomplete typed classification contract"
+    assert verdict_by_id["c_other"].satisfied is True
 
 
 @pytest.mark.asyncio
@@ -1670,6 +3458,189 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
 
 
 @pytest.mark.asyncio
+async def test_page_observation_validation_classification_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {
+            "verdicts": [
+                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c_page", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _validation_classification_criterion("login_gated"),
+            _criterion("c_page", "The page observation confirms the path was inspected."),
+        ]
+    )
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"evidence_text": "The path is login_gated."},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"evidence_text": "The path is login_gated."},
+    )
+
+    assert handler_calls == 1
+    assert result is not None
+    assert result.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    assert verdict_by_id["c_validation"] == CriterionVerdict(
+        criterion_id="c_validation",
+        state="unsatisfied",
+        reason_code="no_evidence",
+        output_path="path_classification",
+        grounding_mode="exact_value",
+        has_exact_value=True,
+        missing_evidence="missing classification output key path_classification",
+    )
+    assert verdict_by_id["c_page"].satisfied is True
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            expected_classification="login_gated",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+        ),
+        _criterion(
+            "c_validation",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            output_path="output.path_classification",
+            expected_output_value="login_gated",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_page_observation_validation_classification_incomplete_contract_cannot_be_judge_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    criterion: CompletionCriterion,
+) -> None:
+    handler_calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {
+            "verdicts": [
+                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c_page", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("path_classification")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            criterion,
+            _criterion("c_page", "The page observation confirms the path was inspected."),
+        ]
+    )
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"path_classification": "login_gated"},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.test/login",
+        title="Login",
+        observed_data={"path_classification": "login_gated"},
+    )
+
+    assert handler_calls == 1
+    assert result is not None
+    assert result.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    assert verdict_by_id["c_validation"].state == "unsatisfied"
+    assert verdict_by_id["c_validation"].reason_code == "no_evidence"
+    assert verdict_by_id["c_validation"].missing_evidence == "incomplete typed classification contract"
+    assert verdict_by_id["c_page"].satisfied is True
+
+
+@pytest.mark.asyncio
+async def test_page_observation_verification_does_not_apply_terminal_goal_record_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
+    )
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/confirmation",
+        observed_data=_terminal_goal_payload(),
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.com/confirmation",
+        observed_data=_terminal_goal_payload(),
+    )
+
+    assert result is not None
+    assert result.is_fully_satisfied() is False
+
+
+@pytest.mark.asyncio
 async def test_page_observation_verification_does_not_overwrite_satisfied_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1853,6 +3824,46 @@ async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monke
     assert result.is_fully_satisfied() is True
 
 
+@pytest.mark.parametrize("reason_code", ["evidence_contradicts", "no_evidence", "unknown"])
+@pytest.mark.asyncio
+async def test_mixed_completion_verification_preserves_structural_unfired_contingent_ids(
+    monkeypatch: pytest.MonkeyPatch, reason_code: str
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c1", "satisfied": False, "reason_code": reason_code}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _ctx_with_blocks("code")
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
+            _criterion(
+                "c1",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+
+    result = await _maybe_run_completion_verification(
+        ctx, _terminal_goal_output_result(blocker_output=None), time.monotonic()
+    )
+
+    assert result is not None
+    assert result.contingent_criterion_ids == ["c1"]
+    assert result.contingent_on_by_criterion_id == {"c1": "the provider site blocks online submission"}
+    assert result.contingent_antecedent_output_path_by_criterion_id == {"c1": "output.blocker"}
+    assert result.structural_unfired_criterion_ids == ["c1"]
+    assert result.is_fully_satisfied() is True
+
+
 def test_gate_recognizes_clean_run_despite_unverified_prefix() -> None:
     ctx = _ctx_unverified_prefix()
     # The full-workflow run-status latch is False (incremental run), yet the judge
@@ -2017,6 +4028,1539 @@ def test_snapshot_uses_structured_record_top_level_output_parameters() -> None:
 
 
 @pytest.mark.asyncio
+async def test_requested_output_path_ignores_evidence_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"evidence_text": "The provider NPI is 1234567890."}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "no_evidence"
+    assert (
+        verification.verdicts[0].missing_evidence
+        == "requested-output criterion lacks typed expected_output_value or expected_output_shape; "
+        "presence-only output cannot confirm value-grounded criterion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_ignores_block_level_prose(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result("The provider NPI is 1234567890."),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_exact_runtime_field_with_expected_value_satisfies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("exact requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.npi"
+
+    trace = verification.to_trace_data()
+    assert trace["verdict_0_criterion_id"] == "c_npi"
+    assert trace["verdict_0_output_path"] == "output.npi"
+    assert trace["verdict_0_grounding_mode"] == "exact_value"
+    assert "verdict_0_expected_output_shape" not in trace
+    assert trace["verdict_0_has_exact_value"] is True
+    assert "1234567890" not in repr(trace)
+
+
+def test_requested_output_path_without_expected_value_structurally_abstains_for_present_values() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "request_id",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_request_id",
+                outcome="The returned record includes request id.",
+                output_path="output.request_id",
+            ),
+            CompletionCriterion(
+                id="c_provider_captured_address",
+                outcome="The returned record includes provider captured address.",
+                output_path="output.provider_captured_address",
+            ),
+            CompletionCriterion(
+                id="c_requested_date",
+                outcome="The returned record includes requested date.",
+                output_path="output.requested_date",
+            ),
+            CompletionCriterion(
+                id="c_status",
+                outcome="The returned record includes status.",
+                output_path="output.status",
+            ),
+        ]
+    )
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        ctx.request_policy.completion_criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "request_id": "100245",
+                    "provider_captured_address": "100245",
+                    "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                    "status": "2026-06-24",
+                    "evidence_text": "The request completed successfully.",
+                }
+            }
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_request_id",
+        "c_provider_captured_address",
+        "c_requested_date",
+        "c_status",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+    assert {verdict.grounding_mode for verdict in verdicts} == {"missing"}
+    assert all(verdict.has_exact_value is False for verdict in verdicts)
+
+
+def test_requested_output_shape_only_generated_fields_structurally_abstain_without_exact_values() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "selected_start_date",
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        ),
+        CompletionCriterion(
+            id="c_account_number",
+            outcome="The returned record includes account number.",
+            output_path="output.account_number",
+            expected_output_shape="numeric_identifier",
+        ),
+        CompletionCriterion(
+            id="c_selected_start_date",
+            outcome="The returned record includes selected start date.",
+            output_path="output.selected_start_date",
+            expected_output_shape="date",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {
+                    "confirmation_number": "WTR-1842-DEMO",
+                    "account_number": "100245",
+                    "selected_start_date": "2026-06-22",
+                }
+            }
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_confirmation_number",
+        "c_account_number",
+        "c_selected_start_date",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+    trace = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[criterion.id for criterion in criteria],
+        verdicts=verdicts,
+    ).to_trace_data()
+    assert trace["verdict_0_output_path"] == "output.confirmation_number"
+    assert trace["verdict_0_grounding_mode"] == "shape"
+    assert trace["verdict_0_expected_output_shape"] == "reference_code"
+    assert trace["verdict_0_has_exact_value"] is False
+    assert "WTR-1842-DEMO" not in repr(trace)
+    assert trace["fully_satisfied"] is False
+    assert trace["unmet_criterion_ids"] == []
+
+
+def test_requested_output_shape_abstains_on_p8_scrambled_values_and_ignores_evidence_text_status() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        ),
+        CompletionCriterion(
+            id="c_provider_captured_address",
+            outcome="The returned record includes provider captured address.",
+            output_path="output.provider_captured_address",
+            expected_output_shape="address",
+        ),
+        CompletionCriterion(
+            id="c_requested_date",
+            outcome="The returned record includes requested date.",
+            output_path="output.requested_date",
+            expected_output_shape="date",
+        ),
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "confirmation_number": "100245",
+                    "provider_captured_address": "100245",
+                    "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                    "status": "2026-06-24",
+                    "evidence_text": "Submitted / Processing",
+                }
+            }
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_confirmation_number",
+        "c_provider_captured_address",
+        "c_requested_date",
+        "c_status",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verifier_rejects_reconstructed_p8_scrambled_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("typed requested-output verifier should not delegate reconstructed P8 proof")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_confirmation_number",
+                "The output includes the confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c_account_number",
+                "The output includes the account number.",
+                output_path="output.account_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            _criterion(
+                "c_provider_captured_address",
+                "The output includes the provider captured address.",
+                output_path="output.provider_captured_address",
+                expected_output_shape="address",
+            ),
+            _criterion(
+                "c_requested_date",
+                "The output includes the requested date.",
+                output_path="output.requested_date",
+                expected_output_shape="date",
+            ),
+            _criterion(
+                "c_status",
+                "The output includes the request status.",
+                output_path="output.status",
+                expected_output_shape="status_label",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "confirmation_number": "QC-2002-DEMO",
+                "account_number": "100245",
+                "provider_captured_address": "100245",
+                "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                "status": "2026-06-24",
+                "evidence_text": "Submitted / Processing",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_confirmation_number"].reason_code == "structurally_abstained"
+    assert verdicts["c_account_number"].reason_code == "structurally_abstained"
+    for criterion_id in ("c_provider_captured_address", "c_requested_date", "c_status"):
+        assert verdicts[criterion_id].state == "unsatisfied"
+        assert verdicts[criterion_id].reason_code == "structurally_abstained"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verifier_accepts_value_correct_reconstructed_p8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("typed requested-output verifier should not delegate value-correct P8 proof")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_confirmation_number",
+                "The output includes the confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c_account_number",
+                "The output includes the account number.",
+                output_path="output.account_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            _criterion(
+                "c_provider_captured_address",
+                "The output includes the provider captured address.",
+                output_path="output.provider_captured_address",
+                expected_output_shape="address",
+            ),
+            _criterion(
+                "c_requested_date",
+                "The output includes the requested date.",
+                output_path="output.requested_date",
+                expected_output_shape="date",
+            ),
+            _criterion(
+                "c_status",
+                "The output includes the request status.",
+                output_path="output.status",
+                expected_output_shape="status_label",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "confirmation_number": "QC-2002-DEMO",
+                "account_number": "100245",
+                "provider_captured_address": "77 Gaslight Way, Decatur, GA 30030",
+                "requested_date": "2026-06-24",
+                "status": "Submitted / Processing",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is False
+    assert {verdict.reason_code for verdict in verification.verdicts} == {"structurally_abstained"}
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verifier_accepts_p7_with_unfired_blocker_and_fee_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c_submit", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "selected_start_date",
+        "deposit_amount",
+        "next_owner",
+        "blocker",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_submit",
+                "The service request is submitted.",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
+            _criterion(
+                "c_confirmation_number",
+                "The output includes the confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c_account_number",
+                "The output includes the account number.",
+                output_path="output.account_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            _criterion(
+                "c_selected_start_date",
+                "The output includes the selected start date.",
+                output_path="output.selected_start_date",
+                expected_output_shape="date",
+            ),
+            _criterion(
+                "c_deposit_amount",
+                "The output includes the deposit amount.",
+                output_path="output.deposit_amount",
+                expected_output_shape="money_amount",
+            ),
+            _criterion(
+                "c_next_owner",
+                "The output includes the next owner.",
+                output_path="output.next_owner",
+                expected_output_shape="owner_label",
+            ),
+            _criterion(
+                "c_blocker",
+                "Any manual service blocker is reported to the user.",
+                output_path="output.blocker",
+                contingent_on="a manual service blocker exists",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "manual_service_blocker": None,
+                "output": {
+                    "confirmation_number": "WTR-1842-DEMO",
+                    "account_number": "100245",
+                    "selected_start_date": "2026-06-22",
+                    "deposit_amount": "$41.00 plus initiation fee",
+                    "next_owner": "Provider",
+                },
+                "evidence_text": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is True
+    assert verification.structural_unfired_criterion_ids == ["c_blocker"]
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_submit"].reason_code == "evidence_confirms"
+    assert verdicts["c_blocker"].reason_code == "no_evidence"
+    assert verdicts["c_deposit_amount"].reason_code == "structurally_abstained"
+    assert all(
+        verdict.reason_code == "structurally_abstained"
+        for cid, verdict in verdicts.items()
+        if cid not in {"c_submit", "c_blocker"}
+    )
+
+
+def test_requested_output_canonical_path_precedence_rejects_wrong_top_level_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {
+                    "confirmation_number": "QC-2002-DEMO",
+                    "output": {"confirmation_number": "WTR-1842-DEMO"},
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:utility_citrus_turn_on.confirmation_number"
+
+
+@pytest.mark.parametrize("canonical_value", [None, ""])
+def test_requested_output_exact_value_canonical_placeholder_not_rescued_by_wrapper(
+    canonical_value: str | None,
+) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {
+                    "confirmation_number": canonical_value,
+                    "output": {"confirmation_number": "WTR-1842-DEMO"},
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:utility_citrus_turn_on.confirmation_number"
+
+
+def test_requested_output_one_wrapper_runtime_field_abstains_without_broad_search() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        )
+    ]
+
+    wrapped_verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"utility_citrus_turn_on": {"output": {"confirmation_number": "WTR-1842-DEMO"}}}
+        ),
+    )
+    unrelated_nested_verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"utility_citrus_turn_on": {"details": {"output": {"confirmation_number": "WTR-1842-DEMO"}}}}
+        ),
+    )
+
+    assert wrapped_verdicts[0].state == "unsatisfied"
+    assert wrapped_verdicts[0].reason_code == "structurally_abstained"
+    assert wrapped_verdicts[0].evidence_ref == "block_outputs:utility_citrus_turn_on.output.confirmation_number"
+    assert unrelated_nested_verdicts[0].state == "unsatisfied"
+    assert unrelated_nested_verdicts[0].reason_code == "missing_exact_field"
+
+
+def test_requested_output_wrapped_wrong_neighbors_structurally_abstain() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("requested_date", "status")
+    criteria = [
+        CompletionCriterion(
+            id="c_requested_date",
+            outcome="The returned record includes requested date.",
+            output_path="output.requested_date",
+            expected_output_shape="date",
+        ),
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "output": {
+                        "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                        "status": "2026-06-24",
+                    }
+                }
+            }
+        ),
+    )
+
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+
+
+@pytest.mark.parametrize("canonical_status", [None, ""])
+def test_requested_output_shape_canonical_placeholder_not_rescued_by_wrapper(
+    canonical_status: str | None,
+) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "status": canonical_status,
+                    "output": {"status": "Submitted / Processing"},
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_ref is None
+
+
+def test_requested_output_exact_values_reject_p8_scrambled_neighbors() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "provider_captured_address",
+        "requested_date",
+        "status",
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="QC-2002-DEMO",
+        ),
+        CompletionCriterion(
+            id="c_provider_captured_address",
+            outcome="The returned record includes provider captured address.",
+            output_path="output.provider_captured_address",
+            expected_output_value="77 Gaslight Way, Decatur, GA 30030",
+        ),
+        CompletionCriterion(
+            id="c_requested_date",
+            outcome="The returned record includes requested date.",
+            output_path="output.requested_date",
+            expected_output_value="2026-06-24",
+        ),
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_value="Submitted / Processing",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "confirmation_number": "QC-2002-DEMO",
+                    "provider_captured_address": "100245",
+                    "requested_date": "77 Gaslight Way, Decatur, GA 30030",
+                    "status": "2026-06-24",
+                    "evidence_text": "Submitted / Processing",
+                }
+            }
+        ),
+    )
+
+    verdicts_by_id = {verdict.criterion_id: verdict for verdict in verdicts}
+    assert verdicts_by_id["c_confirmation_number"].reason_code == "evidence_confirms"
+    for criterion_id in ("c_provider_captured_address", "c_requested_date", "c_status"):
+        assert verdicts_by_id[criterion_id].state == "unsatisfied"
+        assert verdicts_by_id[criterion_id].reason_code == "evidence_contradicts"
+
+
+@pytest.mark.parametrize("status", [None, "None", "null", "n/a", "na", "", "-", "--"])
+def test_requested_output_status_shape_treats_null_placeholders_as_missing(status: str | None) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_peach_gas_quickconnect": {
+                    "status": status,
+                    "evidence_text": "Submitted / Processing",
+                }
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code in {"missing_exact_field", "structurally_abstained"}
+
+
+@pytest.mark.parametrize("status", ["Submitted / Processing", "Approved", "Pending Review", "Not Credentialed"])
+def test_requested_output_status_shape_structurally_abstains_for_real_labels(status: str) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        CompletionCriterion(
+            id="c_status",
+            outcome="The returned record includes status.",
+            output_path="output.status",
+            expected_output_shape="status_label",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_peach_gas_quickconnect": {"status": status}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+
+
+@pytest.mark.parametrize(
+    "deposit_amount",
+    [
+        "2026-06-22",
+        "100245",
+        "77 Gaslight Way, Decatur, GA 30030",
+        "Submitted / Processing",
+        "https://utility.example.test/pay",
+        "initiation fee applies",
+    ],
+)
+def test_requested_output_money_amount_shape_structurally_abstains_for_present_neighbors(deposit_amount: str) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("deposit_amount")
+    criteria = [
+        _criterion(
+            "c_deposit_amount",
+            "The output includes the deposit amount.",
+            output_path="output.deposit_amount",
+            expected_output_shape="money_amount",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_citrus_turn_on": {"deposit_amount": deposit_amount}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+
+
+def test_requested_output_exact_wrong_value_beats_matching_shape() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+            expected_output_shape="reference_code",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_citrus_turn_on": {"confirmation_number": "QC-2002-DEMO"}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+def test_requested_output_shape_missing_field_is_missing_exact_field() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        CompletionCriterion(
+            id="c_confirmation_number",
+            outcome="The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"utility_citrus_turn_on": {"evidence_text": "WTR-1842-DEMO"}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_requires_expected_value_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-grounded requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("service_address", "requested_start_date")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_address",
+                outcome="The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="1234 Sample Utility Way",
+            ),
+            CompletionCriterion(
+                id="c_date",
+                outcome="The returned record includes requested start date.",
+                output_path="output.requested_start_date",
+                expected_output_value="2026-06-22",
+            ),
+        ]
+    )
+
+    swapped = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "service_address": "2026-06-22",
+                "requested_start_date": "1234 Sample Utility Way",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert swapped is not None
+    assert swapped.is_fully_satisfied() is False
+    assert {verdict.reason_code for verdict in swapped.verdicts} == {"evidence_contradicts"}
+
+    matched = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "service_address": "1234 Sample Utility Way",
+                "requested_start_date": "2026-06-22",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert matched is not None
+    assert matched.is_fully_satisfied() is True
+    assert {verdict.reason_code for verdict in matched.verdicts} == {"evidence_confirms"}
+
+
+@pytest.mark.asyncio
+async def test_rehydrated_requested_output_expected_value_blocks_scrambled_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-grounded requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("service_address", "requested_start_date")
+    criteria = (
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned record includes service address.",
+            output_path="output.service_address",
+            expected_output_value="1234 Sample Utility Way",
+        ),
+        CompletionCriterion(
+            id="c_date",
+            outcome="The returned record includes requested start date.",
+            output_path="output.requested_start_date",
+            expected_output_value="2026-06-22",
+        ),
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria_from_json(criteria_to_json(criteria))))
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "service_address": "2026-06-22",
+                "requested_start_date": "1234 Sample Utility Way",
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert {verdict.reason_code for verdict in verification.verdicts} == {"evidence_contradicts"}
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_does_not_match_block_label_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "npi")
+    ctx.code_artifact_metadata = {"npi": _metadata_for_requested_paths("npi")["extract_profile"]}
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_requested_output",
+                "overall_status": "completed",
+                "executed_block_labels": ["npi"],
+                "current_url": "https://example.test/profile",
+                "blocks": [
+                    {
+                        "label": "npi",
+                        "block_type": "CODE",
+                        "status": "completed",
+                        "extracted_data": {"value": "1234567890"},
+                    }
+                ],
+            },
+        },
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("goal_value_path", "requested_path", "runtime_output", "evidence_ref"),
+    [
+        ("$.npi", "output.npi", {"npi": "1234567890"}, "block_outputs:extract_profile.npi"),
+        ("$[*].npi", "output.npi", [{"npi": "1234567890"}], "block_outputs:extract_profile.npi"),
+        ("$[0].npi", "output.[].npi", [{"npi": "1234567890"}], "block_outputs:extract_profile.[].npi"),
+        ("$[].npi", "output.[].npi", [{"npi": "1234567890"}], "block_outputs:extract_profile.[].npi"),
+        (
+            "records[0].npi",
+            "output.records[].npi",
+            {"records": [{"npi": "1234567890"}]},
+            "block_outputs:extract_profile.records[].npi",
+        ),
+        (
+            "output.records[0].npi",
+            "output.records[].npi",
+            {"records": [{"npi": "1234567890"}]},
+            "block_outputs:extract_profile.records[].npi",
+        ),
+    ],
+)
+async def test_requested_output_path_normalizes_jsonpath_and_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+    goal_value_path: str,
+    requested_path: str,
+    runtime_output: Any,
+    evidence_ref: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("normalized requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(goal_value_path)
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path=requested_path,
+                expected_output_value="1234567890",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(runtime_output),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == evidence_ref
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_aliases_authored_contract_to_requested_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("aliased requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The nested record NPI is returned.",
+                output_path="output.records[].npi",
+                expected_output_value="1234567890",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"records": [{"npi": "1234567890"}]}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.records[].npi"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_requires_exact_nested_runtime_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("locations[].address")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_address",
+                outcome="Each listed location includes address.",
+                output_path="output.locations[].address",
+                expected_output_value="100 Main St",
+            )
+        ]
+    )
+
+    missing = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"locations": [{"name": "North Clinic"}]}),
+        time.monotonic(),
+    )
+    assert missing is not None
+    assert missing.is_fully_satisfied() is False
+    assert missing.verdicts[0].reason_code == "missing_exact_field"
+    assert missing.verdicts[0].missing_evidence == (
+        "run output did not include exact structured field output.locations[].address"
+    )
+
+    satisfied = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"locations": [{"address": "100 Main St"}]}),
+        time.monotonic(),
+    )
+    assert satisfied is not None
+    assert satisfied.is_fully_satisfied() is True
+    assert satisfied.verdicts[0].evidence_ref == "block_outputs:extract_profile.locations[].address"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_uses_only_accepted_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("unproducible requested-output criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.raw_code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            )
+        ]
+    )
+
+    rejected = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+    assert rejected is not None
+    assert rejected.is_fully_satisfied() is False
+    assert rejected.verdicts[0].reason_code == "unproducible"
+    assert "unproducible" in rejected.to_trace_data()["reason_codes"]
+
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    accepted = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+    assert accepted is not None
+    assert accepted.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_can_use_static_return_key_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("static requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {"extract_profile": {"claimed_outcomes": [{}]}}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_profile
+              code: |
+                return {"npi": await page.locator("#npi").inner_text()}
+        """
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+async def test_requested_output_path_can_use_static_list_return_key_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("static list requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {"extract_profile": {"claimed_outcomes": [{}]}}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_profile
+              code: |
+                return [{"npi": "1234567890"}]
+        """
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.[].npi",
+                expected_output_value="1234567890",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result([{"npi": "1234567890"}]),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:extract_profile.[].npi"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_criteria_are_not_sent_to_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_prompts: list[str] = []
+
+    async def handler(**kwargs: object) -> dict:
+        prompt = str(kwargs.get("prompt") or "")
+        seen_prompts.append(prompt)
+        return {"verdicts": [{"criterion_id": "c_cart", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            ),
+            CompletionCriterion(id="c_cart", outcome="The cart contains the selected item."),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890", "items": ["a"]}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert seen_prompts and "c_npi" not in seen_prompts[0]
+    assert "c_cart" in seen_prompts[0]
+    assert {verdict.criterion_id for verdict in verification.verdicts} == {"c_npi", "c_cart"}
+
+
+@pytest.mark.asyncio
+async def test_present_generic_requested_output_without_expected_value_abstains_without_vetoing_run_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c_submit", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("customer_name")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_customer_name",
+                outcome="The returned record includes customer name.",
+                output_path="output.customer_name",
+            ),
+            _criterion(
+                "c_submit",
+                "The record extraction completes.",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"customer_name": "Sample Customer"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_customer_name"].reason_code == "structurally_abstained"
+    assert verdicts["c_submit"].reason_code == "evidence_confirms"
+
+
+@pytest.mark.asyncio
+async def test_all_abstained_requested_outputs_do_not_satisfy_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output only abstention should not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("customer_name")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_customer_name",
+                outcome="The returned record includes customer name.",
+                output_path="output.customer_name",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"customer_name": "Sample Customer"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "structurally_abstained"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_bypasses_judge_satisfaction_without_exact_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c_npi", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi")]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"evidence_text": "The provider NPI is 1234567890."}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_verdict_survives_unavailable_judge_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"no_verdicts_key": []}
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c_npi", outcome="The NPI is returned.", output_path="output.npi"),
+            CompletionCriterion(id="c_cart", outcome="The cart contains the selected item."),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"items": ["a"]}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.status == "evaluated"
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == "no_evidence"
+    assert verdicts["c_npi"].satisfied is False
+    assert verdicts["c_cart"].state == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["no_evidence", "unproducible"])
+async def test_unfired_contingent_requested_output_miss_does_not_veto_satisfied_run_criterion(
+    monkeypatch: pytest.MonkeyPatch,
+    reason_code: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("deterministic requested-output and present-value criteria should bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    if reason_code == "no_evidence":
+        ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+        output = {"status": "DONE", "blocker": False}
+    else:
+        output = {"status": "DONE", "blocker": False, "npi": "1234567890"}
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_npi",
+                "The NPI is returned.",
+                output_path="output.npi",
+                contingent_on="the provider lookup is available",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c_status", 'The output includes "DONE".'),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _requested_output_result(output), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == reason_code
+    assert verdicts["c_status"].satisfied is True
+    assert verification.structural_unfired_criterion_ids == ["c_npi"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["no_evidence", "unproducible"])
+async def test_fired_contingent_requested_output_miss_still_vetoes(
+    monkeypatch: pytest.MonkeyPatch,
+    reason_code: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("deterministic requested-output and present-value criteria should bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    if reason_code == "no_evidence":
+        ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+        output = {"status": "DONE", "blocker": True}
+    else:
+        output = {"status": "DONE", "blocker": True, "npi": "1234567890"}
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_npi",
+                "The NPI is returned.",
+                output_path="output.npi",
+                contingent_on="the provider lookup is available",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c_status", 'The output includes "DONE".'),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _requested_output_result(output), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == reason_code
+    assert verdicts["c_status"].satisfied is True
+    assert verification.structural_unfired_criterion_ids == []
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_completion_verification_treats_fallback_record_as_criteria_less(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2047,6 +5591,406 @@ async def test_maybe_run_completion_verification_treats_fallback_record_as_crite
     # verified result, and the path short-circuits before any judge lookup.
     assert verification is None
     assert handler_lookup_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_requested_output_satisfaction_is_not_vetoed_by_fallback_record_abstentions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("value-agnostic fallback criteria must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_npi",
+                outcome="The NPI is returned.",
+                output_path="output.npi",
+                expected_output_value="1234567890",
+            ),
+            *_structured_record_criteria(),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"npi": "1234567890"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert [verdict.criterion_id for verdict in verification.verdicts] == ["c_npi"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_terminal_goal_bypasses_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_lookup_calls = 0
+
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("deterministically covered terminal goal must not call the judge")
+
+    async def handler_lookup(_ctx: object) -> object:
+        nonlocal handler_lookup_calls
+        handler_lookup_calls += 1
+        return fail_handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        handler_lookup,
+    )
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _terminal_goal_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request"
+    assert handler_lookup_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_terminal_goal_without_boolean_bypasses_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("artifact-backed terminal goal must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _terminal_goal_output_result(submitted=None), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_recorded_terminal_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("recorded fallback-floor outcome must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _terminal_goal_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.to_trace_data()["criterion_count"] == 1
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_validation_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("validation review evidence must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _validation_review_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_request"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_uses_live_output_parameter_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("live validation review output parameter evidence must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "validate_business_start_service_review")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _live_validation_review_output_result(), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:validate_business_start_service_review_output"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run_output_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered terminal-action evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c1",
+                "a commercial water service request is started",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_terminal_goal",
+            "overall_status": "completed",
+            "executed_block_labels": ["submit_water_request"],
+            "current_url": "https://example.test/confirmation",
+            "blocks": [],
+            "workflow_run_output_parameters": [
+                {
+                    "workflow_run_id": "wr_terminal_goal",
+                    "output_parameter_id": "op_terminal",
+                    "output_parameter_key": "submit_water_request_output",
+                    "block_label": "submit_water_request",
+                    "block_type": "CODE",
+                    "value": _terminal_goal_payload(),
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].criterion_id == "c1"
+    assert verification.verdicts[0].evidence_ref == "block_outputs:submit_water_request_output"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_page_end_state_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict:
+        captured["prompt"] = prompt
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "__copilot_fallback_floor__run",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_review",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "current_url": "https://example.test/review",
+            "page_title": "Start Service - Review",
+            "blocks": [],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
+    assert "observed_end_state_url: https://example.test/review" in captured["prompt"]
+    assert "observed_end_state_page_title: Start Service - Review" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_without_evidence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("true no-evidence fallback floor must not call the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_empty",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "blocks": [],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.no_gradeable_run_plane is False
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_login_page_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> object:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "__copilot_fallback_floor__run",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "open_demo_utility_login_output",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "open_demo_utility_login")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=build_classifier_fallback_floor([]),
+        classifier_status="fallback",
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_login_only",
+            "overall_status": "completed",
+            "executed_block_labels": ["open_demo_utility_login"],
+            "current_url": "http://localhost:8900/utility_services/demo_utility/",
+            "page_title": "Login",
+            "blocks": [
+                {
+                    "label": "open_demo_utility_login",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "login_page_reached": True,
+                        "evidence_text": "Sample Utility Portal Log in to your account User ID Password",
+                    },
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.verdicts[0].criterion_id == "__copilot_fallback_floor__run"
+    assert verification.verdicts[0].state == "unsatisfied"
+    assert verification.verdicts[0].reason_code == "no_evidence"
+    assert verification.verdicts[0].evidence_ref is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_mixed_terminal_goal_upgrades_judge_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c1",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "block_outputs:submit_water_request",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "submit_water_request")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "a commercial water service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            ),
+            _criterion("c1", "the selected start date is reported"),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _terminal_goal_output_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert {verdict.criterion_id: verdict.reason_code for verdict in verification.verdicts} == {
+        "c0": "evidence_confirms",
+        "c1": "evidence_confirms",
+    }
 
 
 @pytest.mark.asyncio
@@ -2187,6 +6131,548 @@ def test_snapshot_summarizes_registered_download_outputs() -> None:
         "downloaded_file_names": ["apexbiz_100245_2026-05.pdf"],
     }
     assert "apexbiz_100245_2026-05.pdf" in rendered
+    assert "RecordingLocator" not in rendered and "Download" not in rendered and "secret" not in rendered
+
+
+def _download_result(output: dict[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_download",
+            "overall_status": "completed",
+            "executed_block_labels": ["download_document"],
+            "current_url": "https://example.test/documents",
+            "blocks": [
+                {
+                    "label": "download_document",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": output,
+                }
+            ],
+        },
+    }
+
+
+def _registered_download_output_parameter_result(value: dict[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_download",
+            "overall_status": "completed",
+            "executed_block_labels": [],
+            "current_url": "https://example.test/documents",
+            "blocks": [],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_download",
+                    "output_parameter_key": "download_document_output",
+                    "block_label": "download_document",
+                    "block_type": "CODE",
+                    "value": value,
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_registered_non_empty_injects_and_verifies_without_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download_document",
+        )
+    ]
+    assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_download_registered_output_parameter_injects_and_verifies_without_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered output-parameter download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _registered_download_output_parameter_result(
+            {
+                "downloaded_files": [{"filename": "document.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download_document_output",
+        )
+    ]
+    assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_marked_requested_output_id_without_expected_value_is_no_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("marked requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id")
+    requested = _criterion(
+        "c_output_id",
+        "The returned record includes output id.",
+        output_path="output.output_id",
+        deliverable_kind="registered_download",
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=[requested])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
+    assert ctx.request_policy.completion_criteria == [requested]
+
+
+@pytest.mark.asyncio
+async def test_marked_requested_output_npi_without_expected_value_is_no_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("marked requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
+    requested = _criterion(
+        "c_npi",
+        "The returned record includes NPI.",
+        output_path="output.npi",
+        deliverable_kind="registered_download",
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=[requested])
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_npi"].reason_code == "no_evidence"
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
+    assert ctx.request_policy.completion_criteria == [requested]
+
+
+@pytest.mark.asyncio
+async def test_unmarked_requested_output_id_without_expected_value_is_no_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("unmarked requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_output_id",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_marked_download_deliverable_does_not_remove_mixed_extraction_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("mixed requested-output failure must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id", "npi")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_output_id",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            ),
+            _criterion("c_npi", "The returned record includes NPI.", output_path="output.npi"),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
+    assert verdicts["c_npi"].reason_code == "no_evidence"
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID in verdicts
+
+
+@pytest.mark.parametrize(
+    ("output_path", "criterion_id"),
+    [
+        ("output.downloaded_files", "c_downloaded_files"),
+        ("output.downloaded_file_urls", "c_downloaded_file_urls"),
+        ("output.downloaded_file_artifact_ids", "c_downloaded_file_artifact_ids"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_download_output_path_reconciles_with_registered_download_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    output_path: str,
+    criterion_id: str,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download output path must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                criterion_id,
+                "The returned record includes registered download output.",
+                output_path=output_path,
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(
+            {
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+
+
+@pytest.mark.asyncio
+async def test_marked_download_deliverable_without_registered_evidence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("missing registered download evidence must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("output_id")
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/statement.pdf"]',
+        affordance_text="Download",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_output_id",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_output_id"].reason_code == "no_evidence"
+    assert verdicts[REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_download_typed_affordance_injects_and_fails_without_registered_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("missing registered download evidence must be deterministic")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/statement.pdf"]',
+        affordance_text="Download",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="unsatisfied",
+            reason_code="no_evidence",
+            missing_evidence="run output did not include a non-empty registered browser download",
+        )
+    ]
+    assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_definition_only_non_download_remains_no_gradeable_run_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("definition-only criteria must not reach the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="definition_inputs",
+                outcome="The workflow accepts the account number as a reusable input.",
+                level="definition",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.criterion_ids == ["definition_inputs"]
+    assert verification.verdicts == [
+        CriterionVerdict(
+            criterion_id="definition_inputs",
+            state="unknown",
+            reason_code="definition_parameters_absent",
+        )
+    ]
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID not in [
+        criterion.id for criterion in ctx.request_policy.completion_criteria
+    ]
+
+
+def test_download_reconciliation_is_idempotent_when_criterion_exists() -> None:
+    ctx = _run_ctx()
+    criterion = registered_download_completion_criterion()
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    criteria = [criterion]
+
+    reconciled = _reconcile_download_completion_criterion(
+        ctx,
+        {"ok": True, "data": {"reached_download_target": {"download_kind": "extension"}}},
+        criteria,
+    )
+
+    assert reconciled is criteria
+    assert [existing.id for existing in ctx.request_policy.completion_criteria] == [
+        REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+    ]
+
+
+def test_download_reconciliation_does_not_mutate_request_policy() -> None:
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    reconciled = _reconcile_download_completion_criterion(
+        ctx,
+        {"ok": True, "data": {"reached_download_target": {"download_kind": "extension"}}},
+        [],
+    )
+
+    assert [criterion.id for criterion in reconciled] == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert ctx.request_policy.completion_criteria == []
+
+
+def test_download_grader_requires_non_empty_registered_surface() -> None:
+    criteria = [registered_download_completion_criterion()]
+
+    missing = grade_registered_download_criteria(
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"download_document": {"download_registered": True}}),
+    )
+    present = grade_registered_download_criteria(
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "download_document": {
+                    "download_registered": True,
+                    "downloaded_file_count": 0,
+                    "downloaded_file_url_count": 1,
+                    "downloaded_file_artifact_count": 0,
+                }
+            }
+        ),
+    )
+
+    assert missing == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="unsatisfied",
+            reason_code="no_evidence",
+            missing_evidence="run output did not include a non-empty registered browser download",
+        )
+    ]
+    assert (
+        run_plane_all_no_evidence(
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=[REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID],
+                verdicts=missing,
+            )
+        )
+        is True
+    )
+    assert present == [
+        CriterionVerdict(
+            criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download_document",
+        )
+    ]
+
+
+def test_snapshot_normalizes_registered_download_output_parameter_values() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+
+    snapshot = _build_run_evidence_snapshot(
+        ctx,
+        _registered_download_output_parameter_result(
+            {
+                "page": "<RecordingLocator>",
+                "download": "<Download>",
+                "downloaded_file_name": "document.pdf",
+                "downloaded_files": [{"filename": "document.pdf"}],
+                "downloaded_file_urls": ["https://example.test/downloads/document.pdf?token=secret"],
+                "downloaded_file_artifact_ids": ["artifact_1"],
+            }
+        ),
+    )
+    rendered = snapshot.render_prompt_block()
+
+    assert snapshot.block_outputs["download_document_output"] == {
+        "download_registered": True,
+        "downloaded_file_count": 1,
+        "downloaded_file_url_count": 1,
+        "downloaded_file_artifact_count": 1,
+        "downloaded_file_names": ["document.pdf"],
+    }
     assert "RecordingLocator" not in rendered and "Download" not in rendered and "secret" not in rendered
 
 
