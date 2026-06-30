@@ -340,11 +340,15 @@ function Workspace({
     : 0;
   const location = useLocation();
   const navigate = useNavigate();
-  const locationState = location.state as { copilotMessage?: unknown } | null;
+  const locationState = location.state as {
+    copilotMessage?: unknown;
+    copilotFixOrigin?: unknown;
+  } | null;
   const initialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
       : null;
+  const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
     navigate(location.pathname + location.search, {
@@ -2373,6 +2377,7 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
+        initialMessageFixOrigin={initialCopilotFixOrigin}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>
