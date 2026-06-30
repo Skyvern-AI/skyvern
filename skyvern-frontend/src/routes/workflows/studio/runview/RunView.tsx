@@ -1,19 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Share1Icon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
-import { useSearchParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { statusIsFinalized } from "@/routes/tasks/types";
+import {
+  isAction,
+  isObserverThought,
+  isWorkflowRunBlock,
+} from "@/routes/workflows/types/workflowRunTypes";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
 import { cn } from "@/util/utils";
 
+import { useDebugSessionQuery } from "../../hooks/useDebugSessionQuery";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
@@ -21,21 +27,32 @@ import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { pickDownloadedFileFilename } from "../../workflowRun/blockDownloadedFiles";
 import { getRecordingUrls } from "../../workflowRun/recordingUrls";
-import { findActiveItem } from "../../workflowRun/workflowTimelineUtils";
+import {
+  findActiveItem,
+  findTimelineBlock,
+  resolveScreenshotBlockId,
+} from "../../workflowRun/workflowTimelineUtils";
 import { getOrderedRunParameters } from "../../utils";
 import {
+  actionLabel,
   buildFilmstrip,
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
-import { RunDetailsButton } from "./RunDetailsButton";
 import { RunHero } from "./RunHero";
-import { RunInputsButton, type RunInputMeta } from "./RunInputsButton";
-import { RunOutputsButton, type RunOutputFile } from "./RunOutputsButton";
+import { type HeroSelection } from "./HeroScreenshot";
+import { buildRunFixMessage } from "./runFixMessage";
+import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
+import { RunOutputsSection, type RunOutputFile } from "./RunOutputsSection";
+import { RunOverviewButton } from "./RunOverviewButton";
+import { RunPlaceholder } from "./RunPlaceholder";
 
 type RunViewProps = {
   workflowRunId?: string;
-  onFix?: () => void;
+  // The caller is still resolving which run to show; keep the placeholder in its
+  // loading state rather than flashing the "no run yet" empty state.
+  runIdPending?: boolean;
+  onFix?: (seedMessage?: string) => void;
   onRetry?: () => void;
 };
 
@@ -43,13 +60,27 @@ type RunViewProps = {
  * Fused run view: browser hero on the left, run timeline tree + block detail on
  * the right, sharing one pinned item via RunViewStore.
  */
-export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
+export function RunView({
+  workflowRunId,
+  runIdPending = false,
+  onFix,
+  onRetry,
+}: RunViewProps) {
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(queryOptions);
+  // isLoading here, not isPending like RunTab: this query is enabled only once a run
+  // id exists, so a disabled query means "no run" → fall through to the empty CTA.
+  const { data: workflowRun, isLoading } =
+    useWorkflowRunWithWorkflowQuery(queryOptions);
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
+  const { workflowPermanentId } = useParams();
+  const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+    enabled: false,
+  });
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
+  const headerCompact = useRunViewStore((s) => s.headerCompact);
   const studioTab = useStudioShellStore((s) => s.tab);
   const [searchParams, setSearchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
@@ -58,6 +89,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   const apiCredential = useApiCredential();
   const [activeIteration, setActiveIteration] = useState<number | null>(null);
   const [replayOpen, setReplayOpen] = useState(false);
+  const [outputSummary, setOutputSummary] = useState<string | null>(null);
 
   const recordingUrls = useMemo(
     () => getRecordingUrls(workflowRun),
@@ -82,6 +114,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   // from ?active= to restore a deep-linked selection.
   useEffect(() => {
     resetRunView();
+    setOutputSummary(null);
     const active = searchParamsRef.current.get("active");
     if (active) {
       pinFrame(active);
@@ -115,31 +148,36 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
     );
   }, [pinnedFrameId, workflowRunId, setSearchParams]);
 
-  // Pin the resolved run into ?wr= while the Run tab shows it (an ?active=-only link
-  // becomes stable). Gated on the tab: RunView also mounts under Editor, no ?wr= there.
+  // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
+  // the tab: RunView also mounts under Editor, no ?wr= there.
+  //
+  // The guard reads the LIVE URL, not this render's searchParams: a block-run launch
+  // navigates to ?wr=&bl= via a separate router update, and the editor→run transition
+  // can fire this effect from a render whose searchParams closure predates it. Reading
+  // the live URL avoids writing the stale latest-run id back over the new run (which
+  // reverted ?wr= and dropped ?bl=, disabling the debug stream).
   useEffect(() => {
     if (studioTab !== "run") {
       return;
     }
-    const resolvedRunId = workflowRun?.workflow_run_id;
-    if (!resolvedRunId) {
+    if (!workflowRunId) {
+      return;
+    }
+    if (new URLSearchParams(window.location.search).get("wr")) {
       return;
     }
     setSearchParams(
       (prev) => {
-        if (prev.get("wr") === resolvedRunId && !prev.has("bl")) {
+        if (prev.get("wr")) {
           return prev;
         }
         const next = new URLSearchParams(prev);
-        next.set("wr", resolvedRunId);
-        // Viewing the run, not the block-run browser — drop stale ?bl= so a reload
-        // doesn't snap back to the Browser tab.
-        next.delete("bl");
+        next.set("wr", workflowRunId);
         return next;
       },
       { replace: true },
     );
-  }, [studioTab, workflowRun, setSearchParams]);
+  }, [studioTab, workflowRunId, setSearchParams]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
 
@@ -148,12 +186,21 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
+  // A block run executes in the debug session; on the Run tab show that same live
+  // debug stream (the shared node) instead of a separate run stream — but only when
+  // the run's browser session IS the current debug session. A historical block-run
+  // link whose debug session is gone/different falls back to the normal run view.
+  const showDebugStream =
+    studioTab === "run" &&
+    searchParams.has("bl") &&
+    workflowRun?.browser_session_id != null &&
+    workflowRun.browser_session_id === debugSession?.browser_session_id;
+  const fixSeedMessage = useMemo(
+    () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
+    [workflowRun?.failure_reason],
+  );
 
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
-  const shownFrame =
-    (pinnedFrameId ? frames.find((f) => f.id === pinnedFrameId) : undefined) ??
-    lastFrame ??
-    null;
 
   const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const finallyBlockLabel =
@@ -165,6 +212,47 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
     [timeline, selectedId, finalized, finallyBlockLabel],
   );
+
+  // Mirror the legacy run page: an action shows its own screenshot, a block shows
+  // its representative screenshot (a loop/conditional container resolves to its leaf).
+  const heroSelection = useMemo<HeroSelection | null>(() => {
+    if (isAction(activeItem)) {
+      return {
+        kind: "action",
+        artifactId: activeItem.screenshot_artifact_id ?? null,
+        stepId: activeItem.step_id ?? null,
+        actionOrder: activeItem.action_order ?? null,
+      };
+    }
+    if (isWorkflowRunBlock(activeItem)) {
+      const screenshotBlockId = resolveScreenshotBlockId(
+        timeline ?? [],
+        activeItem,
+        activeIteration,
+      );
+      const blockType =
+        findTimelineBlock(timeline ?? [], screenshotBlockId)?.block_type ??
+        activeItem.block_type ??
+        null;
+      return {
+        kind: "block",
+        workflowRunBlockId: screenshotBlockId,
+        blockType,
+      };
+    }
+    if (isObserverThought(activeItem)) {
+      return { kind: "thought", thoughtId: activeItem.thought_id };
+    }
+    return null;
+  }, [activeItem, timeline, activeIteration]);
+
+  const heroLabel = isAction(activeItem)
+    ? actionLabel(activeItem)
+    : isWorkflowRunBlock(activeItem)
+      ? (activeItem.label ?? "Screenshot")
+      : isObserverThought(activeItem)
+        ? (activeItem.thought ?? "Thought")
+        : "Screenshot";
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
     const outputs = workflowRun?.outputs;
@@ -188,11 +276,6 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
       filename: pickDownloadedFileFilename(url, filenameByUrl),
     }));
   }, [workflowRun]);
-
-  const hasOutputs =
-    (extractedInformation != null &&
-      Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0;
 
   const runInputs = useMemo(() => {
     const definitionParameters =
@@ -222,12 +305,15 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
     return { parameters, meta };
   }, [workflowRun]);
 
+  const hasInputs =
+    runInputs.parameters.length > 0 || runInputs.meta.length > 0;
+  const hasOutputs =
+    (extractedInformation != null &&
+      Object.values(extractedInformation).some((value) => value !== null)) ||
+    downloadedFiles.length > 0;
+
   if (!workflowRun) {
-    return (
-      <div className="flex h-full w-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
-        Run the workflow to watch it live here.
-      </div>
-    );
+    return <RunPlaceholder loading={isLoading || runIdPending} />;
   }
 
   const elapsed = formatElapsed(
@@ -244,8 +330,10 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
           />
           <RunHero
             workflowRunId={workflowRun.workflow_run_id}
-            shownFrame={shownFrame}
+            heroSelection={heroSelection}
+            heroLabel={heroLabel}
             running={running}
+            showDebugStream={showDebugStream}
             provisioning={
               workflowRun.status === Status.Created ||
               workflowRun.status === Status.Queued
@@ -256,31 +344,36 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
             browserSessionId={workflowRun.browser_session_id ?? null}
             recordingUrls={recordingUrls}
             elapsed={elapsed}
-            details={
-              <RunDetailsButton
-                workflowRunId={workflowRun.workflow_run_id}
+            overview={
+              <RunOverviewButton
                 status={workflowRun.status}
+                elapsed={elapsed}
                 startedAt={workflowRun.started_at ?? null}
                 finishedAt={workflowRun.finished_at ?? null}
                 failureReason={workflowRun.failure_reason ?? null}
                 failureCategory={workflowRun.failure_category ?? null}
+                workflowRunId={workflowRun.workflow_run_id}
                 browserSessionId={workflowRun.browser_session_id ?? null}
                 browserProfileId={workflowRun.browser_profile_id ?? null}
               />
             }
             inputs={
-              <RunInputsButton
-                parameters={runInputs.parameters}
-                meta={runInputs.meta}
-              />
+              hasInputs ? (
+                <RunInputsSection
+                  parameters={runInputs.parameters}
+                  meta={runInputs.meta}
+                />
+              ) : undefined
             }
             outputs={
               hasOutputs ? (
-                <RunOutputsButton
+                <RunOutputsSection
                   workflowRunId={workflowRun.workflow_run_id}
                   workflowTitle={workflowRun.workflow?.title}
                   extractedInformation={extractedInformation}
                   files={downloadedFiles}
+                  summary={outputSummary}
+                  onSummary={setOutputSummary}
                 />
               ) : undefined
             }
@@ -290,6 +383,8 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
                   trigger={
                     <button
                       type="button"
+                      title={headerCompact ? "API & Webhooks" : undefined}
+                      aria-label="API & Webhooks"
                       className={cn(
                         "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium",
                         "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
@@ -297,7 +392,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
                       )}
                     >
                       <Share1Icon className="h-4 w-4" />
-                      API & Webhooks
+                      {headerCompact ? null : "API & Webhooks"}
                     </button>
                   }
                   getOptions={() => {
@@ -337,7 +432,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
               </>
             }
             onRecordingPlay={onRecordingPlay}
-            onFix={onFix}
+            onFix={onFix ? () => onFix(fixSeedMessage) : undefined}
             onRetry={onRetry}
           />
         </div>

@@ -81,11 +81,13 @@ import {
   BLOCK_SIDEBAR_WIDTH_MAX,
   useBlockSidebarWidthStore,
 } from "@/store/BlockSidebarWidthStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { BLOCK_FORMS, type WorkflowBlockNodeType } from "./BlockConfigForm";
 import { BlockConfigSidebar } from "./BlockConfigSidebar";
 import { getContainedBlockSidebarWidth } from "../blockSidebar";
+import { StudioShellContext } from "../../studio/StudioShellContext";
 
 // EditableNodeTitle (used by the editable block title) measures truncation
 // via ResizeObserver, which jsdom does not implement. Stubbed per-test in
@@ -122,6 +124,7 @@ beforeEach(() => {
     content: "parameters",
   });
   useBlockSidebarWidthStore.getState().reset();
+  useStudioShellStore.getState().reset();
   for (const key of BLOCK_FORM_KEYS) {
     BLOCK_FORMS[key] = StubFormForBlockType(key);
   }
@@ -134,6 +137,33 @@ afterEach(() => {
     BLOCK_FORMS[key] = ORIGINAL_BLOCK_FORMS[key];
   }
 });
+
+// In studio the embedded sidebar portals its surface into the StudioShell
+// settings column (settingsPortalEl). Provide a real portal target via context
+// so the portaled content lands in the document and `screen` can query it.
+function renderEmbedded(initialPath = "/workflows/wpid_abc/edit") {
+  const settingsPortalEl = document.createElement("div");
+  const settingsRailPortalEl = document.createElement("div");
+  document.body.appendChild(settingsPortalEl);
+  document.body.appendChild(settingsRailPortalEl);
+  const result = render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <StudioShellContext.Provider
+        value={{
+          copilotPortalEl: null,
+          settingsPortalEl,
+          settingsRailPortalEl,
+          setEditorStreamSlot: () => {},
+          setBrowserStreamSlot: () => {},
+          setRunStreamSlot: () => {},
+        }}
+      >
+        <BlockConfigSidebar embedded />
+      </StudioShellContext.Provider>
+    </MemoryRouter>,
+  );
+  return { ...result, settingsPortalEl, settingsRailPortalEl };
+}
 
 describe("BlockConfigSidebar mount stability (SKY-9360)", () => {
   test("renders the aside with the slide-in animation when a block is selected", () => {
@@ -321,9 +351,9 @@ describe("BlockConfigSidebar block library layout (contained drawer)", () => {
         </MemoryRouter>,
       );
 
-      const sidebarRoot = screen.getByTestId(
-        "block-config-sidebar",
-      ).parentElement;
+      // aside → shell wrapper → Resizable root (the element carrying the width).
+      const sidebarRoot = screen.getByTestId("block-config-sidebar")
+        .parentElement?.parentElement;
 
       expect(getContainedBlockSidebarWidth(BLOCK_SIDEBAR_WIDTH_MAX, 500)).toBe(
         452,
@@ -444,5 +474,136 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
 
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(mockLabelChangeHandler).not.toHaveBeenCalled();
+  });
+});
+
+describe("BlockConfigSidebar settings collapse (SKY-11481)", () => {
+  test("embedded studio renders the settings panel collapsed to a rail by default", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    renderEmbedded();
+
+    expect(screen.getByTestId("settings-rail")).toBeDefined();
+    expect(useStudioShellStore.getState().settingsCollapsed).toBe(true);
+    // The body stays mounted (so the width animation can clip it) but inert.
+    expect(screen.getByTestId("block-config-sidebar").className).toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("the rail is collapsible for any block, not just Agent Settings", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    renderEmbedded();
+
+    const rail = screen.getByTestId("settings-rail");
+    expect(rail.textContent).toContain("Alpha");
+    expect(screen.getByTestId("block-config-sidebar").className).toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("clicking the rail expands to the full settings panel", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    renderEmbedded();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show settings" }));
+
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+    expect(screen.getByText("Agent Settings")).toBeDefined();
+    // Expanded body is interactive again.
+    expect(screen.getByTestId("block-config-sidebar").className).not.toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("the header chevron collapses the panel back to the rail", () => {
+    act(() => {
+      useStudioShellStore.getState().setSettingsCollapsed(false);
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    renderEmbedded();
+
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Close block configuration" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse settings" }));
+
+    expect(screen.getByTestId("settings-rail")).toBeDefined();
+    expect(useStudioShellStore.getState().settingsCollapsed).toBe(true);
+    // Body stays mounted (clipped under the rail) but inert.
+    expect(screen.getByTestId("block-config-sidebar").className).toContain(
+      "pointer-events-none",
+    );
+  });
+
+  test("the embedded panel portals its surface into the StudioShell settings column", () => {
+    // The panel is now a StudioShell grid column: the shell owns position,
+    // insets, and width, so the embedded surface is portaled into the provided
+    // settings column rather than self-positioning in the canvas.
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    const { settingsPortalEl, settingsRailPortalEl } = renderEmbedded();
+
+    // Collapsed by default: the rail renders in its own column slot, the body
+    // (clipped under it) in the main settings slot.
+    expect(
+      settingsRailPortalEl.querySelector('[data-testid="settings-rail"]'),
+    ).not.toBeNull();
+    expect(
+      settingsPortalEl.querySelector('[data-testid="block-config-sidebar"]'),
+    ).not.toBeNull();
+
+    act(() => {
+      useStudioShellStore.getState().setSettingsCollapsed(false);
+    });
+
+    // Expanded: the body stays in the settings slot and the rail is gone.
+    expect(
+      settingsPortalEl.querySelector('[data-testid="block-config-sidebar"]'),
+    ).not.toBeNull();
+    expect(
+      settingsRailPortalEl.querySelector('[data-testid="settings-rail"]'),
+    ).toBeNull();
+  });
+
+  test("embedded renders nothing when the studio settings column is absent", () => {
+    // Without a StudioShell portal target the panel renders nothing rather than
+    // falling back to an in-canvas overlay.
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar embedded />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByTestId("block-config-sidebar")).toBeNull();
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+  });
+
+  test("legacy (non-embedded) editor does not collapse and keeps the close button", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByTestId("settings-rail")).toBeNull();
+    expect(screen.getByTestId("block-config-sidebar")).toBeDefined();
+    expect(
+      screen.getByRole("button", { name: "Close block configuration" }),
+    ).toBeDefined();
   });
 });

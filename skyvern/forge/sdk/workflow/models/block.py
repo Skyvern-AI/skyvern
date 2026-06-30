@@ -93,6 +93,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -4113,6 +4114,13 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        LOG.info(
+            "CodeBlock runner selection at block",
+            use_codeblock_runner=use_codeblock_runner,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=self.label,
+        )
         if use_codeblock_runner:
             secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
                 block=self,
@@ -4123,6 +4131,13 @@ async def wrapper({default_args}):
                 workflow_run_context=workflow_run_context,
                 parameter_values=parameter_values,
                 credential_parameter_keys=credential_parameter_keys,
+            )
+            LOG.info(
+                "Secure CodeBlock override returned",
+                override_returned_none=secure_code_block_result is None,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
             )
             if secure_code_block_result is not None:
                 return secure_code_block_result
@@ -4800,6 +4815,8 @@ class FileUploadBlock(Block):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
     path: str | None = None
     continue_on_empty: bool = Field(
         default=False,
@@ -4838,6 +4855,12 @@ class FileUploadBlock(Block):
         if self.azure_blob_container_name and workflow_run_context.has_parameter(self.azure_blob_container_name):
             parameters.append(workflow_run_context.get_parameter(self.azure_blob_container_name))
 
+        if self.google_credential_id and workflow_run_context.has_parameter(self.google_credential_id):
+            parameters.append(workflow_run_context.get_parameter(self.google_credential_id))
+
+        if self.google_drive_folder_id and workflow_run_context.has_parameter(self.google_drive_folder_id):
+            parameters.append(workflow_run_context.get_parameter(self.google_drive_folder_id))
+
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
@@ -4867,6 +4890,14 @@ class FileUploadBlock(Block):
         if self.azure_blob_container_name:
             self.azure_blob_container_name = self.format_block_parameter_template_from_workflow_run_context(
                 self.azure_blob_container_name, workflow_run_context
+            )
+        if self.google_credential_id:
+            self.google_credential_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.google_credential_id, workflow_run_context
+            )
+        if self.google_drive_folder_id:
+            self.google_drive_folder_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.google_drive_folder_id, workflow_run_context
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
@@ -4931,6 +4962,20 @@ class FileUploadBlock(Block):
             azure_storage_account_key=azure_storage_account_key,
             azure_blob_container_name=self.azure_blob_container_name,
             azure_blob_name=blob_name,
+        )
+
+    @staticmethod
+    def _build_google_drive_destination(
+        *,
+        access_token: str,
+        folder_id: str,
+    ) -> FileUploadDestination:
+        return FileUploadDestination(
+            storage_type=FileStorageType.GOOGLE_DRIVE,
+            customer_uri=f"https://drive.google.com/drive/folders/{folder_id}",
+            sdk_uri=f"https://drive.google.com/drive/folders/{folder_id}",
+            google_access_token=access_token,
+            google_drive_folder_id=folder_id,
         )
 
     @staticmethod
@@ -5148,6 +5193,11 @@ class FileUploadBlock(Block):
                 missing_parameters.append("azure_storage_account_key")
             if not self.azure_blob_container_name or self.azure_blob_container_name == "":
                 missing_parameters.append("azure_blob_container_name")
+        elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not self.google_credential_id:
+                missing_parameters.append("google_credential_id")
+            if not self.google_drive_folder_id:
+                missing_parameters.append("google_drive_folder_id")
         else:
             return await self.build_block_result(
                 success=False,
@@ -5190,7 +5240,7 @@ class FileUploadBlock(Block):
             files_to_upload = []
             max_file_count = (
                 MAX_UPLOAD_FILE_COUNT
-                if self.storage_type == FileStorageType.S3
+                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE}
                 else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
             )
             files_to_upload = self._get_files_to_upload_from_download_dir(
@@ -5323,6 +5373,40 @@ class FileUploadBlock(Block):
                     )
                     uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
+            elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
+                org_id = organization_id or workflow_run_context.organization_id
+                if not org_id:
+                    raise ValueError("organization_id is required for Google Drive uploads")
+                google_credential_id = (
+                    workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
+                    or self.google_credential_id
+                )
+                if not google_credential_id:
+                    raise ValueError("Google credential id is required")
+
+                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+                    organization_id=org_id,
+                    credential_id=google_credential_id,
+                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                )
+                if not google_credentials or not google_credentials.token:
+                    raise ValueError("Google Drive credential is not connected or is missing required scopes")
+
+                folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
+                for file_path in files_to_upload:
+                    LOG.info("FileUploadBlock Uploading file to Google Drive", file_path=file_path)
+                    destination = self._build_google_drive_destination(
+                        access_token=google_credentials.token,
+                        folder_id=folder_id,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=org_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
+                LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation
                 raise ValueError(f"Unsupported storage type: {self.storage_type}")
@@ -5965,6 +6049,21 @@ class FileParserBlock(Block):
             )
             raise
 
+    async def _resolve_file_parser_handler(
+        self, prompt_type: str, distinct_id: str | None, organization_id: str | None
+    ) -> LLMAPIHandler:
+        """Resolve the default handler for a file-parser prompt type.
+
+        Honors the LLM_CONFIG_BY_PROMPT_TYPE PostHog flag (keyed by prompt type) so the
+        OCR and extraction models can be set without a deploy; falls back to the primary
+        handler. A block-level override_llm_key still takes precedence at the call site.
+        """
+        if distinct_id:
+            posthog_handler = await get_llm_handler_for_prompt_type(prompt_type, distinct_id, organization_id)
+            if posthog_handler:
+                return posthog_handler
+        return app.LLM_API_HANDLER
+
     async def _ocr_pdf_pages(
         self,
         page_images: list[bytes],
@@ -5979,8 +6078,11 @@ class FileParserBlock(Block):
         truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
         """
         llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+        default_handler = await self._resolve_file_parser_handler(
+            "extract-text-from-image", workflow_run_block_id, organization_id
+        )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=app.LLM_API_HANDLER
+            self.override_llm_key, default=default_handler
         )
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
@@ -6051,8 +6153,11 @@ class FileParserBlock(Block):
                 image_bytes = f.read()
 
             llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            default_handler = await self._resolve_file_parser_handler(
+                "extract-text-from-image", workflow_run_block_id, organization_id
+            )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                self.override_llm_key, default=app.LLM_API_HANDLER
+                self.override_llm_key, default=default_handler
             )
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
@@ -6169,7 +6274,10 @@ class FileParserBlock(Block):
         )
 
         llm_key = self.override_llm_key
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+        default_handler = await self._resolve_file_parser_handler(
+            "extract-information-from-file-text", workflow_run_block_id, organization_id
+        )
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
 
         llm_response = await llm_api_handler(
             prompt=llm_prompt,

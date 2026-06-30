@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -110,6 +110,7 @@ class TurnIntentReasonCode(StrEnum):
     RAW_SECRET_REFUSAL = "raw_secret_refusal"
     USER_NON_PROGRESS = "user_non_progress"
     RECOVERY_FROM_RUN_CONTEXT = "recovery_from_run_context"
+    FIX_ORIGIN_DIAGNOSE = "fix_origin_diagnose"
     LLM_CLASSIFIER = "llm_classifier"
     LOW_CONFIDENCE_CLARIFICATION = "low_confidence_clarification"
     TARGET_ENTITY_RESOLVED = "target_entity_resolved"
@@ -579,6 +580,7 @@ async def classify_turn_intent(
         return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.MISSING_HANDLER)
 
     safe_user_message = redact_raw_secrets_for_prompt(user_message)
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
     try:
         prompt = prompt_engine.load_prompt(
@@ -597,7 +599,7 @@ async def classify_turn_intent(
             latest_assistant_turn=transcript.latest_assistant_turn,
             retained_history=transcript.retained_history,
             global_llm_context=escape_code_fences(
-                redact_raw_secrets_for_prompt(global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
+                redact_raw_secrets_for_prompt(safe_global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
             ),
         )
     except Exception as exc:
@@ -753,6 +755,7 @@ def build_turn_intent(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     classifier_result: TurnIntentClassifierResult | None = None,
+    fix_origin: bool = False,
 ) -> TurnIntent:
     has_workflow = bool((workflow_yaml or "").strip())
     has_prior_context = bool((global_llm_context or "").strip())
@@ -863,6 +866,14 @@ def build_turn_intent(
         )
         reason_codes.append(TurnIntentReasonCode.LLM_CLASSIFIER)
         reason_codes.extend(classification.reason_codes)
+
+    # Runs before the LOW_CONFIDENCE / MISSING_EDIT_TARGET downgrades: a CLARIFY here is only a request-policy
+    # clarification (already set) that, like REFUSE, still wins; a confident/would-be-downgraded edit becomes DIAGNOSE.
+    if fix_origin and has_prior_run_signal and mode not in (TurnIntentMode.REFUSE, TurnIntentMode.CLARIFY):
+        mode = TurnIntentMode.DIAGNOSE
+        expected_output = TurnIntentExpectedOutput.RUN_RESULT
+        target_entities.pop("workflow_change", None)
+        reason_codes.append(TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE)
 
     if (
         classification is not None

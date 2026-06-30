@@ -204,6 +204,11 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    # Climbs on each click that made no verified forward progress (failed/timed-out
+    # click or a hollow post-click observe); resets on verified progress.
+    consecutive_no_progress_interaction_count: int = 0
+    last_scout_act_observe_outcome: str | None = None
+    last_scout_act_observe_packet: dict[str, Any] | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
@@ -285,6 +290,8 @@ class AgentContext:
     reached_download_target: ReachedDownloadTarget | None = None
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
+    synthesized_block_offered_goal_complete: bool = False
+    synthesized_block_reopened_after_failed_run: bool = False
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0
@@ -294,6 +301,9 @@ class AgentContext:
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
     # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
     pending_scout_role_name: tuple[str, str, str] | None = None
+    # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
+    # settle re-perception on whether that selector still resolves to a live element.
+    pending_scout_click_selector: str | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.

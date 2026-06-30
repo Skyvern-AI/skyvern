@@ -43,6 +43,10 @@ class ExfiltratedEvent:
     params: dict = dataclasses.field(default_factory=dict)
     source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
     timestamp: float = dataclasses.field(default_factory=lambda: time.time())  # seconds since epoch
+    # Monotonic order assigned at the earliest synchronous capture point so the
+    # interpreter can restore chronological order after async materialization
+    # (e.g. console json_value round-trips) reorders events under load.
+    capture_seq: int = -1
 
 
 OnExfiltrationEvent = t.Callable[[list[ExfiltratedEvent]], None]
@@ -82,8 +86,14 @@ class ExfiltrationChannel(CdpChannel):
         self._last_network_activity_emit = 0.0
         self._network_activity_flush_task: asyncio.Task[None] | None = None
         self._capture_paused = False
+        self._capture_seq = 0
 
         super().__init__(vnc_channel=vnc_channel)
+
+    def _next_capture_seq(self) -> int:
+        seq = self._capture_seq
+        self._capture_seq += 1
+        return seq
 
     def pause_capture(self) -> None:
         self._capture_paused = True
@@ -189,7 +199,7 @@ class ExfiltrationChannel(CdpChannel):
         self._recent_console_event_fingerprints[fingerprint] = now
         return True
 
-    def _emit_console_event(self, event_data: dict[str, t.Any]) -> None:
+    def _emit_console_event(self, event_data: dict[str, t.Any], capture_seq: int) -> None:
         if not self._should_emit_console_event(event_data):
             return
 
@@ -201,6 +211,7 @@ class ExfiltrationChannel(CdpChannel):
                     params=event_data,
                     source=ExfiltratedEventSource.CONSOLE,
                     timestamp=time.time(),
+                    capture_seq=capture_seq,
                 )
             ]
         )
@@ -212,9 +223,9 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        active_channel._emit_console_event(event_data)
+        active_channel._emit_console_event(event_data, active_channel._next_capture_seq())
 
-    async def _handle_console_event_async(self, msg: ConsoleMessage) -> None:
+    async def _handle_console_event_async(self, msg: ConsoleMessage, capture_seq: int) -> None:
         """Parse Playwright console messages for exfiltrated event data."""
         event_data: dict[str, t.Any] | None = None
         try:
@@ -232,12 +243,12 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        self._emit_console_event(event_data)
+        self._emit_console_event(event_data, capture_seq)
 
     def _handle_console_event(self, msg: ConsoleMessage) -> None:
-        self._track_event_task(self._handle_console_event_async(msg))
+        self._track_event_task(self._handle_console_event_async(msg, self._next_capture_seq()))
 
-    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any]) -> None:
+    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any], capture_seq: int) -> None:
         raw_args = params.get("args")
         if not isinstance(raw_args, list):
             return
@@ -246,14 +257,16 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        self._emit_console_event(event_data)
+        self._emit_console_event(event_data, capture_seq)
 
     async def _attach_page_cdp_console_capture(self, page: Page) -> CDPSession | None:
         cdp_session = await page.context.new_cdp_session(page)
         await cdp_session.send("Runtime.enable")
         cdp_session.on(
             "Runtime.consoleAPICalled",
-            lambda params: self._track_event_task(self._handle_runtime_console_event_async(params)),
+            lambda params: self._track_event_task(
+                self._handle_runtime_console_event_async(params, self._next_capture_seq())
+            ),
         )
         return cdp_session
 
@@ -335,6 +348,7 @@ class ExfiltrationChannel(CdpChannel):
                 params=params,
                 source=ExfiltratedEventSource.CDP,
                 timestamp=time.time(),
+                capture_seq=self._next_capture_seq(),
             ),
         ]
 

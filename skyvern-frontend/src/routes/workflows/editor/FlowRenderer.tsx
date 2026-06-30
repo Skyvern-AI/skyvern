@@ -15,6 +15,7 @@ import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosin
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -91,6 +92,7 @@ import {
   WorkflowBlockNode,
 } from "./nodes";
 import { GlobalCollapseControl } from "./collapse/GlobalCollapseControl";
+import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { RedoControl } from "./controls/RedoControl";
@@ -167,6 +169,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
 import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
+import { duplicateBlockBelow } from "./workflowDuplicate";
 
 // Grace period after nodesInitialized before we start tracking changes.
 // Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
@@ -446,6 +449,9 @@ function FlowRenderer({
   const selectedBlockId = useWorkflowPanelStore(
     (state) => state.selectedBlockId,
   );
+  const setSettingsCollapsed = useStudioShellStore(
+    (state) => state.setSettingsCollapsed,
+  );
 
   // Escape clears the canvas selection. The listener is mounted
   // on the FlowRenderer because that scopes the global keydown to the
@@ -459,13 +465,19 @@ function FlowRenderer({
       if (event.key !== "Escape") {
         return;
       }
+      // In the studio shell the settings panel is persistent, so Escape
+      // collapses it to the rail rather than deselecting (which would hide it).
+      if (embedded) {
+        setSettingsCollapsed(true);
+        return;
+      }
       setSelectedBlockId(null);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [setSelectedBlockId, readOnly]);
+  }, [setSelectedBlockId, setSettingsCollapsed, embedded, readOnly]);
 
   // Programmatic viewport changes (e.g. `fitView`) animate via `setViewport`,
   // which fires `onMove`. Without this gate, `constrainPan` would clamp every
@@ -1099,6 +1111,46 @@ function FlowRenderer({
     [onRequestDeleteNode, readOnly],
   );
 
+  const duplicateNode = useCallback(
+    (id: string) => {
+      const result = duplicateBlockBelow({
+        nodes,
+        edges,
+        nodeId: id,
+        generateId: nanoid,
+        generateLabel: generateNodeLabel,
+      });
+
+      if (!result) {
+        return;
+      }
+
+      workflowChangesStore.setHasChanges(true);
+      postHog.capture("builder.block.duplicated", {
+        org_id: workflow.organization_id,
+        position: result.position,
+        source_block_id: id,
+      });
+      doLayout(result.nodes, result.edges);
+      useWorkflowPanelStore
+        .getState()
+        .setSelectedBlockId(result.duplicatedNodeId);
+    },
+    [
+      nodes,
+      edges,
+      doLayout,
+      workflowChangesStore,
+      postHog,
+      workflow.organization_id,
+    ],
+  );
+
+  const duplicateNodeCallback = useCallback(
+    (id: string) => setTimeout(() => duplicateNode(id), 0),
+    [duplicateNode],
+  );
+
   function transmuteNode(id: string, nodeType: string) {
     const nodeToTransmute = nodes.find((node) => node.id === id);
 
@@ -1267,6 +1319,41 @@ function FlowRenderer({
   }, [recordedBlocks, recordedInsertionPoint]);
 
   const editorElementRef = useRef<HTMLDivElement>(null);
+
+  // A collapse/accordion animation settles the node at a new height; the layout
+  // budget can drop its final relayout, so force one (delegated via animationend).
+  useEffect(() => {
+    const root = editorElementRef.current;
+    if (!root) {
+      return;
+    }
+    let relayoutFrame: number | null = null;
+    const handleAnimationEnd = (event: AnimationEvent) => {
+      if (!isHeightCollapseAnimation(event.animationName)) {
+        return;
+      }
+      // Defer two frames so React Flow commits the post-animation measurement
+      // (Radix resolves the height back to `auto`) before we read it.
+      if (relayoutFrame !== null) {
+        cancelAnimationFrame(relayoutFrame);
+      }
+      relayoutFrame = requestAnimationFrame(() => {
+        relayoutFrame = requestAnimationFrame(() => {
+          relayoutFrame = null;
+          const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+          const currentEdges = reactFlowInstance.getEdges();
+          debouncedLayoutForDimensions(currentNodes, currentEdges);
+        });
+      });
+    };
+    root.addEventListener("animationend", handleAnimationEnd);
+    return () => {
+      root.removeEventListener("animationend", handleAnimationEnd);
+      if (relayoutFrame !== null) {
+        cancelAnimationFrame(relayoutFrame);
+      }
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
 
   // Ordered ids of the top-level sortable siblings. M2 extends this with a
   // scope per loop container and per conditional branch
@@ -1818,6 +1905,7 @@ function FlowRenderer({
             // and flip `setHasChanges(true)` on the main editor's store
             // while the user is only inspecting versions.
             requestDeleteNodeCallback: readOnly ? () => {} : requestDeleteNode,
+            duplicateNodeCallback: readOnly ? () => {} : duplicateNodeCallback,
             // setTimeout(..., 0) escapes the Radix dropdown's pointer-event
             // lockout: a synchronous mutation inside the menu's onSelect
             // races the menu's close animation and re-renders nodes while
@@ -1939,12 +2027,21 @@ function FlowRenderer({
                     return;
                   }
                   setSelectedBlockId(node.id);
+                  // Studio: a deliberate block click expands the persistent
+                  // settings panel (it starts collapsed on open).
+                  if (embedded) {
+                    setSettingsCollapsed(false);
+                  }
                 }}
                 onPaneClick={() => {
                   if (readOnly) {
                     return;
                   }
-                  setSelectedBlockId(null);
+                  // Studio: keep the persistent settings panel mounted on a
+                  // canvas click instead of deselecting (which would hide it).
+                  if (!embedded) {
+                    setSelectedBlockId(null);
+                  }
                 }}
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}

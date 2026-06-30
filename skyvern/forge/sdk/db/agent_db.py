@@ -873,6 +873,9 @@ class AgentDB(BaseAlchemyDB):
     async def update_script_block(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.update_script_block(*args, **kwargs)
 
+    async def clear_script_block_run_signatures(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.scripts.clear_script_block_run_signatures(*args, **kwargs)
+
     async def get_script_files(self, *args: Any, **kwargs: Any) -> Any:
         return await self.scripts.get_script_files(*args, **kwargs)
 

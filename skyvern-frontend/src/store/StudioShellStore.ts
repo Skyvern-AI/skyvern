@@ -6,10 +6,12 @@ export type StudioTab = "editor" | "browser" | "run";
 type StudioShellState = {
   tab: StudioTab;
   copilotCollapsed: boolean;
+  settingsCollapsed: boolean;
   pipMinimized: boolean;
   setTab: (tab: StudioTab) => void;
   setCopilotCollapsed: (collapsed: boolean) => void;
   toggleCopilot: () => void;
+  setSettingsCollapsed: (collapsed: boolean) => void;
   setPipMinimized: (minimized: boolean) => void;
   togglePip: () => void;
   reset: () => void;
@@ -18,6 +20,7 @@ type StudioShellState = {
 const DEFAULTS = {
   tab: "editor" as StudioTab,
   copilotCollapsed: false,
+  settingsCollapsed: true,
   pipMinimized: false,
 };
 
@@ -31,6 +34,7 @@ export const useStudioShellStore = create<StudioShellState>()(
       setCopilotCollapsed: (copilotCollapsed) => set({ copilotCollapsed }),
       toggleCopilot: () =>
         set((state) => ({ copilotCollapsed: !state.copilotCollapsed })),
+      setSettingsCollapsed: (settingsCollapsed) => set({ settingsCollapsed }),
       setPipMinimized: (pipMinimized) => set({ pipMinimized }),
       togglePip: () => set((state) => ({ pipMinimized: !state.pipMinimized })),
       reset: () => set(DEFAULTS),
@@ -39,7 +43,9 @@ export const useStudioShellStore = create<StudioShellState>()(
       name: STUDIO_SHELL_STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
       // `tab` is intentionally not persisted: the Run tab is gated on hasRun,
-      // so each session starts on the editor.
+      // so each session starts on the editor. `settingsCollapsed` is also not
+      // persisted: the settings panel must start collapsed on every open, and
+      // clicking a block auto-expands it within the session.
       partialize: (state) => ({
         copilotCollapsed: state.copilotCollapsed,
         pipMinimized: state.pipMinimized,

@@ -43,6 +43,16 @@ def _azure_destination() -> FileUploadDestination:
     )
 
 
+def _google_drive_destination() -> FileUploadDestination:
+    return FileUploadDestination(
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        customer_uri="https://drive.google.com/drive/folders/folder_123",
+        sdk_uri="https://drive.google.com/drive/folders/folder_123",
+        google_access_token="at-1",
+        google_drive_folder_id="folder_123",
+    )
+
+
 @pytest.fixture
 def small_file(tmp_path: Path) -> Path:
     fp = tmp_path / "f.bin"
@@ -117,6 +127,32 @@ async def test_azure_missing_creds_raises(small_file: Path) -> None:
             file_path=str(small_file),
             destination=destination,
         )
+
+
+@pytest.mark.asyncio
+async def test_google_drive_direct_path_calls_drive_service(small_file: Path) -> None:
+    destination = _google_drive_destination()
+    uploaded = MagicMock()
+    uploaded.id = "file_123"
+    uploaded.web_view_link = "https://drive.google.com/file/d/file_123/view"
+
+    with patch(
+        "skyvern.forge.agent_functions.google_drive_service.upload_file",
+        new_callable=AsyncMock,
+        return_value=uploaded,
+    ) as mock_upload:
+        result = await AgentFunction().upload_file_to_customer_storage(
+            file_path=str(small_file),
+            destination=destination,
+            organization_id="o_1",
+        )
+
+    assert result == "https://drive.google.com/file/d/file_123/view"
+    mock_upload.assert_awaited_once_with(
+        access_token="at-1",
+        file_path=str(small_file),
+        folder_id="folder_123",
+    )
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
+    synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -1463,6 +1464,10 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         current_page_challenge_signal = _current_page_terminal_challenge_signal(ctx, arguments, tool_name)
         if current_page_challenge_signal is not None:
             return _emit_tool_blocker_signal(ctx, current_page_challenge_signal)
+
+    persistence_signal = synthesized_block_persistence_signal(ctx, tool_name)
+    if persistence_signal is not None:
+        return _emit_tool_blocker_signal(ctx, persistence_signal)
 
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:

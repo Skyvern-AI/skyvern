@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -45,7 +46,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal
+from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal, reset_no_progress_interaction_count
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -86,6 +87,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     clear_runtime_authoring_repair_context,
     inject_runtime_authoring_repair_context,
+    post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
 )
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
@@ -139,6 +141,8 @@ from .composition_capture import (
     _active_run_terminal_evidence_result,
     _active_run_terminal_evidence_sample,
     _active_run_terminal_monitor_enabled,
+    _capture_composition_evidence,
+    store_post_run_page_evidence,
 )
 from .credentials import (
     _credential_ids_validation_error,
@@ -157,13 +161,23 @@ from .guardrails import (
     _parameter_binding_invariant_error,
     _placeholder_for_parameter_type,
 )
-from .scouting import _mark_page_inspected
+from .scouting import _mark_page_inspected, _mark_post_run_page_observed
 
 LOG = structlog.get_logger()
+
+
+class _RunIdUnset:
+    pass
+
+
+# Distinguishes omitted run id (read ctx) from explicit None (no current run).
+_RUN_ID_UNSET = _RunIdUnset()
 
 _ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_INTERVAL_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_MAX_SAMPLES = 8
+
+_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
 
 # Primary exit condition: seconds of no observed progress across the combined
 # run / block / step heartbeat. Sized to accommodate the slowest single LLM
@@ -981,6 +995,37 @@ async def _attach_registered_output_parameter_values(
     return values_by_label
 
 
+async def _capture_and_store_post_run_failure_page(
+    ctx: CopilotContext,
+    *,
+    run_session_id: str,
+    run_id: str,
+    current_url: str,
+) -> None:
+    """Observe-only capture of the run-session failure page; the discovery extractor reads
+    ctx.browser_session_id per call, so the rebind targets the run session and is restored in a finally.
+    A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
+    this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
+    prior_session_id = ctx.browser_session_id
+    ctx.browser_session_id = run_session_id
+    evidence: dict[str, Any] | None = None
+    try:
+        evidence, _ = await asyncio.wait_for(
+            _capture_composition_evidence(ctx, inspected_url=current_url, current_url=current_url),
+            timeout=_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.debug("Post-run runtime-repair page capture failed", exc_info=True)
+        evidence = None
+    finally:
+        ctx.browser_session_id = prior_session_id
+    if isinstance(evidence, dict) and has_bounded_page_schema(evidence):
+        store_post_run_page_evidence(ctx, evidence, run_id=run_id, current_url=current_url)
+        return
+    if not post_run_inspection_cleanly_matches(ctx.composition_page_evidence, run_id):
+        ctx.composition_page_evidence = None
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -1542,6 +1587,19 @@ async def _run_blocks_and_collect_debug(
         except Exception:
             LOG.debug("Failed to capture post-run screenshot", exc_info=True)
 
+    if (
+        not run_ok
+        and run_session_id
+        and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and not ctx.copilot_total_timeout_exceeded
+    ):
+        await _capture_and_store_post_run_failure_page(
+            ctx,
+            run_session_id=run_session_id,
+            run_id=workflow_run.workflow_run_id,
+            current_url=current_url,
+        )
+
     result_data: dict[str, Any] = {
         "workflow_run_id": workflow_run.workflow_run_id,
         "browser_session_id": run_session_id,
@@ -1589,6 +1647,7 @@ async def _run_blocks_and_collect_debug(
     if run_ok and all(r.get("status") == "completed" for r in results):
         for label, output in block_outputs_by_label.items():
             ctx.verified_block_outputs[label] = output
+        ctx.verified_terminal_block_outputs = dict(block_outputs_by_label)
         existing_prefix = list(getattr(ctx, "verified_prefix_labels", []) or [])
         existing_set = set(existing_prefix)
         for label in labels_to_execute:
@@ -1971,9 +2030,26 @@ def _record_run_blocks_result(
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if run_ok and isinstance(data, dict):
+        terminal_outputs: dict[str, Any] = {}
+        for block in data.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            output = block.get("extracted_data")
+            if isinstance(label, str) and isinstance(output, dict) and output:
+                terminal_outputs[label] = output
+        if terminal_outputs:
+            # Prefer the final run-result extracted_data for terminal replies;
+            # it is the same persisted run evidence completion verification saw.
+            copilot_ctx.verified_terminal_block_outputs = terminal_outputs
+    prior_committed_outcome = _same_run_committed_demonstrated_outcome(
+        copilot_ctx, run_id if isinstance(run_id, str) else None
+    )
     copilot_ctx.completion_verification_result = completion_verification
-    record_completion_verification(copilot_ctx, completion_verification)
-    _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
+    if prior_committed_outcome is None or _verification_fully_satisfied(completion_verification):
+        record_completion_verification(copilot_ctx, completion_verification)
+        _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
@@ -1996,8 +2072,9 @@ def _record_run_blocks_result(
         copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
         copilot_ctx.last_outcome_gate_workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
     copilot_ctx.last_test_suspicious_success = False
-    copilot_ctx.last_run_outcome = None
-    copilot_ctx.last_run_outcome_block_labels = []
+    if prior_committed_outcome is None:
+        copilot_ctx.last_run_outcome = None
+        copilot_ctx.last_run_outcome_block_labels = []
     copilot_ctx.suspicious_success_nudge_count = 0
     copilot_ctx.last_test_anti_bot = None
     prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
@@ -2180,6 +2257,19 @@ def _record_run_blocks_result(
                     display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
                 ),
             )
+        if prior_committed_outcome is not None and artifact_reason is None:
+            # artifact_reason is current-run health; prior_committed_outcome already passed prior ctx artifact-health.
+            copilot_ctx.last_full_workflow_test_ok = True
+            copilot_ctx.last_unverified_block_labels = []
+            copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+            copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+            copilot_ctx.last_test_suspicious_success = False
+            copilot_ctx.last_test_failure_reason = None
+            copilot_ctx.last_outcome_gate_reason = None
+            copilot_ctx.last_outcome_gate_workflow_run_id = None
+            update_repeated_failure_state(copilot_ctx, result)
+            _update_verification_evidence_from_run_result(copilot_ctx, result)
+            return _stash_recorded_run_outcome(copilot_ctx, prior_committed_outcome)
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         copilot_ctx.last_unverified_block_labels = unverified
         outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
@@ -2266,14 +2356,45 @@ def _record_run_blocks_result(
 def _stash_recorded_run_outcome(copilot_ctx: Any, outcome: RecordedRunOutcome) -> RecordedRunOutcome:
     if outcome.workflow_run_id is None:
         outcome = replace(outcome, workflow_run_id=getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
+    committed = _same_run_committed_demonstrated_outcome(copilot_ctx, outcome.workflow_run_id)
+    if committed is not None and outcome.reason_code == "outcome_not_demonstrated":
+        return committed
     copilot_ctx.last_run_outcome = outcome
     copilot_ctx.last_run_outcome_block_labels = list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or [])
+    return outcome
+
+
+def _verification_fully_satisfied(completion_verification: CompletionVerificationResult | None) -> bool:
+    return completion_verification is not None and completion_verification.is_fully_satisfied()
+
+
+def _same_run_committed_demonstrated_outcome(
+    copilot_ctx: Any, workflow_run_id: str | None | _RunIdUnset = _RUN_ID_UNSET
+) -> RecordedRunOutcome | None:
+    artifact_reason = getattr(copilot_ctx, "last_artifact_health_blocker_reason", None)
+    if isinstance(artifact_reason, str) and artifact_reason.strip():
+        return None
+    run_id = (
+        getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+        if workflow_run_id is _RUN_ID_UNSET
+        else workflow_run_id
+    )
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    outcome = getattr(copilot_ctx, "last_run_outcome", None)
+    if not isinstance(outcome, RecordedRunOutcome):
+        return None
+    if outcome.verdict != "demonstrated" or outcome.workflow_run_id != run_id:
+        return None
     return outcome
 
 
 def _adjudicated_run_outcome(
     copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
 ) -> RecordedRunOutcome:
+    committed = _same_run_committed_demonstrated_outcome(copilot_ctx)
+    if committed is not None:
+        return committed
     if completion_verification is not None and completion_verification.status == "evaluated":
         if not completion_verification.is_fully_satisfied():
             return RecordedRunOutcome(
@@ -2326,6 +2447,18 @@ async def _send_run_outcome_update(
         LOG.debug("copilot run_outcome send failed", exc_info=True)
 
 
+def _mark_stored_post_run_failure_page(copilot_ctx: Any) -> None:
+    run_id = copilot_ctx.last_run_blocks_workflow_run_id
+    evidence = copilot_ctx.composition_page_evidence
+    if not post_run_inspection_cleanly_matches(evidence, run_id):
+        return
+    url = evidence.get("current_url") or evidence.get("inspected_url") or ""
+    _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=url)
+    page_title = evidence.get("page_title")
+    if isinstance(page_title, str) and page_title:
+        _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
+
+
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], handler_start: float
 ) -> CompletionVerificationResult | None:
@@ -2336,6 +2469,7 @@ async def _verify_and_record_run_blocks_result(
     if not run_ok:
         completion_verification = await _maybe_run_completion_verification(copilot_ctx, result, handler_start)
         _record_run_blocks_result(copilot_ctx, result, completion_verification=completion_verification)
+        _mark_stored_post_run_failure_page(copilot_ctx)
         return completion_verification
 
     await _send_run_outcome_update(copilot_ctx, result, verdict="evaluating", reason_code=None, display_reason=None)
@@ -2396,6 +2530,8 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     copilot_ctx.verified_criteria_high_water = high_water | current
     copilot_ctx.verified_prefix_high_water_len = max(prefix_high, prefix_len)
     copilot_ctx.verified_full_pass_consumed = full_pass
+    if progressed:
+        reset_no_progress_interaction_count(copilot_ctx)
 
     signature = _repair_non_convergence_signature(contract)
     if signature is None or progressed:

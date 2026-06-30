@@ -23,6 +23,17 @@ def outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
     return result is not None and result.status == "evaluated"
 
 
+def _has_same_run_committed_demonstrated_outcome(ctx: CopilotContext) -> bool:
+    outcome = getattr(ctx, "last_run_outcome", None)
+    run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    return (
+        getattr(outcome, "verdict", None) == "demonstrated"
+        and isinstance(run_id, str)
+        and bool(run_id)
+        and getattr(outcome, "workflow_run_id", None) == run_id
+    )
+
+
 def outcome_fully_verified(ctx: CopilotContext) -> bool:
     """Whether the judge confirmed every outcome criterion from this run's evidence.
 
@@ -31,6 +42,8 @@ def outcome_fully_verified(ctx: CopilotContext) -> bool:
     """
     if artifact_health_blocked(ctx):
         return False
+    if _has_same_run_committed_demonstrated_outcome(ctx):
+        return True
     if not outcome_criteria_evaluated(ctx):
         return False
     result = ctx.completion_verification_result

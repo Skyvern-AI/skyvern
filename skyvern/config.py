@@ -145,6 +145,9 @@ class Settings(BaseSettings):
     # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
     # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
     FAIL_FAST_SHADOW: bool = False
+    # Global kill-switch for select/autocomplete shadow-match observability (LLM-vs-deterministic
+    # agreement logging). Not per-org; set false to silence the logs everywhere.
+    SKYVERN_SELECT_SHADOW_MATCH: bool = True
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
@@ -178,6 +181,14 @@ class Settings(BaseSettings):
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
     COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
+    # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
+    COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
+    COPILOT_CLICK_SETTLE_DELAY_SECONDS: float = 0.6
+    COPILOT_CLICK_SETTLE_DEADLINE_SECONDS: float = 3.5
+    # Kill switch for the clickable-controls grounding channel: when off, composition evidence omits the
+    # clickable_controls key entirely, reverting both the re-perception attach and the evaluate steer.
+    COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED: bool = True
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
@@ -274,6 +285,10 @@ class Settings(BaseSettings):
     # set both to record at an explicit resolution.
     BROWSER_RECORDING_WIDTH: int | None = None
     BROWSER_RECORDING_HEIGHT: int | None = None
+    # Max concurrent LLM enrichment calls per live browser-recording interpretation
+    # session. Bounds the per-action enrichment fan-out so a burst of interactions
+    # can't flood the event loop with simultaneous LLM requests.
+    RECORDING_ENRICHMENT_MAX_CONCURRENCY: int = 4
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
@@ -661,6 +676,9 @@ class Settings(BaseSettings):
     # Google Sheets API runtime tuning
     GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
     GOOGLE_SHEETS_API_MAX_RETRIES: int = 3
+    # Google Drive API runtime tuning
+    GOOGLE_DRIVE_API_TIMEOUT_SECONDS: float = 30.0
+    GOOGLE_DRIVE_API_MAX_RETRIES: int = 3
 
     # Cleanup Cron Settings
     ENABLE_CLEANUP_CRON: bool = False

@@ -228,6 +228,8 @@ async def download_file(
                 # Determine filename - use provided filename or derive from response/URL
                 file_name = _determine_download_filename(filename, dict(response.headers), url)
                 file_path = os.path.join(download_dir, file_name)
+                if not os.path.abspath(file_path).startswith(os.path.abspath(download_dir) + os.sep):
+                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
 
                 LOG.info(f"Downloading file to {file_path}")
                 with open(file_path, "wb") as f:
@@ -481,6 +483,8 @@ def create_named_temporary_file(delete: bool = True, file_name: str | None = Non
         safe_file_name = sanitize_filename(file_name)
         # Create file with exact name (without random characters)
         file_path = os.path.join(temp_dir, safe_file_name)
+        if not os.path.abspath(file_path).startswith(os.path.abspath(temp_dir) + os.sep):
+            raise ValueError(f"Unsafe filename in temporary file creation: {safe_file_name!r}")
         # Open in binary mode and return a NamedTemporaryFile-like object
         file = open(file_path, "wb")
         return tempfile._TemporaryFileWrapper(file, file_path, delete=delete)

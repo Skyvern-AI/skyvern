@@ -1,5 +1,6 @@
 """Tests for multi-field TOTP support in script generation."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,6 +8,21 @@ import pytest
 from skyvern.core.script_generations.generate_script import _annotate_multi_field_totp_sequence
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.handler import _handle_multi_field_totp_sequence
+
+
+class _FakeTotp:
+    interval = 45
+
+    def __init__(self) -> None:
+        self.at_values: list[int] = []
+
+    def at(self, value: int) -> str:
+        self.at_values.append(value)
+        return f"code-at-{value}"
+
+    def now(self) -> str:
+        return "current-code"
 
 
 class TestAnnotateMultiFieldTotpSequence:
@@ -28,6 +44,44 @@ class TestAnnotateMultiFieldTotpSequence:
         # No totp_timing_info should be added
         for action in result:
             assert "totp_timing_info" not in action
+
+
+class TestHandleMultiFieldTotpSequence:
+    @pytest.mark.asyncio
+    async def test_next_window_cache_uses_parsed_interval_for_later_digit_wait(self) -> None:
+        context = SimpleNamespace(totp_codes={})
+        fake_totp = _FakeTotp()
+        task = SimpleNamespace(task_id="task_1")
+
+        with (
+            patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
+            patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
+            patch("skyvern.webeye.actions.handler.time.time", return_value=44),
+        ):
+            result = await _handle_multi_field_totp_sequence(
+                {"action_index": 0, "totp_secret": "otpauth://totp/example?secret=abc"},
+                task,
+            )
+
+        assert result is None
+        assert fake_totp.at_values == [45]
+        assert context.totp_codes["task_1_totp_cache"] == "code-at-45"
+        assert context.totp_codes["task_1_totp_cache_valid_from"] == "45"
+        assert context.totp_codes["task_1_totp_cache_valid_until"] == "90"
+
+        with (
+            patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
+            patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
+            patch("skyvern.webeye.actions.handler.time.time", return_value=44),
+            patch("skyvern.webeye.actions.handler.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+        ):
+            result = await _handle_multi_field_totp_sequence(
+                {"action_index": 5, "totp_secret": "otpauth://totp/example?secret=abc"},
+                task,
+            )
+
+        assert result is None
+        sleep_mock.assert_awaited_once_with(1)
 
     def test_4_digit_sequence_gets_annotated(self) -> None:
         """4 consecutive single-digit inputs with same field_name get annotated."""

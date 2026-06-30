@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
+import type { ReactNode } from "react";
 import { cleanup, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
@@ -11,20 +13,14 @@ import {
   type WorkflowsListContextValue,
 } from "./WorkflowsListContext";
 
-// Isolate WorkflowRow's gating: stub the tagging children (and the unrelated
-// row actions) so the assertions only reflect whether the row chose to render
-// tagging UI, not the children's own internals.
+// Isolate WorkflowRow's tagging gate: stub the tag chips and pass the row through
+// its context-menu wrapper (whose own data hooks are irrelevant here) so the
+// assertions only reflect whether the row chose to render the tag chips.
 vi.mock("../tagging/TagChipList", () => ({
   TagChipList: () => <span data-testid="tag-chip-list" />,
 }));
-vi.mock("../tagging/WorkflowTagEditor", () => ({
-  WorkflowTagEditor: () => <span data-testid="workflow-tag-editor" />,
-}));
-vi.mock("../WorkflowFolderSelector", () => ({
-  WorkflowFolderSelector: () => <span data-testid="folder-selector" />,
-}));
-vi.mock("../../WorkflowActions", () => ({
-  WorkflowActions: () => <span data-testid="workflow-actions" />,
+vi.mock("../WorkflowRowContextMenu", () => ({
+  WorkflowRowContextMenu: ({ children }: { children: ReactNode }) => children,
 }));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => false,
@@ -60,19 +56,22 @@ const contextValue: WorkflowsListContextValue = {
   matchesParameter: () => false,
   handleRowClick: () => {},
   handleIconClick: () => {},
+  onRowDeleted: () => {},
 };
 
 function renderRow(flagValue: boolean | undefined) {
   return render(
-    <FeatureFlagContext.Provider value={() => flagValue}>
-      <WorkflowsListContext.Provider value={contextValue}>
-        <table>
-          <tbody>
-            <WorkflowRow workflow={buildWorkflow()} />
-          </tbody>
-        </table>
-      </WorkflowsListContext.Provider>
-    </FeatureFlagContext.Provider>,
+    <MemoryRouter>
+      <FeatureFlagContext.Provider value={() => flagValue}>
+        <WorkflowsListContext.Provider value={contextValue}>
+          <table>
+            <tbody>
+              <WorkflowRow workflow={buildWorkflow()} />
+            </tbody>
+          </table>
+        </WorkflowsListContext.Provider>
+      </FeatureFlagContext.Provider>
+    </MemoryRouter>,
   );
 }
 
@@ -81,17 +80,15 @@ describe("WorkflowRow tagging gate", () => {
     cleanup();
   });
 
-  it("hides tag chips and the tag editor when WORKFLOW_TAGGING is off", () => {
+  it("hides the tag chips when WORKFLOW_TAGGING is off", () => {
     renderRow(false);
 
     expect(screen.queryByTestId("tag-chip-list")).toBeNull();
-    expect(screen.queryByTestId("workflow-tag-editor")).toBeNull();
   });
 
-  it("shows tag chips and the tag editor when the flag is unresolved (default on)", () => {
+  it("shows the tag chips when the flag is unresolved (default on)", () => {
     renderRow(undefined);
 
     expect(screen.getByTestId("tag-chip-list")).toBeTruthy();
-    expect(screen.getByTestId("workflow-tag-editor")).toBeTruthy();
   });
 });

@@ -53,6 +53,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
     _parse_completion_criteria,
+    _render_active_criteria_for_prompt,
     normalized_criterion_outcome_key,
 )
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -62,8 +63,21 @@ from skyvern.forge.sdk.copilot.tools.completion import (
 )
 
 
-def _criterion(cid: str, outcome: str, *, level: str = "run", output_path: str | None = None) -> CompletionCriterion:
-    return CompletionCriterion(id=cid, outcome=outcome, level=level, output_path=output_path)  # type: ignore[arg-type]
+def _criterion(
+    cid: str,
+    outcome: str,
+    *,
+    level: str = "run",
+    output_path: str | None = None,
+    deliverable_kind: str | None = None,
+) -> CompletionCriterion:
+    return CompletionCriterion(
+        id=cid,
+        outcome=outcome,
+        level=level,  # type: ignore[arg-type]
+        output_path=output_path,
+        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
+    )
 
 
 def _stored(
@@ -260,6 +274,46 @@ def test_criteria_json_round_trip_preserves_level_and_flags() -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
 
 
+def test_criteria_json_round_trip_preserves_terminal_action_fields() -> None:
+    criteria = (
+        CompletionCriterion(
+            id="c0",
+            outcome="a commercial water service request is started",
+            kind="terminal_action",
+            terminal_action_family="request",
+        ),
+    )
+
+    assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_criteria_json_round_trip_preserves_deliverable_kind() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The requested download is returned.",
+            output_path="output.output_id",
+            deliverable_kind="registered_download",
+        ),
+    )
+
+    assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_criteria_from_json_normalizes_unknown_deliverable_kind() -> None:
+    (criterion,) = criteria_from_json(
+        [
+            {
+                "id": "c0",
+                "outcome": "The requested download is returned.",
+                "deliverable_kind": "download",
+            }
+        ]
+    )
+
+    assert criterion.deliverable_kind is None
+
+
 def test_criteria_from_json_coerces_invalid_level_to_run() -> None:
     (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", "level": "bogus"}])
     assert criterion.level == "run"
@@ -393,6 +447,36 @@ def test_completion_verifier_render_includes_required_output_path() -> None:
     rendered = _render_criteria([_criterion("c0", "The returned record includes ID.", output_path="output.id")])
 
     assert "required_output_path=output.id" in rendered
+
+
+def test_active_criteria_rendering_includes_deliverable_kind() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The requested download is returned.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    assert "registered_download" in rendered
+
+
+def test_completion_verifier_render_includes_deliverable_kind() -> None:
+    rendered = _render_criteria(
+        [
+            _criterion(
+                "c0",
+                "The requested download is returned.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    assert "deliverable_kind=registered_download" in rendered
 
 
 def test_required_output_path_missing_is_not_satisfied_by_evidence_text() -> None:
@@ -546,6 +630,132 @@ def test_parse_completion_criteria_tolerates_unhashable_level() -> None:
         ]
     )
     assert [c.level for c in parsed] == ["run", "run"]
+
+
+def test_parse_completion_criteria_tolerates_unhashable_terminal_action_fields() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": ["terminal_action"],
+                "terminal_action_family": ["request"],
+            },
+            {
+                "outcome": "a permit application is submitted",
+                "kind": "terminal_action",
+                "terminal_action_family": ["application"],
+            },
+        ]
+    )
+
+    assert [c.kind for c in parsed] == ["outcome", "terminal_action"]
+    assert [c.terminal_action_family for c in parsed] == [None, None]
+
+
+def test_parse_completion_criteria_dedupes_by_deliverable_kind() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes output id.",
+                "output_path": "output.output_id",
+            },
+            {
+                "outcome": "The returned record includes output id.",
+                "output_path": "output.output_id",
+                "deliverable_kind": "registered_download",
+            },
+            {
+                "outcome": "The returned record includes output id.",
+                "output_path": "output.output_id",
+                "deliverable_kind": "registered_download",
+            },
+        ]
+    )
+
+    assert [(criterion.id, criterion.deliverable_kind) for criterion in parsed] == [
+        ("c0", None),
+        ("c1", "registered_download"),
+    ]
+
+
+def test_parse_completion_criteria_preserves_typed_terminal_action_fields() -> None:
+    (criterion,) = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": "terminal_action",
+                "terminal_action_family": "request",
+            }
+        ]
+    )
+
+    assert criterion.kind == "terminal_action"
+    assert criterion.terminal_action_family == "request"
+
+
+def test_parse_completion_criteria_defaults_invalid_terminal_action_fields() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "a commercial water service request is started",
+                "kind": "terminal_action",
+                "terminal_action_family": "invoice",
+            },
+            {
+                "outcome": "the item is in the cart",
+                "kind": "done",
+                "terminal_action_family": "request",
+            },
+        ]
+    )
+
+    assert parsed[0].kind == "terminal_action"
+    assert parsed[0].terminal_action_family is None
+    assert parsed[1].kind == "outcome"
+    assert parsed[1].terminal_action_family is None
+
+
+def test_adopted_active_criteria_retain_deliverable_kind() -> None:
+    criterion = _criterion(
+        "c0",
+        "The requested download is returned.",
+        output_path="output.output_id",
+        deliverable_kind="registered_download",
+    )
+    stored = StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(criterion,))
+    state = _adopted_turn_state(stored)
+
+    assert state.decision is not None
+    assert state.decision.criteria[0].deliverable_kind == "registered_download"
+
+
+def test_marked_deliverable_criterion_supersedes_unmarked_stored_criterion() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(
+            _criterion(
+                "s0",
+                "The requested download is returned.",
+                output_path="output.output_id",
+            ),
+        ),
+    )
+    fresh = [
+        _criterion(
+            "c0",
+            "The requested download is returned.",
+            output_path="output.output_id",
+            deliverable_kind="registered_download",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2), fresh, actionable=True
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria[0].deliverable_kind == "registered_download"
 
 
 def test_definition_grading_unknown_when_no_deterministic_check_applies() -> None:

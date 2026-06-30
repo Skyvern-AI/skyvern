@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem_Wait
+from skyvern.forge import app
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent as StreamingExfiltratedEvent
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource as StreamingExfiltratedEventSource,
@@ -22,6 +23,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     Mouse,
     RecordingDraftStep,
+    RecordingDraftStepStatus,
 )
 
 ORG_ID = "org_123"
@@ -196,20 +198,27 @@ async def test_processor_process_uses_draft_steps_without_compressed_chunks() ->
     assert parameters == []
 
 
-def _click_streaming_event(*, timestamp: float = 1234.0) -> StreamingExfiltratedEvent:
+def _click_streaming_event(
+    *,
+    timestamp: float = 1234.0,
+    capture_seq: int = -1,
+    sky_id: str = "sky-1",
+    target_id: str = "submit",
+) -> StreamingExfiltratedEvent:
     return StreamingExfiltratedEvent(
         event_name="user_interaction",
         source=StreamingExfiltratedEventSource.CONSOLE,
         timestamp=timestamp,
+        capture_seq=capture_seq,
         params={
             "type": "click",
             "url": "https://example.com",
             "timestamp": timestamp,
             "target": {
                 "tagName": "BUTTON",
-                "id": "submit",
+                "id": target_id,
                 "text": ["Submit"],
-                "skyId": "sky-1",
+                "skyId": sky_id,
             },
             "mousePosition": {"xp": 0.5, "yp": 0.5},
             "activeElement": {"tagName": "BUTTON"},
@@ -221,6 +230,30 @@ def _click_streaming_event(*, timestamp: float = 1234.0) -> StreamingExfiltrated
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_ingest_events_sorts_unprocessed_tail_by_capture_seq() -> None:
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=60,
+    )
+
+    # Events arrive out of capture order (later capture_seq first), as can happen
+    # when a console event's async materialization completes after a later event.
+    session.ingest_events(
+        [
+            _click_streaming_event(timestamp=1003.0, capture_seq=3, sky_id="sky-c", target_id="c"),
+            _click_streaming_event(timestamp=1001.0, capture_seq=1, sky_id="sky-a", target_id="a"),
+            _click_streaming_event(timestamp=1002.0, capture_seq=2, sky_id="sky-b", target_id="b"),
+        ]
+    )
+
+    assert [event.capture_seq for event in session.events] == [1, 2, 3]
+    session.cancel()
 
 
 @pytest.mark.asyncio
@@ -350,6 +383,43 @@ async def test_recording_interpretation_session_advances_past_unhandled_actions(
 
     assert session.emitted_action_count == 2
     assert len(session.steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_enrichment_calls_are_capped_by_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
+    in_flight = 0
+    max_in_flight = 0
+
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return {"block_label": "click_x", "title": "Click X", "prompt": "Click X."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+    session._enrichment_semaphore = asyncio.Semaphore(2)
+
+    events = [
+        _click_streaming_event(timestamp=1000.0 + i, capture_seq=i, sky_id=f"sky-{i}", target_id=f"t{i}")
+        for i in range(8)
+    ]
+    session.ingest_events(events)
+    steps = await session.flush()
+
+    assert len(steps) == 8
+    assert all(step.status == RecordingDraftStepStatus.READY for step in steps)
+    assert max_in_flight == 2
 
 
 def test_emit_snapshot_replays_current_revision_without_incrementing() -> None:

@@ -37,6 +37,12 @@ class StateMachineWait(StateMachine):
             maxlen=MAX_PAGE_ACTIVITY_TIMESTAMPS
         )
 
+        # client_ms - server_ms, measured from console events (which carry both
+        # clocks). Used to project server-stamped CDP activity timestamps into the
+        # client clock so the gap and the busy-span are compared in one domain.
+        # A property of the connection, not the wait window — never cleared on reset.
+        self.client_server_offset_ms: float | None = None
+
         self.reset()
 
     def tick(self, event: ExfiltratedEvent, current_actions: list[Action]) -> ActionWait | None:
@@ -44,11 +50,14 @@ class StateMachineWait(StateMachine):
             if event.event_name == PAGE_ACTIVITY_EVENT_NAME or event.event_name.startswith(
                 PAGE_ACTIVITY_EVENT_NAME_PREFIX
             ):
-                self.page_activity_timestamps_ms.append(event.timestamp * 1000.0)
+                offset_ms = self.client_server_offset_ms or 0.0
+                self.page_activity_timestamps_ms.append(event.timestamp * 1000.0 + offset_ms)
             return None
 
         if event.source != "console":
             return None
+
+        self.client_server_offset_ms = event.params.timestamp - event.timestamp * 1000.0
 
         if self.last_event_timestamp is not None:
             gap_ms = int(event.params.timestamp - self.last_event_timestamp)

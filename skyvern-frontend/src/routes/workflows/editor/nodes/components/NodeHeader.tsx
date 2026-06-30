@@ -27,6 +27,7 @@ import { useOnChange } from "@/hooks/useOnChange";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { useDuplicateNodeCallback } from "@/routes/workflows/hooks/useDuplicateNodeCallback";
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
@@ -259,6 +260,7 @@ function NodeHeader({
     initialValue: blockLabel,
   });
   const blockTitle = blockTitleOverride ?? workflowBlockTitle[type];
+  const duplicateNodeCallback = useDuplicateNodeCallback();
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
@@ -553,7 +555,7 @@ function NodeHeader({
       });
 
       if (studioEnabled) {
-        useStudioShellStore.getState().setTab("browser");
+        useStudioShellStore.getState().setTab("run");
         navigate(
           `/workflows/${workflowPermanentId}/studio?wr=${response.data.run_id}&bl=${encodeURIComponent(label)}`,
         );
@@ -817,6 +819,12 @@ function NodeHeader({
   const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isCanvasLocked = useIsCanvasLocked();
   const dragGatedByMode = isDragGatedByMode({ isRecording, isCanvasLocked });
+  const duplicateDisabledReason = isBlockFinallyGated(
+    blockLabel,
+    workflowSettingsStore.finallyBlockLabel,
+  )
+    ? "Finally block must run last"
+    : null;
 
   // Read-only canvases (compare/diff) drop the grip entirely - the handle
   // is inert there, so a faded button is just visual noise.
@@ -1045,8 +1053,19 @@ function NodeHeader({
                 })}
               >
                 <NodeActionMenu
+                  duplicateDisabledReason={duplicateDisabledReason}
+                  isDuplicable={
+                    !isReadOnlyScope && Boolean(duplicateNodeCallback)
+                  }
                   isScriptable={isScriptable}
                   isCanvasLocked={isCanvasLocked}
+                  onDuplicate={
+                    isReadOnlyScope || !duplicateNodeCallback
+                      ? undefined
+                      : () => {
+                          duplicateNodeCallback(nodeId);
+                        }
+                  }
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}

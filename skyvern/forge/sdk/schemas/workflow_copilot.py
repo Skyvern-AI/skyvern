@@ -115,6 +115,15 @@ class WorkflowCopilotChatRequest(BaseModel):
             "other block unchanged. Used by the block-level Generate action."
         ),
     )
+    fix_origin: bool = Field(
+        False,
+        description=(
+            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Routes the "
+            "run-grounded turn to diagnose-first (DIAGNOSE, no write authority) instead of a direct rewrite. "
+            "Only takes effect when a run signal (workflow_run_id or prior run context) is present; "
+            "otherwise it is a no-op."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):

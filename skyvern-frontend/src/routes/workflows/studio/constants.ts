@@ -1,3 +1,5 @@
+import { type StudioTab } from "@/store/StudioShellStore";
+
 // Width of the docked Copilot spine (px), and its collapsed-rail width.
 export const STUDIO_COPILOT_WIDTH = 450;
 export const STUDIO_COPILOT_RAIL_WIDTH = 60;
@@ -13,3 +15,11 @@ export const STUDIO_COPILOT_COLLAPSE_EASE = "cubic-bezier(0.65, 0, 0.35, 1)";
 // Stable element ids linking each tab to its panel (WAI-ARIA tabs pattern).
 export const studioTabId = (tab: string) => `studio-tab-${tab}`;
 export const studioPanelId = (tab: string) => `studio-panel-${tab}`;
+
+// Deep-link landing tab: any run reference (?wr=) or pinned item (?active=) → Run; else Editor.
+export function initialStudioTab(params: {
+  runId: string | null;
+  active: string | null;
+}): StudioTab {
+  return params.runId || params.active ? "run" : "editor";
+}

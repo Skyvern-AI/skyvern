@@ -967,6 +967,69 @@ async def test_file_upload_block_continue_on_empty_succeeds(tmp_path) -> None:
     mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_file_upload_block_uploads_downloads_to_google_drive(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+    from skyvern.schemas.workflows import FileStorageType
+
+    download_dir = tmp_path / "wr_drive"
+    download_dir.mkdir()
+    source = download_dir / "report.txt"
+    source.write_text("drive upload")
+
+    block = FileUploadBlock.model_construct(
+        label="upload",
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        google_credential_id="goac_123",
+        google_drive_folder_id="https://drive.google.com/drive/folders/folder_123",
+        path=None,
+        continue_on_empty=False,
+    )
+    sentinel = object()
+    workflow_run_context = MagicMock()
+    workflow_run_context.organization_id = "org_1"
+    workflow_run_context.get_original_secret_value_or_none.return_value = None
+
+    with (
+        patch.object(FileUploadBlock, "get_workflow_run_context", return_value=workflow_run_context),
+        patch.object(FileUploadBlock, "format_potential_template_parameters", return_value=None),
+        patch.object(FileUploadBlock, "record_output_parameter_value", new_callable=AsyncMock),
+        patch.object(
+            FileUploadBlock, "build_block_result", new_callable=AsyncMock, return_value=sentinel
+        ) as mock_result,
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
+            return_value=download_dir,
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.AGENT_FUNCTION.get_google_workspace_credentials = AsyncMock(return_value=SimpleNamespace(token="at-1"))
+        mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock(
+            return_value="https://drive.google.com/file/d/file_123/view"
+        )
+        result = await block.execute(
+            workflow_run_id="wr_drive",
+            workflow_run_block_id="wrb_x",
+            organization_id="org_1",
+        )
+
+    assert result is sentinel
+    assert mock_result.await_args.kwargs["success"] is True
+    assert mock_result.await_args.kwargs["output_parameter_value"] == ["https://drive.google.com/file/d/file_123/view"]
+    mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.assert_awaited_once()
+    upload_kwargs = mock_app.AGENT_FUNCTION.upload_file_to_customer_storage.await_args.kwargs
+    assert upload_kwargs["file_path"] == str(source)
+    assert upload_kwargs["organization_id"] == "org_1"
+    assert upload_kwargs["run_id"] == "wr_drive"
+    destination = upload_kwargs["destination"]
+    assert destination.storage_type == FileStorageType.GOOGLE_DRIVE
+    assert destination.google_access_token == "at-1"
+    assert destination.google_drive_folder_id == "folder_123"
+
+
 def test_resolve_run_download_id_preserves_task_id_tail() -> None:
     """CORR-1: mirrors handler.py fallback_run_id=task.workflow_run_id or task.task_id — when both
     context and workflow_run_id are absent, the task_id tail must still be resolved (not None)."""

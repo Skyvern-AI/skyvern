@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classify_request,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
+    request_policy_has_present_completion_contract,
 )
 
 
@@ -61,6 +62,12 @@ def _criterion(
     method_mandated: bool = False,
     contingent_on: str | None = None,
     contingent_antecedent_output_path: str | None = None,
+    deliverable_kind: str | None = None,
+    expected_output_value: str | None = None,
+    expected_output_shape: str | None = None,
+    kind: str = "outcome",
+    classification_output_key: str | None = None,
+    expected_classification: str | bool | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -70,6 +77,12 @@ def _criterion(
         method_mandated=method_mandated,
         contingent_on=contingent_on,
         contingent_antecedent_output_path=contingent_antecedent_output_path,
+        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
+        expected_output_value=expected_output_value,
+        expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
+        kind=kind,  # type: ignore[arg-type]
+        classification_output_key=classification_output_key,
+        expected_classification=expected_classification,
     )
 
 
@@ -94,6 +107,27 @@ def _requested_output_subset(policy: RequestPolicy, requested_output_paths: set[
         and not criterion.method_mandated
         and criterion.output_path in requested_output_paths
     ]
+
+
+def test_present_completion_contract_helper_accepts_present_status() -> None:
+    policy = RequestPolicy(completion_contract_status="present")
+
+    assert request_policy_has_present_completion_contract(policy) is True
+
+
+def test_present_completion_contract_helper_accepts_criteria_backed_policy() -> None:
+    policy = RequestPolicy(
+        completion_contract_status="absent",
+        completion_criteria=[CompletionCriterion(id="record_id", outcome="The returned record includes an id.")],
+    )
+
+    assert request_policy_has_present_completion_contract(policy) is True
+
+
+def test_present_completion_contract_helper_rejects_absent_policy() -> None:
+    policy = RequestPolicy(completion_contract_status="absent", completion_criteria=[])
+
+    assert request_policy_has_present_completion_contract(policy) is False
 
 
 @pytest.mark.asyncio
@@ -237,6 +271,404 @@ async def test_classifier_drift_canonicalizes_to_stable_generic_requested_output
 
 
 @pytest.mark.asyncio
+async def test_requested_output_criteria_preserve_stable_paths_without_derived_carriers() -> None:
+    prompt = "Return a final record with service address 1234 Sample Utility Way and requested start date 2026-06-22."
+    classifier_shapes = [
+        [
+            {
+                "outcome": "The returned record includes requested start date 2026-06-22.",
+                "output_path": "output.requested_start_date",
+            },
+            {
+                "outcome": "The returned record includes service address 1234 Sample Utility Way.",
+                "output_path": "output.service_address",
+            },
+        ],
+        [
+            {"outcome": "The returned record includes service address.", "output_path": "output.service_address"},
+            {
+                "outcome": "The returned record includes requested start date.",
+                "output_path": "output.requested_start_date",
+            },
+            {"outcome": "The workflow runs to an expected result.", "method_mandated": True},
+        ],
+    ]
+
+    policies = [await _policy_for_message(prompt, criteria) for criteria in classifier_shapes]
+    requested_output_paths = {"output.service_address", "output.requested_start_date"}
+    canonical_subsets = [_requested_output_subset(policy, requested_output_paths) for policy in policies]
+    canonical_json = [criteria_to_json(subset) for subset in canonical_subsets]
+
+    assert canonical_json == [canonical_json[0], canonical_json[0]]
+    assert [criterion.id for criterion in canonical_subsets[0]] == [
+        "__copilot_requested_output__output_service_address",
+        "__copilot_requested_output__output_requested_start_date",
+    ]
+    assert [criterion.output_path for criterion in canonical_subsets[0]] == [
+        "output.service_address",
+        "output.requested_start_date",
+    ]
+    assert [criterion.outcome for criterion in canonical_subsets[0]] == [
+        "The returned record includes service address.",
+        "The returned record includes requested start date.",
+    ]
+    assert [criterion.expected_output_value for criterion in canonical_subsets[0]] == [
+        None,
+        None,
+    ]
+    assert [criterion.expected_output_shape for criterion in canonical_subsets[0]] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_requested_output_criteria_do_not_infer_shapes_from_generated_provider_field_names() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with provider captured address, account number, requested date, status, "
+        "confirmation number, deposit amount, and next owner.",
+        [],
+    )
+
+    requested_output_paths = {
+        "output.provider_captured_address",
+        "output.account_number",
+        "output.requested_date",
+        "output.status",
+        "output.confirmation_number",
+        "output.deposit_amount",
+        "output.next_owner",
+    }
+
+    assert {
+        criterion.output_path: criterion.expected_output_shape
+        for criterion in _requested_output_subset(policy, requested_output_paths)
+    } == {
+        "output.provider_captured_address": None,
+        "output.account_number": None,
+        "output.requested_date": None,
+        "output.status": None,
+        "output.confirmation_number": None,
+        "output.deposit_amount": None,
+        "output.next_owner": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "output_path", "_expected_value"),
+    [
+        (
+            "Return a final record with service URL https://example.com/a:b.",
+            "output.service_url",
+            "https://example.com/a:b",
+        ),
+        ("Return a final record with tax rate 1.25.", "output.tax_rate", "1.25"),
+        ("Return a final record with company domain example.com.", "output.company_domain", "example.com"),
+        (
+            "Return a final record with department name Research and Development.",
+            "output.department_name",
+            "Research and Development",
+        ),
+    ],
+)
+async def test_requested_output_expected_values_are_not_synthesized_from_user_message_regex(
+    prompt: str, output_path: str, _expected_value: str
+) -> None:
+    policy = await _policy_for_message(prompt, [])
+
+    criteria = _criteria_for_path(policy, output_path)
+    assert len(criteria) == 1
+    assert (
+        criteria[0].outcome == f"The returned record includes {output_path.removeprefix('output.').replace('_', ' ')}."
+    )
+    assert criteria[0].expected_output_value is None
+
+
+@pytest.mark.asyncio
+async def test_message_text_cannot_override_classifier_typed_expected_output_value() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with service address 999 Wrong Way.",
+        [
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            }
+        ],
+    )
+
+    criteria = _criteria_for_path(policy, "output.service_address")
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_value == "1234 Sample Utility Way"
+
+
+@pytest.mark.asyncio
+async def test_classifier_typed_expected_output_value_is_preserved_without_outcome_carrier() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with service address.",
+        [
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            }
+        ],
+    )
+
+    criteria = _criteria_for_path(policy, "output.service_address")
+    assert len(criteria) == 1
+    assert criteria[0].outcome == "The returned record includes service address."
+    assert criteria[0].expected_output_value == "1234 Sample Utility Way"
+
+
+@pytest.mark.asyncio
+async def test_classifier_typed_expected_output_shape_is_preserved_without_outcome_carrier() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with confirmation number.",
+        [
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            }
+        ],
+    )
+
+    criteria = _criteria_for_path(policy, "output.confirmation_number")
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_shape == "reference_code"
+
+
+@pytest.mark.asyncio
+async def test_classifier_invalid_expected_output_shape_is_ignored() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with custom value.",
+        [
+            {
+                "outcome": "The returned record includes custom value.",
+                "output_path": "output.custom_value",
+                "expected_output_shape": "anything_non_empty",
+            }
+        ],
+    )
+
+    criteria = _criteria_for_path(policy, "output.custom_value")
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_shape is None
+
+
+def test_parse_completion_criteria_accepts_only_declared_expected_output_shapes() -> None:
+    valid, invalid = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            {
+                "outcome": "The returned record includes custom value.",
+                "output_path": "output.custom_value",
+                "expected_output_shape": "anything_non_empty",
+            },
+        ]
+    )
+
+    assert valid.expected_output_shape == "reference_code"
+    assert invalid.expected_output_shape is None
+
+
+def test_parse_completion_criteria_preserves_validation_classification_contract() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "outcome",
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+        ]
+    )
+
+    assert len(parsed) == 2
+    assert parsed[0].kind == "validation_classification"
+    assert parsed[0].classification_output_key == "login_gated"
+    assert parsed[0].expected_classification is True
+    assert parsed[1].kind == "outcome"
+
+
+def test_parse_completion_criteria_drops_requested_output_fields_for_validation_classification() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "output_path": "output.path_classification",
+                "expected_output_value": "login_gated",
+                "expected_output_shape": "status_label",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].kind == "validation_classification"
+    assert parsed[0].output_path is None
+    assert parsed[0].expected_output_value is None
+    assert parsed[0].expected_output_shape is None
+
+
+def test_parse_completion_criteria_dedupes_validation_classification_by_target_and_output_key() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "login_gated",
+            },
+            {
+                "outcome": "Duplicate phrasing should not matter for the same classification target.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "login_gated",
+            },
+            {
+                "outcome": "A different expected classification stays distinct.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "public",
+            },
+        ]
+    )
+
+    assert [(criterion.classification_output_key, criterion.expected_classification) for criterion in parsed] == [
+        ("path_classification", "login_gated"),
+        ("path_classification", "public"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_policy_promotes_login_only_output_to_validation_classification_contract() -> None:
+    policy = await _policy_for_message(
+        (
+            "I need a reusable validation-only workflow that checks whether Riverbend Gas has a public path for "
+            "starting gas service from http://localhost:8900/utility_services/riverbend_gas/. It should look for a "
+            "start, connect, new service, or move-in path without logging in, creating an account, entering identity "
+            "details, entering payment details, accepting terms, or submitting anything. For this eval run, classify "
+            "the safest reachable next step and return a structured summary showing whether a public form exists, "
+            "whether the path is login-only, the visible page/path label, and the recommended next action."
+        ),
+        [
+            {
+                "outcome": "The returned record includes public path exists.",
+                "output_path": "output.public_path_exists",
+            },
+            {
+                "outcome": "The returned record includes safest reachable next step.",
+                "output_path": "output.safest_reachable_next_step",
+            },
+            {
+                "outcome": "The returned record includes login only.",
+                "output_path": "output.login_only",
+            },
+        ],
+    )
+
+    validation_criteria = [
+        criterion for criterion in policy.completion_criteria if criterion.kind == "validation_classification"
+    ]
+    assert len(validation_criteria) == 1
+    assert validation_criteria[0].classification_output_key == "login_only"
+    assert validation_criteria[0].expected_classification is True
+    assert validation_criteria[0].output_path is None
+    assert validation_criteria[0].expected_output_value is None
+    assert not _criteria_for_path(policy, "output.login_only")
+
+
+def test_prompt_summary_includes_validation_classification_output_contract() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_login_only",
+                "The run classifies whether the path is login-only.",
+                kind="validation_classification",
+                classification_output_key="login_only",
+                expected_classification=True,
+            )
+        ]
+    )
+
+    summary = policy.prompt_summary()
+
+    assert "validation_classification_output_contracts:" in summary
+    assert "criterion_id: c_login_only" in summary
+    assert "return_key: login_only" in summary
+    assert "expected_value: true" in summary
+    assert "return_location: top_level_block_output" in summary
+
+
+@pytest.mark.asyncio
+async def test_request_policy_promotes_path_classification_when_classifier_supplies_target() -> None:
+    policy = await _policy_for_message(
+        "Classify whether the service path is login-gated and return path classification.",
+        [
+            {
+                "outcome": "The returned record includes path classification.",
+                "output_path": "output.path_classification",
+                "expected_output_value": "login-gated",
+            }
+        ],
+    )
+
+    assert len(policy.completion_criteria) == 1
+    criterion = policy.completion_criteria[0]
+    assert criterion.kind == "validation_classification"
+    assert criterion.classification_output_key == "path_classification"
+    assert criterion.expected_classification == "login-gated"
+    assert criterion.output_path is None
+    assert criterion.expected_output_value is None
+
+
+@pytest.mark.asyncio
+async def test_requested_output_canonicalization_preserves_classifier_shape_first() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with confirmation number.",
+        [
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "numeric_identifier",
+            }
+        ],
+    )
+
+    criteria = _criteria_for_path(policy, "output.confirmation_number")
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_shape == "numeric_identifier"
+
+
+@pytest.mark.asyncio
+async def test_classifier_non_string_expected_output_value_is_ignored() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with service address.",
+        [
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": {"value": "1234 Sample Utility Way"},
+            }
+        ],
+    )
+
+    criteria = _criteria_for_path(policy, "output.service_address")
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_value is None
+
+
+@pytest.mark.asyncio
 async def test_method_and_setup_text_do_not_become_completion_criteria() -> None:
     policy = await _policy_for_message(
         "Build a lookup. Open Show Details, click Search, choose a plan, set the location, then output profile details.",
@@ -264,7 +696,7 @@ async def test_reusable_input_id_does_not_cover_requested_output_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unbound_requested_output_narrative_is_replaced_but_unrelated_run_gate_remains() -> None:
+async def test_unbound_requested_output_narrative_is_replaced_but_specific_run_gate_remains() -> None:
     policy = await _policy_for_message(
         "Return a final record with record id, status, and phone.",
         [
@@ -282,6 +714,34 @@ async def test_unbound_requested_output_narrative_is_replaced_but_unrelated_run_
             {"output.record_id", "output.status", "output.phone"},
         )
     } == {"output.record_id", "output.status", "output.phone"}
+
+
+@pytest.mark.asyncio
+async def test_generic_ungrounded_run_gate_drops_after_requested_output_canonicalization() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with record id.",
+        [{"outcome": "The workflow runs to its intended end state with the expected output."}],
+    )
+
+    assert "The workflow runs to its intended end state with the expected output." not in _outcomes(policy)
+    assert _criteria_for_path(policy, "output.record_id")
+
+
+@pytest.mark.asyncio
+async def test_terminal_action_run_gate_survives_requested_output_canonicalization() -> None:
+    policy = await _policy_for_message(
+        "Submit the request and return a final record with confirmation number.",
+        [
+            {
+                "outcome": "The request submission action is completed.",
+                "kind": "terminal_action",
+                "terminal_action_family": "request",
+            },
+        ],
+    )
+
+    assert "The request submission action is completed." in _outcomes(policy)
+    assert _criteria_for_path(policy, "output.confirmation_number")
 
 
 @pytest.mark.asyncio
@@ -399,6 +859,99 @@ def test_classifier_parse_preserves_contingent_antecedent_output_path_without_in
     assert criteria[3].contingent_antecedent_output_path is None
 
 
+def test_classifier_parse_preserves_only_registered_download_deliverable_kind() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested download is returned.",
+                "deliverable_kind": "registered_download",
+            },
+            {
+                "outcome": "Unknown deliverable is ignored.",
+                "deliverable_kind": "download",
+            },
+            {
+                "outcome": "Absent deliverable stays empty.",
+            },
+        ]
+    )
+
+    assert [criterion.deliverable_kind for criterion in criteria] == ["registered_download", None, None]
+
+
+def test_requested_output_canonicalization_drops_marker_for_output_id() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record includes output id.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with output id.",
+        aliases={"output id": "output.output_id"},
+    )
+
+    criteria = _requested_output_subset(policy, {"output.output_id"})
+    assert len(criteria) == 1
+    assert criteria[0].id == "__copilot_requested_output__output_output_id"
+    assert criteria[0].deliverable_kind is None
+
+
+def test_requested_output_canonicalization_drops_marker_for_npi() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes NPI.",
+                "output_path": "output.npi",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+    assert parsed[0].deliverable_kind == "registered_download"
+    policy = RequestPolicy(completion_criteria=parsed)
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with NPI.",
+        aliases={"NPI": "output.npi"},
+    )
+
+    criteria = _requested_output_subset(policy, {"output.npi"})
+    assert len(criteria) == 1
+    assert criteria[0].id == "__copilot_requested_output__output_npi"
+    assert criteria[0].deliverable_kind is None
+
+
+def test_requested_output_canonicalization_preserves_marker_for_approved_download_path() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record includes download artifact.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with download artifact.",
+        aliases={"download artifact": "output.downloaded_file_artifact_ids"},
+    )
+
+    criteria = _requested_output_subset(policy, {"output.downloaded_file_artifact_ids"})
+    assert len(criteria) == 1
+    assert criteria[0].id == "__copilot_requested_output__output_downloaded_file_artifact_ids"
+    assert criteria[0].deliverable_kind == "registered_download"
+
+
 def test_active_criteria_rendering_includes_contingent_on() -> None:
     rendered = _render_active_criteria_for_prompt(
         [
@@ -416,6 +969,8 @@ def test_active_criteria_rendering_includes_contingent_on() -> None:
             "implicit": False,
             "method_mandated": False,
             "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
             "contingent_on": "the provider site blocks online submission",
         }
     ]
@@ -439,8 +994,115 @@ def test_active_criteria_rendering_includes_contingent_antecedent_output_path() 
             "implicit": False,
             "method_mandated": False,
             "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
             "contingent_on": "the provider site blocks online submission",
             "contingent_antecedent_output_path": "output.blocker",
+        }
+    ]
+
+
+def test_active_criteria_rendering_includes_deliverable_kind() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The requested download is returned.",
+                output_path="output.output_id",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "The requested download is returned.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
+            "deliverable_kind": "registered_download",
+            "output_path": "output.output_id",
+        }
+    ]
+
+
+def test_active_criteria_rendering_includes_expected_output_value_as_structured_data() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="1234 Sample Utility Way",
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "The returned record includes service address.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
+            "output_path": "output.service_address",
+            "expected_output_value": "1234 Sample Utility Way",
+        }
+    ]
+
+
+def test_active_criteria_rendering_includes_expected_output_shape_as_structured_data() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "The returned record includes confirmation number.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "kind": "outcome",
+            "terminal_action_family": None,
+            "output_path": "output.confirmation_number",
+            "expected_output_shape": "reference_code",
+        }
+    ]
+
+
+def test_active_criteria_rendering_includes_validation_classification_contract() -> None:
+    rendered = _render_active_criteria_for_prompt(
+        [
+            _criterion(
+                "c0",
+                "The run classifies whether the path is login gated.",
+                kind="validation_classification",
+                classification_output_key="login_gated",
+                expected_classification=True,
+            )
+        ]
+    )
+
+    assert json.loads(rendered) == [
+        {
+            "outcome": "The run classifies whether the path is login gated.",
+            "implicit": False,
+            "method_mandated": False,
+            "level": "run",
+            "kind": "validation_classification",
+            "terminal_action_family": None,
+            "classification_output_key": "login_gated",
+            "expected_classification": True,
         }
     ]
 
@@ -457,6 +1119,198 @@ def test_criteria_json_round_trips_contingent_on() -> None:
     restored = criteria_from_json(criteria_to_json(criteria))
 
     assert restored == criteria
+
+
+def test_criteria_json_round_trips_expected_output_value() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The returned record includes service address.",
+            output_path="output.service_address",
+            expected_output_value="1234 Sample Utility Way",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+
+
+def test_criteria_json_round_trips_expected_output_shape() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+
+
+def test_criteria_json_round_trips_validation_classification_contract() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="login_gated",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+
+
+def test_criteria_json_rehydrates_validation_classification_without_requested_output_fields() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            output_path="output.path_classification",
+            expected_output_value="login_gated",
+            expected_output_shape="status_label",
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert len(restored) == 1
+    assert restored[0].kind == "validation_classification"
+    assert restored[0].output_path is None
+    assert restored[0].expected_output_value is None
+    assert restored[0].expected_output_shape is None
+
+
+def test_request_policy_trace_exposes_requested_output_grounding_contract_without_values() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_address",
+                "The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="1234 Sample Utility Way",
+            ),
+            _criterion(
+                "c_confirmation",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion("c_status", "The returned record includes status.", output_path="output.status"),
+        ]
+    )
+
+    trace = policy.to_trace_data()
+
+    assert trace["requested_output_criteria_count"] == 3
+    assert trace["requested_output_criterion_0_id"] == "c_address"
+    assert trace["requested_output_criterion_0_output_path"] == "output.service_address"
+    assert trace["requested_output_criterion_0_grounding_mode"] == "exact_value"
+    assert trace["requested_output_criterion_0_has_exact_value"] is True
+    assert "requested_output_criterion_0_expected_output_shape" not in trace
+    assert trace["requested_output_criterion_1_id"] == "c_confirmation"
+    assert trace["requested_output_criterion_1_output_path"] == "output.confirmation_number"
+    assert trace["requested_output_criterion_1_grounding_mode"] == "shape"
+    assert trace["requested_output_criterion_1_expected_output_shape"] == "reference_code"
+    assert trace["requested_output_criterion_1_has_exact_value"] is False
+    assert trace["requested_output_criterion_2_id"] == "c_status"
+    assert trace["requested_output_criterion_2_output_path"] == "output.status"
+    assert trace["requested_output_criterion_2_grounding_mode"] == "missing"
+    assert trace["requested_output_criterion_2_has_exact_value"] is False
+    assert "1234 Sample Utility Way" not in repr(trace)
+
+
+def test_reconcile_supersedes_same_output_path_with_different_expected_output_value() -> None:
+    stored = _stored(
+        _criterion(
+            "s0",
+            "The returned record includes service address.",
+            output_path="output.service_address",
+            expected_output_value="1234 Sample Utility Way",
+        )
+    )
+    fresh = [
+        _criterion(
+            "c0",
+            "The returned record includes service address.",
+            output_path="output.service_address",
+            expected_output_value="7890 Changed Ave",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        fresh,
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == tuple(fresh)
+
+
+def test_reconcile_supersedes_same_output_path_with_different_expected_output_shape() -> None:
+    stored = _stored(
+        _criterion(
+            "s0",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        )
+    )
+    fresh = [
+        _criterion(
+            "c0",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_shape="numeric_identifier",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        fresh,
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == tuple(fresh)
+
+
+def test_reconcile_supersedes_validation_classification_with_different_target() -> None:
+    stored = _stored(
+        _criterion(
+            "s0",
+            "The run classifies whether the path is login gated.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="login_gated",
+        )
+    )
+    fresh = [
+        _criterion(
+            "c0",
+            "The run classifies whether the path is public.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="public",
+        )
+    ]
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        fresh,
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == tuple(fresh)
 
 
 def test_criteria_json_round_trips_contingent_antecedent_output_path() -> None:
