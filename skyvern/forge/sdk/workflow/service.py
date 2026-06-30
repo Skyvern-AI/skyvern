@@ -6362,14 +6362,46 @@ class WorkflowService:
         LOG.debug("Persisting video data", number_of_video_artifacts=len(video_artifacts))
         # Flush here: code-block recordings key on the block/run id, which clean_up_workflow's task-id drain skips.
         upload_keys: set[str] = set()
+        last_step: Step | None = None
+        last_step_resolved = False
         for video_artifact in video_artifacts:
-            upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
-                artifact_id=video_artifact.video_artifact_id,
-                organization_id=workflow_run.organization_id,
-                data=video_artifact.video_data,
+            if video_artifact.video_artifact_id:
+                upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
+                    artifact_id=video_artifact.video_artifact_id,
+                    organization_id=workflow_run.organization_id,
+                    data=video_artifact.video_data,
+                )
+                if upload_key:
+                    upload_keys.add(upload_key)
+                continue
+
+            # No pre-registered artifact row: a recording attached at browser teardown
+            # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
+            # Upload by path so the bytes stream straight from disk to storage.
+            video_path = video_artifact.video_path
+            if not video_path or not os.path.exists(video_path):
+                continue
+            if not last_step_resolved:
+                last_step_resolved = True
+                tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
+                if tasks:
+                    last_step = await app.DATABASE.tasks.get_latest_step(
+                        task_id=tasks[-1].task_id, organization_id=workflow_run.organization_id
+                    )
+            if last_step is None:
+                LOG.warning(
+                    "Cannot persist path-based recording: no latest step for workflow run",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    video_path=video_path,
+                )
+                continue
+            artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                step=last_step,
+                artifact_type=ArtifactType.RECORDING,
+                path=video_path,
             )
-            if upload_key:
-                upload_keys.add(upload_key)
+            video_artifact.video_artifact_id = artifact_id
+            upload_keys.add(last_step.task_id)
         if upload_keys:
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(list(upload_keys))
 
