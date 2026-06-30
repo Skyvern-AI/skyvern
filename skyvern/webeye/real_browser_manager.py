@@ -484,7 +484,12 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                if finalize:
+                # Only the local Playwright-launched recording path produces WebM
+                # that needs the remux fix-up. Other producers (e.g. fully formed
+                # MP4 downloaded from a remote source) are already container-valid
+                # and would be corrupted by ``finalize_webm`` — read those raw.
+                is_webm = path.lower().endswith(".webm")
+                if finalize and is_webm:
                     # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
                     # even when browser_context.close() was killed mid-finalization.
                     browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
