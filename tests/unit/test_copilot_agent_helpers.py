@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
@@ -835,6 +836,30 @@ workflow_definition:
         assert "page_actions: Search button.search disabled" in prompt
         assert "adapt the next code block to the observed page state" in prompt
         assert "do not re-emit the same failing selector or name path" in prompt
+
+    def test_recorded_build_test_outcome_prompt_renders_structural_grounding(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                attempted_block_label="search_records",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="runtime:timeout_waiting_for_selector:failed",
+                page_evidence_refs=["form:Search #search", "result:#results rows=unknown"],
+                observed_evidence_summary="Timeout waiting for results.",
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "RECORDED BUILD-TEST OUTCOME" in prompt
+        assert "phase: persisted_block_run" in prompt
+        assert "reason_code: runtime_block_failure" in prompt
+        assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
+        assert "Do not re-emit the same plan against the same structural key" in prompt
 
 
 class TestVerifiedWorkflowOrNone:

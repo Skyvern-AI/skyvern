@@ -17,6 +17,7 @@ import pytest
 from agents import RunConfig
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
@@ -273,6 +274,101 @@ class TestSynthesizedOfferPersistenceGate:
         assert signal.recovery_hint == "retry_with_different_tool"
         assert signal.renders_final_reply is False
         assert synthesized_block_persistence_signal(ctx, "update_and_run_blocks") is None
+
+    def test_authoring_offer_blocks_page_mutating_tool_before_loop_detection(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = False
+        ctx.scout_trajectory = [{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}]
+
+        signal = synthesized_block_persistence_signal(ctx, "click")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert signal.blocked_tool == "click"
+        assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
+        assert signal.renders_final_reply is False
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["update_and_run_blocks", "update_workflow", "fill_credential_field"],
+    )
+    def test_authoring_offer_keeps_allowed_tools_unblocked(self, tool_name: str) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = False
+        ctx.scout_trajectory = [{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}]
+
+        assert synthesized_block_persistence_signal(ctx, tool_name) is None
+
+    def test_authoring_offer_does_not_block_mutating_tool_when_trajectory_changed(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = False
+        ctx.scout_trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_authoring_offer_does_not_block_mutating_tool_without_offer(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = False
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}]
+
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_unresolved_recorded_outcome_blocks_page_mutating_tool_until_update_and_run_blocks(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.completion_verification_result = self._unsatisfied_verification()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:partial",
+        )
+
+        signal = synthesized_block_persistence_signal(ctx, "click")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert signal.blocked_tool == "click"
+        assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
+        assert "last recorded test outcome" in signal.agent_steering_text
+        assert synthesized_block_persistence_signal(ctx, "update_and_run_blocks") is None
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
 
     @pytest.mark.parametrize(
         "ctx_attrs",
