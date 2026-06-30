@@ -77,7 +77,7 @@ export type FilmstripFrame = {
   actionOrder: number | null;
 };
 
-function actionLabel(action: ActionsApiResponse): string {
+export function actionLabel(action: ActionsApiResponse): string {
   const candidate =
     action.intention?.trim() ||
     action.description?.trim() ||
