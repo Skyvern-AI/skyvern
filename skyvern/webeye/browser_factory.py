@@ -965,6 +965,69 @@ async def _connect_to_cdp_browser(
     return browser_context, browser_artifacts, None
 
 
+
+
+async def _create_invisible_playwright_firefox(
+    playwright: Playwright,
+    proxy_location: ProxyLocationInput = None,
+    extra_http_headers: dict[str, str] | None = None,
+    **kwargs: dict,
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    # invisible_playwright ships a patched Firefox whose fingerprint is fixed at
+    # the C++/source level (no injected JS), so this reuses Skyvern's browser args
+    # and artifacts and only swaps the engine to Firefox. Opt-in: used when
+    # BROWSER_TYPE == "invisible-playwright". The import is lazy, so it adds no
+    # dependency unless that type is selected.
+    try:
+        import secrets
+
+        from invisible_playwright._fpforge import generate_profile
+        from invisible_playwright._webgl_personas import forced_gpu_class
+        from invisible_playwright.download import ensure_binary
+        from invisible_playwright.prefs import translate_profile_to_prefs
+    except ImportError as e:
+        raise RuntimeError(
+            "BROWSER_TYPE 'invisible-playwright' requires the invisible_playwright package: "
+            "pip install git+https://github.com/feder-cr/invisible_playwright.git"
+        ) from e
+
+    user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+    download_dir = initialize_download_dir()
+
+    browser_args = BrowserContextFactory.build_browser_args(
+        proxy_location=proxy_location, extra_http_headers=extra_http_headers
+    )
+    # build_browser_args is Chromium-oriented; Firefox only needs the generic
+    # context options, so drop the Chromium-only launch keys.
+    for key in ("args", "ignore_default_args"):
+        browser_args.pop(key, None)
+
+    seed = secrets.randbits(31)
+    profile = generate_profile(seed, fixed_gpu_class=forced_gpu_class(seed))
+    firefox_user_prefs = translate_profile_to_prefs(
+        profile,
+        locale=settings.BROWSER_LOCALE or "en-US",
+        timezone=browser_args.get("timezone_id") or "",
+    )
+
+    browser_args.update(
+        {
+            "user_data_dir": user_data_dir,
+            "downloads_path": download_dir,
+            "headless": False,
+            "executable_path": str(ensure_binary()),
+            "firefox_user_prefs": firefox_user_prefs,
+        }
+    )
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+        har_path=browser_args["record_har_path"],
+        browser_session_dir=user_data_dir,
+    )
+    browser_context = await playwright.firefox.launch_persistent_context(**browser_args)
+    return browser_context, browser_artifacts, None
+
+
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
 BrowserContextFactory.register_type("cdp-connect", _create_cdp_connection_browser)
+BrowserContextFactory.register_type("invisible-playwright", _create_invisible_playwright_firefox)
