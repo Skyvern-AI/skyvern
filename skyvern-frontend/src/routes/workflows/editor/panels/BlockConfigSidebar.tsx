@@ -8,6 +8,7 @@ import {
 import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import {
   BLOCK_SIDEBAR_WIDTH_MAX,
@@ -36,12 +37,8 @@ import {
 import { BlockConfigForm } from "./BlockConfigForm";
 import { useHasInteractedThisSession } from "./useHasInteractedThisSession";
 import { WorkflowNodeLibraryPanel } from "./WorkflowNodeLibraryPanel";
-import {
-  STUDIO_COPILOT_COLLAPSE_EASE,
-  STUDIO_COPILOT_RAIL_WIDTH,
-  STUDIO_COPILOT_TRANSITION_EASE,
-  STUDIO_COPILOT_TRANSITION_MS,
-} from "../../studio/constants";
+import { STUDIO_COPILOT_RAIL_WIDTH } from "../../studio/constants";
+import { useStudioShellContext } from "../../studio/StudioShellContext";
 import type { AddNodeProps } from "../Workspace";
 
 // React Flow node type → backend WorkflowBlockType. The two diverge in
@@ -141,32 +138,29 @@ function SettingsRail({
   identity,
   onExpand,
 }: Readonly<{ identity: SidebarIdentity; onExpand: () => void }>) {
-  // Opaque background covers the clipped panel underneath immediately (no
-  // show-through "open-flicker"); only the controls fade in, like Copilot.
+  // Self-contained bordered card filling the rail slot (mirrors CopilotRail) so
+  // its left edge reads as a panel edge; fades in like the Copilot rail.
   return (
     <div
       data-testid="settings-rail"
-      style={{ width: SETTINGS_RAIL_WIDTH }}
-      className="absolute right-0 top-0 h-full bg-slate-elevation2"
+      className="flex h-full w-full flex-col items-center gap-3 rounded-xl border border-border bg-slate-elevation2 py-3 shadow-xl duration-300 animate-in fade-in"
     >
-      <div className="flex h-full flex-col items-center gap-3 py-3 duration-300 animate-in fade-in">
-        <button
-          type="button"
-          onClick={onExpand}
-          title="Show settings"
-          aria-label="Show settings"
-          className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        >
-          <ChevronLeftIcon className="h-4 w-4" />
-        </button>
-        <SidebarIdentityIcon identity={identity} />
-        <span
-          className="mt-1 max-h-[60%] overflow-hidden text-ellipsis text-xs font-medium tracking-wide text-muted-foreground"
-          style={{ writingMode: "vertical-rl" }}
-        >
-          {identity.label}
-        </span>
-      </div>
+      <button
+        type="button"
+        onClick={onExpand}
+        title="Show settings"
+        aria-label="Show settings"
+        className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        <ChevronLeftIcon className="h-4 w-4" />
+      </button>
+      <SidebarIdentityIcon identity={identity} />
+      <span
+        className="mt-1 max-h-[60%] overflow-hidden text-ellipsis text-xs font-medium tracking-wide text-muted-foreground"
+        style={{ writingMode: "vertical-rl" }}
+      >
+        {identity.label}
+      </span>
     </div>
   );
 }
@@ -424,6 +418,7 @@ function BlockConfigSidebar({
   const setStudioSettingsCollapsed = useStudioShellStore(
     (state) => state.setSettingsCollapsed,
   );
+  const { settingsPortalEl, settingsRailPortalEl } = useStudioShellContext();
   const containedWidth = getContainedBlockSidebarWidth(
     width,
     editorShellMetrics.width,
@@ -469,13 +464,10 @@ function BlockConfigSidebar({
   const settingsCollapsed = isCollapsibleSettings && studioSettingsCollapsed;
   const selectedIdentity = getSidebarIdentity(selectedNode);
 
-  // Transition stays on so the toggle always animates (like Copilot); dropped
-  // mid-drag, where the live width is tracked so the body follows the handle.
-  const [isResizing, setIsResizing] = useState(false);
-  const [resizingWidth, setResizingWidth] = useState<number | null>(null);
-
   useLayoutEffect(() => {
-    if (!sidebarVisible) {
+    // Legacy overlay only: studio sizes its column in StudioShell, so the
+    // contained-width measurement and rendered-width var are unused there.
+    if (!sidebarVisible || embedded) {
       setEditorShellMetrics({
         gutterPx: getBlockSidebarGutterPx(null),
         width: null,
@@ -520,15 +512,21 @@ function BlockConfigSidebar({
     };
     // Re-measure on collapse toggle: the shell width changes, so the contained
     // width bounds need refreshing.
-  }, [sidebarVisible, settingsCollapsed]);
+  }, [sidebarVisible, settingsCollapsed, embedded]);
 
   useLayoutEffect(() => {
-    if (!sidebarVisible) {
+    if (!sidebarVisible || embedded) {
       return;
     }
 
     setRenderedWidth(settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedWidth);
-  }, [settingsCollapsed, containedWidth, setRenderedWidth, sidebarVisible]);
+  }, [
+    settingsCollapsed,
+    containedWidth,
+    setRenderedWidth,
+    sidebarVisible,
+    embedded,
+  ]);
 
   // In build mode the block-config form is unavailable, but the node library
   // must still render so users can insert blocks from the canvas.
@@ -540,83 +538,22 @@ function BlockConfigSidebar({
     return null;
   }
 
-  // Fixed body width tracks the live handle while resizing, the stored width
-  // otherwise — never the rail width, so the clipping shell never reflows it.
-  const bodyWidth =
-    isResizing && resizingWidth !== null ? resizingWidth : containedWidth;
-
-  return (
-    <Resizable
-      ref={resizableRef}
-      size={{
-        width:
-          embedded && settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedWidth,
-        height: "auto",
-      }}
-      minWidth={
-        embedded && settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedMinWidth
-      }
-      maxWidth={containedMaxWidth}
-      enable={{ left: !(embedded && settingsCollapsed) }}
-      onResizeStart={() => setIsResizing(true)}
-      onResize={(_e, _dir, ref) => setResizingWidth(ref.offsetWidth)}
-      onResizeStop={(_e, _dir, ref) => {
-        setWidth(ref.offsetWidth);
-        setIsResizing(false);
-        setResizingWidth(null);
-      }}
-      handleClasses={{ left: "block-sidebar-resize-handle" }}
-      handleStyles={{
-        left: {
-          width: "12px",
-          left: "-6px",
-          cursor: "col-resize",
-        },
-      }}
-      style={{
-        position: "absolute",
-        top: embedded ? "0.75rem" : mode === "build" ? "7rem" : "2rem",
-        // Embedded mirrors the Copilot column's uniform py-3/pl-3 (0.75rem)
-        // inset; legacy keeps its wider 1.5rem gutter.
-        right: embedded ? "0.75rem" : "1.5rem",
-        bottom: embedded ? "0.75rem" : "1.5rem",
-        // Copilot's open/collapse curve, always on so the toggle animates with
-        // no snap; dropped mid-drag so a resize tracks the handle 1:1.
-        transition:
-          embedded && !isResizing
-            ? `width ${STUDIO_COPILOT_TRANSITION_MS}ms ${
-                settingsCollapsed
-                  ? STUDIO_COPILOT_COLLAPSE_EASE
-                  : STUDIO_COPILOT_TRANSITION_EASE
-              }`
-            : undefined,
-      }}
-      className="z-30"
-    >
-      <div
-        className={cn(
-          "relative h-full w-full overflow-hidden",
-          "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
-        )}
-      >
+  // Studio: the panel is a StudioShell grid column (the shell owns the width,
+  // collapse rail, and resize), so we portal the surface into that column and
+  // fill it. The body stays mounted but inert while collapsed so the shell's
+  // width animation can clip it without it reflowing.
+  if (embedded) {
+    // The expanded panel and the collapsed rail portal into separate StudioShell
+    // slots (the shell owns their sizing/position), mirroring the Copilot's
+    // fixed chat + separate rail overlay. The body stays mounted but inert while
+    // collapsed so the shell's width animation can clip it without reflow.
+    const bodyCard = (
+      <div className="relative h-full w-full overflow-hidden rounded-xl border border-border bg-slate-elevation2 shadow-xl">
         <aside
           data-testid="block-config-sidebar"
-          style={
-            embedded
-              ? {
-                  position: "absolute",
-                  inset: 0,
-                  left: "auto",
-                  width: bodyWidth,
-                }
-              : undefined
-          }
           className={cn(
-            "flex h-full flex-col",
-            // Collapsed: the rail covers it; disable the clipped strip.
-            embedded && settingsCollapsed && "pointer-events-none",
-            !embedded &&
-              "w-full duration-200 ease-out animate-in slide-in-from-right-5",
+            "flex h-full w-full flex-col",
+            settingsCollapsed && "pointer-events-none",
           )}
         >
           {showLibrary ? (
@@ -637,12 +574,74 @@ function BlockConfigSidebar({
             />
           ) : null}
         </aside>
-        {embedded && settingsCollapsed ? (
-          <SettingsRail
-            identity={selectedIdentity}
-            onExpand={() => setStudioSettingsCollapsed(false)}
-          />
-        ) : null}
+      </div>
+    );
+
+    return (
+      <>
+        {settingsPortalEl ? createPortal(bodyCard, settingsPortalEl) : null}
+        {settingsCollapsed && settingsRailPortalEl
+          ? createPortal(
+              <SettingsRail
+                identity={selectedIdentity}
+                onExpand={() => setStudioSettingsCollapsed(false)}
+              />,
+              settingsRailPortalEl,
+            )
+          : null}
+      </>
+    );
+  }
+
+  return (
+    <Resizable
+      ref={resizableRef}
+      size={{ width: containedWidth, height: "auto" }}
+      minWidth={containedMinWidth}
+      maxWidth={containedMaxWidth}
+      enable={{ left: true }}
+      onResizeStop={(_e, _dir, ref) => {
+        setWidth(ref.offsetWidth);
+      }}
+      handleClasses={{ left: "block-sidebar-resize-handle" }}
+      handleStyles={{
+        left: {
+          width: "12px",
+          left: "-6px",
+          cursor: "col-resize",
+        },
+      }}
+      style={{
+        position: "absolute",
+        top: mode === "build" ? "7rem" : "2rem",
+        right: "1.5rem",
+        bottom: "1.5rem",
+      }}
+      className="z-30"
+    >
+      <div
+        className={cn(
+          "relative h-full w-full overflow-hidden",
+          "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
+        )}
+      >
+        <aside
+          data-testid="block-config-sidebar"
+          className="flex h-full w-full flex-col duration-200 ease-out animate-in slide-in-from-right-5"
+        >
+          {showLibrary ? (
+            <BlockLibrarySidebarBody
+              onAddNode={(props) => onAddNode?.(props)}
+              onClose={closeWorkflowPanel}
+            />
+          ) : selectedBlockId !== null ? (
+            <BlockConfigSidebarBody
+              selectedBlockId={selectedBlockId}
+              identity={selectedIdentity}
+              onClose={() => setSelectedBlockId(null)}
+            />
+          ) : null}
+        </aside>
       </div>
     </Resizable>
   );

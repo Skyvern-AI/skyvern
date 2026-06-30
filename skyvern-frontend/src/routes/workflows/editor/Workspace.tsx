@@ -1552,7 +1552,12 @@ function Workspace({
       className="relative h-full w-full"
       style={
         {
-          [BLOCK_SIDEBAR_WIDTH_VAR]: `${renderedBlockSidebarWidth}px`,
+          // In studio the settings panel is its own grid column (StudioShell), so
+          // the Stage already reflows; zero the var so on-canvas overlays don't
+          // double-offset. Legacy keeps the overlay's measured width.
+          [BLOCK_SIDEBAR_WIDTH_VAR]: embedded
+            ? "0px"
+            : `${renderedBlockSidebarWidth}px`,
         } as React.CSSProperties
       }
     >
@@ -1719,7 +1724,9 @@ function Workspace({
               className={cn(
                 "absolute z-30 transition-all duration-300 ease-out",
                 embedded ? "top-3" : "top-[8.5rem]",
-                blockSidebarOpen
+                // Studio: the settings panel is a separate grid column, so
+                // in-stage sub-panels anchor to the Stage edge, never offset.
+                !embedded && blockSidebarOpen
                   ? HEADER_RIGHT_INSET_OPEN
                   : HEADER_RIGHT_INSET_CLOSED,
               )}
@@ -1817,7 +1824,7 @@ function Workspace({
                       // Studio's top bar is above the canvas, so the panel drops
                       // from the canvas top; legacy's header is inside it.
                       embedded ? "top-3" : "top-[8.5rem]",
-                      blockSidebarOpen
+                      !embedded && blockSidebarOpen
                         ? HEADER_RIGHT_INSET_OPEN
                         : HEADER_RIGHT_INSET_CLOSED,
                     )}
