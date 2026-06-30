@@ -1864,6 +1864,40 @@ class TestTranslateToAgentResultGating:
         assert agent_result.workflow_yaml is None
         assert agent_result.response_type == "REPLACE_WORKFLOW"
 
+    def test_inline_replace_workflow_suppressed_on_no_mutation_turn(self, monkeypatch) -> None:
+        # A DIAGNOSE turn is may_update_workflow=False, but an inline REPLACE_WORKFLOW bypasses the
+        # may_update_workflow authority enforced on the update_workflow tool. The translate helper must downgrade
+        # it to a REPLY so the diagnosis lands without processing or staging the REPLACE candidate.
+        def _must_not_process(**kwargs):
+            raise AssertionError("inline REPLACE_WORKFLOW was processed on a no-mutation turn")
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _must_not_process)
+        ctx = _ctx(
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.DIAGNOSE,
+                authority=TurnIntentAuthority(
+                    may_update_workflow=False, may_run_blocks=False, may_read_run_context=True
+                ),
+            ),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "Here's the fixed workflow.",
+                "workflow_yaml": "new: yaml",
+            }
+        )
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+        # Downgraded to REPLY; the REPLACE candidate is neither processed (the patch would have raised) nor staged.
+        assert agent_result.response_type == "REPLY"
+        assert ctx.last_workflow is None
+        assert agent_result.updated_workflow is None
+        assert "confirm and i'll apply" in agent_result.user_response.lower()
+
     def test_inline_replace_workflow_rejects_stale_block_metadata(self, monkeypatch) -> None:
         # Inline REPLACE_WORKFLOW bypasses _update_workflow, so it must also
         # reject a corrected workflow whose labels/titles still describe the
