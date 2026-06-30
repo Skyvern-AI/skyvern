@@ -165,6 +165,14 @@ from .scouting import _mark_page_inspected, _mark_post_run_page_observed
 
 LOG = structlog.get_logger()
 
+
+class _RunIdUnset:
+    pass
+
+
+# Distinguishes omitted run id (read ctx) from explicit None (no current run).
+_RUN_ID_UNSET = _RunIdUnset()
+
 _ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_INTERVAL_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_MAX_SAMPLES = 8
@@ -2035,9 +2043,13 @@ def _record_run_blocks_result(
             # Prefer the final run-result extracted_data for terminal replies;
             # it is the same persisted run evidence completion verification saw.
             copilot_ctx.verified_terminal_block_outputs = terminal_outputs
+    prior_committed_outcome = _same_run_committed_demonstrated_outcome(
+        copilot_ctx, run_id if isinstance(run_id, str) else None
+    )
     copilot_ctx.completion_verification_result = completion_verification
-    record_completion_verification(copilot_ctx, completion_verification)
-    _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
+    if prior_committed_outcome is None or _verification_fully_satisfied(completion_verification):
+        record_completion_verification(copilot_ctx, completion_verification)
+        _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
@@ -2060,8 +2072,9 @@ def _record_run_blocks_result(
         copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
         copilot_ctx.last_outcome_gate_workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
     copilot_ctx.last_test_suspicious_success = False
-    copilot_ctx.last_run_outcome = None
-    copilot_ctx.last_run_outcome_block_labels = []
+    if prior_committed_outcome is None:
+        copilot_ctx.last_run_outcome = None
+        copilot_ctx.last_run_outcome_block_labels = []
     copilot_ctx.suspicious_success_nudge_count = 0
     copilot_ctx.last_test_anti_bot = None
     prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
@@ -2244,6 +2257,19 @@ def _record_run_blocks_result(
                     display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
                 ),
             )
+        if prior_committed_outcome is not None and artifact_reason is None:
+            # artifact_reason is current-run health; prior_committed_outcome already passed prior ctx artifact-health.
+            copilot_ctx.last_full_workflow_test_ok = True
+            copilot_ctx.last_unverified_block_labels = []
+            copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+            copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+            copilot_ctx.last_test_suspicious_success = False
+            copilot_ctx.last_test_failure_reason = None
+            copilot_ctx.last_outcome_gate_reason = None
+            copilot_ctx.last_outcome_gate_workflow_run_id = None
+            update_repeated_failure_state(copilot_ctx, result)
+            _update_verification_evidence_from_run_result(copilot_ctx, result)
+            return _stash_recorded_run_outcome(copilot_ctx, prior_committed_outcome)
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         copilot_ctx.last_unverified_block_labels = unverified
         outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
@@ -2330,14 +2356,45 @@ def _record_run_blocks_result(
 def _stash_recorded_run_outcome(copilot_ctx: Any, outcome: RecordedRunOutcome) -> RecordedRunOutcome:
     if outcome.workflow_run_id is None:
         outcome = replace(outcome, workflow_run_id=getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
+    committed = _same_run_committed_demonstrated_outcome(copilot_ctx, outcome.workflow_run_id)
+    if committed is not None and outcome.reason_code == "outcome_not_demonstrated":
+        return committed
     copilot_ctx.last_run_outcome = outcome
     copilot_ctx.last_run_outcome_block_labels = list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or [])
+    return outcome
+
+
+def _verification_fully_satisfied(completion_verification: CompletionVerificationResult | None) -> bool:
+    return completion_verification is not None and completion_verification.is_fully_satisfied()
+
+
+def _same_run_committed_demonstrated_outcome(
+    copilot_ctx: Any, workflow_run_id: str | None | _RunIdUnset = _RUN_ID_UNSET
+) -> RecordedRunOutcome | None:
+    artifact_reason = getattr(copilot_ctx, "last_artifact_health_blocker_reason", None)
+    if isinstance(artifact_reason, str) and artifact_reason.strip():
+        return None
+    run_id = (
+        getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+        if workflow_run_id is _RUN_ID_UNSET
+        else workflow_run_id
+    )
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    outcome = getattr(copilot_ctx, "last_run_outcome", None)
+    if not isinstance(outcome, RecordedRunOutcome):
+        return None
+    if outcome.verdict != "demonstrated" or outcome.workflow_run_id != run_id:
+        return None
     return outcome
 
 
 def _adjudicated_run_outcome(
     copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
 ) -> RecordedRunOutcome:
+    committed = _same_run_committed_demonstrated_outcome(copilot_ctx)
+    if committed is not None:
+        return committed
     if completion_verification is not None and completion_verification.status == "evaluated":
         if not completion_verification.is_fully_satisfied():
             return RecordedRunOutcome(

@@ -66,6 +66,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _parse_completion_criteria,
     build_classifier_fallback_floor,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     _active_run_terminal_evidence_needs_visual_fallback,
@@ -354,6 +355,63 @@ def _patch_completion_handler(monkeypatch: pytest.MonkeyPatch, handler: object) 
 def test_is_fully_satisfied_requires_every_criterion() -> None:
     assert _evaluated(("c0", True), ("c1", True)).is_fully_satisfied() is True
     assert _evaluated(("c0", True), ("c1", False)).is_fully_satisfied() is False
+
+
+def test_observed_end_state_satisfaction_takes_precedence_over_reperception_contradiction() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_reach",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="observed_end_state_url",
+        ),
+        CriterionVerdict(
+            criterion_id="c_reperception",
+            state="unsatisfied",
+            reason_code="evidence_contradicts",
+            evidence_ref="scout_synthesized_browser_steps_output",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_reperception_contradiction_without_observed_end_state_satisfaction_still_blocks() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_output",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:submit_request",
+        ),
+        CriterionVerdict(
+            criterion_id="c_reperception",
+            state="unsatisfied",
+            reason_code="evidence_contradicts",
+            evidence_ref="scout_synthesized_browser_steps_output",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_observed_end_state_satisfaction_does_not_override_requested_output_contradiction() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_reach",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="observed_end_state_url",
+        ),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="evidence_contradicts",
+            evidence_ref="block_outputs:submit_request.confirmation_number",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is False
 
 
 def _mixed(*verdicts: CriterionVerdict) -> CompletionVerificationResult:
@@ -2011,20 +2069,44 @@ def test_parse_caps_count() -> None:
     assert len(_parse_completion_criteria(raw)) == 8
 
 
+def _verification_satisfaction_ctx(
+    completion_verification: CompletionVerificationResult | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        completion_verification_result=completion_verification,
+        last_artifact_health_blocker_reason=None,
+        last_run_blocks_workflow_run_id=None,
+        last_run_outcome=None,
+    )
+
+
 def test_verification_satisfaction_no_cvr_uses_prior_proxy() -> None:
-    assert _verification_satisfaction(True, False, "completed", None) == (True, True)
-    assert _verification_satisfaction(True, True, "completed", None) == (False, False)
-    assert _verification_satisfaction(False, False, None, None) == (None, None)
+    ctx = _verification_satisfaction_ctx()
+    assert _verification_satisfaction(ctx, True, False, "completed", None) == (True, True)
+    assert _verification_satisfaction(ctx, True, True, "completed", None) == (False, False)
+    assert _verification_satisfaction(ctx, False, False, None, None) == (None, None)
 
 
 def test_verification_satisfaction_evaluated_drives_contract_signal() -> None:
-    assert _verification_satisfaction(True, False, "completed", _evaluated(("c0", True))) == (True, True)
-    _, contract = _verification_satisfaction(True, False, "completed", _evaluated(("c0", False)))
+    satisfied = _evaluated(("c0", True))
+    unsatisfied = _evaluated(("c0", False))
+    assert _verification_satisfaction(
+        _verification_satisfaction_ctx(satisfied), True, False, "completed", satisfied
+    ) == (
+        True,
+        True,
+    )
+    _, contract = _verification_satisfaction(
+        _verification_satisfaction_ctx(unsatisfied), True, False, "completed", unsatisfied
+    )
     assert contract is False
 
 
 def test_verification_satisfaction_unavailable_fails_closed() -> None:
-    _, contract = _verification_satisfaction(True, False, "completed", CompletionVerificationResult("unavailable"))
+    unavailable = CompletionVerificationResult("unavailable")
+    _, contract = _verification_satisfaction(
+        _verification_satisfaction_ctx(unavailable), True, False, "completed", unavailable
+    )
     assert contract is False
 
 
@@ -2458,6 +2540,29 @@ def test_tool_visible_result_keeps_mid_build_run_visible_success() -> None:
     assert visible["ok"] is True
 
 
+def test_tool_visible_result_keeps_committed_same_run_success_after_later_contradiction() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    result = _clean_success_result()
+
+    _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("c0", True)))
+    visible = _tool_visible_result_after_completion_verification(ctx, result, _contradicted("c0"))
+
+    assert visible["ok"] is True
+    assert visible is result
+    assert "failure_categories" not in visible["data"]
+    assert "completion_verification" not in visible["data"]
+
+
+def test_tool_visible_result_downgrades_first_pass_contradiction_without_committed_outcome() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    result = _clean_success_result()
+
+    visible = _tool_visible_result_after_completion_verification(ctx, result, _contradicted("c0"))
+
+    assert visible["ok"] is False
+    assert visible["data"]["failure_categories"][0]["category"] == "OUTCOME_UNVERIFIED"
+
+
 def test_record_run_blocks_keeps_building_on_mid_build_no_evidence() -> None:
     ctx = _ctx_with_blocks("goto_url", "navigation")
     _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
@@ -2492,6 +2597,138 @@ def test_record_run_blocks_demonstrated_when_lone_definition_abstention_with_con
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
     assert verified_goal_satisfied_context(ctx) is True
+
+
+def test_committed_same_run_outcome_survives_later_contradictory_overwrite() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    verification = _mixed(
+        CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms"),
+        CriterionVerdict(criterion_id="c1", state="unknown", reason_code="definition_parameters_absent"),
+    )
+
+    recorded = _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=verification)
+
+    assert recorded == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_x")
+    assert outcome_fully_verified(ctx) is True
+
+    ctx.completion_verification_result = _mixed(
+        CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts"),
+        CriterionVerdict(criterion_id="c1", state="unknown", reason_code="definition_parameters_absent"),
+    )
+
+    assert outcome_fully_verified(ctx) is True
+    assert verified_goal_satisfied_context(ctx) is True
+
+
+def test_first_pass_contradiction_without_committed_run_outcome_still_fails() -> None:
+    ctx = _ctx_with_blocks("extraction")
+
+    recorded = _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_contradicted("c0"))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_demonstrated"
+    assert outcome_fully_verified(ctx) is False
+    assert verified_goal_satisfied_context(ctx) is False
+
+
+def test_same_run_contradiction_after_committed_outcome_does_not_churn() -> None:
+    ctx = _ctx_with_blocks("extraction")
+
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))
+    recorded = _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_contradicted("c0"))
+
+    assert recorded == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_x")
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+    assert ctx.last_full_workflow_test_ok is True
+    assert outcome_fully_verified(ctx) is True
+
+
+def test_missing_run_id_does_not_preserve_committed_same_run_outcome() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    malformed_result = _clean_success_result()
+    malformed_result["data"].pop("workflow_run_id")
+
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))
+    recorded = _record_run_blocks_result(ctx, malformed_result, completion_verification=_contradicted("c0"))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_demonstrated"
+    assert ctx.last_run_outcome == recorded
+    assert outcome_fully_verified(ctx) is False
+
+
+def test_committed_same_run_outcome_surfaces_verified_workflow_after_later_contradiction() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.last_workflow_yaml = "workflow: {}"
+
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))
+    ctx.completion_verification_result = _contradicted("c0")
+
+    assert _completion_contract_not_violated(ctx) is True
+    assert _verified_workflow_or_none(ctx) == (ctx.last_workflow, "workflow: {}")
+
+
+def test_first_pass_contradiction_does_not_surface_verified_workflow() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.last_workflow_yaml = "workflow: {}"
+
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_contradicted("c0"))
+
+    assert _completion_contract_not_violated(ctx) is False
+    assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+def test_different_run_id_committed_outcome_does_not_surface_verified_workflow() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.last_workflow_yaml = "workflow: {}"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    ctx.last_run_blocks_workflow_run_id = "wr_new"
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_prior")
+    ctx.completion_verification_result = _contradicted("c0")
+
+    assert outcome_fully_verified(ctx) is False
+    assert _completion_contract_not_violated(ctx) is False
+    assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+def test_missing_current_run_id_does_not_surface_verified_workflow_from_prior_outcome() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.last_workflow_yaml = "workflow: {}"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    ctx.last_run_blocks_workflow_run_id = None
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_prior")
+    ctx.completion_verification_result = _contradicted("c0")
+
+    assert outcome_fully_verified(ctx) is False
+    assert _completion_contract_not_violated(ctx) is False
+    assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+def test_artifact_health_blocks_verified_workflow_surfacing_with_committed_outcome() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.last_workflow_yaml = "workflow: {}"
+
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))
+    ctx.last_artifact_health_blocker_reason = "Code block failed with SyntaxError."
+
+    assert outcome_fully_verified(ctx) is False
+    assert _completion_contract_not_violated(ctx) is False
+    assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+def test_unavailable_verification_without_committed_outcome_fails_closed_for_surfacing() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.last_workflow_yaml = "workflow: {}"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    ctx.completion_verification_result = CompletionVerificationResult(status="unavailable")
+
+    assert outcome_fully_verified(ctx) is False
+    assert _completion_contract_not_violated(ctx) is False
+    assert _verified_workflow_or_none(ctx) == (None, None)
 
 
 def _goto_only_result() -> dict:
@@ -3164,6 +3401,17 @@ def test_artifact_health_blocks_fully_satisfied_failed_run() -> None:
     assert outcome_fully_verified(ctx) is False
     assert verified_goal_satisfied_context(ctx) is False
     assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+def test_artifact_health_blocks_committed_same_run_outcome() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    verification = _evaluated(("c0", True))
+
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=verification)
+    ctx.last_artifact_health_blocker_reason = "Code block failed with SyntaxError."
+
+    assert outcome_fully_verified(ctx) is False
+    assert verified_goal_satisfied_context(ctx) is False
 
 
 @pytest.mark.asyncio
