@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
@@ -715,6 +716,56 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
     return "\n\n" + "\n".join(line for line in lines if line)
 
 
+def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
+    if ctx is None:
+        return ""
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return ""
+    outcome = ctx.latest_recorded_build_test_outcome
+    if not isinstance(outcome, RecordedBuildTestOutcome) or not outcome.is_authoritative:
+        return ""
+    LOG.info(
+        "copilot recorded build-test outcome rendered",
+        phase=outcome.phase,
+        reason_code=outcome.reason_code,
+        structural_key=outcome.structural_key,
+        workflow_run_id=outcome.workflow_run_id,
+    )
+    lines = [
+        "RECORDED BUILD-TEST OUTCOME:",
+        f"phase: {_clean_authoring_repair_prompt_atom(outcome.phase)}",
+        f"attempted_tool: {_clean_authoring_repair_prompt_atom(outcome.attempted_tool)}",
+        f"attempted_target: {_clean_authoring_repair_prompt_atom(outcome.attempted_target)}",
+        f"attempted_block_label: {_clean_authoring_repair_prompt_atom(outcome.attempted_block_label)}",
+        f"verdict: {_clean_authoring_repair_prompt_atom(outcome.verdict)}",
+        f"reason_code: {_clean_authoring_repair_prompt_atom(outcome.reason_code)}",
+        f"structural_key: {_clean_authoring_repair_prompt_atom(outcome.structural_key or '')}",
+        f"block_labels: {_render_authoring_repair_prompt_list(outcome.block_labels)}",
+        f"page_evidence_refs: {_render_authoring_repair_prompt_list(outcome.page_evidence_refs)}",
+    ]
+    if outcome.missing_requested_output_facts:
+        lines.append("missing_requested_output_facts:")
+        for fact in outcome.missing_requested_output_facts[:8]:
+            if not isinstance(fact, dict):
+                continue
+            fields = []
+            for key in ("output_root", "output_path", "value_status", "reason_code"):
+                value = fact.get(key)
+                if isinstance(value, str) and value.strip():
+                    fields.append(f"{key}={_clean_authoring_repair_prompt_atom(value)}")
+            if fields:
+                lines.append(f"- {'; '.join(fields)}")
+    if outcome.workflow_run_id:
+        lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    if outcome.observed_evidence_summary:
+        lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
+    lines.append(
+        "Before saving or rerunning, change the next authored step, selector, extraction, or binding based on this "
+        "recorded structure. Do not re-emit the same plan against the same structural key."
+    )
+    return "\n\n" + "\n".join(line for line in lines if line)
+
+
 def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     """Pre-authoring offer of the synthesized code block.
 
@@ -804,6 +855,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         return (
             prompt
             + _runtime_verification_evidence_prompt(ctx)
+            + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
             + _synthesized_block_offer_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)

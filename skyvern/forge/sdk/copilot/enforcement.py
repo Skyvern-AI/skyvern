@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
@@ -166,6 +167,9 @@ TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS = frozenset(
     {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "fill_credential_field", "update_workflow"}
+)
+_SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
+    {"click", "press_key", "type_text", "select_option", "navigate_browser"}
 )
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
 # OpenAI detail=high cost per resized image. If we support other providers,
@@ -2127,10 +2131,63 @@ def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
     return synthesized_trajectory_is_goal_complete(ctx)
 
 
+def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
+        return False
+    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened_after_failed_run(ctx):
+        return False
+    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
+        return False
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return False
+    if not getattr(ctx, "synthesized_block_offered", False):
+        return False
+    trajectory = getattr(ctx, "scout_trajectory", None) or []
+    return (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) == len(trajectory)
+
+
+def _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
+        return False
+    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
+        return False
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return False
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
+        return False
+    if latest.phase != "persisted_block_run" or latest.reason_code != "outcome_not_demonstrated":
+        return False
+    return _completion_verification_unsatisfied(ctx)
+
+
 def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
     if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
         return None
-    if not _should_force_synthesized_block_persistence(ctx):
+    if _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx, tool_name):
+        return CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text=(
+                "The last recorded test outcome is authoritative and still has unsatisfied completion criteria. "
+                f"Call {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} with a materially changed authored workflow now; "
+                "do not spend the repair attempt on browser interaction."
+            ),
+            user_facing_reason="I need to revise and test the workflow code instead of interacting with the page.",
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL}),
+            preserves_workflow_draft=True,
+            renders_final_reply=False,
+            internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+            blocked_tool=tool_name,
+            extra={"recorded_outcome_reason_code": "outcome_not_demonstrated"},
+        )
+    if not _should_force_synthesized_block_persistence(ctx) and not _should_block_mutating_tool_after_synthesized_offer(
+        ctx, tool_name
+    ):
         return None
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",

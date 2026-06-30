@@ -179,6 +179,10 @@ RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
 # Skip post-run work when only a sub-millisecond budget remains; asyncio.timeout would fire on the first await.
 POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
 
+# Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
+# run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
+CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
+
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
 # dashboards key on these strings — do not rename without updating monitors.
@@ -1461,6 +1465,68 @@ class WorkflowService:
 
         return None
 
+    async def auto_create_browser_session_for_code_block_if_needed(
+        self,
+        organization_id: str,
+        workflow: Workflow,
+        *,
+        workflow_run_id: str,
+        browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
+        proxy_location: ProxyLocationInput = None,
+    ) -> PersistentBrowserSession | None:
+        """Auto-provision a persistent browser session for runs that contain a CodeBlock.
+
+        The secure CodeBlock runner brokers page operations against a live persistent browser
+        session, so a CodeBlock with no caller-supplied session would otherwise fall back to
+        the legacy in-process executor. When the org is enabled for the secure runner, provision
+        a session here so the CodeBlock routes to the runner. A run's browser_profile_id is loaded
+        into the session so profile-backed CodeBlock workflows still reach the runner. Returns None
+        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, a
+        session was already supplied, or session creation fails.
+        """
+        if browser_session_id:  # the caller supplied a session; respect it unchanged
+            return None
+
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        if not any(block.block_type == BlockType.CODE for block in all_blocks):
+            return None
+
+        should_create = await app.AGENT_FUNCTION.should_auto_create_browser_session_for_code_block(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_id=workflow.workflow_id,
+        )
+        if not should_create:
+            return None
+
+        try:
+            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                organization_id=organization_id,
+                timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
+                browser_profile_id=browser_profile_id,
+                proxy_location=proxy_location,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to auto-create browser session for CodeBlock run; falling back to legacy executor",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return None
+
+        LOG.info(
+            "Auto-created browser session for CodeBlock run",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_session_id=browser_session.persistent_browser_session_id,
+        )
+        return browser_session
+
     async def _collect_inherited_workflow_system_prompt(
         self,
         parent_workflow_run_id: str | None,
@@ -1786,6 +1852,19 @@ class WorkflowService:
                 organization.organization_id,
                 workflow,
                 browser_session_id=browser_session_id,
+                proxy_location=workflow_run.proxy_location,
+            )
+
+        # The CodeBlock auto-PBS path is intentionally NOT gated on browser_profile_id: a
+        # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
+        # profile is loaded into the auto-created session instead of skipping it.
+        if browser_session is None and browser_session_id is None:
+            browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
+                organization.organization_id,
+                workflow,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
                 proxy_location=workflow_run.proxy_location,
             )
 

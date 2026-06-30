@@ -23,6 +23,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_blocker_signal_for_reason_codes,
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    authored_structure_signature_from_workflow,
+    record_build_test_outcome,
+    recorded_outcome_from_run_blocks_result,
+)
 from skyvern.forge.sdk.copilot.code_block_security import (
     COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
     CodeBlockSecurityInput,
@@ -2184,15 +2190,14 @@ def _record_run_blocks_result(
         stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        return _stash_recorded_run_outcome(
-            copilot_ctx,
-            RecordedRunOutcome(
-                verdict="not_demonstrated",
-                reason_code=TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
-                display_reason=run_outcome_display_reason(terminal_challenge.reason),
-                workflow_run_id=terminal_challenge.workflow_run_id,
-            ),
+        recorded_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code=TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+            display_reason=run_outcome_display_reason(terminal_challenge.reason),
+            workflow_run_id=terminal_challenge.workflow_run_id,
         )
+        _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+        return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
@@ -2220,14 +2225,13 @@ def _record_run_blocks_result(
                 data.setdefault("failure_reason", failure_reason)
             update_repeated_failure_state(copilot_ctx, result)
             _update_verification_evidence_from_run_result(copilot_ctx, result)
-            return _stash_recorded_run_outcome(
-                copilot_ctx,
-                RecordedRunOutcome(
-                    verdict="not_demonstrated",
-                    reason_code="blocker_reported",
-                    display_reason=run_outcome_display_reason(structured_blocker),
-                ),
+            recorded_outcome = RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="blocker_reported",
+                display_reason=run_outcome_display_reason(structured_blocker),
             )
+            _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+            return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
         if completion_fully_satisfied:
             # ``verified_terminal_proposal_ready`` is telemetry only (the barrier keys
             # on ``outcome_fully_verified(ctx)``); clearing the stale suspicious-success
@@ -2249,14 +2253,13 @@ def _record_run_blocks_result(
             copilot_ctx.probable_site_block_streak_count = 0
             update_repeated_failure_state(copilot_ctx, result)
             _update_verification_evidence_from_run_result(copilot_ctx, result)
-            return _stash_recorded_run_outcome(
-                copilot_ctx,
-                RecordedRunOutcome(
-                    verdict="not_demonstrated",
-                    reason_code="no_meaningful_output",
-                    display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
-                ),
+            recorded_outcome = RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="no_meaningful_output",
+                display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
             )
+            _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+            return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
         if prior_committed_outcome is not None and artifact_reason is None:
             # artifact_reason is current-run health; prior_committed_outcome already passed prior ctx artifact-health.
             copilot_ctx.last_full_workflow_test_ok = True
@@ -2312,7 +2315,9 @@ def _record_run_blocks_result(
             )
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
+        recorded_outcome = _adjudicated_run_outcome(copilot_ctx, completion_verification)
+        _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+        return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
     if outcome_fully_verified(copilot_ctx):
         copilot_ctx.last_test_suspicious_success = False
@@ -2327,7 +2332,9 @@ def _record_run_blocks_result(
         copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
+        recorded_outcome = _adjudicated_run_outcome(copilot_ctx, completion_verification)
+        _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+        return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
     copilot_ctx.last_test_non_retriable_nav_error = _detect_non_retriable_nav_error(result)
@@ -2350,7 +2357,29 @@ def _record_run_blocks_result(
         copilot_ctx.last_test_failure_reason = str(result["error"])
     update_repeated_failure_state(copilot_ctx, result)
     _update_verification_evidence_from_run_result(copilot_ctx, result)
+    _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, None)
     return None
+
+
+def _record_adjudicated_build_test_outcome(
+    copilot_ctx: Any,
+    result: dict[str, Any],
+    completion_verification: CompletionVerificationResult | None,
+    recorded_run_outcome: RecordedRunOutcome | None,
+) -> None:
+    record_build_test_outcome(
+        copilot_ctx,
+        recorded_outcome_from_run_blocks_result(
+            result,
+            page_evidence=getattr(copilot_ctx, "composition_page_evidence", None),
+            recorded_run_outcome=recorded_run_outcome,
+            completion_verification=completion_verification,
+            authored_structure_signature=authored_structure_signature_from_workflow(
+                getattr(copilot_ctx, "workflow_yaml", None),
+                getattr(copilot_ctx, "code_artifact_metadata", None),
+            ),
+        ),
+    )
 
 
 def _stash_recorded_run_outcome(copilot_ctx: Any, outcome: RecordedRunOutcome) -> RecordedRunOutcome:
@@ -2490,9 +2519,12 @@ async def _verify_and_record_run_blocks_result(
     return completion_verification
 
 
-def _repair_non_convergence_signature(contract: DiagnosisRepairContract) -> str | None:
+def _repair_non_convergence_signature(copilot_ctx: Any, contract: DiagnosisRepairContract) -> str | None:
     if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
         return None
+    recorded = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
+    if isinstance(recorded, RecordedBuildTestOutcome) and recorded.structural_key is not None:
+        return f"recorded_build_test_outcome:{recorded.structural_key}"
     identity = contract.diagnosis_result.root_cause_identity
     if identity.primary_category == _AUTHORING_REPAIR_CATEGORY and identity.root_cause_signature:
         return identity.root_cause_signature
@@ -2533,7 +2565,7 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     if progressed:
         reset_no_progress_interaction_count(copilot_ctx)
 
-    signature = _repair_non_convergence_signature(contract)
+    signature = _repair_non_convergence_signature(copilot_ctx, contract)
     if signature is None or progressed:
         copilot_ctx.consecutive_non_converging_repair_count = 0
         copilot_ctx.last_repair_non_convergence_signature = None
