@@ -34,9 +34,13 @@ import { RunHero } from "./RunHero";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsButton, type RunInputMeta } from "./RunInputsButton";
 import { RunOutputsButton, type RunOutputFile } from "./RunOutputsButton";
+import { RunPlaceholder } from "./RunPlaceholder";
 
 type RunViewProps = {
   workflowRunId?: string;
+  // The caller is still resolving which run to show; keep the placeholder in its
+  // loading state rather than flashing the "no run yet" empty state.
+  runIdPending?: boolean;
   onFix?: (seedMessage?: string) => void;
   onRetry?: () => void;
 };
@@ -45,9 +49,17 @@ type RunViewProps = {
  * Fused run view: browser hero on the left, run timeline tree + block detail on
  * the right, sharing one pinned item via RunViewStore.
  */
-export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
+export function RunView({
+  workflowRunId,
+  runIdPending = false,
+  onFix,
+  onRetry,
+}: RunViewProps) {
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(queryOptions);
+  // isLoading here, not isPending like RunTab: this query is enabled only once a run
+  // id exists, so a disabled query means "no run" → fall through to the empty CTA.
+  const { data: workflowRun, isLoading } =
+    useWorkflowRunWithWorkflowQuery(queryOptions);
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
   const { workflowPermanentId } = useParams();
   const { data: debugSession } = useDebugSessionQuery({
@@ -248,11 +260,7 @@ export function RunView({ workflowRunId, onFix, onRetry }: RunViewProps) {
   }, [workflowRun]);
 
   if (!workflowRun) {
-    return (
-      <div className="flex h-full w-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
-        Run the workflow to watch it live here.
-      </div>
-    );
+    return <RunPlaceholder loading={isLoading || runIdPending} />;
   }
 
   const elapsed = formatElapsed(
