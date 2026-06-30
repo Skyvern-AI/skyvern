@@ -4731,10 +4731,23 @@ class ForgeAgent:
             )
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
-                await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
-                    organization_id=task.organization_id,
-                    data=video_artifact.video_data,
+                if video_artifact.video_artifact_id:
+                    await app.ARTIFACT_MANAGER.update_artifact_data(
+                        artifact_id=video_artifact.video_artifact_id,
+                        organization_id=task.organization_id,
+                        data=video_artifact.video_data,
+                    )
+                    continue
+                # No pre-registered artifact row: a recording attached at browser teardown
+                # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
+                # Upload by path so the bytes stream straight from disk to storage.
+                video_path = video_artifact.video_path
+                if not video_path or not os.path.exists(video_path):
+                    continue
+                video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                    step=last_step,
+                    artifact_type=ArtifactType.RECORDING,
+                    path=video_path,
                 )
 
             _ctx = skyvern_context.current()
