@@ -755,6 +755,23 @@ class AgentFunction:
         """
         return False
 
+    async def should_auto_create_browser_session_for_code_block(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> bool:
+        """Whether a run containing a CodeBlock should get an auto-provisioned browser session.
+
+        The secure CodeBlock runner brokers page operations against a live persistent browser
+        session, so a run that has a CodeBlock but no caller-supplied session needs one created
+        for it before block execution. OSS has no runner and returns False; cloud overrides to
+        consult the same env/flag gate as should_use_codeblock_runner.
+        """
+        return False
+
     async def execute_code_block_override(
         self,
         *,
