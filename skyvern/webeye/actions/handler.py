@@ -427,6 +427,18 @@ async def _save_adopted_session_download(
             exc_info=True,
         )
 
+    # Ordering: ``save_as`` above has already run and failed (empty or raised).
+    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
+    # the scheme), so route them through an in-page fetch from a same-origin frame.
+    if download.url.startswith("blob:"):
+        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+            page=page, blob_url=download.url, workflow_run_id=workflow_run_id
+        )
+        if blob_bytes is None:
+            return None
+        download_target.write_bytes(blob_bytes)
+        return download_target
+
     try:
         response = await page.context.request.get(download.url)
         if response.status != 200:
@@ -2692,14 +2704,27 @@ async def handle_input_text_action(
     if not await skyvern_element.is_spinbtn_input() and (
         current_text or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
     ):
+        is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
             LOG.info("None input tag clear timeout", action=action)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
 
     # wait for blocking element to show up
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
