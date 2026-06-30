@@ -80,7 +80,7 @@ function GeneratingCodeIndicator() {
 
   return (
     <span
-      className="inline-flex items-center gap-2 rounded-md bg-slate-elevation3 px-3 py-1.5 text-sm font-medium text-muted-foreground"
+      className="inline-flex h-9 items-center gap-2 rounded-md bg-slate-elevation3 px-3 text-sm font-medium text-muted-foreground"
       title="Generating cached code for this run"
     >
       <ReloadIcon className="size-4 animate-spin" />
@@ -245,9 +245,13 @@ function PanelToggle({
   return (
     <Button
       variant="tertiary"
-      size={icon ? "icon" : "lg"}
-      className={icon ? "size-9" : undefined}
+      size={icon ? "icon" : "default"}
       disabled={isRecording}
+      aria-pressed={isOpen}
+      className={cn(
+        isOpen &&
+          "border-studio-accent/40 bg-studio-accent/15 text-foreground hover:bg-studio-accent/20",
+      )}
       onClick={() => (isOpen ? close() : setState({ active: true, content }))}
       title={label}
       aria-label={label}
@@ -304,7 +308,7 @@ function RunStopButton() {
         <DialogTrigger asChild>
           <Button
             variant="destructive"
-            size="lg"
+            size="default"
             disabled={cancelRun.isPending || isRecording}
           >
             {cancelRun.isPending ? (
@@ -339,7 +343,7 @@ function RunStopButton() {
   }
   return (
     <Button
-      size="lg"
+      size="default"
       disabled={isRecording}
       onClick={() => navigate(`/workflows/${workflowPermanentId}/run`)}
     >
@@ -353,23 +357,28 @@ export function StudioTopBar() {
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow} />
+      <div className="h-6 w-px bg-border" aria-hidden />
       <StudioTabs />
       <div className="flex-1" />
       <GeneratingCodeIndicator />
       {isGlobalWorkflow ? (
         <MakeACopyButton />
       ) : (
-        <div data-tour="editor-actions" className="flex items-center gap-3">
-          <SaveButton />
-          <PanelToggle
-            content="schedules"
-            label="Schedule"
-            icon={<CalendarIcon className="size-5" />}
-          />
-          <EditorOverflowMenu />
-          <div className="mx-1 h-6 w-px bg-border" />
-          <PanelToggle content="parameters" label="Inputs" />
-          <RunStopButton />
+        <div data-tour="editor-actions" className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
+            <SaveButton />
+            <PanelToggle
+              content="schedules"
+              label="Schedule"
+              icon={<CalendarIcon className="size-5" />}
+            />
+            <EditorOverflowMenu triggerClassName="size-9" />
+          </div>
+          <div className="h-6 w-px bg-border" aria-hidden />
+          <div className="flex items-center gap-2">
+            <PanelToggle content="parameters" label="Inputs" />
+            <RunStopButton />
+          </div>
         </div>
       )}
     </div>

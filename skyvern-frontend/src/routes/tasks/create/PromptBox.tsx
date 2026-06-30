@@ -280,8 +280,14 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     onSuccess: ({ data: workflow, prompt }) => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
+      // `?via=discover` is what makes WorkflowEditor fire
+      // `copilot.discover.started` with entry_point=discover on mount.
       navigate(
-        workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
+        workflowEditorPath(
+          workflow.workflow_permanent_id,
+          studioEnabled,
+          "?via=discover",
+        ),
         {
           state: { copilotMessage: prompt },
         },

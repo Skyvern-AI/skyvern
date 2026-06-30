@@ -152,7 +152,15 @@ class RealBrowserState(BrowserState):
         if await self.get_working_page() is None:
             page: Page | None = None
             use_existing_page = False
-            if browser_address and len(self.browser_context.pages) > 0:
+            # Some remote browser sessions bind their capture/streaming to the
+            # CDP target that existed at session creation. Opening a new tab
+            # and then running _close_all_other_pages detaches that binding
+            # from the page the agent actually navigates. Reuse the existing
+            # page so the remote session stays aligned with the active target.
+            has_remote_browser_session = bool(
+                self.browser_artifacts and self.browser_artifacts.remote_browser_session_id
+            )
+            if (browser_address or has_remote_browser_session) and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
                 if pages:
                     page = pages[-1]

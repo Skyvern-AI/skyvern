@@ -22,7 +22,9 @@ export function RunTab() {
   const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
   const setCopilotCollapsed = useStudioShellStore((s) => s.setCopilotCollapsed);
-  const { data: runs } = useWorkflowRunsQuery({
+  // isPending (not isLoading) stays true while the query is disabled waiting for
+  // globalWorkflows, so the empty state can't flash before the run lookup settles.
+  const { data: runs, isPending: runsPending } = useWorkflowRunsQuery({
     workflowPermanentId,
     page: 1,
     pageSize: 1,
@@ -35,11 +37,12 @@ export function RunTab() {
   return (
     <RunView
       workflowRunId={runId}
+      runIdPending={!urlRunId && runsPending}
       onFix={(seedMessage) => {
         // Seed via location.state (Workspace reads it as the copilot's initialMessage);
         // replace so Fix adds no Back-able entry and the message can't re-fire on Back.
         navigate(`${location.pathname}${location.search}`, {
-          state: { copilotMessage: seedMessage },
+          state: { copilotMessage: seedMessage, copilotFixOrigin: true },
           replace: true,
         });
         setCopilotCollapsed(false);

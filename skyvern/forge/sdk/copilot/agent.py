@@ -262,6 +262,7 @@ class RequestPolicyGuardrailInputs:
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
+    fix_origin: bool = False
     stored_completion_criteria: StoredCriteriaSnapshot | None = None
 
 
@@ -456,6 +457,7 @@ def _store_request_policy_on_context(
         workflow_run_id=policy_inputs.workflow_run_id,
         browser_session_id=policy_inputs.browser_session_id,
         classifier_result=turn_intent_classifier_result,
+        fix_origin=policy_inputs.fix_origin,
     )
 
 
@@ -1177,6 +1179,8 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
 def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
     if artifact_health_blocked(ctx):
         return False
+    if outcome_fully_verified(ctx):
+        return True
     result = ctx.completion_verification_result
     if result is None:
         return True
@@ -3778,6 +3782,7 @@ async def _run_copilot_turn_impl(
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
+        fix_origin=getattr(chat_request, "fix_origin", False),
         stored_completion_criteria=stored_completion_criteria,
     )
     request_policy_guardrails = _build_copilot_input_guardrails(
