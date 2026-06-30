@@ -427,6 +427,18 @@ async def _save_adopted_session_download(
             exc_info=True,
         )
 
+    # Ordering: ``save_as`` above has already run and failed (empty or raised).
+    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
+    # the scheme), so route them through an in-page fetch from a same-origin frame.
+    if download.url.startswith("blob:"):
+        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+            page=page, blob_url=download.url, workflow_run_id=workflow_run_id
+        )
+        if blob_bytes is None:
+            return None
+        download_target.write_bytes(blob_bytes)
+        return download_target
+
     try:
         response = await page.context.request.get(download.url)
         if response.status != 200:
