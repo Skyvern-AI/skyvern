@@ -2704,14 +2704,27 @@ async def handle_input_text_action(
     if not await skyvern_element.is_spinbtn_input() and (
         current_text or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
     ):
+        is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
             LOG.info("None input tag clear timeout", action=action)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+            return [
+                ActionFailure(
+                    InvalidElementForTextInput(
+                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                    )
+                )
+            ]
 
     # wait for blocking element to show up
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
