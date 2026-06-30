@@ -22,7 +22,8 @@ import { RunHero } from "./RunHero";
 
 const baseProps = {
   workflowRunId: "wr_1",
-  shownFrame: null,
+  heroSelection: null,
+  heroLabel: "",
   running: true,
   provisioning: false,
   isPaused: false,
