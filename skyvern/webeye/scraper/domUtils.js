@@ -927,6 +927,58 @@ function isInteractableInput(element, hoverStylesMap) {
   return isHoverPointerElement(element, hoverStylesMap) || type !== "hidden";
 }
 
+function isDatepickerNavigationElement(element) {
+  if (element.tagName.toLowerCase() !== "th") {
+    return false;
+  }
+
+  const classNames = (element.className?.toString().toLowerCase() ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  const ariaDisabled =
+    element.getAttribute?.("aria-disabled")?.toLowerCase() === "true";
+  if (element.disabled || ariaDisabled || classNames.includes("disabled")) {
+    return false;
+  }
+
+  let current = element.parentElement;
+  let hasDatepickerAncestor = false;
+  const maxDatepickerAncestorDepth = 25;
+  for (let depth = 0; current && depth < maxDatepickerAncestorDepth; depth++) {
+    const ancestorClassNames = (
+      current.className?.toString().toLowerCase() ?? ""
+    )
+      .split(/\s+/)
+      .filter(Boolean);
+    if (
+      ancestorClassNames.some(
+        (name) =>
+          name === "datepicker" ||
+          name.startsWith("datepicker-") ||
+          name === "bootstrap-datepicker",
+      )
+    ) {
+      hasDatepickerAncestor = true;
+      break;
+    }
+    current = current.parentElement;
+  }
+  if (!hasDatepickerAncestor) {
+    return false;
+  }
+
+  if (
+    classNames.some((name) =>
+      ["prev", "next", "datepicker-switch"].includes(name),
+    )
+  ) {
+    return true;
+  }
+
+  const text = (element.textContent || "").trim();
+  return ["«", "»", "‹", "›"].includes(text);
+}
+
 function isValidCSSSelector(selector) {
   try {
     document.querySelector(selector);
@@ -971,6 +1023,10 @@ function isInteractable(element, hoverStylesMap) {
   }
 
   const tagName = element.tagName.toLowerCase();
+  if (isDatepickerNavigationElement(element)) {
+    return true;
+  }
+
   if (tagName === "html") {
     return false;
   }
