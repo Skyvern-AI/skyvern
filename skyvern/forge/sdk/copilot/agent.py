@@ -2672,6 +2672,22 @@ async def _translate_to_agent_result(
         note = detail if not contains_internal_machinery_leak(detail) else _INLINE_REJECT_NOTE_FALLBACK
         return f"{response}\n\n(Note: {note})"
 
+    turn_intent = ctx.turn_intent if isinstance(ctx.turn_intent, TurnIntent) else None
+    may_update_workflow = turn_intent is None or turn_intent.authority.may_update_workflow
+    if resp_type == "REPLACE_WORKFLOW" and turn_intent is not None and not turn_intent.authority.may_update_workflow:
+        # A no-mutation turn (e.g. DIAGNOSE) must not stage a draft even via an inline REPLACE_WORKFLOW, which
+        # bypasses the may_update_workflow=False authority enforced on the update_workflow tool. Downgrade to a
+        # REPLY so the diagnosis still lands but no edit is staged; the user applies it on a follow-up edit turn.
+        LOG.info(
+            "copilot suppressed inline REPLACE_WORKFLOW on no-mutation turn",
+            turn_intent_mode=turn_intent.mode.value,
+        )
+        user_response = _with_inline_reject_note(
+            user_response,
+            "Diagnosing a failed run doesn't edit the workflow on its own — confirm and I'll apply the change.",
+        )
+        resp_type = "REPLY"
+
     if resp_type == "REPLACE_WORKFLOW":
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
@@ -2774,9 +2790,15 @@ async def _translate_to_agent_result(
     # never run, so a leftover ``last_test_ok is True`` from an earlier tested
     # (but different) yaml must not promote this untested one.
     # ``blocker_active`` should already have rewritten resp_type away from
-    # REPLACE_WORKFLOW above; explicit guard here defends against future
-    # refactors that re-emit REPLACE_WORKFLOW post-rendering.
-    if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow and not blocker_active:
+    # REPLACE_WORKFLOW above, and a no-mutation turn was downgraded to REPLY;
+    # the explicit guards here defend against future refactors that re-emit
+    # REPLACE_WORKFLOW post-rendering or bypass the downgrade.
+    if (
+        resp_type == "REPLACE_WORKFLOW"
+        and last_workflow is not ctx.last_workflow
+        and not blocker_active
+        and may_update_workflow
+    ):
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
