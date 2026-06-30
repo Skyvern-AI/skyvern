@@ -1798,7 +1798,12 @@ export function WorkflowCopilotChat({
     if (!initialMessage || hasAutoSentRef.current) {
       return;
     }
-    if (isLoadingHistory || isWaitingForLiveBrowser || queuedPrompt) {
+    if (
+      isLoadingHistory ||
+      isLoading ||
+      isWaitingForLiveBrowser ||
+      queuedPrompt
+    ) {
       return;
     }
     const saveData = getSaveData();
@@ -1822,6 +1827,7 @@ export function WorkflowCopilotChat({
   }, [
     initialMessage,
     isLoadingHistory,
+    isLoading,
     isWaitingForLiveBrowser,
     queuedPrompt,
     getSaveData,
