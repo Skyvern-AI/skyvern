@@ -29,11 +29,11 @@ import {
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
-import { RunDetailsButton } from "./RunDetailsButton";
 import { RunHero } from "./RunHero";
 import { buildRunFixMessage } from "./runFixMessage";
-import { RunInputsButton, type RunInputMeta } from "./RunInputsButton";
-import { RunOutputsButton, type RunOutputFile } from "./RunOutputsButton";
+import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
+import { RunOutputsSection, type RunOutputFile } from "./RunOutputsSection";
+import { RunOverviewButton } from "./RunOverviewButton";
 import { RunPlaceholder } from "./RunPlaceholder";
 
 type RunViewProps = {
@@ -69,6 +69,7 @@ export function RunView({
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
+  const headerCompact = useRunViewStore((s) => s.headerCompact);
   const studioTab = useStudioShellStore((s) => s.tab);
   const [searchParams, setSearchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
@@ -77,6 +78,7 @@ export function RunView({
   const apiCredential = useApiCredential();
   const [activeIteration, setActiveIteration] = useState<number | null>(null);
   const [replayOpen, setReplayOpen] = useState(false);
+  const [outputSummary, setOutputSummary] = useState<string | null>(null);
 
   const recordingUrls = useMemo(
     () => getRecordingUrls(workflowRun),
@@ -101,6 +103,7 @@ export function RunView({
   // from ?active= to restore a deep-linked selection.
   useEffect(() => {
     resetRunView();
+    setOutputSummary(null);
     const active = searchParamsRef.current.get("active");
     if (active) {
       pinFrame(active);
@@ -226,11 +229,6 @@ export function RunView({
     }));
   }, [workflowRun]);
 
-  const hasOutputs =
-    (extractedInformation != null &&
-      Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0;
-
   const runInputs = useMemo(() => {
     const definitionParameters =
       workflowRun?.workflow?.workflow_definition?.parameters;
@@ -258,6 +256,13 @@ export function RunView({
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
     return { parameters, meta };
   }, [workflowRun]);
+
+  const hasInputs =
+    runInputs.parameters.length > 0 || runInputs.meta.length > 0;
+  const hasOutputs =
+    (extractedInformation != null &&
+      Object.values(extractedInformation).some((value) => value !== null)) ||
+    downloadedFiles.length > 0;
 
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
@@ -290,31 +295,36 @@ export function RunView({
             browserSessionId={workflowRun.browser_session_id ?? null}
             recordingUrls={recordingUrls}
             elapsed={elapsed}
-            details={
-              <RunDetailsButton
-                workflowRunId={workflowRun.workflow_run_id}
+            overview={
+              <RunOverviewButton
                 status={workflowRun.status}
+                elapsed={elapsed}
                 startedAt={workflowRun.started_at ?? null}
                 finishedAt={workflowRun.finished_at ?? null}
                 failureReason={workflowRun.failure_reason ?? null}
                 failureCategory={workflowRun.failure_category ?? null}
+                workflowRunId={workflowRun.workflow_run_id}
                 browserSessionId={workflowRun.browser_session_id ?? null}
                 browserProfileId={workflowRun.browser_profile_id ?? null}
               />
             }
             inputs={
-              <RunInputsButton
-                parameters={runInputs.parameters}
-                meta={runInputs.meta}
-              />
+              hasInputs ? (
+                <RunInputsSection
+                  parameters={runInputs.parameters}
+                  meta={runInputs.meta}
+                />
+              ) : undefined
             }
             outputs={
               hasOutputs ? (
-                <RunOutputsButton
+                <RunOutputsSection
                   workflowRunId={workflowRun.workflow_run_id}
                   workflowTitle={workflowRun.workflow?.title}
                   extractedInformation={extractedInformation}
                   files={downloadedFiles}
+                  summary={outputSummary}
+                  onSummary={setOutputSummary}
                 />
               ) : undefined
             }
@@ -324,6 +334,8 @@ export function RunView({
                   trigger={
                     <button
                       type="button"
+                      title={headerCompact ? "API & Webhooks" : undefined}
+                      aria-label="API & Webhooks"
                       className={cn(
                         "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium",
                         "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
@@ -331,7 +343,7 @@ export function RunView({
                       )}
                     >
                       <Share1Icon className="h-4 w-4" />
-                      API & Webhooks
+                      {headerCompact ? null : "API & Webhooks"}
                     </button>
                   }
                   getOptions={() => {
