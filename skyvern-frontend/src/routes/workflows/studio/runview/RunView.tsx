@@ -8,6 +8,11 @@ import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { statusIsFinalized } from "@/routes/tasks/types";
+import {
+  isAction,
+  isObserverThought,
+  isWorkflowRunBlock,
+} from "@/routes/workflows/types/workflowRunTypes";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
@@ -22,14 +27,20 @@ import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { pickDownloadedFileFilename } from "../../workflowRun/blockDownloadedFiles";
 import { getRecordingUrls } from "../../workflowRun/recordingUrls";
-import { findActiveItem } from "../../workflowRun/workflowTimelineUtils";
+import {
+  findActiveItem,
+  findTimelineBlock,
+  resolveScreenshotBlockId,
+} from "../../workflowRun/workflowTimelineUtils";
 import { getOrderedRunParameters } from "../../utils";
 import {
+  actionLabel,
   buildFilmstrip,
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
 import { RunHero } from "./RunHero";
+import { type HeroSelection } from "./HeroScreenshot";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
 import { RunOutputsSection, type RunOutputFile } from "./RunOutputsSection";
@@ -190,10 +201,6 @@ export function RunView({
   );
 
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
-  const shownFrame =
-    (pinnedFrameId ? frames.find((f) => f.id === pinnedFrameId) : undefined) ??
-    lastFrame ??
-    null;
 
   const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const finallyBlockLabel =
@@ -205,6 +212,47 @@ export function RunView({
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
     [timeline, selectedId, finalized, finallyBlockLabel],
   );
+
+  // Mirror the legacy run page: an action shows its own screenshot, a block shows
+  // its representative screenshot (a loop/conditional container resolves to its leaf).
+  const heroSelection = useMemo<HeroSelection | null>(() => {
+    if (isAction(activeItem)) {
+      return {
+        kind: "action",
+        artifactId: activeItem.screenshot_artifact_id ?? null,
+        stepId: activeItem.step_id ?? null,
+        actionOrder: activeItem.action_order ?? null,
+      };
+    }
+    if (isWorkflowRunBlock(activeItem)) {
+      const screenshotBlockId = resolveScreenshotBlockId(
+        timeline ?? [],
+        activeItem,
+        activeIteration,
+      );
+      const blockType =
+        findTimelineBlock(timeline ?? [], screenshotBlockId)?.block_type ??
+        activeItem.block_type ??
+        null;
+      return {
+        kind: "block",
+        workflowRunBlockId: screenshotBlockId,
+        blockType,
+      };
+    }
+    if (isObserverThought(activeItem)) {
+      return { kind: "thought", thoughtId: activeItem.thought_id };
+    }
+    return null;
+  }, [activeItem, timeline, activeIteration]);
+
+  const heroLabel = isAction(activeItem)
+    ? actionLabel(activeItem)
+    : isWorkflowRunBlock(activeItem)
+      ? (activeItem.label ?? "Screenshot")
+      : isObserverThought(activeItem)
+        ? (activeItem.thought ?? "Thought")
+        : "Screenshot";
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
     const outputs = workflowRun?.outputs;
@@ -282,7 +330,8 @@ export function RunView({
           />
           <RunHero
             workflowRunId={workflowRun.workflow_run_id}
-            shownFrame={shownFrame}
+            heroSelection={heroSelection}
+            heroLabel={heroLabel}
             running={running}
             showDebugStream={showDebugStream}
             provisioning={

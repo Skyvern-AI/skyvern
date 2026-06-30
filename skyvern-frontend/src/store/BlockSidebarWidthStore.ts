@@ -3,7 +3,12 @@ import { persist, createJSONStorage } from "zustand/middleware";
 
 export const BLOCK_SIDEBAR_WIDTH_MIN = 320;
 export const BLOCK_SIDEBAR_WIDTH_MAX = 640;
-export const BLOCK_SIDEBAR_WIDTH_DEFAULT = 360;
+// Matches the Copilot column (STUDIO_COPILOT_WIDTH) so the two studio rails open
+// to the same width; still drag-resizable within MIN/MAX.
+export const BLOCK_SIDEBAR_WIDTH_DEFAULT = 450;
+// The pre-v1 default; v0 sessions that never customized the width hold this, and
+// should move to the new default rather than keep the old narrower one.
+const BLOCK_SIDEBAR_WIDTH_OLD_DEFAULT = 360;
 export const BLOCK_SIDEBAR_WIDTH_STORAGE_KEY = "skyvern.blockSidebarWidth";
 
 type BlockSidebarWidthStore = {
@@ -45,6 +50,19 @@ const useBlockSidebarWidthStore = create<BlockSidebarWidthStore>()(
       name: BLOCK_SIDEBAR_WIDTH_STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({ width: state.width }),
+      // Bumped when the default changed 360 -> 450 (match the Copilot column).
+      // Move the old default (and any out-of-range value) to the new default,
+      // but keep a width the user deliberately dragged within range.
+      version: 1,
+      migrate: (persisted) => {
+        const prev = (persisted as { width?: number } | null)?.width;
+        const keep =
+          typeof prev === "number" &&
+          prev !== BLOCK_SIDEBAR_WIDTH_OLD_DEFAULT &&
+          prev >= BLOCK_SIDEBAR_WIDTH_MIN &&
+          prev <= BLOCK_SIDEBAR_WIDTH_MAX;
+        return { width: keep ? prev : BLOCK_SIDEBAR_WIDTH_DEFAULT };
+      },
     },
   ),
 );

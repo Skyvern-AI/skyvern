@@ -16,15 +16,15 @@ import { useRunViewStore } from "@/store/RunViewStore";
 import { cn } from "@/util/utils";
 
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
-import { FilmstripFrame } from "../runProjections";
 import { useStudioShellContext } from "../StudioShellContext";
 import { HeroRecording } from "./HeroRecording";
-import { HeroScreenshot } from "./HeroScreenshot";
+import { HeroScreenshot, type HeroSelection } from "./HeroScreenshot";
 import { RunLiveStream } from "./RunLiveStream";
 
 type RunHeroProps = {
   workflowRunId: string;
-  shownFrame: FilmstripFrame | null;
+  heroSelection: HeroSelection | null;
+  heroLabel: string;
   running: boolean;
   // A block run shows the shared debug-session stream (re-parented in by the
   // shell), view-only, instead of mounting a separate run stream.
@@ -92,7 +92,8 @@ function ViewToggle({
 
 export function RunHero({
   workflowRunId,
-  shownFrame,
+  heroSelection,
+  heroLabel,
   running,
   showDebugStream,
   provisioning,
@@ -185,7 +186,7 @@ export function RunHero({
             ? "Inputs"
             : center === "outputs"
               ? "Outputs"
-              : (shownFrame?.label ?? "Screenshot");
+              : (heroLabel ?? "Screenshot");
 
   const headerIcon =
     center === "recording" ? (
@@ -355,23 +356,19 @@ export function RunHero({
             recordingUrls={recordingUrls}
             onPlay={onRecordingPlay}
           />
-        ) : shownFrame ? (
-          <HeroScreenshot
-            workflowRunBlockId={shownFrame.blockId}
-            blockType={shownFrame.blockType}
-            running={running}
-          />
+        ) : heroSelection ? (
+          <HeroScreenshot selection={heroSelection} running={running} />
         ) : (
           <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
             Waiting for the first action…
           </div>
         )}
 
-        {center === "screenshot" && scrubbing && shownFrame ? (
+        {center === "screenshot" && scrubbing && heroSelection ? (
           <div className="absolute left-3 top-3 flex max-w-[26rem] items-center gap-2 rounded-md bg-black/70 px-3 py-1.5 text-xs text-white backdrop-blur">
             <CounterClockwiseClockIcon className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">
-              Inspecting step · <b>{shownFrame.label}</b>
+              Inspecting · <b>{heroLabel}</b>
             </span>
             {running || showDebugStream ? (
               <button
