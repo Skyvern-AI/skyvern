@@ -422,6 +422,93 @@ function getActionOutputValue(action: ActionsApiResponse): unknown {
   return action.response;
 }
 
+function isSameStepInstance(
+  previousAction: ActionsApiResponse | null,
+  action: ActionsApiResponse,
+): boolean {
+  if (!previousAction) return false;
+  if (previousAction.step_id && action.step_id) {
+    return previousAction.step_id === action.step_id;
+  }
+  if (
+    previousAction.step_order == null ||
+    action.step_order == null ||
+    previousAction.step_order !== action.step_order
+  ) {
+    return false;
+  }
+  if (previousAction.action_order != null && action.action_order != null) {
+    return action.action_order > previousAction.action_order;
+  }
+  return true;
+}
+
+function getActionStepIndex(
+  actions: Array<ActionsApiResponse> | null,
+  selectedAction: ActionsApiResponse,
+): number | null {
+  const selectedStepOrder = selectedAction.step_order;
+  if (selectedStepOrder == null) return null;
+
+  const selectedActionIndex =
+    actions?.findIndex(
+      (action) => action.action_id === selectedAction.action_id,
+    ) ?? -1;
+  if (!actions || selectedActionIndex === -1) {
+    return selectedStepOrder;
+  }
+
+  const seenStepOrders = new Set<number>();
+  const previousActionByStepOrder = new Map<number, ActionsApiResponse>();
+  let retryOffset = 0;
+
+  for (let index = 0; index <= selectedActionIndex; index += 1) {
+    const action = actions[index];
+    if (
+      !action ||
+      action.step_order == null ||
+      action.step_order > selectedStepOrder
+    ) {
+      continue;
+    }
+
+    const previousAction =
+      previousActionByStepOrder.get(action.step_order) ?? null;
+    if (!isSameStepInstance(previousAction, action)) {
+      if (seenStepOrders.has(action.step_order)) {
+        retryOffset += 1;
+      } else {
+        seenStepOrders.add(action.step_order);
+      }
+    }
+    previousActionByStepOrder.set(action.step_order, action);
+  }
+
+  return selectedStepOrder + retryOffset;
+}
+
+function getDiagnosticsPath(
+  taskId: string,
+  action?: ActionsApiResponse | null,
+  stepIndex?: number | null,
+): string {
+  const searchParams = new URLSearchParams();
+  if (action?.step_id) {
+    searchParams.set("step_id", action.step_id);
+  }
+
+  if (stepIndex != null) {
+    searchParams.set("step", String(stepIndex));
+  } else if (action?.step_order != null) {
+    searchParams.set("step", String(action.step_order));
+  }
+
+  const query = searchParams.toString();
+  return query
+    ? `/tasks/${taskId}/diagnostics?${query}`
+    : `/tasks/${taskId}/diagnostics`;
+}
+
 function BlockInspector({
   block,
   action,
@@ -453,6 +540,10 @@ function BlockInspector({
     : "Outputs";
   const defaultTab = hasOutput ? "outputs" : "summary";
   const [activeTab, setActiveTab] = useState(defaultTab);
+  const diagnosticsTaskId = action?.task_id ?? block.task_id;
+  const diagnosticsStepIndex = action
+    ? getActionStepIndex(block.actions, action)
+    : null;
   const triggerClassName =
     "rounded px-2.5 py-1 text-xs font-medium text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200 data-[state=active]:bg-slate-elevation4 data-[state=active]:text-slate-50 data-[state=active]:shadow-sm";
 
@@ -484,9 +575,13 @@ function BlockInspector({
           >
             {outputTabLabel}
           </TabsTrigger>
-          {block.task_id && (
+          {diagnosticsTaskId && (
             <Link
-              to={`/tasks/${block.task_id}/diagnostics`}
+              to={getDiagnosticsPath(
+                diagnosticsTaskId,
+                action,
+                diagnosticsStepIndex,
+              )}
               title="Go to diagnostics"
               onClick={(event) => event.stopPropagation()}
               className={cn(
