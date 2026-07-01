@@ -291,6 +291,10 @@ class Settings(BaseSettings):
     # session. Bounds the per-action enrichment fan-out so a burst of interactions
     # can't flood the event loop with simultaneous LLM requests.
     RECORDING_ENRICHMENT_MAX_CONCURRENCY: int = 4
+    # LLM used to enrich live recording draft steps (label/title/goal). A fast, cheap
+    # model keeps the click->labeled-draft latency low. Falls back to the default
+    # LLM_API_HANDLER when the key is unset or not registered in this environment.
+    RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False

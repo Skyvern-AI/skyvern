@@ -38,8 +38,8 @@ from skyvern.services.browser_recording.types import (
 
 LOG = structlog.get_logger(__name__)
 
-INTERPRETATION_DEBOUNCE_SECONDS = 0.4
-INTERPRETATION_MAX_WAIT_SECONDS = 2.0
+INTERPRETATION_DEBOUNCE_SECONDS = 0.15
+INTERPRETATION_MAX_WAIT_SECONDS = 0.8
 # events_to_actions is pure CPU and runs on the event loop; log when a single pass
 # is slow enough to risk starving the raw-event/WebSocket path so we can decide
 # whether to offload it to a thread.
