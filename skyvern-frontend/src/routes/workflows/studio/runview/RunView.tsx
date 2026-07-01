@@ -458,14 +458,22 @@ export function RunView({
                 hideLiveBadge
                 activeItem={activeItem}
                 activeIteration={activeIteration}
-                onActionItemSelected={(item) => pinFrame(item.action.action_id)}
-                onBlockItemSelected={(block) =>
-                  pinFrame(block.workflow_run_block_id)
-                }
-                onThoughtItemSelected={(thought) =>
-                  pinFrame(thought.thought_id)
-                }
-                onLiveStreamSelected={() => pinFrame("stream")}
+                onActionItemSelected={(item) => {
+                  setActiveIteration(null);
+                  pinFrame(item.action.action_id);
+                }}
+                onBlockItemSelected={(block) => {
+                  setActiveIteration(null);
+                  pinFrame(block.workflow_run_block_id);
+                }}
+                onThoughtItemSelected={(thought) => {
+                  setActiveIteration(null);
+                  pinFrame(thought.thought_id);
+                }}
+                onLiveStreamSelected={() => {
+                  setActiveIteration(null);
+                  pinFrame("stream");
+                }}
                 onIterationSelected={(loopBlock, iterationIndex) => {
                   setActiveIteration(iterationIndex);
                   pinFrame(loopBlock.workflow_run_block_id);
@@ -480,7 +488,6 @@ export function RunView({
                 timelineReady={Boolean(timeline)}
                 showDownloadedFiles
                 workflowRunId={workflowRunId}
-                onActionSelect={(payload) => pinFrame(payload.action.action_id)}
                 onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
               />
             </div>

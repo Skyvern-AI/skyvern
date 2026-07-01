@@ -6,6 +6,11 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import {
+  ActionTypes,
+  getReadableActionType,
+  type ActionsApiResponse,
+} from "@/api/types";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/util/utils";
@@ -369,15 +374,80 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   return fields;
 }
 
-function BlockInspector({ block }: { block: WorkflowRunBlock }) {
-  const inputFields = useMemo(() => getInputFields(block), [block]);
-  const summaryFields = useMemo(() => getSummaryFields(block), [block]);
-  const outputValue = getOutputValue(block);
-  const showsExtractedInformation = shouldShowExtractedInformation(block);
+function getActionInputValue(action: ActionsApiResponse): string | null {
+  // Mirror ActionCardCompact: script-generated input text lives in response.
+  if (action.action_type === ActionTypes.InputText) {
+    return action.text ?? action.response;
+  }
+  return action.text;
+}
+
+function getActionInputFields(
+  action: ActionsApiResponse,
+): Array<InspectorField> {
+  const fields: Array<InspectorField> = [];
+  pushField(fields, "Input", getActionInputValue(action));
+  return fields;
+}
+
+function getActionSummaryFields(
+  action: ActionsApiResponse,
+): Array<InspectorField> {
+  const fields: Array<InspectorField> = [];
+  pushField(fields, "Type", getReadableActionType(action.action_type));
+  pushField(fields, "Status", action.status);
+  pushField(
+    fields,
+    "Confidence",
+    action.confidence_float != null
+      ? `${Math.round(action.confidence_float * 100)}%`
+      : null,
+  );
+  pushField(fields, "Reasoning", action.reasoning);
+  pushField(fields, "Intention", action.intention);
+  return fields;
+}
+
+function getActionOutputValue(action: ActionsApiResponse): unknown {
+  // response doubles as stored input only for input-text actions — don't echo
+  // it back as output there. Other action types legitimately carry their
+  // result in response even when it equals text, so never suppress for them.
+  if (
+    action.action_type === ActionTypes.InputText &&
+    typeof action.response === "string" &&
+    action.response === getActionInputValue(action)
+  ) {
+    return null;
+  }
+  return action.response;
+}
+
+function BlockInspector({
+  block,
+  action,
+}: {
+  block: WorkflowRunBlock;
+  action?: ActionsApiResponse | null;
+}) {
+  const inputFields = useMemo(
+    () => (action ? getActionInputFields(action) : getInputFields(block)),
+    [action, block],
+  );
+  const summaryFields = useMemo(
+    () => (action ? getActionSummaryFields(action) : getSummaryFields(block)),
+    [action, block],
+  );
+  const showsExtractedInformation =
+    !action && shouldShowExtractedInformation(block);
+  const outputValue = action
+    ? getActionOutputValue(action)
+    : getOutputValue(block);
   const hasOutput = showsExtractedInformation || !isEmptyValue(outputValue);
   const outputRootLabel = showsExtractedInformation
     ? "extracted_information"
-    : "output";
+    : action
+      ? "response"
+      : "output";
   const outputTabLabel = showsExtractedInformation
     ? "Extracted Information"
     : "Outputs";
@@ -388,7 +458,7 @@ function BlockInspector({ block }: { block: WorkflowRunBlock }) {
 
   useEffect(() => {
     setActiveTab(defaultTab);
-  }, [block.workflow_run_block_id, defaultTab]);
+  }, [block.workflow_run_block_id, action?.action_id, defaultTab]);
 
   return (
     <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-3">
