@@ -116,6 +116,11 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.validation_evidence_router import (
+    ValidationRouterMode,
+    ValidationRouterResult,
+    route_validation_evidence,
+)
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
@@ -167,6 +172,7 @@ from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 LOG = structlog.get_logger()
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
+DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
 
 
 def should_auto_download_pdf(pdf_src: str) -> bool:
@@ -350,6 +356,71 @@ def _build_totp_timeout_reasoning(task: Task) -> str:
     else:
         polled = f"totp_identifier={task.totp_identifier}"
     return f"No TOTP verification code found. Going to terminate. Polled source: {polled}."
+
+
+VALIDATION_EVIDENCE_ROUTER_MODE_FLAG = "VALIDATION_EVIDENCE_ROUTER_MODE"
+DEFAULT_VALIDATION_ROUTER_MIN_CONFIDENCE = 0.90
+
+
+async def resolve_validation_evidence_route(
+    task: Task,
+    step: Step | None,
+    complete_criterion: str | None,
+    terminate_criterion: str | None,
+    navigation_payload_str: str,
+    error_code_mapping_str: str | None,
+    local_datetime: str,
+) -> ValidationRouterResult:
+    try:
+        mode_value = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+            VALIDATION_EVIDENCE_ROUTER_MODE_FLAG,
+            task.workflow_run_id or task.task_id,
+            properties={"organization_id": task.organization_id},
+        )
+    except Exception:
+        LOG.warning("VALIDATION_EVIDENCE_ROUTER_MODE flag read failed, defaulting to off", exc_info=True)
+        mode_value = "off"
+
+    mode_str = str(mode_value).strip().lower() if mode_value else "off"
+    try:
+        mode = ValidationRouterMode(mode_str)
+    except ValueError:
+        LOG.warning(
+            "Unrecognized VALIDATION_EVIDENCE_ROUTER_MODE value; defaulting to off",
+            mode_str=mode_str,
+        )
+        mode = ValidationRouterMode.OFF
+
+    min_confidence = DEFAULT_VALIDATION_ROUTER_MIN_CONFIDENCE
+
+    return await route_validation_evidence(
+        complete_criterion=complete_criterion,
+        terminate_criterion=terminate_criterion,
+        navigation_payload_str=navigation_payload_str,
+        error_code_mapping_str=error_code_mapping_str,
+        local_datetime=local_datetime,
+        mode=mode,
+        min_confidence=min_confidence,
+        llm_handler=app.SECONDARY_LLM_API_HANDLER,
+        step=step,
+    )
+
+
+@dataclass(frozen=True)
+class PromptBuildResult:
+    prompt: str
+    use_caching: bool
+    prompt_name: str
+    without_page_information: bool
+
+
+@dataclass(frozen=True)
+class StepPromptResult:
+    scraped_page: ScrapedPage
+    extract_action_prompt: str
+    use_caching: bool
+    prompt_name: str
+    without_page_information: bool
 
 
 class ForgeAgent:
@@ -1393,6 +1464,7 @@ class ForgeAgent:
             speculative_plan: SpeculativePlan | None = None
             reuse_speculative_llm_response = False
             speculative_llm_metadata: SpeculativeLLMMetadata | None = None
+            without_page_information = False
             is_extraction_task = not task.navigation_goal and not isinstance(task_block, ValidationBlock)
             if context:
                 speculative_plan = context.speculative_plans.pop(step.step_id, None)
@@ -1419,17 +1491,17 @@ class ForgeAgent:
                     )
                     prefetched_summary_task.add_done_callback(_discard_background_task_result)
 
-                (
-                    scraped_page,
-                    extract_action_prompt,
-                    use_caching,
-                    prompt_name,
-                ) = await self.build_and_record_step_prompt(
+                step_prompt = await self.build_and_record_step_prompt(
                     task,
                     step,
                     browser_state,
                     engine,
                 )
+                scraped_page = step_prompt.scraped_page
+                extract_action_prompt = step_prompt.extract_action_prompt
+                use_caching = step_prompt.use_caching
+                prompt_name = step_prompt.prompt_name
+                without_page_information = step_prompt.without_page_information
                 json_response = None
 
             detailed_agent_step_output.scraped_page = scraped_page
@@ -1515,7 +1587,7 @@ class ForgeAgent:
                             prompt=extract_action_prompt,
                             prompt_name=prompt_name,
                             step=step,
-                            screenshots=scraped_page.screenshots,
+                            screenshots=[] if without_page_information else scraped_page.screenshots,
                             system_prompt=task.workflow_system_prompt,
                         )
                     else:
@@ -2549,13 +2621,18 @@ class ForgeAgent:
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
 
-            scraped_page, extract_action_prompt, use_caching, prompt_name = await self.build_and_record_step_prompt(
+            step_prompt = await self.build_and_record_step_prompt(
                 task,
                 next_step,
                 browser_state,
                 engine,
                 persist_artifacts=False,
             )
+            scraped_page = step_prompt.scraped_page
+            extract_action_prompt = step_prompt.extract_action_prompt
+            use_caching = step_prompt.use_caching
+            prompt_name = step_prompt.prompt_name
+            without_page_information = step_prompt.without_page_information
 
             if scraped_page.check_pdf_viewer_embed():
                 next_step.is_speculative = False
@@ -2573,7 +2650,7 @@ class ForgeAgent:
                 prompt=extract_action_prompt,
                 prompt_name=prompt_name,
                 step=next_step,
-                screenshots=scraped_page.screenshots,
+                screenshots=[] if without_page_information else scraped_page.screenshots,
                 system_prompt=task.workflow_system_prompt,
             )
 
@@ -3272,7 +3349,7 @@ class ForgeAgent:
         engine: RunEngine,
         *,
         persist_artifacts: bool = True,
-    ) -> tuple[ScrapedPage, str, bool, str]:
+    ) -> StepPromptResult:
         _scrape_span = otel_trace.get_current_span()
         _scrape_span.set_attribute("engine", str(engine))
         _scrape_span.set_attribute("pre_scraped", False)
@@ -3418,8 +3495,9 @@ class ForgeAgent:
         )
         extract_action_prompt = ""
         prompt_name = EXTRACT_ACTION_PROMPT_NAME  # Default; overwritten below for non-CUA engines
+        without_page_information = False
         if engine not in CUA_ENGINES:
-            extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
+            build_result = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
@@ -3427,11 +3505,21 @@ class ForgeAgent:
                 verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
                 expire_verification_code=True,
             )
+            extract_action_prompt = build_result.prompt
+            use_caching = build_result.use_caching
+            prompt_name = build_result.prompt_name
+            without_page_information = build_result.without_page_information
 
         _scrape_span.set_attribute("element_count", len(scraped_page.elements))
         _scrape_span.set_attribute("prompt_name", prompt_name)
         _scrape_span.set_attribute("use_caching", bool(use_caching))
-        return scraped_page, extract_action_prompt, use_caching, prompt_name
+        return StepPromptResult(
+            scraped_page=scraped_page,
+            extract_action_prompt=extract_action_prompt,
+            use_caching=use_caching,
+            prompt_name=prompt_name,
+            without_page_information=without_page_information,
+        )
 
     @traced(name="skyvern.agent.persist_artifacts")
     async def _persist_scrape_artifacts(
@@ -3719,7 +3807,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         verification_code_check: bool = False,
         expire_verification_code: bool = False,
-    ) -> tuple[str, bool, str]:
+    ) -> PromptBuildResult:
         actions_and_results_str = await self._get_action_results(task)
 
         # Generate the extract action prompt
@@ -3736,10 +3824,11 @@ class ForgeAgent:
 
         task_type = task.task_type if task.task_type else TaskType.general
         template = ""
+        without_page_information = False
         if task_type == TaskType.general:
             template = EXTRACT_ACTION_TEMPLATE
         elif task_type == TaskType.validation:
-            template = "decisive-criterion-validate"
+            template = DECISIVE_CRITERION_VALIDATE_TEMPLATE
         elif task_type == TaskType.action:
             prompt = prompt_engine.load_prompt(
                 "infer-action-type", navigation_goal=navigation_goal, prompt_name="infer-action-type"
@@ -3776,12 +3865,48 @@ class ForgeAgent:
         if not template:
             raise UnsupportedTaskType(task_type=task_type)
 
+        # Validation evidence router (SKY-10620 Route B)
+        error_code_mapping_str = json.dumps(task.error_code_mapping) if task.error_code_mapping else None
         context = skyvern_context.ensure_context()
+        local_datetime = datetime.now(context.tz_info).isoformat()
+        if task_type == TaskType.validation:
+            router_result = await resolve_validation_evidence_route(
+                task=task,
+                step=step,
+                complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                navigation_payload_str=navigation_payload_str,
+                error_code_mapping_str=error_code_mapping_str,
+                local_datetime=local_datetime,
+            )
+            without_page_information = router_result.effective_without_page_information
+
+            _prompt_build_span = otel_trace.get_current_span()
+            _prompt_build_span.set_attribute("validation.router.mode", str(router_result.mode))
+            _prompt_build_span.set_attribute("validation.router.decision", str(router_result.decision))
+            if router_result.evidence_kind is not None:
+                _prompt_build_span.set_attribute("validation.router.evidence_kind", str(router_result.evidence_kind))
+            if router_result.confidence is not None:
+                _prompt_build_span.set_attribute("validation.router.confidence", float(router_result.confidence))
+            if router_result.failure_reason is not None:
+                _prompt_build_span.set_attribute("validation.router.failure_reason", str(router_result.failure_reason))
+            _prompt_build_span.set_attribute("validation.without_page_information", bool(without_page_information))
+
+            LOG.info(
+                "Validation evidence router decision",
+                task_id=task.task_id,
+                mode=str(router_result.mode),
+                decision=str(router_result.decision),
+                evidence_kind=str(router_result.evidence_kind) if router_result.evidence_kind else None,
+                confidence=router_result.confidence,
+                failure_reason=str(router_result.failure_reason) if router_result.failure_reason else None,
+                without_page_information=without_page_information,
+            )
 
         slim_output = await get_slim_output_template_value(template)
 
         # Reset cached prompt and cache reference by default; we will set them below if caching is enabled.
-        # This prevents extract-action cache from being attached to other prompts like decisive-criterion-validate.
+        # This prevents extract-action cache from being attached to other prompts (e.g. validation).
         context.cached_static_prompt = None
         context.vertex_cache_name = None
 
@@ -3849,6 +3974,10 @@ class ForgeAgent:
             context.format_recent_dialog_messages() if template == EXTRACT_ACTION_TEMPLATE else None
         )
 
+        if template == DECISIVE_CRITERION_VALIDATE_TEMPLATE and cache_enabled:
+            LOG.warning("Prompt caching is not supported for validation prompts; using uncached render")
+            cache_enabled = False
+
         if template == EXTRACT_ACTION_TEMPLATE and cache_enabled:
             try:
                 # Try to load split templates for caching
@@ -3860,10 +3989,8 @@ class ForgeAgent:
                     "data_extraction_goal": task.data_extraction_goal,
                     "enable_new_planner_actions": enable_new_planner_actions,
                     "action_history": actions_and_results_str,
-                    "error_code_mapping_str": (
-                        json.dumps(task.error_code_mapping) if task.error_code_mapping else None
-                    ),
-                    "local_datetime": datetime.now(context.tz_info).isoformat(),
+                    "error_code_mapping_str": error_code_mapping_str,
+                    "local_datetime": local_datetime,
                     "verification_code_check": verification_code_check,
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
@@ -3950,42 +4077,61 @@ class ForgeAgent:
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
                 if recent_dialog_messages_str is not None:
                     context.clear_recent_dialog_messages()
-                return combined_prompt, use_caching, prompt_name
+                return PromptBuildResult(
+                    prompt=combined_prompt,
+                    use_caching=use_caching,
+                    prompt_name=prompt_name,
+                    without_page_information=False,
+                )
 
             except Exception as e:
                 LOG.warning("Failed to load cached prompt templates, falling back to original", error=str(e))
                 # Fall through to original behavior
 
         # Original behavior - load full prompt
-        full_prompt = load_prompt_with_elements(
-            element_tree_builder=scraped_page,
-            prompt_engine=prompt_engine,
-            template_name=template,
-            navigation_goal=navigation_goal,
-            navigation_payload_str=navigation_payload_str,
-            starting_url=starting_url,
-            current_url=current_url,
-            data_extraction_goal=task.data_extraction_goal,
-            enable_new_planner_actions=enable_new_planner_actions,
-            action_history=actions_and_results_str,
-            error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-            local_datetime=datetime.now(context.tz_info).isoformat(),
-            verification_code_check=verification_code_check,
-            complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-            terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-            show_close_page_action=show_close_page_action,
-            show_new_tab_action=show_new_tab_action,
-            show_switch_tab_action=show_switch_tab_action,
-            open_tabs_context=open_tabs_context,
-            recent_dialog_messages_str=recent_dialog_messages_str,
-            llm_screenshots_enabled=llm_screenshots_enabled,
-            enriched_tree_enabled=enriched_tree_enabled,
-            slim_output=slim_output,
-            lean_compress_long_href=False,
-            lean_compress_image_src=context.enable_lean_element_tree,
-            lean_strip_url_query_strings=context.enable_lean_element_tree,
-            lean_compress_nonnavigable_href=context.enable_lean_element_tree,
-        )
+        if template == DECISIVE_CRITERION_VALIDATE_TEMPLATE and without_page_information:
+            full_prompt = prompt_engine.load_prompt(
+                template,
+                navigation_goal=navigation_goal,
+                navigation_payload_str=navigation_payload_str,
+                data_extraction_goal=task.data_extraction_goal,
+                error_code_mapping_str=error_code_mapping_str,
+                local_datetime=local_datetime,
+                complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                without_page_information=True,
+                prompt_name=template,
+            )
+        else:
+            full_prompt = load_prompt_with_elements(
+                element_tree_builder=scraped_page,
+                prompt_engine=prompt_engine,
+                template_name=template,
+                navigation_goal=navigation_goal,
+                navigation_payload_str=navigation_payload_str,
+                starting_url=starting_url,
+                current_url=current_url,
+                data_extraction_goal=task.data_extraction_goal,
+                enable_new_planner_actions=enable_new_planner_actions,
+                action_history=actions_and_results_str,
+                error_code_mapping_str=error_code_mapping_str,
+                local_datetime=local_datetime,
+                verification_code_check=verification_code_check,
+                complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                show_close_page_action=show_close_page_action,
+                show_new_tab_action=show_new_tab_action,
+                show_switch_tab_action=show_switch_tab_action,
+                open_tabs_context=open_tabs_context,
+                recent_dialog_messages_str=recent_dialog_messages_str,
+                llm_screenshots_enabled=llm_screenshots_enabled,
+                enriched_tree_enabled=enriched_tree_enabled,
+                slim_output=slim_output,
+                lean_compress_long_href=False,
+                lean_compress_image_src=context.enable_lean_element_tree,
+                lean_strip_url_query_strings=context.enable_lean_element_tree,
+                lean_compress_nonnavigable_href=context.enable_lean_element_tree,
+            )
 
         # Map template to prompt_name for logging/caching guards
         prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
@@ -4000,7 +4146,12 @@ class ForgeAgent:
         if recent_dialog_messages_str is not None:
             context.clear_recent_dialog_messages()
 
-        return full_prompt, use_caching, prompt_name
+        return PromptBuildResult(
+            prompt=full_prompt,
+            use_caching=use_caching,
+            prompt_name=prompt_name,
+            without_page_information=without_page_information,
+        )
 
     async def _get_prompt_caching_settings(self, context: SkyvernContext) -> dict[str, bool]:
         """
@@ -6008,13 +6159,17 @@ class ForgeAgent:
         current_context = skyvern_context.ensure_context()
         current_context.totp_codes[task.task_id] = otp_value.value
 
-        extract_action_prompt, use_caching, prompt_name = await self._build_extract_action_prompt(
+        build_result = await self._build_extract_action_prompt(
             task,
             step,
             browser_state,
             scraped_page,
             verification_code_check=False,
         )
+        extract_action_prompt = build_result.prompt
+        use_caching = build_result.use_caching
+        prompt_name = build_result.prompt_name
+        without_page_information = build_result.without_page_information
         llm_key_override = task.llm_key
         if await service_utils.is_cua_task(task=task):
             llm_key_override = None
@@ -6030,7 +6185,7 @@ class ForgeAgent:
         return await llm_api_handler(
             prompt=extract_action_prompt,
             step=step,
-            screenshots=scraped_page.screenshots,
+            screenshots=[] if without_page_information else scraped_page.screenshots,
             prompt_name=prompt_name,
             system_prompt=task.workflow_system_prompt,
         )
