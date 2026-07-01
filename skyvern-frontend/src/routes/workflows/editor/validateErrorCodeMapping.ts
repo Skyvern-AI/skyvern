@@ -1,3 +1,5 @@
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
+
 /**
  * Validate an errorCodeMapping JSON string. The value must:
  *   - parse as JSON,
@@ -17,8 +19,13 @@ export function validateErrorCodeMapping(
   let parsed: unknown;
   try {
     parsed = JSON.parse(errorCodeMapping);
-  } catch {
-    errors.push(`${label}: Error messages is not valid JSON.`);
+  } catch (error) {
+    errors.push(
+      `${label}: Error messages are not valid JSON: ${getJsonParseErrorDetail(
+        errorCodeMapping,
+        error,
+      )}`,
+    );
     return errors;
   }
   // `null` is the disabled sentinel — valid.

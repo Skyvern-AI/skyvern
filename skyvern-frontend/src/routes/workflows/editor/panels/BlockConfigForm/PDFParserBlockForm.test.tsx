@@ -154,6 +154,13 @@ describe("PDFParserBlockForm (SKY-93XX)", () => {
     expect(
       (screen.getByTestId("model-select") as HTMLSelectElement).value,
     ).toBe("gpt-4o");
+    const advancedSettings = screen.getByText("Advanced Settings");
+    fireEvent.click(advancedSettings);
+    expect(
+      advancedSettings.compareDocumentPosition(
+        screen.getByText("Ignore System Prompt"),
+      ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   test("editing fileUrl propagates via updateNodeData", () => {

@@ -1,4 +1,5 @@
 import { TSON } from "@/util/tson";
+import { getInvalidJsonMessage } from "@/util/jsonParseError";
 
 // URL Validation Helper
 export function validateUrl(url: string): { valid: boolean; message: string } {
@@ -31,7 +32,13 @@ export function validateJson(value: string): {
   // First check: does it pass TSON (template-aware) parsing?
   const tsonResult = TSON.parse(trimmed);
   if (!tsonResult.success) {
-    return { valid: false, message: tsonResult.error || "Invalid JSON" };
+    return {
+      valid: false,
+      message: getInvalidJsonMessage(
+        trimmed,
+        tsonResult.error || "Parse error",
+      ),
+    };
   }
 
   // Second check: does it also pass strict JSON parsing?
