@@ -1008,6 +1008,90 @@ class Block(BaseModel, abc.ABC):
     ) -> list[PARAMETER_TYPE]:
         pass
 
+    def _build_loop_graph(
+        self,
+        blocks: list[BlockTypeVar],
+        skip_sequential_defaulting: bool = False,
+    ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
+        label_to_block: dict[str, BlockTypeVar] = {}
+        default_next_map: dict[str, str | None] = {}
+
+        for block in blocks:
+            if block.label in label_to_block:
+                raise InvalidWorkflowDefinition(f"Duplicate block label detected in loop: {block.label}")
+            label_to_block[block.label] = block
+            default_next_map[block.label] = block.next_block_label
+
+        if not skip_sequential_defaulting:
+            has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
+            if not has_conditional_blocks:
+                for idx, block in enumerate(blocks[:-1]):
+                    if default_next_map.get(block.label) is None:
+                        default_next_map[block.label] = blocks[idx + 1].label
+
+        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
+        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+
+        adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
+        incoming: dict[str, int] = {label: 0 for label in label_to_block}
+
+        def _add_edge(source: str, target: str | None) -> None:
+            if not target:
+                return
+            if target not in label_to_block:
+                raise InvalidWorkflowDefinition(
+                    f"Block {source} references unknown next_block_label {target} inside loop {self.label}"
+                )
+            # Allow multiple branches of a conditional to point to the same target
+            # without double-counting the incoming edge.
+            if target not in adjacency[source]:
+                adjacency[source].add(target)
+                incoming[target] += 1
+
+        for label, block in label_to_block.items():
+            if block.block_type == BlockType.CONDITIONAL:
+                for branch in block.ordered_branches:
+                    _add_edge(label, branch.next_block_label)
+            else:
+                _add_edge(label, default_next_map.get(label))
+
+        roots = [label for label, count in incoming.items() if count == 0]
+        if not roots:
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: every block is the target of another"
+                " block's next_block_label, so there is no starting block."
+                " At least one block must not be the target of any next_block_label or branch condition."
+            )
+        if len(roots) > 1:
+            raise InvalidWorkflowDefinition(
+                f"Disconnected blocks detected inside loop {self.label}: blocks"
+                f" ({', '.join(sorted(roots))}) are not reachable from any other block."
+                " Every block must be reachable from the first block through next_block_label or"
+                " conditional branch references."
+                " Either connect them by setting another block's next_block_label to point to them, or remove them."
+            )
+
+        queue: deque[str] = deque([roots[0]])
+        visited_count = 0
+        in_degree = dict(incoming)
+        while queue:
+            node = queue.popleft()
+            visited_count += 1
+            for neighbor in adjacency[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if visited_count != len(label_to_block):
+            raise InvalidWorkflowDefinition(
+                f"Circular reference detected inside loop {self.label}: some blocks form a loop through their"
+                " next_block_label references, causing an infinite cycle."
+                " Ensure that following next_block_label from any block eventually reaches a block"
+                " with next_block_label set to null."
+            )
+
+        return roots[0], label_to_block, default_next_map
+
 
 def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     categories = task.failure_category
@@ -2227,90 +2311,6 @@ class ForLoopBlock(Block):
             output_parameter=output_param,
         )
 
-    def _build_loop_graph(
-        self,
-        blocks: list[BlockTypeVar],
-        skip_sequential_defaulting: bool = False,
-    ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
-        label_to_block: dict[str, BlockTypeVar] = {}
-        default_next_map: dict[str, str | None] = {}
-
-        for block in blocks:
-            if block.label in label_to_block:
-                raise InvalidWorkflowDefinition(f"Duplicate block label detected in loop: {block.label}")
-            label_to_block[block.label] = block
-            default_next_map[block.label] = block.next_block_label
-
-        if not skip_sequential_defaulting:
-            has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
-            if not has_conditional_blocks:
-                for idx, block in enumerate(blocks[:-1]):
-                    if default_next_map.get(block.label) is None:
-                        default_next_map[block.label] = blocks[idx + 1].label
-
-        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
-        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
-
-        adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
-        incoming: dict[str, int] = {label: 0 for label in label_to_block}
-
-        def _add_edge(source: str, target: str | None) -> None:
-            if not target:
-                return
-            if target not in label_to_block:
-                raise InvalidWorkflowDefinition(
-                    f"Block {source} references unknown next_block_label {target} inside loop {self.label}"
-                )
-            # Allow multiple branches of a conditional to point to the same target
-            # without double-counting the incoming edge.
-            if target not in adjacency[source]:
-                adjacency[source].add(target)
-                incoming[target] += 1
-
-        for label, block in label_to_block.items():
-            if block.block_type == BlockType.CONDITIONAL:
-                for branch in block.ordered_branches:
-                    _add_edge(label, branch.next_block_label)
-            else:
-                _add_edge(label, default_next_map.get(label))
-
-        roots = [label for label, count in incoming.items() if count == 0]
-        if not roots:
-            raise InvalidWorkflowDefinition(
-                f"Circular reference detected inside loop {self.label}: every block is the target of another"
-                " block's next_block_label, so there is no starting block."
-                " At least one block must not be the target of any next_block_label or branch condition."
-            )
-        if len(roots) > 1:
-            raise InvalidWorkflowDefinition(
-                f"Disconnected blocks detected inside loop {self.label}: blocks"
-                f" ({', '.join(sorted(roots))}) are not reachable from any other block."
-                " Every block must be reachable from the first block through next_block_label or"
-                " conditional branch references."
-                " Either connect them by setting another block's next_block_label to point to them, or remove them."
-            )
-
-        queue: deque[str] = deque([roots[0]])
-        visited_count = 0
-        in_degree = dict(incoming)
-        while queue:
-            node = queue.popleft()
-            visited_count += 1
-            for neighbor in adjacency[node]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
-
-        if visited_count != len(label_to_block):
-            raise InvalidWorkflowDefinition(
-                f"Circular reference detected inside loop {self.label}: some blocks form a loop through their"
-                " next_block_label references, causing an infinite cycle."
-                " Ensure that following next_block_label from any block eventually reaches a block"
-                " with next_block_label set to null."
-            )
-
-        return roots[0], label_to_block, default_next_map
-
     def validate_loop_blocks(self) -> None:
         """Validate the loop_blocks graph for cycles, orphans, and dangling references.
 
@@ -2867,90 +2867,6 @@ class WhileLoopBlock(Block):
             for parameter in loop_block.get_all_parameters(workflow_run_id):
                 parameters.add(parameter)
         return list(parameters)
-
-    def _build_loop_graph(
-        self,
-        blocks: list[BlockTypeVar],
-        skip_sequential_defaulting: bool = False,
-    ) -> tuple[str, dict[str, BlockTypeVar], dict[str, str | None]]:
-        # Duplicated from ForLoopBlock._build_loop_graph for PR 1; promotion to a shared
-        # helper is tracked in PR 7 (refactor).
-        label_to_block: dict[str, BlockTypeVar] = {}
-        default_next_map: dict[str, str | None] = {}
-
-        for block in blocks:
-            if block.label in label_to_block:
-                raise InvalidWorkflowDefinition(f"Duplicate block label detected in loop: {block.label}")
-            label_to_block[block.label] = block
-            default_next_map[block.label] = block.next_block_label
-
-        if not skip_sequential_defaulting:
-            has_conditional_blocks = any(block.block_type == BlockType.CONDITIONAL for block in blocks)
-            if not has_conditional_blocks:
-                for idx, block in enumerate(blocks[:-1]):
-                    if default_next_map.get(block.label) is None:
-                        default_next_map[block.label] = blocks[idx + 1].label
-
-        # SKY-8571: connect conditional branch terminals to the conditional's merge-point successor.
-        resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
-
-        adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
-        incoming: dict[str, int] = {label: 0 for label in label_to_block}
-
-        def _add_edge(source: str, target: str | None) -> None:
-            if not target:
-                return
-            if target not in label_to_block:
-                raise InvalidWorkflowDefinition(
-                    f"Block {source} references unknown next_block_label {target} inside loop {self.label}"
-                )
-            if target not in adjacency[source]:
-                adjacency[source].add(target)
-                incoming[target] += 1
-
-        for label, block in label_to_block.items():
-            if block.block_type == BlockType.CONDITIONAL:
-                for branch in block.ordered_branches:
-                    _add_edge(label, branch.next_block_label)
-            else:
-                _add_edge(label, default_next_map.get(label))
-
-        roots = [label for label, count in incoming.items() if count == 0]
-        if not roots:
-            raise InvalidWorkflowDefinition(
-                f"Circular reference detected inside loop {self.label}: every block is the target of another"
-                " block's next_block_label, so there is no starting block."
-                " At least one block must not be the target of any next_block_label or branch condition."
-            )
-        if len(roots) > 1:
-            raise InvalidWorkflowDefinition(
-                f"Disconnected blocks detected inside loop {self.label}: blocks"
-                f" ({', '.join(sorted(roots))}) are not reachable from any other block."
-                " Every block must be reachable from the first block through next_block_label or"
-                " conditional branch references."
-                " Either connect them by setting another block's next_block_label to point to them, or remove them."
-            )
-
-        queue: deque[str] = deque([roots[0]])
-        visited_count = 0
-        in_degree = dict(incoming)
-        while queue:
-            node = queue.popleft()
-            visited_count += 1
-            for neighbor in adjacency[node]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
-
-        if visited_count != len(label_to_block):
-            raise InvalidWorkflowDefinition(
-                f"Circular reference detected inside loop {self.label}: some blocks form a loop through their"
-                " next_block_label references, causing an infinite cycle."
-                " Ensure that following next_block_label from any block eventually reaches a block"
-                " with next_block_label set to null."
-            )
-
-        return roots[0], label_to_block, default_next_map
 
     def validate_loop_blocks(self) -> None:
         """Validate the loop_blocks graph and recurse into nested loop blocks."""
