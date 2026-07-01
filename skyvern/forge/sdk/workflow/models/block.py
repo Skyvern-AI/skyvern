@@ -36,6 +36,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
 
@@ -88,12 +89,14 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_na
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, InvalidLLMResponseType
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -273,6 +276,16 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.failed: BlockStatus.failed,
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
+}
+
+ENABLE_CODE_BLOCK_SELF_HEALING_FLAG = "ENABLE_CODE_BLOCK_SELF_HEALING"
+
+TASK_TO_BLOCK_STATUS: dict[TaskStatus, BlockStatus] = {
+    TaskStatus.completed: BlockStatus.completed,
+    TaskStatus.terminated: BlockStatus.terminated,
+    TaskStatus.failed: BlockStatus.failed,
+    TaskStatus.canceled: BlockStatus.canceled,
+    TaskStatus.timed_out: BlockStatus.timed_out,
 }
 
 
@@ -1508,13 +1521,7 @@ class BaseTaskBlock(Block):
                 raise UnexpectedTaskStatus(task_id=updated_task.task_id, status=updated_task.status)
             current_running_task = updated_task
 
-            block_status_mapping = {
-                TaskStatus.completed: BlockStatus.completed,
-                TaskStatus.terminated: BlockStatus.terminated,
-                TaskStatus.failed: BlockStatus.failed,
-                TaskStatus.canceled: BlockStatus.canceled,
-                TaskStatus.timed_out: BlockStatus.timed_out,
-            }
+            block_status_mapping = TASK_TO_BLOCK_STATUS
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     "Task completed",
@@ -3982,6 +3989,286 @@ async def wrapper({default_args}):
             )
             return value
 
+    def _match_step_for_failing_line(self, failing_line: int) -> CodeBlockStep | None:
+        """Advisory nearest-preceding-start match; a lone ``line_start`` (``line_end`` None) is
+        open-ended. Step spans are display-oriented and can drift, so a miss never blocks the heal."""
+        best: CodeBlockStep | None = None
+        best_start = -1
+        for step in self.steps or []:
+            if step.line_start is None or step.line_start > failing_line:
+                continue
+            if step.line_end is not None and failing_line > step.line_end:
+                continue
+            if step.line_start > best_start:
+                best = step
+                best_start = step.line_start
+        return best
+
+    async def _self_heal_enabled(self, organization_id: str | None) -> bool:
+        # Per-org PostHog dial over the env default, mirroring the master copilot flags: the env
+        # default is the OSS/standalone fallback and a resolution failure degrades to it, never raising.
+        env_enabled = settings.ENABLE_CODE_BLOCK_SELF_HEALING
+        provider = app.EXPERIMENTATION_PROVIDER
+        if not organization_id or isinstance(provider, NoOpExperimentationProvider):
+            return env_enabled
+        try:
+            flag_enabled = await provider.is_feature_enabled_cached(
+                ENABLE_CODE_BLOCK_SELF_HEALING_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+            return bool(flag_enabled) or env_enabled
+        except Exception:
+            LOG.warning(
+                "Failed to resolve code-block self-heal flag; falling back to env default",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return env_enabled
+
+    def _is_healable_page_failure(self, exception: Exception, recording_page: RecordingPage) -> bool:
+        """Heal genuine page failures only: a recorded page call raised, or an (unmapped) Playwright
+        page error surfaced. A deliberate non-Playwright raise in user logic stays non-healable."""
+        if recording_page.last_recorded_exception() is exception:
+            return True
+        return isinstance(exception, PlaywrightError)  # locator/timeout/navigation errors subclass this
+
+    async def _finalize_recovery_block(
+        self,
+        recovery_block_id: str | None,
+        status: BlockStatus,
+        organization_id: str | None,
+        failure_reason: str | None = None,
+    ) -> None:
+        # The child recovery block surfaces the heal's actions on the run timeline (parented to the code
+        # block); keep its status synced with the heal outcome so it doesn't dangle in `running`.
+        if recovery_block_id is None:
+            return
+        try:
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=recovery_block_id,
+                organization_id=organization_id,
+                status=status,
+                failure_reason=failure_reason,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to finalize self-heal recovery block",
+                workflow_run_block_id=recovery_block_id,
+                exc_info=True,
+            )
+
+    async def _fail_escalation_task(
+        self,
+        escalation_task: Task | None,
+        escalation_step: Step | None,
+        recovery_block_id: str | None,
+        organization_id: str | None,
+    ) -> None:
+        # Best-effort so an aborted heal never strands its escalation task/step/recovery block in `running`.
+        await self._finalize_recovery_block(recovery_block_id, BlockStatus.failed, organization_id)
+        if escalation_task is None:
+            return
+        try:
+            await app.DATABASE.tasks.update_task(
+                task_id=escalation_task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+            )
+            if escalation_step is not None:
+                await app.DATABASE.tasks.update_step(
+                    task_id=escalation_task.task_id,
+                    step_id=escalation_step.step_id,
+                    status=StepStatus.failed,
+                    is_last=True,
+                    organization_id=organization_id,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to finalize stranded self-heal escalation task",
+                task_id=escalation_task.task_id,
+                exc_info=True,
+            )
+
+    async def _attempt_self_heal(
+        self,
+        *,
+        exception: Exception,
+        failing_line: int | None,
+        recording_page: RecordingPage,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> BlockResult | None:
+        """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
+        (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
+        heal was attempted, or None to fall through to the caller's fail-closed path."""
+        if not await self._self_heal_enabled(organization_id):
+            return None
+        if not self._is_healable_page_failure(exception, recording_page):
+            return None
+        if not self.prompt:
+            return None
+        if not organization_id:
+            return None
+        organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+        if organization is None:
+            return None
+
+        escalation_task: Task | None = None
+        escalation_step: Step | None = None
+        recovery_block_id: str | None = None
+        try:
+            # block.prompt is the operative goal; a confidently-matched step only narrows it. The match
+            # is advisory (spans are display-oriented and render-shifted), so any miss heals on the prompt.
+            safe_main = workflow_run_context.mask_secrets_in_data(self.prompt)
+            matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
+            if matched_step is not None and matched_step.description:
+                safe_mini = workflow_run_context.mask_secrets_in_data(matched_step.description)
+                navigation_goal = compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
+            else:
+                navigation_goal = safe_main
+
+            workflow_system_prompt = (
+                None
+                if self.ignore_workflow_system_prompt
+                else workflow_run_context.resolve_effective_workflow_system_prompt()
+            )
+            task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
+            # Bound by the global default but never above the org's per-run cap — execute_step gives
+            # task.max_steps_per_run precedence over organization.max_steps_per_run.
+            heal_max_steps = settings.MAX_STEPS_PER_RUN
+            if organization.max_steps_per_run is not None:
+                heal_max_steps = min(heal_max_steps, organization.max_steps_per_run)
+            # Blank url: the heal takes over the live, half-mutated page rather than re-navigating to it
+            # (a truthy task.url makes the browser manager reload the page on the browser-session path).
+            escalation_task = await app.DATABASE.tasks.create_task(
+                url="",
+                title=self.label,
+                navigation_goal=navigation_goal,
+                data_extraction_goal=None,
+                navigation_payload=None,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                order=task_order,
+                retry=task_retry,
+                max_steps_per_run=heal_max_steps,
+                model=self.model,
+                workflow_system_prompt=workflow_system_prompt,
+            )
+            escalation_task = await app.DATABASE.tasks.update_task(
+                task_id=escalation_task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
+            escalation_step = await app.DATABASE.tasks.create_step(
+                escalation_task.task_id,
+                order=0,
+                retry_index=0,
+                organization_id=organization_id,
+            )
+            # Child block parented to the code block, linked to the escalation task: the timeline attaches
+            # the heal's actions to this nested node (actions join by task_id), while the code block keeps
+            # the seat task so its own pre-failure actions stay visible too.
+            recovery_block = await app.DATABASE.observer.create_workflow_run_block(
+                workflow_run_id=workflow_run_id,
+                parent_workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                task_id=escalation_task.task_id,
+                label="Self-heal recovery",
+                block_type=BlockType.TASK,
+            )
+            recovery_block_id = recovery_block.workflow_run_block_id
+
+            # Attribute the heal's steps to the escalation task for its duration; restored in finally.
+            current_context = skyvern_context.ensure_context()
+            previous_task_id = current_context.task_id
+            current_context.task_id = escalation_task.task_id
+            try:
+                # execute_step self-drives to a terminal across multiple steps (execute_all_steps),
+                # bounded by the task's max_steps_per_run — not a single step.
+                await app.agent.execute_step(
+                    organization=organization,
+                    task=escalation_task,
+                    step=escalation_step,
+                    task_block=None,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=False,
+                )
+            finally:
+                current_context.task_id = previous_task_id
+
+            updated_task = await app.DATABASE.tasks.get_task(
+                task_id=escalation_task.task_id, organization_id=organization_id
+            )
+            if updated_task is None or not updated_task.status.is_final():
+                await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Self-heal escalation did not reach a final status for block {self.label}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if updated_task.status == TaskStatus.completed:
+                downloaded_files: list[FileInfo] = []
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                            organization_id=organization_id,
+                            run_id=current_context.run_id if current_context.run_id else workflow_run_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+                downloaded_files = filter_downloaded_files_for_current_iteration(
+                    downloaded_files,
+                    current_context.loop_internal_state,
+                )
+                task_output = TaskOutput.from_task(updated_task, downloaded_files)
+                output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
+                await self._finalize_recovery_block(recovery_block_id, BlockStatus.completed, organization_id)
+                return await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=output_parameter_value,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            recovery_status = TASK_TO_BLOCK_STATUS.get(updated_task.status, BlockStatus.failed)
+            recovery_failure_reason = (
+                updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}"
+            )
+            await self._finalize_recovery_block(
+                recovery_block_id, recovery_status, organization_id, failure_reason=recovery_failure_reason
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=recovery_failure_reason,
+                output_parameter_value=None,
+                status=recovery_status,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except asyncio.CancelledError:
+            # CancelledError is BaseException, not Exception — finalize explicitly, then never swallow it.
+            await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+            raise
+        except Exception:
+            LOG.warning(
+                "Code block self-heal escalation failed; falling back to fail-closed",
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+            return None
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4328,6 +4615,21 @@ async def wrapper({default_args}):
                     )
                 )
             await _persist_recorded_actions(recorded)
+            healed = await self._attempt_self_heal(
+                exception=e,
+                failing_line=failing_line,
+                recording_page=recording_page,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            if healed is not None:
+                # Finalize the seat task to the heal outcome before the idempotent `finally` no-ops it,
+                # so a healed success no longer leaves the seat row failed under a completed block.
+                await _finalize_code_block_task(success=healed.success)
+                return healed
             await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,

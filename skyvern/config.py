@@ -205,6 +205,8 @@ class Settings(BaseSettings):
     # already-authenticated session (the first run and every login-replaying repair re-run alike).
     # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
     COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
+    # Default for the bounded code-block self-heal; off by default.
+    ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]

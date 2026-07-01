@@ -60,6 +60,10 @@ _WRAPPED_GOAL_RE = re.compile(
 )
 
 
+def compose_mini_goal(main_goal: str, mini_goal: str) -> str:
+    return MINI_GOAL_TEMPLATE.format(main_goal=main_goal, mini_goal=mini_goal)
+
+
 def wrap_block_goals(workflow_yaml: str, user_message: str) -> str:
     """Return ``workflow_yaml`` with each block's ``navigation_goal``,
     ``complete_criterion``, and ``terminate_criterion`` wrapped via
