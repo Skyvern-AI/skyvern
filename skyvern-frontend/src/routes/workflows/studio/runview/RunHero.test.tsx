@@ -77,6 +77,50 @@ describe("RunHero Code surface (single source of truth)", () => {
   });
 });
 
+describe("RunHero header dedupe", () => {
+  test("recording view does not echo the active toggle label in the header", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        recordingUrls={["https://example.com/rec.mp4"]}
+      />,
+    );
+    // Only the toggle should say "Recording" — not the header label too.
+    expect(screen.getAllByText("Recording")).toHaveLength(1);
+  });
+
+  test("code view does not echo the active toggle as a header label", () => {
+    useRunViewStore.getState().setCenterView("code");
+    render(<RunHero {...baseProps} showDebugStream={false} />);
+    // The Code toggle communicates the view; the "Generated code" header is redundant.
+    expect(screen.queryByText("Generated code")).toBeNull();
+  });
+
+  test("scrubbed action description appears once, not in the header too", () => {
+    useRunViewStore.getState().pinFrame("f1");
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        heroSelection={{ kind: "thought", thoughtId: "t1" }}
+        heroLabel="Click the login button"
+      />,
+    );
+    // The in-card "Inspecting step" bar owns the action description.
+    expect(screen.getAllByText("Click the login button")).toHaveLength(1);
+  });
+
+  test("view toggles live in the labeled segmented control, on the leading edge", () => {
+    render(<RunHero {...baseProps} showDebugStream={false} />);
+    const group = screen.getByRole("group", { name: "Center view" });
+    expect(group.contains(screen.getByText("Live"))).toBe(true);
+    expect(group.contains(screen.getByText("Code"))).toBe(true);
+  });
+});
+
 describe("RunHero failure banner", () => {
   const failedProps = {
     ...baseProps,

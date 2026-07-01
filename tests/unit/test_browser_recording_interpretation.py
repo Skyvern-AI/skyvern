@@ -233,6 +233,67 @@ def _click_streaming_event(
 
 
 @pytest.mark.asyncio
+async def test_jittered_reclick_yields_single_draft_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click the submit button."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0, capture_seq=0)])
+    session.ingest_events([_click_streaming_event(timestamp=1002.0, capture_seq=1)])
+    steps = await session.flush()
+
+    assert len(steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_adjacent_duplicate_suppressed_but_later_repeat_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click", "title": "Click", "prompt": "Click."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events(
+        [
+            _click_streaming_event(timestamp=1000.0, capture_seq=0, sky_id="sky-a", target_id="a"),
+            _click_streaming_event(timestamp=1010.0, capture_seq=1, sky_id="sky-b", target_id="b"),
+            _click_streaming_event(timestamp=1005.0, capture_seq=2, sky_id="sky-a", target_id="a"),
+        ]
+    )
+    steps = await session.flush()
+
+    assert [(step.action_kind, step.timestamp_start) for step in steps] == [
+        (ActionKind.CLICK, 1000.0),
+        (ActionKind.CLICK, 1010.0),
+    ]
+
+    # A genuine later repeat of A (well outside the dedup window) is preserved.
+    session.ingest_events([_click_streaming_event(timestamp=5000.0, capture_seq=3, sky_id="sky-a", target_id="a")])
+    steps = await session.flush()
+
+    assert len(steps) == 3
+    assert steps[-1].timestamp_start == 5000.0
+
+
+@pytest.mark.asyncio
 async def test_ingest_events_sorts_unprocessed_tail_by_capture_seq() -> None:
     session = RecordingInterpretationSession(
         browser_session_id=PBS_ID,

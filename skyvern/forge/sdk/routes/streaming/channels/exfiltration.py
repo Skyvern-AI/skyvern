@@ -184,11 +184,18 @@ class ExfiltrationChannel(CdpChannel):
         for fingerprint in expired:
             self._recent_console_event_fingerprints.pop(fingerprint, None)
 
-    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+    # Excluded from the fingerprint: advances by ms when one interaction is re-captured across a reconnect.
+    _CONSOLE_FINGERPRINT_VOLATILE_KEYS: t.ClassVar[frozenset[str]] = frozenset({"timestamp"})
+
+    def _console_fingerprint(self, event_data: dict[str, t.Any]) -> str:
+        stable = {k: v for k, v in event_data.items() if k not in self._CONSOLE_FINGERPRINT_VOLATILE_KEYS}
         try:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"))
         except TypeError:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"), default=str)
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+        fingerprint = self._console_fingerprint(event_data)
 
         now = time.monotonic()
         self._prune_console_dedup_cache(now)

@@ -66,6 +66,10 @@ LOG = structlog.get_logger(__name__)
 MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
 DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
 
+# Re-captures of one interaction land within this browser-clock (ms) window; genuine repeats fall outside it.
+DUPLICATE_ACTION_WINDOW_MS = 250
+DUPLICATE_ACTION_SCAN_DEPTH = 8
+
 
 def _action_identity(action: Action) -> tuple[str, str, str, str]:
     """Stable identity fields used for duplicate-action suppression."""
@@ -79,20 +83,20 @@ def _action_identity(action: Action) -> tuple[str, str, str, str]:
 
 def _is_duplicate_action(candidate: Action, existing_actions: list[Action]) -> bool:
     """
-    Suppress duplicate actions emitted from duplicate transport events.
-
-    We only dedupe when the latest action has the exact same identity and
-    timestamps, which keeps intentional repeated clicks intact.
+    Suppress duplicate actions from duplicate transport events: a recent action (within
+    DUPLICATE_ACTION_WINDOW_MS, by identity) marks the candidate a duplicate. The tail scan and
+    window catch non-adjacent, ms-jittered re-captures while keeping intentional repeats intact.
     """
     if not existing_actions:
         return False
 
-    previous = existing_actions[-1]
-    return (
-        _action_identity(previous) == _action_identity(candidate)
-        and previous.timestamp_start == candidate.timestamp_start
-        and previous.timestamp_end == candidate.timestamp_end
-    )
+    for previous in reversed(existing_actions[-DUPLICATE_ACTION_SCAN_DEPTH:]):
+        if _action_identity(previous) != _action_identity(candidate):
+            continue
+        if abs(candidate.timestamp_start - previous.timestamp_start) <= DUPLICATE_ACTION_WINDOW_MS:
+            return True
+
+    return False
 
 
 def deterministic_goto_url_label(url: str) -> str:
