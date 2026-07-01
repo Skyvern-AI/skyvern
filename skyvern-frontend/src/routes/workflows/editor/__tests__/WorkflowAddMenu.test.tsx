@@ -46,6 +46,23 @@ function renderInDebugMode() {
   );
 }
 
+function renderWithScope(scope: {
+  isDebugMode: boolean;
+  blockRunsEnabled: boolean;
+}) {
+  return render(
+    <DebugStoreContext.Provider value={scope}>
+      <WorkflowAddMenu
+        onAdd={() => {}}
+        onRecord={() => {}}
+        onUploadSOP={() => {}}
+      >
+        <span>child</span>
+      </WorkflowAddMenu>
+    </DebugStoreContext.Provider>,
+  );
+}
+
 function lastItems(): RadialMenuItem[] {
   const calls = (radialMenuMock as Mock).mock.calls;
   const last = calls[calls.length - 1];
@@ -109,5 +126,44 @@ describe("WorkflowAddMenu — Record Browser item visibility/enabled state", () 
     const item = recordBrowserItem(lastItems());
     expect(item).toBeDefined();
     expect(item?.enabled).toBe(false);
+  });
+});
+
+describe("WorkflowAddMenu — menu visibility gate", () => {
+  beforeEach(() => {
+    radialMenuMock.mockClear();
+  });
+
+  afterEach(() => {
+    useSettingsStore.setState(initialSettings, true);
+    useRecordingStore.setState(initialRecording, true);
+    cleanup();
+  });
+
+  it("renders the radial menu in the studio editor (blockRunsEnabled) even when not in debug mode", () => {
+    useSettingsStore.getState().setIsUsingABrowser(true);
+    useSettingsStore.getState().setIsLoadingABrowser(false);
+    useRecordingStore.setState({ isRecording: false });
+
+    const { getByTestId } = renderWithScope({
+      isDebugMode: false,
+      blockRunsEnabled: true,
+    });
+
+    expect(getByTestId("radial-menu")).toBeDefined();
+    const items = lastItems();
+    expect(items.find((i) => i.text === "Upload SOP")).toBeDefined();
+    expect(recordBrowserItem(items)).toBeDefined();
+  });
+
+  it("hides the menu (renders only children) when neither debug nor studio block-runs are active", () => {
+    const { queryByTestId, getByText } = renderWithScope({
+      isDebugMode: false,
+      blockRunsEnabled: false,
+    });
+
+    expect(queryByTestId("radial-menu")).toBeNull();
+    expect(getByText("child")).toBeDefined();
+    expect(radialMenuMock).not.toHaveBeenCalled();
   });
 });

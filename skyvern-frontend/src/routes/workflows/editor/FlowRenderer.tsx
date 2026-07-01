@@ -92,6 +92,7 @@ import {
   WorkflowBlockNode,
 } from "./nodes";
 import { GlobalCollapseControl } from "./collapse/GlobalCollapseControl";
+import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
 import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
@@ -2027,10 +2028,18 @@ function FlowRenderer({
                     return;
                   }
                   setSelectedBlockId(node.id);
-                  // Studio: a deliberate block click expands the persistent
-                  // settings panel (it starts collapsed on open).
+                  // Studio's embedded editor uses build mode, so a block click reveals
+                  // its inline editor (the header chevron still collapses it).
                   if (embedded) {
                     setSettingsCollapsed(false);
+                    if (isWorkflowBlockNode(appNode)) {
+                      useNodeCollapseStore
+                        .getState()
+                        .expandBlock(
+                          workflow.workflow_permanent_id ?? "__global__",
+                          appNode.data.label,
+                        );
+                    }
                   }
                 }}
                 onPaneClick={() => {
