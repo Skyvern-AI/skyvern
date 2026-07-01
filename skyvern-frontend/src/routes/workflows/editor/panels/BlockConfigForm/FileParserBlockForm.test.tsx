@@ -159,6 +159,13 @@ describe("FileParserBlockForm (SKY-9381)", () => {
     expect(screen.getByText("Auto detect")).toBeDefined();
     expect(screen.getByTestId("json-schema-input")).toBeDefined();
     expect(screen.getByTestId("model-selector")).toBeDefined();
+    const advancedSettings = screen.getByText("Advanced Settings");
+    fireEvent.click(advancedSettings);
+    expect(
+      advancedSettings.compareDocumentPosition(
+        screen.getByText("Ignore System Prompt"),
+      ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   test("File URL onChange dispatches updateNodeData via useUpdate (byte-identical write)", () => {
