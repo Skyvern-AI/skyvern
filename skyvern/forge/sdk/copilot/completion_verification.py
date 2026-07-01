@@ -45,6 +45,7 @@ _CONTINGENT_ABSTENTION_REASON_CODES = frozenset(
     {"unknown", "no_evidence", "evidence_contradicts", "missing_exact_field", "unproducible"}
 )
 REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
+TERMINAL_RECORD_CORROBORATION_CRITERION_ID = "__copilot_terminal_record_corroboration__"
 _REGISTERED_DOWNLOAD_COUNT_KEYS = (
     "downloaded_file_count",
     "downloaded_file_url_count",
@@ -80,7 +81,7 @@ class CriterionVerdict:
     evidence_ref: str | None = None
     missing_evidence: str | None = None
     output_path: str | None = None
-    grounding_mode: Literal["exact_value", "shape", "missing"] | None = None
+    grounding_mode: Literal["exact_value", "shape", "missing", "terminal_record"] | None = None
     expected_output_shape: str | None = None
     has_exact_value: bool = False
 
@@ -107,6 +108,10 @@ class CompletionVerificationResult:
         has_observed_reach_state = any(
             _is_satisfied_observed_end_state_verdict(verdict) for verdict in verdict_by_id.values()
         )
+        has_requested_output_abstention_corroboration = any(
+            _is_satisfied_observed_end_state_verdict(verdict) or _is_satisfied_terminal_record_verdict(verdict)
+            for verdict in verdict_by_id.values()
+        )
         satisfied_run_plane_count = 0
         for criterion_id in self.criterion_ids:
             verdict = verdict_by_id.get(criterion_id)
@@ -126,6 +131,11 @@ class CompletionVerificationResult:
                 self.contingent_criterion_ids,
                 self.structural_unfired_criterion_ids,
             ):
+                continue
+            if verdict is not None and _is_corroborated_structural_requested_output_abstention(
+                verdict, has_requested_output_abstention_corroboration
+            ):
+                satisfied_run_plane_count += 1
                 continue
             if verdict is not None and _is_structural_requested_output_abstention(verdict):
                 continue
@@ -1181,10 +1191,29 @@ def grade_terminal_goal_record_criteria(
                         state="satisfied",
                         reason_code="evidence_confirms",
                         evidence_ref=f"block_outputs:{label}",
+                        grounding_mode="terminal_record",
                     )
                 )
         if verdicts:
             return verdicts
+    return []
+
+
+def grade_terminal_goal_record_corroboration(snapshot: RunEvidenceSnapshot) -> list[CriterionVerdict]:
+    for label, payload in snapshot.block_outputs.items():
+        record = _structured_record_payload(payload)
+        if record is None:
+            continue
+        if any(_terminal_goal_record_confirmed(record, family) for family in _TERMINAL_RECORD_FAMILIES):
+            return [
+                CriterionVerdict(
+                    criterion_id=TERMINAL_RECORD_CORROBORATION_CRITERION_ID,
+                    state="satisfied",
+                    reason_code="evidence_confirms",
+                    evidence_ref=f"block_outputs:{label}",
+                    grounding_mode="terminal_record",
+                )
+            ]
     return []
 
 
@@ -1852,6 +1881,14 @@ def _is_satisfied_observed_end_state_verdict(verdict: CriterionVerdict) -> bool:
     )
 
 
+def _is_satisfied_terminal_record_verdict(verdict: CriterionVerdict) -> bool:
+    return (
+        verdict.state == "satisfied"
+        and verdict.reason_code == "evidence_confirms"
+        and verdict.grounding_mode == "terminal_record"
+    )
+
+
 def _is_reperception_contradiction(verdict: CriterionVerdict) -> bool:
     return (
         verdict.state == "unsatisfied"
@@ -1866,6 +1903,16 @@ def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
 
 def _is_structural_requested_output_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unsatisfied" and verdict.reason_code == _STRUCTURAL_ABSTENTION_REASON_CODE
+
+
+def _is_corroborated_structural_requested_output_abstention(verdict: CriterionVerdict, has_corroboration: bool) -> bool:
+    return (
+        has_corroboration
+        and _is_structural_requested_output_abstention(verdict)
+        and bool(verdict.evidence_ref)
+        and bool(verdict.output_path)
+        and not verdict.has_exact_value
+    )
 
 
 def _is_contingent_abstention(
@@ -1934,6 +1981,12 @@ def combine_verification_results(
         verdict_by_id.get(cid, CriterionVerdict(criterion_id=cid, state="unknown", reason_code="unknown"))
         for cid in criterion_ids
     ]
+    if run_result is not None:
+        verdicts.extend(
+            verdict
+            for verdict in run_result.verdicts
+            if verdict.criterion_id not in criterion_ids and _is_satisfied_terminal_record_verdict(verdict)
+        )
     return CompletionVerificationResult(
         status="evaluated",
         criterion_ids=list(criterion_ids),
