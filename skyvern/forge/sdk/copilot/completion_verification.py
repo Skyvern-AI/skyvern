@@ -1915,6 +1915,20 @@ def _is_corroborated_structural_requested_output_abstention(verdict: CriterionVe
     )
 
 
+def only_structural_requested_output_abstentions(result: CompletionVerificationResult) -> bool:
+    if result.status != "evaluated" or not result.criterion_ids or result.is_fully_satisfied():
+        return False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    unmet: list[CriterionVerdict] = []
+    for criterion_id in result.criterion_ids:
+        verdict = verdict_by_id.get(criterion_id)
+        if verdict is None:
+            return False
+        if not verdict.satisfied:
+            unmet.append(verdict)
+    return bool(unmet) and all(_is_structural_requested_output_abstention(verdict) for verdict in unmet)
+
+
 def _is_contingent_abstention(
     verdict: CriterionVerdict,
     contingent_criterion_ids: Iterable[str],
