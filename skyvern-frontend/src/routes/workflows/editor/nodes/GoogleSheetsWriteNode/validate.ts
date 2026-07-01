@@ -1,3 +1,5 @@
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
+
 import type { GoogleSheetsWriteNode } from "./types";
 
 const missing = (value: string): boolean => !value.trim();
@@ -35,8 +37,13 @@ export function validateGoogleSheetsWriteNode(
           `${label}: Column mapping must be a JSON object of source field -> column letter.`,
         );
       }
-    } catch {
-      errors.push(`${label}: Column mapping is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${label}: Column mapping is not valid JSON: ${getJsonParseErrorDetail(
+          mapping,
+          error,
+        )}`,
+      );
     }
   }
   return errors;

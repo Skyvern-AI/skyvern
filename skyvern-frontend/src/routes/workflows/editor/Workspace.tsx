@@ -103,6 +103,7 @@ import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
@@ -2432,7 +2433,10 @@ function Workspace({
               } catch (error) {
                 toast({
                   title: "Error",
-                  description: "Invalid JSON format in extra http headers",
+                  description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
+                    saveData.settings.extraHttpHeaders ?? "",
+                    error,
+                  )}`,
                   variant: "destructive",
                 });
                 return;
@@ -2448,7 +2452,10 @@ function Workspace({
               } catch (error) {
                 toast({
                   title: "Error",
-                  description: "Invalid JSON format in cdp connect headers",
+                  description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
+                    saveData.settings.cdpConnectHeaders ?? "",
+                    error,
+                  )}`,
                   variant: "destructive",
                 });
                 return;
