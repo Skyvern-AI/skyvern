@@ -9,11 +9,12 @@ from jinja2.sandbox import SandboxedEnvironment
 import skyvern.forge.sdk.workflow.models.block as _block_mod
 from skyvern.config import settings as base_settings
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import TextPromptBlockYAML, WorkflowRequest
+from skyvern.schemas.workflows import BlockStatus, TextPromptBlockYAML, WorkflowRequest
 
 block_module = sys.modules["skyvern.forge.sdk.workflow.models.block"]
 
@@ -128,6 +129,7 @@ async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name):
     assert captured["llm_key"] == expected_llm_key
     assert captured["prompt_name"] == "text-prompt"
     assert response == {"llm_response": "ok"}
+    assert block.json_schema is None
 
 
 @pytest.mark.asyncio
@@ -399,6 +401,434 @@ async def test_text_prompt_block_uses_explicit_internal_llm_key_override(monkeyp
     assert captured["default_handler"] == fake_default_handler
     fake_override_handler.assert_awaited_once()
     assert response == {"llm_response": "override"}
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_array_schema_does_not_force_dict(monkeypatch):
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "first_name": {"type": "string"},
+                    "last_name": {"type": "string"},
+                },
+                "required": ["first_name", "last_name"],
+            },
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_handler(*, prompt: str, prompt_name: str, force_dict: bool, **kwargs):
+        captured["prompt"] = prompt
+        captured["prompt_name"] = prompt_name
+        captured["force_dict"] = force_dict
+        return [{"first_name": "Zachary", "last_name": "Leibrand"}]
+
+    async def fake_resolve_default_llm_handler(*args, **kwargs):
+        return fake_handler
+
+    def fake_get_override_handler(llm_key: str | None, *, default):
+        return default
+
+    monkeypatch.setattr(
+        block_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        fake_get_override_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "_resolve_default_llm_handler",
+        fake_resolve_default_llm_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_engine,
+        "load_prompt_from_string",
+        lambda template, **kwargs: template,
+    )
+
+    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+
+    assert captured["prompt_name"] == "text-prompt"
+    assert captured["force_dict"] is False
+    assert response == [{"first_name": "Zachary", "last_name": "Leibrand"}]
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_object_schema_does_not_force_dict_before_validation(monkeypatch):
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "properties": {
+                "invoice_search_string": {"type": "string"},
+            },
+            "required": ["invoice_search_string"],
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_handler(*, prompt: str, prompt_name: str, force_dict: bool, **kwargs):
+        captured["force_dict"] = force_dict
+        return {"invoice_search_string": "062026"}
+
+    async def fake_resolve_default_llm_handler(*args, **kwargs):
+        return fake_handler
+
+    def fake_get_override_handler(llm_key: str | None, *, default):
+        return default
+
+    monkeypatch.setattr(
+        block_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        fake_get_override_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "_resolve_default_llm_handler",
+        fake_resolve_default_llm_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_engine,
+        "load_prompt_from_string",
+        lambda template, **kwargs: template,
+    )
+
+    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+
+    assert captured["force_dict"] is False
+    assert response == {"invoice_search_string": "062026"}
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_retry_feedback_is_not_rendered_as_template(monkeypatch):
+    block = _make_text_prompt_block(
+        prompt="Hello {{ name }}",
+        json_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+    )
+    captured: dict[str, object] = {}
+    rendered_templates: list[str] = []
+
+    async def fake_handler(*, prompt: str, prompt_name: str, force_dict: bool, **kwargs):
+        captured["prompt"] = prompt
+        return {"answer": "ok"}
+
+    async def fake_resolve_default_llm_handler(*args, **kwargs):
+        return fake_handler
+
+    def fake_get_override_handler(llm_key: str | None, *, default):
+        return default
+
+    def fake_load_prompt_from_string(template: str, **kwargs: str) -> str:
+        rendered_templates.append(template)
+        assert "previous response failed JSON schema validation" not in template
+        return template.replace("{{ name }}", kwargs["name"])
+
+    monkeypatch.setattr(
+        block_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        fake_get_override_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "_resolve_default_llm_handler",
+        fake_resolve_default_llm_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(prompt_engine, "load_prompt_from_string", fake_load_prompt_from_string)
+
+    await block.send_prompt(
+        block.prompt,
+        {"name": "Alice"},
+        workflow_run_id="workflow-run",
+        organization_id="org-1",
+        schema_validation_failure="root: has 1 unexpected properties {{ dangerous_lookup }}",
+    )
+
+    sent_prompt = captured["prompt"]
+    assert isinstance(sent_prompt, str)
+    assert "Hello Alice" in sent_prompt
+    assert "previous response failed JSON schema validation" in sent_prompt
+    assert "{{ dangerous_lookup }}" in sent_prompt
+
+
+def test_text_prompt_block_schema_validation_rejects_wrong_root_type() -> None:
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "first_name": {"type": "string"},
+                    "last_name": {"type": "string"},
+                },
+                "required": ["first_name", "last_name"],
+            },
+        },
+    )
+
+    failure_reason = block._validate_response_against_json_schema(
+        {"first_name": "f_name_var", "last_name": "l_name_var\n```python\n..."}
+    )
+
+    assert failure_reason is not None
+    assert "does not match text prompt JSON schema" in failure_reason
+    assert "root" in failure_reason
+    assert "expected type array, got object" in failure_reason
+
+
+def test_text_prompt_block_schema_validation_feedback_does_not_echo_invalid_response() -> None:
+    secret_like_value = "customer-private-value-" + ("x" * 300)
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "properties": {
+                "values": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["values"],
+        },
+    )
+
+    failure_reason = block._validate_response_against_json_schema({"values": secret_like_value})
+
+    assert failure_reason is not None
+    assert "root.values: expected type array, got string" in failure_reason
+    assert secret_like_value not in failure_reason
+    assert "customer-private-value" not in failure_reason
+
+
+def test_text_prompt_block_additional_properties_feedback_does_not_echo_response_keys() -> None:
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "properties": {"safe": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    )
+
+    failure_reason = block._validate_response_against_json_schema({"safe": "ok", "customer@example.com": "private"})
+
+    assert failure_reason is not None
+    assert "has 1 unexpected properties" in failure_reason
+    assert "customer@example.com" not in failure_reason
+    assert "private" not in failure_reason
+
+
+def test_text_prompt_block_map_value_path_does_not_echo_response_key() -> None:
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "object",
+            "additionalProperties": {"type": "number"},
+        },
+    )
+
+    failure_reason = block._validate_response_against_json_schema({"customer@example.com": "not-a-number"})
+
+    assert failure_reason is not None
+    assert "root.<map value>: expected type number, got string" in failure_reason
+    assert "customer@example.com" not in failure_reason
+    assert "not-a-number" not in failure_reason
+
+
+def test_text_prompt_block_unresolvable_ref_fails_schema_validation_gracefully() -> None:
+    block = _make_text_prompt_block(json_schema={"$ref": "#/$defs/missing"})
+
+    failure_reason = block._validate_response_against_json_schema({"value": "ok"})
+
+    assert failure_reason is not None
+    assert "Text prompt JSON schema validation failed" in failure_reason
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_execute_fails_schema_validation_before_recording(monkeypatch):
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "first_name": {"type": "string"},
+                    "last_name": {"type": "string"},
+                },
+                "required": ["first_name", "last_name"],
+            },
+        },
+    )
+    workflow_run_context = _make_workflow_run_context()
+    bad_response = {"first_name": "f_name_var", "last_name": "code fragment"}
+    record_output_parameter_value = AsyncMock()
+    send_prompt = AsyncMock(return_value=bad_response)
+
+    monkeypatch.setattr(TextPromptBlock, "send_prompt", send_prompt)
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "get_workflow_run_context",
+        staticmethod(lambda workflow_run_id: workflow_run_context),
+    )
+    monkeypatch.setattr(TextPromptBlock, "record_output_parameter_value", record_output_parameter_value)
+
+    result = await block.execute(
+        workflow_run_id="workflow-run",
+        workflow_run_block_id="workflow-run-block",
+        organization_id="org-1",
+    )
+
+    assert result.success is False
+    assert result.status == BlockStatus.failed
+    assert result.output_parameter_value is None
+    assert result.failure_reason is not None
+    assert "does not match text prompt JSON schema" in result.failure_reason
+    record_output_parameter_value.assert_not_awaited()
+    assert send_prompt.await_count == block.schema_validation_max_attempts
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_execute_invalid_schema_fails_without_llm_retry(monkeypatch):
+    block = _make_text_prompt_block(json_schema={"type": 123})
+    workflow_run_context = _make_workflow_run_context()
+    record_output_parameter_value = AsyncMock()
+    send_prompt = AsyncMock(return_value={"llm_response": "ok"})
+
+    monkeypatch.setattr(TextPromptBlock, "send_prompt", send_prompt)
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "get_workflow_run_context",
+        staticmethod(lambda workflow_run_id: workflow_run_context),
+    )
+    monkeypatch.setattr(TextPromptBlock, "record_output_parameter_value", record_output_parameter_value)
+
+    result = await block.execute(
+        workflow_run_id="workflow-run",
+        workflow_run_block_id="workflow-run-block",
+        organization_id="org-1",
+    )
+
+    assert result.success is False
+    assert result.status == BlockStatus.failed
+    assert result.failure_reason == "Text prompt JSON schema is invalid."
+    send_prompt.assert_not_awaited()
+    record_output_parameter_value.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_execute_retries_schema_validation_failure(monkeypatch):
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "first_name": {"type": "string"},
+                    "last_name": {"type": "string"},
+                },
+                "required": ["first_name", "last_name"],
+            },
+        },
+    )
+    workflow_run_context = _make_workflow_run_context()
+    bad_response = {"first_name": "f_name_var", "last_name": "code fragment"}
+    good_response = [{"first_name": "Zachary", "last_name": "Leibrand"}]
+    responses = [bad_response, good_response]
+    prompts: list[str] = []
+    retry_failures: list[str | None] = []
+    record_output_parameter_value = AsyncMock()
+
+    async def fake_send_prompt(self, prompt, *args, **kwargs):
+        prompts.append(prompt)
+        retry_failures.append(kwargs.get("schema_validation_failure"))
+        return responses.pop(0)
+
+    monkeypatch.setattr(TextPromptBlock, "send_prompt", fake_send_prompt)
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "get_workflow_run_context",
+        staticmethod(lambda workflow_run_id: workflow_run_context),
+    )
+    monkeypatch.setattr(TextPromptBlock, "record_output_parameter_value", record_output_parameter_value)
+
+    result = await block.execute(
+        workflow_run_id="workflow-run",
+        workflow_run_block_id="workflow-run-block",
+        organization_id="org-1",
+    )
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert result.output_parameter_value == good_response
+    assert prompts == [block.prompt, block.prompt]
+    assert retry_failures[0] is None
+    assert retry_failures[1] is not None
+    assert "expected type array, got object" in retry_failures[1]
+    record_output_parameter_value.assert_awaited_once_with(workflow_run_context, "workflow-run", good_response)
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_execute_retries_response_format_failure(monkeypatch):
+    block = _make_text_prompt_block(
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "first_name": {"type": "string"},
+                    "last_name": {"type": "string"},
+                },
+                "required": ["first_name", "last_name"],
+            },
+        },
+    )
+    workflow_run_context = _make_workflow_run_context()
+    raw_bad_response = "not-json-customer-private-value-" + ("x" * 300)
+    good_response = [{"first_name": "Zachary", "last_name": "Leibrand"}]
+    prompts: list[str] = []
+    retry_failures: list[str | None] = []
+    record_output_parameter_value = AsyncMock()
+
+    async def fake_send_prompt(self, prompt, *args, **kwargs):
+        prompts.append(prompt)
+        retry_failures.append(kwargs.get("schema_validation_failure"))
+        if len(prompts) == 1:
+            raise InvalidLLMResponseFormat(raw_bad_response)
+        return good_response
+
+    monkeypatch.setattr(TextPromptBlock, "send_prompt", fake_send_prompt)
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "get_workflow_run_context",
+        staticmethod(lambda workflow_run_id: workflow_run_context),
+    )
+    monkeypatch.setattr(TextPromptBlock, "record_output_parameter_value", record_output_parameter_value)
+
+    result = await block.execute(
+        workflow_run_id="workflow-run",
+        workflow_run_block_id="workflow-run-block",
+        organization_id="org-1",
+    )
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert result.output_parameter_value == good_response
+    assert prompts == [block.prompt, block.prompt]
+    assert retry_failures[0] is None
+    assert retry_failures[1] is not None
+    assert "InvalidLLMResponseFormat" in retry_failures[1]
+    assert raw_bad_response not in retry_failures[1]
+    assert "customer-private-value" not in retry_failures[1]
+    record_output_parameter_value.assert_awaited_once_with(workflow_run_context, "workflow-run", good_response)
 
 
 def test_workflow_request_deserialization_strips_invalid_text_prompt_llm_key() -> None:
