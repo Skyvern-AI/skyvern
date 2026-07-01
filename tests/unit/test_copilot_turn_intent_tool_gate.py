@@ -613,6 +613,7 @@ async def test_get_run_results_defaults_to_successful_same_turn_run() -> None:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
 
         result = await _get_run_results({}, ctx)
 
@@ -633,6 +634,7 @@ async def test_get_run_results_defaults_to_latest_same_turn_run_when_no_success(
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
 
         result = await _get_run_results({}, ctx)
 
@@ -682,6 +684,7 @@ async def test_get_run_results_uses_pending_reconciliation_run_when_id_omitted()
     with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
         result = await _get_run_results({}, ctx)
 
     assert result["ok"] is True
