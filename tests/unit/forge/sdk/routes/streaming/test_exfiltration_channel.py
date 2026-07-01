@@ -294,6 +294,46 @@ class TestExfiltrationChannelEvents:
         page.add_init_script.assert_not_awaited()
         assert page.evaluate.await_count == 2
 
+    def test_console_fingerprint_ignores_volatile_timestamp(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        jittered = {**_make_event_data(), "timestamp": 1002.0}
+
+        assert channel._console_fingerprint(first) == channel._console_fingerprint(jittered)
+
+    def test_should_emit_console_event_dedupes_across_ms_jitter(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        jittered = {**_make_event_data(), "timestamp": 1002.0}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(jittered) is False
+
+    def test_should_emit_console_event_keeps_distinct_interactions(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        distinct_target = {
+            **_make_event_data(),
+            "timestamp": 1002.0,
+            "target": {"tagName": "BUTTON", "id": "cancel", "skyId": "sky-2", "text": ["Cancel"]},
+        }
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(distinct_target) is True
+
+    def test_reconnect_recapture_with_jitter_emits_single_interaction(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        ExfiltrationChannel._active_binding_channels[page] = channel
+
+        # A reconnect re-injects the exfiltrate script, re-emitting the same DOM
+        # interaction with an advanced browser clock; the stable fingerprint dedupes
+        # it even though the channel instance (and its cache) survived the reconnect.
+        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1000.0})
+        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1002.0})
+
+        on_event.assert_called_once()
+
 
 class TestNavigationReExfiltration:
     @pytest.mark.asyncio
