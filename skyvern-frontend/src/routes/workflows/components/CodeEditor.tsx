@@ -8,7 +8,10 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { useDebouncedCallback } from "use-debounce";
 
-import { isOversizedDocument } from "./oversizedDocument";
+import {
+  isDeeplyNestedDocument,
+  LARGE_DOCUMENT_CHAR_THRESHOLD,
+} from "./oversizedDocument";
 import "./code-mirror-overrides.css";
 
 function getLanguageExtension(language: "python" | "json" | "html") {
@@ -150,9 +153,19 @@ function CodeEditorImpl({
     if (!viewRef.current) viewRef.current = viewUpdate.view;
   }, []);
 
-  const oversized = useMemo(
-    () => isOversizedDocument(internalValue),
+  // Highlighting is only unsafe for deeply nested documents (the stack-overflow
+  // trigger); line-wrapping is additionally guarded by raw size. Keeping these
+  // separate lets large-but-shallow payloads (e.g. webhook bodies) stay
+  // syntax-highlighted while still rendering unwrapped. See SKY-11432 / SKY-11608.
+  const deeplyNested = useMemo(
+    () => isDeeplyNestedDocument(internalValue),
     [internalValue],
+  );
+  // Reuses deeplyNested's scan instead of calling isOversizedDocument, which
+  // would re-run getMaxStructureDepth for values under the size threshold.
+  const oversized = useMemo(
+    () => internalValue.length > LARGE_DOCUMENT_CHAR_THRESHOLD || deeplyNested,
+    [internalValue, deeplyNested],
   );
   const effectiveLineWrap = lineWrap && !oversized;
 
@@ -162,7 +175,7 @@ function CodeEditorImpl({
   // unnecessary editor state reconfiguration.
   const extensions = useMemo<Extension[]>(() => {
     const exts: Extension[] = [];
-    if (language && !oversized) {
+    if (language && !deeplyNested) {
       exts.push(getLanguageExtension(language));
     }
     if (effectiveLineWrap) {
@@ -175,7 +188,7 @@ function CodeEditorImpl({
       exts.push(fullHeightExtension);
     }
     return exts;
-  }, [language, oversized, effectiveLineWrap, extraExtensions, fullHeight]);
+  }, [language, deeplyNested, effectiveLineWrap, extraExtensions, fullHeight]);
 
   const style: React.CSSProperties = { fontSize };
   if (fullHeight) {
