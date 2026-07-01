@@ -139,6 +139,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RecordingPage,
     user_code_line_from_exception,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -149,7 +150,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -4441,138 +4441,30 @@ async def wrapper({default_args}):
             if secure_code_block_result is not None:
                 return secure_code_block_result
 
-        workflow_run_block = None
-
         # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
         # the standard action/artifact timeline and the agent can later take over on failure.
         # Promptless blocks have no task and persist neither actions nor screenshots.
-        task: Task | None = None
-        step: Step | None = None
-        if self.prompt:
-            task, step = await app.agent.create_task_and_step_from_code_block(
-                code_block=self,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                task_url=page.url,
-            )
-
-        screenshot_tasks: list[asyncio.Task[None]] = []
-
-        async def _screenshot_sink(action: Action) -> None:
-            # No task means no action row will reference the screenshot, so skip it rather than orphan an artifact.
-            nonlocal workflow_run_block
-            if task is None:
-                return
-            # Every action that reaches this sink is one the recorder chose to surface on the timeline
-            # (goto, click, input, page.evaluate, select, hover, ...), so each one earns a screenshot.
-            # Re-listing eligible types here only drifts from the recorder's maps — which is exactly how
-            # page.evaluate (EXECUTE_JS) ended up with no screenshot.
-            # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
-            # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
-            # only the page-free S3 upload is deferred off the critical path.
-            try:
-                if workflow_run_block is None:
-                    workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
-                        workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
-                    )
-                run_block = workflow_run_block
-                screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
-            except Exception:
-                LOG.warning(
-                    "Code block screenshot capture failed",
-                    workflow_run_block_id=workflow_run_block_id,
-                    exc_info=True,
-                )
-                return
-
-            async def _upload() -> None:
-                try:
-                    action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                        workflow_run_block=run_block,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        data=screenshot,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Code block screenshot upload failed",
-                        workflow_run_block_id=workflow_run_block_id,
-                        exc_info=True,
-                    )
-
-            screenshot_tasks.append(asyncio.create_task(_upload()))
-
-        async def _drain_screenshots() -> None:
-            if screenshot_tasks:
-                await asyncio.gather(*screenshot_tasks, return_exceptions=True)
-
-        recording_page = RecordingPage(page, on_action=_screenshot_sink)
-
-        async def _persist_recorded_actions(recorded: list[Action]) -> None:
-            # Best-effort like the screenshot sink: recording must never change block outcome.
-            await _drain_screenshots()
-            if not recorded or task is None or step is None:
-                return
-            try:
-                masked = workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
-                for raw in masked:
-                    action = Action.model_validate(raw)
-                    action.task_id = task.task_id
-                    action.step_id = step.step_id
-                    action.step_order = step.order
-                    action.organization_id = organization_id
-                    await app.DATABASE.workflow_params.create_action(action)
-            except Exception:
-                LOG.warning(
-                    "Failed to persist recorded code block actions",
-                    workflow_run_block_id=workflow_run_block_id,
-                    exc_info=True,
-                )
-
-        finalized = False
-
-        async def _finalize_code_block_task(success: bool) -> None:
-            # Finalize both task and step on every exit path (incl. CancelledError via the finally); idempotent.
-            nonlocal finalized
-            if task is None or finalized:
-                return
-            finalized = True
-            try:
-                await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=organization_id,
-                    status=TaskStatus.completed if success else TaskStatus.failed,
-                )
-                if step is not None:
-                    await app.DATABASE.tasks.update_step(
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        status=StepStatus.completed if success else StepStatus.failed,
-                        output=AgentStepOutput(action_results=[]) if success else None,
-                        is_last=True,
-                        organization_id=organization_id,
-                    )
-            except Exception:
-                LOG.warning(
-                    "Failed to finalize code block task status",
-                    workflow_run_block_id=workflow_run_block_id,
-                    exc_info=True,
-                )
+        recorder = CodeBlockActionRecording(
+            code_block=self,
+            page=page,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            workflow_run_context=workflow_run_context,
+        )
+        await recorder.create_task_and_step()
+        recording_page = recorder.recording_page
 
         try:
-            if task is not None:
-                await app.DATABASE.observer.update_workflow_run_block(
-                    workflow_run_block_id=workflow_run_block_id,
-                    task_id=task.task_id,
-                    organization_id=organization_id,
-                )
+            await recorder.link_block()
             user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
             )
         except InsecureCodeDetected as e:
-            await _drain_screenshots()
-            await _finalize_code_block_task(success=False)
+            await recorder.persist(recorder.recorded_actions())
+            await recorder.finalize(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
@@ -4582,8 +4474,8 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         except asyncio.TimeoutError:
-            await _persist_recorded_actions(recording_page.recorded_actions())
-            await _finalize_code_block_task(success=False)
+            await recorder.persist(recorder.recorded_actions())
+            await recorder.finalize(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=(
@@ -4601,8 +4493,8 @@ async def wrapper({default_args}):
             # User code can raise an exception carrying a resolved secret (e.g.
             # `raise Exception(await cred.otp())`); mask before it reaches the persisted reason.
             failure_reason = workflow_run_context.mask_secrets_in_data(exc.message)
-            recorded = recording_page.recorded_actions()
-            if recording_page.last_recorded_exception() is not e:
+            recorded = recorder.recorded_actions()
+            if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
                     Action(
@@ -4614,7 +4506,7 @@ async def wrapper({default_args}):
                         output={"code_line": failing_line},
                     )
                 )
-            await _persist_recorded_actions(recorded)
+            await recorder.persist(recorded)
             healed = await self._attempt_self_heal(
                 exception=e,
                 failing_line=failing_line,
@@ -4628,9 +4520,9 @@ async def wrapper({default_args}):
             if healed is not None:
                 # Finalize the seat task to the heal outcome before the idempotent `finally` no-ops it,
                 # so a healed success no longer leaves the seat row failed under a completed block.
-                await _finalize_code_block_task(success=healed.success)
+                await recorder.finalize(success=healed.success)
                 return healed
-            await _finalize_code_block_task(success=False)
+            await recorder.finalize(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=failure_reason,
@@ -4641,11 +4533,11 @@ async def wrapper({default_args}):
             )
 
         else:
-            await _persist_recorded_actions(recording_page.recorded_actions())
-            await _finalize_code_block_task(success=True)
+            await recorder.persist(recorder.recorded_actions())
+            await recorder.finalize(success=True)
         finally:
-            # Safety net for paths the except arms miss (CancelledError, update_workflow_run_block failure).
-            await _finalize_code_block_task(success=False)
+            # Safety net for paths the except arms miss (CancelledError, link_block failure).
+            await recorder.finalize(success=False)
 
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
