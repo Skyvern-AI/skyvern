@@ -128,9 +128,6 @@ function WorkflowRunRightColumn({
           activeIteration={activeIteration}
           timeline={timeline}
           timelineReady={timelineReady}
-          onActionSelect={(item) => {
-            onSetActiveItem(item.action.action_id);
-          }}
           onThoughtSelect={(thought) => {
             onSetActiveItem(thought.thought_id);
           }}

@@ -217,7 +217,7 @@ describe("WorkflowRunBlockDetail router", () => {
     );
   });
 
-  it("renders actions for a file_download block", () => {
+  it("does not duplicate the timeline with an Actions (N) section", () => {
     const action: ActionsApiResponse = {
       action_id: "act_download",
       action_type: ActionTypes.Click,
@@ -242,8 +242,10 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
 
-    expect(screen.getByText("Actions (1)")).toBeDefined();
-    expect(screen.getByText("Click the invoice download link")).toBeDefined();
+    // The bottom timeline already lists every action; the detail panel must
+    // not re-list them under an "Actions (N)" section.
+    expect(screen.queryByText(/^Actions \(\d+\)$/)).toBeNull();
+    expect(screen.queryByText("Click the invoice download link")).toBeNull();
   });
 
   it("renders the conditional detail (branch evaluation) for a conditional block", () => {
@@ -332,7 +334,7 @@ describe("WorkflowRunBlockDetail router", () => {
     expect(screen.getByText("Running")).toBeDefined();
   });
 
-  it("surfaces the selected action directly under the block header", () => {
+  it("does not show a redundant Selected action section when a child action is selected", () => {
     const action: ActionsApiResponse = {
       action_id: "act_extract",
       action_type: ActionTypes.extract,
@@ -363,11 +365,51 @@ describe("WorkflowRunBlockDetail router", () => {
       />,
     );
 
+    // The block header still identifies the resolved block...
     expect(screen.getByText("calendar_lookup")).toBeDefined();
-    expect(screen.getByText("Selected action")).toBeDefined();
+    // ...but the redundant "Selected action" card is gone.
+    expect(screen.queryByText("Selected action")).toBeNull();
+  });
+
+  it("reflects the selected child action's data in the inspector tabs, not the parent block", () => {
+    const action: ActionsApiResponse = {
+      action_id: "act_input",
+      action_type: ActionTypes.InputText,
+      status: Status.Completed,
+      task_id: null,
+      step_id: null,
+      step_order: null,
+      action_order: null,
+      reasoning: "Input the last name into the search field",
+      description: null,
+      intention: null,
+      response: null,
+      text: "McTesterson",
+      created_by: null,
+      confidence_float: 1,
+    };
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_task",
+      block_type: "task_v2",
+      label: "registry_search",
+      actions: [action],
+    });
+
+    render(
+      <WorkflowRunBlockDetail
+        activeItem={action}
+        timeline={[buildBlockItem(block)]}
+      />,
+    );
+
+    // The action's reasoning is surfaced in the inspector (Summary by default).
     expect(
-      screen.getAllByText("Extract the event date from the page")[0],
+      screen.getByText("Input the last name into the search field"),
     ).toBeDefined();
+    // Its input value shows under Inputs — the child action, not the block.
+    // Radix Tabs activates on mousedown, not a bare click event.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Inputs" }));
+    expect(screen.getByText("McTesterson")).toBeDefined();
   });
 
   it("ignores a stale activeIteration when falling back via 'stream'", () => {
