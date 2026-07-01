@@ -329,6 +329,18 @@ def recorded_outcome_from_run_blocks_result(
                     "evidence_refs": "run output structure",
                 },
             )
+        if recorded_run_outcome.verdict == "not_evaluated":
+            return RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code=reason_code,
+                workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
+                block_labels=block_labels,
+                authored_structure_signature=authored_structure_signature,
+                observed_evidence_summary=recorded_run_outcome.display_reason or "",
+                key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
+            )
         structural_identity = verification_identity
         evidence_refs = output_refs
         if not structural_identity and not page_refs and not evidence_refs:

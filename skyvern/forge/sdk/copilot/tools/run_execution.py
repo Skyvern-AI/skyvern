@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
+    only_structural_requested_output_abstentions,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
@@ -2475,6 +2476,7 @@ def _record_run_blocks_result(
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         copilot_ctx.last_unverified_block_labels = unverified
         outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
+        outcome_failure_warrants_repair = _outcome_failure_warrants_repair(copilot_ctx, completion_verification)
         if outcome_unverified_reason is not None:
             # The workflow already has a confirmation block, yet the produced
             # evidence does not demonstrate the outcome (or contradicts it). Treat
@@ -2484,7 +2486,7 @@ def _record_run_blocks_result(
             # so preserve streak state until produced evidence demonstrates the
             # outcome; terminal success stays withheld either way via the
             # verification result.
-            if _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
+            if outcome_failure_warrants_repair:
                 copilot_ctx.last_test_suspicious_success = True
                 copilot_ctx.last_test_failure_reason = outcome_unverified_reason
                 if isinstance(data, dict):
@@ -2501,6 +2503,18 @@ def _record_run_blocks_result(
             copilot_ctx.last_unverified_block_labels = []
             copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
             copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+            copilot_ctx.last_test_failure_reason = None
+        elif (
+            outcome_unverified_reason is not None
+            and completion_verification is not None
+            and only_structural_requested_output_abstentions(completion_verification)
+            and not unverified
+        ):
+            copilot_ctx.last_full_workflow_test_ok = True
+            copilot_ctx.last_unverified_block_labels = []
+            copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+            copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+            copilot_ctx.last_test_suspicious_success = False
             copilot_ctx.last_test_failure_reason = None
         elif outcome_unverified_reason is None and not unverified:
             copilot_ctx.last_full_workflow_test_ok = True
@@ -2625,6 +2639,11 @@ def _adjudicated_run_outcome(
         return committed
     if completion_verification is not None and completion_verification.status == "evaluated":
         if not completion_verification.is_fully_satisfied():
+            if only_structural_requested_output_abstentions(completion_verification):
+                return RecordedRunOutcome(
+                    verdict="not_evaluated",
+                    display_reason=run_outcome_display_reason("Completion remains unverified."),
+                )
             return RecordedRunOutcome(
                 verdict="not_demonstrated",
                 reason_code="outcome_not_demonstrated",
