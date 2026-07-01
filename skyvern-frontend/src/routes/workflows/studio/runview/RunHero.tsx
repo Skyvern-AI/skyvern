@@ -8,6 +8,7 @@ import {
   GlobeIcon,
   ListBulletIcon,
   PlayIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
@@ -33,6 +34,7 @@ type RunHeroProps = {
   isPaused: boolean;
   failed: boolean;
   failureReason: string | null;
+  codeGenerating?: boolean;
   browserSessionId: string | null;
   recordingUrls: string[];
   elapsed: string;
@@ -62,18 +64,20 @@ function ViewToggle({
   icon,
   label,
   compact,
+  title,
 }: {
   active: boolean;
   onClick: () => void;
   icon: React.ReactNode;
   label: string;
   compact: boolean;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      title={compact ? label : undefined}
+      title={title ?? (compact ? label : undefined)}
       aria-label={label}
       aria-pressed={active}
       className={cn(
@@ -100,6 +104,7 @@ export function RunHero({
   isPaused,
   failed,
   failureReason,
+  codeGenerating = false,
   browserSessionId,
   recordingUrls,
   elapsed,
@@ -268,7 +273,19 @@ export function RunHero({
             onClick={() => toggleCenter("code")}
             compact={compact}
             label="Code"
-            icon={<CodeIcon className="h-3 w-3" />}
+            title={
+              codeGenerating ? "Generating cached code for this run" : undefined
+            }
+            icon={
+              codeGenerating ? (
+                <ReloadIcon
+                  data-testid="code-generating-spinner"
+                  className="h-3 w-3 animate-spin"
+                />
+              ) : (
+                <CodeIcon className="h-3 w-3" />
+              )
+            }
           />
           {inputs ? (
             <ViewToggle

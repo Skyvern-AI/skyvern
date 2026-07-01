@@ -25,7 +25,6 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioShellStore, type StudioTab } from "@/store/StudioShellStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -36,10 +35,8 @@ import { cn } from "@/util/utils";
 import { EditableNodeTitle } from "../editor/nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "../editor/header/EditorOverflowMenu";
 import { MakeACopyButton } from "../editor/MakeACopyButton";
-import { useIsGeneratingCode } from "../editor/hooks/useIsGeneratingCode";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
-import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { studioPanelId, studioTabId } from "./constants";
@@ -53,39 +50,6 @@ function useIsGlobalWorkflow(): boolean {
     globalWorkflows?.some(
       (w) => w.workflow_permanent_id === workflowPermanentId,
     ),
-  );
-}
-
-function GeneratingCodeIndicator() {
-  const { workflowPermanentId } = useParams();
-  const urlRunId = useStudioRunId();
-  const { data: runs } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    page: 1,
-    pageSize: 1,
-  });
-  const workflowRunId = urlRunId ?? runs?.[0]?.workflow_run_id;
-  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
-  const cacheKeyValue = useCacheKeyValueStore((s) => s.cacheKeyValue);
-  const isGeneratingCode = useIsGeneratingCode({
-    cacheKey: workflow?.cache_key ?? "",
-    cacheKeyValue,
-    workflowPermanentId,
-    workflowRunId,
-  });
-
-  if (!isGeneratingCode) {
-    return null;
-  }
-
-  return (
-    <span
-      className="inline-flex h-9 items-center gap-2 rounded-md bg-slate-elevation3 px-3 text-sm font-medium text-muted-foreground"
-      title="Generating cached code for this run"
-    >
-      <ReloadIcon className="size-4 animate-spin" />
-      Code
-    </span>
   );
 }
 
@@ -360,7 +324,6 @@ export function StudioTopBar() {
       <div className="h-6 w-px bg-border" aria-hidden />
       <StudioTabs />
       <div className="flex-1" />
-      <GeneratingCodeIndicator />
       {isGlobalWorkflow ? (
         <MakeACopyButton />
       ) : (

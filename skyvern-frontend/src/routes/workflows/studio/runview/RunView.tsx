@@ -19,6 +19,8 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
 import { cn } from "@/util/utils";
 
+import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
+import { constructCacheKeyValue } from "../../editor/utils";
 import { useDebugSessionQuery } from "../../hooks/useDebugSessionQuery";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
@@ -73,6 +75,17 @@ export function RunView({
     useWorkflowRunWithWorkflowQuery(queryOptions);
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
   const { workflowPermanentId } = useParams();
+  const cacheKey = workflowRun?.workflow?.cache_key ?? "";
+  const codeGenerating = useIsGeneratingCode({
+    cacheKey,
+    cacheKeyValue: constructCacheKeyValue({
+      codeKey: cacheKey,
+      workflow: workflowRun?.workflow,
+      workflowRun,
+    }),
+    workflowPermanentId,
+    workflowRunId,
+  });
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
     enabled: false,
@@ -341,6 +354,7 @@ export function RunView({
             isPaused={workflowRun.status === Status.Paused}
             failed={failed}
             failureReason={workflowRun.failure_reason ?? null}
+            codeGenerating={codeGenerating}
             browserSessionId={workflowRun.browser_session_id ?? null}
             recordingUrls={recordingUrls}
             elapsed={elapsed}
