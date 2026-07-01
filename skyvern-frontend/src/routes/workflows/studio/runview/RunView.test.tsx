@@ -1,11 +1,17 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
-import { Status } from "@/api/types";
+import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import { useRunViewStore } from "@/store/RunViewStore";
 import type {
   WorkflowRunBlock,
@@ -16,6 +22,7 @@ import { RunView } from "./RunView";
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
+  runHeroProps: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -36,7 +43,12 @@ vi.mock("../../hooks/useDebugSessionQuery", () => ({
 vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
   useIsGeneratingCode: () => false,
 }));
-vi.mock("./RunHero", () => ({ RunHero: () => <div data-testid="run-hero" /> }));
+vi.mock("./RunHero", () => ({
+  RunHero: (props: Record<string, unknown>) => {
+    mocks.runHeroProps.push(props);
+    return <div data-testid="run-hero" />;
+  },
+}));
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: () => null,
 }));
@@ -102,6 +114,23 @@ function buildBlockItem(
   };
 }
 
+function buildAction(
+  overrides: Partial<ActionsApiResponse> = {},
+): ActionsApiResponse {
+  return {
+    action_id: "act_default",
+    action_type: ActionTypes.Click,
+    status: Status.Completed,
+    intention: null,
+    description: null,
+    reasoning: null,
+    step_id: "step_default",
+    action_order: 0,
+    screenshot_artifact_id: null,
+    ...overrides,
+  } as ActionsApiResponse;
+}
+
 function seedForLoopRun() {
   // current_index 0 keeps the header's fallback chip on "Iteration 1" so the
   // timeline's "Iteration 2" row is the only "Iteration 2" before selection.
@@ -147,6 +176,7 @@ afterEach(() => {
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
+  mocks.runHeroProps = [];
 });
 beforeEach(() => useRunViewStore.getState().reset());
 
@@ -175,5 +205,131 @@ describe("RunView iteration selection", () => {
     fireEvent.click(scope.getByText(/Loop over 2 values/));
     expect(scope.queryByText(/Iterable values/)).not.toBeNull();
     expect(scope.queryByText("Iteration 2 value")).toBeNull();
+  });
+});
+
+describe("RunView screenshot center view", () => {
+  test("selects the latest action frame when a running run opens Screenshots", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          actions: [
+            buildAction({
+              action_id: "act_1",
+              action_order: 0,
+              screenshot_artifact_id: "art_1",
+            }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.heroSelection).toBeNull();
+
+    act(() => {
+      useRunViewStore.getState().pinFrame("stream");
+      useRunViewStore.getState().setCenterView("screenshots");
+    });
+
+    const screenshotProps = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(screenshotProps?.hasScreenshots).toBe(true);
+    expect(screenshotProps?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: "art_1",
+      stepId: "step_default",
+      actionOrder: 0,
+    });
+  });
+
+  test("does not advertise screenshots for actions without screenshot candidates", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          actions: [
+            buildAction({
+              action_id: "act_1",
+              step_id: null,
+              screenshot_artifact_id: null,
+            }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.hasScreenshots).toBe(false);
+    expect(props?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: null,
+      stepId: null,
+    });
+  });
+
+  test("does not advertise step screenshots without an action order", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          actions: [
+            buildAction({
+              action_id: "act_1",
+              action_order: null,
+              screenshot_artifact_id: null,
+            }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.hasScreenshots).toBe(false);
+    expect(props?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: null,
+      stepId: "step_default",
+      actionOrder: null,
+    });
   });
 });
