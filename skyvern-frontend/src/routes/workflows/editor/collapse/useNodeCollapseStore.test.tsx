@@ -97,6 +97,35 @@ describe("useNodeCollapseStore (SKY-9069 / SKY-9361)", () => {
     });
   });
 
+  test("expandBlock clears a collapsed label", () => {
+    const { toggleBlock, expandBlock } = useNodeCollapseStore.getState();
+    toggleBlock(WF, "alpha");
+    expect(useNodeCollapseStore.getState().collapsed[`${WF}\x1falpha`]).toBe(
+      true,
+    );
+    expandBlock(WF, "alpha");
+    expect(`${WF}\x1falpha` in useNodeCollapseStore.getState().collapsed).toBe(
+      false,
+    );
+  });
+
+  test("expandBlock is a no-op for an already-open block", () => {
+    const before = useNodeCollapseStore.getState().collapsed;
+    useNodeCollapseStore.getState().expandBlock(WF, "never-collapsed");
+    expect(useNodeCollapseStore.getState().collapsed).toBe(before);
+  });
+
+  test("expandBlock leaves other labels and workflows untouched", () => {
+    const { collapseAll, expandBlock } = useNodeCollapseStore.getState();
+    collapseAll("wf_other", ["x"]);
+    collapseAll(WF, ["a", "b"]);
+    expandBlock(WF, "a");
+    expect(useNodeCollapseStore.getState().collapsed).toEqual({
+      "wf_other\x1fx": true,
+      [`${WF}\x1fb`]: true,
+    });
+  });
+
   test("pruneStaleLabels drops entries whose labels are no longer present", () => {
     const { collapseAll, pruneStaleLabels } = useNodeCollapseStore.getState();
     collapseAll("wf_other", ["keep"]);
