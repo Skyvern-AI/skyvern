@@ -333,9 +333,6 @@ function Workspace({
     (s) => s.setCopilotCollapsed,
   );
   const studioSetTab = useStudioShellStore((s) => s.setTab);
-  const studioSetSettingsCollapsed = useStudioShellStore(
-    (s) => s.setSettingsCollapsed,
-  );
   // The studio canvas sits right of the Copilot column; offset the fit by the
   // column width so the chain centers on the whole page, not just the pane.
   const studioCanvasCenterOffset = embedded
@@ -853,7 +850,6 @@ function Workspace({
   // payload resolves.
   const cacheKeyInitWpidRef = useRef<string | null>(null);
   useEffect(() => {
-    // Studio defaults the selection to the start node on open (legacy keeps it
     // empty), unless the URL asks for a specific block; fires only on workflow
     // change, so tab-switch selection persists.
     const initialSelectedBlockId = getInitialSelectedBlockId({
@@ -862,11 +858,6 @@ function Workspace({
       searchParams,
     });
     useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
-    // The collapse flag is a module-level store, so it survives an in-session
-    // A→B workflow nav; re-collapse here so every workflow opens to the rail.
-    if (embedded) {
-      studioSetSettingsCollapsed(true);
-    }
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     cacheKeyInitWpidRef.current = null;
@@ -1412,11 +1403,6 @@ function Workspace({
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
     useWorkflowPanelStore.getState().setSelectedBlockId(id);
-    // Adding a block is a deliberate action: expand the studio settings panel
-    // to the new block (the library flow doesn't go through onNodeClick).
-    if (embedded) {
-      studioSetSettingsCollapsed(false);
-    }
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -1569,9 +1555,9 @@ function Workspace({
       className="relative h-full w-full"
       style={
         {
-          // In studio the settings panel is its own grid column (StudioShell), so
-          // the Stage already reflows; zero the var so on-canvas overlays don't
-          // double-offset. Legacy keeps the overlay's measured width.
+          // Studio has no block-config settings sidebar (settings are inline in
+          // the blocks), so zero the var; the on-canvas sidebar-offset consumers
+          // are suppressed there anyway. Legacy keeps the overlay's measured width.
           [BLOCK_SIDEBAR_WIDTH_VAR]: embedded
             ? "0px"
             : `${renderedBlockSidebarWidth}px`,
