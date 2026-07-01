@@ -1035,6 +1035,7 @@ class WorkflowService:
         workflow_schedule_id: str | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        resolved_workflow_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -1044,15 +1045,24 @@ class WorkflowService:
         :param workflow_id: The workflow id to run.
         :param organization_id: The organization id for the workflow.
         :param max_steps_override: The max steps override for the workflow run, if any.
+        :param resolved_workflow_id: Pin the exact workflow version row to run against, resolved by
+            workflow_id. Used when the (permanent_id, version) index is non-unique and a version=
+            lookup could resolve the wrong row. When None, resolve by permanent id + version.
         :return: The created workflow run.
         """
         async with app.DATABASE.workflow_runs.Session() as outer_session:
             # Validate the workflow and the organization
-            workflow = await self.get_workflow_by_permanent_id(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=None if is_template_workflow else organization.organization_id,
-                version=version,
-            )
+            if resolved_workflow_id is not None:
+                workflow = await app.DATABASE.workflows.get_workflow(
+                    workflow_id=resolved_workflow_id,
+                    organization_id=None if is_template_workflow else organization.organization_id,
+                )
+            else:
+                workflow = await self.get_workflow_by_permanent_id(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=None if is_template_workflow else organization.organization_id,
+                    version=version,
+                )
             if workflow is None:
                 LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
                 raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
@@ -1709,15 +1719,11 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = workflow_override or await self.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_run.workflow_permanent_id
-        )
-        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
-        browser_profile_id = workflow_run.browser_profile_id
-        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
-        # Guard: if the run was canceled while queued (before Temporal picked it up),
-        # don't overwrite the canceled status with running.
+        # Guard: if the run was canceled while queued (before Temporal picked it up), don't
+        # overwrite the canceled status with running. Checked BEFORE workflow resolution so a run
+        # whose stamped workflow version was deleted after cancellation does not raise
+        # WorkflowNotFound on a late worker pickup.
         if workflow_run.status == WorkflowRunStatus.canceled:
             LOG.info(
                 "Workflow run was canceled before execution started, skipping",
@@ -1725,6 +1731,14 @@ class WorkflowService:
                 organization_id=organization_id,
             )
             return workflow_run
+
+        # Resolve the exact version stamped on the run (run.workflow_id is always set), not the
+        # latest published version, so a publish between run creation and execution does not change
+        # what executes.
+        workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
+        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
+        browser_profile_id = workflow_run.browser_profile_id
+        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
         if enterprise_gated_features:
