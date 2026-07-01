@@ -7,6 +7,7 @@ mode: custom
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-of-june-30%2C-2026" className="cl-sidebar-link">Week of Jun 30, 2026</a>
     <a href="#week-of-june-22%2C-2026" className="cl-sidebar-link">Week of Jun 22, 2026</a>
     <a href="#week-of-june-15%2C-2026" className="cl-sidebar-link">Week of Jun 15, 2026</a>
     <a href="#week-of-june-8%2C-2026" className="cl-sidebar-link">Week of Jun 8, 2026</a>
@@ -26,6 +27,28 @@ mode: custom
   <div className="cl-content">
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
+
+<Update label="Week of June 30, 2026" description="Workflow Studio UX improvements, faster enrichment, code-block self-heal, extraction accuracy, bug fixes">
+
+## Improvements
+
+- **Block Type Shown in Workflow Studio Header** — The block detail panel in Workflow Studio now displays the block type in the header, making it easier to identify what kind of block you're editing at a glance. ([#6956](https://github.com/Skyvern-AI/skyvern/pull/6956))
+- **Improved Extraction Accuracy for Absent Data** — The agent now better handles cases where requested output is genuinely absent from the page, reducing false positives in extraction results. ([#6957](https://github.com/Skyvern-AI/skyvern/pull/6957))
+- **Data-Only Validation Skips Page Evidence** — Validation steps that check only extracted data no longer capture page screenshots when they aren't needed, reducing unnecessary work during runs. ([#6960](https://github.com/Skyvern-AI/skyvern/pull/6960))
+- **Copilot Block Runs Routed to UI Worker** — Copilot block runs are now dispatched to a dedicated UI worker, keeping the editor responsive during live automation. ([#6962](https://github.com/Skyvern-AI/skyvern/pull/6962))
+- **Clearer Invalid JSON Errors in Workflow Editor** — The workflow editor now surfaces a descriptive error when a parameter contains invalid JSON, making it faster to diagnose and fix configuration mistakes. ([#6963](https://github.com/Skyvern-AI/skyvern/pull/6963))
+- **"Ignore System Prompt" Moved to Advanced Settings** — The "Ignore system prompt" option has been relocated to the advanced settings panel, reducing clutter in the default block configuration view. ([#6964](https://github.com/Skyvern-AI/skyvern/pull/6964))
+- **Empty Extra HTTP Headers Hidden** — Extra HTTP header fields that are empty no longer appear in block configurations, reducing visual noise in the workflow editor. ([#6966](https://github.com/Skyvern-AI/skyvern/pull/6966))
+- **Block Selection Persisted in URL** — The selected block in Workflow Studio is now encoded in the URL, so your selection is preserved on reload and can be shared via link. ([#6969](https://github.com/Skyvern-AI/skyvern/pull/6969))
+- **Code-Block Self-Heal Minimum Retry Floor** — The code-block self-healing loop now enforces a minimum number of repair attempts before giving up, preventing premature failures on recoverable errors. ([#6971](https://github.com/Skyvern-AI/skyvern/pull/6971))
+- **Faster Live-Draft Enrichment** — Workflow recording live-draft enrichment now uses a faster model and a shorter debounce interval, making draft suggestions appear noticeably sooner while recording. ([#6973](https://github.com/Skyvern-AI/skyvern/pull/6973))
+
+## Bug fixes
+
+- Fixed syntax highlighting disappearing when viewing large webhook payloads. ([#6967](https://github.com/Skyvern-AI/skyvern/pull/6967))
+- Fixed LLM blocks not enforcing their configured output schema, which could allow malformed data to propagate to downstream blocks. ([#6965](https://github.com/Skyvern-AI/skyvern/pull/6965))
+
+</Update>
 
 <Update label="Week of June 22, 2026" description="Workflow Studio preview, new models, label management, Gmail OTP, Copilot improvements, analytics filters, bug fixes">
 
