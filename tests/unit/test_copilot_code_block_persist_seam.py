@@ -12,17 +12,24 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    authored_structure_signature_from_workflow,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
     _sandbox_shim_surface,
     strip_redundant_sandbox_imports,
 )
+from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_synthesis import _get_by_role_expr, _get_by_role_expr_strict
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -42,7 +49,10 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
-from skyvern.forge.sdk.copilot.tools.workflow_update import _strip_redundant_sandbox_imports_in_yaml
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _code_safety_reject_payload,
+    _strip_redundant_sandbox_imports_in_yaml,
+)
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind, _kind_for_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
@@ -1055,6 +1065,919 @@ class TestCodeRepairProgressClassification:
         assert result["data"]["progress_text"] != result["user_facing_summary"]
 
     @pytest.mark.asyncio
+    async def test_generated_code_preflight_string_reject_is_not_authoritative(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_code_block_safety_errors",
+            lambda workflow_yaml, prior_yaml: [
+                "Code block `search_registry` failed the generated-code preflight check: "
+                "AUTHOR_PAGE_EVALUATE: page.evaluate is not allowed."
+            ],
+        )
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "code_safety_reject"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is False
+        assert ctx.latest_recorded_build_test_outcome.structural_key is None
+
+    def test_code_safety_payload_keeps_typed_security_error_authoritative(self) -> None:
+        payload = _code_safety_reject_payload(
+            [
+                CodeBlockSecurityError(
+                    "Code block `search_registry` failed the Copilot code security check: page.request is not allowed.",
+                    block_label="search_registry",
+                    reason_code="AUTHOR_PAGE_REQUEST",
+                    surface="page.request",
+                )
+            ]
+        )
+
+        assert payload == {
+            "code_safety_errors": [
+                {
+                    "block_label": "search_registry",
+                    "reason_code": "AUTHOR_PAGE_REQUEST",
+                    "surface": "page.request",
+                }
+            ]
+        }
+
+    def test_code_safety_payload_rejects_string_only_preflight_authority(self) -> None:
+        payload = _code_safety_reject_payload(
+            [
+                "Code block `search_registry` failed the generated-code preflight check: "
+                "AUTHOR_PAGE_EVALUATE: page.evaluate is not allowed."
+            ]
+        )
+
+        assert payload is None
+
+    @pytest.mark.asyncio
+    async def test_authoritative_recorded_outcome_rejects_unchanged_authored_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _code_yaml('await page.goto("https://example.com/old")')
+        signature = authored_structure_signature_from_workflow(_SAFE_CODE_YAML)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:typed-outcome",
+            authored_structure_signature=signature,
+        )
+
+        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "unchanged after the last recorded test outcome" in result["error"]
+        assert ctx.workflow_yaml == _code_yaml('await page.goto("https://example.com/old")')
+        assert ctx.has_staged_proposal is False
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "unchanged_after_recorded_outcome"
+        assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+
+    @pytest.mark.asyncio
+    async def test_repeated_unchanged_authored_candidate_keeps_same_reject_key_and_backstop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        signature = authored_structure_signature_from_workflow(_SAFE_CODE_YAML)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:typed-outcome",
+            authored_structure_signature=signature,
+        )
+
+        first = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
+        first_key = ctx.latest_recorded_build_test_outcome.structural_key
+        first_count = ctx.code_authoring_guardrail_reject_count
+        second = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
+
+        assert first["ok"] is False
+        assert second["ok"] is False
+        assert first_key is not None
+        assert ctx.latest_recorded_build_test_outcome.structural_key == first_key
+        assert first_count == 1
+        assert ctx.code_authoring_guardrail_reject_count == 2
+
+    @pytest.mark.asyncio
+    async def test_authoritative_recorded_outcome_allows_changed_authored_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        signature = authored_structure_signature_from_workflow(_SAFE_CODE_YAML)
+        changed_yaml = _code_yaml('await page.goto("https://example.com/search")\nvalue = "changed"')
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:typed-outcome",
+            authored_structure_signature=signature,
+        )
+
+        result = await _update_workflow({"workflow_yaml": changed_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == changed_yaml
+        assert ctx.has_staged_proposal is True
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_output_empty_changed_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["npi", "locations"],
+            verdicts=[
+                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
+                CriterionVerdict(criterion_id="locations", state="unsatisfied", reason_code="no_evidence"),
+            ],
+        )
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi", "locations"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi", "locations"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+        )
+        partial_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              parameters:
+              - parameter_type: workflow
+                workflow_parameter_type: string
+                key: address_city_county_or_zip_code
+              blocks:
+              - block_type: code
+                label: {label}
+                parameter_keys:
+                - address_city_county_or_zip_code
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+                  await page.locator("#locInput").fill(str(address_city_county_or_zip_code))
+                  return {{}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not return any keyed output" in result["error"]
+        assert ctx.has_staged_proposal is False
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_implicit_keyed_output_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["npi", "locations"],
+            verdicts=[
+                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
+                CriterionVerdict(criterion_id="locations", state="unsatisfied", reason_code="no_evidence"),
+            ],
+        )
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi", "locations"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi", "locations"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+                  npi = "1234567890"
+                  locations = [{{"address": "123 Main St"}}]
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_candidate_missing_requested_output_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["address"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["address"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+                {"output_path": "locations", "output_root": "locations", "value_status": "empty_typed_value"},
+                {"output_path": "statuses", "output_root": "statuses", "value_status": "no_typed_value"},
+            ],
+        )
+        partial_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+                  address = "North Carolina, USA"
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        assert ctx.has_staged_proposal is False
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+
+    @pytest.mark.asyncio
+    async def test_metadata_reject_persists_missing_roots_for_next_author_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        partial_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+                  return {{"search_options": []}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "address",
+                "output_root": "address",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            },
+            {
+                "output_path": "credentialing_status",
+                "output_root": "credentialing_status",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            },
+        ]
+        rendered = agent_module._recorded_build_test_outcome_prompt(ctx)
+        assert "missing_requested_output_facts:" in rendered
+        assert "output_root=address" in rendered
+        assert "output_root=credentialing_status" in rendered
+        assert "value_status=no_typed_value" in rendered
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_when_last_run_produced_required_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.verified_block_outputs[label] = {
+            "address": "North Carolina, USA",
+            "credentialing_status": "Active",
+            "locations": [{"address": "North Carolina, USA"}],
+            "statuses": ["Active"],
+        }
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+                {"output_path": "locations", "output_root": "locations", "value_status": "empty_typed_value"},
+                {"output_path": "statuses", "output_root": "statuses", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+                  address = "North Carolina, USA"
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_still_rejects_empty_last_run_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.verified_block_outputs[label] = {
+            "address": "",
+            "credentialing_status": "",
+            "locations": [],
+            "statuses": [],
+        }
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not return any keyed output" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_candidate_covering_missing_output_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [
+                    {"goal_value_paths": ["address", "credentialing_status", "locations", "statuses"]}
+                ],
+                "terminal_verifier_expectations": [
+                    {"goal_value_paths": ["address", "credentialing_status", "locations", "statuses"]}
+                ],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+                {"output_path": "locations", "output_root": "locations", "value_status": "empty_typed_value"},
+                {"output_path": "statuses", "output_root": "statuses", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
+                  address = "North Carolina, USA"
+                  credentialing_status = "unknown"
+                  locations = []
+                  statuses = []
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_helper_returning_missing_output_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["address", "credentialing_status"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["address", "credentialing_status"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  async def extract():
+                      return {{"address": "North Carolina", "credentialing_status": "unknown"}}
+
+                  return await extract()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_helper_local_dict_output_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["address", "credentialing_status"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["address", "credentialing_status"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  async def extract():
+                      result = {{"address": "North Carolina", "credentialing_status": "unknown"}}
+                      return result
+
+                  return await extract()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_top_level_literal_key_dict_updates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["address", "credentialing_status"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["address", "credentialing_status"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  result = {{"address": "North Carolina"}}
+                  result["credentialing_status"] = "unknown"
+                  return result
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_helper_literal_key_dict_updates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["address", "credentialing_status"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["address", "credentialing_status"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
+                {
+                    "output_path": "credentialing_status",
+                    "output_root": "credentialing_status",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  async def extract():
+                      result = {{}}
+                      result["address"] = "North Carolina"
+                      result["credentialing_status"] = "unknown"
+                      return result
+
+                  return await extract()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+
+    @pytest.mark.asyncio
+    async def test_captured_select_option_rejects_authored_text_click_plan_selection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "select_option",
+                "selector": "#planSelect",
+                "source_url": "https://example.com/plans?session=private",
+                "value": "gold",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Plan lookup
+            workflow_definition:
+              parameters:
+              - parameter_type: workflow
+                workflow_parameter_type: string
+                key: plan
+              blocks:
+              - block_type: code
+                label: plan_selection
+                parameter_keys:
+                - plan
+                code: |
+                  main = page.locator("main")
+                  await main.get_by_text(str(plan), exact=True).first.click()
+                  return {"selected_plan": str(plan)}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "select-option interaction with a text click" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "select_option_interaction_mismatch"
+        assert repair_context["block_label"] == "plan_selection"
+        assert repair_context["selector"] == "#planSelect"
+        assert repair_context["source_url"] == "https://example.com"
+        assert "private" not in str(repair_context)
+        assert ctx.last_code_authoring_repair_context is not None
+        assert ctx.last_code_authoring_repair_context.reason_code == "select_option_interaction_mismatch"
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "code_safety_reject"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+        assert ctx.has_staged_proposal is False
+
+    @pytest.mark.asyncio
+    async def test_captured_select_option_allows_authored_select_api(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "select_option",
+                "selector": "#planSelect",
+                "source_url": "https://example.com/plans",
+                "value": "gold",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Plan lookup
+            workflow_definition:
+              parameters:
+              - parameter_type: workflow
+                workflow_parameter_type: string
+                key: plan
+              blocks:
+              - block_type: code
+                label: plan_selection
+                parameter_keys:
+                - plan
+                code: |
+                  await page.locator("#planSelect").select_option(label=str(plan))
+                  return {"selected_plan": str(plan)}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == submitted
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.asyncio
+    async def test_captured_select_option_allows_later_unrelated_text_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "select_option",
+                "selector": "#planSelect",
+                "source_url": "https://example.com/plans",
+                "value": "gold",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Plan lookup
+            workflow_definition:
+              parameters:
+              - parameter_type: workflow
+                workflow_parameter_type: string
+                key: plan
+              blocks:
+              - block_type: code
+                label: plan_selection
+                parameter_keys:
+                - plan
+                code: |
+                  await page.locator("#planSelect").select_option(label=str(plan))
+                  return {"selected_plan": str(plan)}
+              - block_type: code
+                label: continue_from_plan
+                code: |
+                  await page.get_by_text("Continue", exact=True).click()
+                  return {"continued": True}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == submitted
+        assert ctx.last_code_authoring_repair_context is None
+
+    @pytest.mark.asyncio
+    async def test_runtime_hidden_option_failure_rejects_repeated_text_click_structure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "select_option",
+                "selector": "#planSelect",
+                "source_url": "https://example.com/plans",
+                "value": "gold",
+                "trajectory_index": 0,
+            }
+        ]
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            structural_failure_identity="runtime:hidden-option-click",
+            authored_structure_signature="authored:previous-hidden-option-click",
+        )
+
+        def submitted_yaml(return_value: str) -> str:
+            return _yaml(
+                f"""
+                title: Plan lookup
+                workflow_definition:
+                  parameters:
+                  - parameter_type: workflow
+                    workflow_parameter_type: string
+                    key: plan
+                  blocks:
+                  - block_type: code
+                    label: plan_selection
+                    parameter_keys:
+                    - plan
+                    code: |
+                      main = page.locator("main")
+                      await main.get_by_text(str(plan), exact=True).first.click()
+                      return {{"selected_plan": "{return_value}"}}
+                """
+            )
+
+        first = await _update_workflow({"workflow_yaml": submitted_yaml("first")}, ctx, allow_missing_credentials=True)
+        first_key = ctx.latest_recorded_build_test_outcome.structural_key
+        first_count = ctx.code_authoring_guardrail_reject_count
+        second = await _update_workflow(
+            {"workflow_yaml": submitted_yaml("second")}, ctx, allow_missing_credentials=True
+        )
+
+        assert first["ok"] is False
+        assert second["ok"] is False
+        assert first_key is not None
+        assert ctx.latest_recorded_build_test_outcome.structural_key == first_key
+        assert first_count == 1
+        assert ctx.code_authoring_guardrail_reject_count == 2
+        assert ctx.has_staged_proposal is False
+
+    @pytest.mark.asyncio
     async def test_raw_conflict_marker_reject_carries_progress_surface_kind(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1486,6 +2409,9 @@ class TestCompiledAuthoringImposition:
         assert ctx.workflow_yaml == ""
         assert "authoring_repair_context" not in result["data"]
         assert ctx.last_code_authoring_repair_context is None
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     @pytest.mark.asyncio
     async def test_output_intent_rejects_partial_metadata_without_output_label(
@@ -1525,6 +2451,113 @@ class TestCompiledAuthoringImposition:
         assert "extract_registry" in result["error"]
         assert "must pass `code_artifact_metadata`" in result["error"]
         assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_enter_directory_location_output_block_metadata_passes_before_persist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: enter_directory_location
+                prompt: Enter the directory location and output the selected address.
+                code: |
+                  await page.locator("#locInput").fill("North Carolina, USA")
+                  address = "North Carolina, USA"
+            """
+        )
+        metadata = [
+            {
+                "block_label": "enter_directory_location",
+                "declared_goal": "Enter the directory location and return the address.",
+                "claimed_outcomes": [
+                    {
+                        "id": "claim:address",
+                        "status": "observed_not_verified",
+                        "goal_value_paths": ["address"],
+                    }
+                ],
+                "terminal_verifier_expectations": [
+                    {
+                        "id": "expectation:address",
+                        "goal_value_paths": ["address"],
+                    }
+                ],
+            }
+        ]
+
+        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml
+        assert "enter_directory_location" in ctx.code_artifact_metadata
+        assert ctx.latest_recorded_build_test_outcome is None
+
+    @pytest.mark.asyncio
+    async def test_invalid_metadata_records_typed_outcome_without_prose_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        submitted = _yaml(
+            """
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: search_registry
+                code: |
+                  records = [{"number": "REC-001"}]
+            """
+        )
+        metadata = [
+            {
+                "block_label": "search_registry",
+                "claimed_outcomes": [{"id": "claim:rows", "status": "satisfied"}],
+            }
+        ]
+
+        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
+
+        assert result["ok"] is False
+        assert "Artifact metadata" in result["error"]
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+        structural_payload = workflow_update_module._code_artifact_metadata_reject_payload(
+            workflow_yaml=submitted,
+            raw_metadata=metadata,
+            offending_labels=["search_registry"],
+            violation_categories=["missing_declared_goal", "missing_required_list", "missing_artifact_refs"],
+        )
+        assert structural_payload is not None
+        assert structural_payload["offending_labels"] == ["search_registry"]
+        assert structural_payload["missing_fields_by_label"] == {
+            "search_registry": [
+                "declared_goal",
+                "page_dependencies",
+                "completion_criteria",
+                "terminal_verifier_expectations",
+                "evidence_refs_or_observation_refs",
+            ]
+        }
+        assert structural_payload["code_block_output_status"] == {
+            "search_registry": {
+                "block_type": "code",
+                "has_code": True,
+                "declares_output_intent": False,
+                "declares_output_roots": [],
+                "has_meaningful_output": False,
+            }
+        }
+        payload_text = str(structural_payload)
+        assert "requires non-empty" not in payload_text
+        assert "claim:rows" not in payload_text
 
     @pytest.mark.asyncio
     async def test_imposition_preserves_submitted_extraction_suffix(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1954,8 +2987,11 @@ class TestCompiledAuthoringImposition:
         assert result["ok"] is False
         assert "submitted code mixes direct fills using `provider_name`" in result["error"]
         assert ctx.workflow_yaml == ""
-        assert "authoring_repair_context" not in result["data"]
-        assert ctx.last_code_authoring_repair_context is None
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["provider_name"]
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
 
     @pytest.mark.asyncio
     async def test_typed_default_contract_reject_clears_stale_repair_context(
@@ -1994,7 +3030,101 @@ class TestCompiledAuthoringImposition:
 
         assert result["ok"] is False
         assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["provider_name"]
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
         assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_single_synthesized_key_without_bindable_fill_records_repair_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#location",
+                "source_url": "https://example.com/directory",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: search_directory
+                code: |
+                  await page.locator("#submit").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
+        assert repair_context["selector"] == "#location"
+        assert repair_context["source_url"] == "https://example.com"
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_synthesized_parameter_repair_context_uses_safe_selector_atom(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        raw_selector = "#location-" + ("x" * 180)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": raw_selector,
+                "source_url": "https://example.com/directory?query=raw",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: search_directory
+                code: |
+                  await page.locator("#submit").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
+        assert repair_context["selector"] in (None, "")
+        assert repair_context["source_url"] == "https://example.com"
+        assert raw_selector not in str(repair_context)
 
     @pytest.mark.asyncio
     async def test_multi_input_missing_synthesized_parameter_rejects_with_repair_context(
@@ -2169,7 +3299,7 @@ class TestCompiledAuthoringImposition:
         }
 
     @pytest.mark.asyncio
-    async def test_synthesized_parameter_aliases_by_typed_length_to_declared_default(
+    async def test_synthesized_parameter_does_not_alias_by_typed_length_to_declared_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _stub_successful_update(monkeypatch)
@@ -2214,19 +3344,19 @@ class TestCompiledAuthoringImposition:
 
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
-        assert result["ok"] is True
-        parsed = parse_workflow_yaml(ctx.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
-        assert block["parameter_keys"] == ["search_location", "provider_first_name"]
-        assert "str(search_location)" in block["code"]
-        assert "address_or_postal_code" not in block["code"]
-        assert result["data"]["imposed_substitutions"]["parameter_aliases"] == {
-            "address_or_postal_code": "search_location"
-        }
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `address_or_postal_code`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["address_or_postal_code"]
+        assert ctx.workflow_yaml == ""
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     @pytest.mark.asyncio
-    async def test_synthesized_provider_search_key_rewrites_to_declared_first_last_inputs(
+    async def test_synthesized_provider_search_key_does_not_compose_declared_first_last_inputs(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _stub_successful_update(monkeypatch)
@@ -2238,6 +3368,7 @@ class TestCompiledAuthoringImposition:
                 "selector": "#locInput",
                 "source_url": "https://example.com/find-care",
                 "typed_length": 17,
+                "typed_value": "Example City, USA",
                 "role": "textbox",
                 "accessible_name": "Address or postal code",
                 "trajectory_index": 0,
@@ -2274,21 +3405,16 @@ class TestCompiledAuthoringImposition:
 
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
-        assert result["ok"] is True
-        parsed = parse_workflow_yaml(ctx.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
-        assert block["parameter_keys"] == ["search_location", "provider_first_name", "provider_last_name"]
-        assert "str(search_location)" in block["code"]
-        assert '(str(provider_first_name) + " " + str(provider_last_name))' in block["code"]
-        assert "address_or_postal_code" not in block["code"]
-        assert "provider_name_or_identifier" not in block["code"]
-        assert result["data"]["imposed_substitutions"]["parameter_aliases"] == {
-            "address_or_postal_code": "search_location"
-        }
-        assert result["data"]["imposed_substitutions"]["parameter_expressions"] == {
-            "provider_name_or_identifier": ('(str(provider_first_name) + " " + str(provider_last_name))')
-        }
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `provider_name_or_identifier`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["provider_name_or_identifier"]
+        assert ctx.workflow_yaml == ""
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     def test_identifier_rewrite_skips_string_literals_and_comments(self) -> None:
         source = (
@@ -2300,11 +3426,11 @@ class TestCompiledAuthoringImposition:
         rewritten = workflow_update_module._replace_python_identifier(
             source,
             "provider_query",
-            '(str(provider_first_name) + " " + str(provider_last_name))',
+            "provider_name",
         )
 
         ast.parse(rewritten)
-        assert 'str((str(provider_first_name) + " " + str(provider_last_name)))' in rewritten
+        assert 'await page.locator("#providerSearch").fill(str(provider_name))' in rewritten
         assert "# provider_query should stay readable in comments" in rewritten
         assert '"provider_query should stay readable in strings"' in rewritten
 
@@ -2325,35 +3451,8 @@ class TestCompiledAuthoringImposition:
             '    await page.locator("#providerSearch").fill("")\n'
         )
 
-    def test_ambiguous_combined_default_match_logs_and_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        debug_events: list[tuple[str, dict[str, object]]] = []
-        monkeypatch.setattr(
-            workflow_update_module,
-            "LOG",
-            SimpleNamespace(debug=lambda event, **kwargs: debug_events.append((event, kwargs))),
-        )
-
-        result = workflow_update_module._combined_string_default_expression(
-            [
-                {"key": "first_name", "default_value": "Given"},
-                {"key": "last_name", "default_value": "Family"},
-                {"key": "given_name", "default_value": "Given"},
-                {"key": "family_name", "default_value": "Family"},
-            ],
-            synthesized_default="Given Family",
-            typed_length=None,
-        )
-
-        assert result is None
-        assert debug_events == [
-            (
-                "copilot_synthesized_parameter_combined_default_ambiguous",
-                {"match_count": 3, "synthesized_default_present": True, "typed_length": None},
-            )
-        ]
-
     @pytest.mark.asyncio
-    async def test_synthesized_provider_search_key_rewrites_to_short_first_last_inputs(
+    async def test_single_synthesized_location_key_rejects_unique_declared_search_location_without_exact_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _stub_successful_update(monkeypatch)
@@ -2362,11 +3461,11 @@ class TestCompiledAuthoringImposition:
         ctx.scout_trajectory = [
             {
                 "tool_name": "type_text",
-                "selector": "#providerSearch",
+                "selector": "#locInput",
                 "source_url": "https://example.com/find-care",
-                "typed_length": 12,
+                "typed_length": 19,
                 "role": "textbox",
-                "accessible_name": "Provider name or identifier",
+                "accessible_name": "Address City County or Zip Code",
                 "trajectory_index": 0,
             }
         ]
@@ -2375,30 +3474,193 @@ class TestCompiledAuthoringImposition:
             title: Directory lookup
             workflow_definition:
               parameters:
-              - {key: first_name, default_value: "Given"}
-              - {key: last_name, default_value: "Family"}
+              - {key: plan, default_value: "Coastal Complete Health"}
+              - {key: provider_first_name, default_value: "Jordan"}
+              - {key: provider_last_name, default_value: "Avery"}
+              - {key: provider_npi, default_value: "1457803926"}
+              - {key: search_location, default_value: "North Carolina, USA"}
               blocks:
               - block_type: code
-                label: search_directory
+                label: open_directory_plan_selection
                 parameter_keys:
-                - provider_name_or_identifier
+                - address_city_county_or_zip_code
                 code: |
-                  await page.locator("#providerSearch").fill(str(provider_name_or_identifier))
+                  await page.locator("#planContinue").click()
             """
         )
 
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
-        assert result["ok"] is True
-        parsed = parse_workflow_yaml(ctx.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
-        assert block["parameter_keys"] == ["first_name", "last_name"]
-        assert '(str(first_name) + " " + str(last_name))' in block["code"]
-        assert "provider_name_or_identifier" not in block["code"]
-        assert result["data"]["imposed_substitutions"]["parameter_expressions"] == {
-            "provider_name_or_identifier": ('(str(first_name) + " " + str(last_name))')
-        }
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
+        assert repair_context["available_parameter_keys"] == [
+            "plan",
+            "provider_first_name",
+            "provider_last_name",
+            "provider_npi",
+            "search_location",
+        ]
+        assert ctx.workflow_yaml == ""
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+
+    @pytest.mark.asyncio
+    async def test_single_synthesized_location_key_rejects_unique_declared_search_location_without_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 19,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: plan}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_first_name}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_last_name}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_npi}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location}
+              blocks:
+              - block_type: code
+                label: open_directory_plan_selection
+                parameter_keys:
+                - address_city_county_or_zip_code
+                code: |
+                  await page.locator("#planContinue").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
+        assert repair_context["available_parameter_keys"] == [
+            "plan",
+            "provider_first_name",
+            "provider_last_name",
+            "provider_npi",
+            "search_location",
+        ]
+        assert ctx.workflow_yaml == ""
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+
+    @pytest.mark.asyncio
+    async def test_single_synthesized_location_key_rejects_ambiguous_declared_location_alias_without_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 19,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location}
+              - {parameter_type: workflow, workflow_parameter_type: string, key: service_location}
+              blocks:
+              - block_type: code
+                label: open_directory_plan_selection
+                parameter_keys:
+                - address_city_county_or_zip_code
+                code: |
+                  await page.locator("#planContinue").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
+        assert repair_context["available_parameter_keys"] == ["search_location", "service_location"]
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+
+    @pytest.mark.asyncio
+    async def test_single_synthesized_location_key_keeps_authoritative_reject_when_length_alias_ambiguous(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#locInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 19,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {key: search_location, default_value: "North Carolina, USA"}
+              - {key: alternate_location, default_value: "South Carolina, USA"}
+              blocks:
+              - block_type: code
+                label: open_directory_plan_selection
+                parameter_keys:
+                - address_city_county_or_zip_code
+                code: |
+                  await page.locator("#planContinue").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["block_label"] == "open_directory_plan_selection"
+        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
+        assert repair_context["available_parameter_keys"] == ["alternate_location", "search_location"]
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     @pytest.mark.asyncio
     async def test_single_local_string_constant_is_lifted_for_synthesized_key(
@@ -2425,7 +3687,7 @@ class TestCompiledAuthoringImposition:
         ]
 
     @pytest.mark.asyncio
-    async def test_single_submitted_string_parameter_is_adopted_for_synthesized_key(
+    async def test_single_submitted_string_parameter_is_not_adopted_by_length_for_synthesized_key(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _stub_successful_update(monkeypatch)
@@ -2434,22 +3696,17 @@ class TestCompiledAuthoringImposition:
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_PARAMETER_YAML}, ctx)
 
-        assert result["ok"] is True
-        parsed = parse_workflow_yaml(ctx.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
         synthesized_key = "search_by_doctor_name_or_specialty_hospital_procedure_and_more"
-        assert f'await page.locator("#provInput").fill(str({synthesized_key}))' in block["code"]
-        assert block["parameter_keys"] == [synthesized_key]
-        assert parsed["workflow_definition"]["parameters"] == [
-            {
-                "parameter_type": "workflow",
-                "workflow_parameter_type": "string",
-                "key": synthesized_key,
-                "default_value": "Sample Search",
-            }
-        ]
-        assert result["data"]["imposed_substitutions"]["parameter_keys"] == [synthesized_key]
+        assert result["ok"] is False
+        assert f"Unable to bind synthesized parameter `{synthesized_key}`" in result["error"]
+        repair_context = result["data"]["authoring_repair_context"]
+        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
+        assert repair_context["unresolved_names"] == [synthesized_key]
+        assert ctx.workflow_yaml == ""
+        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     @pytest.mark.asyncio
     async def test_mixed_literal_and_computed_fill_rejects_before_persist(
@@ -3293,12 +4550,12 @@ def _terminal_challenge_signal() -> CopilotToolBlockerSignal:
 
 class TestCodeAuthoringGuardrailChurnBackstop:
     @pytest.mark.asyncio
-    async def test_counter_climbs_on_distinct_rejects_and_resets_on_accept(
+    async def test_counter_climbs_on_repeated_recorded_outcome_and_resets_on_accept(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ctx = _code_only_ctx()
         for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
-            result = await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+            result = await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
             assert result["ok"] is False
             assert ctx.code_authoring_guardrail_reject_count == index + 1
         assert ctx.blocker_signal is None
@@ -3340,8 +4597,8 @@ class TestCodeAuthoringGuardrailChurnBackstop:
     @pytest.mark.asyncio
     async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
         ctx = _code_only_ctx()
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
 
         assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
         churn = ctx.blocker_signal
@@ -3358,8 +4615,8 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         ctx.blocker_signal = terminal
         ctx.latest_tool_blocker_signal = terminal
 
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
 
         assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
         assert ctx.blocker_signal is terminal
@@ -3556,20 +4813,13 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         ]
         await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
 
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.code_authoring_guardrail_reject_count == 1
         assert ctx.last_code_authoring_reject_was_credential_priority is False
-        with pytest.raises(CopilotTurnHalt) as excinfo:
-            _check_enforcement(ctx)
-        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.blocker_signal is None
+        assert _check_enforcement(ctx) is None
 
     @pytest.mark.asyncio
-    async def test_non_credential_reject_halts_immediately_when_count_pre_charged(self) -> None:
-        # Credential-priority rejects can push the shared counter into the 4..8 band where the
-        # credential bound still defers; a later non-credential reject flips the flag and halts at
-        # once on the non-credential N=4, since the count is already past it.
+    async def test_non_credential_reject_resets_when_recorded_outcome_changes_after_precharge(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
 
@@ -3590,11 +4840,31 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         ]
         await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
 
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 2
+        assert ctx.code_authoring_guardrail_reject_count == 1
         assert ctx.last_code_authoring_reject_was_credential_priority is False
-        with pytest.raises(CopilotTurnHalt) as excinfo:
-            _check_enforcement(ctx)
-        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+        assert ctx.blocker_signal is None
+        assert _check_enforcement(ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_changed_authoring_recorded_outcome_resets_guardrail_backstop(self) -> None:
+        ctx = _code_only_ctx()
+
+        await _update_workflow({"workflow_yaml": _code_yaml("value = missing_first_name()")}, ctx)
+        first_key = ctx.latest_recorded_build_test_outcome.structural_key
+        await _update_workflow({"workflow_yaml": _code_yaml("value = missing_second_name()")}, ctx)
+
+        assert first_key is not None
+        assert ctx.latest_recorded_build_test_outcome.structural_key != first_key
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_identical_authoring_recorded_outcome_still_halts_at_backstop(self) -> None:
+        ctx = _code_only_ctx()
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _code_yaml("value = missing_first_name()")}, ctx)
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
         churn = ctx.blocker_signal
         assert isinstance(churn, CopilotToolBlockerSignal)
         assert churn.internal_reason_code == "code_authoring_guardrail_churn"
@@ -3602,8 +4872,8 @@ class TestCodeAuthoringGuardrailChurnBackstop:
     @pytest.mark.asyncio
     async def test_accept_after_latched_churn_clears_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = _code_only_ctx()
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(index)}, ctx)
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
         churn = ctx.blocker_signal
         assert isinstance(churn, CopilotToolBlockerSignal)
         assert churn.internal_reason_code == "code_authoring_guardrail_churn"

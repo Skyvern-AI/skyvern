@@ -6,10 +6,14 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
+    recorded_outcome_from_author_time_reject,
+    recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, LoadedResultCompositionTarget
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 
@@ -324,6 +328,166 @@ def test_outcome_not_demonstrated_keeps_authoritative_unsatisfied_criteria_ident
     payload_text = str(outcome.structural_key_payload)
     assert "evidence_text" not in payload_text
     assert "address and statuses" not in payload_text
+
+
+def test_authoring_repair_context_produces_structural_recorded_outcome() -> None:
+    context = CodeAuthoringRepairContext(
+        block_label="search_records",
+        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        unresolved_names=["confirmation_number", "row_text"],
+        parameter_keys=["confirmation_number"],
+        available_parameter_keys=["confirmation_number"],
+        binding_candidates=["confirmation_number", "row_text"],
+    )
+
+    outcome = recorded_outcome_from_authoring_repair_context(context)
+
+    assert outcome.phase == "author_time_reject"
+    assert outcome.reason_code == "sandbox_unresolved_name"
+    assert outcome.structural_key is not None
+    assert (
+        outcome.structural_key
+        == recorded_outcome_from_authoring_repair_context(
+            context.model_copy(update={"unresolved_names": ["row_text", "confirmation_number"]})
+        ).structural_key
+    )
+
+
+def test_author_time_reject_structural_payloads_make_distinct_keys() -> None:
+    first = recorded_outcome_from_author_time_reject(
+        reason_code="schema_incompatibility",
+        structural_payload={
+            "block_label": "extract_record",
+            "incompatible_paths": ["records[].expiration_date"],
+            "known_output_paths": ["records[].name"],
+        },
+    )
+    second = recorded_outcome_from_author_time_reject(
+        reason_code="schema_incompatibility",
+        structural_payload={
+            "block_label": "extract_record",
+            "incompatible_paths": ["records[].license_number"],
+            "known_output_paths": ["records[].name"],
+        },
+    )
+
+    assert first.structural_key is not None
+    assert second.structural_key is not None
+    assert first.structural_key != second.structural_key
+
+
+def test_metadata_reject_preserves_missing_requested_output_facts() -> None:
+    outcome = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={
+            "reason_code": "recorded_outcome_missing_output_coverage",
+            "missing_output_roots": ["address", "credentialing_status"],
+            "block_labels": ["lookup_provider_and_extract_credentials"],
+        },
+        missing_requested_output_facts=[
+            {
+                "output_path": "address",
+                "output_root": "address",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            },
+            {
+                "output_path": "credentialing_status",
+                "output_root": "credentialing_status",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            },
+        ],
+    )
+
+    assert outcome.reason_code == "metadata_reject"
+    assert outcome.is_authoritative is True
+    assert outcome.missing_requested_output_facts == [
+        {
+            "output_path": "address",
+            "output_root": "address",
+            "reason_code": "recorded_outcome_missing_output_coverage",
+            "value_status": "no_typed_value",
+        },
+        {
+            "output_path": "credentialing_status",
+            "output_root": "credentialing_status",
+            "reason_code": "recorded_outcome_missing_output_coverage",
+            "value_status": "no_typed_value",
+        },
+    ]
+    assert outcome.structural_key_payload is not None
+    assert "address" in str(outcome.structural_key_payload)
+
+
+def test_author_time_reject_without_structural_payload_is_not_authoritative() -> None:
+    outcome = recorded_outcome_from_author_time_reject(
+        reason_code="code_safety_reject",
+        observed_evidence_summary="Rewrite the code without unsafe behavior.",
+    )
+
+    assert outcome.is_authoritative is False
+    assert outcome.structural_key is None
+
+
+def test_metadata_reject_key_uses_typed_fields_not_wording() -> None:
+    first = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={
+            "reason_code": "metadata_reject",
+            "offending_labels": ["search_registry"],
+            "required_fields": ["claimed_outcomes", "completion_criteria"],
+            "missing_fields_by_label": {"search_registry": ["claimed_outcomes"]},
+            "violation_categories": ["missing_required_list"],
+        },
+        observed_evidence_summary="Metadata requires non-empty claimed_outcomes.",
+    )
+    same_structure = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={
+            "reason_code": "metadata_reject",
+            "offending_labels": ["search_registry"],
+            "required_fields": ["claimed_outcomes", "completion_criteria"],
+            "missing_fields_by_label": {"search_registry": ["claimed_outcomes"]},
+            "violation_categories": ["missing_required_list"],
+        },
+        observed_evidence_summary="Different wording for the same typed metadata failure.",
+    )
+    changed_label = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={
+            "reason_code": "metadata_reject",
+            "offending_labels": ["extract_registry"],
+            "required_fields": ["claimed_outcomes", "completion_criteria"],
+            "missing_fields_by_label": {"extract_registry": ["claimed_outcomes"]},
+            "violation_categories": ["missing_required_list"],
+        },
+    )
+    changed_required_field = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={
+            "reason_code": "metadata_reject",
+            "offending_labels": ["search_registry"],
+            "required_fields": ["terminal_verifier_expectations"],
+            "missing_fields_by_label": {"search_registry": ["terminal_verifier_expectations"]},
+            "violation_categories": ["missing_required_list"],
+        },
+    )
+    changed_missing_field = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={
+            "reason_code": "metadata_reject",
+            "offending_labels": ["search_registry"],
+            "required_fields": ["claimed_outcomes", "completion_criteria"],
+            "missing_fields_by_label": {"search_registry": ["completion_criteria"]},
+            "violation_categories": ["missing_required_list"],
+        },
+    )
+
+    assert first.structural_key == same_structure.structural_key
+    assert changed_label.structural_key != first.structural_key
+    assert changed_required_field.structural_key != first.structural_key
+    assert changed_missing_field.structural_key != first.structural_key
 
 
 def test_runtime_block_failure_outcome_includes_bounded_page_state_and_run_id() -> None:

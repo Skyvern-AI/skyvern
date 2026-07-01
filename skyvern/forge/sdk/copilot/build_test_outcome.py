@@ -12,7 +12,9 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -172,6 +174,74 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
         if isinstance(previous_key, str):
             return previous_key == latest["structural_key"]
     return None
+
+
+def recorded_outcome_from_authoring_repair_context(
+    repair_context: CodeAuthoringRepairContext,
+) -> RecordedBuildTestOutcome:
+    reason_code = _authoring_reason_code(repair_context.reason_code)
+    identity_payload = {
+        "reason_code": repair_context.reason_code,
+        "unresolved_names": sorted(repair_context.unresolved_names),
+        "parameter_keys": sorted(repair_context.parameter_keys),
+        "available_parameter_keys": sorted(repair_context.available_parameter_keys),
+        "binding_candidates": sorted(repair_context.binding_candidates),
+        "selector": _bounded_ref(repair_context.selector),
+        "refiner_selector": _bounded_ref(repair_context.refiner_selector),
+        "runtime_failure_class": _bounded_ref(repair_context.runtime_failure_class),
+        "failed_block_status": _bounded_ref(repair_context.failed_block_status),
+    }
+    page_refs = _page_refs_from_authoring_context(repair_context)
+    return RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        attempted_tool="update_workflow",
+        attempted_block_label=repair_context.block_label,
+        verdict="authoring_rejected",
+        reason_code=reason_code,
+        block_labels=[repair_context.block_label],
+        workflow_run_id=repair_context.workflow_run_id,
+        structural_failure_identity="authoring:" + _stable_hash(identity_payload),
+        page_evidence_refs=page_refs,
+        observed_evidence_summary=_bounded_text(repair_context.runtime_failure_reason or repair_context.reason_code),
+        key_provenance={
+            "structural_failure_identity": "CodeAuthoringRepairContext structural fields",
+            "page_evidence_refs": "CodeAuthoringRepairContext bounded page fields",
+        },
+    )
+
+
+def recorded_outcome_from_author_time_reject(
+    *,
+    reason_code: BuildTestOutcomeReasonCode,
+    attempted_tool: str = "update_workflow",
+    attempted_block_label: str = "",
+    block_labels: Sequence[str] = (),
+    structural_failure_identity: str = "",
+    structural_payload: Mapping[str, object] | None = None,
+    authored_structure_signature: str | None = None,
+    observed_evidence_summary: str = "",
+    page_evidence_refs: Sequence[str] = (),
+    missing_requested_output_facts: Sequence[Mapping[str, object]] = (),
+) -> RecordedBuildTestOutcome:
+    if structural_payload is not None:
+        structural_failure_identity = "author_time:" + _stable_hash(structural_payload)
+    return RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        attempted_tool=attempted_tool,
+        attempted_block_label=attempted_block_label,
+        verdict="authoring_rejected",
+        reason_code=reason_code,
+        block_labels=_clean_list(block_labels),
+        structural_failure_identity=structural_failure_identity,
+        authored_structure_signature=authored_structure_signature,
+        missing_requested_output_facts=[dict(fact) for fact in missing_requested_output_facts],
+        observed_evidence_summary=_bounded_text(observed_evidence_summary),
+        page_evidence_refs=_clean_list(page_evidence_refs),
+        key_provenance={
+            "structural_failure_identity": "author-time validator structural reason",
+            "page_evidence_refs": "author-time validator structural refs",
+        },
+    )
 
 
 def recorded_outcome_from_loaded_result_evidence(
@@ -410,6 +480,19 @@ def _code_block_signature_payloads(value: object) -> list[dict[str, object]]:
     return sorted(payloads, key=lambda item: str(item.get("label")))
 
 
+def _authoring_reason_code(value: str) -> BuildTestOutcomeReasonCode:
+    if value == SANDBOX_UNRESOLVED_NAME_REASON_CODE:
+        return "sandbox_unresolved_name"
+    if value == "synthesized_parameter_binding_ambiguous":
+        return "synthesized_parameter_binding_ambiguous"
+    if value == "runtime_block_failure":
+        return "runtime_block_failure"
+    if value == "select_option_interaction_mismatch":
+        # Select-option mismatches are author-time policy rejects, not a separate outcome class.
+        return "code_safety_reject"
+    return "code_safety_reject"
+
+
 def _normalized_code_text(code: str) -> str:
     return "\n".join(line.rstrip() for line in textwrap.dedent(code).strip().splitlines())
 
@@ -558,6 +641,19 @@ def _origin_ref(value: object) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
     return f"origin:{parsed.scheme}://{parsed.netloc}"
+
+
+def _page_refs_from_authoring_context(repair_context: CodeAuthoringRepairContext) -> list[str]:
+    refs: list[str] = []
+    if repair_context.current_origin:
+        refs.append(f"origin:{_bounded_ref(repair_context.current_origin)}")
+    for summary in repair_context.page_form_summaries[:3]:
+        refs.append(f"form:{_bounded_ref(summary)}")
+    for summary in repair_context.page_result_summaries[:3]:
+        refs.append(f"result:{_bounded_ref(summary)}")
+    for summary in repair_context.page_action_summaries[:3]:
+        refs.append(f"action:{_bounded_ref(summary)}")
+    return refs
 
 
 def _page_evidence_refs(page_evidence: Mapping[str, object] | None) -> list[str]:
