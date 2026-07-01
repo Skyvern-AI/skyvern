@@ -414,6 +414,189 @@ def test_observed_end_state_satisfaction_does_not_override_requested_output_cont
     assert result.is_fully_satisfied() is False
 
 
+def test_observed_end_state_corroborates_structural_requested_output_abstention() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_reach",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="observed_end_state_url",
+        ),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref="block_outputs:extract_profile.customer_name",
+            output_path="output.customer_name",
+            grounding_mode="shape",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_structural_requested_output_abstention_without_typed_corroboration_does_not_veto() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_output",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:extract_profile",
+        ),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref="block_outputs:extract_profile.customer_name",
+            output_path="output.customer_name",
+            grounding_mode="shape",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_structural_requested_output_abstention_without_typed_corroboration_gets_no_floor_credit() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_output",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="block_outputs:extract_profile",
+            ),
+            CriterionVerdict(
+                criterion_id="c_requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:extract_profile.customer_name",
+                output_path="output.customer_name",
+                grounding_mode="shape",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_requested_output_no_evidence_with_observed_end_state_still_blocks() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_reach",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="observed_end_state_url",
+        ),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="no_evidence",
+            evidence_ref="block_outputs:extract_profile.customer_name",
+            output_path="output.customer_name",
+            grounding_mode="missing",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_terminal_record_corroborates_structural_requested_output_abstention() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_submit",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:submit_request",
+            grounding_mode="terminal_record",
+        ),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref="block_outputs:submit_request.confirmation_number",
+            output_path="output.confirmation_number",
+            grounding_mode="shape",
+        ),
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_terminal_record_corroboration_gives_structural_requested_output_abstention_floor_credit() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_submit",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="block_outputs:submit_request",
+                grounding_mode="terminal_record",
+            ),
+            CriterionVerdict(
+                criterion_id="c_requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:submit_request.confirmation_number",
+                output_path="output.confirmation_number",
+                grounding_mode="shape",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is True
+
+
+def test_unmarked_block_output_does_not_corroborate_structural_requested_output_abstention() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_submit",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="block_outputs:submit_request",
+            ),
+            CriterionVerdict(
+                criterion_id="c_requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:submit_request.confirmation_number",
+                output_path="output.confirmation_number",
+                grounding_mode="shape",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_requested_output_wrong_exact_value_with_observed_end_state_still_blocks() -> None:
+    result = _mixed(
+        CriterionVerdict(
+            criterion_id="c_reach",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="observed_end_state_url",
+        ),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="evidence_contradicts",
+            evidence_ref="block_outputs:submit_request.confirmation_number",
+            output_path="output.confirmation_number",
+            grounding_mode="exact_value",
+            has_exact_value=True,
+        ),
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
 def _mixed(*verdicts: CriterionVerdict) -> CompletionVerificationResult:
     return CompletionVerificationResult(
         status="evaluated", criterion_ids=[v.criterion_id for v in verdicts], verdicts=list(verdicts)
@@ -1011,6 +1194,7 @@ def test_terminal_goal_record_satisfies_flat_submit_payload() -> None:
             state="satisfied",
             reason_code="evidence_confirms",
             evidence_ref="block_outputs:submit_water_request",
+            grounding_mode="terminal_record",
         )
     ]
 
@@ -5667,6 +5851,92 @@ async def test_all_abstained_requested_outputs_do_not_satisfy_completion(
     assert verification is not None
     assert verification.is_fully_satisfied() is False
     assert verification.verdicts[0].reason_code == "structurally_abstained"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_only_terminal_record_corroboration_satisfies_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output only terminal record corroboration should bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths(
+        "confirmation_number",
+        "account_number",
+        "selected_start_date",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_confirmation",
+                outcome="The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+            ),
+            CompletionCriterion(
+                id="c_account",
+                outcome="The returned record includes account number.",
+                output_path="output.account_number",
+            ),
+            CompletionCriterion(
+                id="c_start_date",
+                outcome="The returned record includes selected start date.",
+                output_path="output.selected_start_date",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(_terminal_goal_payload()),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert {verdicts[criterion_id].reason_code for criterion_id in ("c_confirmation", "c_account", "c_start_date")} == {
+        "structurally_abstained"
+    }
+    terminal_record_verdicts = [
+        verdict for verdict in verification.verdicts if verdict.grounding_mode == "terminal_record"
+    ]
+    assert len(terminal_record_verdicts) == 1
+    assert terminal_record_verdicts[0].evidence_ref == "block_outputs:extract_profile"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_only_generic_output_has_no_terminal_record_corroboration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("requested-output only generic output should bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("customer_name")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_customer_name",
+                outcome="The returned record includes customer name.",
+                output_path="output.customer_name",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result({"customer_name": "Sample Customer"}),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert all(verdict.grounding_mode != "terminal_record" for verdict in verification.verdicts)
 
 
 @pytest.mark.asyncio

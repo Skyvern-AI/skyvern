@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_record_semantic_consistency,
     grade_registered_download_criteria,
     grade_structured_record_criteria,
+    grade_terminal_goal_record_corroboration,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
     is_fallback_floor_base_criterion,
@@ -762,6 +763,15 @@ def _merge_run_verdicts(
         verdicts=[
             verdict_by_id.get(criterion_id, CriterionVerdict(criterion_id, "unknown", "unknown"))
             for criterion_id in criterion_ids
+        ]
+        + [
+            verdict
+            for verdicts in verdict_groups
+            for verdict in verdicts
+            if verdict.criterion_id not in criterion_ids
+            and verdict.state == "satisfied"
+            and verdict.reason_code == "evidence_confirms"
+            and verdict.grounding_mode == "terminal_record"
         ],
         contingent_criterion_ids=contingent_criterion_ids or default_contingent_ids,
         contingent_on_by_criterion_id=contingent_on_by_criterion_id or default_contingent_on_by_id,
@@ -776,14 +786,17 @@ def _merge_run_verdicts_if_requested_output_exists(
     run_criteria: list[CompletionCriterion],
     requested_output_verdicts: list[CriterionVerdict],
     *verdict_groups: list[CriterionVerdict],
+    snapshot: RunEvidenceSnapshot | None = None,
     structural_unfired_criterion_ids: list[str] | None = None,
 ) -> CompletionVerificationResult | None:
     if not requested_output_verdicts:
         return None
+    extra_verdicts = [grade_terminal_goal_record_corroboration(snapshot)] if snapshot is not None else []
     return _merge_run_verdicts(
         run_criteria,
         requested_output_verdicts,
         *verdict_groups,
+        *extra_verdicts,
         structural_unfired_criterion_ids=structural_unfired_criterion_ids,
     )
 
@@ -1004,6 +1017,7 @@ async def _maybe_run_completion_verification(
         run_result = _merge_run_verdicts(
             run_criteria,
             requested_output_verdicts,
+            grade_terminal_goal_record_corroboration(snapshot),
             structural_unfired_criterion_ids=run_structural_unfired_ids,
         )
     else:
@@ -1023,6 +1037,7 @@ async def _maybe_run_completion_verification(
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
                     run_criteria,
                     requested_output_verdicts,
+                    snapshot=snapshot,
                     structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 if requested_output_result is not None:
@@ -1052,6 +1067,7 @@ async def _maybe_run_completion_verification(
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
                     run_criteria,
                     requested_output_verdicts,
+                    snapshot=snapshot,
                     structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 if requested_output_result is not None:
@@ -1078,6 +1094,7 @@ async def _maybe_run_completion_verification(
                     _merge_run_verdicts_if_requested_output_exists(
                         run_criteria,
                         requested_output_verdicts,
+                        snapshot=snapshot,
                         structural_unfired_criterion_ids=run_structural_unfired_ids,
                     )
                     or judged_result
