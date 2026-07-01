@@ -108,6 +108,10 @@ import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
+import {
+  getInitialSelectedBlockId,
+  useSelectedBlockUrlSync,
+} from "./hooks/useSelectedBlockUrlSync";
 import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useWorkspaceMountInitialization } from "./hooks/useWorkspaceMountInitialization";
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
@@ -850,11 +854,14 @@ function Workspace({
   const cacheKeyInitWpidRef = useRef<string | null>(null);
   useEffect(() => {
     // Studio defaults the selection to the start node on open (legacy keeps it
-    // empty); fires only on workflow change, so tab-switch selection persists.
-    const startNodeId = embedded
-      ? (initialNodes.find((node) => node.type === "start")?.id ?? null)
-      : null;
-    useWorkflowPanelStore.getState().setSelectedBlockId(startNodeId);
+    // empty), unless the URL asks for a specific block; fires only on workflow
+    // change, so tab-switch selection persists.
+    const initialSelectedBlockId = getInitialSelectedBlockId({
+      enabled: embedded,
+      nodes: initialNodes,
+      searchParams,
+    });
+    useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
     // The collapse flag is a module-level store, so it survives an in-session
     // A→B workflow nav; re-collapse here so every workflow opens to the rail.
     if (embedded) {
@@ -948,6 +955,11 @@ function Workspace({
   });
 
   useCacheKeyValueUrlSync(cacheKeyInitWpidRef.current === workflowPermanentId);
+  useSelectedBlockUrlSync({
+    enabled: embedded,
+    nodes,
+    getNodes: getNodes as () => Array<AppNode>,
+  });
 
   // Centralized function to manage comparison and panel states
   const clearComparisonViewAndShowFreshIfActive = useCallback(
