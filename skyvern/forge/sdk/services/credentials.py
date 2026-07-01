@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import unquote, urlsplit
 
@@ -20,6 +21,24 @@ class AzureVaultConstants(StrEnum):
     """Constants for Azure Vault integration."""
 
     TOTP = "AZ_TOTP"  # Special value to indicate a TOTP code
+
+
+class AuthenticatorTotpErrorCode(StrEnum):
+    """Stable machine-readable errors for authenticator TOTP validation."""
+
+    AUTHENTICATOR_KEY_REQUIRED = "authenticator_key_required"
+    INVALID_AUTHENTICATOR_KEY = "invalid_authenticator_key"
+    AUTHENTICATOR_NO_CODE_SECRET = "authenticator_no_code_secret"
+    AUTHENTICATOR_TOTP_CONFIG_UNSUPPORTED = "authenticator_totp_config_unsupported"
+    AUTHENTICATOR_FEATURE_RESTRICTED = "authenticator_feature_restricted"
+
+
+@dataclass(frozen=True)
+class AuthenticatorTotpParseResult:
+    secret: str | None = None
+    error_code: AuthenticatorTotpErrorCode | None = None
+    message: str | None = None
+    vendor: str | None = None
 
 
 def _strip_totp_input_whitespace(totp_secret: str) -> str:

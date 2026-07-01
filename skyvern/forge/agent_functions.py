@@ -40,6 +40,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
@@ -941,6 +942,13 @@ class AgentFunction:
         organization_id: str | None = None,
     ) -> str | None:
         return None
+
+    async def parse_enterprise_totp_secret_result(
+        self,
+        totp_secret: str,
+        organization_id: str | None = None,
+    ) -> AuthenticatorTotpParseResult:
+        return AuthenticatorTotpParseResult()
 
     async def prepare_step_execution(
         self,
