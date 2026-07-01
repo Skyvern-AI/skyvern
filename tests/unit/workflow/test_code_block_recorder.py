@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -539,6 +540,52 @@ async def test_goal_code_block_finalizes_step_on_cancellation(monkeypatch: pytes
     step_statuses = [call.kwargs.get("status") for call in mocks["update_step"].await_args_list]
     assert TaskStatus.failed in task_statuses
     assert StepStatus.failed in step_statuses
+
+
+@pytest.mark.asyncio
+async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healed code block finalizes its SEAT task to completed — never a completed block over a failed seat."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("rotted selector")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=SimpleNamespace(success=True)))
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
+    assert TaskStatus.completed in statuses
+    assert TaskStatus.failed not in statuses
+
+
+@pytest.mark.asyncio
+async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the heal declines (None), the block fails closed and the seat task is finalized failed."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("rotted selector")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
+    assert TaskStatus.failed in statuses
 
 
 @pytest.mark.asyncio
