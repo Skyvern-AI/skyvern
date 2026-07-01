@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    only_structural_requested_output_abstentions,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -23,7 +27,6 @@ from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CopilotContext
 
 _TEXT_MAX = 240
@@ -243,16 +246,23 @@ def build_diagnosis_repair_contract(
             "Stop re-authoring: the edited extraction schema declares fields that map to no output the "
             "workflow produces, so the mismatch is not repairable without user input."
         )
-    completion_check = {
-        RepairNextAction.NO_CHANGE: "Current run already satisfies the goal.",
-        RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
-        RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
-    }.get(
-        next_action,
-        f"Run repaired block labels and confirm success: {', '.join(target_blocks)}"
-        if target_blocks
-        else "Run the repaired workflow path and confirm the requested goal is satisfied.",
-    )
+    if (
+        next_action == RepairNextAction.NO_CHANGE
+        and user_goal_satisfied is True
+        and completion_contract_satisfied is True
+    ):
+        completion_check = "Current run already satisfies the goal."
+    else:
+        completion_check = {
+            RepairNextAction.NO_CHANGE: "No repair selected; completion remains unverified.",
+            RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
+            RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
+        }.get(
+            next_action,
+            f"Run repaired block labels and confirm success: {', '.join(target_blocks)}"
+            if target_blocks
+            else "Run the repaired workflow path and confirm the requested goal is satisfied.",
+        )
     required_authority: list[str] = []
     if next_action == RepairNextAction.ASK:
         required_authority = ["may_answer_without_mutation"]
@@ -651,7 +661,11 @@ def _verification_satisfaction(
 
 
 def _completion_verification_failed(completion_verification: CompletionVerificationResult | None) -> bool:
-    return completion_verification is not None and not completion_verification.is_fully_satisfied()
+    if completion_verification is None or completion_verification.is_fully_satisfied():
+        return False
+    if completion_verification.status != "evaluated" or not completion_verification.criterion_ids:
+        return True
+    return not only_structural_requested_output_abstentions(completion_verification)
 
 
 def _missing_context(result: dict[str, Any], data: dict[str, Any], failure_type: DiagnosisFailureType) -> list[str]:

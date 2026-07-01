@@ -67,6 +67,14 @@ def _contradictory_completion_verification() -> CompletionVerificationResult:
     )
 
 
+def _structural_abstention_completion_verification() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="structurally_abstained")],
+    )
+
+
 def _clean_completed_result() -> dict[str, object]:
     return {
         "ok": True,
@@ -959,6 +967,27 @@ def test_clean_run_with_present_unsatisfied_completion_verification_fails_safe(
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.completion_contract_satisfied is False
     assert contract.verification_result.remaining_blocker is not None
+
+
+def test_clean_run_with_structural_abstention_completion_verification_does_not_repair() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = _structural_abstention_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+    ctx.latest_diagnosis_repair_contract = contract
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.repair_decision.next_action != RepairNextAction.REPAIR
+    assert contract.repair_decision.completion_check == "No repair selected; completion remains unverified."
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is False
 
 
 def test_clean_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:

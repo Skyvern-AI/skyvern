@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     _verification_satisfaction,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    built_unverified_repair_inert_context,
     outcome_fully_verified,
     verified_goal_satisfied_context,
 )
@@ -2783,6 +2784,35 @@ def test_record_run_blocks_demonstrated_when_lone_definition_abstention_with_con
     assert verified_goal_satisfied_context(ctx) is True
 
 
+def test_record_run_blocks_keeps_clean_structural_abstention_as_built_unverified() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    verification = _mixed(
+        CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="structurally_abstained")
+    )
+
+    recorded = _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=verification)
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert recorded.reason_code is None
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+    assert ctx.last_full_workflow_test_ok is True
+    ctx.latest_diagnosis_repair_contract = DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
+        verification_result=VerificationResult(user_goal_satisfied=False, completion_contract_satisfied=False),
+    )
+    assert verified_goal_satisfied_context(ctx) is False
+    assert built_unverified_repair_inert_context(ctx) is True
+    assert outcome_fully_verified(ctx) is False
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.is_authoritative is False
+
+
 def test_committed_same_run_outcome_survives_later_contradictory_overwrite() -> None:
     ctx = _ctx_with_blocks("extraction")
     verification = _mixed(
@@ -3398,12 +3428,32 @@ def test_active_terminal_watchdog_exit_cannot_promote_to_terminal_success() -> N
 def test_outcome_failure_warrants_repair() -> None:
     has_block = _ctx_with_blocks("extraction")
     nav_only = _ctx_with_blocks("goto_url", "navigation")
+    structural_abstention = _mixed(
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref="block_outputs:lookup.missing_value",
+        )
+    )
+    mixed_abstention_and_failure = _mixed(
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref="block_outputs:lookup.missing_value",
+        ),
+        CriterionVerdict(criterion_id="c_real_failure", state="unsatisfied", reason_code="no_evidence"),
+    )
     assert _outcome_failure_warrants_repair(nav_only, None) is False
     # Contradiction is a real failure regardless of which blocks exist.
     assert _outcome_failure_warrants_repair(nav_only, _contradicted("c0")) is True
     # Absence of evidence: failure only once a confirmation block exists.
     assert _outcome_failure_warrants_repair(has_block, _evaluated(("c0", False))) is True
     assert _outcome_failure_warrants_repair(nav_only, _evaluated(("c0", False))) is False
+    assert structural_abstention.is_fully_satisfied() is False
+    assert _outcome_failure_warrants_repair(has_block, structural_abstention) is False
+    assert _outcome_failure_warrants_repair(has_block, mixed_abstention_and_failure) is True
 
 
 # --- Direction 2: recognition governed by evidence, not run status ---------------

@@ -17,6 +17,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
+    _build_built_unverified_exit_result,
     _build_goal_satisfied_exit_result,
     _resolve_wrapped_exception_exit_result,
 )
@@ -43,10 +44,15 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+    CopilotBuiltUnverified,
     CopilotGoalSatisfied,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
+    _check_enforcement,
+    built_unverified_repair_inert_context,
+    verified_goal_claim_authorized,
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
@@ -121,6 +127,18 @@ def _verified_goal_contract(*, next_action: RepairNextAction = RepairNextAction.
         verification_result=VerificationResult(
             user_goal_satisfied=True,
             completion_contract_satisfied=True,
+        ),
+    )
+
+
+def _unverified_no_repair_contract() -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
+        verification_result=VerificationResult(
+            user_goal_satisfied=False,
+            completion_contract_satisfied=False,
         ),
     )
 
@@ -1137,6 +1155,30 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert not verified_goal_satisfied_context(ctx)
 
+    def test_check_enforcement_stops_after_structural_built_unverified_terminal(self) -> None:
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+        )
+
+        assert verified_goal_satisfied_context(ctx) is False
+        assert built_unverified_repair_inert_context(ctx) is True
+        assert verified_goal_claim_authorized(ctx) is False
+        with pytest.raises(CopilotBuiltUnverified):
+            _check_enforcement(ctx)
+
     def test_verified_goal_satisfied_context_rejects_undercovered_workflow(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
 
@@ -1170,7 +1212,8 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert result.updated_workflow is workflow
         assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "review_tested"
+        assert result.apply_without_review is False
         # No adjudicated outcome evidence: the turn ends but the claim renders
         # built-but-unverified instead of a tested-success claim.
         assert "not independently verified" in result.user_response.lower()
@@ -1189,9 +1232,48 @@ class TestVerifiedGoalSatisfiedStop:
             verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
         )
         verified = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+        assert verified.proposal_disposition == "auto_applicable"
         assert "tested" in verified.user_response.lower()
         assert verified.narrative_payload is not None
         assert verified.narrative_payload["verifiedSuccess"] is True
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_renders_structural_abstention_as_built_unverified(self) -> None:
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+
+        assert verified_goal_satisfied_context(ctx) is False
+        assert built_unverified_repair_inert_context(ctx) is True
+        assert verified_goal_claim_authorized(ctx) is False
+
+        result = await _build_built_unverified_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is workflow
+        assert result.proposal_disposition == "review_tested"
+        assert result.apply_without_review is False
+        assert "not independently verified" in result.user_response.lower()
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.terminal_reason == BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON
+        assert result.narrative_payload is not None
+        assert result.narrative_payload["verifiedSuccess"] is False
 
     @pytest.mark.asyncio
     async def test_goal_satisfied_exit_result_carries_outcome_adjudication(self) -> None:
@@ -1788,6 +1870,80 @@ class TestTranslateToAgentResultGating:
         assert agent_result.workflow_yaml == "title: Verified Draft"
         assert agent_result.clear_proposed_workflow is False
         assert agent_result.proposal_disposition == "auto_applicable"
+
+    def test_wip_exit_structural_abstention_stays_review_only(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+
+        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow=workflow,
+            last_workflow_yaml="title: Structural Draft",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+        )
+
+        agent_result = agent_module._build_wip_exit_result(
+            ctx,
+            global_llm_context=None,
+            default_reply="Timed out.",
+            unvalidated_reply="Draft needs review.",
+            tested_reply="Tested.",
+            terminal_reason="max_turns",
+        )
+
+        assert verified_goal_claim_authorized(ctx) is False
+        assert agent_result.updated_workflow is workflow
+        assert agent_result.proposal_disposition == "review_tested"
+        assert agent_result.apply_without_review is False
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["verifiedSuccess"] is False
+
+    def test_wip_exit_verified_claim_still_auto_applies_code_only(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+
+        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow=workflow,
+            last_workflow_yaml="title: Verified Draft",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            has_staged_proposal=True,
+            staged_workflow=workflow,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+
+        agent_result = agent_module._build_wip_exit_result(
+            ctx,
+            global_llm_context=None,
+            default_reply="Timed out.",
+            unvalidated_reply="Draft needs review.",
+            tested_reply="Tested.",
+            terminal_reason="max_turns",
+        )
+
+        assert verified_goal_claim_authorized(ctx) is True
+        assert agent_result.updated_workflow is workflow
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.apply_without_review is True
 
     def test_output_field_confirmation_question_is_blocked_when_contract_present(self) -> None:
         ctx = _ctx(
@@ -2497,6 +2653,7 @@ workflow_definition:
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "review_untested"
         assert "could not verify the requested outcome" in agent_result.user_response.lower()
+        assert "did not demonstrate" not in agent_result.user_response.lower()
         assert "output judge unavailable" in agent_result.user_response.lower()
         assert "untested" not in agent_result.user_response.lower()
 
@@ -2535,6 +2692,11 @@ workflow_definition:
             last_update_block_count=3,
             has_staged_proposal=True,
             staged_workflow=wf,
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
         agent_result = asyncio.run(
