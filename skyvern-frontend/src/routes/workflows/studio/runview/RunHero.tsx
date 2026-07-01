@@ -178,33 +178,16 @@ export function RunHero({
                   ? "recording"
                   : "screenshot";
 
+  // The right-side toggles own the view identity (Live/Recording/Code) and the
+  // in-card "Inspecting step" bar owns a scrubbed action's description; the
+  // header only adds context they don't surface — the live page URL, or the
+  // final frame's label when nothing else names it.
   const headerLabel =
     center === "stream"
-      ? // VNC streams carry no page URL (pixels only); only the CDP path sets
-        // streamUrl, so fall back to a neutral label instead of "Loading…".
-        (streamUrl ?? "Live browser")
-      : center === "recording"
-        ? "Recording"
-        : center === "code"
-          ? "Generated code"
-          : center === "inputs"
-            ? "Inputs"
-            : center === "outputs"
-              ? "Outputs"
-              : (heroLabel ?? "Screenshot");
-
-  const headerIcon =
-    center === "recording" ? (
-      <PlayIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-    ) : center === "code" ? (
-      <CodeIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-    ) : center === "inputs" ? (
-      <ListBulletIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-    ) : center === "outputs" ? (
-      <FileTextIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-    ) : (
-      <GlobeIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-    );
+      ? streamUrl
+      : center === "screenshot" && !scrubbing
+        ? heroLabel
+        : null;
 
   const toggleCenter = (view: "code" | "inputs" | "outputs") =>
     setCenterView(centerView === view ? "default" : view);
@@ -215,13 +198,11 @@ export function RunHero({
         ref={headerRef}
         className="flex items-center gap-2 border-b border-border px-3 py-2"
       >
-        <div className="flex min-w-0 flex-1 items-center gap-1.5">
-          {headerIcon}
-          <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
-            {headerLabel}
-          </span>
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
+        <div
+          role="group"
+          aria-label="Center view"
+          className="flex shrink-0 items-center gap-0.5 rounded-md border border-slate-700 bg-slate-elevation2 p-0.5"
+        >
           {showDebugStream ? (
             <>
               <ViewToggle
@@ -305,6 +286,18 @@ export function RunHero({
               icon={<FileTextIcon className="h-3 w-3" />}
             />
           ) : null}
+        </div>
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          {headerLabel ? (
+            <>
+              <GlobeIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+                {headerLabel}
+              </span>
+            </>
+          ) : null}
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
           {overview || actions ? (
             <div className="mx-0.5 h-4 w-px bg-border" />
           ) : null}
