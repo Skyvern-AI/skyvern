@@ -27,6 +27,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioShellStore, type StudioTab } from "@/store/StudioShellStore";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -56,6 +57,10 @@ function useIsGlobalWorkflow(): boolean {
 function StudioTabs() {
   const tab = useStudioShellStore((s) => s.tab);
   const setTab = useStudioShellStore((s) => s.setTab);
+  const hasUnseenBrowserActivity = useStudioBrowserStore(
+    (s) => s.hasUnseenActivity,
+  );
+  const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
   const urlRunId = useStudioRunId();
   const { workflowPermanentId } = useParams();
   const { data: urlRun } = useWorkflowRunWithWorkflowQuery(
@@ -78,6 +83,13 @@ function StudioTabs() {
     { id: "run", label: "Run", disabled: !hasRun },
   ];
 
+  const selectTab = (nextTab: StudioTab) => {
+    if (nextTab === "browser") {
+      clearBrowserActivity();
+    }
+    setTab(nextTab);
+  };
+
   // Roving arrow-key navigation across the enabled tabs (WAI-ARIA tabs).
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
@@ -98,54 +110,74 @@ function StudioTabs() {
             : last;
     const next = enabled[nextIndex];
     if (next) {
-      setTab(next.id);
+      selectTab(next.id);
       document.getElementById(studioTabId(next.id))?.focus();
     }
   };
 
   return (
-    <div
-      role="tablist"
-      aria-label="Studio view"
-      className="flex items-center gap-1"
-      onKeyDown={onKeyDown}
-    >
-      {tabs.map((t) => {
-        const selected = tab === t.id;
-        return (
-          <button
-            key={t.id}
-            id={studioTabId(t.id)}
-            type="button"
-            role="tab"
-            aria-selected={selected}
-            aria-controls={studioPanelId(t.id)}
-            tabIndex={selected ? 0 : -1}
-            disabled={t.disabled}
-            onClick={() => !t.disabled && setTab(t.id)}
-            className={cn(
-              "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
-              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-              selected
-                ? "bg-studio-accent/15 text-foreground ring-1 ring-inset ring-studio-accent/40"
-                : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
-              t.disabled &&
-                "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
-            )}
-          >
-            {t.label}
-            {t.id === "run" && runStatus ? (
-              <StatusBadge
-                status={runStatus}
-                alwaysShowLabel
-                // overrides StatusBadge's md:px-2.5 to keep the chip compact in the tab bar
-                className="h-5 gap-1 px-1.5 py-0 text-[10px] md:w-auto md:px-1.5"
-              />
-            ) : null}
-          </button>
-        );
-      })}
-    </div>
+    <>
+      <div
+        role="tablist"
+        aria-label="Studio view"
+        className="flex items-center gap-1"
+        onKeyDown={onKeyDown}
+      >
+        {tabs.map((t) => {
+          const selected = tab === t.id;
+          const browserActivityLabel =
+            t.id === "browser" && hasUnseenBrowserActivity
+              ? "Browser, new activity"
+              : undefined;
+          return (
+            <button
+              key={t.id}
+              id={studioTabId(t.id)}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              aria-controls={studioPanelId(t.id)}
+              aria-label={browserActivityLabel}
+              tabIndex={selected ? 0 : -1}
+              disabled={t.disabled}
+              onClick={() => !t.disabled && selectTab(t.id)}
+              className={cn(
+                "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                selected
+                  ? "bg-studio-accent/15 text-foreground ring-1 ring-inset ring-studio-accent/40"
+                  : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
+                t.disabled &&
+                  "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
+              )}
+            >
+              {t.label}
+              {t.id === "browser" && hasUnseenBrowserActivity ? (
+                <span
+                  aria-hidden="true"
+                  title="New browser activity"
+                  className="relative flex size-2 shrink-0"
+                >
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-studio-accent opacity-75 motion-safe:animate-ping" />
+                  <span className="relative inline-flex size-2 rounded-full bg-studio-accent shadow-[0_0_0_3px_rgba(109,108,246,0.20)]" />
+                </span>
+              ) : null}
+              {t.id === "run" && runStatus ? (
+                <StatusBadge
+                  status={runStatus}
+                  alwaysShowLabel
+                  // overrides StatusBadge's md:px-2.5 to keep the chip compact in the tab bar
+                  className="h-5 gap-1 px-1.5 py-0 text-[10px] md:w-auto md:px-1.5"
+                />
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+      <span role="status" aria-live="polite" className="sr-only">
+        {hasUnseenBrowserActivity ? "New browser activity" : ""}
+      </span>
+    </>
   );
 }
 

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import { useParams } from "react-router-dom";
 
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -18,6 +18,8 @@ export function StudioBrowserStream() {
   const isRecording = useRecordingStore((s) => s.isRecording);
   const reloadNonce = useStudioBrowserStore((s) => s.reloadNonce);
   const setStreamUrl = useStudioBrowserStore((s) => s.setStreamUrl);
+  const markActivity = useStudioBrowserStore((s) => s.markActivity);
+  const clearActivity = useStudioBrowserStore((s) => s.clearActivity);
   const reset = useStudioBrowserStore((s) => s.reset);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -30,6 +32,27 @@ export function StudioBrowserStream() {
     return () => reset();
   }, [browserSessionId, reset]);
 
+  useEffect(() => {
+    if (tab === "browser") {
+      clearActivity();
+    }
+  }, [clearActivity, tab]);
+
+  const handleUrlChange = useCallback(
+    (url: string) => {
+      setStreamUrl(url);
+    },
+    [setStreamUrl],
+  );
+
+  const handleActivity = useCallback(() => {
+    if (tab === "browser") {
+      clearActivity();
+      return;
+    }
+    markActivity();
+  }, [clearActivity, markActivity, tab]);
+
   if (!browserSessionId) {
     return null;
   }
@@ -41,7 +64,8 @@ export function StudioBrowserStream() {
       interactive={false}
       showControlButtons={tab === "browser"}
       isRecording={isRecording}
-      onUrlChange={setStreamUrl}
+      onUrlChange={handleUrlChange}
+      onActivity={handleActivity}
     />
   );
 }
