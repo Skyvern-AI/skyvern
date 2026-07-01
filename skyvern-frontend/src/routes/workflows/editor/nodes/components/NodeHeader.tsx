@@ -66,6 +66,7 @@ import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
 } from "@/store/WorkflowSettingsStore";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn, formatDate, toDate } from "@/util/utils";
 import {
   statusIsAFailureType,
@@ -188,7 +189,10 @@ const getPayload = (opts: {
     toast({
       variant: "warning",
       title: "Extra HTTP Headers",
-      description: "Invalid extra HTTP Headers JSON",
+      description: `Invalid extra HTTP Headers JSON: ${getJsonParseErrorDetail(
+        String(opts.workflowSettings.extraHttpHeaders ?? ""),
+        e,
+      )}`,
     });
   }
 

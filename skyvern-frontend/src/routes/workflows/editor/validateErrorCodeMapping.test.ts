@@ -13,7 +13,7 @@ describe("validateErrorCodeMapping", () => {
   test("invalid JSON returns a parse error", () => {
     const result = validateErrorCodeMapping("block_1", "{not json");
     expect(result).toHaveLength(1);
-    expect(result[0]).toContain("Error messages is not valid JSON");
+    expect(result[0]).toContain("Error messages are not valid JSON");
   });
 
   test("null value (mapping disabled) returns no errors", () => {

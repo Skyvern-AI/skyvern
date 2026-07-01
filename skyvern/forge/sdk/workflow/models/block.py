@@ -33,6 +33,8 @@ from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.sandbox import SandboxedEnvironment
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
@@ -83,6 +85,8 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, InvalidLLMResponseType
+from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
@@ -4378,6 +4382,173 @@ async def wrapper({default_args}):
         )
 
 
+SCHEMA_VALIDATION_MAX_ATTEMPTS = 2
+SCHEMA_VALIDATION_MAX_ERRORS = 5
+
+
+def _default_structured_output_schema(description: str) -> dict[str, Any]:
+    # The output field is optional to preserve the legacy permissive default schema.
+    return {
+        "type": "object",
+        "properties": {
+            "output": {
+                "type": "object",
+                "description": description,
+            }
+        },
+    }
+
+
+def _default_text_prompt_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "llm_response": {
+                "type": "string",
+                "description": "Your response to the prompt",
+            }
+        },
+    }
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
+
+
+def _schema_type_description(schema_type: Any) -> str:
+    if isinstance(schema_type, list):
+        return " or ".join(str(t) for t in schema_type)
+    return str(schema_type)
+
+
+def _schema_path(error: ValidationError) -> str:
+    schema_path = list(error.absolute_schema_path)
+    path_parts: list[str] = []
+    index = 0
+    while index < len(schema_path):
+        part = schema_path[index]
+        if part == "properties" and index + 1 < len(schema_path):
+            path_parts.append(str(schema_path[index + 1]))
+            index += 2
+            continue
+        if part == "items":
+            path_parts.append("[]")
+            index += 1
+            continue
+        if part == "additionalProperties":
+            path_parts.append("<map value>")
+            index += 1
+            continue
+        if part == "patternProperties":
+            path_parts.append("<map value>")
+            index += 2 if index + 1 < len(schema_path) else 1
+            continue
+        index += 1
+
+    return "root" + "".join(f"{part}" if part == "[]" else f".{part}" for part in path_parts)
+
+
+def _format_schema_validation_error(error: ValidationError) -> str:
+    path = _schema_path(error)
+    actual_type = _json_type_name(error.instance)
+
+    if error.validator == "type":
+        expected_type = _schema_type_description(error.validator_value)
+        return f"{path}: expected type {expected_type}, got {actual_type}"
+
+    if error.validator == "required":
+        match = re.match(r"'([^']+)' is a required property", error.message)
+        if match:
+            return f"{path}: missing required property {match.group(1)}"
+        return f"{path}: missing required property"
+
+    if error.validator == "additionalProperties":
+        unexpected_count: int | None = None
+        schema_properties = error.schema.get("properties", {}) if isinstance(error.schema, dict) else {}
+        if isinstance(error.instance, dict) and isinstance(schema_properties, dict):
+            unexpected_count = sum(1 for field in error.instance if field not in schema_properties)
+        if unexpected_count is not None:
+            return f"{path}: has {unexpected_count} unexpected properties"
+        return f"{path}: has unexpected properties"
+
+    if error.validator in {"minItems", "maxItems"} and isinstance(error.instance, list):
+        return f"{path}: violates {error.validator}={error.validator_value}; item count={len(error.instance)}"
+
+    if error.validator in {"minLength", "maxLength"} and isinstance(error.instance, str):
+        return f"{path}: violates {error.validator}={error.validator_value}; string length={len(error.instance)}"
+
+    if error.validator == "enum":
+        allowed_count = len(error.validator_value) if isinstance(error.validator_value, list) else "configured"
+        return f"{path}: value is not one of {allowed_count} allowed values; got {actual_type}"
+
+    return f"{path}: violates {error.validator} constraint; got {actual_type}"
+
+
+def _validate_response_against_json_schema(
+    response: Any,
+    json_schema: dict[str, Any] | None,
+    schema_label: str,
+    max_errors: int = SCHEMA_VALIDATION_MAX_ERRORS,
+) -> str | None:
+    if not json_schema:
+        return None
+
+    if not validate_schema(json_schema):
+        return f"{schema_label} JSON schema is invalid."
+
+    try:
+        validator = Draft202012Validator(json_schema)
+        validation_errors = [_format_schema_validation_error(error) for error in validator.iter_errors(response)]
+    except Exception as e:
+        LOG.warning(
+            "Failed to validate LLM response against JSON schema",
+            schema_label=schema_label,
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        return f"{schema_label} JSON schema validation failed ({type(e).__name__})."
+
+    validation_errors = list(dict.fromkeys(validation_errors))
+    if not validation_errors:
+        return None
+
+    return f"LLM response does not match {schema_label.lower()} JSON schema: " + "; ".join(
+        validation_errors[:max_errors]
+    )
+
+
+def _is_schema_configuration_failure(failure_reason: str) -> bool:
+    return "JSON schema is invalid" in failure_reason or "JSON schema validation failed" in failure_reason
+
+
+def _llm_response_format_failure_reason(error: Exception) -> str:
+    return f"LLM response could not be parsed or coerced into the required JSON shape ({type(error).__name__})."
+
+
+def _build_schema_validation_retry_prompt(prompt: str, failure_reason: str) -> str:
+    return (
+        f"{prompt}\n\n"
+        "Your previous response failed JSON schema validation.\n"
+        f"Validation error: {failure_reason}\n\n"
+        "Retry the task. Return only valid JSON that exactly matches the schema. "
+        "Do not include markdown, code fences, explanatory text, or extra fields."
+    )
+
+
 class TextPromptBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -4387,6 +4558,8 @@ class TextPromptBlock(Block):
     prompt: str
     parameters: list[PARAMETER_TYPE] = []
     json_schema: dict[str, Any] | None = None
+    schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
+    schema_validation_max_errors: ClassVar[int] = SCHEMA_VALIDATION_MAX_ERRORS
 
     def get_all_parameters(
         self,
@@ -4423,6 +4596,14 @@ class TextPromptBlock(Block):
 
         self._apply_workflow_system_prompt(workflow_run_context)
 
+    def _validate_response_against_json_schema(self, response: Any) -> str | None:
+        return _validate_response_against_json_schema(
+            response,
+            self.json_schema,
+            "Text prompt",
+            max_errors=self.schema_validation_max_errors,
+        )
+
     async def send_prompt(
         self,
         prompt: str,
@@ -4430,28 +4611,23 @@ class TextPromptBlock(Block):
         workflow_run_id: str,
         organization_id: str | None = None,
         workflow_run_block_id: str | None = None,
-    ) -> dict[str, Any]:
+        schema_validation_failure: str | None = None,
+        json_schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
             self.override_llm_key_for_organization(organization_id) or self.llm_key, default=default_llm_handler
         )
-        if not self.json_schema:
-            self.json_schema = {
-                "type": "object",
-                "properties": {
-                    "llm_response": {
-                        "type": "string",
-                        "description": "Your response to the prompt",
-                    }
-                },
-            }
+        schema_to_use = json_schema or self.json_schema or _default_text_prompt_schema()
 
         prompt = prompt_engine.load_prompt_from_string(prompt, **parameter_values)
+        if schema_validation_failure:
+            prompt = _build_schema_validation_retry_prompt(prompt, schema_validation_failure)
         prompt += (
             "\n\n"
             + "Please respond to the prompt above using the following JSON definition:\n\n"
             + "```json\n"
-            + json.dumps(self.json_schema, indent=2)
+            + json.dumps(schema_to_use, indent=2)
             + "\n```\n\n"
         )
 
@@ -4478,6 +4654,8 @@ class TextPromptBlock(Block):
             system_prompt=self.workflow_system_prompt,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+            force_dict=False,
         )
 
         if workflow_run_block:
@@ -4570,33 +4748,111 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        try:
-            response = await self.send_prompt(
-                self.prompt,
-                parameter_values,
-                workflow_run_id,
-                organization_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-        except Exception as e:
-            try:
-                resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
-            except Exception:
-                resolved_llm_key = self.llm_key
-            LOG.exception(
-                "TextPromptBlock LLM call failed",
-                block_label=self.label,
-                workflow_run_id=workflow_run_id,
-                llm_key=resolved_llm_key,
-            )
+        response: dict[str, Any] | list | str | None = None
+        schema_to_use = self.json_schema or _default_text_prompt_schema()
+        if not validate_schema(schema_to_use):
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"LLM call failed: {e}",
+                failure_reason="Text prompt JSON schema is invalid.",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+        schema_validation_failure_for_retry: str | None = None
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                response = await self.send_prompt(
+                    self.prompt,
+                    parameter_values,
+                    workflow_run_id,
+                    organization_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    schema_validation_failure=schema_validation_failure_for_retry,
+                    json_schema=schema_to_use,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                response_format_failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "TextPromptBlock LLM response failed response-format validation",
+                    block_label=self.label,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=schema_to_use.get("type"),
+                )
+                if not will_retry:
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=response_format_failure_reason,
+                        output_parameter_value=None,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
+                schema_validation_failure_for_retry = response_format_failure_reason
+                continue
+            except Exception as e:
+                try:
+                    resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
+                except Exception:
+                    resolved_llm_key = self.llm_key
+                LOG.exception(
+                    "TextPromptBlock LLM call failed",
+                    block_label=self.label,
+                    workflow_run_id=workflow_run_id,
+                    llm_key=resolved_llm_key,
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"LLM call failed: {e}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            schema_validation_failure = _validate_response_against_json_schema(
+                response,
+                schema_to_use,
+                "Text prompt",
+                max_errors=self.schema_validation_max_errors,
+            )
+            if not schema_validation_failure:
+                break
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "TextPromptBlock LLM response failed schema validation",
+                block_label=self.label,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=schema_to_use.get("type"),
+            )
+            if not will_retry:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=schema_validation_failure,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            schema_validation_failure_for_retry = schema_validation_failure
+            continue
+
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
@@ -5789,6 +6045,8 @@ class FileParserBlock(Block):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
+    ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
 
     def get_failure_error_codes(self) -> list[str]:
         return ["FILE_PARSER_ERROR"]
@@ -5808,6 +6066,38 @@ class FileParserBlock(Block):
         )
 
         self._apply_workflow_system_prompt(workflow_run_context)
+
+    @staticmethod
+    def _validate_ocr_llm_response(llm_response: Any) -> str | None:
+        if not isinstance(llm_response, dict):
+            return (
+                f"OCR response must be a JSON object with extracted_text string; got {_json_type_name(llm_response)}."
+            )
+        if not isinstance(llm_response.get("extracted_text"), str):
+            return (
+                "OCR response must include extracted_text as a string; "
+                f"got {_json_type_name(llm_response.get('extracted_text'))}."
+            )
+        return None
+
+    @staticmethod
+    def _build_ocr_validation_retry_prompt(prompt: str, failure_reason: str) -> str:
+        return (
+            f"{prompt}\n\n"
+            "Your previous OCR response failed JSON validation.\n"
+            f"Validation error: {failure_reason}\n\n"
+            'Retry the task. Return only valid JSON with this exact shape: {"extracted_text": "..."} '
+            "Do not include markdown, code fences, explanatory text, or extra fields."
+        )
+
+    @staticmethod
+    def _validate_ai_response_against_json_schema(response: Any, json_schema: dict[str, Any]) -> str | None:
+        return _validate_response_against_json_schema(
+            response,
+            json_schema,
+            "File parser",
+            max_errors=SCHEMA_VALIDATION_MAX_ERRORS,
+        )
 
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
@@ -6089,6 +6379,9 @@ class FileParserBlock(Block):
         bounded concurrency, reassembled in page order with page markers, and
         truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
         """
+        if self.ocr_validation_max_attempts <= 0:
+            raise ValueError("OCR validation max attempts must be greater than 0.")
+
         llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
         default_handler = await self._resolve_file_parser_handler(
             "extract-text-from-image", workflow_run_block_id, organization_id
@@ -6100,17 +6393,53 @@ class FileParserBlock(Block):
 
         async def _ocr_page(page_image: bytes) -> str:
             async with semaphore:
-                # OCR transcription intentionally skips system_prompt; it still applies
-                # to the downstream extract-information-from-file-text call.
-                llm_response = await llm_api_handler(
-                    prompt=llm_prompt,
-                    prompt_name="extract-text-from-image",
-                    screenshots=[page_image],
-                    force_dict=True,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-                return llm_response.get("extracted_text", "") or ""
+                prompt_for_attempt = llm_prompt
+                for attempt in range(self.ocr_validation_max_attempts):
+                    try:
+                        # OCR transcription intentionally skips system_prompt; it still applies
+                        # to the downstream extract-information-from-file-text call.
+                        llm_response = await llm_api_handler(
+                            prompt=prompt_for_attempt,
+                            prompt_name="extract-text-from-image",
+                            screenshots=[page_image],
+                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                            force_dict=False,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                        failure_reason = _llm_response_format_failure_reason(e)
+                        will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                        LOG.warning(
+                            "FileParserBlock PDF OCR LLM response failed response-format validation",
+                            file_url=self.file_url,
+                            attempt=attempt + 1,
+                            max_attempts=self.ocr_validation_max_attempts,
+                            will_retry=will_retry,
+                            error_type=type(e).__name__,
+                        )
+                        if not will_retry:
+                            raise ValueError(failure_reason) from e
+                        prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, failure_reason)
+                        continue
+
+                    ocr_failure_reason = self._validate_ocr_llm_response(llm_response)
+                    if not ocr_failure_reason:
+                        return llm_response.get("extracted_text", "") or ""
+
+                    will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                    LOG.warning(
+                        "FileParserBlock PDF OCR LLM response failed schema validation",
+                        file_url=self.file_url,
+                        attempt=attempt + 1,
+                        max_attempts=self.ocr_validation_max_attempts,
+                        will_retry=will_retry,
+                        failure_reason=ocr_failure_reason,
+                    )
+                    if not will_retry:
+                        raise ValueError(ocr_failure_reason)
+                    prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
+                raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
         page_results = await asyncio.gather(
             *(_ocr_page(page_image) for page_image in page_images),
@@ -6160,6 +6489,9 @@ class FileParserBlock(Block):
         organization_id: str | None = None,
     ) -> str:
         """Parse image file using vision LLM for OCR."""
+        if self.ocr_validation_max_attempts <= 0:
+            raise ValueError("OCR validation max attempts must be greater than 0.")
+
         try:
             with open(file_path, "rb") as f:
                 image_bytes = f.read()
@@ -6173,15 +6505,52 @@ class FileParserBlock(Block):
             )
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
-            llm_response = await llm_api_handler(
-                prompt=llm_prompt,
-                prompt_name="extract-text-from-image",
-                screenshots=[image_bytes],
-                force_dict=True,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-            return llm_response.get("extracted_text", "")
+            prompt_for_attempt = llm_prompt
+            for attempt in range(self.ocr_validation_max_attempts):
+                try:
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-text-from-image",
+                        screenshots=[image_bytes],
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                        force_dict=False,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                    failure_reason = _llm_response_format_failure_reason(e)
+                    will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                    LOG.warning(
+                        "FileParserBlock image OCR LLM response failed response-format validation",
+                        file_url=self.file_url,
+                        attempt=attempt + 1,
+                        max_attempts=self.ocr_validation_max_attempts,
+                        will_retry=will_retry,
+                        error_type=type(e).__name__,
+                    )
+                    if not will_retry:
+                        raise ValueError(failure_reason) from e
+                    prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, failure_reason)
+                    continue
+
+                ocr_failure_reason = self._validate_ocr_llm_response(llm_response)
+                if not ocr_failure_reason:
+                    return llm_response.get("extracted_text", "") or ""
+
+                will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                LOG.warning(
+                    "FileParserBlock image OCR LLM response failed schema validation",
+                    file_url=self.file_url,
+                    attempt=attempt + 1,
+                    max_attempts=self.ocr_validation_max_attempts,
+                    will_retry=will_retry,
+                    failure_reason=ocr_failure_reason,
+                )
+                if not will_retry:
+                    raise ValueError(ocr_failure_reason)
+                prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
+
+            raise RuntimeError("OCR retry loop exhausted without returning or raising.")
         except Exception:
             LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
             raise
@@ -6262,18 +6631,12 @@ class FileParserBlock(Block):
         workflow_run_context: WorkflowRunContext,
         workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | list | str | None:
         """Extract structured data using AI based on json_schema."""
         # Use local variable to avoid mutating the instance
-        schema_to_use = self.json_schema or {
-            "type": "object",
-            "properties": {
-                "output": {
-                    "type": "object",
-                    "description": "Information extracted from the file",
-                }
-            },
-        }
+        schema_to_use = self.json_schema or _default_structured_output_schema("Information extracted from the file")
+        if not validate_schema(schema_to_use):
+            raise ValueError("File parser JSON schema is invalid.")
 
         # Convert content to string for AI processing
         if isinstance(content, list):
@@ -6291,15 +6654,58 @@ class FileParserBlock(Block):
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
 
-        llm_response = await llm_api_handler(
-            prompt=llm_prompt,
-            prompt_name="extract-information-from-file-text",
-            force_dict=False,
-            system_prompt=self.workflow_system_prompt,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-        )
-        return llm_response
+        prompt_for_attempt = llm_prompt
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                llm_response = await llm_api_handler(
+                    prompt=prompt_for_attempt,
+                    prompt_name="extract-information-from-file-text",
+                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                    force_dict=False,
+                    system_prompt=self.workflow_system_prompt,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "FileParserBlock extraction LLM response failed response-format validation",
+                    file_url=self.file_url,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=schema_to_use.get("type"),
+                )
+                if not will_retry:
+                    raise ValueError(failure_reason) from e
+                prompt_for_attempt = _build_schema_validation_retry_prompt(llm_prompt, failure_reason)
+                continue
+
+            schema_validation_failure = self._validate_ai_response_against_json_schema(llm_response, schema_to_use)
+            if not schema_validation_failure:
+                return llm_response
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "FileParserBlock extraction LLM response failed schema validation",
+                file_url=self.file_url,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=schema_to_use.get("type"),
+            )
+            if not will_retry:
+                raise ValueError(schema_validation_failure)
+            prompt_for_attempt = _build_schema_validation_retry_prompt(
+                llm_prompt,
+                schema_validation_failure,
+            )
+
+        raise AssertionError("unreachable schema validation retry loop exit")
 
     async def _record_failure(
         self,
@@ -6468,7 +6874,7 @@ class FileParserBlock(Block):
             )
 
         # If json_schema is provided, use AI to extract structured data
-        final_data: str | list[dict[str, Any]] | dict[str, Any]
+        final_data: Any
         LOG.debug(
             "FileParserBlock JSON schema check",
             has_json_schema=self.json_schema is not None,
@@ -6521,6 +6927,7 @@ class PDFParserBlock(Block):
 
     file_url: str
     json_schema: dict[str, Any] | None = None
+    schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
 
     def get_all_parameters(
         self,
@@ -6589,27 +6996,92 @@ class PDFParserBlock(Block):
             )
 
         if not self.json_schema:
-            self.json_schema = {
-                "type": "object",
-                "properties": {
-                    "output": {
-                        "type": "object",
-                        "description": "Information extracted from the text",
-                    }
-                },
-            }
+            self.json_schema = _default_structured_output_schema("Information extracted from the text")
+        schema_to_use = self.json_schema
+        assert schema_to_use is not None
+        if not validate_schema(schema_to_use):
+            return await self.build_block_result(
+                success=False,
+                failure_reason="File parser JSON schema is invalid.",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
         llm_prompt = prompt_engine.load_prompt(
-            "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
+            "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=schema_to_use
         )
-        llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt,
-            prompt_name="extract-information-from-file-text",
-            force_dict=False,
-            system_prompt=self.workflow_system_prompt,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-        )
+
+        llm_response: dict[str, Any] | list | str | None = None
+        prompt_for_attempt = llm_prompt
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                llm_response = await app.LLM_API_HANDLER(
+                    prompt=prompt_for_attempt,
+                    prompt_name="extract-information-from-file-text",
+                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                    force_dict=False,
+                    system_prompt=self.workflow_system_prompt,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "PDFParserBlock extraction LLM response failed response-format validation",
+                    file_url=self.file_url,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=schema_to_use.get("type"),
+                )
+                if not will_retry:
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=failure_reason,
+                        output_parameter_value=None,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                prompt_for_attempt = _build_schema_validation_retry_prompt(llm_prompt, failure_reason)
+                continue
+
+            schema_validation_failure = FileParserBlock._validate_ai_response_against_json_schema(
+                llm_response,
+                schema_to_use,
+            )
+            if not schema_validation_failure:
+                break
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "PDFParserBlock extraction LLM response failed schema validation",
+                file_url=self.file_url,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=schema_to_use.get("type"),
+            )
+            if not will_retry:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=schema_validation_failure,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            prompt_for_attempt = _build_schema_validation_retry_prompt(
+                llm_prompt,
+                schema_validation_failure,
+            )
+
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(
