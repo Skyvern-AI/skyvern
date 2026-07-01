@@ -246,6 +246,16 @@ interface ChatMessage {
   narrative?: TurnNarrativeState;
 }
 
+const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const narrative = messages[index]?.narrative;
+    if (narrative?.turnId && shouldShowDiffCard(narrative)) {
+      return narrative.turnId;
+    }
+  }
+  return null;
+};
+
 type QueuedPrompt = {
   id: string;
   content: string;
@@ -485,6 +495,11 @@ export function WorkflowCopilotChat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  // Turn IDs the user explicitly rejected. This is client-local because reject
+  // only reverts the local canvas; the backend proposalDisposition stays fixed.
+  const [rejectedTurnIds, setRejectedTurnIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -687,6 +702,7 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
+    setRejectedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
@@ -719,6 +735,10 @@ export function WorkflowCopilotChat({
           return hydrated;
         })(),
       }));
+      const pendingProposalTurnId = data.proposed_workflow
+        ? getLatestDiffCardTurnId(historyMessages)
+        : null;
+      latestTurnId.current = pendingProposalTurnId;
       setMessages(historyMessages);
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
@@ -733,6 +753,7 @@ export function WorkflowCopilotChat({
       if (!workflowPermanentId) return;
       setIsLoadingHistory(true);
       updateQueuedPrompt(null);
+      setRejectedTurnIds(new Set());
       setNarrative(EMPTY_NARRATIVE);
       turnSnapshots.current.clear();
       pendingSubmitSnapshot.current = null;
@@ -878,10 +899,13 @@ export function WorkflowCopilotChat({
     // The staged proposal was rendered onto the canvas mid-turn (via
     // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
     // canvas state captured client-side at submit time.
-    const turnId = latestTurnId.current;
+    const turnId = latestTurnId.current ?? getLatestDiffCardTurnId(messages);
     const entry = turnId ? turnSnapshots.current.get(turnId) : null;
     if (entry?.snapshot) {
       applyWorkflowUpdate(entry.snapshot);
+    }
+    if (turnId) {
+      setRejectedTurnIds((prev) => new Set(prev).add(turnId));
     }
     setProposedWorkflow(null);
     void clearProposedWorkflow(false);
@@ -2022,9 +2046,9 @@ export function WorkflowCopilotChat({
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working — message will queue…"
+      ? "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
-        ? "Live browser is starting. Send now to queue your prompt."
+        ? "Live browser is starting. Your next send will wait until it connects."
         : null;
   const inputStatusText = isSpeechListening
     ? browserStatusText
@@ -2194,7 +2218,14 @@ export function WorkflowCopilotChat({
                       </div>
                     ) : null}
                     {docked && shouldShowDiffCard(message.narrative) ? (
-                      <DiffCard turn={message.narrative} />
+                      <DiffCard
+                        pendingProposal={showProposalActions}
+                        rejected={
+                          message.narrative.turnId !== null &&
+                          rejectedTurnIds.has(message.narrative.turnId)
+                        }
+                        turn={message.narrative}
+                      />
                     ) : null}
                     {docked &&
                     isLastMessage &&
@@ -2313,9 +2344,9 @@ export function WorkflowCopilotChat({
               queuedPrompt
                 ? "Prompt queued..."
                 : isLoading
-                  ? "Type a message to queue for the next turn…"
+                  ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
-                    ? "Type a prompt to queue..."
+                    ? "Type a prompt to send when ready..."
                     : "Message Skyvern Copilot…"
             }
             value={inputValue}
@@ -2350,13 +2381,15 @@ export function WorkflowCopilotChat({
           ) : isLoading ? (
             <>
               <button
+                type="button"
                 onClick={() => handleSend()}
-                title="Queue for the next turn"
+                title="Send after this turn finishes"
                 className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
-                Queue
+                Send next
               </button>
               <button
+                type="button"
                 onClick={cancelSend}
                 title="Cancel run"
                 className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
