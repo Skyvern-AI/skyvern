@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => {
     clipboardPasteFrom: ReturnType<typeof vi.fn>;
     sendKey: ReturnType<typeof vi.fn>;
     disconnect: ReturnType<typeof vi.fn>;
+    _framebufferUpdate: () => boolean;
   }> = [];
   const apiGet = vi.fn(async () => ({
     data: {
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => {
     clipboardPasteFrom = vi.fn();
     sendKey = vi.fn();
     disconnect = vi.fn();
+    _framebufferUpdate = vi.fn(() => true);
 
     private listeners: Record<string, RfbListener[]> = {};
 
@@ -122,7 +124,7 @@ vi.mock("@/store/useRecordingStore", () => ({
   useRecordingStore: () => mocks.recordingStore,
 }));
 
-function renderBrowserStream() {
+function renderBrowserStream(props: { onActivity?: () => void } = {}) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -137,6 +139,7 @@ function renderBrowserStream() {
         browserSessionId="pbs_test"
         interactive={false}
         showControlButtons={true}
+        onActivity={props.onActivity}
       />
     </QueryClientProvider>,
   );
@@ -190,5 +193,19 @@ describe("BrowserStream", () => {
     await waitFor(() => {
       expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(4);
     });
+  });
+
+  it("notifies activity after a VNC framebuffer update completes", async () => {
+    const onActivity = vi.fn();
+
+    renderBrowserStream({ onActivity });
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances).toHaveLength(1);
+    });
+
+    mocks.rfbInstances[0]!._framebufferUpdate();
+
+    expect(onActivity).toHaveBeenCalledTimes(1);
   });
 });

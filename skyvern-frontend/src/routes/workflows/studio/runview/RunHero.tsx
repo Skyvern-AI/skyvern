@@ -6,6 +6,7 @@ import {
   ExclamationTriangleIcon,
   FileTextIcon,
   GlobeIcon,
+  ImageIcon,
   ListBulletIcon,
   PlayIcon,
   ReloadIcon,
@@ -13,7 +14,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
-import { useRunViewStore } from "@/store/RunViewStore";
+import { type RunCenterView, useRunViewStore } from "@/store/RunViewStore";
 import { cn } from "@/util/utils";
 
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
@@ -37,6 +38,7 @@ type RunHeroProps = {
   codeGenerating?: boolean;
   browserSessionId: string | null;
   recordingUrls: string[];
+  hasScreenshots?: boolean;
   elapsed: string;
   inputs?: ReactNode;
   outputs?: ReactNode;
@@ -57,6 +59,57 @@ type CenterView =
 
 // Below this header width the toggle/dropdown labels collapse to icons.
 const HEADER_COMPACT_BELOW_PX = 640;
+
+// RunCenterView stores user intent; the hero renders screenshots in one surface.
+function resolveCenterView({
+  centerView,
+  hasScreenshots,
+  hasInputs,
+  hasOutputs,
+  scrubbing,
+  showDebugStream,
+  recordingOpen,
+  hasRecording,
+  running,
+  failed,
+}: {
+  centerView: RunCenterView;
+  hasScreenshots: boolean;
+  hasInputs: boolean;
+  hasOutputs: boolean;
+  scrubbing: boolean;
+  showDebugStream: boolean;
+  recordingOpen: boolean;
+  hasRecording: boolean;
+  running: boolean;
+  failed: boolean;
+}): CenterView {
+  if (centerView === "screenshots" && hasScreenshots) {
+    return "screenshot";
+  }
+  if (centerView === "code") {
+    return "code";
+  }
+  if (centerView === "inputs" && hasInputs) {
+    return "inputs";
+  }
+  if (centerView === "outputs" && hasOutputs) {
+    return "outputs";
+  }
+  if (scrubbing) {
+    return "screenshot";
+  }
+  if (showDebugStream) {
+    return recordingOpen && hasRecording ? "recording" : "stream";
+  }
+  if (running) {
+    return "stream";
+  }
+  if (hasRecording && !failed) {
+    return "recording";
+  }
+  return "screenshot";
+}
 
 function ViewToggle({
   active,
@@ -107,6 +160,7 @@ export function RunHero({
   codeGenerating = false,
   browserSessionId,
   recordingUrls,
+  hasScreenshots = false,
   elapsed,
   inputs,
   outputs,
@@ -159,24 +213,18 @@ export function RunHero({
 
   // An explicit tab wins; otherwise a block run defaults to the live debug
   // stream and a full run to its stream (running) / recording / screenshot.
-  const center: CenterView =
-    centerView === "code"
-      ? "code"
-      : centerView === "inputs" && inputs
-        ? "inputs"
-        : centerView === "outputs" && outputs
-          ? "outputs"
-          : scrubbing
-            ? "screenshot"
-            : showDebugStream
-              ? recordingOpen && hasRecording
-                ? "recording"
-                : "stream"
-              : running
-                ? "stream"
-                : hasRecording && !failed
-                  ? "recording"
-                  : "screenshot";
+  const center = resolveCenterView({
+    centerView,
+    hasScreenshots,
+    hasInputs: Boolean(inputs),
+    hasOutputs: Boolean(outputs),
+    scrubbing,
+    showDebugStream,
+    recordingOpen,
+    hasRecording,
+    running,
+    failed,
+  });
 
   // The right-side toggles own the view identity (Live/Recording/Code) and the
   // in-card "Inspecting step" bar owns a scrubbed action's description; the
@@ -247,6 +295,15 @@ export function RunHero({
               compact={compact}
               label="Recording"
               icon={<PlayIcon className="h-3 w-3" />}
+            />
+          ) : null}
+          {hasScreenshots ? (
+            <ViewToggle
+              active={center === "screenshot"}
+              onClick={() => setCenterView("screenshots")}
+              compact={compact}
+              label="Screenshots"
+              icon={<ImageIcon className="h-3 w-3" />}
             />
           ) : null}
           <ViewToggle
