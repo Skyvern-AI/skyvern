@@ -62,6 +62,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_parameter_id
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -6611,6 +6612,109 @@ class WorkflowService:
                 entries=task_archive_entries,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+
+    @staticmethod
+    def _regenerate_dispatch_draft_parameter_ids(definition: WorkflowDefinition, workflow_id: str) -> None:
+        """Regenerate the persisted-row parameter ids (WorkflowParameter, OutputParameter) on a
+        definition so they can be inserted under a new workflow_id without colliding on the global
+        parameter primary keys (the source workflow shares those ids). The subsequent
+        update_workflow_definition reconcile creates the rows from these ids and rebinds each
+        block's output_parameter to the regenerated instance by key. Other parameter kinds
+        (credential / secret / context) live only in the JSON definition and are resolved by
+        field/key at runtime, so they keep their ids.
+
+        The caller passes a deep copy of the definition; the shared ctx.staged_workflow /
+        runtime_workflow object must not be mutated.
+        """
+        for parameter in definition.parameters:
+            if isinstance(parameter, WorkflowParameter):
+                parameter.workflow_id = workflow_id
+                parameter.workflow_parameter_id = generate_workflow_parameter_id()
+            elif isinstance(parameter, OutputParameter):
+                parameter.workflow_id = workflow_id
+                parameter.output_parameter_id = generate_output_parameter_id()
+
+    async def create_copilot_dispatch_draft_version(
+        self,
+        *,
+        runtime_workflow: Workflow,
+        organization_id: str,
+    ) -> Workflow:
+        """Persist ``runtime_workflow`` (the copilot's wrapped test definition) as a real new
+        workflow version that the dispatched run resolves by ``run.workflow_id``.
+
+        Uses the normal create machinery: an empty version row is created, then
+        update_workflow_definition reconciles fresh WorkflowParameter / OutputParameter ROWS for
+        the new version and aligns block output-parameter references. Parameter ids are
+        regenerated per-version on a DEEP COPY of the definition (the source ids would collide on
+        the global parameter PKs, and the shared ctx.staged_workflow / runtime_workflow object
+        must not be mutated). The returned (reloaded) version carries the regenerated ids; the
+        caller maps post-run output values against it. The version is created as auto_generated
+        and is soft-deleted by the caller once the run reaches a terminal state.
+        """
+        # next_version is computed including soft-deleted rows: a soft-deleted version still
+        # reserves its number under the unique (org, permanent_id, version) constraint, so
+        # filtering deleted rows here would recompute a taken number and IntegrityError.
+        latest = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+            organization_id=organization_id,
+            filter_deleted=False,
+        )
+        next_version = (latest.version if latest else 0) + 1
+        dispatch_definition = runtime_workflow.workflow_definition.model_copy(deep=True)
+        placeholder = await self.create_workflow(
+            title=runtime_workflow.title,
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+            organization_id=organization_id,
+            workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+            version=next_version,
+            status=WorkflowStatus.auto_generated,
+            description=runtime_workflow.description,
+            proxy_location=runtime_workflow.proxy_location,
+            webhook_callback_url=runtime_workflow.webhook_callback_url,
+            totp_verification_url=runtime_workflow.totp_verification_url,
+            totp_identifier=runtime_workflow.totp_identifier,
+            persist_browser_session=runtime_workflow.persist_browser_session,
+            browser_profile_id=runtime_workflow.browser_profile_id,
+            browser_profile_key=runtime_workflow.browser_profile_key,
+            model=runtime_workflow.model,
+            max_screenshot_scrolling_times=runtime_workflow.max_screenshot_scrolls,
+            max_elapsed_time_minutes=runtime_workflow.max_elapsed_time_minutes,
+            extra_http_headers=runtime_workflow.extra_http_headers,
+            cdp_connect_headers=runtime_workflow.cdp_connect_headers,
+            run_with=runtime_workflow.run_with,
+            ai_fallback=runtime_workflow.ai_fallback,
+            code_version=runtime_workflow.code_version,
+            run_sequentially=runtime_workflow.run_sequentially or False,
+            sequential_key=runtime_workflow.sequential_key,
+            adaptive_caching=runtime_workflow.adaptive_caching,
+            generate_script_on_terminal=runtime_workflow.generate_script_on_terminal,
+            folder_id=runtime_workflow.folder_id,
+            is_saved_task=runtime_workflow.is_saved_task,
+        )
+        try:
+            self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
+            return await self.update_workflow_definition(
+                workflow_id=placeholder.workflow_id,
+                organization_id=organization_id,
+                workflow_definition=dispatch_definition,
+            )
+        except Exception:
+            # The placeholder row already exists as the latest version; if definition
+            # persistence fails, soft-delete it so it does not linger as the latest pointer.
+            try:
+                await app.DATABASE.workflows.soft_delete_workflow_by_id(
+                    workflow_id=placeholder.workflow_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to clean up partial copilot dispatch version after persistence error",
+                    workflow_id=placeholder.workflow_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+            raise
 
     async def make_workflow_definition(
         self,

@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -245,6 +246,73 @@ async def _cancel_run_task_if_not_final(
             workflow_run_id=workflow_run_id,
             exc_info=True,
         )
+
+
+async def _cooperative_cancel_dispatched_run(workflow_run_id: str) -> None:
+    """Best-effort cooperative cancel of a worker-dispatched copilot run.
+
+    The run executes on the worker (Temporal), so there is no in-process ``run_task`` to
+    cancel/drain. We flip the DB status to ``canceled`` (a no-op when already terminal) so the
+    worker stops at the next step boundary. Unlike the inline path's 5s task drain this is
+    cooperative-first; a true Temporal ``workflow_handle.cancel()`` is a follow-up.
+    """
+    try:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
+            workflow_run_id=workflow_run_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Cooperative cancel of dispatched copilot run failed",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+
+
+async def _delete_dispatch_draft(workflow_id: str, organization_id: str) -> None:
+    """Best-effort soft-delete of the copilot dispatch version once the run is done.
+
+    The dispatch version is written at version=latest+1, so without this it would become the
+    latest version returned by edit/view/GET /workflows/{wpid} resolution (latest-by-permanent-id)
+    and show the wrapped snapshot. Soft-deleting it restores the user's real latest version
+    (get_workflow_by_permanent_id excludes soft-deleted rows). The dispatched run already ran
+    against this version (worker resolved it by run.workflow_id before terminal), so deleting it
+    afterward does not affect execution. Best-effort: a failure here must never fail the run.
+    """
+    try:
+        await app.DATABASE.workflows.soft_delete_workflow_by_id(
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to soft-delete copilot dispatch draft; it may linger as the latest version",
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+
+
+async def _delete_dispatch_draft_if_run_final(workflow_id: str, workflow_run_id: str, organization_id: str) -> None:
+    """Soft-delete the dispatch draft, but only once the run is in a final state.
+
+    The worker resolves the pinned draft via get_workflow(run.workflow_id) when it picks the run
+    up. Deleting the draft while the run is still non-final — e.g. an unexpected exception bubbles
+    out of the poll loop before the worker loads it — would make that resolution 404 with
+    WorkflowNotFound. A non-final exit leaves the draft in place rather than racing the worker.
+    """
+    run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+    if run is None or not run.status.is_final():
+        LOG.info(
+            "Skipping copilot dispatch draft delete; run is not final yet",
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            status=run.status if run else None,
+        )
+        return
+    await _delete_dispatch_draft(workflow_id, organization_id)
 
 
 def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
@@ -559,9 +627,13 @@ async def _watchdog_error_message(
     workflow_run_id: str,
     run: WorkflowRun | None,
     budget_seconds: int,
+    dispatch_to_worker: bool = False,
 ) -> str:
     """LLM-facing error string for a non-success watchdog exit. No variant uses
     "timed out" or other retry-inviting phrasing — those are SKY-9163 traps.
+
+    ``dispatch_to_worker`` runs skip the ``_fallback_page_info`` CDP read: the worker
+    owns the run's persistent browser session, so the API must not attach to it.
     """
     if exit_reason == "stagnation":
         body = (
@@ -594,7 +666,7 @@ async def _watchdog_error_message(
             f"Do NOT retry the same chain unchanged — a longer "
             f"run won't fit either."
         )
-        current_url, _ = await _fallback_page_info(ctx)
+        current_url, _ = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
         if current_url:
             message += f" Browser was on: {current_url}"
         return message
@@ -609,7 +681,7 @@ async def _watchdog_error_message(
             "current-page evidence, and update only the block(s) that overshot or kept running after the state "
             "was reached. Do NOT report end-to-end success unless a corrected workflow run verifies cleanly."
         )
-        current_url, _ = await _fallback_page_info(ctx)
+        current_url, _ = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
         if current_url:
             message += f" Browser was on: {current_url}"
         return message
@@ -631,7 +703,7 @@ async def _watchdog_error_message(
         f"Do NOT re-invoke block-running tools in this session without first calling "
         f"`get_run_results` with this workflow_run_id and reporting the result to the user."
     )
-    current_url, _ = await _fallback_page_info(ctx)
+    current_url, _ = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
     if current_url:
         message += f" Browser was on: {current_url}"
     return message
@@ -1120,6 +1192,13 @@ async def _run_blocks_and_collect_debug(
         return {"ok": False, "error": "Organization not found"}
 
     organization = Organization.model_validate(org)
+    # Copilot-only gate, default OFF (flag-off is byte-for-byte the inline path below). When ON,
+    # the block test run is persisted as a draft and dispatched to the -ui worker tier instead
+    # of running inline on the API service.
+    dispatch_to_worker = await app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker(
+        organization_id=ctx.organization_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+    )
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
     runtime_workflow, runtime_frontier_anchor_url = _workflow_with_runtime_frontier_anchor(
         runtime_workflow,
@@ -1232,35 +1311,103 @@ async def _run_blocks_and_collect_debug(
         max_screenshot_scrolls=0,
     )
 
-    workflow_run = await workflow_service.prepare_workflow(
-        workflow_id=ctx.workflow_permanent_id,
-        organization=organization,
-        workflow_request=workflow_request,
-        template=False,
-        version=None,
-        max_steps=None,
-        request_id=None,
-        copilot_session_id=ctx.workflow_copilot_chat_id,
-    )
+    # Snapshot version persisted for a dispatched run; the run is created against its exact
+    # workflow_id so the worker resolves the wrapped definition via run.workflow_id, and it is
+    # soft-deleted once the run resolves so it never lingers as the latest-by-permanent-id pointer
+    # for edit/view. None for the inline path.
+    dispatch_draft_workflow_id: str | None = None
+    # The persisted dispatch version (its own regenerated parameter ids) used for post-run output
+    # mapping on the dispatch path; runtime_workflow / ctx.staged_workflow is left unmutated.
+    dispatch_workflow: Workflow | None = None
+    if dispatch_to_worker:
+        # Persist the wrapped runtime workflow as a real new version (with its own
+        # parameter / output-parameter rows) through the normal create machinery. The run is
+        # then created against this version so the worker resolves it by run.workflow_id and
+        # registers block outputs from the version's own rows. On any persistence failure, fall
+        # back to the inline path for this run so flag-on degrades safely.
+        try:
+            dispatch_workflow = await app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version(
+                runtime_workflow=runtime_workflow,
+                organization_id=ctx.organization_id,
+            )
+            dispatch_draft_workflow_id = dispatch_workflow.workflow_id
+        except Exception:
+            LOG.warning(
+                "Failed to persist copilot dispatch version; falling back to inline run",
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                exc_info=True,
+            )
+            dispatch_to_worker = False
+            dispatch_workflow = None
 
-    from skyvern.utils.files import initialize_skyvern_state_file
-
-    await initialize_skyvern_state_file(
-        workflow_run_id=workflow_run.workflow_run_id,
-        organization_id=ctx.organization_id,
-    )
-
-    run_task = asyncio.create_task(
-        app.WORKFLOW_SERVICE.execute_workflow(
-            workflow_run_id=workflow_run.workflow_run_id,
-            api_key="copilot-agent",
+    # run_task is the in-process inline execution task. For dispatched runs it stays None: the
+    # worker owns execution and the watchdog observes purely via DB polling.
+    run_task: asyncio.Task | None = None
+    try:
+        workflow_run = await workflow_service.prepare_workflow(
+            workflow_id=ctx.workflow_permanent_id,
             organization=organization,
-            browser_session_id=run_session_id,
-            block_labels=labels_to_execute,
-            block_outputs=block_outputs_to_seed or None,
-            workflow_override=runtime_workflow,
+            workflow_request=workflow_request,
+            template=False,
+            # Dispatched runs pin the exact persisted snapshot version by workflow_id (the
+            # (permanent_id, version) index is non-unique); inline runs use the latest version
+            # and pass the runtime workflow in-process via workflow_override.
+            resolved_workflow_id=dispatch_draft_workflow_id,
+            max_steps=None,
+            request_id=None,
+            # The trigger type (and the -ui queue routing it implies) is a cloud contract; ask the
+            # AgentFunction for it rather than hardcoding "manual == -ui pool" in OSS. OSS base
+            # returns None (no routing hint); cloud returns the value its executor routes to -ui.
+            trigger_type=(app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None),
+            copilot_session_id=ctx.workflow_copilot_chat_id,
         )
-    )
+
+        if dispatch_to_worker:
+            # Submit through the cloud executor (Temporal). The run was created against the
+            # snapshot version, so the worker resolves the exact wrapped definition via
+            # run.workflow_id — no workflow_override over the wire. block_labels/block_outputs and
+            # the shared browser session reproduce the frontier re-run on the worker.
+            await AsyncExecutorFactory.get_executor().execute_workflow(
+                request=None,
+                background_tasks=None,
+                organization=organization,
+                workflow_id=workflow_run.workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                max_steps_override=None,
+                api_key="copilot-agent",
+                browser_session_id=run_session_id,
+                block_labels=labels_to_execute,
+                block_outputs=block_outputs_to_seed or None,
+            )
+        else:
+            from skyvern.utils.files import initialize_skyvern_state_file
+
+            await initialize_skyvern_state_file(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=ctx.organization_id,
+            )
+
+            run_task = asyncio.create_task(
+                app.WORKFLOW_SERVICE.execute_workflow(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    api_key="copilot-agent",
+                    organization=organization,
+                    browser_session_id=run_session_id,
+                    block_labels=labels_to_execute,
+                    block_outputs=block_outputs_to_seed or None,
+                    workflow_override=runtime_workflow,
+                )
+            )
+    except BaseException:
+        # Run setup / submission failed OR the tool was cancelled after the dispatch version was
+        # created. The watchdog cleanup below never runs on this path, so soft-delete the version
+        # here so it does not linger as the latest-by-permanent-id pointer. Catch BaseException so
+        # asyncio.CancelledError (the SDK tool timeout) also cleans the draft up.
+        if dispatch_draft_workflow_id is not None:
+            await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+            dispatch_draft_workflow_id = None
+        raise
 
     # The OpenAI Agents SDK wraps this tool in
     # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``, so
@@ -1304,7 +1451,10 @@ async def _run_blocks_and_collect_debug(
     seen_block_states: dict[str, str] = {}
     prior_block_ts: datetime | None = initial_block_ts
     last_block_fetch_monotonic = 0.0
-    active_terminal_monitor_enabled = await _active_run_terminal_monitor_enabled(ctx)
+    # Dispatched runs are owned by the worker, which now holds the persistent browser session.
+    # The API side must not touch that PBS over CDP, so the in-run active-terminal evidence
+    # monitor (which samples the live page) is disabled for dispatched runs.
+    active_terminal_monitor_enabled = (not dispatch_to_worker) and await _active_run_terminal_monitor_enabled(ctx)
     next_active_terminal_monitor_monotonic = (
         started_monotonic + _ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS
         if active_terminal_monitor_enabled
@@ -1343,9 +1493,11 @@ async def _run_blocks_and_collect_debug(
                 exit_reason = "success"
                 break
 
-            if run_task.done():
+            if run_task is not None and run_task.done():
                 # Row not terminal yet — shared reconcile path below flips
                 # most of these back to success after post-drain reread.
+                # Dispatched runs have no in-process task, so loop exit is anchored purely
+                # on the DB-terminal status check above.
                 exit_reason = "task_exit_unfinalized"
                 break
 
@@ -1416,7 +1568,11 @@ async def _run_blocks_and_collect_debug(
                 if pre_cancel_run is not None:
                     run = pre_cancel_run
                 if run is None or not WorkflowRunStatus(run.status).is_final():
-                    await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                    if run_task is not None:
+                        await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                    else:
+                        # Phase 4: dispatched run — cooperative DB cancel so the worker stops.
+                        await _cooperative_cancel_dispatched_run(workflow_run.workflow_run_id)
                     run_cancelled_by_watchdog = True
                     run = await _safe_read_workflow_run(
                         workflow_run.workflow_run_id, ctx.organization_id, context="post-drain"
@@ -1431,13 +1587,16 @@ async def _run_blocks_and_collect_debug(
             assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
             _mark_pending_reconciliation_run(ctx, workflow_run.workflow_run_id)
             error_msg = await _watchdog_error_message(
-                exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds
+                exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds, dispatch_to_worker
             )
             user_failure_reason = _watchdog_user_failure_reason(
                 exit_reason, workflow_run.workflow_run_id, budget_seconds, run
             )
             user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
-            current_url, page_title = await _fallback_page_info(ctx, session_id_override=run_session_id)
+            # Dispatched runs: the worker owns the run session, so do not attach to it over CDP.
+            current_url, page_title = (
+                ("", "") if dispatch_to_worker else await _fallback_page_info(ctx, session_id_override=run_session_id)
+            )
             if exit_reason == "active_run_terminal_evidence" and active_run_terminal_evidence is not None:
                 result: dict[str, Any] = _active_run_terminal_evidence_result(
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -1489,10 +1648,21 @@ async def _run_blocks_and_collect_debug(
         # the cleanup so the parent cancellation can't interrupt it mid-await.
         # If the shield itself is cancelled, fall back to a detached task
         # that outlives tool teardown and still reconciles workflow state.
+        cancel_cleanup = (
+            _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+            if run_task is not None
+            # Dispatched run: no in-process task, cooperatively flip the DB status instead.
+            else _cooperative_cancel_dispatched_run(workflow_run.workflow_run_id)
+        )
         try:
-            await asyncio.shield(_cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id))
+            await asyncio.shield(cancel_cleanup)
         except asyncio.CancelledError:
-            fallback = asyncio.ensure_future(_cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id))
+            fallback_cleanup = (
+                _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                if run_task is not None
+                else _cooperative_cancel_dispatched_run(workflow_run.workflow_run_id)
+            )
+            fallback = asyncio.ensure_future(fallback_cleanup)
             _DETACHED_CLEANUP_TASKS.add(fallback)
             fallback.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
             fallback.add_done_callback(_log_detached_cleanup_failure)
@@ -1500,9 +1670,19 @@ async def _run_blocks_and_collect_debug(
     finally:
         # Belt and braces. If any exit path above missed a cancel — e.g. an
         # unexpected exception bubbling out of the poll loop — make sure the
-        # run_task is at least signaled to cancel so we don't leak it.
-        if not run_task.done():
+        # run_task is at least signaled to cancel so we don't leak it. Dispatched
+        # runs have no in-process task, so there is nothing to signal here.
+        if run_task is not None and not run_task.done():
             run_task.cancel()
+        # Soft-delete the pinned draft so it never lingers as the latest version. Gated on a final
+        # run state: on the normal path the poll loop only exits once the run is terminal, but an
+        # unexpected exception can reach here before the worker has loaded the draft, and deleting
+        # it then would 404 the worker's get_workflow(run.workflow_id). Runs on every exit path
+        # (success fall-through, failure return, cancel raise).
+        if dispatch_draft_workflow_id is not None:
+            await _delete_dispatch_draft_if_run_final(
+                dispatch_draft_workflow_id, workflow_run.workflow_run_id, ctx.organization_id
+            )
 
     # Skip the rebind when a fresh run session was used so the scout's restored
     # debug session stays the context session for the rest of the turn.
@@ -1565,10 +1745,17 @@ async def _run_blocks_and_collect_debug(
     for entry in results:
         entry.pop("action_trace", None)
 
-    current_url, page_title = await _fallback_page_info(ctx, session_id_override=run_session_id)
+    # Dispatched runs: the worker owns the run session; do not touch it over CDP from the API.
+    # current_url/page_title are sourced from worker-persisted run data elsewhere if needed.
+    current_url, page_title = (
+        ("", "") if dispatch_to_worker else await _fallback_page_info(ctx, session_id_override=run_session_id)
+    )
 
     screenshot_b64: str | None = None
-    if not run_ok and run_session_id:
+    # Dispatched runs: the worker owns the persistent browser session, so the API side must not
+    # grab the live page over CDP. A worker-persisted screenshot artifact can be surfaced from
+    # the DB instead (follow-up); for now the dispatched failure packet omits the inline capture.
+    if not dispatch_to_worker and not run_ok and run_session_id:
         try:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                 session_id=run_session_id,
@@ -1594,11 +1781,13 @@ async def _run_blocks_and_collect_debug(
             LOG.debug("Failed to capture post-run screenshot", exc_info=True)
 
     if (
-        not run_ok
+        not dispatch_to_worker
+        and not run_ok
         and run_session_id
         and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
         and not ctx.copilot_total_timeout_exceeded
     ):
+        # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
         await _capture_and_store_post_run_failure_page(
             ctx,
             run_session_id=run_session_id,
@@ -1639,7 +1828,10 @@ async def _run_blocks_and_collect_debug(
 
     registered_outputs_by_label = await _attach_registered_output_parameter_values(
         workflow_run_id=workflow_run.workflow_run_id,
-        workflow=runtime_workflow,
+        # Dispatched runs: the worker wrote outputs keyed by the persisted dispatch version's
+        # regenerated output-parameter ids, so map against that version (not runtime_workflow,
+        # which is intentionally left with the source ids). Inline runs map against runtime_workflow.
+        workflow=dispatch_workflow if dispatch_workflow is not None else runtime_workflow,
         data=result_data,
         persisted_output_parameters=all_output_params,
     )
@@ -1745,7 +1937,14 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
         "overall_status": run.status,
         "blocks": results,
     }
-    current_url, page_title = await _fallback_page_info(ctx)
+    # When worker-dispatch is enabled for this copilot session the run's persistent browser
+    # session is worker-owned (for a non-fresh run ctx.browser_session_id == run_session_id), so
+    # the API must not attach to it over CDP. Mirror the gating in _run_blocks_and_collect_debug.
+    dispatch_to_worker = await app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker(
+        organization_id=ctx.organization_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+    )
+    current_url, page_title = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
     if current_url:
         result_data["current_url"] = current_url
         result_data["page_title"] = page_title
