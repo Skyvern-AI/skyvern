@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry, LLMConfigRegistrationIssue
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistrationIssue, LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.internal_auth import _require_local_access
@@ -66,10 +66,7 @@ def _server_llm_issue(llm_key: str) -> LLMConfigIssueResponse | None:
     return LLMConfigIssueResponse(
         llm_key=llm_key,
         missing_env_vars=missing_env_vars,
-        detail=(
-            f"{llm_key} is missing required environment variables: "
-            f"{', '.join(missing_env_vars)}"
-        ),
+        detail=(f"{llm_key} is missing required environment variables: {', '.join(missing_env_vars)}"),
     )
 
 
@@ -104,9 +101,7 @@ async def evaluate_llm_status() -> LLMDiagnosticsResponse:
     has_server_configured_llm = default_issue is None
 
     issues = [
-        _issue_response(issue)
-        for issue in LLMConfigRegistry.get_config_issues()
-        if issue.llm_key != settings.LLM_KEY
+        _issue_response(issue) for issue in LLMConfigRegistry.get_config_issues() if issue.llm_key != settings.LLM_KEY
     ]
     if default_issue:
         issues.insert(0, default_issue)
