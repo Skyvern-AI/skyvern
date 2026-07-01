@@ -307,6 +307,14 @@ function BlockConfigSidebarBody({
                 fallbackLabel={identity.label}
               />
             )}
+            {identity.blockType ? (
+              <p
+                className="truncate text-xs text-slate-400"
+                title={workflowBlockTitle[identity.blockType]}
+              >
+                {workflowBlockTitle[identity.blockType]}
+              </p>
+            ) : null}
             <SubLabel />
           </div>
         </div>
