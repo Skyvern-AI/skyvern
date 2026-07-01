@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    built_unverified_repair_inert_context,
     verified_goal_claim_authorized,
     verified_goal_satisfied_context,
 )
@@ -1003,12 +1004,63 @@ def _legacy_verified_ctx() -> CopilotContext:
     )
 
 
+def _no_repair_unverified_contract() -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
+        verification_result=VerificationResult(
+            user_goal_satisfied=False,
+            completion_contract_satisfied=False,
+        ),
+    )
+
+
 def test_claim_closure_turn_still_ends_but_claim_downgrades() -> None:
     ctx = _legacy_verified_ctx()
     # Turn completion is unchanged: the legacy conjunction still satisfies the gate.
     assert verified_goal_satisfied_context(ctx) is True
     # The claim tier is closed: no adjudicated evidence, no tested-success claim.
     assert verified_goal_claim_authorized(ctx) is False
+
+
+def test_structural_abstention_no_repair_terminalizes_without_authorizing_success_claim() -> None:
+    ctx = _ctx(
+        last_test_ok=True,
+        last_full_workflow_test_ok=True,
+        latest_diagnosis_repair_contract=_no_repair_unverified_contract(),
+        completion_verification_result=_evaluated(_verdict("c0", "unsatisfied", "structurally_abstained")),
+    )
+
+    assert ctx.completion_verification_result is not None
+    assert ctx.completion_verification_result.is_fully_satisfied() is False
+    assert verified_goal_satisfied_context(ctx) is False
+    assert built_unverified_repair_inert_context(ctx) is True
+    assert verified_goal_claim_authorized(ctx) is False
+
+
+def test_structural_abstention_terminalization_rejects_real_unsatisfied_verdicts() -> None:
+    ctx = _ctx(
+        last_test_ok=True,
+        last_full_workflow_test_ok=True,
+        latest_diagnosis_repair_contract=_no_repair_unverified_contract(),
+        completion_verification_result=_evaluated(_verdict("c0", "unsatisfied", "no_evidence")),
+    )
+
+    assert verified_goal_satisfied_context(ctx) is False
+    assert built_unverified_repair_inert_context(ctx) is False
+
+
+def test_structural_abstention_terminalization_rejects_contradictions() -> None:
+    ctx = _ctx(
+        last_test_ok=True,
+        last_full_workflow_test_ok=True,
+        latest_diagnosis_repair_contract=_no_repair_unverified_contract(),
+        completion_verification_result=_evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts")),
+    )
+
+    assert verified_goal_satisfied_context(ctx) is False
+    assert built_unverified_repair_inert_context(ctx) is False
 
 
 def test_claim_authorized_with_adjudicated_evidence() -> None:
