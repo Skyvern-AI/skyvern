@@ -6,6 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -162,8 +163,10 @@ const workflowDraft = () => ({
   workflow: { workflow_id: "wf_draft" },
 });
 
-async function renderChat() {
-  const view = render(<WorkflowCopilotChat />);
+async function renderChat(
+  props: ComponentProps<typeof WorkflowCopilotChat> = {},
+) {
+  const view = render(<WorkflowCopilotChat {...props} />);
   // Let the mount-time chat-history fetch settle.
   await waitFor(() =>
     expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
@@ -695,6 +698,150 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("keeps a rejected history-loaded auto-applicable draft labeled as proposed changes", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "I drafted workflow changes for review.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: false,
+            proposalDisposition: "auto_applicable",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 1,
+              blockLabels: ["open_page"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage: "I drafted workflow changes for review.",
+            narrativeSummary: "I drafted workflow changes for review.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    await renderChat({ docked: true, portalTarget });
+
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    });
+
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Applied changes")).toBeNull();
+    portalTarget.remove();
+  });
+
+  it("relabels an auto-applicable draft as applied changes once accepted", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "I drafted workflow changes for review.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: false,
+            proposalDisposition: "auto_applicable",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 1,
+              blockLabels: ["open_page"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage: "I drafted workflow changes for review.",
+            narrativeSummary: "I drafted workflow changes for review.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    await renderChat({ docked: true, portalTarget });
+
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Applied changes")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
+    );
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+    );
+    expect(screen.getByText("Applied changes")).toBeTruthy();
+    expect(screen.queryByText("Proposed changes")).toBeNull();
+    portalTarget.remove();
   });
 
   it("renders an ASK_QUESTION response payload as a question", async () => {
