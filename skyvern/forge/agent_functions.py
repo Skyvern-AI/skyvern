@@ -59,6 +59,10 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+# Playwright's always-on ffmpeg VP8 encoder scales CPU with pixel count; 720p is the
+# legibility / CPU tradeoff point that the BROWSER_RECORDING_720P flag opts a run into.
+RECORDING_VIDEO_SIZE_720P: dict[str, int] = {"width": 1280, "height": 720}
+
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
@@ -728,6 +732,21 @@ class AgentFunction:
         routers so the default returns False.
         """
         return False
+
+    async def resolve_recording_video_size(
+        self,
+        current_size: dict[str, int] | None,
+        *,
+        distinct_id: str | None,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+    ) -> dict[str, int] | None:
+        """Resolve the browser recording resolution for this run.
+
+        Returns ``current_size`` unchanged. Cloud overrides this to opt runs into
+        an elevated resolution behind a feature flag.
+        """
+        return current_size
 
     async def should_keep_code_mode_for_workflow_run(
         self,
