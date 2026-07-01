@@ -75,7 +75,7 @@ function Settings() {
           <HiddenCopyableInput value={apiKey ?? "API key not found"} />
         </CardContent>
       </Card>
-      <Card>
+      <Card id="custom-llms">
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">1Password Integration</CardTitle>
           <CardDescription>

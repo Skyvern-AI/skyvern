@@ -1653,9 +1653,15 @@ class LLMAPIHandlerFactory:
         llm_key: str,
         base_parameters: dict[str, Any] | None = None,
     ) -> LLMAPIHandler:
+        if settings.ENV == "local" and LLMConfigRegistry.get_config_issue(llm_key):
+            return dummy_llm_api_handler
+
         try:
             llm_config = LLMConfigRegistry.get_config(llm_key)
         except InvalidLLMConfigError:
+            return dummy_llm_api_handler
+
+        if settings.ENV == "local" and llm_config.get_missing_env_vars():
             return dummy_llm_api_handler
 
         if LLMConfigRegistry.is_router_config(llm_key):

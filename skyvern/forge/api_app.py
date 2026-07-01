@@ -36,7 +36,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
-from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
@@ -372,6 +372,9 @@ def create_api_app() -> FastAPI:
         fastapi_app.include_router(internal_auth.router, prefix="/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_llms.router, prefix="/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
