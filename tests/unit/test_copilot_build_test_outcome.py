@@ -330,6 +330,45 @@ def test_outcome_not_demonstrated_keeps_authoritative_unsatisfied_criteria_ident
     assert "address and statuses" not in payload_text
 
 
+def test_not_evaluated_recorded_outcome_is_not_authoritative_repair_failure() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structural",
+            "blocks": [
+                {
+                    "label": "publish_result",
+                    "status": "completed",
+                    "extracted_data": {"document_name": "Resale Demand Package"},
+                }
+            ],
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                output_path="output.document_name",
+            )
+        ],
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_structural"),
+        completion_verification=verification,
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.reason_code == "failed_run"
+    assert outcome.is_authoritative is False
+
+
 def test_authoring_repair_context_produces_structural_recorded_outcome() -> None:
     context = CodeAuthoringRepairContext(
         block_label="search_records",
