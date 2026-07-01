@@ -793,6 +793,19 @@ class AgentFunction:
         """
         return None
 
+    async def should_dispatch_copilot_block_run_to_worker(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> bool:
+        """Base no-op (copilot runs its block test inline); overridden per deployment."""
+        return False
+
+    def resolve_copilot_dispatch_trigger_type(self) -> "WorkflowRunTriggerType | None":
+        """Base no-op (no dispatch routing hint); overridden per deployment."""
+        return None
+
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
         return True
