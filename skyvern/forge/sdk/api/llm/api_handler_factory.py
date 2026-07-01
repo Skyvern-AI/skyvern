@@ -1661,9 +1661,6 @@ class LLMAPIHandlerFactory:
         except InvalidLLMConfigError:
             return dummy_llm_api_handler
 
-        if settings.ENV == "local" and llm_config.get_missing_env_vars():
-            return dummy_llm_api_handler
-
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
