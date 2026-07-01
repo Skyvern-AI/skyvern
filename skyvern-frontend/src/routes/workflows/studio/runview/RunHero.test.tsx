@@ -58,6 +58,25 @@ describe("RunHero block-run stream", () => {
   });
 });
 
+describe("RunHero Code surface (single source of truth)", () => {
+  test("the Code toggle opens the generated-code view", () => {
+    render(<RunHero {...baseProps} showDebugStream={false} />);
+    expect(screen.queryByTestId("workflow-run-code")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Code" }));
+    expect(screen.queryByTestId("workflow-run-code")).not.toBeNull();
+  });
+
+  test("the Code toggle owns code-generation state, showing a spinner while generating", () => {
+    const { rerender } = render(
+      <RunHero {...baseProps} showDebugStream={false} codeGenerating={false} />,
+    );
+    expect(screen.queryByTestId("code-generating-spinner")).toBeNull();
+
+    rerender(<RunHero {...baseProps} showDebugStream={false} codeGenerating />);
+    expect(screen.queryByTestId("code-generating-spinner")).not.toBeNull();
+  });
+});
+
 describe("RunHero failure banner", () => {
   const failedProps = {
     ...baseProps,
