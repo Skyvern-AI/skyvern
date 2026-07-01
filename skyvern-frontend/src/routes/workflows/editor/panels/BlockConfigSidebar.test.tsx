@@ -477,6 +477,38 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
   });
 });
 
+describe("BlockConfigSidebar block type visibility (SKY-11622)", () => {
+  test("shows the block type beneath the editable label so the selected block type is identifiable without reading the form", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    // The label (block name) and the human-readable block type render as
+    // distinct lines — the type is no longer inferable only from the icon.
+    expect(screen.getByText("Alpha")).toBeDefined();
+    expect(screen.getByText("Task")).toBeDefined();
+  });
+
+  test("does not render a block-type line for the start (Agent Settings) node, which is not a block", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Agent Settings")).toBeDefined();
+    expect(screen.queryByText("Task")).toBeNull();
+  });
+});
+
 describe("BlockConfigSidebar settings collapse (SKY-11481)", () => {
   test("embedded studio renders the settings panel collapsed to a rail by default", () => {
     act(() => {
