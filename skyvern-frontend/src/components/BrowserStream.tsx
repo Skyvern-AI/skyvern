@@ -131,8 +131,13 @@ type Props = {
   isVisible?: boolean;
   isExecuting?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onActivity?: () => void;
   // --
   onClose?: () => void;
+};
+
+type RfbWithFrameUpdates = RFB & {
+  _framebufferUpdate?: () => boolean;
 };
 
 function BrowserStream({
@@ -146,6 +151,7 @@ function BrowserStream({
   isVisible = true,
   isExecuting = false,
   onReadyChange,
+  onActivity,
   // --
   onClose,
 }: Props) {
@@ -226,6 +232,7 @@ function BrowserStream({
     setCanvasContainer(node);
   }, []);
   const rfbRef = useRef<RFB | null>(null);
+  const onActivityRef = useRef(onActivity);
   const userCanSendVncInputRef = useRef(false);
   const observerRef = useRef<MutationObserver | null>(null);
   const messageReconnectAttemptsRef = useRef(0);
@@ -240,6 +247,10 @@ function BrowserStream({
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
     entity !== "browserSession" || isBrowserSessionStarted;
+
+  useEffect(() => {
+    onActivityRef.current = onActivity;
+  }, [onActivity]);
 
   useEffect(() => {
     setIsBrowserSessionStarted(false);
@@ -431,6 +442,22 @@ function BrowserStream({
         const rfb = new RFB(canvas, vncUrl);
 
         rfb.scaleViewport = true;
+
+        const frameUpdateRfb = rfb as RfbWithFrameUpdates;
+        // noVNC does not expose a public framebuffer-update event in 1.5.x.
+        // Hook the internal method defensively so activity tracking degrades
+        // to no-op if the private API changes.
+        const originalFrameUpdate =
+          frameUpdateRfb._framebufferUpdate?.bind(rfb);
+        if (originalFrameUpdate) {
+          frameUpdateRfb._framebufferUpdate = () => {
+            const didCompleteFrameUpdate = originalFrameUpdate();
+            if (didCompleteFrameUpdate) {
+              onActivityRef.current?.();
+            }
+            return didCompleteFrameUpdate;
+          };
+        }
 
         rfbRef.current = rfb;
 

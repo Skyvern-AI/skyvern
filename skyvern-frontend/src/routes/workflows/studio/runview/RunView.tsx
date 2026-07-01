@@ -58,6 +58,19 @@ type RunViewProps = {
   onRetry?: () => void;
 };
 
+function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
+  if (!selection) {
+    return false;
+  }
+  if (selection.kind === "action") {
+    return Boolean(
+      selection.artifactId ||
+      (selection.stepId && selection.actionOrder != null),
+    );
+  }
+  return true;
+}
+
 /**
  * Fused run view: browser hero on the left, run timeline tree + block detail on
  * the right, sharing one pinned item via RunViewStore.
@@ -91,6 +104,7 @@ export function RunView({
     enabled: false,
   });
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
+  const centerView = useRunViewStore((s) => s.centerView);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
   const headerCompact = useRunViewStore((s) => s.headerCompact);
@@ -214,12 +228,15 @@ export function RunView({
   );
 
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
+  const showingScreenshots = centerView === "screenshots";
 
   const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
   const selectedId =
-    pinnedFrameId ?? (running ? "stream" : lastFrame?.id) ?? null;
+    pinnedFrameId ??
+    (running && !showingScreenshots ? "stream" : lastFrame?.id) ??
+    null;
   const activeItem = useMemo(
     () =>
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
@@ -258,6 +275,25 @@ export function RunView({
     }
     return null;
   }, [activeItem, timeline, activeIteration]);
+  const hasScreenshotFrame = useMemo(
+    () =>
+      frames.some(
+        (frame) =>
+          frame.screenshotArtifactId != null ||
+          (frame.stepId != null && frame.actionOrder != null),
+      ),
+    [frames],
+  );
+  const activeSelectionHasScreenshot = useMemo(
+    () => hasScreenshotCandidate(heroSelection),
+    [heroSelection],
+  );
+  // Frames are the usual source; the selection keeps the toggle visible while
+  // filmstrip data is still catching up.
+  const hasScreenshots = useMemo(
+    () => hasScreenshotFrame || activeSelectionHasScreenshot,
+    [hasScreenshotFrame, activeSelectionHasScreenshot],
+  );
 
   const heroLabel = isAction(activeItem)
     ? actionLabel(activeItem)
@@ -357,6 +393,7 @@ export function RunView({
             codeGenerating={codeGenerating}
             browserSessionId={workflowRun.browser_session_id ?? null}
             recordingUrls={recordingUrls}
+            hasScreenshots={hasScreenshots}
             elapsed={elapsed}
             overview={
               <RunOverviewButton

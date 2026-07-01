@@ -77,6 +77,73 @@ describe("RunHero Code surface (single source of truth)", () => {
   });
 });
 
+describe("RunHero screenshot discoverability", () => {
+  const propsWithScreenshots = {
+    ...baseProps,
+    showDebugStream: false,
+    running: false,
+    heroSelection: {
+      kind: "action" as const,
+      artifactId: "art_1",
+      stepId: "step_1",
+      actionOrder: 0,
+    },
+    heroLabel: "Clicked submit",
+    hasScreenshots: true,
+  };
+
+  test("completed runs with recordings expose a Screenshots return path", () => {
+    render(
+      <RunHero
+        {...propsWithScreenshots}
+        recordingUrls={["https://example.com/rec.mp4"]}
+      />,
+    );
+
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Code" }));
+    expect(screen.queryByTestId("workflow-run-code")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("workflow-run-code")).toBeNull();
+  });
+
+  test("running runs can return from live view to available screenshots", () => {
+    render(<RunHero {...propsWithScreenshots} running />);
+
+    expect(screen.queryByTestId("run-live-stream")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("run-live-stream")).toBeNull();
+  });
+
+  test("does not infer the Screenshots toggle from a screenshot-less selection", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        heroSelection={{
+          kind: "action",
+          artifactId: null,
+          stepId: null,
+          actionOrder: 0,
+        }}
+        heroLabel="Clicked submit"
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
+  });
+});
+
 describe("RunHero header dedupe", () => {
   test("recording view does not echo the active toggle label in the header", () => {
     render(
