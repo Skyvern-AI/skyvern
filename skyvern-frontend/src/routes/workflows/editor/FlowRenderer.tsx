@@ -15,7 +15,6 @@ import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosin
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -92,6 +91,7 @@ import {
   WorkflowBlockNode,
 } from "./nodes";
 import { GlobalCollapseControl } from "./collapse/GlobalCollapseControl";
+import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
 import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
@@ -449,9 +449,6 @@ function FlowRenderer({
   const selectedBlockId = useWorkflowPanelStore(
     (state) => state.selectedBlockId,
   );
-  const setSettingsCollapsed = useStudioShellStore(
-    (state) => state.setSettingsCollapsed,
-  );
 
   // Escape clears the canvas selection. The listener is mounted
   // on the FlowRenderer because that scopes the global keydown to the
@@ -465,19 +462,13 @@ function FlowRenderer({
       if (event.key !== "Escape") {
         return;
       }
-      // In the studio shell the settings panel is persistent, so Escape
-      // collapses it to the rail rather than deselecting (which would hide it).
-      if (embedded) {
-        setSettingsCollapsed(true);
-        return;
-      }
       setSelectedBlockId(null);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [setSelectedBlockId, setSettingsCollapsed, embedded, readOnly]);
+  }, [setSelectedBlockId, readOnly]);
 
   // Programmatic viewport changes (e.g. `fitView`) animate via `setViewport`,
   // which fires `onMove`. Without this gate, `constrainPan` would clamp every
@@ -2027,10 +2018,15 @@ function FlowRenderer({
                     return;
                   }
                   setSelectedBlockId(node.id);
-                  // Studio: a deliberate block click expands the persistent
-                  // settings panel (it starts collapsed on open).
-                  if (embedded) {
-                    setSettingsCollapsed(false);
+                  // Studio's embedded editor uses build mode, so a block click
+                  // reveals its inline editor (the header chevron collapses it).
+                  if (embedded && isWorkflowBlockNode(appNode)) {
+                    useNodeCollapseStore
+                      .getState()
+                      .expandBlock(
+                        workflow.workflow_permanent_id ?? "__global__",
+                        appNode.data.label,
+                      );
                   }
                 }}
                 onPaneClick={() => {
