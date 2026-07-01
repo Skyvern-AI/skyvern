@@ -2022,9 +2022,9 @@ export function WorkflowCopilotChat({
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working — message will queue…"
+      ? "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
-        ? "Live browser is starting. Send now to queue your prompt."
+        ? "Live browser is starting. Your next send will wait until it connects."
         : null;
   const inputStatusText = isSpeechListening
     ? browserStatusText
@@ -2313,9 +2313,9 @@ export function WorkflowCopilotChat({
               queuedPrompt
                 ? "Prompt queued..."
                 : isLoading
-                  ? "Type a message to queue for the next turn…"
+                  ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
-                    ? "Type a prompt to queue..."
+                    ? "Type a prompt to send when ready..."
                     : "Message Skyvern Copilot…"
             }
             value={inputValue}
@@ -2350,13 +2350,15 @@ export function WorkflowCopilotChat({
           ) : isLoading ? (
             <>
               <button
+                type="button"
                 onClick={() => handleSend()}
-                title="Queue for the next turn"
+                title="Send after this turn finishes"
                 className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
-                Queue
+                Send next
               </button>
               <button
+                type="button"
                 onClick={cancelSend}
                 title="Cancel run"
                 className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"

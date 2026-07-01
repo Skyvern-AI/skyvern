@@ -235,6 +235,45 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
   });
 
+  it("labels the in-flight follow-up action as the next send", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(
+      screen.getByText(
+        "Copilot is working. Your next send will wait for the next turn.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByPlaceholderText("Type a message to send next…"),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+  });
+
+  it("explains that the next send waits while the live browser is starting", async () => {
+    render(
+      <WorkflowCopilotChat requiresLiveBrowser isLiveBrowserReady={false} />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByPlaceholderText("Type a prompt to send when ready..."),
+      ).toBeTruthy(),
+    );
+
+    expect(
+      screen.getByText(
+        "Live browser is starting. Your next send will wait until it connects.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+    // The old copy conflated sending with queuing; guard against its return.
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+    expect(screen.queryByText(/Send now to queue your prompt/)).toBeNull();
+    expect(screen.queryByPlaceholderText(/Type a prompt to queue/)).toBeNull();
+  });
+
   it("still sends the message when dictation audio upload fails", async () => {
     await renderChat();
     speechState.takeAudioBlob.mockReturnValueOnce(
