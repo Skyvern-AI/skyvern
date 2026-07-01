@@ -2,7 +2,12 @@ import { create } from "zustand";
 
 // Which tab takes over the hero center. "default" leaves the live stream /
 // recording / screenshot logic in charge; the rest are explicit center tabs.
-export type RunCenterView = "default" | "code" | "inputs" | "outputs";
+export type RunCenterView =
+  | "default"
+  | "screenshots"
+  | "code"
+  | "inputs"
+  | "outputs";
 
 type RunViewState = {
   // The frame the user is inspecting. null means "follow the live edge" while
@@ -26,7 +31,14 @@ export const useRunViewStore = create<RunViewState>((set) => ({
   // Inspecting a frame or jumping to live/recording always drops any override.
   pinFrame: (id) => set({ pinnedFrameId: id, centerView: "default" }),
   jumpToLive: () => set({ pinnedFrameId: null, centerView: "default" }),
-  setCenterView: (view) => set({ centerView: view }),
+  setCenterView: (view) =>
+    set((state) => ({
+      centerView: view,
+      pinnedFrameId:
+        view === "screenshots" && state.pinnedFrameId === "stream"
+          ? null
+          : state.pinnedFrameId,
+    })),
   setHeaderCompact: (compact) => set({ headerCompact: compact }),
   reset: () => set({ pinnedFrameId: null, centerView: "default" }),
 }));
