@@ -130,7 +130,7 @@ describe("SideNav", () => {
 
     fireEvent.click(screen.getByTitle("Agents"));
 
-    expect(screen.getByTestId("location").textContent).toBe("/workflows");
+    expect(screen.getByTestId("location").textContent).toBe("/agents");
   });
 
   it("starts recipes collapsed on short screens", () => {

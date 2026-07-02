@@ -124,7 +124,7 @@ describe("FirstRunRecoveryGuidance", () => {
       />,
     );
     fireEvent.click(getByTestId("recovery-path-edit_workflow"));
-    expect(navigateMock).toHaveBeenCalledWith("/workflows/wpid_123/studio");
+    expect(navigateMock).toHaveBeenCalledWith("/agents/wpid_123/studio");
   });
 
   it("navigates to /build when the studio preview is off (AC2 wiring)", () => {
@@ -137,7 +137,7 @@ describe("FirstRunRecoveryGuidance", () => {
       />,
     );
     fireEvent.click(getByTestId("recovery-path-edit_workflow"));
-    expect(navigateMock).toHaveBeenCalledWith("/workflows/wpid_123/build");
+    expect(navigateMock).toHaveBeenCalledWith("/agents/wpid_123/build");
   });
 
   it("records chosen + opened outcome for an external path (AC3)", () => {

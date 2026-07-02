@@ -575,10 +575,10 @@ function NodeHeader({
           bl: label,
         });
         search.set(STUDIO_PANES_PARAM, panes.join(","));
-        navigate(`/workflows/${workflowPermanentId}/studio?${search}`);
+        navigate(`/agents/${workflowPermanentId}/studio?${search}`);
       } else {
         navigate(
-          `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
+          `/agents/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
         );
       }
     },

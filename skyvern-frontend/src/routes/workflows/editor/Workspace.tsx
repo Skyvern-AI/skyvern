@@ -819,7 +819,7 @@ function Workspace({
   // Per-workflow store reset. Earlier revisions did this from
   // `useMountEffect`, but the Workspace instance can be reused across
   // workflows when the parent route doesn't key by workflowPermanentId
-  // (e.g. /workflows/A/build → /workflows/B/build); in that case the
+  // (e.g. /agents/A/build → /agents/B/build); in that case the
   // mount-only initializer would skip and selectedBlockId / showAllCode /
   // sidebar save timestamps would leak from A into B. Keying this on
   // `workflowPermanentId` fires the reset on every workflow change,

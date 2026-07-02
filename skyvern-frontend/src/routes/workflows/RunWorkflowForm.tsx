@@ -405,13 +405,13 @@ function RunWorkflowForm({
       if (studioEnabled) {
         // Land in the studio shell; the ?wr= deep link opens the Run pane.
         navigate(
-          `/workflows/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
+          `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
         );
       } else {
         navigate(
           env.useNewRunsUrl
             ? `/runs/${response.data.workflow_run_id}`
-            : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+            : `/agents/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
         );
       }
     },

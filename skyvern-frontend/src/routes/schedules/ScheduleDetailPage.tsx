@@ -244,7 +244,7 @@ function ScheduleDetailPage() {
             {humanReadable} · {schedule.timezone}
           </p>
           <Link
-            to={`/workflows/${schedule.workflow_permanent_id}/runs`}
+            to={`/agents/${schedule.workflow_permanent_id}/runs`}
             className="mt-1 inline-block text-xs text-slate-400 hover:text-slate-200 hover:underline"
             onClick={(e) => e.stopPropagation()}
           >

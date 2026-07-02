@@ -15,7 +15,7 @@ function LegacyBuildRedirect() {
       : location.search;
   return (
     <Navigate
-      to={`/workflows/${workflowPermanentId}/studio${query}`}
+      to={`/agents/${workflowPermanentId}/studio${query}`}
       state={location.state}
       replace
     />

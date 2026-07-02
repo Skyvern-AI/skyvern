@@ -39,7 +39,7 @@ function renderAt(path: string) {
             element={<RunStopButton />}
           />
           <Route
-            path="/workflows/:workflowPermanentId/run"
+            path="/agents/:workflowPermanentId/run"
             element={<LocationProbe />}
           />
         </Routes>
@@ -76,7 +76,7 @@ describe("RunStopButton concurrency with a live block run", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
     expect(screen.getByTestId("location").textContent).toBe(
-      "/workflows/wpid_1/run",
+      "/agents/wpid_1/run",
     );
   });
 
@@ -104,7 +104,7 @@ describe("RunStopButton concurrency with a live block run", () => {
 
     expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.getByTestId("location").textContent).toBe(
-      "/workflows/wpid_1/run",
+      "/agents/wpid_1/run",
     );
   });
 });

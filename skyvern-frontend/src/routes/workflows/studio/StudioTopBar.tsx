@@ -170,7 +170,7 @@ export function RunStopButton() {
     },
   });
 
-  const startFullRun = () => navigate(`/workflows/${workflowPermanentId}/run`);
+  const startFullRun = () => navigate(`/agents/${workflowPermanentId}/run`);
 
   if (running && activeRunId) {
     const stopDialog = (
