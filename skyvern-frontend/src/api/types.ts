@@ -842,6 +842,8 @@ export type BrowserProfileApiResponse = {
   source_browser_type: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
+  is_managed?: boolean;
+  workflow_permanent_id?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
