@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import typing as t
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageInReload,
     MessageInTakeScreenshot,
     MessageKind,
+    MessageOutExfiltratedEvent,
     MessageOutRecordingInterpretationUpdate,
     loop_stream_messages,
     message_to_dict,
@@ -355,3 +357,34 @@ class TestMessageLoopUrlUpdates:
         method.assert_awaited_once_with(**expected_kwargs)
         execute.get_current_url.assert_awaited_once_with()
         websocket.send_json.assert_any_await({"kind": "browser-url", "url": current_url})
+
+
+class TestMessageToDictJsonSafety:
+    def test_non_finite_floats_become_null(self) -> None:
+        msg = MessageOutExfiltratedEvent(
+            event_name="click",
+            params={"mousePosition": {"xa": 42.0, "xp": float("nan"), "yp": float("inf")}},
+        )
+
+        data = message_to_dict(msg)
+
+        mouse = data["params"]["mousePosition"]
+        assert mouse["xa"] == 42.0
+        assert mouse["xp"] is None
+        assert mouse["yp"] is None
+        json.dumps(data, allow_nan=False)
+
+    def test_non_finite_floats_in_nested_model_become_null(self) -> None:
+        step = RecordingDraftStep(
+            step_id="s1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click",
+            timestamp_start=float("nan"),
+        )
+        msg = MessageOutRecordingInterpretationUpdate(steps=[step])
+
+        data = message_to_dict(msg)
+
+        assert data["steps"][0]["timestamp_start"] is None
+        json.dumps(data, allow_nan=False)

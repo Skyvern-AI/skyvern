@@ -15,6 +15,7 @@ Channel data:
 import asyncio
 import dataclasses
 import enum
+import math
 import typing as t
 
 import structlog
@@ -383,14 +384,27 @@ def message_to_dict(message: MessageOut) -> dict:
         if isinstance(obj, enum.Enum):
             return obj.value
         if isinstance(obj, BaseModel):
-            return obj.model_dump(mode="json")
+            return _replace_non_finite(obj.model_dump(mode="json"))
         if isinstance(obj, list):
             return [convert_value(item) for item in obj]
         if isinstance(obj, dict):
             return {key: convert_value(value) for key, value in obj.items()}
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
         return obj
 
     return {key: convert_value(value) for key, value in dataclasses.asdict(message).items()}
+
+
+def _replace_non_finite(obj: t.Any) -> t.Any:
+    """NaN/Infinity are not valid JSON; JSON.parse rejects them and drops the whole frame."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, list):
+        return [_replace_non_finite(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _replace_non_finite(value) for key, value in obj.items()}
+    return obj
 
 
 @dataclasses.dataclass
