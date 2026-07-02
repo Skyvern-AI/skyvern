@@ -18,6 +18,7 @@ import type {
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
 import { RunView } from "./RunView";
+import { getSelectedRunFrameId } from "./runFrameSelection";
 
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
@@ -181,6 +182,80 @@ afterEach(() => {
   mocks.runHeroProps = [];
 });
 beforeEach(() => useRunViewStore.getState().reset());
+
+describe("getSelectedRunFrameId", () => {
+  test("defaults to live stream while a run is running", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: true,
+        lastFrameId: "action_1",
+      }),
+    ).toBe("stream");
+  });
+
+  test("preserves an explicit pinned frame while a run is running", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: "action_1",
+        running: true,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_1");
+  });
+
+  test("uses the latest frame while a running run shows screenshots", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: true,
+        showingScreenshots: true,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+
+  test("uses the final frame after a live stream pin outlives a completed run", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: "stream",
+        running: false,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+
+  test("preserves an explicit pinned frame after a run finalizes", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: "action_1",
+        running: false,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_1");
+  });
+
+  test("defaults to the final frame after a run finalizes without a pin", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: false,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+
+  test("uses the latest frame while the Browser pane owns a live debug stream", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: true,
+        debugStreamInBrowserPane: true,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+});
 
 function seedLiveBlockRun() {
   mocks.debugSession = { browser_session_id: "pbs_1" };

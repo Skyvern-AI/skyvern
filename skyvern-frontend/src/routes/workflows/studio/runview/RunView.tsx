@@ -49,6 +49,7 @@ import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
 import { RunOutputsSection, type RunOutputFile } from "./RunOutputsSection";
 import { RunOverviewButton } from "./RunOverviewButton";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { getSelectedRunFrameId } from "./runFrameSelection";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -257,16 +258,13 @@ export function RunView({
   const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
-  const rawSelectedId =
-    pinnedFrameId ??
-    (running && !showingScreenshots ? "stream" : lastFrame?.id) ??
-    null;
-  // A "stream" selection has no hero surface while the Browser pane hosts the
-  // debug node; follow the newest frame so screenshots track the live edge.
-  const selectedId =
-    rawSelectedId === "stream" && debugStreamInBrowserPane
-      ? (lastFrame?.id ?? null)
-      : rawSelectedId;
+  const selectedId = getSelectedRunFrameId({
+    pinnedFrameId,
+    running,
+    showingScreenshots,
+    debugStreamInBrowserPane,
+    lastFrameId: lastFrame?.id ?? null,
+  });
   const activeItem = useMemo(
     () =>
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),

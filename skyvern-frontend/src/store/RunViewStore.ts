@@ -5,6 +5,8 @@ import { create } from "zustand";
 export type RunCenterView =
   | "default"
   | "screenshots"
+  | "recording"
+  | "screenshot"
   | "code"
   | "inputs"
   | "outputs";
