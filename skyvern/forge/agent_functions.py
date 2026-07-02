@@ -756,6 +756,13 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def resolve_mcp_code_only_mode(
+        self,
+        organization_id: str | None,
+        request_override: bool | None,
+    ) -> bool:
+        return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
+
     async def should_use_codeblock_runner(
         self,
         *,
