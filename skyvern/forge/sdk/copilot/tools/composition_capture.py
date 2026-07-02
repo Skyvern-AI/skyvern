@@ -25,9 +25,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.request_policy import completion_criterion_requires_active_run_terminal_monitor
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
 )
@@ -79,7 +83,10 @@ async def _active_run_terminal_monitor_enabled(copilot_ctx: Any) -> bool:
         return False
     if not getattr(copilot_ctx, "discovery_mcp_server", None):
         return False
-    if not _completion_verification_criteria(copilot_ctx):
+    criteria = _completion_verification_criteria(copilot_ctx)
+    if not criteria:
+        return False
+    if not any(completion_criterion_requires_active_run_terminal_monitor(criterion) for criterion in criteria):
         return False
     return await _completion_verification_handler(copilot_ctx) is not None
 
@@ -194,6 +201,7 @@ def _active_run_terminal_evidence_result(
             "current_url": observed_url,
             "page_title": observed_title,
             "active_run_terminal_evidence_detected": True,
+            "active_run_terminal_evidence_reason_code": ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
             "active_run_terminal_evidence_sample_index": getattr(sample, "sample_index", None),
             "full_workflow_verified": False,
             "current_page_evidence": getattr(sample, "page_evidence", None),

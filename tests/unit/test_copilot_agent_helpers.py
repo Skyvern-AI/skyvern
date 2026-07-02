@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_claim_authorized,
     verified_goal_satisfied_context,
 )
+from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _MAX_COMPLETION_CRITERIA,
@@ -73,6 +74,7 @@ from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REA
 from skyvern.forge.sdk.copilot.tools.completion import _completion_verification_criteria
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
     TurnHalt,
     TurnHaltKind,
     raise_if_turn_halt,
@@ -1057,6 +1059,48 @@ class TestVerifiedGoalSatisfiedStop:
         assert result.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
         assert result.proposal_disposition != "no_proposal"
 
+    def test_verified_turn_halt_suppresses_active_run_terminal_evidence_only(self) -> None:
+        ctx = _ctx()
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="active run reached requested state",
+            user_facing_reason="active run reached requested state",
+            recovery_hint="report_blocker_to_user",
+            internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        ctx.latest_tool_blocker_signal = signal
+        ctx.tool_blocker_signals.append(signal)
+        ctx.turn_halt = TurnHalt(
+            kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
+            blocker_signal=signal,
+            extra={"source": "run_execution"},
+        )
+
+        raise_if_turn_halt(ctx, verified=True)
+
+        assert not isinstance(ctx.turn_halt, TurnHalt)
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert ctx.tool_blocker_signals == []
+
+    def test_verified_turn_halt_keeps_terminal_challenge_blocker(self) -> None:
+        ctx = _ctx()
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="stop on terminal challenge",
+            user_facing_reason="The site requires human verification.",
+            recovery_hint="stop",
+            internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=signal)
+
+        with pytest.raises(CopilotTurnHalt):
+            raise_if_turn_halt(ctx, verified=True)
+
     @pytest.mark.asyncio
     async def test_wrapped_exception_resolver_renders_success_over_involuntary_halt(self) -> None:
         ctx = _ctx(
@@ -1303,6 +1347,35 @@ class TestVerifiedGoalSatisfiedStop:
         assert result.turn_outcome.terminal_reason == BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON
         assert result.narrative_payload is not None
         assert result.narrative_payload["verifiedSuccess"] is False
+
+    def test_corroborated_structural_abstention_avoids_built_unverified_terminal(self) -> None:
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0", "c0__requested_output_corroborator"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                        evidence_ref="block_outputs:extract_first_three_quotes.quotes",
+                        output_path="output.quotes",
+                        grounding_mode="missing",
+                    ),
+                    CriterionVerdict(
+                        criterion_id="c0__requested_output_corroborator",
+                        state="satisfied",
+                        reason_code="evidence_confirms",
+                    ),
+                ],
+            ),
+        )
+
+        assert verified_goal_satisfied_context(ctx) is True
+        assert built_unverified_repair_inert_context(ctx) is False
 
     @pytest.mark.asyncio
     async def test_goal_satisfied_exit_result_carries_outcome_adjudication(self) -> None:
