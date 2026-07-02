@@ -617,28 +617,39 @@ class ForgeAgent:
     ) -> tuple[Task, Step]:
         """Container task v1 for a code block's recorded actions, also the seat for future agent fallback."""
         task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
-        task = await app.DATABASE.tasks.create_task(
-            url=task_url,
-            title=code_block.label,
-            navigation_goal=code_block.prompt,
-            data_extraction_goal=None,
-            navigation_payload=None,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            order=task_order,
-            retry=task_retry,
-        )
-        task = await app.DATABASE.tasks.update_task(
-            task_id=task.task_id,
-            organization_id=organization_id,
-            status=TaskStatus.running,
-        )
-        step = await app.DATABASE.tasks.create_step(
-            task.task_id,
-            order=0,
-            retry_index=0,
-            organization_id=organization_id,
-        )
+        task: Task | None = None
+        try:
+            task = await app.DATABASE.tasks.create_task(
+                url=task_url,
+                title=code_block.label,
+                navigation_goal=code_block.prompt,
+                data_extraction_goal=None,
+                navigation_payload=None,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                order=task_order,
+                retry=task_retry,
+            )
+            task = await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
+            step = await app.DATABASE.tasks.create_step(
+                task.task_id,
+                order=0,
+                retry_index=0,
+                organization_id=organization_id,
+            )
+        except Exception:
+            if task is not None:
+                with contextlib.suppress(Exception):
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=organization_id,
+                        status=TaskStatus.failed,
+                    )
+            raise
         return task, step
 
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
