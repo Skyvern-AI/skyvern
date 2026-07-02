@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useRunViewStore } from "@/store/RunViewStore";
@@ -266,6 +272,160 @@ describe("RunHero header dedupe", () => {
     const group = screen.getByRole("group", { name: "Center view" });
     expect(group.contains(screen.getByText("Live"))).toBe(true);
     expect(group.contains(screen.getByText("Code"))).toBe(true);
+  });
+});
+
+describe("RunHero recording navigation", () => {
+  test("live-pinned running runs can switch from recording back to the final run frame after finalizing", () => {
+    useRunViewStore.getState().pinFrame("stream");
+    const finalFrameSelection = { kind: "thought" as const, thoughtId: "t1" };
+    const { rerender } = render(
+      <RunHero {...baseProps} showDebugStream={false} />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Run" })).toBeNull();
+
+    rerender(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        recordingUrls={["https://example.com/rec.mp4"]}
+        heroSelection={finalFrameSelection}
+        heroLabel="Final frame"
+      />,
+    );
+
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Run" })).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+  });
+
+  test("finalized runs can switch from the default recording back to the run frame", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        recordingUrls={["https://example.com/rec.mp4"]}
+        heroSelection={{ kind: "thought", thoughtId: "t1" }}
+        heroLabel="Final frame"
+      />,
+    );
+
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+    expect(screen.queryByTestId("hero-screenshot")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+    expect(screen.queryByTestId("hero-screenshot")).toBeNull();
+  });
+
+  test("explicit run view stays selected while the frame selection reloads", () => {
+    const { rerender } = render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        recordingUrls={["https://example.com/rec.mp4"]}
+        heroSelection={{ kind: "thought", thoughtId: "t1" }}
+        heroLabel="Final frame"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+
+    rerender(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        recordingUrls={["https://example.com/rec.mp4"]}
+        heroSelection={null}
+        heroLabel="Final frame"
+      />,
+    );
+
+    expect(screen.queryByText("Waiting for the first action…")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Run" })).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+  });
+
+  test("failed runs with a recording can open it from the run frame", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        failed
+        recordingUrls={["https://example.com/rec.mp4"]}
+        heroSelection={{ kind: "thought", thoughtId: "t1" }}
+        heroLabel="Failure frame"
+      />,
+    );
+
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+    expect(screen.queryByTestId("hero-screenshot")).toBeNull();
+  });
+
+  test("failed runs without a frame can return from recording to the run view", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        failed
+        recordingUrls={["https://example.com/rec.mp4"]}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Run" })).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.queryByText("Waiting for the first action…")).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+  });
+
+  test("scrubbed failed runs can open the recording from the inspection overlay", () => {
+    useRunViewStore.getState().pinFrame("f1");
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        failed
+        recordingUrls={["https://example.com/rec.mp4"]}
+        heroSelection={{ kind: "thought", thoughtId: "t1" }}
+        heroLabel="Failure frame"
+      />,
+    );
+
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+
+    const overlay = screen.getByText("Failure frame").closest("div");
+    if (!overlay) {
+      throw new Error("Expected the inspection overlay to be visible");
+    }
+
+    fireEvent.click(within(overlay).getByRole("button", { name: "Recording" }));
+    expect(screen.queryByTestId("hero-recording")).not.toBeNull();
+    expect(screen.queryByTestId("hero-screenshot")).toBeNull();
   });
 });
 
