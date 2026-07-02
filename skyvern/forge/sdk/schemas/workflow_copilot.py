@@ -288,6 +288,14 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "Distinct from `summary`, which is capped tighter for the visible bullet."
         ),
     )
+    workflow_run_id: str | None = Field(
+        None,
+        description=(
+            "The workflow run a block-running tool created, when this result came from one "
+            "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
+            "passed or failed; None for non-run tools."
+        ),
+    )
 
 
 class WorkflowCopilotCondensingUpdate(BaseModel):
