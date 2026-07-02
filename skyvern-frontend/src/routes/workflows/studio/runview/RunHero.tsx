@@ -15,7 +15,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
-import { type RunCenterView, useRunViewStore } from "@/store/RunViewStore";
+import { useRunViewStore } from "@/store/RunViewStore";
 import { cn } from "@/util/utils";
 
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
@@ -23,6 +23,7 @@ import { useStudioShellContext } from "../StudioShellContext";
 import { matchFailureTips } from "./failureTips";
 import { HeroRecording } from "./HeroRecording";
 import { HeroScreenshot, type HeroSelection } from "./HeroScreenshot";
+import { resolveRunHeroCenterView } from "./runHeroCenter";
 import { RunLiveStream } from "./RunLiveStream";
 
 type RunHeroProps = {
@@ -59,77 +60,11 @@ type RunHeroProps = {
   onRetry?: () => void;
 };
 
-type CenterView =
-  | "code"
-  | "inputs"
-  | "outputs"
-  | "stream"
-  | "recording"
-  | "screenshot";
-
 // Below this header width the toggle/dropdown labels collapse to icons.
 const HEADER_COMPACT_BELOW_PX = 640;
 
 const RECORDING_ARCHIVED_LABEL =
   "Recording archived — contact support@skyvern.com to request restoration";
-
-// RunCenterView stores user intent; the hero renders screenshots in one surface.
-function resolveCenterView({
-  centerView,
-  hasScreenshots,
-  hasInputs,
-  hasOutputs,
-  scrubbing,
-  showDebugStream,
-  debugStreamInBrowserPane,
-  recordingOpen,
-  hasRecording,
-  running,
-  failed,
-}: {
-  centerView: RunCenterView;
-  hasScreenshots: boolean;
-  hasInputs: boolean;
-  hasOutputs: boolean;
-  scrubbing: boolean;
-  showDebugStream: boolean;
-  debugStreamInBrowserPane: boolean;
-  recordingOpen: boolean;
-  hasRecording: boolean;
-  running: boolean;
-  failed: boolean;
-}): CenterView {
-  if (centerView === "screenshots" && hasScreenshots) {
-    return "screenshot";
-  }
-  if (centerView === "code") {
-    return "code";
-  }
-  if (centerView === "inputs" && hasInputs) {
-    return "inputs";
-  }
-  if (centerView === "outputs" && hasOutputs) {
-    return "outputs";
-  }
-  if (scrubbing) {
-    return "screenshot";
-  }
-  if (showDebugStream) {
-    if (recordingOpen && hasRecording) {
-      return "recording";
-    }
-    // The Browser pane owns the singleton stream node; the hero shows
-    // live-edge screenshots and its Live chip points at that pane instead.
-    return debugStreamInBrowserPane ? "screenshot" : "stream";
-  }
-  if (running) {
-    return "stream";
-  }
-  if (hasRecording && !failed) {
-    return "recording";
-  }
-  return "screenshot";
-}
 
 function ViewToggle({
   active,
@@ -235,18 +170,16 @@ export function RunHero({
   const scrubbing = pinnedFrameId != null && pinnedFrameId !== "stream";
   const hasRecording = recordingUrls.length > 0;
 
-  // An explicit tab wins; otherwise a block run defaults to the live debug
-  // stream and a full run to its stream (running) / recording / screenshot.
-  const center = resolveCenterView({
+  const center = resolveRunHeroCenterView({
     centerView,
     hasScreenshots,
     hasInputs: Boolean(inputs),
     hasOutputs: Boolean(outputs),
+    hasRecording,
     scrubbing,
     showDebugStream,
     debugStreamInBrowserPane,
     recordingOpen,
-    hasRecording,
     running,
     failed,
   });
@@ -272,6 +205,8 @@ export function RunHero({
 
   const toggleCenter = (view: "code" | "inputs" | "outputs") =>
     setCenterView(centerView === view ? "default" : view);
+  const showRunToggle =
+    Boolean(heroSelection) || centerView === "screenshot" || failed;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
@@ -331,13 +266,24 @@ export function RunHero({
               }
             />
           ) : hasRecording ? (
-            <ViewToggle
-              active={center === "recording"}
-              onClick={jumpToLive}
-              compact={compact}
-              label="Recording"
-              icon={<PlayIcon className="h-3 w-3" />}
-            />
+            <>
+              {showRunToggle ? (
+                <ViewToggle
+                  active={center === "screenshot"}
+                  onClick={() => setCenterView("screenshot")}
+                  compact={compact}
+                  label="Run"
+                  icon={<CounterClockwiseClockIcon className="h-3 w-3" />}
+                />
+              ) : null}
+              <ViewToggle
+                active={center === "recording"}
+                onClick={() => setCenterView("recording")}
+                compact={compact}
+                label="Recording"
+                icon={<PlayIcon className="h-3 w-3" />}
+              />
+            </>
           ) : recordingArchived ? (
             <button
               type="button"
@@ -521,7 +467,10 @@ export function RunHero({
             ) : hasRecording ? (
               <button
                 type="button"
-                onClick={jumpToLive}
+                onClick={() => {
+                  // Preserve the inspected frame so "Run" returns to this step.
+                  setCenterView("recording");
+                }}
                 className="ml-1 inline-flex items-center gap-1.5 rounded-full bg-white/15 px-2 py-0.5 text-[11px] hover:bg-white/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white"
               >
                 <PlayIcon className="h-3 w-3" />
