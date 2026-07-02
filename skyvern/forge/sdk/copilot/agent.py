@@ -763,6 +763,10 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
     ]
     if outcome.missing_requested_output_facts:
         lines.append("missing_requested_output_facts:")
+        lines.append(
+            "Use the exact output_path values in goal_value_paths and returned output; "
+            "output_root is diagnostic grouping only."
+        )
         for fact in outcome.missing_requested_output_facts[:8]:
             if not isinstance(fact, dict):
                 continue

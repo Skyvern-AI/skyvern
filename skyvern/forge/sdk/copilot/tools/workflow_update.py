@@ -1282,6 +1282,17 @@ def _metadata_output_path_roots(raw_metadata: object) -> list[str]:
 
 def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list[str]]:
     roots_by_label: dict[str, set[str]] = {}
+    for label, paths in _metadata_output_paths_by_label(raw_metadata).items():
+        roots = roots_by_label.setdefault(label, set())
+        for path in paths:
+            root = _top_level_path_segment(path)
+            if root:
+                roots.add(root)
+    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+
+
+def _metadata_output_paths_by_label(raw_metadata: object) -> dict[str, list[str]]:
+    paths_by_label: dict[str, set[str]] = {}
     unlabeled_index = 0
     for raw_item in _code_artifact_metadata_items(raw_metadata):
         item = _raw_metadata_item_mapping(raw_item)
@@ -1291,23 +1302,30 @@ def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list
         if not label:
             unlabeled_index += 1
             label = f"<unlabeled:{unlabeled_index}>"
-        roots = roots_by_label.setdefault(label, set())
-        roots.update(_metadata_item_output_path_roots(item))
-    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+        paths = paths_by_label.setdefault(label, set())
+        paths.update(_metadata_item_output_paths(item))
+    return {label: sorted(paths) for label, paths in sorted(paths_by_label.items()) if paths}
 
 
 def _metadata_item_output_path_roots(item: Mapping[str, Any]) -> set[str]:
     roots: set[str] = set()
+    for path in _metadata_item_output_paths(item):
+        root = _top_level_path_segment(path)
+        if root:
+            roots.add(root)
+    return roots
+
+
+def _metadata_item_output_paths(item: Mapping[str, Any]) -> set[str]:
+    """Return declared output paths plus schema property roots used for static root matching."""
+    paths: set[str] = set()
     for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
         for row in _artifact_rows(item.get(field_name)):
-            for path in _artifact_string_list(row.get("goal_value_paths")):
-                root = path.split(".", 1)[0].split("[", 1)[0].strip()
-                if root:
-                    roots.add(root)
+            paths.update(_artifact_goal_value_paths(row.get("goal_value_paths")))
             schema = _parse_extraction_schema(row.get("extraction_schema"))
             if schema is not None:
-                roots.update(_schema_property_roots(schema))
-    return roots
+                paths.update(_schema_property_roots(schema))
+    return paths
 
 
 def _metadata_reject_code_block_output_status(
@@ -1404,16 +1422,16 @@ def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
     return not verification.is_fully_satisfied()
 
 
-def _recorded_outcome_missing_output_roots(ctx: AgentContext) -> set[str]:
+def _recorded_outcome_missing_output_paths(ctx: AgentContext) -> set[str]:
     latest = ctx.latest_recorded_build_test_outcome
-    roots: set[str] = set()
+    paths: set[str] = set()
     if isinstance(latest, RecordedBuildTestOutcome) and latest.reason_code == "outcome_not_demonstrated":
         for fact in latest.missing_requested_output_facts:
-            root = str(fact.get("output_root") or "").strip()
-            if root:
-                roots.add(root)
-    if roots:
-        return roots
+            path = str(fact.get("output_path") or fact.get("output_root") or "").strip()
+            if path:
+                paths.add(path)
+    if paths:
+        return paths
     verification = getattr(ctx, "completion_verification_result", None)
     if verification is None or getattr(verification, "status", None) != "evaluated":
         return set()
@@ -1421,37 +1439,39 @@ def _recorded_outcome_missing_output_roots(ctx: AgentContext) -> set[str]:
         if getattr(verdict, "satisfied", False):
             continue
         output_path = str(getattr(verdict, "output_path", "") or "").strip()
-        root = output_path.split(".", 1)[0].split("[", 1)[0].strip()
-        if root:
-            roots.add(root)
-    return roots
+        if output_path:
+            paths.add(output_path)
+    return paths
 
 
-def _candidate_missing_required_output_roots(
+def _candidate_missing_required_output_paths(
     workflow_yaml: str,
     code_artifact_metadata: object,
     *,
-    required_roots: set[str],
+    required_paths: set[str],
 ) -> list[str]:
-    if not required_roots:
+    if not required_paths:
         return []
-    declared_roots_by_label = {
-        label: set(roots) for label, roots in _metadata_output_path_roots_by_label(code_artifact_metadata).items()
+    required_paths = {path for path in (str(item).strip() for item in required_paths) if path}
+    declared_paths_by_label = {
+        label: set(paths) for label, paths in _metadata_output_paths_by_label(code_artifact_metadata).items()
     }
     produced_by_label = _workflow_yaml_produced_output_roots_by_label(workflow_yaml)
-    covered_roots: set[str] = set()
-    abstained_declared_roots: set[str] = set()
-    for label, declared_roots in declared_roots_by_label.items():
+    covered_paths: set[str] = set()
+    abstained_declared_paths: set[str] = set()
+    for label, declared_paths in declared_paths_by_label.items():
         produced = produced_by_label.get(label)
         if produced is None:
             continue
-        covered_roots.update(declared_roots & produced.roots)
+        for required_path in required_paths & declared_paths:
+            if _top_level_path_segment(required_path) in produced.roots:
+                covered_paths.add(required_path)
         if produced.abstained:
-            abstained_declared_roots.update(declared_roots)
-    missing_roots = required_roots - covered_roots
-    if missing_roots:
-        missing_roots -= abstained_declared_roots
-    return sorted(missing_roots)
+            abstained_declared_paths.update(required_paths & declared_paths)
+    missing_paths = required_paths - covered_paths
+    if missing_paths:
+        missing_paths -= abstained_declared_paths
+    return sorted(missing_paths)
 
 
 class _ProducedOutputRoots(NamedTuple):
@@ -5250,15 +5270,15 @@ async def _update_workflow(
             data=_code_repair_progress_data(),
         )
 
-    recorded_output_roots_required = _recorded_outcome_requires_output_candidate(ctx)
-    recorded_missing_output_roots = (
-        _recorded_outcome_missing_output_roots(ctx) if recorded_output_roots_required else set()
+    recorded_output_paths_required = _recorded_outcome_requires_output_candidate(ctx)
+    recorded_missing_output_paths = (
+        _recorded_outcome_missing_output_paths(ctx) if recorded_output_paths_required else set()
     )
-    unresolved_recorded_output_roots = recorded_missing_output_roots
+    unresolved_recorded_output_paths = recorded_missing_output_paths
 
     output_empty_labels = (
         _output_empty_code_block_labels(workflow_yaml, getattr(ctx, "code_artifact_metadata", None))
-        if recorded_output_roots_required and (not recorded_missing_output_roots or unresolved_recorded_output_roots)
+        if recorded_output_paths_required and (not recorded_missing_output_paths or unresolved_recorded_output_paths)
         else []
     )
     if output_empty_labels:
@@ -5289,28 +5309,35 @@ async def _update_workflow(
             data=_code_repair_progress_data(),
         )
 
-    missing_output_roots = (
-        _candidate_missing_required_output_roots(
+    missing_output_paths = (
+        _candidate_missing_required_output_paths(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
-            required_roots=unresolved_recorded_output_roots,
+            required_paths=unresolved_recorded_output_paths,
         )
-        if recorded_output_roots_required
+        if recorded_output_paths_required
         else []
     )
-    if missing_output_roots:
+    if missing_output_paths:
         authored_structure_signature = authored_structure_signature_from_workflow(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
         )
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+        missing_output_roots = sorted(
+            {root for path in missing_output_paths if (root := _top_level_path_segment(path))}
+        )
         _record_author_time_reject_outcome(
             ctx,
             reason_code="metadata_reject",
-            summary="Submitted workflow does not cover the missing requested output roots from the last recorded test outcome.",
+            summary=(
+                "Submitted workflow does not cover the missing requested output paths "
+                "from the last recorded test outcome."
+            ),
             structural_payload={
                 "reason_code": "recorded_outcome_missing_output_coverage",
                 "authored_structure_signature": authored_structure_signature,
+                "missing_output_paths": missing_output_paths,
                 "missing_output_roots": missing_output_roots,
                 "block_labels": block_labels,
                 "recorded_reason_code": "outcome_not_demonstrated",
@@ -5319,19 +5346,21 @@ async def _update_workflow(
             block_labels=block_labels,
             missing_requested_output_facts=[
                 {
-                    "output_path": root,
-                    "output_root": root,
+                    "output_path": path,
+                    "output_root": _top_level_path_segment(path),
                     "reason_code": "recorded_outcome_missing_output_coverage",
                     "value_status": "no_typed_value",
                 }
-                for root in missing_output_roots
+                for path in missing_output_paths
             ],
         )
         _record_code_authoring_guardrail_reject(ctx)
+        missing_path_text = ", ".join(missing_output_paths[:8])
         return reject(
             error=(
-                "Submitted workflow does not cover the missing requested output roots from the last recorded test "
-                "outcome. Declare and produce structured output for those roots before testing again."
+                "Submitted workflow does not cover the missing requested output paths from the last recorded test "
+                f"outcome: {missing_path_text}. Declare those exact output_path values in goal_value_paths and "
+                "produce matching structured output before testing again; output_root is diagnostic only."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
