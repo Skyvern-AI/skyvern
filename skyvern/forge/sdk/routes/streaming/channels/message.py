@@ -137,6 +137,9 @@ class MessageInBeginExfiltration(Message):
     # Client capability: true only when the frontend understands delta interpretation
     # updates. Defaults false so older clients keep receiving full snapshots.
     supports_interpretation_deltas: bool = False
+    # Per-recording id from the client. Distinguishes a reconnect (same id, reuse
+    # session) from a new recording (new id, fresh session). None on older clients.
+    recording_attempt_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -329,10 +332,12 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInAskForClipboardResponse(text=text)
         case MessageKind.BEGIN_EXFILTRATION:
             workflow_permanent_id = data.get("workflow_permanent_id")
+            recording_attempt_id = data.get("recording_attempt_id")
             return MessageInBeginExfiltration(
                 workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
                 live_interpretation_enabled=bool(data.get("live_interpretation_enabled") or False),
                 supports_interpretation_deltas=bool(data.get("supports_interpretation_deltas") or False),
+                recording_attempt_id=recording_attempt_id if isinstance(recording_attempt_id, str) else None,
             )
         case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
@@ -702,6 +707,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         workflow_permanent_id=message.workflow_permanent_id,
                         on_update=on_interpretation_update,
                         deltas_enabled=message.supports_interpretation_deltas,
+                        recording_attempt_id=message.recording_attempt_id,
                     )
                     live_interpretation_browser_session_id = browser_session_id
 

@@ -247,11 +247,16 @@ class RecordingInterpretationSession:
         debounce_seconds: float = INTERPRETATION_DEBOUNCE_SECONDS,
         max_wait_seconds: float = INTERPRETATION_MAX_WAIT_SECONDS,
         deltas_enabled: bool = False,
+        recording_attempt_id: str | None = None,
     ) -> None:
         self.browser_session_id = browser_session_id
         self.organization_id = organization_id
         self.workflow_permanent_id = workflow_permanent_id
         self.on_update = on_update
+        # Identifies the client-side recording attempt. A cached session is
+        # reused across reconnects only when this matches; a new recording sends
+        # a new id, forcing a fresh session (state machines reset from scratch).
+        self.recording_attempt_id = recording_attempt_id
         self.set_deltas_enabled(deltas_enabled)
         self.interpretation_session_id = str(uuid.uuid4())
         self.debounce_seconds = debounce_seconds
