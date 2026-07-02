@@ -1074,6 +1074,9 @@ class SkyvernFrame:
             except (TimeoutError, asyncio.TimeoutError):
                 network_idle_result = "timeout"
                 LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
+            except Exception:
+                network_idle_result = "error"
+                LOG.warning("Failed to check network idle, proceeding", exc_info=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 
