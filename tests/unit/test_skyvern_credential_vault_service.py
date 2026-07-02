@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
@@ -106,7 +107,7 @@ async def test_skyvern_credential_vault_round_trips_encrypted_password(tmp_path,
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
 
     repository = _FakeCredentialRepository()
-    app.DATABASE.credentials = repository
+    monkeypatch.setattr(app.DATABASE, "credentials", repository)
 
     service = SkyvernCredentialVaultService()
     request = _password_request()
@@ -134,7 +135,7 @@ async def test_skyvern_credential_vault_update_creates_new_item_and_cleans_old(t
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
 
-    app.DATABASE.credentials = _FakeCredentialRepository()
+    monkeypatch.setattr(app.DATABASE, "credentials", _FakeCredentialRepository())
 
     service = SkyvernCredentialVaultService()
     request = _password_request(password="old-password")
@@ -159,7 +160,7 @@ async def test_skyvern_credential_vault_update_creates_new_item_and_cleans_old(t
 async def test_skyvern_credential_vault_cleans_item_when_create_db_fails(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
-    app.DATABASE.credentials = _FailingCreateCredentialRepository()
+    monkeypatch.setattr(app.DATABASE, "credentials", _FailingCreateCredentialRepository())
 
     service = SkyvernCredentialVaultService()
 
@@ -173,7 +174,7 @@ async def test_skyvern_credential_vault_cleans_item_when_create_db_fails(tmp_pat
 async def test_skyvern_credential_vault_cleans_new_item_when_update_db_fails(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
-    app.DATABASE.credentials = _FailingUpdateCredentialRepository()
+    monkeypatch.setattr(app.DATABASE, "credentials", _FailingUpdateCredentialRepository())
 
     service = SkyvernCredentialVaultService()
     credential = await service.create_credential("org_test", _password_request(password="old-password"))
@@ -213,7 +214,7 @@ async def test_skyvern_credential_vault_rejects_invalid_item_id(tmp_path, monkey
 async def test_skyvern_credential_vault_wrong_key_cannot_decrypt_item(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", Fernet.generate_key().decode("utf-8"))
-    app.DATABASE.credentials = _FakeCredentialRepository()
+    monkeypatch.setattr(app.DATABASE, "credentials", _FakeCredentialRepository())
 
     credential = await SkyvernCredentialVaultService().create_credential("org_test", _password_request())
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", Fernet.generate_key().decode("utf-8"))
@@ -222,3 +223,20 @@ async def test_skyvern_credential_vault_wrong_key_cannot_decrypt_item(tmp_path, 
         await SkyvernCredentialVaultService().get_credential_item(credential)
 
     assert exc_info.value.status_code == 500
+
+
+def test_skyvern_credential_vault_key_file_creation_is_single_winner(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    key_path = tmp_path / ".fernet_key"
+
+    def create_key_file() -> bytes:
+        return SkyvernCredentialVaultService()._create_or_read_key_file(key_path)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        returned_keys = list(executor.map(lambda _: create_key_file(), range(8)))
+
+    stored_key = key_path.read_bytes().strip()
+    assert len(set(returned_keys)) == 1
+    assert returned_keys[0] == stored_key
+    assert list(tmp_path.glob("*.tmp")) == []

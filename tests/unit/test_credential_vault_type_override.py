@@ -1,12 +1,16 @@
 """Tests for per-credential vault_type override in CreateCredentialRequest and vault service routing."""
 
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 from skyvern.config import Settings
-from skyvern.forge.sdk.routes.credentials import _get_credential_vault_service
+from skyvern.forge.sdk.routes.credentials import (
+    _delete_temporary_test_login_credential,
+    _get_credential_vault_service,
+)
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     CredentialResponse,
@@ -323,3 +327,88 @@ class TestGetCredentialVaultServiceRouting:
             mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = mock_custom
             result = await _get_credential_vault_service(vault_type_override=None)
             assert result is mock_custom
+
+
+class TestTemporaryTestLoginCredentialCleanup:
+    """Verify temporary login-test credentials are deleted through the owning vault service."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_temporary_skyvern_credential_through_vault_service(self) -> None:
+        credential = SimpleNamespace(
+            credential_id="cred_temp",
+            organization_id="org_test",
+            name="_test_login_example",
+            vault_type=CredentialVaultType.SKYVERN,
+        )
+        mock_repository = MagicMock()
+        mock_repository.get_credential = AsyncMock(return_value=credential)
+        mock_service = MagicMock(spec=CredentialVaultService)
+        mock_service.delete_credential = AsyncMock()
+
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.is_local_credential_vault_enabled.return_value = True
+            mock_app.DATABASE.credentials = mock_repository
+            mock_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = mock_service
+
+            await _delete_temporary_test_login_credential(
+                credential_id="cred_temp",
+                organization_id="org_test",
+                reason="test",
+            )
+
+        mock_service.delete_credential.assert_awaited_once_with(credential)
+
+    @pytest.mark.asyncio
+    async def test_defaults_missing_vault_type_to_bitwarden_for_legacy_credentials(self) -> None:
+        credential = SimpleNamespace(
+            credential_id="cred_temp",
+            organization_id="org_test",
+            name="_test_login_example",
+            vault_type=None,
+        )
+        mock_repository = MagicMock()
+        mock_repository.get_credential = AsyncMock(return_value=credential)
+        mock_service = MagicMock(spec=CredentialVaultService)
+        mock_service.delete_credential = AsyncMock()
+
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings"),
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_app.DATABASE.credentials = mock_repository
+            mock_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_service
+
+            await _delete_temporary_test_login_credential(
+                credential_id="cred_temp",
+                organization_id="org_test",
+                reason="test",
+            )
+
+        mock_service.delete_credential.assert_awaited_once_with(credential)
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_temporary_credentials(self) -> None:
+        credential = SimpleNamespace(
+            credential_id="cred_regular",
+            organization_id="org_test",
+            name="regular credential",
+            vault_type=CredentialVaultType.SKYVERN,
+        )
+        mock_repository = MagicMock()
+        mock_repository.get_credential = AsyncMock(return_value=credential)
+        mock_service = MagicMock(spec=CredentialVaultService)
+        mock_service.delete_credential = AsyncMock()
+
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.DATABASE.credentials = mock_repository
+
+            await _delete_temporary_test_login_credential(
+                credential_id="cred_regular",
+                organization_id="org_test",
+                reason="test",
+            )
+
+        mock_service.delete_credential.assert_not_awaited()

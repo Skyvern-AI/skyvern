@@ -103,7 +103,7 @@ class SkyvernCredentialVaultService(CredentialVaultService):
                 "Failed to read local credential vault item",
                 credential_id=db_credential.credential_id,
                 item_id=db_credential.item_id,
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
             raise HTTPException(status_code=500, detail="Credential vault item could not be read") from exc
 
@@ -114,10 +114,14 @@ class SkyvernCredentialVaultService(CredentialVaultService):
         payload = json.dumps(item.model_dump(mode="json"), separators=(",", ":"))
         encrypted_payload = self._get_fernet().encrypt(payload.encode("utf-8"))
 
-        temp_path = item_path.with_suffix(".tmp")
-        temp_path.write_bytes(encrypted_payload)
-        self._chmod_best_effort(temp_path, 0o600)
-        temp_path.replace(item_path)
+        temp_path = item_path.with_suffix(f".{secrets.token_urlsafe(8)}.tmp")
+        try:
+            self._write_file_durable(temp_path, encrypted_payload, mode=0o600)
+            temp_path.replace(item_path)
+            self._fsync_directory_best_effort(item_path.parent)
+        finally:
+            with suppress(FileNotFoundError):
+                temp_path.unlink()
 
     def _get_fernet(self) -> Fernet:
         if self._fernet is not None:
@@ -133,12 +137,25 @@ class SkyvernCredentialVaultService(CredentialVaultService):
         if key_path.exists():
             key_bytes = key_path.read_bytes().strip()
         else:
-            key_bytes = Fernet.generate_key()
-            key_path.write_bytes(key_bytes + b"\n")
-            self._chmod_best_effort(key_path, 0o600)
+            key_bytes = self._create_or_read_key_file(key_path)
 
         self._fernet = Fernet(key_bytes)
         return self._fernet
+
+    def _create_or_read_key_file(self, key_path: Path) -> bytes:
+        key_bytes = Fernet.generate_key()
+        temp_path = key_path.with_name(f".fernet_key.{secrets.token_urlsafe(8)}.tmp")
+        try:
+            self._write_file_durable(temp_path, key_bytes + b"\n", mode=0o600)
+            try:
+                os.link(temp_path, key_path)
+                self._fsync_directory_best_effort(key_path.parent)
+                return key_bytes
+            except FileExistsError:
+                return key_path.read_bytes().strip()
+        finally:
+            with suppress(FileNotFoundError):
+                temp_path.unlink()
 
     def _vault_dir(self) -> Path:
         vault_dir = Path(settings.LOCAL_CREDENTIAL_VAULT_PATH).expanduser().resolve()
@@ -167,3 +184,25 @@ class SkyvernCredentialVaultService(CredentialVaultService):
     def _chmod_best_effort(path: Path, mode: int) -> None:
         with suppress(OSError):
             os.chmod(path, mode)
+
+    @staticmethod
+    def _write_file_durable(path: Path, payload: bytes, *, mode: int) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            with os.fdopen(fd, "wb") as file:
+                fd = -1
+                file.write(payload)
+                file.flush()
+                os.fsync(file.fileno())
+        finally:
+            if fd != -1:
+                os.close(fd)
+
+    @staticmethod
+    def _fsync_directory_best_effort(path: Path) -> None:
+        with suppress(OSError):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
