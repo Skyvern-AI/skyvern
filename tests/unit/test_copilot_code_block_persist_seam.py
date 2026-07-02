@@ -128,6 +128,17 @@ _SAFE_EXTRACTION_CODE_YAML = _yaml(
     """
 )
 
+_RAW_SECRET_OUTPUT_POLICY_YAML = _yaml(
+    """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: navigation
+        label: login
+        navigation_goal: Type password: hunter2 into the password field.
+    """
+)
+
 
 def _code_yaml(
     code: str,
@@ -1257,6 +1268,117 @@ class TestCodeRepairProgressClassification:
         assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_explicit_empty_return_despite_assigned_goal_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["npi"],
+            verdicts=[
+                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
+            ],
+        )
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  npi = await page.locator("#npi").inner_text(timeout=5000)
+                  return {{}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not return any keyed output" in result["error"]
+        assert ctx.has_staged_proposal is False
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.is_authoritative is True
+        assert outcome.block_labels == [label]
+        assert outcome.structural_failure_identity.startswith("author_time:")
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_known_empty_helper_without_missing_facts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["npi"],
+            verdicts=[
+                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
+            ],
+        )
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  def build():
+                      return {{}}
+
+                  return build()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not return any keyed output" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.block_labels == [label]
+        assert outcome.missing_requested_output_facts == []
+        assert outcome.structural_failure_identity.startswith("author_time:")
+
+    @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_implicit_keyed_output_candidate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1361,6 +1483,808 @@ class TestCodeRepairProgressClassification:
         assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
         assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
+    def test_required_output_roots_ignore_nested_debug_output_root_without_declared_root(self) -> None:
+        label = "extract_provider_profile"
+        metadata = {label: {"block_label": label, "claimed_outcomes": [{"goal_value_paths": ["debug_output"]}]}}
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"debug_output": {{"npi": "1234567890"}}}}
+            """
+        )
+
+        assert workflow_update_module._candidate_missing_required_output_roots(
+            candidate_yaml,
+            metadata,
+            required_roots={"npi"},
+        ) == ["npi"]
+
+    def test_required_output_roots_ignore_same_label_undeclared_static_root(self) -> None:
+        label = "extract_provider_profile"
+        metadata = {label: {"block_label": label, "claimed_outcomes": [{"goal_value_paths": ["address"]}]}}
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"npi": "1234567890"}}
+            """
+        )
+
+        assert workflow_update_module._candidate_missing_required_output_roots(
+            candidate_yaml,
+            metadata,
+            required_roots={"npi"},
+        ) == ["npi"]
+
+    def test_required_output_roots_ignore_static_root_without_label_metadata(self) -> None:
+        label = "extract_provider_profile"
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"npi": "1234567890"}}
+            """
+        )
+
+        assert workflow_update_module._candidate_missing_required_output_roots(
+            candidate_yaml,
+            {},
+            required_roots={"npi"},
+        ) == ["npi"]
+
+    def test_required_output_roots_accept_same_label_declared_static_root(self) -> None:
+        label = "extract_provider_profile"
+        metadata = {label: {"block_label": label, "claimed_outcomes": [{"goal_value_paths": ["npi"]}]}}
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"npi": "1234567890"}}
+            """
+        )
+
+        assert (
+            workflow_update_module._candidate_missing_required_output_roots(
+                candidate_yaml,
+                metadata,
+                required_roots={"npi"},
+            )
+            == []
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_unprovable_dynamic_output_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  result = {{}}
+                  key = "npi"
+                  value = await page.locator("#npi").inner_text(timeout=5000)
+                  result[key] = value
+                  return result
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert all(
+            fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
+            for fact in outcome.missing_requested_output_facts
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_literal_list_of_output_dicts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return [{{"npi": "123"}}]
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert all(
+            fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
+            for fact in outcome.missing_requested_output_facts
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_dynamic_list_output_to_abstain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  record = {{"npi": "123"}}
+                  return [record]
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert all(
+            fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
+            for fact in outcome.missing_requested_output_facts
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_dynamic_key_list_dict_to_abstain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  key = "npi"
+                  return [{{key: "123"}}]
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert all(
+            fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
+            for fact in outcome.missing_requested_output_facts
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_dynamic_key_local_dict_to_abstain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  key = "npi"
+                  result = {{key: "123"}}
+                  return result
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert all(
+            fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
+            for fact in outcome.missing_requested_output_facts
+        )
+
+    def test_local_dict_dynamic_key_preserves_literal_roots_while_abstaining(self) -> None:
+        produced = workflow_update_module._code_block_produced_output_roots(
+            """
+            key = "npi"
+            result = {"address": "North Carolina", key: "123"}
+            return result
+            """
+        )
+
+        assert produced.roots == {"address"}
+        assert produced.abstained is True
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_helper_dynamic_key_local_dict_to_abstain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  def build():
+                      key = "npi"
+                      result = {{key: "123"}}
+                      return result
+
+                  return build()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert all(
+            fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
+            for fact in outcome.missing_requested_output_facts
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_unrelated_dynamic_output_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["address"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["address"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  result = {{}}
+                  key = "address"
+                  result[key] = await page.locator("#address").inner_text(timeout=5000)
+                  return result
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "npi",
+                "output_root": "npi",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_when_unrelated_block_abstains(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        declared_label = "extract_provider_profile"
+        unrelated_label = "extract_unrelated_status"
+        ctx.code_artifact_metadata = {
+            declared_label: {
+                "block_label": declared_label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {declared_label}
+                code: |
+                  return {{"address": "North Carolina"}}
+              - block_type: code
+                label: {unrelated_label}
+                code: |
+                  result = {{}}
+                  key = "status"
+                  result[key] = await page.locator("#status").inner_text(timeout=5000)
+                  return result
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "npi",
+                "output_root": "npi",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_keeps_undeclared_missing_roots_with_dynamic_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+                {"output_path": "status", "output_root": "status", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  result = {{}}
+                  key = "npi"
+                  result[key] = await page.locator("#npi").inner_text(timeout=5000)
+                  return result
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "status",
+                "output_root": "status",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_literal_output_missing_required_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"address": "North Carolina"}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.block_labels == [label]
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "npi",
+                "output_root": "npi",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_empty_return_despite_assigned_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  npi = await page.locator("#npi").inner_text(timeout=5000)
+                  return {{}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not return any keyed output" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.block_labels == [label]
+        assert outcome.missing_requested_output_facts == []
+
+    @pytest.mark.parametrize("return_expression", ["None", "[]", '["not keyed"]'])
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_static_non_keyed_return_with_unrelated_output(
+        self, monkeypatch: pytest.MonkeyPatch, return_expression: str
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        declared_label = "extract_provider_profile"
+        unrelated_label = "extract_unrelated_status"
+        ctx.code_artifact_metadata = {
+            declared_label: {
+                "block_label": declared_label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {declared_label}
+                code: |
+                  return {return_expression}
+              - block_type: code
+                label: {unrelated_label}
+                code: |
+                  return {{"status": "active"}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "npi",
+                "output_root": "npi",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_helper_known_empty_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "lookup_provider_and_extract_credentials"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  def build():
+                      return {{}}
+
+                  return build()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not return any keyed output" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == []
+
     @pytest.mark.asyncio
     async def test_metadata_reject_persists_missing_roots_for_next_author_context(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1424,17 +2348,16 @@ class TestCodeRepairProgressClassification:
         assert "value_status=no_typed_value" in rendered
 
     @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_allows_when_last_run_produced_required_roots(
+    async def test_authoritative_outcome_not_demonstrated_rejects_when_only_last_run_produced_required_roots(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
+        label = "extract_top_hn_post"
         ctx.verified_block_outputs[label] = {
-            "address": "North Carolina, USA",
-            "credentialing_status": "Active",
-            "locations": [{"address": "North Carolina, USA"}],
-            "statuses": ["Active"],
+            "top_post": "Claude Sonnet 5",
+            "rank": 1,
+            "url": "https://news.ycombinator.com/item?id=1",
         }
         ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
             phase="persisted_block_run",
@@ -1444,26 +2367,72 @@ class TestCodeRepairProgressClassification:
             structural_failure_identity="completion:unsatisfied-output",
             authored_structure_signature="authored:previous-failed-candidate",
             missing_requested_output_facts=[
-                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
-                {
-                    "output_path": "credentialing_status",
-                    "output_root": "credentialing_status",
-                    "value_status": "no_typed_value",
-                },
-                {"output_path": "locations", "output_root": "locations", "value_status": "empty_typed_value"},
-                {"output_path": "statuses", "output_root": "statuses", "value_status": "no_typed_value"},
+                {"output_path": "top_post", "output_root": "top_post", "value_status": "presence_only_evidence"},
             ],
         )
         candidate_yaml = _yaml(
             f"""
-            title: Provider lookup
+            title: Hacker News lookup
             workflow_definition:
               blocks:
               - block_type: code
                 label: {label}
                 code: |
-                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
-                  address = "North Carolina, USA"
+                  return {{"rank": 1, "url": "https://news.ycombinator.com/item?id=1"}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "does not cover the missing requested output roots" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "top_post",
+                "output_root": "top_post",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_allows_static_return_for_required_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "extract_top_hn_post"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["top_post"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["top_post"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {"output_path": "top_post", "output_root": "top_post", "value_status": "presence_only_evidence"},
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Hacker News lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"top_post": "Claude Sonnet 5", "rank": 1}}
             """
         )
 
@@ -4630,6 +5599,47 @@ class TestCodeAuthoringGuardrailChurnBackstop:
 
         assert result["ok"] is True
         assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_output_policy_reject_records_author_time_reject_and_guardrail_count(self) -> None:
+        ctx = _code_only_ctx()
+
+        result = await _update_workflow(
+            {"workflow_yaml": _RAW_SECRET_OUTPUT_POLICY_YAML},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is False
+        assert "raw_secret_leak" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.phase == "author_time_reject"
+        assert outcome.reason_code == "output_policy_reject"
+        assert outcome.is_authoritative is True
+        assert outcome.structural_key is not None
+        assert "Output policy blocked" in outcome.observed_evidence_summary
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_repeated_output_policy_reject_halts_at_guardrail_backstop(self) -> None:
+        ctx = _code_only_ctx()
+
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            result = await _update_workflow(
+                {"workflow_yaml": _RAW_SECRET_OUTPUT_POLICY_YAML},
+                ctx,
+                allow_missing_credentials=True,
+            )
+            assert result["ok"] is False
+
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        assert ctx.latest_tool_blocker_signal is churn
+        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
 
     @pytest.mark.asyncio
     async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
