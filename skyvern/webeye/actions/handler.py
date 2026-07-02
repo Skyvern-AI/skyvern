@@ -2126,6 +2126,9 @@ async def _build_after_click_verify_prompt(
         navigation_payload=task.navigation_payload,
         new_elements_ids=new_element_ids,
         without_screenshots=True,
+        # No action_history_evidence: this call site judges mid-action continuation, and the
+        # history here is the menu-opening click — evidence-shortcutting it would certify
+        # the dropdown before the actual selection.
         action_history=action_history_str,
         slim_output=slim_output,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
