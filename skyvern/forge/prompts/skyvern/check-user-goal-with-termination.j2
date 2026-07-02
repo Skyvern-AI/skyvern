@@ -23,7 +23,13 @@ Important: Think carefully about the difference between "terminate" and "continu
 User Goal:
 ```
 {{ navigation_goal }}
+```{% if big_goal_context %}
+
+The user goal above is one step of a larger objective. The larger objective is provided ONLY as context to help you understand the step:
 ```
+{{ big_goal_context }}
+```
+Judge the status ONLY against the user goal above: return "complete" as soon as that step is done{{ " according to the complete criterion" if complete_criterion else "" }}, even if the larger objective is not finished yet. Return "terminate" only if that step itself can never be achieved — the larger objective being unfinished is NEVER a reason to continue or to terminate. If the user goal describes an action and the Action History shows that action completed successfully, the step is done — return "complete" even if the acted-on element is no longer on the current page; its absence after a successful action is NOT a reason to terminate.{% endif %}
 
 User Details:
 ```

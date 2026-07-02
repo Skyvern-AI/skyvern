@@ -14,12 +14,15 @@ Without this wrap:
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+import structlog
 import yaml
 
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.utils.yaml_loader import safe_load_no_dates
+
+LOG = structlog.get_logger()
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -140,6 +143,45 @@ def _extract_wrapped_goal(value: str) -> tuple[str, str] | None:
         last = (mini_goal, main_goal)
         current = mini_goal
     return last
+
+
+class UnwrappedGoals(NamedTuple):
+    navigation_goal: str | None
+    complete_criterion: str | None
+    terminate_criterion: str | None
+    big_goal_context: str | None
+
+
+def unwrap_goal_fields(
+    navigation_goal: str | None,
+    complete_criterion: str | None = None,
+    terminate_criterion: str | None = None,
+) -> UnwrappedGoals:
+    """Reduce MINI_GOAL_TEMPLATE-wrapped fields to their mini goals plus one
+    shared big-goal context for completion verification. Wrapping applies one
+    user message across all fields, so the first wrapped field's main goal
+    wins. Unwrapped fields pass through untouched and ``big_goal_context``
+    stays ``None`` so the verify prompts render byte-identical to today."""
+    big_goal: str | None = None
+    minis: list[str | None] = []
+    for value in (navigation_goal, complete_criterion, terminate_criterion):
+        if not value:
+            minis.append(value)
+            continue
+        parts = _extract_wrapped_goal(value)
+        if parts is None:
+            minis.append(value)
+            continue
+        mini_goal, main_goal = parts
+        minis.append(mini_goal)
+        if big_goal is None:
+            big_goal = main_goal
+        elif main_goal != big_goal:
+            LOG.debug("Wrapped goal fields carry mismatched main goals; first wins")
+    unwrapped_navigation_goal, unwrapped_complete_criterion, unwrapped_terminate_criterion = minis
+    return UnwrappedGoals(
+        unwrapped_navigation_goal, unwrapped_complete_criterion, unwrapped_terminate_criterion, big_goal
+    )
 
 
 def _wrapped_field_value(value: Any, main_goal: str) -> str | None:
