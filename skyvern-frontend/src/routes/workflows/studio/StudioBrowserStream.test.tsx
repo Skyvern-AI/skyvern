@@ -4,6 +4,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { Status } from "@/api/types";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioBrowserStream } from "./StudioBrowserStream";
@@ -13,10 +15,17 @@ const runtimeConfigMock = vi.hoisted(() => ({
   browserStreamingMode: "vnc",
 }));
 
+const workflowRunQueryMock = vi.hoisted(() => vi.fn());
+
 vi.mock("../hooks/useDebugSessionQuery", () => ({
   useDebugSessionQuery: () => ({
     data: { browser_session_id: "pbs_test" },
   }),
+}));
+
+vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
+  useWorkflowRunWithWorkflowQuery: (options?: { workflowRunId?: string }) =>
+    workflowRunQueryMock(options),
 }));
 
 vi.mock("@/hooks/useRuntimeConfig", () => ({
@@ -71,6 +80,7 @@ vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
 }));
 
 const initialBrowserState = useStudioBrowserStore.getState();
+const initialRecordingState = useRecordingStore.getState();
 
 // Drives a real pane-state URL write, so the effect chain under test is the
 // same one a spine click goes through.
@@ -104,10 +114,29 @@ function renderStudioBrowserStream(initialPath: string) {
 
 const BROWSER_CLOSED_PATH = "/workflows/wpid_test/studio?panes=editor";
 const BROWSER_OPEN_PATH = "/workflows/wpid_test/studio?panes=editor,browser";
+const BLOCK_RUN_OPEN_PATH = `${BROWSER_OPEN_PATH}&wr=run_1&bl=Block%201`;
+const BLOCK_RUN_CLOSED_PATH = `${BROWSER_CLOSED_PATH}&wr=run_1&bl=Block%201`;
+
+function mockWorkflowRun(status: Status, browserSessionId: string | null) {
+  workflowRunQueryMock.mockReturnValue({
+    data: { status, browser_session_id: browserSessionId },
+  });
+}
+
+function controlButtonsAttr(streamButtonName: string): string | null {
+  return (
+    screen
+      .getByRole("button", { name: streamButtonName })
+      .parentElement?.getAttribute("data-show-control-buttons") ?? null
+  );
+}
 
 beforeEach(() => {
   runtimeConfigMock.browserStreamingMode = "vnc";
   useStudioBrowserStore.setState(initialBrowserState, true);
+  useRecordingStore.setState(initialRecordingState, true);
+  workflowRunQueryMock.mockReset();
+  workflowRunQueryMock.mockReturnValue({ data: undefined });
 });
 
 describe("StudioBrowserStream browser activity notifications", () => {
@@ -195,5 +224,75 @@ describe("StudioBrowserStream browser activity notifications", () => {
     expect(useStudioBrowserStore.getState().streamUrl).toBe(
       "https://example.test",
     );
+  });
+});
+
+describe("StudioBrowserStream block-run take-control gating", () => {
+  it("locks take-control while a block run executes in the debug session", () => {
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("no");
+    expect(screen.getByRole("status").textContent).toContain(
+      "Skyvern is running this block",
+    );
+  });
+
+  it("locks the CDP stream the same way (input socket keys off the same prop)", () => {
+    runtimeConfigMock.browserStreamingMode = "cdp";
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
+
+    expect(controlButtonsAttr("emit cdp activity")).toBe("no");
+    expect(screen.getByRole("status").textContent).toContain(
+      "Skyvern is running this block",
+    );
+  });
+
+  it("re-enables take-control once the block run finalizes", () => {
+    mockWorkflowRun(Status.Completed, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("releases the lock while the block run is paused (may need human input)", () => {
+    mockWorkflowRun(Status.Paused, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("ignores a block run executing in a different browser session", () => {
+    mockWorkflowRun(Status.Running, "pbs_other");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+  });
+
+  it("ignores a full (non-block) run even when its session matches", () => {
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(`${BROWSER_OPEN_PATH}&wr=run_1`);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+  });
+
+  it("shows no lock pill while the Browser pane is closed", () => {
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_CLOSED_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("no");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("defers to an active recording instead of yanking its control", () => {
+    useRecordingStore.setState({ isRecording: true });
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });
