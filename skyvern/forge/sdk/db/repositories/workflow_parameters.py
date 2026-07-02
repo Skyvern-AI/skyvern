@@ -53,6 +53,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
 )
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -801,6 +802,7 @@ class WorkflowParametersRepository(BaseRepository):
                 return None
             return TaskGeneration.model_validate(task_generation)
 
+    @traced(name="skyvern.db.create_action")
     @db_operation("create_action")
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:

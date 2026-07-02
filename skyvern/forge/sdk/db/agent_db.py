@@ -595,69 +595,6 @@ class AgentDB(BaseAlchemyDB):
     async def get_workflow_run_block_errors(self, *args: Any, **kwargs: Any) -> Any:
         return await self.workflow_runs.get_workflow_run_block_errors(*args, **kwargs)
 
-    # -- Workflow parameter delegates --
-
-    async def create_workflow_parameter(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_workflow_parameter(*args, **kwargs)
-
-    async def create_aws_secret_parameter(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_aws_secret_parameter(*args, **kwargs)
-
-    async def create_output_parameter(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_output_parameter(*args, **kwargs)
-
-    async def save_workflow_definition_parameters(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.save_workflow_definition_parameters(*args, **kwargs)
-
-    async def get_workflow_output_parameters(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_workflow_output_parameters(*args, **kwargs)
-
-    async def get_workflow_output_parameters_by_ids(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_workflow_output_parameters_by_ids(*args, **kwargs)
-
-    async def get_workflow_parameters(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_workflow_parameters(*args, **kwargs)
-
-    async def get_workflow_parameter(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_workflow_parameter(*args, **kwargs)
-
-    async def create_task_generation(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_task_generation(*args, **kwargs)
-
-    async def create_ai_suggestion(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_ai_suggestion(*args, **kwargs)
-
-    async def create_workflow_copilot_chat(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_workflow_copilot_chat(*args, **kwargs)
-
-    async def update_workflow_copilot_chat(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.update_workflow_copilot_chat(*args, **kwargs)
-
-    async def create_workflow_copilot_chat_message(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_workflow_copilot_chat_message(*args, **kwargs)
-
-    async def get_workflow_copilot_chat_messages(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_workflow_copilot_chat_messages(*args, **kwargs)
-
-    async def get_workflow_copilot_chat_by_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_workflow_copilot_chat_by_id(*args, **kwargs)
-
-    async def get_latest_workflow_copilot_chat(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_latest_workflow_copilot_chat(*args, **kwargs)
-
-    async def get_task_generation_by_prompt_hash(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.get_task_generation_by_prompt_hash(*args, **kwargs)
-
-    @traced(name="skyvern.db.create_action")
-    async def create_action(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.create_action(*args, **kwargs)
-
-    async def update_action_reasoning(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.update_action_reasoning(*args, **kwargs)
-
-    async def retrieve_action_plan(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.workflow_params.retrieve_action_plan(*args, **kwargs)
-
     async def create_task_run(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.create_task_run(*args, **kwargs)
 
