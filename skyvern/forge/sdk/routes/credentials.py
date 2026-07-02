@@ -2840,7 +2840,13 @@ async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
 ) -> CredentialVaultService:
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
-    if vault_type == CredentialVaultType.BITWARDEN:
+    if vault_type == CredentialVaultType.SKYVERN:
+        if not settings.is_local_credential_vault_enabled():
+            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not enabled")
+        if not app.SKYVERN_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not configured")
+        return app.SKYVERN_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:

@@ -15,6 +15,6 @@ export interface GetCredentialsRequest {
     page?: number;
     /** Number of items per page */
     page_size?: number;
-    /** Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault') */
+    /** Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault') */
     vault_type?: Skyvern.CredentialVaultType;
 }
