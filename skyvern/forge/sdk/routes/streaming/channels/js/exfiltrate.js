@@ -167,10 +167,16 @@
               ? e.target?.value
               : undefined,
             mousePosition: {
-              xa: e.clientX,
-              ya: e.clientY,
-              xp: e.clientX / window.innerWidth,
-              yp: e.clientY / window.innerHeight,
+              xa: Number.isFinite(e.clientX) ? e.clientX : null,
+              ya: Number.isFinite(e.clientY) ? e.clientY : null,
+              xp:
+                Number.isFinite(e.clientX) && window.innerWidth
+                  ? e.clientX / window.innerWidth
+                  : null,
+              yp:
+                Number.isFinite(e.clientY) && window.innerHeight
+                  ? e.clientY / window.innerHeight
+                  : null,
             },
             key: e.key,
             code: e.code,
