@@ -21,15 +21,15 @@ from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
-from skyvern.forge.sdk.artifact.storage.test_helpers import (
+from skyvern.forge.sdk.db.id import generate_artifact_id
+from skyvern.forge.sdk.models import Step
+from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_for_ai_suggestion,
     create_fake_step,
     create_fake_task_v2,
     create_fake_thought,
     create_fake_workflow_run_block,
 )
-from skyvern.forge.sdk.db.id import generate_artifact_id
-from skyvern.forge.sdk.models import Step
 
 # Test constants
 TEST_BUCKET = "test-skyvern-bucket"
