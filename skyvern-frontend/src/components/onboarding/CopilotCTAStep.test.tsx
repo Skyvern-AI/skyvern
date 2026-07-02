@@ -116,7 +116,7 @@ describe("CopilotCTAStep", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create with AI" }));
 
     await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith("/workflows/wpid_x/studio", {
+      expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_x/studio", {
         state: { copilotMessage: "fill out my form" },
       }),
     );
@@ -135,7 +135,7 @@ describe("CopilotCTAStep", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create with AI" }));
 
     await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith("/workflows/wpid_x/build", {
+      expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_x/build", {
         state: { copilotMessage: "fill out my form" },
       }),
     );

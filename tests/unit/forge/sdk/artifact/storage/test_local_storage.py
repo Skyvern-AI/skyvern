@@ -4,7 +4,7 @@ from freezegun import freeze_time
 from skyvern.config import settings
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
-from skyvern.forge.sdk.artifact.storage.test_helpers import (
+from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_for_ai_suggestion,
     create_fake_step,
     create_fake_task_v2,

@@ -1,12 +1,13 @@
 import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { StartNode } from "./types";
+import { GearIcon } from "@radix-ui/react-icons";
+import { OPEN_WORKFLOW_SETTINGS_EVENT, type StartNode } from "./types";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -43,6 +44,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
   const reactFlowInstance = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
+  const [settingsAccordionValue, setSettingsAccordionValue] = useState("");
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
@@ -90,6 +92,27 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
   }, [data.showCode]);
+
+  // Clicking the start node on the canvas asks for the settings to open; the
+  // accordion trigger itself still collapses/expands as usual. No rerender
+  // bump: Radix unmounts closed content, so opening mounts the editor fresh.
+  const settingsAccordionValueRef = useRef(settingsAccordionValue);
+  settingsAccordionValueRef.current = settingsAccordionValue;
+  useEffect(() => {
+    if (!data.withWorkflowSettings) {
+      return;
+    }
+    const openSettings = () => {
+      if (settingsAccordionValueRef.current === "settings") {
+        return;
+      }
+      setSettingsAccordionValue("settings");
+    };
+    window.addEventListener(OPEN_WORKFLOW_SETTINGS_EVENT, openSettings);
+    return () => {
+      window.removeEventListener(OPEN_WORKFLOW_SETTINGS_EVENT, openSettings);
+    };
+  }, [data.withWorkflowSettings]);
 
   useEffect(() => {
     workflowSettingsStore.setWorkflowSettings(makeStartSettings(data));
@@ -155,11 +178,23 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                 <Accordion
                   type="single"
                   collapsible
-                  onValueChange={() => rerender.bump()}
+                  value={settingsAccordionValue}
+                  onValueChange={(value) => {
+                    setSettingsAccordionValue(value);
+                    rerender.bump();
+                  }}
                 >
                   <AccordionItem value="settings" className="mt-4 border-b-0">
                     <AccordionTrigger className="py-2">
-                      Workflow Settings
+                      {/* Wrapped so the open-state chevron rotation targets
+                          only the trigger's own direct svg. */}
+                      <span className="flex items-center gap-2">
+                        <GearIcon
+                          className="h-4 w-4 text-muted-foreground"
+                          aria-hidden
+                        />
+                        Workflow Settings
+                      </span>
                     </AccordionTrigger>
                     <AccordionContent className="pl-6 pr-1 pt-1">
                       <div key={rerender.key}>

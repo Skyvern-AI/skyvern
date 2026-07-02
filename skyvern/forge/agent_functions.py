@@ -40,6 +40,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
@@ -57,6 +58,10 @@ if TYPE_CHECKING:
     from skyvern.services.otp_service import OTPValue
 
 LOG = structlog.get_logger()
+
+# Playwright's always-on ffmpeg VP8 encoder scales CPU with pixel count; 720p is the
+# legibility / CPU tradeoff point that the BROWSER_RECORDING_720P flag opts a run into.
+RECORDING_VIDEO_SIZE_720P: dict[str, int] = {"width": 1280, "height": 720}
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
@@ -728,6 +733,21 @@ class AgentFunction:
         """
         return False
 
+    async def resolve_recording_video_size(
+        self,
+        current_size: dict[str, int] | None,
+        *,
+        distinct_id: str | None,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+    ) -> dict[str, int] | None:
+        """Resolve the browser recording resolution for this run.
+
+        Returns ``current_size`` unchanged. Cloud overrides this to opt runs into
+        an elevated resolution behind a feature flag.
+        """
+        return current_size
+
     async def should_keep_code_mode_for_workflow_run(
         self,
         *,
@@ -735,6 +755,13 @@ class AgentFunction:
         workflow_run: "WorkflowRun",
     ) -> bool:
         return True
+
+    async def resolve_mcp_code_only_mode(
+        self,
+        organization_id: str | None,
+        request_override: bool | None,
+    ) -> bool:
+        return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
 
     async def should_use_codeblock_runner(
         self,
@@ -752,6 +779,23 @@ class AgentFunction:
         execute_code_block_override so the override only runs the runner. OSS has no
         runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
         only routes runs that have a browser session for the runner to broker against.
+        """
+        return False
+
+    async def should_auto_create_browser_session_for_code_block(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> bool:
+        """Whether a run containing a CodeBlock should get an auto-provisioned browser session.
+
+        The secure CodeBlock runner brokers page operations against a live persistent browser
+        session, so a run that has a CodeBlock but no caller-supplied session needs one created
+        for it before block execution. OSS has no runner and returns False; cloud overrides to
+        consult the same env/flag gate as should_use_codeblock_runner.
         """
         return False
 
@@ -773,6 +817,19 @@ class AgentFunction:
         overrides to dispatch to the runner. Callers must gate on
         should_use_codeblock_runner first.
         """
+        return None
+
+    async def should_dispatch_copilot_block_run_to_worker(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> bool:
+        """Base no-op (copilot runs its block test inline); overridden per deployment."""
+        return False
+
+    def resolve_copilot_dispatch_trigger_type(self) -> "WorkflowRunTriggerType | None":
+        """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
@@ -924,6 +981,13 @@ class AgentFunction:
         organization_id: str | None = None,
     ) -> str | None:
         return None
+
+    async def parse_enterprise_totp_secret_result(
+        self,
+        totp_secret: str,
+        organization_id: str | None = None,
+    ) -> AuthenticatorTotpParseResult:
+        return AuthenticatorTotpParseResult()
 
     async def prepare_step_execution(
         self,

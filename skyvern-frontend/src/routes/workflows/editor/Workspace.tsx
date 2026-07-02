@@ -90,6 +90,7 @@ import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
+import { RecentActivityRunSelector } from "@/routes/workflows/debugger/recentActivity/RecentActivityRunSelector";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   BranchContext,
@@ -99,14 +100,18 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
-import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
+import {
+  getInitialSelectedBlockId,
+  useSelectedBlockUrlSync,
+} from "./hooks/useSelectedBlockUrlSync";
 import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useWorkspaceMountInitialization } from "./hooks/useWorkspaceMountInitialization";
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
@@ -152,11 +157,7 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
-import {
-  STUDIO_COPILOT_RAIL_WIDTH,
-  STUDIO_COPILOT_WIDTH,
-} from "../studio/constants";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
 
@@ -323,21 +324,8 @@ function Workspace({
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
-  const studioCopilotCollapsed = useStudioShellStore((s) => s.copilotCollapsed);
-  const studioSetCopilotCollapsed = useStudioShellStore(
-    (s) => s.setCopilotCollapsed,
-  );
-  const studioSetTab = useStudioShellStore((s) => s.setTab);
-  const studioSetSettingsCollapsed = useStudioShellStore(
-    (s) => s.setSettingsCollapsed,
-  );
-  // The studio canvas sits right of the Copilot column; offset the fit by the
-  // column width so the chain centers on the whole page, not just the pane.
-  const studioCanvasCenterOffset = embedded
-    ? studioCopilotCollapsed
-      ? STUDIO_COPILOT_RAIL_WIDTH
-      : STUDIO_COPILOT_WIDTH
-    : 0;
+  const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
+  const studioCopilotOpen = studioPanes.includes("copilot");
   const location = useLocation();
   const navigate = useNavigate();
   const locationState = location.state as {
@@ -831,7 +819,7 @@ function Workspace({
   // Per-workflow store reset. Earlier revisions did this from
   // `useMountEffect`, but the Workspace instance can be reused across
   // workflows when the parent route doesn't key by workflowPermanentId
-  // (e.g. /workflows/A/build → /workflows/B/build); in that case the
+  // (e.g. /agents/A/build → /agents/B/build); in that case the
   // mount-only initializer would skip and selectedBlockId / showAllCode /
   // sidebar save timestamps would leak from A into B. Keying this on
   // `workflowPermanentId` fires the reset on every workflow change,
@@ -848,17 +836,14 @@ function Workspace({
   // payload resolves.
   const cacheKeyInitWpidRef = useRef<string | null>(null);
   useEffect(() => {
-    // Studio defaults the selection to the start node on open (legacy keeps it
-    // empty); fires only on workflow change, so tab-switch selection persists.
-    const startNodeId = embedded
-      ? (initialNodes.find((node) => node.type === "start")?.id ?? null)
-      : null;
-    useWorkflowPanelStore.getState().setSelectedBlockId(startNodeId);
-    // The collapse flag is a module-level store, so it survives an in-session
-    // A→B workflow nav; re-collapse here so every workflow opens to the rail.
-    if (embedded) {
-      studioSetSettingsCollapsed(true);
-    }
+    // empty), unless the URL asks for a specific block; fires only on workflow
+    // change, so tab-switch selection persists.
+    const initialSelectedBlockId = getInitialSelectedBlockId({
+      enabled: embedded,
+      nodes: initialNodes,
+      searchParams,
+    });
+    useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     cacheKeyInitWpidRef.current = null;
@@ -947,6 +932,11 @@ function Workspace({
   });
 
   useCacheKeyValueUrlSync(cacheKeyInitWpidRef.current === workflowPermanentId);
+  useSelectedBlockUrlSync({
+    enabled: embedded,
+    nodes,
+    getNodes: getNodes as () => Array<AppNode>,
+  });
 
   // Centralized function to manage comparison and panel states
   const clearComparisonViewAndShowFreshIfActive = useCallback(
@@ -1399,11 +1389,6 @@ function Workspace({
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
     useWorkflowPanelStore.getState().setSelectedBlockId(id);
-    // Adding a block is a deliberate action: expand the studio settings panel
-    // to the new block (the library flow doesn't go through onNodeClick).
-    if (embedded) {
-      studioSetSettingsCollapsed(false);
-    }
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -1556,9 +1541,9 @@ function Workspace({
       className="relative h-full w-full"
       style={
         {
-          // In studio the settings panel is its own grid column (StudioShell), so
-          // the Stage already reflows; zero the var so on-canvas overlays don't
-          // double-offset. Legacy keeps the overlay's measured width.
+          // Studio has no block-config settings sidebar (settings are inline in
+          // the blocks), so zero the var; the on-canvas sidebar-offset consumers
+          // are suppressed there anyway. Legacy keeps the overlay's measured width.
           [BLOCK_SIDEBAR_WIDTH_VAR]: embedded
             ? "0px"
             : `${renderedBlockSidebarWidth}px`,
@@ -1805,7 +1790,6 @@ function Workspace({
                 onEdgesChange={onEdgesChange}
                 initialTitle={initialTitle}
                 workflow={workflow}
-                centerOffsetX={studioCanvasCenterOffset}
                 embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
@@ -2007,7 +1991,7 @@ function Workspace({
                 </div>
                 {/* infinite canvas */}
                 <div
-                  className={cn("h-full w-[50%]", {
+                  className={cn("relative h-full w-[50%]", {
                     "w-[100%]":
                       leftSideLayoutMode === "side-by-side" && !showAllCode,
                   })}
@@ -2029,17 +2013,15 @@ function Workspace({
                     historyApplyTrigger={historyApplyTrigger}
                     onLayoutPhaseChange={setFlowLayoutPhase}
                   />
+                  {!blockLabel && (
+                    <div className="pointer-events-none absolute bottom-3 left-1/2 z-20 w-[20rem] max-w-[calc(100%-2rem)] -translate-x-1/2 [&>*]:pointer-events-auto">
+                      <RecentActivityRunSelector
+                        contentSide="top"
+                        contentAlign="center"
+                      />
+                    </div>
+                  )}
                 </div>
-              </div>
-              {/* block runs history for current debug session id*/}
-              {/*
-                pointer-events-none on the wrapper so clicks pass through to
-                the FlowRenderer's bottom-left Controls (FitView, Lock,
-                GlobalCollapse) that sit in the same corner; the actual
-                debugger chip re-enables pointer events on itself.
-              */}
-              <div className="pointer-events-none absolute bottom-[0.5rem] left-[0.75rem] flex w-full items-start justify-center [&>*]:pointer-events-auto">
-                <DebuggerBlockRuns />
               </div>
             </div>
 
@@ -2359,14 +2341,10 @@ function Workspace({
       )}
 
       <WorkflowCopilotChat
-        isOpen={
-          embedded ? !studioCopilotCollapsed : showBrowser && isCopilotOpen
-        }
+        isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
         docked={embedded}
+        chromeless={embedded}
         portalTarget={embedded ? studioCopilotPortalEl : undefined}
-        onCollapse={
-          embedded ? () => studioSetCopilotCollapsed(true) : undefined
-        }
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
@@ -2432,7 +2410,10 @@ function Workspace({
               } catch (error) {
                 toast({
                   title: "Error",
-                  description: "Invalid JSON format in extra http headers",
+                  description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
+                    saveData.settings.extraHttpHeaders ?? "",
+                    error,
+                  )}`,
                   variant: "destructive",
                 });
                 return;
@@ -2448,7 +2429,10 @@ function Workspace({
               } catch (error) {
                 toast({
                   title: "Error",
-                  description: "Invalid JSON format in cdp connect headers",
+                  description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
+                    saveData.settings.cdpConnectHeaders ?? "",
+                    error,
+                  )}`,
                   variant: "destructive",
                 });
                 return;
@@ -2543,10 +2527,10 @@ function Workspace({
             };
 
             // Hide chat and show comparison. The comparison renders on the
-            // editor canvas, so surface the editor tab when docked in the studio.
+            // editor canvas, so surface the Editor pane when docked in the studio.
             setIsCopilotOpen(false);
             if (embedded) {
-              studioSetTab("editor");
+              openStudioPane("editor");
             }
             setWorkflowPanelState({
               active: false,

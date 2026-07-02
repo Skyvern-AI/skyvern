@@ -1414,7 +1414,7 @@ class TestPreflightSurfacesSyntaxError:
         diagnostics = preflight_code_block(code, parameter_keys=())
 
         assert sum(1 for d in diagnostics if d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT") == 1
-        assert any("localized result/detail" in d.message for d in diagnostics)
+        assert any("localized container" in d.message for d in diagnostics)
 
     def test_broad_body_text_wait_for_function_keyword_expression_surfaces_selection_diagnostic(self) -> None:
         code = (
@@ -1435,6 +1435,182 @@ class TestPreflightSurfacesSyntaxError:
         diagnostics = preflight_code_block(code, parameter_keys=())
 
         assert not any(d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT" for d in diagnostics)
+
+    def test_global_get_by_text_wait_for_surfaces_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").wait_for(timeout=5000)\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_global_get_by_text_wait_for_alias_surfaces_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\nawait target.wait_for(timeout=5000)\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "if ready:\n"
+            '    target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "    await target.wait_for(timeout=5000)\n",
+            "for _ in [1]:\n"
+            '    target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "    await target.wait_for(timeout=5000)\n",
+            "try:\n"
+            '    target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "    await target.wait_for(timeout=5000)\n"
+            "except Exception:\n"
+            "    pass\n",
+        ],
+    )
+    def test_nested_get_by_text_alias_wait_surfaces_ambiguous_locator_diagnostic(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=("ready",))
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_rebound_get_by_text_alias_does_not_surface_stale_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            'target = page.locator("#safe")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert not any(d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR" for d in diagnostics)
+
+    def test_get_by_text_alias_wait_before_rebind_surfaces_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "await target.wait_for(timeout=5000)\n"
+            'target = page.locator("#safe")\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_nested_earlier_get_by_text_rebind_does_not_clear_later_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_nested_later_get_by_text_rebind_does_not_clear_outer_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'await page.locator("table").wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("table").first.wait_for(state="visible", timeout=15000)\n',
+            'table = page.locator("table")\nawait table.first.wait_for(state="visible", timeout=15000)\n',
+        ],
+    )
+    def test_broad_global_table_wait_for_surfaces_selection_diagnostic(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'if ready:\n    target = page.locator("table")\n    await target.wait_for(timeout=5000)\n',
+            'for _ in [1]:\n    target = page.locator("table")\n    await target.wait_for(timeout=5000)\n',
+            "try:\n"
+            '    target = page.locator("table")\n'
+            "    await target.wait_for(timeout=5000)\n"
+            "except Exception:\n"
+            "    pass\n",
+        ],
+    )
+    def test_nested_table_alias_wait_surfaces_broad_table_diagnostic(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=("ready",))
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'await page.locator("table tbody tr").first.wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("#coastalCard").locator("table").first.wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("table").get_by_role("row").first.wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("table").filter(has_text="Credentialed").wait_for(timeout=15000)\n',
+            'table = page.locator("table").filter(has_text="Credentialed")\nawait table.wait_for(timeout=15000)\n',
+        ],
+    )
+    def test_scoped_or_narrowed_table_wait_for_is_allowed(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR" for d in diagnostics)
+
+    def test_rebound_table_alias_does_not_surface_stale_broad_table_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.locator("table")\ntarget = page.locator("#safe")\nawait target.wait_for(timeout=5000)\n',
+            parameter_keys=(),
+        )
+
+        assert not any(d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR" for d in diagnostics)
+
+    def test_table_alias_wait_before_rebind_surfaces_broad_table_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.locator("table")\nawait target.wait_for(timeout=5000)\ntarget = page.locator("#safe")\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    def test_nested_earlier_table_rebind_does_not_clear_later_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            'target = page.locator("table")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    def test_nested_later_table_rebind_does_not_clear_outer_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.locator("table")\n'
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'await page.locator("main").get_by_text("NATIONAL PROVIDER IDENTIFIER").wait_for(timeout=5000)\n',
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").first.wait_for(timeout=5000)\n',
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").nth(0).wait_for(timeout=5000)\n',
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").filter(visible=True).wait_for(timeout=5000)\n',
+        ],
+    )
+    def test_scoped_or_narrowed_get_by_text_wait_for_is_allowed(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR" for d in diagnostics)
 
     def test_non_page_wait_for_function_does_not_surface_body_text_diagnostic(self) -> None:
         code = """
@@ -1462,7 +1638,7 @@ class TestPreflightSurfacesSyntaxError:
         errors = _code_block_safety_errors(workflow_yaml, None)
 
         assert any("failed the generated-code preflight check" in str(error) for error in errors)
-        assert any("localized result/detail" in str(error) for error in errors)
+        assert any("localized container" in str(error) for error in errors)
 
     def test_broad_container_record_scan_surfaces_row_extraction_diagnostic(self) -> None:
         code = """

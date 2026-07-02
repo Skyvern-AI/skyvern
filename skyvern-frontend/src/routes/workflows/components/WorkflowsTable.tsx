@@ -84,7 +84,7 @@ function WorkflowsTable() {
                   if (event.ctrlKey || event.metaKey) {
                     window.open(
                       window.location.origin +
-                        `/workflows/${workflow.workflow_permanent_id}`,
+                        `/agents/${workflow.workflow_permanent_id}`,
                       "_blank",
                       "noopener,noreferrer",
                     );

@@ -724,6 +724,22 @@ class TestEnforcementStateUpdates:
         assert ctx.update_workflow_called is False
 
 
+def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
+    from skyvern.forge.sdk.copilot.streaming_adapter import _tool_result_workflow_run_id
+
+    payload = {"ok": True, "data": {"workflow_run_id": "wr_42"}}
+    # Block-running tools created the run -> surface it (pass or fail).
+    assert _tool_result_workflow_run_id("update_and_run_blocks", payload) == "wr_42"
+    assert _tool_result_workflow_run_id("run_blocks_and_collect_debug", payload) == "wr_42"
+    # get_run_results echoes a prior run id; attributing it to this turn would grade a stale run.
+    assert _tool_result_workflow_run_id("get_run_results", payload) is None
+    assert _tool_result_workflow_run_id("update_workflow", payload) is None
+    # Malformed / missing data payloads yield None rather than raising.
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {}) is None
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": "string"}) is None
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
+
+
 class TestFlushGoalSatisfiedToolResult:
     @staticmethod
     def _ctx(**overrides: Any) -> SimpleNamespace:

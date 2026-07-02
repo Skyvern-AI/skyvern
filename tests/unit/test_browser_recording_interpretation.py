@@ -24,6 +24,7 @@ from skyvern.services.browser_recording.types import (
     Mouse,
     RecordingDraftStep,
     RecordingDraftStepStatus,
+    RecordingInterpretationUpdate,
 )
 
 ORG_ID = "org_123"
@@ -230,6 +231,67 @@ def _click_streaming_event(
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_jittered_reclick_yields_single_draft_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click the submit button."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0, capture_seq=0)])
+    session.ingest_events([_click_streaming_event(timestamp=1002.0, capture_seq=1)])
+    steps = await session.flush()
+
+    assert len(steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_adjacent_duplicate_suppressed_but_later_repeat_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click", "title": "Click", "prompt": "Click."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events(
+        [
+            _click_streaming_event(timestamp=1000.0, capture_seq=0, sky_id="sky-a", target_id="a"),
+            _click_streaming_event(timestamp=1010.0, capture_seq=1, sky_id="sky-b", target_id="b"),
+            _click_streaming_event(timestamp=1005.0, capture_seq=2, sky_id="sky-a", target_id="a"),
+        ]
+    )
+    steps = await session.flush()
+
+    assert [(step.action_kind, step.timestamp_start) for step in steps] == [
+        (ActionKind.CLICK, 1000.0),
+        (ActionKind.CLICK, 1010.0),
+    ]
+
+    # A genuine later repeat of A (well outside the dedup window) is preserved.
+    session.ingest_events([_click_streaming_event(timestamp=5000.0, capture_seq=3, sky_id="sky-a", target_id="a")])
+    steps = await session.flush()
+
+    assert len(steps) == 3
+    assert steps[-1].timestamp_start == 5000.0
 
 
 @pytest.mark.asyncio
@@ -522,3 +584,162 @@ def test_start_session_resumes_after_websocket_disconnect_without_stop() -> None
 
     assert registry._sessions[PBS_ID] is session
     assert reconnect_updates == [4]
+
+
+def test_start_session_same_recording_attempt_id_reuses_session() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+    session = registry._sessions[PBS_ID]
+    session.session_revision = 5
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+
+    # Same recording (reconnect) reuses the cached session and its revision.
+    assert registry._sessions[PBS_ID] is session
+    assert registry._sessions[PBS_ID].session_revision == 5
+
+
+def test_start_session_new_recording_attempt_id_forces_fresh_session() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+    stale = registry._sessions[PBS_ID]
+    stale.session_revision = 42
+    stale.steps = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+        )
+    ]
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-2",
+    )
+
+    # A new recording gets a fresh session: not the stale object, revision reset,
+    # no carried-over steps.
+    fresh = registry._sessions[PBS_ID]
+    assert fresh is not stale
+    assert fresh.recording_attempt_id == "attempt-2"
+    assert fresh.session_revision == 0
+    assert fresh.steps == []
+
+
+@pytest.mark.asyncio
+async def test_emits_deltas_for_steps_and_snapshot_on_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click submit."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        deltas_enabled=True,
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    # Steps arrive as deltas (placeholder + enriched), never re-sending the full list.
+    deltas = [u for u in updates if not u.is_snapshot]
+    assert any(u.changed_steps for u in deltas)
+    assert all(u.steps == [] for u in deltas)
+
+    # Finalize ends with an authoritative snapshot carrying the full list.
+    assert updates[-1].is_snapshot is True
+    assert updates[-1].finalized is True
+    assert len(updates[-1].steps) == 1
+
+    # A delta never smuggles the whole growing list back in.
+    assert all(u.is_snapshot or not u.steps for u in updates)
+
+
+@pytest.mark.asyncio
+async def test_no_deltas_when_client_lacks_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click", "title": "Click", "prompt": "Click."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        # deltas_enabled defaults False — a client that didn't opt in gets snapshots.
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    # Every update is a full snapshot; no changed_steps are ever sent.
+    assert all(u.is_snapshot for u in updates)
+    assert all(not u.changed_steps for u in updates)
+    assert updates[-1].steps  # final snapshot still carries the steps
+
+
+@pytest.mark.asyncio
+async def test_resume_capture_emits_resync_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click", "title": "Click", "prompt": "Click."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await asyncio.sleep(0.05)
+
+    session.pause_capture()
+    updates.clear()
+    session.resume_capture()
+
+    assert len(updates) == 1
+    assert updates[0].is_snapshot is True
+    session.cancel()

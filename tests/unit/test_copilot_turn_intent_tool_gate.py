@@ -82,10 +82,8 @@ def _assert_signal(
     ("mode", "tool_name", "expected_reason"),
     [
         (TurnIntentMode.DOCS_ANSWER, "update_workflow", "turn_intent_no_mutation_update_blocked"),
-        (TurnIntentMode.DIAGNOSE, "run_blocks_and_collect_debug", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.DOCS_ANSWER, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.DOCS_ANSWER, "list_credentials", "turn_intent_credential_metadata_blocked"),
-        (TurnIntentMode.DIAGNOSE, "list_credentials", "turn_intent_credential_metadata_blocked"),
         (TurnIntentMode.CLARIFY, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.CLARIFY, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.REFUSE, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
@@ -107,6 +105,55 @@ def test_no_mutation_turn_intent_blocks_mutating_tools(
     ctx = _ctx(intent)
     signal = _turn_intent_tool_error(ctx, tool_name)
     _assert_signal(signal, internal_reason_code=expected_reason, classifier_mode=mode.value, blocked_tool=tool_name)
+
+
+def _diagnose_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.DIAGNOSE,
+        authority=TurnIntentAuthority(
+            may_update_workflow=False,
+            may_run_blocks=False,
+            may_read_run_context=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_reason"),
+    [
+        ("run_blocks_and_collect_debug", "turn_intent_no_mutation_run_blocked"),
+        ("update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
+        ("update_workflow", "turn_intent_no_mutation_update_blocked"),
+        ("inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
+        ("list_credentials", "turn_intent_credential_metadata_blocked"),
+    ],
+)
+def test_diagnose_denied_tool_soft_blocks_and_continues_to_diagnosis(tool_name: str, expected_reason: str) -> None:
+    # A denied tool in a diagnose turn stays denied but must not terminate the turn: the blocker is a
+    # non-terminating soft steer toward an evidence-grounded fix, covering every denied tool class.
+    signal = _turn_intent_tool_error(_ctx(_diagnose_intent()), tool_name)
+    assert signal is not None
+    assert signal.internal_reason_code == expected_reason
+    assert signal.blocked_tool == tool_name
+    assert signal.classifier_mode == TurnIntentMode.DIAGNOSE.value
+    # the load-bearing assertions: soft, non-terminating, steered at the run evidence + a confirmable fix
+    assert signal.blocker_kind == "tool_error"
+    assert signal.renders_final_reply is False
+    assert signal.recovery_hint == "retry_with_different_tool"
+    steer = signal.agent_steering_text.lower()
+    assert "diagnose" in steer and "fix" in steer
+    assert "i'll respond with the information i already have" not in signal.user_facing_reason.lower()
+    for token in _LEAK_TOKENS:
+        assert token not in signal.user_facing_reason
+
+
+@pytest.mark.parametrize("tool_name", ["update_workflow", "update_and_run_blocks", "run_blocks_and_collect_debug"])
+def test_diagnose_soft_block_still_denies_side_effect(tool_name: str) -> None:
+    # A non-terminating soft block still returns a blocker, so the side-effecting tool is denied and never runs;
+    # renders_final_reply governs only whether the turn ends, not whether the side effect runs.
+    signal = _turn_intent_tool_error(_ctx(_diagnose_intent()), tool_name)
+    assert signal is not None
+    assert tool_name not in signal.cleared_by_tools
 
 
 def test_turn_intent_gate_allows_draft_update_without_run_authority() -> None:
@@ -566,6 +613,7 @@ async def test_get_run_results_defaults_to_successful_same_turn_run() -> None:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
 
         result = await _get_run_results({}, ctx)
 
@@ -586,6 +634,7 @@ async def test_get_run_results_defaults_to_latest_same_turn_run_when_no_success(
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
 
         result = await _get_run_results({}, ctx)
 
@@ -635,6 +684,7 @@ async def test_get_run_results_uses_pending_reconciliation_run_when_id_omitted()
     with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
         result = await _get_run_results({}, ctx)
 
     assert result["ok"] is True

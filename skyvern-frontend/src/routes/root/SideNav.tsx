@@ -78,7 +78,7 @@ function SideNav({ collapsed }: Props = {}) {
     },
     {
       label: "Agents",
-      to: "/workflows",
+      to: "/agents",
       icon: <LightningBoltIcon className="size-4" />,
       children: [
         {
@@ -101,7 +101,7 @@ function SideNav({ collapsed }: Props = {}) {
         },
         {
           label: "All Agents",
-          to: "/workflows",
+          to: "/agents",
           icon: <ListBulletIcon className="size-3.5" />,
         },
         {

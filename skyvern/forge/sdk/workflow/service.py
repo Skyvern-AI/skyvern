@@ -62,6 +62,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_parameter_id
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -178,6 +179,10 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
 # Skip post-run work when only a sub-millisecond budget remains; asyncio.timeout would fire on the first await.
 POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
+
+# Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
+# run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
+CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
 
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
@@ -1031,6 +1036,7 @@ class WorkflowService:
         workflow_schedule_id: str | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        resolved_workflow_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -1040,15 +1046,24 @@ class WorkflowService:
         :param workflow_id: The workflow id to run.
         :param organization_id: The organization id for the workflow.
         :param max_steps_override: The max steps override for the workflow run, if any.
+        :param resolved_workflow_id: Pin the exact workflow version row to run against, resolved by
+            workflow_id. Used when the (permanent_id, version) index is non-unique and a version=
+            lookup could resolve the wrong row. When None, resolve by permanent id + version.
         :return: The created workflow run.
         """
         async with app.DATABASE.workflow_runs.Session() as outer_session:
             # Validate the workflow and the organization
-            workflow = await self.get_workflow_by_permanent_id(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=None if is_template_workflow else organization.organization_id,
-                version=version,
-            )
+            if resolved_workflow_id is not None:
+                workflow = await app.DATABASE.workflows.get_workflow(
+                    workflow_id=resolved_workflow_id,
+                    organization_id=None if is_template_workflow else organization.organization_id,
+                )
+            else:
+                workflow = await self.get_workflow_by_permanent_id(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=None if is_template_workflow else organization.organization_id,
+                    version=version,
+                )
             if workflow is None:
                 LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
                 raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
@@ -1461,6 +1476,68 @@ class WorkflowService:
 
         return None
 
+    async def auto_create_browser_session_for_code_block_if_needed(
+        self,
+        organization_id: str,
+        workflow: Workflow,
+        *,
+        workflow_run_id: str,
+        browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
+        proxy_location: ProxyLocationInput = None,
+    ) -> PersistentBrowserSession | None:
+        """Auto-provision a persistent browser session for runs that contain a CodeBlock.
+
+        The secure CodeBlock runner brokers page operations against a live persistent browser
+        session, so a CodeBlock with no caller-supplied session would otherwise fall back to
+        the legacy in-process executor. When the org is enabled for the secure runner, provision
+        a session here so the CodeBlock routes to the runner. A run's browser_profile_id is loaded
+        into the session so profile-backed CodeBlock workflows still reach the runner. Returns None
+        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, a
+        session was already supplied, or session creation fails.
+        """
+        if browser_session_id:  # the caller supplied a session; respect it unchanged
+            return None
+
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        if not any(block.block_type == BlockType.CODE for block in all_blocks):
+            return None
+
+        should_create = await app.AGENT_FUNCTION.should_auto_create_browser_session_for_code_block(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_id=workflow.workflow_id,
+        )
+        if not should_create:
+            return None
+
+        try:
+            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                organization_id=organization_id,
+                timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
+                browser_profile_id=browser_profile_id,
+                proxy_location=proxy_location,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to auto-create browser session for CodeBlock run; falling back to legacy executor",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return None
+
+        LOG.info(
+            "Auto-created browser session for CodeBlock run",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_session_id=browser_session.persistent_browser_session_id,
+        )
+        return browser_session
+
     async def _collect_inherited_workflow_system_prompt(
         self,
         parent_workflow_run_id: str | None,
@@ -1643,15 +1720,11 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = workflow_override or await self.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_run.workflow_permanent_id
-        )
-        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
-        browser_profile_id = workflow_run.browser_profile_id
-        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
-        # Guard: if the run was canceled while queued (before Temporal picked it up),
-        # don't overwrite the canceled status with running.
+        # Guard: if the run was canceled while queued (before Temporal picked it up), don't
+        # overwrite the canceled status with running. Checked BEFORE workflow resolution so a run
+        # whose stamped workflow version was deleted after cancellation does not raise
+        # WorkflowNotFound on a late worker pickup.
         if workflow_run.status == WorkflowRunStatus.canceled:
             LOG.info(
                 "Workflow run was canceled before execution started, skipping",
@@ -1659,6 +1732,14 @@ class WorkflowService:
                 organization_id=organization_id,
             )
             return workflow_run
+
+        # Resolve the exact version stamped on the run (run.workflow_id is always set), not the
+        # latest published version, so a publish between run creation and execution does not change
+        # what executes.
+        workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
+        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
+        browser_profile_id = workflow_run.browser_profile_id
+        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
         if enterprise_gated_features:
@@ -1786,6 +1867,19 @@ class WorkflowService:
                 organization.organization_id,
                 workflow,
                 browser_session_id=browser_session_id,
+                proxy_location=workflow_run.proxy_location,
+            )
+
+        # The CodeBlock auto-PBS path is intentionally NOT gated on browser_profile_id: a
+        # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
+        # profile is loaded into the auto-created session instead of skipping it.
+        if browser_session is None and browser_session_id is None:
+            browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
+                organization.organization_id,
+                workflow,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
                 proxy_location=workflow_run.proxy_location,
             )
 
@@ -6518,6 +6612,109 @@ class WorkflowService:
                 entries=task_archive_entries,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+
+    @staticmethod
+    def _regenerate_dispatch_draft_parameter_ids(definition: WorkflowDefinition, workflow_id: str) -> None:
+        """Regenerate the persisted-row parameter ids (WorkflowParameter, OutputParameter) on a
+        definition so they can be inserted under a new workflow_id without colliding on the global
+        parameter primary keys (the source workflow shares those ids). The subsequent
+        update_workflow_definition reconcile creates the rows from these ids and rebinds each
+        block's output_parameter to the regenerated instance by key. Other parameter kinds
+        (credential / secret / context) live only in the JSON definition and are resolved by
+        field/key at runtime, so they keep their ids.
+
+        The caller passes a deep copy of the definition; the shared ctx.staged_workflow /
+        runtime_workflow object must not be mutated.
+        """
+        for parameter in definition.parameters:
+            if isinstance(parameter, WorkflowParameter):
+                parameter.workflow_id = workflow_id
+                parameter.workflow_parameter_id = generate_workflow_parameter_id()
+            elif isinstance(parameter, OutputParameter):
+                parameter.workflow_id = workflow_id
+                parameter.output_parameter_id = generate_output_parameter_id()
+
+    async def create_copilot_dispatch_draft_version(
+        self,
+        *,
+        runtime_workflow: Workflow,
+        organization_id: str,
+    ) -> Workflow:
+        """Persist ``runtime_workflow`` (the copilot's wrapped test definition) as a real new
+        workflow version that the dispatched run resolves by ``run.workflow_id``.
+
+        Uses the normal create machinery: an empty version row is created, then
+        update_workflow_definition reconciles fresh WorkflowParameter / OutputParameter ROWS for
+        the new version and aligns block output-parameter references. Parameter ids are
+        regenerated per-version on a DEEP COPY of the definition (the source ids would collide on
+        the global parameter PKs, and the shared ctx.staged_workflow / runtime_workflow object
+        must not be mutated). The returned (reloaded) version carries the regenerated ids; the
+        caller maps post-run output values against it. The version is created as auto_generated
+        and is soft-deleted by the caller once the run reaches a terminal state.
+        """
+        # next_version is computed including soft-deleted rows: a soft-deleted version still
+        # reserves its number under the unique (org, permanent_id, version) constraint, so
+        # filtering deleted rows here would recompute a taken number and IntegrityError.
+        latest = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+            organization_id=organization_id,
+            filter_deleted=False,
+        )
+        next_version = (latest.version if latest else 0) + 1
+        dispatch_definition = runtime_workflow.workflow_definition.model_copy(deep=True)
+        placeholder = await self.create_workflow(
+            title=runtime_workflow.title,
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+            organization_id=organization_id,
+            workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+            version=next_version,
+            status=WorkflowStatus.auto_generated,
+            description=runtime_workflow.description,
+            proxy_location=runtime_workflow.proxy_location,
+            webhook_callback_url=runtime_workflow.webhook_callback_url,
+            totp_verification_url=runtime_workflow.totp_verification_url,
+            totp_identifier=runtime_workflow.totp_identifier,
+            persist_browser_session=runtime_workflow.persist_browser_session,
+            browser_profile_id=runtime_workflow.browser_profile_id,
+            browser_profile_key=runtime_workflow.browser_profile_key,
+            model=runtime_workflow.model,
+            max_screenshot_scrolling_times=runtime_workflow.max_screenshot_scrolls,
+            max_elapsed_time_minutes=runtime_workflow.max_elapsed_time_minutes,
+            extra_http_headers=runtime_workflow.extra_http_headers,
+            cdp_connect_headers=runtime_workflow.cdp_connect_headers,
+            run_with=runtime_workflow.run_with,
+            ai_fallback=runtime_workflow.ai_fallback,
+            code_version=runtime_workflow.code_version,
+            run_sequentially=runtime_workflow.run_sequentially or False,
+            sequential_key=runtime_workflow.sequential_key,
+            adaptive_caching=runtime_workflow.adaptive_caching,
+            generate_script_on_terminal=runtime_workflow.generate_script_on_terminal,
+            folder_id=runtime_workflow.folder_id,
+            is_saved_task=runtime_workflow.is_saved_task,
+        )
+        try:
+            self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
+            return await self.update_workflow_definition(
+                workflow_id=placeholder.workflow_id,
+                organization_id=organization_id,
+                workflow_definition=dispatch_definition,
+            )
+        except Exception:
+            # The placeholder row already exists as the latest version; if definition
+            # persistence fails, soft-delete it so it does not linger as the latest pointer.
+            try:
+                await app.DATABASE.workflows.soft_delete_workflow_by_id(
+                    workflow_id=placeholder.workflow_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to clean up partial copilot dispatch version after persistence error",
+                    workflow_id=placeholder.workflow_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+            raise
 
     async def make_workflow_definition(
         self,

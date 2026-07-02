@@ -6,16 +6,28 @@ import { create } from "zustand";
  */
 type StudioBrowserState = {
   streamUrl: string | null;
+  hasUnseenActivity: boolean;
   reloadNonce: number;
   setStreamUrl: (url: string | null) => void;
+  markActivity: () => void;
+  clearActivity: () => void;
   reload: () => void;
   reset: () => void;
 };
 
 export const useStudioBrowserStore = create<StudioBrowserState>()((set) => ({
   streamUrl: null,
+  hasUnseenActivity: false,
   reloadNonce: 0,
   setStreamUrl: (streamUrl) => set({ streamUrl }),
+  markActivity: () =>
+    set((state) =>
+      state.hasUnseenActivity ? state : { hasUnseenActivity: true },
+    ),
+  clearActivity: () =>
+    set((state) =>
+      state.hasUnseenActivity ? { hasUnseenActivity: false } : state,
+    ),
   reload: () => set((state) => ({ reloadNonce: state.reloadNonce + 1 })),
-  reset: () => set({ streamUrl: null }),
+  reset: () => set({ streamUrl: null, hasUnseenActivity: false }),
 }));

@@ -38,7 +38,7 @@ export function StudioRoute() {
   }
   return (
     <Navigate
-      to={`/workflows/${workflowPermanentId}/edit${location.search}`}
+      to={`/agents/${workflowPermanentId}/edit${location.search}`}
       state={location.state}
       replace
     />
@@ -56,7 +56,7 @@ export function EditRoute() {
   if (studioEnabled) {
     return (
       <Navigate
-        to={`/workflows/${workflowPermanentId}/studio${location.search}`}
+        to={`/agents/${workflowPermanentId}/studio${location.search}`}
         state={location.state}
         replace
       />
