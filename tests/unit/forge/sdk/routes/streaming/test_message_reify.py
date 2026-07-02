@@ -131,6 +131,29 @@ class TestReifyChannelMessage:
         assert isinstance(msg, MessageInBeginExfiltration)
         assert msg.supports_interpretation_deltas is True
 
+    def test_begin_exfiltration_defaults_no_recording_attempt_id(self) -> None:
+        msg = reify_channel_message(
+            {
+                "kind": "begin-exfiltration",
+                "workflow_permanent_id": "wpid_123",
+                "live_interpretation_enabled": True,
+            }
+        )
+        assert isinstance(msg, MessageInBeginExfiltration)
+        assert msg.recording_attempt_id is None
+
+    def test_begin_exfiltration_carries_recording_attempt_id(self) -> None:
+        msg = reify_channel_message(
+            {
+                "kind": "begin-exfiltration",
+                "workflow_permanent_id": "wpid_123",
+                "live_interpretation_enabled": True,
+                "recording_attempt_id": "attempt-abc",
+            }
+        )
+        assert isinstance(msg, MessageInBeginExfiltration)
+        assert msg.recording_attempt_id == "attempt-abc"
+
     def test_recording_rearm_capture(self) -> None:
         assert isinstance(
             reify_channel_message({"kind": "recording-rearm-capture"}),
