@@ -157,28 +157,33 @@ def unwrap_goal_fields(
     complete_criterion: str | None = None,
     terminate_criterion: str | None = None,
 ) -> UnwrappedGoals:
-    """Reduce MINI_GOAL_TEMPLATE-wrapped fields to their mini goals plus one
-    shared big-goal context for completion verification. Wrapping applies one
-    user message across all fields, so the first wrapped field's main goal
-    wins. Unwrapped fields pass through untouched and ``big_goal_context``
-    stays ``None`` so the verify prompts render byte-identical to today."""
+    """Reduce MINI_GOAL_TEMPLATE-wrapped fields to their mini goals plus one shared
+    big-goal context (first wrapped field's main goal wins). Unwrapped fields pass
+    through untouched, keeping the verify prompts byte-identical to today."""
     big_goal: str | None = None
-    minis: list[str | None] = []
-    for value in (navigation_goal, complete_criterion, terminate_criterion):
+
+    def unwrap_one(value: str | None) -> str | None:
+        nonlocal big_goal
         if not value:
-            minis.append(value)
-            continue
+            return value
         parts = _extract_wrapped_goal(value)
         if parts is None:
-            minis.append(value)
-            continue
+            return value
         mini_goal, main_goal = parts
-        minis.append(mini_goal)
         if big_goal is None:
             big_goal = main_goal
         elif main_goal != big_goal:
-            LOG.debug("Wrapped goal fields carry mismatched main goals; first wins")
-    unwrapped_navigation_goal, unwrapped_complete_criterion, unwrapped_terminate_criterion = minis
+            # Goal text can carry user-typed content; log shape only, never the strings.
+            LOG.debug(
+                "Wrapped goal fields carry mismatched main goals; first wins",
+                first_main_goal_length=len(big_goal),
+                conflicting_main_goal_length=len(main_goal),
+            )
+        return mini_goal
+
+    unwrapped_navigation_goal = unwrap_one(navigation_goal)
+    unwrapped_complete_criterion = unwrap_one(complete_criterion)
+    unwrapped_terminate_criterion = unwrap_one(terminate_criterion)
     return UnwrappedGoals(
         unwrapped_navigation_goal, unwrapped_complete_criterion, unwrapped_terminate_criterion, big_goal
     )

@@ -678,3 +678,115 @@ async def test_recovery_block_finalized_to_non_completed_status(monkeypatch: pyt
 
     assert result is not None and result.success is False
     assert any(u.get("status") == BlockStatus.terminated for u in state["recovery_block_updates"])
+
+
+@pytest.mark.asyncio
+async def test_mid_block_failure_composes_remaining_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="open the portal", line_start=1, line_end=1),
+            CodeBlockStep(description="click the invoices tab", line_start=2, line_end=2),
+            CodeBlockStep(description="download the latest invoice", line_start=3, line_end=3),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "click the invoices tab" in goal
+    assert "Then: download the latest invoice" in goal
+    # steps before the failure already ran as code — they must not be re-demanded.
+    assert "open the portal" not in goal
+    assert DEFAULT_PROMPT in goal
+
+
+@pytest.mark.asyncio
+async def test_last_step_failure_keeps_single_step_goal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="open the portal", line_start=1, line_end=1),
+            CodeBlockStep(description="download the latest invoice", line_start=2, line_end=2),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "download the latest invoice" in goal
+    assert "Then:" not in goal
+
+
+@pytest.mark.asyncio
+async def test_remaining_steps_without_descriptions_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="click the invoices tab", line_start=1, line_end=1),
+            CodeBlockStep(description=None, line_start=2, line_end=2),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "click the invoices tab" in goal
+    assert "Then:" not in goal
+
+
+@pytest.mark.asyncio
+async def test_remaining_step_descriptions_are_masked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="open the portal", line_start=1, line_end=1),
+            CodeBlockStep(description=f"submit token {SECRET_VALUE}", line_start=2, line_end=2),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(with_secret=True), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "open the portal" in goal
+    assert "Then:" in goal
+    assert SECRET_VALUE not in goal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "steps",
+    [
+        pytest.param([CodeBlockStep(description="download", line_start=1, line_end=1)], id="matched_step"),
+        pytest.param(None, id="bare_prompt"),
+    ],
+)
+async def test_escalation_task_verifies_with_action_history(
+    monkeypatch: pytest.MonkeyPatch, steps: list[CodeBlockStep] | None
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=steps)
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["include_action_history_in_verification"] is True
