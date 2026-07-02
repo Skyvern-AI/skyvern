@@ -431,7 +431,7 @@ function NodeHeader({
         throw new ValidationFailureError();
       }
 
-      await saveWorkflow.mutateAsync();
+      await saveWorkflow.mutateAsync(undefined);
 
       if (!workflowPermanentId) {
         log.error("Run block: there is no workflowPermanentId");

@@ -24,6 +24,7 @@ export type WorkflowStartNodeData = {
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
   workflowSystemPrompt: string | null;
+  errorCodeMapping: Record<string, string> | null;
   label: "__start_block__";
   showCode: boolean;
 };

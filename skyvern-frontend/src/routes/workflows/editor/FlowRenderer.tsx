@@ -21,6 +21,10 @@ import {
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import {
+  commitYamlDraft,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -973,6 +977,11 @@ function FlowRenderer({
   }, [constructSaveData, readOnly]);
 
   async function handleSave(): Promise<boolean> {
+    // With the YAML editor open (e.g. the nav-blocker "Save changes" dialog),
+    // persist the parsed draft directly instead of the stale pre-edit canvas.
+    if (useWorkflowYamlEditorStore.getState().active) {
+      return commitYamlDraft(true);
+    }
     // Validate before saving; block if any workflow errors exist
     const errors = getWorkflowErrors(nodes);
     if (errors.length > 0) {
@@ -989,7 +998,7 @@ function FlowRenderer({
       });
       return false;
     }
-    await saveWorkflow.mutateAsync();
+    await saveWorkflow.mutateAsync(undefined);
     return true;
   }
 

@@ -34,20 +34,10 @@ import { EditableNodeTitle } from "../editor/nodes/components/EditableNodeTitle"
 import { EditorOverflowMenu } from "../editor/header/EditorOverflowMenu";
 import { MakeACopyButton } from "../editor/MakeACopyButton";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
-import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { runOutcomeFromStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
-
-function useIsGlobalWorkflow(): boolean {
-  const { workflowPermanentId } = useParams();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  return Boolean(
-    globalWorkflows?.some(
-      (w) => w.workflow_permanent_id === workflowPermanentId,
-    ),
-  );
-}
 
 function TitleSection({ editable = true }: { editable?: boolean }) {
   const { title, setTitle } = useWorkflowTitleStore();

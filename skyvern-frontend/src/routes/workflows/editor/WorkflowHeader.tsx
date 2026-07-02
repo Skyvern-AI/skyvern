@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/tooltip";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { MakeACopyButton } from "./MakeACopyButton";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -37,16 +38,6 @@ import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
-
-function useIsGlobalWorkflow(): boolean {
-  const { workflowPermanentId } = useParams();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  return Boolean(
-    globalWorkflows?.some(
-      (w) => w.workflow_permanent_id === workflowPermanentId,
-    ),
-  );
-}
 
 function GeneratingCodeButton() {
   const showAllCode = useShowAllCodeStore((s) => s.showAllCode);
