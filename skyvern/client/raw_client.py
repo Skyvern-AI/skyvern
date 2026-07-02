@@ -2562,6 +2562,7 @@ class RawSkyvern:
     def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -2575,6 +2576,9 @@ class RawSkyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional URL to open when the standalone browser session starts.
+
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
@@ -2639,6 +2643,7 @@ class RawSkyvern:
             "v1/browser_sessions",
             method="POST",
             json={
+                "url": url,
                 "timeout": timeout,
                 "proxy_location": convert_and_respect_annotation_metadata(
                     object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
@@ -6414,6 +6419,7 @@ class AsyncRawSkyvern:
     async def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -6427,6 +6433,9 @@ class AsyncRawSkyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional URL to open when the standalone browser session starts.
+
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
@@ -6491,6 +6500,7 @@ class AsyncRawSkyvern:
             "v1/browser_sessions",
             method="POST",
             json={
+                "url": url,
                 "timeout": timeout,
                 "proxy_location": convert_and_respect_annotation_metadata(
                     object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"

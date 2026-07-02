@@ -7,6 +7,7 @@ from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
 from skyvern.services.browser_recording.types import RecordingDraftStep
+from skyvern.utils.url_validators import validate_url
 
 MIN_TIMEOUT = 5
 MAX_TIMEOUT = 60 * 24  # 24 hours
@@ -14,6 +15,18 @@ DEFAULT_TIMEOUT = 60
 
 
 class CreateBrowserSessionRequest(BaseModel):
+    url: str | None = Field(
+        default=None,
+        description="Optional URL to open when the standalone browser session starts.",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_start_url(cls, value: str | None) -> str | None:
+        if not value:
+            return value
+        return validate_url(value)
+
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
         description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",

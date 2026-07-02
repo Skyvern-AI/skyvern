@@ -9265,6 +9265,18 @@
       },
       "CreateBrowserSessionRequest": {
         "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Optional URL to open when the standalone browser session starts."
+          },
           "timeout": {
             "anyOf": [
               {
