@@ -17,7 +17,7 @@ from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Response, TimeoutError
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -322,26 +322,64 @@ def _select_shadow_candidates_from_elements(elements: list[dict]) -> list[dict[s
     return candidates
 
 
+SELECT_SHADOW_MATCH_FIELD_MAX_CHARS = 120
+
+
+def _truncate_select_shadow_field(text: str | None) -> str | None:
+    if text is None:
+        return None
+    if len(text) <= SELECT_SHADOW_MATCH_FIELD_MAX_CHARS:
+        return text
+    return text[:SELECT_SHADOW_MATCH_FIELD_MAX_CHARS] + "…"
+
+
+class SelectShadowAgreement(BaseModel):
+    agrees: bool | None
+    llm_index: int | None = None
+    llm_value: str | None = None
+    llm_element_id: str | None = None
+
+    # Fields come straight from LLM JSON; malformed values must never drop the shadow event.
+    @field_validator("llm_value", "llm_element_id", mode="before")
+    @classmethod
+    def _coerce_llm_text(cls, value: Any) -> str | None:
+        return None if value is None else str(value)
+
+    @field_validator("llm_index", mode="before")
+    @classmethod
+    def _coerce_llm_index(cls, value: Any) -> int | None:
+        if value is None or isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except ValueError:
+            return None
+
+
 def _select_shadow_agrees_with_native_choice(
     candidates: list[dict[str, str | None]],
     matched_index: int | None,
     *,
     llm_index: int | None,
     llm_value: str | None,
-) -> bool | None:
+) -> SelectShadowAgreement:
+    agreement = SelectShadowAgreement(agrees=None, llm_index=llm_index, llm_value=llm_value)
     if matched_index is None:
-        return False
+        agreement.agrees = False
+        return agreement
     if llm_index is not None:
-        return matched_index == llm_index
+        agreement.agrees = matched_index == llm_index
+        return agreement
     if llm_value is None or matched_index >= len(candidates):
-        return None
+        return agreement
 
     matched_candidate = candidates[matched_index]
     llm_value_norm = _normalize_select_shadow_text(llm_value)
-    return llm_value_norm in {
+    agreement.agrees = llm_value_norm in {
         _normalize_select_shadow_text(matched_candidate.get("label")),
         _normalize_select_shadow_text(matched_candidate.get("value")),
     }
+    return agreement
 
 
 def _select_shadow_agrees_with_element_choice(
@@ -350,19 +388,25 @@ def _select_shadow_agrees_with_element_choice(
     *,
     llm_element_id: str | None,
     llm_value: str | None,
-) -> bool | None:
+) -> SelectShadowAgreement:
+    agreement = SelectShadowAgreement(agrees=None, llm_value=llm_value, llm_element_id=llm_element_id)
     if matched_index is None:
-        return False
+        agreement.agrees = False
+        return agreement
     if matched_index >= len(candidates):
-        return None
+        return agreement
 
     matched_candidate = candidates[matched_index]
     matched_element_id = matched_candidate.get("element_id")
     if matched_element_id and llm_element_id:
-        return matched_element_id == llm_element_id
+        agreement.agrees = matched_element_id == llm_element_id
+        return agreement
     if llm_value is None:
-        return None
-    return _normalize_select_shadow_text(matched_candidate.get("label")) == _normalize_select_shadow_text(llm_value)
+        return agreement
+    agreement.agrees = _normalize_select_shadow_text(matched_candidate.get("label")) == _normalize_select_shadow_text(
+        llm_value
+    )
+    return agreement
 
 
 def _log_select_shadow_match(
@@ -370,7 +414,7 @@ def _log_select_shadow_match(
     prompt_name: str,
     target_value: str | None,
     get_candidates: Callable[[], list[dict[str, str | None]]],
-    agreement: Callable[[list[dict[str, str | None]], int | None], bool | None],
+    agreement: Callable[[list[dict[str, str | None]], int | None], SelectShadowAgreement],
 ) -> None:
     if not _select_shadow_match_enabled():
         return
@@ -379,13 +423,29 @@ def _log_select_shadow_match(
         candidates = get_candidates()
         option_labels = [candidate["label"] or "" for candidate in candidates]
         matched_index, tier = classify_option_match(target_value, option_labels)
+        result = agreement(candidates, matched_index)
+        disagreement_fields: dict[str, Any] = {}
+        if matched_index is not None and result.agrees is not True:
+            matched_candidate = candidates[matched_index] if matched_index < len(candidates) else {}
+            disagreement_fields = {
+                "target_value": _truncate_select_shadow_field(target_value),
+                "matched_index": matched_index,
+                "matched_label": _truncate_select_shadow_field(matched_candidate.get("label")),
+                "matched_value": _truncate_select_shadow_field(matched_candidate.get("value")),
+                "matched_element_id": matched_candidate.get("element_id"),
+                "llm_index": result.llm_index,
+                "llm_value": _truncate_select_shadow_field(result.llm_value),
+                "llm_element_id": result.llm_element_id,
+            }
+            disagreement_fields = {key: value for key, value in disagreement_fields.items() if value is not None}
         LOG.info(
             "select_shadow_match",
             prompt_name=prompt_name,
             option_count=len(option_labels),
             match_tier=tier,
             match_found=matched_index is not None,
-            match_agrees_with_llm=agreement(candidates, matched_index),
+            match_agrees_with_llm=result.agrees,
+            **disagreement_fields,
         )
     except Exception:
         LOG.debug("select_shadow_match failed", exc_info=True)
