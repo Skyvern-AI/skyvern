@@ -13,7 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
@@ -47,6 +47,7 @@ BuildTestOutcomeReasonCode = Literal[
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
     "metadata_reject",
+    "output_policy_reject",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
@@ -781,6 +782,8 @@ def _missing_requested_output_facts(
     for verdict in completion_verification.verdicts:
         if verdict.satisfied or not verdict.output_path:
             continue
+        if _has_presence_only_output_evidence(verdict):
+            continue
         output_path = _bounded_ref(verdict.output_path)
         output_root = _output_path_root(output_path)
         if not output_root:
@@ -803,6 +806,15 @@ def _missing_requested_output_facts(
             fact["partial_output_block_labels"] = partial_labels
         facts.append(fact)
     return sorted(facts, key=lambda item: str(item.get("output_path") or ""))
+
+
+def _has_presence_only_output_evidence(verdict: CriterionVerdict) -> bool:
+    return (
+        verdict.reason_code == "structurally_abstained"
+        and verdict.grounding_mode == "missing"
+        and isinstance(verdict.evidence_ref, str)
+        and bool(verdict.evidence_ref.strip())
+    )
 
 
 def _output_path_root(output_path: str) -> str:

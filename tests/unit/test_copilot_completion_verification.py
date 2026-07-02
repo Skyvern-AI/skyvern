@@ -2647,10 +2647,15 @@ def _requested_output_result(output: Any) -> dict:
 
 def _metadata_for_requested_paths(*paths: str) -> dict[str, Any]:
     return {
-        "extract_profile": {
+        label: {
             "claimed_outcomes": [{"goal_value_paths": list(paths)}],
             "terminal_verifier_expectations": [{"goal_value_paths": list(paths)}],
         }
+        for label in (
+            "extract_profile",
+            "utility_citrus_turn_on",
+            "utility_peach_gas_quickconnect",
+        )
     }
 
 
@@ -4603,7 +4608,335 @@ async def test_requested_output_path_exact_runtime_field_with_expected_value_sat
     assert "1234567890" not in repr(trace)
 
 
-def test_requested_output_path_without_expected_value_structurally_abstains_for_present_values() -> None:
+@pytest.mark.asyncio
+async def test_requested_output_typed_block_fields_do_not_admit_undeclared_returned_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("typed requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("address", "credentialing_status", "locations")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_address",
+                outcome="The returned profile includes address.",
+                output_path="output.address",
+                expected_output_value="101 Example Ave",
+            ),
+            CompletionCriterion(
+                id="c_credentialing_status",
+                outcome="The returned profile includes credentialing status.",
+                output_path="output.credentialing_status",
+                expected_output_value="Active",
+            ),
+            CompletionCriterion(
+                id="c_locations",
+                outcome="The returned profile includes location address.",
+                output_path="output.locations.address",
+                expected_output_value="101 Example Ave",
+            ),
+            CompletionCriterion(
+                id="c_statuses",
+                outcome="The returned profile includes statuses.",
+                output_path="output.statuses",
+                expected_output_value="Active",
+            ),
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _requested_output_result(
+            {
+                "address": "101 Example Ave",
+                "credentialing_status": "Active",
+                "locations": [{"address": "101 Example Ave"}],
+                "statuses": ["Active"],
+            }
+        ),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert {verdict.criterion_id for verdict in verification.verdicts if verdict.satisfied} == {
+        "c_address",
+        "c_credentialing_status",
+        "c_locations",
+    }
+    statuses = next(verdict for verdict in verification.verdicts if verdict.criterion_id == "c_statuses")
+    assert statuses.state == "unsatisfied"
+    assert statuses.reason_code == "unproducible"
+    assert statuses.evidence_ref is None
+    assert {
+        verdict.evidence_ref for verdict in verification.verdicts if verdict.criterion_id in {"c_address", "c_statuses"}
+    } == {"block_outputs:extract_profile.address", None}
+
+
+def test_requested_output_nested_declared_output_root_maps_to_requested_output_path() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("profile.address")
+    criteria = [
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned profile includes address.",
+            output_path="output.address",
+            expected_output_value="101 Example Ave",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"extract_profile": {"profile": {"address": "101 Example Ave"}}}),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_ref == "block_outputs:extract_profile.profile.address"
+
+
+@pytest.mark.parametrize(
+    ("accepted_payload", "expected_reason", "expected_ref"),
+    [
+        ({"address": "Wrong Example Ave"}, "evidence_contradicts", "block_outputs:extract_profile.address"),
+        ({"status": "active"}, "missing_exact_field", None),
+    ],
+)
+def test_requested_output_ignores_unrelated_block_outputs_when_matching_values(
+    accepted_payload: dict[str, str],
+    expected_reason: str,
+    expected_ref: str | None,
+) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("address")
+    criteria = [
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned profile includes address.",
+            output_path="output.address",
+            expected_output_value="101 Example Ave",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "extract_profile": accepted_payload,
+                "unrelated_lookup": {"address": "101 Example Ave"},
+            }
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == expected_reason
+    assert verdicts[0].evidence_ref == expected_ref
+
+
+def test_requested_output_evidence_text_with_expected_value_does_not_satisfy() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("address")
+    criteria = [
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned profile includes address.",
+            output_path="output.address",
+            expected_output_value="101 Example Ave",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"extract_profile": {"evidence_text": "Address: 101 Example Ave"}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+
+
+def test_requested_output_roots_do_not_satisfy_from_executed_block_output_without_static_metadata_roots() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {}
+    criteria = [
+        CompletionCriterion(
+            id="c_npi",
+            outcome="The returned profile includes NPI.",
+            output_path="output.npi",
+            expected_output_value="1234567890",
+        ),
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned profile includes address.",
+            output_path="output.address",
+            expected_output_value="101 Example Ave",
+        ),
+        CompletionCriterion(
+            id="c_credentialing_status",
+            outcome="The returned profile includes credentialing status.",
+            output_path="output.credentialing_status",
+            expected_output_value="Active",
+        ),
+        CompletionCriterion(
+            id="c_locations",
+            outcome="The returned profile includes locations.",
+            output_path="output.locations.address",
+            expected_output_value="101 Example Ave",
+        ),
+        CompletionCriterion(
+            id="c_statuses",
+            outcome="The returned profile includes statuses.",
+            output_path="output.statuses",
+            expected_output_value="Active",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            executed_block_labels=["extract_profile"],
+            block_outputs={
+                "extract_profile": {
+                    "npi": "1234567890",
+                    "address": "101 Example Ave",
+                    "credentialing_status": "Active",
+                    "locations": [{"address": "101 Example Ave"}],
+                    "statuses": ["Active"],
+                }
+            },
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {
+        "c_npi",
+        "c_address",
+        "c_credentialing_status",
+        "c_locations",
+        "c_statuses",
+    }
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"unproducible"}
+    assert all(verdict.evidence_ref is None for verdict in verdicts)
+
+
+def test_requested_output_roots_without_expected_values_abstain_from_runtime_presence() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("address", "statuses")
+    criteria = [
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned profile includes address.",
+            output_path="output.address",
+        ),
+        CompletionCriterion(
+            id="c_statuses",
+            outcome="The returned profile includes statuses.",
+            output_path="output.statuses",
+        ),
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            executed_block_labels=["extract_profile"],
+            block_outputs={"extract_profile": {"address": "101 Example Ave", "statuses": ["Active"]}},
+        ),
+    )
+
+    assert {verdict.criterion_id for verdict in verdicts} == {"c_address", "c_statuses"}
+    assert {verdict.state for verdict in verdicts} == {"unsatisfied"}
+    assert {verdict.reason_code for verdict in verdicts} == {"structurally_abstained"}
+    assert {verdict.evidence_ref for verdict in verdicts} == {
+        "block_outputs:extract_profile.address",
+        "block_outputs:extract_profile.statuses",
+    }
+
+
+def test_requested_output_executed_root_admission_ignores_evidence_text_only_values() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {}
+    criteria = [
+        CompletionCriterion(
+            id="c_npi",
+            outcome="The returned profile includes NPI.",
+            output_path="output.npi",
+            expected_output_value="1234567890",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            executed_block_labels=["extract_profile"],
+            block_outputs={"extract_profile": {"evidence_text": "The provider NPI is 1234567890."}},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "unproducible"
+
+
+def test_requested_output_executed_root_admission_ignores_unexecuted_block_outputs() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {}
+    criteria = [
+        CompletionCriterion(
+            id="c_address",
+            outcome="The returned profile includes address.",
+            output_path="output.address",
+            expected_output_value="101 Example Ave",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            executed_block_labels=["extract_profile"],
+            block_outputs={
+                "extract_profile": {"status": "Active"},
+                "unrelated_lookup": {"address": "101 Example Ave"},
+            },
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "unproducible"
+
+
+def test_requested_output_missing_metadata_and_runtime_field_fails_closed() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("address")
+    criteria = [
+        CompletionCriterion(
+            id="c_statuses",
+            outcome="The returned profile includes statuses.",
+            output_path="output.statuses",
+            expected_output_value="Active",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"extract_profile": {"address": "101 Example Ave"}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "unproducible"
+    assert verdicts[0].missing_evidence == "accepted code artifact metadata does not declare output.statuses"
+
+
+def test_requested_output_path_without_expected_value_abstains_for_present_typed_values() -> None:
     ctx = _run_ctx()
     ctx.code_artifact_metadata = _metadata_for_requested_paths(
         "request_id",
@@ -4724,7 +5057,11 @@ def test_requested_output_shape_only_generated_fields_structurally_abstain_witho
     assert trace["verdict_0_has_exact_value"] is False
     assert "WTR-1842-DEMO" not in repr(trace)
     assert trace["fully_satisfied"] is False
-    assert trace["unmet_criterion_ids"] == []
+    assert trace["unmet_criterion_ids"] == [
+        "c_confirmation_number",
+        "c_account_number",
+        "c_selected_start_date",
+    ]
 
 
 def test_requested_output_shape_abstains_on_p8_scrambled_values_and_ignores_evidence_text_status() -> None:
@@ -5751,6 +6088,165 @@ async def test_requested_output_path_can_use_static_return_key_contract(
 
 
 @pytest.mark.asyncio
+async def test_requested_output_path_can_use_static_return_contract_without_matching_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("static requested-output evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "story")
+    ctx.code_artifact_metadata = {
+        "stale_extract": _metadata_for_requested_paths("top_post_identified")["extract_profile"]
+    }
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: story
+              code: |
+                return {"top_post_identified": True}
+        """
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_top_post",
+                outcome="The top Hacker News post is identified.",
+                output_path="output.top_post_identified",
+                expected_output_value="true",
+            )
+        ]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_hn",
+                "overall_status": "completed",
+                "executed_block_labels": ["story"],
+                "blocks": [
+                    {
+                        "label": "story",
+                        "block_type": "CODE",
+                        "status": "completed",
+                        "extracted_data": {"top_post_identified": True},
+                    }
+                ],
+            },
+        },
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.verdicts[0].evidence_ref == "block_outputs:story.top_post_identified"
+
+
+def test_requested_output_path_dynamic_return_without_metadata_does_not_admit_runtime_output() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: story
+              code: |
+                return await extract_top_post()
+        """
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_top_post",
+            outcome="The top Hacker News post is identified.",
+            output_path="output.top_post_identified",
+            expected_output_value="true",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"story": {"top_post_identified": True}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "unproducible"
+    assert verdicts[0].evidence_ref is None
+
+
+def test_requested_output_static_contract_scopes_runtime_evidence_to_same_label() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: story
+              code: |
+                return {"top_post_identified": False}
+        """
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_top_post",
+            outcome="The top Hacker News post is identified.",
+            output_path="output.top_post_identified",
+            expected_output_value="true",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"unrelated_lookup": {"top_post_identified": True}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_ref is None
+
+
+def test_requested_output_runtime_debug_output_does_not_create_projection_contract() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {}
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_profile
+              code: |
+                return {"npi": await page.locator("#npi").inner_text()}
+        """
+    )
+    criteria = [
+        CompletionCriterion(
+            id="c_npi",
+            outcome="The NPI is returned.",
+            output_path="output.npi",
+            expected_output_value="1234567890",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(block_outputs={"extract_profile": {"debug_output": {"npi": "1234567890"}}}),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_ref is None
+
+
+@pytest.mark.asyncio
 async def test_requested_output_path_can_use_static_list_return_key_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5832,7 +6328,7 @@ async def test_requested_output_criteria_are_not_sent_to_judge(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_present_generic_requested_output_without_expected_value_abstains_without_vetoing_run_success(
+async def test_present_generic_requested_output_without_expected_value_structurally_abstains(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def handler(**_: object) -> dict:
@@ -5865,14 +6361,21 @@ async def test_present_generic_requested_output_without_expected_value_abstains_
     )
 
     assert verification is not None
-    assert verification.is_fully_satisfied() is True
     verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
     assert verdicts["c_customer_name"].reason_code == "structurally_abstained"
+    assert verdicts["c_customer_name"].satisfied is False
     assert verdicts["c_submit"].reason_code == "evidence_confirms"
+    assert verification.is_fully_satisfied() is True
+    trace = verification.to_trace_data()
+    assert trace["unmet_criterion_ids"] == ["c_customer_name"]
+    assert trace["verdict_0_missing_evidence"] == (
+        "requested-output field is present, but the criterion lacks typed expected_output_value or "
+        "expected_output_shape to prove the value"
+    )
 
 
 @pytest.mark.asyncio
-async def test_all_abstained_requested_outputs_do_not_satisfy_completion(
+async def test_present_requested_output_without_expected_value_cannot_satisfy_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fail_handler(**_: object) -> object:
@@ -6064,7 +6567,7 @@ async def test_unfired_contingent_requested_output_miss_does_not_veto_satisfied_
         ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
         output = {"status": "DONE", "blocker": False}
     else:
-        output = {"status": "DONE", "blocker": False, "npi": "1234567890"}
+        output = {"status": "DONE", "blocker": False}
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
             _criterion(
@@ -6104,7 +6607,7 @@ async def test_fired_contingent_requested_output_miss_still_vetoes(
         ctx.code_artifact_metadata = _metadata_for_requested_paths("npi")
         output = {"status": "DONE", "blocker": True}
     else:
-        output = {"status": "DONE", "blocker": True, "npi": "1234567890"}
+        output = {"status": "DONE", "blocker": True}
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
             _criterion(

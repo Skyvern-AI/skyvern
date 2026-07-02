@@ -369,6 +369,105 @@ def test_not_evaluated_recorded_outcome_is_not_authoritative_repair_failure() ->
     assert outcome.is_authoritative is False
 
 
+def test_outcome_not_demonstrated_does_not_mark_presence_only_abstention_as_missing_output() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_top_post",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "extract_top_hn_post",
+                    "status": "completed",
+                    "extracted_data": {"output": {"top_post": "Claude Sonnet 5"}},
+                }
+            ],
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["top_post"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="top_post",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                output_path="output.top_post",
+                grounding_mode="missing",
+                evidence_ref="block_outputs:extract_top_hn_post.output.top_post",
+            )
+        ],
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_top_post",
+        ),
+        completion_verification=verification,
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.is_authoritative is True
+    assert outcome.missing_requested_output_facts == []
+
+
+def test_outcome_not_demonstrated_keeps_missing_fact_for_absent_requested_output() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_no_top_post",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "extract_top_hn_post",
+                    "status": "completed",
+                    "extracted_data": {"output": {}},
+                }
+            ],
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["top_post"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="top_post",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                output_path="output.top_post",
+                grounding_mode="missing",
+            )
+        ],
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_no_top_post",
+        ),
+        completion_verification=verification,
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.missing_requested_output_facts == [
+        {
+            "criterion_id": "top_post",
+            "output_path": "output.top_post",
+            "output_root": "output",
+            "reason_code": "no_evidence",
+            "value_status": "no_typed_value",
+            "grounding_mode": "missing",
+        }
+    ]
+
+
 def test_authoring_repair_context_produces_structural_recorded_outcome() -> None:
     context = CodeAuthoringRepairContext(
         block_label="search_records",
@@ -554,6 +653,40 @@ def test_metadata_reject_key_uses_typed_fields_not_wording() -> None:
     assert changed_label.structural_key != first.structural_key
     assert changed_required_field.structural_key != first.structural_key
     assert changed_missing_field.structural_key != first.structural_key
+
+
+def test_output_policy_reject_key_uses_stable_trace_payload() -> None:
+    payload = {
+        "surface": "tool_body",
+        "tool_name": "update_workflow",
+        "allowed": False,
+        "output_kind": "workflow_update_proposal",
+        "reason_codes": ["raw_secret_leak"],
+    }
+    first = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload=payload,
+        observed_evidence_summary="Output policy blocked this Copilot output before persistence.",
+    )
+    same_structure = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload=dict(payload),
+        observed_evidence_summary="Different wording for the same output-policy reject.",
+    )
+    changed_reason = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload={**payload, "reason_codes": ["unapproved_credential_reference"]},
+    )
+    changed_surface = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload={**payload, "surface": "final_response"},
+    )
+
+    assert first.reason_code == "output_policy_reject"
+    assert first.is_authoritative is True
+    assert first.structural_key == same_structure.structural_key
+    assert changed_reason.structural_key != first.structural_key
+    assert changed_surface.structural_key != first.structural_key
 
 
 def test_runtime_block_failure_outcome_includes_bounded_page_state_and_run_id() -> None:

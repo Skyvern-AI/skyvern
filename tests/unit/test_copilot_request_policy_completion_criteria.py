@@ -320,6 +320,54 @@ async def test_requested_output_criteria_preserve_stable_paths_without_derived_c
 
 
 @pytest.mark.asyncio
+async def test_resale_docs_requested_output_uses_explicit_document_name_and_blocks_terminal_record_fields() -> None:
+    policy = await _policy_for_message(
+        (
+            "I need a reusable workflow that retrieves the resale demand document name from the mock ResaleDocs Hub "
+            "order-status page. The confirmation number should be a reusable input; for this eval run use "
+            "DEMO-RESALE-1842. The workflow should look up the order, open the order-level View / Download document "
+            "list, choose the highest-priority HOA demand or resale statement document row, and output one "
+            "requested-output field named document_name containing the selected row's visible document name. Do not "
+            "include an exact expected value for document_name in the workflow output contract, and do not output "
+            "confirmation_number, order_id, request_id, submission_id, or a terminal-record identifier."
+        ),
+        [
+            {
+                "outcome": "The returned record includes visible document name.",
+                "output_path": "output.visible_document_name",
+            },
+            {
+                "outcome": "The returned record includes terminal record identifier.",
+                "output_path": "output.terminal_record_identifier",
+            },
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+            },
+            {
+                "outcome": "The returned record includes order id.",
+                "output_path": "output.order_id",
+            },
+        ],
+    )
+
+    assert [criterion.output_path for criterion in policy.completion_criteria] == ["output.document_name"]
+    assert policy.completion_criteria[0].expected_output_value is None
+    assert policy.completion_criteria[0].expected_output_shape is None
+
+
+@pytest.mark.asyncio
+async def test_named_customer_prose_does_not_become_requested_output_field_name() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with customer named Acme and status.",
+        [],
+    )
+
+    assert not _criteria_for_path(policy, "output.acme")
+    assert _criteria_for_path(policy, "output.status")
+
+
+@pytest.mark.asyncio
 async def test_requested_output_criteria_do_not_infer_shapes_from_generated_provider_field_names() -> None:
     policy = await _policy_for_message(
         "Return a final record with provider captured address, account number, requested date, status, "

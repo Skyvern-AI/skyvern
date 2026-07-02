@@ -11,7 +11,7 @@ import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Annotated, Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -1432,98 +1432,89 @@ def _candidate_missing_required_output_roots(
     code_artifact_metadata: object,
     *,
     required_roots: set[str],
-    runtime_produced_roots: set[str] | None = None,
 ) -> list[str]:
     if not required_roots:
         return []
-    declared_roots = set(_metadata_output_path_roots(code_artifact_metadata))
-    produced_roots = _workflow_yaml_produced_output_roots(workflow_yaml)
-    covered_roots = (declared_roots & produced_roots) | (runtime_produced_roots or set())
-    return sorted(required_roots - covered_roots)
-
-
-def _recorded_runtime_produced_output_roots(ctx: AgentContext, workflow_yaml: str) -> set[str]:
-    verified_outputs = getattr(ctx, "verified_block_outputs", None)
-    if not isinstance(verified_outputs, Mapping):
-        return set()
-    code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-    roots: set[str] = set()
-    for label, output in verified_outputs.items():
-        if not isinstance(label, str) or label not in code_block_labels:
+    declared_roots_by_label = {
+        label: set(roots) for label, roots in _metadata_output_path_roots_by_label(code_artifact_metadata).items()
+    }
+    produced_by_label = _workflow_yaml_produced_output_roots_by_label(workflow_yaml)
+    covered_roots: set[str] = set()
+    abstained_declared_roots: set[str] = set()
+    for label, declared_roots in declared_roots_by_label.items():
+        produced = produced_by_label.get(label)
+        if produced is None:
             continue
-        roots.update(_meaningful_runtime_output_roots(output))
-    return roots
+        covered_roots.update(declared_roots & produced.roots)
+        if produced.abstained:
+            abstained_declared_roots.update(declared_roots)
+    missing_roots = required_roots - covered_roots
+    if missing_roots:
+        missing_roots -= abstained_declared_roots
+    return sorted(missing_roots)
 
 
-def _meaningful_runtime_output_roots(value: object, *, prefix: str = "") -> set[str]:
-    roots: set[str] = set()
-    if isinstance(value, Mapping):
-        for raw_key, child in value.items():
-            if not isinstance(raw_key, str):
-                continue
-            key = raw_key.strip()
-            if not key or key == "evidence_text" or not _is_structural_runtime_output_key(key):
-                continue
-            path = f"{prefix}.{key}" if prefix else key
-            if _runtime_output_value_is_meaningful(child):
-                roots.add(path.split(".", 1)[0])
-                roots.update(_meaningful_runtime_output_roots(child, prefix=path))
-        return roots
-    if isinstance(value, list):
-        for item in value:
-            roots.update(_meaningful_runtime_output_roots(item, prefix=prefix))
-    return roots
+class _ProducedOutputRoots(NamedTuple):
+    roots: set[str]
+    abstained: bool = False
 
 
-def _runtime_output_value_is_meaningful(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, Mapping):
-        return any(_runtime_output_value_is_meaningful(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_runtime_output_value_is_meaningful(item) for item in value)
-    return True
+def _workflow_yaml_produced_output_roots_by_label(workflow_yaml: str) -> dict[str, _ProducedOutputRoots]:
+    return {
+        label: _code_block_produced_output_roots(str(block.get("code") or ""))
+        for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items()
+    }
 
 
-def _workflow_yaml_produced_output_roots(workflow_yaml: str) -> set[str]:
-    roots: set[str] = set()
-    for block in _workflow_yaml_code_blocks_by_label(workflow_yaml).values():
-        roots.update(_code_block_produced_output_roots(str(block.get("code") or "")))
-    return roots
-
-
-def _code_block_produced_output_roots(code: str) -> set[str]:
+def _code_block_produced_output_roots(code: str) -> _ProducedOutputRoots:
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
     except SyntaxError:
-        return set()
+        return _ProducedOutputRoots(set(), True)
     scope_statements = list(_iter_top_level_scope(tree.body))
     assigned_roots = _assigned_top_level_names(tree.body)
     dict_assignments: dict[str, set[str]] = {}
+    dynamic_dict_assignment_names: set[str] = set()
     helper_return_roots = _helper_function_literal_return_roots(tree.body)
     returned_roots: set[str] = set()
+    abstained = False
+    saw_return = False
     for node in scope_statements:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            dict_roots = _dict_literal_string_key_roots(node.value)
             if isinstance(node.value, ast.Dict):
-                dict_assignments[node.targets[0].id] = dict_roots
+                produced = _dict_literal_output_roots(node.value)
+                dict_assignments[node.targets[0].id] = produced.roots
+                if produced.abstained:
+                    dynamic_dict_assignment_names.add(node.targets[0].id)
         elif isinstance(node, ast.Assign):
-            _apply_literal_dict_key_assignment(dict_assignments, node)
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and isinstance(node.value, ast.Dict):
-                dict_assignments[node.target.id] = _dict_literal_string_key_roots(node.value)
-            _apply_literal_dict_key_assignment(dict_assignments, node)
+                produced = _dict_literal_output_roots(node.value)
+                dict_assignments[node.target.id] = produced.roots
+                if produced.abstained:
+                    dynamic_dict_assignment_names.add(node.target.id)
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
         elif isinstance(node, ast.AugAssign):
-            _apply_literal_dict_key_assignment(dict_assignments, node)
-        elif isinstance(node, ast.Return) and node.value is not None:
-            returned_roots.update(_return_output_roots(node.value, dict_assignments, helper_return_roots))
-    return returned_roots or assigned_roots
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
+        elif isinstance(node, ast.Return):
+            saw_return = True
+            if node.value is not None:
+                returned = _return_output_roots(
+                    node.value,
+                    dict_assignments,
+                    dynamic_dict_assignment_names,
+                    helper_return_roots,
+                )
+                returned_roots.update(returned.roots)
+                abstained = abstained or returned.abstained
+    roots = returned_roots if saw_return else assigned_roots
+    return _ProducedOutputRoots(roots, abstained)
 
 
 def _apply_literal_dict_key_assignment(
     dict_assignments: dict[str, set[str]],
+    dynamic_dict_assignment_names: set[str],
     node: ast.Assign | ast.AnnAssign | ast.AugAssign,
 ) -> None:
     targets: list[ast.expr] = []
@@ -1533,11 +1524,20 @@ def _apply_literal_dict_key_assignment(
         targets = [node.target]
     for target in targets:
         assignment = _literal_dict_key_assignment(target)
+        target_name = _dict_subscript_target_name(target)
         if assignment is None:
+            if target_name in dict_assignments:
+                dynamic_dict_assignment_names.add(target_name)
             continue
         name, key = assignment
         if name in dict_assignments:
             dict_assignments[name].add(key)
+
+
+def _dict_subscript_target_name(target: ast.expr) -> str | None:
+    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        return target.value.id
+    return None
 
 
 def _literal_dict_key_assignment(target: ast.expr) -> tuple[str, str] | None:
@@ -1552,50 +1552,101 @@ def _literal_dict_key_assignment(target: ast.expr) -> tuple[str, str] | None:
 def _return_output_roots(
     node: ast.expr,
     dict_assignments: Mapping[str, set[str]],
-    helper_return_roots: Mapping[str, set[str]],
-) -> set[str]:
+    dynamic_dict_assignment_names: set[str],
+    helper_return_roots: Mapping[str, _ProducedOutputRoots],
+) -> _ProducedOutputRoots:
     if isinstance(node, ast.Await):
-        return _return_output_roots(node.value, dict_assignments, helper_return_roots)
+        return _return_output_roots(node.value, dict_assignments, dynamic_dict_assignment_names, helper_return_roots)
     if isinstance(node, ast.Name):
-        return set(dict_assignments.get(node.id, set()))
+        if node.id in dict_assignments:
+            return _ProducedOutputRoots(
+                set(dict_assignments.get(node.id, set())), node.id in dynamic_dict_assignment_names
+            )
+        return _ProducedOutputRoots(set(), True)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        return set(helper_return_roots.get(node.func.id, set()))
-    return _dict_literal_string_key_roots(node)
+        return helper_return_roots.get(node.func.id, _ProducedOutputRoots(set(), True))
+    if isinstance(node, ast.Dict):
+        return _dict_literal_output_roots(node)
+    if isinstance(node, ast.List):
+        return _list_literal_output_roots(node)
+    if isinstance(node, (ast.Constant, ast.Tuple, ast.Set)):
+        return _ProducedOutputRoots(set(), False)
+    return _ProducedOutputRoots(set(), True)
 
 
-def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[str, set[str]]:
-    helpers: dict[str, set[str]] = {}
+def _list_literal_output_roots(node: ast.List) -> _ProducedOutputRoots:
+    if not node.elts:
+        return _ProducedOutputRoots(set(), False)
+    if all(isinstance(element, ast.Dict) for element in node.elts):
+        roots: set[str] = set()
+        abstained = False
+        for element in node.elts:
+            produced = _dict_literal_output_roots(cast(ast.Dict, element))
+            roots.update(produced.roots)
+            abstained = abstained or produced.abstained
+        return _ProducedOutputRoots(roots, abstained)
+    if all(isinstance(element, ast.Constant) for element in node.elts):
+        return _ProducedOutputRoots(set(), False)
+    return _ProducedOutputRoots(set(), True)
+
+
+def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[str, _ProducedOutputRoots]:
+    helpers: dict[str, _ProducedOutputRoots] = {}
     for statement in statements:
         if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         dict_assignments: dict[str, set[str]] = {}
+        dynamic_dict_assignment_names: set[str] = set()
         roots: set[str] = set()
+        abstained = False
+        saw_return = False
         for helper_statement in _iter_top_level_scope(statement.body):
             if (
                 isinstance(helper_statement, ast.Assign)
                 and len(helper_statement.targets) == 1
                 and isinstance(helper_statement.targets[0], ast.Name)
             ):
-                dict_roots = _dict_literal_string_key_roots(helper_statement.value)
                 if isinstance(helper_statement.value, ast.Dict):
-                    dict_assignments[helper_statement.targets[0].id] = dict_roots
+                    produced = _dict_literal_output_roots(helper_statement.value)
+                    dict_assignments[helper_statement.targets[0].id] = produced.roots
+                    if produced.abstained:
+                        dynamic_dict_assignment_names.add(helper_statement.targets[0].id)
             elif isinstance(helper_statement, ast.Assign):
-                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
             elif isinstance(helper_statement, ast.AnnAssign):
                 if isinstance(helper_statement.target, ast.Name) and isinstance(helper_statement.value, ast.Dict):
-                    dict_assignments[helper_statement.target.id] = _dict_literal_string_key_roots(
-                        helper_statement.value
-                    )
-                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+                    produced = _dict_literal_output_roots(helper_statement.value)
+                    dict_assignments[helper_statement.target.id] = produced.roots
+                    if produced.abstained:
+                        dynamic_dict_assignment_names.add(helper_statement.target.id)
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
             elif isinstance(helper_statement, ast.AugAssign):
-                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
-            elif isinstance(helper_statement, ast.Return) and helper_statement.value is not None:
-                roots.update(_dict_literal_string_key_roots(helper_statement.value))
-                if isinstance(helper_statement.value, ast.Name):
-                    roots.update(dict_assignments.get(helper_statement.value.id, set()))
-        if roots:
-            helpers[statement.name] = roots
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
+            elif isinstance(helper_statement, ast.Return):
+                saw_return = True
+                if helper_statement.value is not None:
+                    returned = _return_output_roots(
+                        helper_statement.value,
+                        dict_assignments,
+                        dynamic_dict_assignment_names,
+                        {},
+                    )
+                    roots.update(returned.roots)
+                    abstained = abstained or returned.abstained
+        if roots or abstained or saw_return:
+            helpers[statement.name] = _ProducedOutputRoots(roots, abstained)
     return helpers
+
+
+def _dict_literal_output_roots(node: ast.Dict) -> _ProducedOutputRoots:
+    roots: set[str] = set()
+    abstained = False
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
+            roots.add(key.value.strip())
+        else:
+            abstained = True
+    return _ProducedOutputRoots(roots, abstained)
 
 
 def _dict_literal_string_key_roots(node: ast.expr) -> set[str]:
@@ -1629,13 +1680,14 @@ def _code_block_has_meaningful_output(code: str, artifact: object) -> bool:
         tree = ast.parse(code)
     except SyntaxError:
         return False
+    helper_return_roots = _helper_function_literal_return_roots(tree.body)
 
     class ReturnVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.has_meaningful_return = False
 
         def visit_Return(self, node: ast.Return) -> None:
-            if _return_value_is_meaningful(node.value):
+            if _return_value_is_meaningful(node.value, helper_return_roots):
                 self.has_meaningful_return = True
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -1838,11 +1890,21 @@ def _code_block_has_top_level_return(tree: ast.AST) -> bool:
     return any(isinstance(statement, ast.Return) for statement in _iter_top_level_scope(body))
 
 
-def _return_value_is_meaningful(node: ast.expr | None) -> bool:
+def _return_value_is_meaningful(
+    node: ast.expr | None,
+    helper_return_roots: Mapping[str, _ProducedOutputRoots],
+) -> bool:
     if node is None:
         return False
+    if isinstance(node, ast.Await):
+        return _return_value_is_meaningful(node.value, helper_return_roots)
     if isinstance(node, ast.Constant) and node.value is None:
         return False
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        produced = helper_return_roots.get(node.func.id)
+        if produced is not None:
+            return bool(produced.roots) or produced.abstained
+        return True
     if (
         isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set))
         and not getattr(node, "elts", None)
@@ -5089,16 +5151,25 @@ async def _update_workflow(
         tool_arguments=params,
     )
     if not output_policy_verdict.allowed:
+        output_policy_trace_data = output_policy_verdict_to_trace_data(
+            output_policy_verdict,
+            surface="tool_body",
+            tool_name="update_workflow",
+        )
+        output_policy_error = format_output_policy_tool_error(output_policy_verdict)
         _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
             "copilot output policy tool body verdict",
-            **output_policy_verdict_to_trace_data(
-                output_policy_verdict,
-                surface="tool_body",
-                tool_name="update_workflow",
-            ),
+            **output_policy_trace_data,
         )
-        return reject(error=format_output_policy_tool_error(output_policy_verdict))
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="output_policy_reject",
+            summary=output_policy_error,
+            structural_payload=output_policy_trace_data,
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(error=output_policy_error)
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
@@ -5183,10 +5254,7 @@ async def _update_workflow(
     recorded_missing_output_roots = (
         _recorded_outcome_missing_output_roots(ctx) if recorded_output_roots_required else set()
     )
-    runtime_produced_output_roots = (
-        _recorded_runtime_produced_output_roots(ctx, workflow_yaml) if recorded_output_roots_required else set()
-    )
-    unresolved_recorded_output_roots = recorded_missing_output_roots - runtime_produced_output_roots
+    unresolved_recorded_output_roots = recorded_missing_output_roots
 
     output_empty_labels = (
         _output_empty_code_block_labels(workflow_yaml, getattr(ctx, "code_artifact_metadata", None))
@@ -5226,7 +5294,6 @@ async def _update_workflow(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
             required_roots=unresolved_recorded_output_roots,
-            runtime_produced_roots=runtime_produced_output_roots,
         )
         if recorded_output_roots_required
         else []
