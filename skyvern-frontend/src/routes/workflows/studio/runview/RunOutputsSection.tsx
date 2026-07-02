@@ -11,6 +11,9 @@ type RunOutputsSectionProps = {
   workflowTitle?: string | null;
   extractedInformation: Record<string, unknown> | null;
   files: RunOutputFile[];
+  // Task 2.0 runs report their output on task_v2, not the run-level outputs.
+  observerOutput?: Record<string, unknown> | null;
+  webhookFailureReason?: string | null;
   // Owned by RunView so the generated summary survives center-tab switches
   // (this section unmounts when another tab takes the center).
   summary: string | null;
@@ -22,13 +25,20 @@ export function RunOutputsSection({
   workflowTitle,
   extractedInformation,
   files,
+  observerOutput = null,
+  webhookFailureReason = null,
   summary,
   onSummary,
 }: RunOutputsSectionProps) {
   const hasExtracted =
     extractedInformation != null &&
     Object.values(extractedInformation).some((value) => value !== null);
-  if (!hasExtracted && files.length === 0) {
+  if (
+    !hasExtracted &&
+    files.length === 0 &&
+    observerOutput == null &&
+    !webhookFailureReason
+  ) {
     return null;
   }
 
@@ -36,6 +46,27 @@ export function RunOutputsSection({
 
   return (
     <div className="flex flex-col gap-5">
+      {webhookFailureReason ? (
+        <div className="flex flex-col gap-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            Webhook failure reason
+          </span>
+          <div className="whitespace-pre-wrap rounded-md border border-border bg-slate-elevation3 p-3 text-sm text-warning">
+            {webhookFailureReason}
+          </div>
+        </div>
+      ) : null}
+      {observerOutput != null ? (
+        <div className="flex flex-col gap-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            Task 2.0 output
+          </span>
+          <OverviewCodeBlock
+            value={JSON.stringify(observerOutput, null, 2)}
+            maxHeight="320px"
+          />
+        </div>
+      ) : null}
       {hasExtracted ? (
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">

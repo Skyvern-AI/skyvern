@@ -1,18 +1,14 @@
 import { useState, type KeyboardEvent } from "react";
-import { useParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
-import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
-import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META } from "./paneMeta";
 import { STUDIO_PANE_IDS, type StudioPaneId } from "./panes";
-import { finalizedRunStatus } from "./runProjections";
 import { useStudioPanes } from "./useStudioPanes";
-import { useStudioRunId } from "./useStudioRunId";
+import { useStudioRunSignals } from "./useStudioRunSignals";
 
 // Terminal-only (finalizedRunStatus never returns a live status); mirrors the
 // StatusBadge variant buckets so the dot reads the same as the run chip.
@@ -47,20 +43,7 @@ export function StudioSpine() {
   );
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
 
-  const urlRunId = useStudioRunId();
-  const { workflowPermanentId } = useParams();
-  const { data: urlRun } = useWorkflowRunWithWorkflowQuery(
-    urlRunId ? { workflowRunId: urlRunId } : undefined,
-  );
-  const { data: runs } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    page: 1,
-    pageSize: 1,
-  });
-  const hasRun = Boolean(urlRunId) || (runs?.length ?? 0) > 0;
-  const runStatus = finalizedRunStatus(
-    urlRunId ? urlRun?.status : runs?.[0]?.status,
-  );
+  const { hasRun, runStatus } = useStudioRunSignals();
 
   const onToggle = (id: StudioPaneId) => {
     if (id === "browser" && !panes.includes("browser")) {

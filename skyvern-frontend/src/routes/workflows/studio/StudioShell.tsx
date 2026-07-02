@@ -9,23 +9,21 @@ import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
 import { StudioBrowserStream } from "./StudioBrowserStream";
+import { StudioCoachMark } from "./StudioCoachMark";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META } from "./paneMeta";
-import { type StudioPaneId } from "./panes";
+import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
+import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { StudioShellContext } from "./StudioShellContext";
 import { StudioSpine } from "./StudioSpine";
+import { StudioStageLauncher } from "./StudioStageLauncher";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
 import { useStudioPanes } from "./useStudioPanes";
 
-// Width floors from the approved mock; the Copilot pane also holds a ceiling so
-// a lone chat doesn't stretch across the whole stage.
-const PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
-  copilot: 260,
-  editor: 220,
-  browser: 260,
-  run: 220,
-};
+// The Copilot pane holds a ceiling so a lone chat doesn't stretch across the
+// whole stage; the shared floors live in panes.ts next to the fit math.
 const COPILOT_MAX_WIDTH = 440;
 
 function StudioPane({
@@ -49,7 +47,7 @@ function StudioPane({
       aria-label={label}
       style={{
         order,
-        minWidth: PANE_MIN_WIDTH[id],
+        minWidth: STUDIO_PANE_MIN_WIDTH[id],
         maxWidth: id === "copilot" ? COPILOT_MAX_WIDTH : undefined,
       }}
       className={cn(
@@ -85,7 +83,18 @@ function StudioPane({
  * order (?panes=). The Copilot chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
+  return (
+    <StudioPaneDefaultsProvider
+      hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
+    >
+      <StudioStage {...props} />
+    </StudioPaneDefaultsProvider>
+  );
+}
+
+function StudioStage(props: StudioWorkspaceProps) {
   const { panes, closePane } = useStudioPanes();
+  const { registerStageElement } = useStudioPaneDefaults();
   const pipMinimized = useStudioShellStore((s) => s.pipMinimized);
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
@@ -176,7 +185,10 @@ export function StudioShell(props: StudioWorkspaceProps) {
           {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
               stream slots); the CSS order carries the click order instead, so
               screen-reader/Tab order stays the fixed order, not the visual one. */}
-          <div className="relative flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden p-3">
+          <div
+            ref={registerStageElement}
+            className="relative flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden p-3"
+          >
             <StudioPane {...paneProps("copilot")}>
               {/* Copilot portal target. Kept mounted while the pane is closed so
                   an in-flight Copilot turn isn't torn down. */}
@@ -193,13 +205,8 @@ export function StudioShell(props: StudioWorkspaceProps) {
             <StudioPane {...paneProps("run")}>
               <RunTab />
             </StudioPane>
-            {panes.length === 0 ? (
-              <div className="flex flex-1 items-center justify-center">
-                <p className="max-w-[17rem] text-center text-sm text-muted-foreground">
-                  No panes open. Open one from the rail on the left.
-                </p>
-              </div>
-            ) : null}
+            {panes.length === 0 ? <StudioStageLauncher /> : null}
+            <StudioCoachMark />
             <StudioWorkflowPanels />
           </div>
         </div>
