@@ -93,6 +93,7 @@ from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
+from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -2943,8 +2944,24 @@ class ForgeAgent:
             )
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
+        # SKY-11295: verify MINI_GOAL_TEMPLATE-wrapped goals against the mini goal only —
+        # passed verbatim, the verifier judges the big goal and under-claims to max-steps.
+        unwrapped_goals = unwrap_goal_fields(
+            task.navigation_goal,
+            task.complete_criterion,
+            task.terminate_criterion,
+        )
+        if unwrapped_goals.big_goal_context is not None:
+            LOG.info(
+                "Unwrapped mini-goal for completion verification",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+
         actions_and_results_str = ""
-        if task.include_action_history_in_verification:
+        # A step-scale mini goal is often action-phrased ("Click X"); once the page
+        # navigates, page state alone can't certify it — wrapped goals verify with history.
+        if task.include_action_history_in_verification or unwrapped_goals.big_goal_context is not None:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
 
         # Check if we should use the termination-aware prompt (experiment)
@@ -2989,10 +3006,11 @@ class ForgeAgent:
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
             template_name=template_name,
-            navigation_goal=task.navigation_goal,
+            navigation_goal=unwrapped_goals.navigation_goal,
             navigation_payload=task.navigation_payload,
-            complete_criterion=task.complete_criterion,
-            terminate_criterion=task.terminate_criterion,
+            complete_criterion=unwrapped_goals.complete_criterion,
+            terminate_criterion=unwrapped_goals.terminate_criterion,
+            big_goal_context=unwrapped_goals.big_goal_context,
             action_history=actions_and_results_str,
             slim_output=slim_output,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
@@ -3058,6 +3076,7 @@ class ForgeAgent:
         span = otel_trace.get_current_span()
         span.set_attribute("verification.status", verification_status.value)
         span.set_attribute("verification.template", template_name)
+        span.set_attribute("verification.goal_unwrapped", unwrapped_goals.big_goal_context is not None)
         record_verification_span_attrs(span, result.thoughts)
         return result
 

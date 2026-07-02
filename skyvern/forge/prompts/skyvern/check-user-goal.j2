@@ -13,7 +13,13 @@ Make sure to ONLY return the JSON object in this format with no additional text 
 User Goal:
 ```
 {{ navigation_goal }}
+```{% if big_goal_context %}
+
+The user goal above is one step of a larger objective. The larger objective is provided ONLY as context to help you understand the step:
 ```
+{{ big_goal_context }}
+```
+Certify ONLY the user goal above{{ " according to the complete criterion" if complete_criterion else "" }}: set user_goal_achieved to true as soon as that step is done, even if the larger objective is not finished yet. Do NOT require the larger objective to be complete. If the user goal describes an action and the Action History shows that action completed successfully, the step is done — set user_goal_achieved to true even if the acted-on element is no longer on the current page.{% endif %}
 
 User Details:
 ```
