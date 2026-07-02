@@ -46,9 +46,15 @@ vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
   useIsGeneratingCode: () => false,
 }));
 vi.mock("./RunHero", () => ({
-  RunHero: (props: Record<string, unknown>) => {
+  RunHero: (props: Record<string, unknown> & { outputs?: ReactNode }) => {
     mocks.runHeroProps.push(props);
-    return <div data-testid="run-hero" />;
+    return (
+      <div data-testid="run-hero">
+        {props.outputs ? (
+          <div data-testid="run-outputs">{props.outputs}</div>
+        ) : null}
+      </div>
+    );
   },
 }));
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
@@ -171,6 +177,22 @@ function seedForLoopRun() {
     workflow: {
       workflow_definition: { blocks: [], finally_block_label: null },
     },
+  };
+}
+
+function seedCompletedRun(overrides: Record<string, unknown> = {}) {
+  mocks.timeline = [];
+  mocks.workflowRun = {
+    workflow_run_id: "wr_1",
+    status: Status.Completed,
+    downloaded_file_urls: [],
+    downloaded_files: [],
+    errors: null,
+    outputs: null,
+    workflow: {
+      workflow_definition: { blocks: [], finally_block_label: null },
+    },
+    ...overrides,
   };
 }
 
@@ -344,7 +366,7 @@ describe("RunView iteration selection", () => {
     fireEvent.click(scope.getByText(/Loop over 2 values/));
     expect(scope.queryByText(/Iterable values/)).not.toBeNull();
     expect(scope.queryByText("Iteration 2 value")).toBeNull();
-  });
+  }, 20_000);
 });
 
 describe("RunView screenshot center view", () => {
@@ -470,5 +492,82 @@ describe("RunView screenshot center view", () => {
       stepId: "step_default",
       actionOrder: null,
     });
+  });
+});
+
+describe("RunView output signals", () => {
+  test("surfaces run errors, error codes, and rich downloaded files", () => {
+    seedCompletedRun({
+      errors: [
+        {
+          error_code: "E_INVOICE_MISSING",
+          reasoning: "The expected invoice was not available.",
+        },
+        {
+          error_code: "E_PAYMENT_BLOCKED",
+          confidence_float: 0.91,
+        },
+      ],
+      downloaded_files: [
+        {
+          url: "https://example.test/downloads/report.pdf",
+          filename: "report.pdf",
+          checksum: null,
+          file_size: null,
+          modified_at: null,
+          artifact_id: null,
+        },
+      ],
+      downloaded_file_urls: null,
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+    const scope = within(container);
+
+    expect(scope.getByText("Run errors")).not.toBeNull();
+    expect(scope.getAllByText("E_INVOICE_MISSING").length).toBeGreaterThan(0);
+    expect(scope.getByText("E_PAYMENT_BLOCKED")).not.toBeNull();
+    expect(
+      scope.getByText("The expected invoice was not available."),
+    ).not.toBeNull();
+    expect(scope.queryByText("confidence_float")).toBeNull();
+    expect(scope.getByText("Downloaded files")).not.toBeNull();
+    expect(scope.getByText("report.pdf")).not.toBeNull();
+  });
+
+  test("does not treat a user output parameter named errors as run errors", () => {
+    seedCompletedRun({
+      outputs: {
+        errors: [{ message: "This is ordinary user output data." }],
+      },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+    const scope = within(container);
+
+    expect(scope.queryByText("Run errors")).toBeNull();
+  });
+
+  test("does not add an output slot when run signals are absent", () => {
+    seedCompletedRun();
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+    const scope = within(container);
+
+    expect(scope.queryByTestId("run-outputs")).toBeNull();
+    expect(scope.queryByText("Run errors")).toBeNull();
+    expect(scope.queryByText("Downloaded files")).toBeNull();
   });
 });

@@ -16,7 +16,7 @@ import {
 import { useRunViewStore } from "@/store/RunViewStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
-import { cn } from "@/util/utils";
+import { cn, isRecord } from "@/util/utils";
 
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
@@ -46,7 +46,11 @@ import { RunHero } from "./RunHero";
 import { type HeroSelection } from "./HeroScreenshot";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
-import { RunOutputsSection, type RunOutputFile } from "./RunOutputsSection";
+import {
+  RunOutputsSection,
+  type RunOutputError,
+  type RunOutputFile,
+} from "./RunOutputsSection";
 import { RunOverviewButton } from "./RunOverviewButton";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { getSelectedRunFrameId } from "./runFrameSelection";
@@ -71,6 +75,17 @@ function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
     );
   }
   return true;
+}
+
+function isRunOutputError(value: unknown): value is RunOutputError {
+  return isRecord(value);
+}
+
+function normalizeRunOutputErrors(value: unknown): RunOutputError[] {
+  if (Array.isArray(value)) {
+    return value.filter(isRunOutputError);
+  }
+  return [];
 }
 
 /**
@@ -333,25 +348,40 @@ export function RunView({
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
     const outputs = workflowRun?.outputs;
-    return typeof outputs === "object" &&
-      outputs !== null &&
-      "extracted_information" in outputs
+    return isRecord(outputs) && "extracted_information" in outputs
       ? (outputs.extracted_information as Record<string, unknown>)
       : null;
   }, [workflowRun]);
 
   const downloadedFiles = useMemo<RunOutputFile[]>(() => {
-    const urls = workflowRun?.downloaded_file_urls ?? [];
     const filenameByUrl = new Map<string, string>();
+    const files: RunOutputFile[] = [];
+    const seen = new Set<string>();
+    const pushFile = (url: string, filename?: string | null) => {
+      if (seen.has(url)) {
+        return;
+      }
+      seen.add(url);
+      files.push({
+        url,
+        filename: filename || pickDownloadedFileFilename(url, filenameByUrl),
+      });
+    };
     for (const file of workflowRun?.downloaded_files ?? []) {
       if (file.filename) {
         filenameByUrl.set(file.url, file.filename);
       }
+      pushFile(file.url, file.filename);
     }
-    return urls.map((url) => ({
-      url,
-      filename: pickDownloadedFileFilename(url, filenameByUrl),
-    }));
+    // Prefer rich metadata first; URL fallback only fills gaps without duplicating.
+    for (const url of workflowRun?.downloaded_file_urls ?? []) {
+      pushFile(url);
+    }
+    return files;
+  }, [workflowRun]);
+
+  const runErrors = useMemo<RunOutputError[]>(() => {
+    return normalizeRunOutputErrors(workflowRun?.errors);
   }, [workflowRun]);
 
   const runInputs = useMemo(() => {
@@ -393,6 +423,7 @@ export function RunView({
   const hasInputs =
     runInputs.parameters.length > 0 || runInputs.meta.length > 0;
   const hasOutputs =
+    runErrors.length > 0 ||
     (extractedInformation != null &&
       Object.values(extractedInformation).some((value) => value !== null)) ||
     downloadedFiles.length > 0 ||
@@ -465,6 +496,7 @@ export function RunView({
                   workflowTitle={workflowRun.workflow?.title}
                   extractedInformation={extractedInformation}
                   files={downloadedFiles}
+                  errors={runErrors}
                   observerOutput={observerOutput}
                   webhookFailureReason={webhookFailureReason}
                   summary={outputSummary}

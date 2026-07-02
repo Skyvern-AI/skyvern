@@ -1,5 +1,6 @@
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { DebuggerRunTimeline } from "./DebuggerRunTimeline";
+import { RecentActivityRunSelector } from "./recentActivity/RecentActivityRunSelector";
 
 function DebuggerRun() {
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -13,6 +14,9 @@ function DebuggerRun() {
 
   return (
     <div className="flex h-full w-full flex-col items-center justify-start overflow-hidden overflow-y-auto">
+      <div className="w-[calc(100%-2rem)] self-start pb-2">
+        <RecentActivityRunSelector />
+      </div>
       {workflowFailureReason}
       <div className="h-full w-full">
         <DebuggerRunTimeline

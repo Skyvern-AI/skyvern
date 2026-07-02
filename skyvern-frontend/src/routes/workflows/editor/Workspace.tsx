@@ -90,6 +90,7 @@ import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
+import { RecentActivityRunSelector } from "@/routes/workflows/debugger/recentActivity/RecentActivityRunSelector";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   BranchContext,
@@ -99,7 +100,6 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
-import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -1991,7 +1991,7 @@ function Workspace({
                 </div>
                 {/* infinite canvas */}
                 <div
-                  className={cn("h-full w-[50%]", {
+                  className={cn("relative h-full w-[50%]", {
                     "w-[100%]":
                       leftSideLayoutMode === "side-by-side" && !showAllCode,
                   })}
@@ -2013,17 +2013,15 @@ function Workspace({
                     historyApplyTrigger={historyApplyTrigger}
                     onLayoutPhaseChange={setFlowLayoutPhase}
                   />
+                  {!blockLabel && (
+                    <div className="pointer-events-none absolute bottom-3 left-1/2 z-20 w-[20rem] max-w-[calc(100%-2rem)] -translate-x-1/2 [&>*]:pointer-events-auto">
+                      <RecentActivityRunSelector
+                        contentSide="top"
+                        contentAlign="center"
+                      />
+                    </div>
+                  )}
                 </div>
-              </div>
-              {/* block runs history for current debug session id*/}
-              {/*
-                pointer-events-none on the wrapper so clicks pass through to
-                the FlowRenderer's bottom-left Controls (FitView, Lock,
-                GlobalCollapse) that sit in the same corner; the actual
-                debugger chip re-enables pointer events on itself.
-              */}
-              <div className="pointer-events-none absolute bottom-[0.5rem] left-[0.75rem] flex w-full items-start justify-center [&>*]:pointer-events-auto">
-                <DebuggerBlockRuns />
               </div>
             </div>
 
