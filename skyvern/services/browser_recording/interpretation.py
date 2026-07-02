@@ -246,11 +246,13 @@ class RecordingInterpretationSession:
         on_update: OnRecordingInterpretationUpdate,
         debounce_seconds: float = INTERPRETATION_DEBOUNCE_SECONDS,
         max_wait_seconds: float = INTERPRETATION_MAX_WAIT_SECONDS,
+        deltas_enabled: bool = False,
     ) -> None:
         self.browser_session_id = browser_session_id
         self.organization_id = organization_id
         self.workflow_permanent_id = workflow_permanent_id
         self.on_update = on_update
+        self.set_deltas_enabled(deltas_enabled)
         self.interpretation_session_id = str(uuid.uuid4())
         self.debounce_seconds = debounce_seconds
         self.max_wait_seconds = max_wait_seconds
@@ -281,6 +283,10 @@ class RecordingInterpretationSession:
             if isinstance(machine, sm.Wait):
                 machine.reset()
 
+    def set_deltas_enabled(self, enabled: bool) -> None:
+        # Deltas require both the client capability and the server kill switch.
+        self._deltas_enabled = enabled and settings.RECORDING_INTERPRETATION_DELTAS_ENABLED
+
     def pause_capture(self) -> None:
         self._capture_paused = True
         self.reset_wait_capture()
@@ -288,6 +294,10 @@ class RecordingInterpretationSession:
     def resume_capture(self) -> None:
         self._capture_paused = False
         self.reset_wait_capture()
+        # Enrichment deltas that landed while paused were dropped client-side, so
+        # send an authoritative snapshot to resync on resume.
+        if self.session_revision > 0:
+            self._emit()
 
     def ingest_events(self, events: list[streaming_exfiltration.ExfiltratedEvent]) -> None:
         if self._capture_paused:
@@ -314,7 +324,8 @@ class RecordingInterpretationSession:
 
         self.pending = True
         self.finalized = False
-        self._emit_update()
+        # Pending ping: no step changed yet, just signal interpretation is in flight.
+        self._emit(changed_steps=[])
         self._schedule_interpretation()
 
     def cancel(self) -> None:
@@ -383,27 +394,29 @@ class RecordingInterpretationSession:
 
             new_actions = self._all_actions[self.emitted_action_count :]
 
+            new_steps: list[RecordingDraftStep] = []
             for offset, action in enumerate(new_actions):
                 action_index = self.emitted_action_count + offset
                 draft_step = await self._step_from_action(processor, action_index, action)
                 if draft_step:
                     draft_step.label = self._unique_step_label(draft_step.label, draft_step)
                     self.steps.append(draft_step)
+                    new_steps.append(draft_step)
 
             self.emitted_action_count += len(new_actions)
             self.pending = False
             self.finalized = finalized and not self._enrichment_tasks
-            self._emit_update()
+            self._emit(changed_steps=new_steps)
 
         if not finalized:
             return
 
-        # Hold the finalized signal until in-flight LLM enrichment lands, so
-        # commit paths never capture placeholder metadata.
+        # Hold the finalized signal until in-flight LLM enrichment lands, so commit
+        # paths never capture placeholder metadata. Emit a final snapshot so the
+        # client's full step list is authoritative regardless of any dropped delta.
         await self._drain_enrichment()
-        if not self.finalized:
-            self.finalized = True
-            self._emit_update()
+        self.finalized = True
+        self._emit()
 
     async def _step_from_action(
         self,
@@ -492,7 +505,7 @@ class RecordingInterpretationSession:
             step.parameter_keys = enriched.parameter_keys
 
         step.status = RecordingDraftStepStatus.READY
-        self._emit_update()
+        self._emit(changed_steps=[step])
 
     async def _drain_enrichment(self) -> None:
         while self._enrichment_tasks:
@@ -529,12 +542,21 @@ class RecordingInterpretationSession:
                 organization_id=self.organization_id,
             )
 
-    def _emit_update(self) -> None:
+    def _emit(self, *, changed_steps: list[RecordingDraftStep] | None = None) -> None:
+        # Snapshot when changed_steps is None (full steps, is_snapshot=True); delta
+        # otherwise (only the changed steps), keeping each update O(1) instead of
+        # re-sending the whole growing list. Both advance session_revision so the
+        # client's staleness guard orders them.
         self.session_revision += 1
+        # Send a delta only when the client understands them and a changed set was
+        # given; otherwise fall back to a full snapshot (legacy-compatible).
+        is_delta = self._deltas_enabled and changed_steps is not None
         update = RecordingInterpretationUpdate(
             interpretation_session_id=self.interpretation_session_id,
             session_revision=self.session_revision,
-            steps=self.steps,
+            steps=[] if is_delta else self.steps,
+            changed_steps=changed_steps if is_delta else [],
+            is_snapshot=not is_delta,
             pending=self.pending,
             finalized=self.finalized,
         )

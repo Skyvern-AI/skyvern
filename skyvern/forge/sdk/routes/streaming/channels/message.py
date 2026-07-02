@@ -133,6 +133,9 @@ class MessageInBeginExfiltration(Message):
     kind: t.Literal[MessageKind.BEGIN_EXFILTRATION] = MessageKind.BEGIN_EXFILTRATION
     workflow_permanent_id: str | None = None
     live_interpretation_enabled: bool = False
+    # Client capability: true only when the frontend understands delta interpretation
+    # updates. Defaults false so older clients keep receiving full snapshots.
+    supports_interpretation_deltas: bool = False
 
 
 @dataclasses.dataclass
@@ -268,6 +271,8 @@ class MessageOutRecordingInterpretationUpdate(Message):
     interpretation_session_id: str = ""
     session_revision: int = 0
     steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
+    changed_steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
+    is_snapshot: bool = True
     pending: bool = False
     finalized: bool = False
 
@@ -326,6 +331,7 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInBeginExfiltration(
                 workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
                 live_interpretation_enabled=bool(data.get("live_interpretation_enabled") or False),
+                supports_interpretation_deltas=bool(data.get("supports_interpretation_deltas") or False),
             )
         case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
@@ -660,6 +666,8 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                                 interpretation_session_id=update.interpretation_session_id,
                                 session_revision=update.session_revision,
                                 steps=update.steps,
+                                changed_steps=update.changed_steps,
+                                is_snapshot=update.is_snapshot,
                                 pending=update.pending,
                                 finalized=update.finalized,
                             )
@@ -679,6 +687,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         organization_id=message_channel.organization_id,
                         workflow_permanent_id=message.workflow_permanent_id,
                         on_update=on_interpretation_update,
+                        deltas_enabled=message.supports_interpretation_deltas,
                     )
                     live_interpretation_browser_session_id = browser_session_id
 

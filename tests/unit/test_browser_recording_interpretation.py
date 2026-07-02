@@ -24,6 +24,7 @@ from skyvern.services.browser_recording.types import (
     Mouse,
     RecordingDraftStep,
     RecordingDraftStepStatus,
+    RecordingInterpretationUpdate,
 )
 
 ORG_ID = "org_123"
@@ -583,3 +584,96 @@ def test_start_session_resumes_after_websocket_disconnect_without_stop() -> None
 
     assert registry._sessions[PBS_ID] is session
     assert reconnect_updates == [4]
+
+
+@pytest.mark.asyncio
+async def test_emits_deltas_for_steps_and_snapshot_on_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click submit."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        deltas_enabled=True,
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    # Steps arrive as deltas (placeholder + enriched), never re-sending the full list.
+    deltas = [u for u in updates if not u.is_snapshot]
+    assert any(u.changed_steps for u in deltas)
+    assert all(u.steps == [] for u in deltas)
+
+    # Finalize ends with an authoritative snapshot carrying the full list.
+    assert updates[-1].is_snapshot is True
+    assert updates[-1].finalized is True
+    assert len(updates[-1].steps) == 1
+
+    # A delta never smuggles the whole growing list back in.
+    assert all(u.is_snapshot or not u.steps for u in updates)
+
+
+@pytest.mark.asyncio
+async def test_no_deltas_when_client_lacks_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click", "title": "Click", "prompt": "Click."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        # deltas_enabled defaults False — a client that didn't opt in gets snapshots.
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    # Every update is a full snapshot; no changed_steps are ever sent.
+    assert all(u.is_snapshot for u in updates)
+    assert all(not u.changed_steps for u in updates)
+    assert updates[-1].steps  # final snapshot still carries the steps
+
+
+@pytest.mark.asyncio
+async def test_resume_capture_emits_resync_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click", "title": "Click", "prompt": "Click."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await asyncio.sleep(0.05)
+
+    session.pause_capture()
+    updates.clear()
+    session.resume_capture()
+
+    assert len(updates) == 1
+    assert updates[0].is_snapshot is True
+    session.cancel()

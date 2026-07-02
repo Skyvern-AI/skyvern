@@ -295,6 +295,10 @@ class Settings(BaseSettings):
     # model keeps the click->labeled-draft latency low. Falls back to the default
     # LLM_API_HANDLER when the key is unset or not registered in this environment.
     RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
+    # Server-side kill switch for delta interpretation updates. Deltas are also
+    # gated per-connection on the client declaring support (begin-exfiltration
+    # supports_interpretation_deltas); this only force-disables them everywhere.
+    RECORDING_INTERPRETATION_DELTAS_ENABLED: bool = True
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False

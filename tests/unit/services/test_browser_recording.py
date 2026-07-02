@@ -37,6 +37,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEventCdpParams,
     Mouse,
+    RecordingDraftStep,
     RecordingDraftStepStatus,
     RecordingInterpretationUpdate,
 )
@@ -486,10 +487,14 @@ async def test_live_interpretation_emits_placeholder_then_enriched(monkeypatch: 
     session.ingest_events([make_streaming_console_click(timestamp_ms=1000.0)])
     await asyncio.sleep(0.05)
 
-    # the placeholder draft is visible before the LLM responds
-    updates_with_steps = [update for update in updates if update.steps]
+    # the placeholder draft is visible before the LLM responds — it arrives as a
+    # delta (changed_steps), since only snapshots carry the full steps list.
+    def emitted_steps(u: RecordingInterpretationUpdate) -> list[RecordingDraftStep]:
+        return u.steps if u.is_snapshot else u.changed_steps
+
+    updates_with_steps = [update for update in updates if emitted_steps(update)]
     assert updates_with_steps
-    placeholder = updates_with_steps[-1].steps[0]
+    placeholder = emitted_steps(updates_with_steps[-1])[0]
     assert placeholder.status == RecordingDraftStepStatus.INTERPRETING
     assert placeholder.title == "Click 'Click me'"
     assert placeholder.navigation_goal == "Click 'Click me'."
@@ -582,7 +587,8 @@ async def test_live_interpretation_max_wait_fires_during_continuous_events() -> 
         await asyncio.sleep(0.02)
 
     try:
-        assert any(update.steps for update in updates)
+        # steps land in changed_steps (delta) or steps (snapshot) depending on emit type.
+        assert any(update.steps or update.changed_steps for update in updates)
     finally:
         session.cancel()
         # let the cancelled debounce task unwind before the loop closes
