@@ -4126,7 +4126,19 @@ async def wrapper({default_args}):
             safe_main = workflow_run_context.mask_secrets_in_data(self.prompt)
             matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
             if matched_step is not None and matched_step.description:
-                safe_mini = workflow_run_context.mask_secrets_in_data(matched_step.description)
+                # The heal owns the failing step plus every subsequent authored step — a
+                # step-only goal would complete the block while trailing steps ran by no one.
+                steps = self.steps or []
+                # Identity scan, not .index(): value equality would match an earlier duplicate step.
+                matched_index = next((i for i, step in enumerate(steps) if step is matched_step), None)
+                if matched_index is None:
+                    matched_index = len(steps) - 1  # defensive; matched_step always comes from self.steps
+                descriptions = [matched_step.description] + [
+                    step.description for step in steps[matched_index + 1 :] if step.description
+                ]
+                safe_mini = "\nThen: ".join(
+                    workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+                )
                 navigation_goal = compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
             else:
                 navigation_goal = safe_main
@@ -4157,6 +4169,9 @@ async def wrapper({default_args}):
                 max_steps_per_run=heal_max_steps,
                 model=self.model,
                 workflow_system_prompt=workflow_system_prompt,
+                # Heal goals are action-phrased; after the page navigates, only the action
+                # history can evidence completion.
+                include_action_history_in_verification=True,
             )
             escalation_task = await app.DATABASE.tasks.update_task(
                 task_id=escalation_task.task_id,

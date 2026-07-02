@@ -19,7 +19,9 @@ The user goal above is one step of a larger objective. The larger objective is p
 ```
 {{ big_goal_context }}
 ```
-Certify ONLY the user goal above{{ " according to the complete criterion" if complete_criterion else "" }}: set user_goal_achieved to true as soon as that step is done, even if the larger objective is not finished yet. Do NOT require the larger objective to be complete. If the user goal describes an action and the Action History shows that action completed successfully, the step is done — set user_goal_achieved to true even if the acted-on element is no longer on the current page.{% endif %}
+Certify ONLY the user goal above{{ " according to the complete criterion" if complete_criterion else "" }}: set user_goal_achieved to true as soon as that step is done, even if the larger objective is not finished yet. Do NOT require the larger objective to be complete.{% endif %}{% if action_history_evidence %}
+
+If the user goal describes actions, judge it against the Action History: it is achieved only when every described action (including each 'Then:' step) shows as completed successfully — never after only the first of several actions. A successfully completed action counts even when the acted-on element is no longer on the current page.{{ " The complete criterion still governs: action history is supporting evidence for it, not a substitute." if complete_criterion else "" }}{% endif %}
 
 User Details:
 ```

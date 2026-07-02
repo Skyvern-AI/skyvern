@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError  # noqa: F401
-from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
@@ -680,123 +679,6 @@ class AgentDB(BaseAlchemyDB):
     async def get_run(self, *args: Any, **kwargs: Any) -> Any:
         return await self.tasks.get_run(*args, **kwargs)
 
-    # -- Artifact delegates --
-
-    @traced(name="skyvern.db.create_artifact")
-    async def create_artifact(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.create_artifact(*args, **kwargs)
-
-    @traced(name="skyvern.db.bulk_create_artifacts")
-    async def bulk_create_artifacts(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.bulk_create_artifacts(*args, **kwargs)
-
-    async def get_artifacts_for_task_v2(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifacts_for_task_v2(*args, **kwargs)
-
-    async def get_artifacts_for_task_step(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifacts_for_task_step(*args, **kwargs)
-
-    async def get_artifacts_for_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifacts_for_run(*args, **kwargs)
-
-    async def get_artifact_by_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifact_by_id(*args, **kwargs)
-
-    async def get_artifacts_by_ids(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifacts_by_ids(*args, **kwargs)
-
-    async def get_artifacts_by_entity_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifacts_by_entity_id(*args, **kwargs)
-
-    async def get_artifact_by_entity_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifact_by_entity_id(*args, **kwargs)
-
-    async def get_artifact(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifact(*args, **kwargs)
-
-    async def get_artifact_for_run(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifact_for_run(*args, **kwargs)
-
-    async def get_latest_artifact(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_latest_artifact(*args, **kwargs)
-
-    async def get_latest_n_artifacts(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_latest_n_artifacts(*args, **kwargs)
-
-    async def delete_task_artifacts(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.delete_task_artifacts(*args, **kwargs)
-
-    async def delete_task_v2_artifacts(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.delete_task_v2_artifacts(*args, **kwargs)
-
-    async def update_action_screenshot_artifact_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.update_action_screenshot_artifact_id(*args, **kwargs)
-
-    # -- Browser session delegates --
-
-    async def create_browser_profile(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.create_browser_profile(*args, **kwargs)
-
-    async def get_browser_profile(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_browser_profile(*args, **kwargs)
-
-    async def list_browser_profiles(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.list_browser_profiles(*args, **kwargs)
-
-    async def delete_browser_profile(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.delete_browser_profile(*args, **kwargs)
-
-    async def hard_delete_browser_profile(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.hard_delete_browser_profile(*args, **kwargs)
-
-    async def get_active_persistent_browser_sessions(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_active_persistent_browser_sessions(*args, **kwargs)
-
-    async def get_persistent_browser_sessions_history(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_persistent_browser_sessions_history(*args, **kwargs)
-
-    async def get_persistent_browser_session_by_runnable_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_persistent_browser_session_by_runnable_id(*args, **kwargs)
-
-    async def get_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.get_persistent_browser_session(*args, **kwargs)
-
-    async def create_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.create_persistent_browser_session(*args, **kwargs)
-
-    async def update_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.update_persistent_browser_session(*args, **kwargs)
-
-    async def set_persistent_browser_session_browser_address(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.set_persistent_browser_session_browser_address(*args, **kwargs)
-
-    async def update_persistent_browser_session_compute_cost(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.update_persistent_browser_session_compute_cost(*args, **kwargs)
-
-    async def mark_persistent_browser_session_deleted(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.mark_persistent_browser_session_deleted(*args, **kwargs)
-
-    async def occupy_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.occupy_persistent_browser_session(*args, **kwargs)
-
-    async def release_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.release_persistent_browser_session(*args, **kwargs)
-
-    async def close_persistent_browser_session(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.close_persistent_browser_session(*args, **kwargs)
-
-    async def get_all_active_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
-        return await self.browser_sessions.get_all_active_persistent_browser_sessions()
-
-    async def archive_browser_session_address(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.browser_sessions.archive_browser_session_address(*args, **kwargs)
-
-    async def get_uncompleted_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
-        return await self.browser_sessions.get_uncompleted_persistent_browser_sessions()
-
-    async def get_debug_session_by_browser_session_id(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.debug.get_debug_session_by_browser_session_id(*args, **kwargs)
-
     # -- Schedule delegates --
 
     async def create_workflow_schedule(self, *args: Any, **kwargs: Any) -> Any:
@@ -1018,8 +900,3 @@ class AgentDB(BaseAlchemyDB):
 
     async def get_workflow_run_blocks(self, *args: Any, **kwargs: Any) -> Any:
         return await self.observer.get_workflow_run_blocks(*args, **kwargs)
-
-    # -- Artifact delegates --
-
-    async def get_artifact_by_id_no_org(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.artifacts.get_artifact_by_id_no_org(*args, **kwargs)
