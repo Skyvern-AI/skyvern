@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from skyvern.config import settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.core import skyvern_context
@@ -78,7 +79,8 @@ async def _call_complete_verify(
         return "rendered prompt"
 
     monkeypatch.setattr("skyvern.forge.agent.load_prompt_with_elements", capture_prompt)
-    monkeypatch.setattr(ForgeAgent, "_get_action_results", AsyncMock(return_value=ACTION_HISTORY_STUB))
+    history_mock = AsyncMock(return_value=ACTION_HISTORY_STUB)
+    monkeypatch.setattr(ForgeAgent, "_get_action_results", history_mock)
 
     llm_response = (
         {"status": "complete", "thoughts": "done", "page_info": "ok", "failure_categories": []}
@@ -109,6 +111,9 @@ async def _call_complete_verify(
         )
     finally:
         skyvern_context.reset()
+    captured_kwargs["_history_window"] = (
+        history_mock.call_args.kwargs.get("history_window") if history_mock.call_args else None
+    )
     return captured_kwargs
 
 
@@ -125,6 +130,10 @@ async def test_wrapped_goal_threads_mini_and_context_legacy_prompt(monkeypatch: 
     # Step-scale mini goals are often action-phrased; the verifier gets the
     # action history even though include_action_history_in_verification is off.
     assert captured["action_history"] == ACTION_HISTORY_STUB
+    assert captured["action_history_evidence"] is True
+    # Evidence fetches use the full-run window: a 1-step slice hides earlier
+    # Then-step actions and makes every-action verification unsatisfiable.
+    assert captured["_history_window"] == settings.MAX_STEPS_PER_RUN
 
 
 @pytest.mark.asyncio
@@ -158,6 +167,8 @@ async def test_unwrapped_goal_passes_through_with_no_context(monkeypatch: pytest
     assert captured["terminate_criterion"] is None
     assert captured["big_goal_context"] is None
     assert captured["action_history"] == ""
+    assert captured["action_history_evidence"] is False
+    assert captured["_history_window"] is None
 
 
 @pytest.mark.asyncio
@@ -216,6 +227,9 @@ async def test_after_click_verifier_unwraps_wrapped_goal(monkeypatch: pytest.Mon
     assert captured["navigation_goal"] == MINI_GOAL
     assert captured["big_goal_context"] == MAIN_GOAL
     assert captured["template_name"] == "check-user-goal"
+    # The after-click verifier judges mid-action continuation; treating the
+    # menu-opening click as completion evidence would end dropdown flows early.
+    assert "action_history_evidence" not in captured
 
 
 @pytest.mark.asyncio
