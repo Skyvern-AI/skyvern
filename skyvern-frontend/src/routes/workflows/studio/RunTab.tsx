@@ -42,7 +42,7 @@ export function RunTab() {
       onRetry={
         isBlockRun
           ? undefined
-          : () => navigate(`/workflows/${workflowPermanentId}/run`)
+          : () => navigate(`/agents/${workflowPermanentId}/run`)
       }
     />
   );

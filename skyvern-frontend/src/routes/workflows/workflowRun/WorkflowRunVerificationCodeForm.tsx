@@ -19,7 +19,7 @@ function WorkflowRunVerificationCodeForm({
 
   const navigateUrl =
     workflowRun?.workflow?.workflow_permanent_id && workflowRun?.workflow_run_id
-      ? `/workflows/${workflowRun.workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}`
+      ? `/agents/${workflowRun.workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}`
       : undefined;
 
   return (

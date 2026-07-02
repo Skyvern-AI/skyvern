@@ -273,7 +273,7 @@ function WorkflowRun() {
     <h1 className="text-3xl">
       <Link
         className="hover:underline hover:underline-offset-2"
-        to={`/workflows/${workflowPermanentId}/runs`}
+        to={`/agents/${workflowPermanentId}/runs`}
       >
         {workflow?.title}
       </Link>
@@ -347,7 +347,7 @@ function WorkflowRun() {
     recentRuns[0]?.run_id === workflowRun?.workflow_run_id;
 
   const handleFirstFailedRunRetry = useCallback(() => {
-    navigate(`/workflows/${workflowPermanentId}/run`, {
+    navigate(`/agents/${workflowPermanentId}/run`, {
       state: {
         data: workflowRun?.parameters ?? {},
         proxyLocation,
@@ -539,7 +539,7 @@ function WorkflowRun() {
     }
     return (
       <Navigate
-        to={`/workflows/${workflowPermanentId}/studio?${studioParams.toString()}`}
+        to={`/agents/${workflowPermanentId}/studio?${studioParams.toString()}`}
         replace
       />
     );
@@ -698,7 +698,7 @@ function WorkflowRun() {
             {workflowRunIsFinalized && !isTaskv2Run && !isWorkflowDeleted && (
               <Button asChild>
                 <Link
-                  to={`/workflows/${workflowPermanentId}/run`}
+                  to={`/agents/${workflowPermanentId}/run`}
                   state={{
                     data: parameters,
                     proxyLocation,
