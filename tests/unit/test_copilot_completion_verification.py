@@ -1872,6 +1872,70 @@ def test_fallback_floor_accepts_live_validation_review_output_parameter_shape() 
     ]
 
 
+def test_fallback_floor_accepts_live_validation_review_submit_controls_shape_without_url() -> None:
+    payload = _live_validation_review_output_payload(final_submit_controls_present=None)
+    payload["submit_controls_visible"] = ["Submit Request", "Back"]
+    snapshot = RunEvidenceSnapshot(block_outputs={"validate_business_start_service_review_output": payload})
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id="__copilot_fallback_floor__run",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:validate_business_start_service_review_output",
+        )
+    ]
+
+
+def test_fallback_floor_rejects_live_validation_review_submit_controls_after_final_click() -> None:
+    payload = _live_validation_review_output_payload(
+        final_submit_controls_present=None,
+        submit_finalize_control_clicked=True,
+    )
+    payload["submit_controls_visible"] = ["Submit Request", "Back"]
+    snapshot = RunEvidenceSnapshot(block_outputs={"validate_business_start_service_review_output": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_live_validation_review_back_only_submit_controls() -> None:
+    payload = _live_validation_review_output_payload(final_submit_controls_present=None)
+    payload["submit_controls_visible"] = ["Back"]
+    snapshot = RunEvidenceSnapshot(block_outputs={"validate_business_start_service_review_output": payload})
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_observed_end_state_url_without_review_contract() -> None:
+    snapshot = RunEvidenceSnapshot(
+        current_url="http://localhost:8900/utility_services/peach_electric/",
+        page_title="Peach Electric - Start Service",
+    )
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+def test_fallback_floor_rejects_page_title_without_observed_end_state_url() -> None:
+    snapshot = RunEvidenceSnapshot(page_title="Start Service - Review")
+
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        RunEvidenceSnapshot(current_url="https://example.test/review", failed_block_labels=["submit_request"]),
+        RunEvidenceSnapshot(current_url="https://example.test/review", failure_classes=["ActionFailed"]),
+    ],
+)
+def test_fallback_floor_rejects_observed_end_state_url_with_typed_failure_evidence(
+    snapshot: RunEvidenceSnapshot,
+) -> None:
+    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
+
+
 def test_fallback_floor_rejects_generated_validation_review_after_final_click() -> None:
     snapshot = RunEvidenceSnapshot(
         block_outputs={
@@ -7183,13 +7247,10 @@ async def test_maybe_run_completion_verification_terminal_goal_uses_workflow_run
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_page_end_state_evidence(
+async def test_maybe_run_completion_verification_fallback_floor_rejects_clean_url_without_review_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, str] = {}
-
-    async def handler(*, prompt: str, prompt_name: str) -> dict:
-        captured["prompt"] = prompt
+    async def handler(**_: object) -> dict:
         return {
             "verdicts": [
                 {
@@ -7213,8 +7274,8 @@ async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_p
             "workflow_run_id": "wr_review",
             "overall_status": "completed",
             "executed_block_labels": [],
-            "current_url": "https://example.test/review",
-            "page_title": "Start Service - Review",
+            "current_url": "http://localhost:8900/utility_services/peach_electric/",
+            "page_title": "Peach Electric - Start Service",
             "blocks": [],
         },
     }
@@ -7226,8 +7287,7 @@ async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_p
     assert verification.is_fully_satisfied() is False
     assert verification.verdicts[0].state == "unsatisfied"
     assert verification.verdicts[0].reason_code == "no_evidence"
-    assert "observed_end_state_url: https://example.test/review" in captured["prompt"]
-    assert "observed_end_state_page_title: Start Service - Review" in captured["prompt"]
+    assert verification.verdicts[0].evidence_ref is None
 
 
 @pytest.mark.asyncio
@@ -7263,7 +7323,7 @@ async def test_maybe_run_completion_verification_fallback_floor_without_evidence
 
 
 @pytest.mark.asyncio
-async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_login_page_output(
+async def test_maybe_run_completion_verification_fallback_floor_rejects_typed_failure_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def handler(**_: object) -> object:
@@ -7289,7 +7349,7 @@ async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_l
         "ok": True,
         "data": {
             "workflow_run_id": "wr_login_only",
-            "overall_status": "completed",
+            "overall_status": "failed",
             "executed_block_labels": ["open_demo_utility_login"],
             "current_url": "http://localhost:8900/utility_services/demo_utility/",
             "page_title": "Login",
@@ -7297,7 +7357,8 @@ async def test_maybe_run_completion_verification_fallback_floor_rejects_judged_l
                 {
                     "label": "open_demo_utility_login",
                     "block_type": "CODE",
-                    "status": "completed",
+                    "status": "failed",
+                    "failure_reason": "Page.evaluate: SyntaxError: Unexpected token ')'",
                     "extracted_data": {
                         "login_page_reached": True,
                         "evidence_text": "Sample Utility Portal Log in to your account User ID Password",
