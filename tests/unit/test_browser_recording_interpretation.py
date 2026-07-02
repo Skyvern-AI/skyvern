@@ -586,6 +586,72 @@ def test_start_session_resumes_after_websocket_disconnect_without_stop() -> None
     assert reconnect_updates == [4]
 
 
+def test_start_session_same_recording_attempt_id_reuses_session() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+    session = registry._sessions[PBS_ID]
+    session.session_revision = 5
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+
+    # Same recording (reconnect) reuses the cached session and its revision.
+    assert registry._sessions[PBS_ID] is session
+    assert registry._sessions[PBS_ID].session_revision == 5
+
+
+def test_start_session_new_recording_attempt_id_forces_fresh_session() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+    stale = registry._sessions[PBS_ID]
+    stale.session_revision = 42
+    stale.steps = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+        )
+    ]
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-2",
+    )
+
+    # A new recording gets a fresh session: not the stale object, revision reset,
+    # no carried-over steps.
+    fresh = registry._sessions[PBS_ID]
+    assert fresh is not stale
+    assert fresh.recording_attempt_id == "attempt-2"
+    assert fresh.session_revision == 0
+    assert fresh.steps == []
+
+
 @pytest.mark.asyncio
 async def test_emits_deltas_for_steps_and_snapshot_on_finalize(
     monkeypatch: pytest.MonkeyPatch,
