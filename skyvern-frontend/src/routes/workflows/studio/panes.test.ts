@@ -2,7 +2,14 @@ import { describe, expect, test } from "vitest";
 
 import {
   DEFAULT_STUDIO_PANES,
+  STUDIO_STAGE_GAP_PX,
+  STUDIO_STAGE_PADDING_PX,
+  STUDIO_PANE_MIN_WIDTH,
+  defaultPanesForWorkflowState,
+  fitPanesToWidth,
+  panesFitWidth,
   panesFromDeepLink,
+  panesListEqual,
   parsePanesParam,
   resolveOpenPanes,
   searchWithPanes,
@@ -122,6 +129,124 @@ describe("resolveOpenPanes", () => {
       "copilot",
       "browser",
     ]);
+  });
+});
+
+describe("defaultPanesForWorkflowState", () => {
+  test("an agent with runs starts on Copilot + Browser", () => {
+    expect(
+      defaultPanesForWorkflowState({ hasRuns: true, hasBlocks: true }),
+    ).toEqual(["copilot", "browser"]);
+  });
+
+  test("a never-run agent starts on Copilot + Editor", () => {
+    expect(
+      defaultPanesForWorkflowState({ hasRuns: false, hasBlocks: true }),
+    ).toEqual(["copilot", "editor"]);
+  });
+
+  test("a known runs signal outranks the blocks heuristic", () => {
+    expect(
+      defaultPanesForWorkflowState({ hasRuns: true, hasBlocks: false }),
+    ).toEqual(["copilot", "browser"]);
+  });
+
+  test("unknown runs falls back to blocks: an empty agent starts on the editor", () => {
+    expect(
+      defaultPanesForWorkflowState({ hasRuns: undefined, hasBlocks: false }),
+    ).toEqual(["copilot", "editor"]);
+  });
+
+  test("unknown runs with blocks keeps the legacy default", () => {
+    expect(
+      defaultPanesForWorkflowState({ hasRuns: undefined, hasBlocks: true }),
+    ).toEqual([...DEFAULT_STUDIO_PANES]);
+  });
+});
+
+describe("resolveOpenPanes with custom defaults", () => {
+  test("no params resolves to the given defaults", () => {
+    expect(resolveOpenPanes("", ["copilot", "editor"])).toEqual([
+      "copilot",
+      "editor",
+    ]);
+  });
+
+  test("deep links are unaffected by custom defaults", () => {
+    expect(resolveOpenPanes("?wr=wr_123", ["copilot", "editor"])).toEqual([
+      "run",
+    ]);
+    expect(
+      resolveOpenPanes("?wr=wr_123&bl=block_1", ["copilot", "editor"]),
+    ).toEqual(["run", "browser"]);
+  });
+
+  test("an explicit ?panes= is never overridden by custom defaults", () => {
+    expect(resolveOpenPanes("?panes=browser", ["copilot", "editor"])).toEqual([
+      "browser",
+    ]);
+    expect(resolveOpenPanes("?panes=", ["copilot", "editor"])).toEqual([]);
+  });
+});
+
+describe("panesListEqual", () => {
+  test("compares contents and order", () => {
+    expect(panesListEqual(["copilot", "browser"], ["copilot", "browser"])).toBe(
+      true,
+    );
+    expect(panesListEqual(["copilot", "browser"], ["browser", "copilot"])).toBe(
+      false,
+    );
+    expect(panesListEqual(["copilot"], ["copilot", "browser"])).toBe(false);
+    expect(panesListEqual([], [])).toBe(true);
+  });
+});
+
+describe("panesFitWidth", () => {
+  const width = (panes: Parameters<typeof panesFitWidth>[0]) =>
+    panes.reduce((sum, id) => sum + STUDIO_PANE_MIN_WIDTH[id], 0) +
+    STUDIO_STAGE_PADDING_PX +
+    STUDIO_STAGE_GAP_PX * (panes.length - 1);
+
+  test("an empty list always fits", () => {
+    expect(panesFitWidth([], 0)).toBe(true);
+  });
+
+  test("fits exactly at the min-width sum plus stage chrome", () => {
+    const panes = ["copilot", "browser"] as const;
+    expect(panesFitWidth(panes, width(panes))).toBe(true);
+    expect(panesFitWidth(panes, width(panes) - 1)).toBe(false);
+  });
+});
+
+describe("fitPanesToWidth", () => {
+  test("returns the list unchanged when everything fits", () => {
+    expect(
+      fitPanesToWidth(["copilot", "editor", "browser", "run"], 2000),
+    ).toEqual(["copilot", "editor", "browser", "run"]);
+  });
+
+  test("keeps the longest leading prefix that fits", () => {
+    // copilot(260) + editor(220) + padding(24) + gap(12) = 516 fits in 600;
+    // adding browser(260) + gap(12) = 788 does not.
+    expect(
+      fitPanesToWidth(["copilot", "editor", "browser", "run"], 600),
+    ).toEqual(["copilot", "editor"]);
+  });
+
+  test("degrades deterministically by order, not by pane size", () => {
+    expect(fitPanesToWidth(["run", "copilot", "browser"], 600)).toEqual([
+      "run",
+      "copilot",
+    ]);
+  });
+
+  test("always keeps the first pane even when nothing fits", () => {
+    expect(fitPanesToWidth(["browser", "run"], 100)).toEqual(["browser"]);
+  });
+
+  test("keeps an empty list empty", () => {
+    expect(fitPanesToWidth([], 100)).toEqual([]);
   });
 });
 

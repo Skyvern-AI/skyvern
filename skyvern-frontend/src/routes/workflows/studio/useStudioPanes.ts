@@ -5,7 +5,9 @@ import {
   type NavigateOptions,
 } from "react-router-dom";
 
+import { liveSearch } from "./liveSearch";
 import {
+  panesListEqual,
   resolveOpenPanes,
   searchWithPanes,
   togglePane as togglePaneIn,
@@ -13,6 +15,7 @@ import {
   withPaneOpen,
   type StudioPaneId,
 } from "./panes";
+import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 
 /**
  * Pane state lives in the URL (?panes=), so the open set and its order are
@@ -23,10 +26,22 @@ import {
 export function useStudioPanes() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { defaultPanes, clamp, notePaneWrite } = useStudioPaneDefaults();
+
+  // The mount-time viewport clamp only masks the exact pane list the URL
+  // carried at mount; any other list means someone navigated, so present it
+  // as-is. The first write clears the clamp for good.
+  const present = useCallback(
+    (resolved: StudioPaneId[]): StudioPaneId[] =>
+      clamp && panesListEqual(resolved, clamp.source)
+        ? [...clamp.presented]
+        : resolved,
+    [clamp],
+  );
 
   const panes = useMemo(
-    () => resolveOpenPanes(location.search),
-    [location.search],
+    () => present(resolveOpenPanes(location.search, defaultPanes)),
+    [location.search, defaultPanes, present],
   );
 
   const applyPanes = useCallback(
@@ -34,16 +49,16 @@ export function useStudioPanes() {
       compute: (current: StudioPaneId[]) => StudioPaneId[],
       options?: Pick<NavigateOptions, "state">,
     ) => {
-      // window.location is blank under a memory router (tests); fall back to
-      // the router's location, which is identical to the live URL in a browser.
-      const liveSearch = window.location.search || location.search;
-      const next = compute(resolveOpenPanes(liveSearch));
+      const search = liveSearch(location.search);
+      const current = present(resolveOpenPanes(search, defaultPanes));
+      const next = compute(current);
+      notePaneWrite({ previous: current, next });
       navigate(
-        { search: searchWithPanes(liveSearch, next) },
+        { search: searchWithPanes(search, next) },
         { replace: true, ...options },
       );
     },
-    [navigate, location.search],
+    [navigate, location.search, defaultPanes, present, notePaneWrite],
   );
 
   const togglePane = useCallback(
