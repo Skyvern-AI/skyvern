@@ -237,6 +237,23 @@ describe("BlockConfigSidebar mount stability (SKY-9360)", () => {
     expect(stub.getAttribute("data-block-type")).toBe("task");
     expect(stub.getAttribute("data-block-id")).toBe("block-a");
   });
+
+  test("block-config body uses px-6 py-5 padding", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    const body = screen.getByTestId("block-config-sidebar-body");
+
+    expect(body.className).toContain("px-6");
+    expect(body.className).toContain("py-5");
+  });
 });
 
 describe("BlockConfigSidebar footer label", () => {
@@ -396,6 +413,26 @@ describe("BlockConfigSidebar block library layout (contained drawer)", () => {
 
     expect(panel).not.toBeNull();
     expect(panel?.className).toContain("w-full");
+  });
+
+  test("block-library body uses px-6 py-5 padding", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setWorkflowPanelState({
+        active: true,
+        content: "nodeLibrary",
+      });
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    const body = screen.getByTestId("block-library-sidebar-body");
+
+    expect(body.className).toContain("px-6");
+    expect(body.className).toContain("py-5");
   });
 });
 

@@ -277,7 +277,10 @@ function BlockConfigSidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div
+        data-testid="block-config-sidebar-body"
+        className="flex-1 overflow-y-auto px-6 py-5"
+      >
         <BlockConfigForm blockId={selectedBlockId} />
       </div>
       <UpdatedAgoFooter blockId={selectedBlockId} />
@@ -317,7 +320,10 @@ function BlockLibrarySidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex min-h-0 flex-1 overflow-hidden px-5 py-4">
+      <div
+        data-testid="block-library-sidebar-body"
+        className="flex min-h-0 flex-1 overflow-hidden px-6 py-5"
+      >
         <WorkflowNodeLibraryPanel onNodeClick={onAddNode} />
       </div>
     </>
