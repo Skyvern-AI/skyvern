@@ -1389,9 +1389,13 @@ def _review_page_with_final_controls_visible(record: dict[str, Any]) -> bool:
     if not _has_review_page_evidence(record):
         return False
     final_controls = record.get("final_controls_visible")
+    expected_controls = {"submit request", "submit", "back"}
+    if not isinstance(final_controls, list):
+        final_controls = record.get("submit_controls_visible")
+        expected_controls = {"submit request", "submit"}
     if isinstance(final_controls, list):
         visible = {_normalize_present_value(str(value)) for value in final_controls if isinstance(value, str)}
-        if visible & {"submit request", "submit", "back"}:
+        if visible & expected_controls:
             return True
     return any(
         "final" in _key_word_tokens(key)
