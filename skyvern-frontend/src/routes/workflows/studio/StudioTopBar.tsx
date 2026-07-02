@@ -7,7 +7,7 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -125,10 +125,11 @@ function PanelToggle({
   );
 }
 
-function RunStopButton() {
+export function RunStopButton() {
   const navigate = useNavigate();
   const { workflowPermanentId } = useParams();
   const runId = useStudioRunId();
+  const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
@@ -137,6 +138,9 @@ function RunStopButton() {
   );
   const activeRunId = workflowRun?.workflow_run_id;
   const running = runOutcomeFromStatus(workflowRun?.status) === "running";
+  // ?bl= marks the URL run as a block run; a full run can start alongside it
+  // (they execute concurrently), so Run stays available next to Stop.
+  const isBlockRun = searchParams.has("bl");
 
   const cancelRun = useMutation({
     mutationFn: async () => {
@@ -166,8 +170,10 @@ function RunStopButton() {
     },
   });
 
+  const startFullRun = () => navigate(`/workflows/${workflowPermanentId}/run`);
+
   if (running && activeRunId) {
-    return (
+    const stopDialog = (
       <Dialog>
         <DialogTrigger asChild>
           <Button
@@ -204,13 +210,42 @@ function RunStopButton() {
         </DialogContent>
       </Dialog>
     );
+    if (!isBlockRun) {
+      return stopDialog;
+    }
+    return (
+      <>
+        {stopDialog}
+        <Dialog>
+          <DialogTrigger asChild>
+            <Button size="default" disabled={isRecording}>
+              <PlayIcon className="mr-2 size-4" /> Run
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Start a full run?</DialogTitle>
+              <DialogDescription>
+                A block run is still executing. It will keep running — you can
+                watch it in the Browser pane while the Run pane switches to the
+                new full run.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="secondary">Not now</Button>
+              </DialogClose>
+              <DialogClose asChild>
+                <Button onClick={startFullRun}>Start full run</Button>
+              </DialogClose>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </>
+    );
   }
   return (
-    <Button
-      size="default"
-      disabled={isRecording}
-      onClick={() => navigate(`/workflows/${workflowPermanentId}/run`)}
-    >
+    <Button size="default" disabled={isRecording} onClick={startFullRun}>
       <PlayIcon className="mr-2 size-4" /> Run
     </Button>
   );

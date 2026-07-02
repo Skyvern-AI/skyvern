@@ -22,6 +22,7 @@ import { RunView } from "./RunView";
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
+  debugSession: undefined as unknown,
   runHeroProps: [] as Array<Record<string, unknown>>,
 }));
 
@@ -38,7 +39,7 @@ vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
   }),
 }));
 vi.mock("../../hooks/useDebugSessionQuery", () => ({
-  useDebugSessionQuery: () => ({ data: undefined }),
+  useDebugSessionQuery: () => ({ data: mocks.debugSession }),
 }));
 vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
   useIsGeneratingCode: () => false,
@@ -176,9 +177,72 @@ afterEach(() => {
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
+  mocks.debugSession = undefined;
   mocks.runHeroProps = [];
 });
 beforeEach(() => useRunViewStore.getState().reset());
+
+function seedLiveBlockRun() {
+  mocks.debugSession = { browser_session_id: "pbs_1" };
+  mocks.timeline = [
+    buildBlockItem(
+      buildBlock({
+        workflow_run_block_id: "wrb_1",
+        actions: [
+          buildAction({
+            action_id: "act_1",
+            action_order: 0,
+            screenshot_artifact_id: "art_1",
+          }),
+        ],
+      }),
+    ),
+  ];
+  mocks.workflowRun = {
+    workflow_run_id: "wr_1",
+    status: Status.Running,
+    browser_session_id: "pbs_1",
+    workflow: {
+      workflow_definition: { blocks: [], finally_block_label: null },
+    },
+  };
+}
+
+describe("RunView block run and the Browser pane", () => {
+  test("Browser pane open: the hero gets live-edge screenshots, not the stream selection", () => {
+    seedLiveBlockRun();
+    render(
+      <MemoryRouter
+        initialEntries={["/?wr=wr_1&bl=Block%201&panes=run,browser"]}
+      >
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.showDebugStream).toBe(true);
+    expect(props?.debugStreamInBrowserPane).toBe(true);
+    // Without the remap the "stream" selection would leave heroSelection null.
+    expect(props?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: "art_1",
+    });
+  });
+
+  test("Browser pane closed, Run pane open: the hero stays self-sufficient", () => {
+    seedLiveBlockRun();
+    render(
+      <MemoryRouter initialEntries={["/?wr=wr_1&bl=Block%201&panes=run"]}>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.showDebugStream).toBe(true);
+    expect(props?.debugStreamInBrowserPane).toBe(false);
+    expect(props?.paneOpen).toBe(true);
+  });
+});
 
 describe("RunView iteration selection", () => {
   test("selecting the loop block after an iteration clears the iteration scope", () => {

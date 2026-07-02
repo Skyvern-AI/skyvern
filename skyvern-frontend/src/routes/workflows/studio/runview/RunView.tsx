@@ -40,6 +40,7 @@ import {
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
+import { studioPanelId } from "../constants";
 import { useStudioPanes } from "../useStudioPanes";
 import { RunHero } from "./RunHero";
 import { type HeroSelection } from "./HeroScreenshot";
@@ -108,7 +109,7 @@ export function RunView({
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
   const headerCompact = useRunViewStore((s) => s.headerCompact);
-  const { panes: studioPanes } = useStudioPanes();
+  const { panes: studioPanes, openPane } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("run");
   const browserPaneOpen = studioPanes.includes("browser");
   const [searchParams, setSearchParams] = useSearchParams();
@@ -228,6 +229,23 @@ export function RunView({
     searchParams.has("bl") &&
     workflowRun?.browser_session_id != null &&
     workflowRun.browser_session_id === debugSession?.browser_session_id;
+  // The open Browser pane outranks the hero for the singleton debug-stream
+  // node (StudioShell priority); the hero then points at it instead.
+  const debugStreamInBrowserPane = showDebugStream && browserPaneOpen;
+  const focusBrowserPane = useCallback(() => {
+    openPane("browser");
+    // Defer past the pane-open commit so the scroll sees the visible panel.
+    requestAnimationFrame(() => {
+      const reduceMotion =
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      document.getElementById(studioPanelId("browser"))?.scrollIntoView({
+        behavior: reduceMotion ? "auto" : "smooth",
+        block: "nearest",
+        inline: "nearest",
+      });
+    });
+  }, [openPane]);
   const fixSeedMessage = useMemo(
     () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
     [workflowRun?.failure_reason],
@@ -239,10 +257,16 @@ export function RunView({
   const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
-  const selectedId =
+  const rawSelectedId =
     pinnedFrameId ??
     (running && !showingScreenshots ? "stream" : lastFrame?.id) ??
     null;
+  // A "stream" selection has no hero surface while the Browser pane hosts the
+  // debug node; follow the newest frame so screenshots track the live edge.
+  const selectedId =
+    rawSelectedId === "stream" && debugStreamInBrowserPane
+      ? (lastFrame?.id ?? null)
+      : rawSelectedId;
   const activeItem = useMemo(
     () =>
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
@@ -360,12 +384,22 @@ export function RunView({
     return { parameters, meta };
   }, [workflowRun]);
 
+  // Task 2.0 runs carry their output (and any webhook failure) on task_v2,
+  // not on the workflow-run outputs field.
+  const observerOutput = workflowRun?.task_v2?.output ?? null;
+  const webhookFailureReason =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason ??
+    null;
+
   const hasInputs =
     runInputs.parameters.length > 0 || runInputs.meta.length > 0;
   const hasOutputs =
     (extractedInformation != null &&
       Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0;
+    downloadedFiles.length > 0 ||
+    observerOutput != null ||
+    webhookFailureReason != null;
 
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
@@ -389,7 +423,9 @@ export function RunView({
             heroLabel={heroLabel}
             running={running}
             showDebugStream={showDebugStream}
-            debugStreamInBrowserPane={browserPaneOpen}
+            debugStreamInBrowserPane={debugStreamInBrowserPane}
+            onFocusBrowserPane={focusBrowserPane}
+            paneOpen={runPaneOpen}
             provisioning={
               workflowRun.status === Status.Created ||
               workflowRun.status === Status.Queued
@@ -400,6 +436,7 @@ export function RunView({
             codeGenerating={codeGenerating}
             browserSessionId={workflowRun.browser_session_id ?? null}
             recordingUrls={recordingUrls}
+            recordingArchived={workflowRun.recording_archived ?? false}
             hasScreenshots={hasScreenshots}
             elapsed={elapsed}
             overview={
@@ -430,6 +467,8 @@ export function RunView({
                   workflowTitle={workflowRun.workflow?.title}
                   extractedInformation={extractedInformation}
                   files={downloadedFiles}
+                  observerOutput={observerOutput}
+                  webhookFailureReason={webhookFailureReason}
                   summary={outputSummary}
                   onSummary={setOutputSummary}
                 />

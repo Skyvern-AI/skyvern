@@ -58,6 +58,87 @@ describe("RunHero block-run stream", () => {
   });
 });
 
+describe("RunHero when the Browser pane hosts the debug stream", () => {
+  const blockRunProps = {
+    ...baseProps,
+    showDebugStream: true,
+    debugStreamInBrowserPane: true,
+  };
+
+  test("renders live-edge screenshots, not a dead stream slot", () => {
+    render(
+      <RunHero
+        {...blockRunProps}
+        heroSelection={{
+          kind: "action",
+          artifactId: "art_1",
+          stepId: "step_1",
+          actionOrder: 0,
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("run-stream-slot")).toBeNull();
+    expect(screen.queryByTestId("run-live-stream")).toBeNull();
+    expect(screen.queryByTestId("hero-screenshot")).not.toBeNull();
+  });
+
+  test("the Live chip focuses the Browser pane and unpins to the live edge", () => {
+    const onFocusBrowserPane = vi.fn();
+    useRunViewStore.getState().pinFrame("act_1");
+    render(
+      <RunHero {...blockRunProps} onFocusBrowserPane={onFocusBrowserPane} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Live" }));
+
+    expect(onFocusBrowserPane).toHaveBeenCalledTimes(1);
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(screen.queryByTestId("run-stream-slot")).toBeNull();
+  });
+
+  test("a queued block run surfaces its queued state", () => {
+    render(<RunHero {...blockRunProps} provisioning />);
+    expect(screen.queryByText(/Run queued/)).not.toBeNull();
+  });
+
+  test("a queued block run also shows the queued chip over the hosted slot", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream
+        debugStreamInBrowserPane={false}
+        provisioning
+      />,
+    );
+    expect(screen.queryByTestId("run-stream-slot")).not.toBeNull();
+    expect(screen.queryByText(/Run queued/)).not.toBeNull();
+  });
+});
+
+describe("RunHero closed pane", () => {
+  test("mounts no full-run stream while the pane is hidden", () => {
+    render(<RunHero {...baseProps} showDebugStream={false} paneOpen={false} />);
+    expect(screen.queryByTestId("run-live-stream")).toBeNull();
+    expect(screen.queryByTestId("run-stream-slot")).toBeNull();
+  });
+});
+
+describe("RunHero archived recording", () => {
+  test("explains an archived recording instead of hiding it silently", () => {
+    render(
+      <RunHero
+        {...baseProps}
+        showDebugStream={false}
+        running={false}
+        recordingArchived
+        heroSelection={{ kind: "thought", thoughtId: "t1" }}
+      />,
+    );
+    const chip = screen.getByRole("button", { name: /Recording archived/ });
+    expect((chip as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
 describe("RunHero Code surface (single source of truth)", () => {
   test("the Code toggle opens the generated-code view", () => {
     render(<RunHero {...baseProps} showDebugStream={false} />);
