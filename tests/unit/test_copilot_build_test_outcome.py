@@ -5,11 +5,13 @@ from types import SimpleNamespace
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_structure_signature_from_workflow,
+    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_run_blocks_result,
+    recorded_outcome_from_scout_act_observe_hollow,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -111,6 +113,39 @@ def test_structural_key_does_not_require_fixture_slug_or_raw_transcript_text() -
     assert "synthetic transcript excerpt" not in str(key_payload)
 
 
+def test_scout_act_observe_hollow_outcome_is_structural_and_privacy_bounded() -> None:
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#search",
+        current_url="https://example.com/customers/acme-inc/results?token=secret",
+        source_url="https://example.com/accounts/claim-123/search?name=customer",
+        page_evidence={
+            "page_title": "Private Account Search",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "clickable_controls": [],
+            "visible_text": "Customer name should not persist",
+            "body": "<main></main>",
+            "schema_empty_page": True,
+        },
+        recapture_attempted=True,
+        recapture_result="timeout",
+    )
+
+    dumped = outcome.model_dump(mode="json")
+    key_payload = outcome.structural_key_payload
+
+    assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+    assert outcome.structural_key is not None
+    assert outcome.is_authoritative is True
+    assert "recapture_attempted:true" in outcome.page_evidence_refs
+    assert "recapture_result:timeout" in outcome.page_evidence_refs
+    for sensitive in ("token=secret", "name=customer", "acme-inc", "claim-123", "Customer name", "Private Account"):
+        assert sensitive not in str(dumped)
+        assert sensitive not in str(key_payload)
+
+
 def test_prose_or_label_only_typed_outcome_is_not_authoritative() -> None:
     outcome = RecordedBuildTestOutcome(
         phase="author_time_reject",
@@ -144,6 +179,51 @@ def test_record_none_clears_stale_latest_outcome() -> None:
     record_build_test_outcome(ctx, None)
 
     assert ctx.latest_recorded_build_test_outcome is None
+
+
+def test_repeated_outcome_ignores_intervening_scout_evaluate_history() -> None:
+    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    author_reject = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        structural_failure_identity="author:missing-output",
+    )
+    scout_hollow = RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout:hollow",
+    )
+
+    record_build_test_outcome(ctx, author_reject)
+    record_build_test_outcome(ctx, scout_hollow)
+    record_build_test_outcome(ctx, author_reject)
+
+    assert latest_recorded_build_test_outcome_repeated(ctx) is True
+
+
+def test_repeated_outcome_still_detects_different_author_reject_after_scout_evaluate() -> None:
+    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    first_reject = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        structural_failure_identity="author:missing-output",
+    )
+    scout_hollow = RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout:hollow",
+    )
+    second_reject = first_reject.model_copy(update={"structural_failure_identity": "author:different-output"})
+
+    record_build_test_outcome(ctx, first_reject)
+    record_build_test_outcome(ctx, scout_hollow)
+    record_build_test_outcome(ctx, second_reject)
+
+    assert latest_recorded_build_test_outcome_repeated(ctx) is False
 
 
 def test_authored_structure_signature_is_stable_and_excludes_raw_code_or_prose() -> None:
@@ -466,6 +546,8 @@ def test_outcome_not_demonstrated_keeps_missing_fact_for_absent_requested_output
             "grounding_mode": "missing",
         }
     ]
+    assert outcome.structural_key_payload is not None
+    assert "output.top_post" in str(outcome.structural_key_payload)
 
 
 def test_authoring_repair_context_produces_structural_recorded_outcome() -> None:
