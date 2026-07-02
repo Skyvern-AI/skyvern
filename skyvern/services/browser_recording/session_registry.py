@@ -27,6 +27,7 @@ class RecordingInterpretationSessionRegistry:
         organization_id: str,
         workflow_permanent_id: str,
         on_update: OnRecordingInterpretationUpdate,
+        deltas_enabled: bool = False,
     ) -> None:
         self._prune_expired_sessions()
         existing = self._sessions.get(browser_session_id)
@@ -37,6 +38,7 @@ class RecordingInterpretationSessionRegistry:
             and not existing.finalized
         ):
             existing.on_update = on_update
+            existing.set_deltas_enabled(deltas_enabled)
             self._last_seen[browser_session_id] = time.monotonic()
             existing.emit_snapshot()
             return
@@ -47,6 +49,7 @@ class RecordingInterpretationSessionRegistry:
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             on_update=on_update,
+            deltas_enabled=deltas_enabled,
         )
         self._last_seen[browser_session_id] = time.monotonic()
 
