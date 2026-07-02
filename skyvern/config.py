@@ -562,8 +562,11 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
-    # Where credentials are stored: bitwarden, azure_vault, gcp, or custom
+    # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
     CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
+    LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
+    LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
 
     # GCP Secret Manager credential vault settings
     GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
@@ -887,6 +890,11 @@ class Settings(BaseSettings):
         :return: True if env is not local, else False
         """
         return self.ENV != "local"
+
+    def is_local_credential_vault_enabled(self) -> bool:
+        if self.ENABLE_LOCAL_CREDENTIAL_VAULT is not None:
+            return self.ENABLE_LOCAL_CREDENTIAL_VAULT
+        return not self.is_cloud_environment()
 
     def execute_all_steps(self) -> bool:
         """

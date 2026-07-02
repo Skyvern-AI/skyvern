@@ -363,7 +363,7 @@ Restart Skyvern after setting these variables.
 | Status stays Inactive | Verify the API base URL is a valid URL and the API token is not empty. The configuration is validated on save but does not make a live request to your server. |
 | Credentials not created | Review your API logs for auth errors. Ensure the response includes an `id` field. Skyvern expects HTTP 200 for all operations. |
 | Credentials not retrieved | Ensure the GET response includes all required fields for the credential type (`username` and `password` for passwords, all card fields for credit cards, `secret_value` for secrets). |
-| Env config not working | Restart Skyvern after setting variables. Verify `CREDENTIAL_VAULT_TYPE=custom` is set and both URL and token are provided. The default vault type is `bitwarden`, so this variable must be explicitly set. |
+| Env config not working | Restart Skyvern after setting variables. Verify `CREDENTIAL_VAULT_TYPE=custom` is set and both URL and token are provided. Deployment defaults vary, so `custom` must be explicitly set for an external service. |
 
 ---
 
