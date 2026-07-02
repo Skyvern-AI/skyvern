@@ -31,6 +31,9 @@ type RunHeroProps = {
   // A block run shows the shared debug-session stream (re-parented in by the
   // shell), view-only, instead of mounting a separate run stream.
   showDebugStream: boolean;
+  // The open Browser pane outranks this hero for the single stream node; point
+  // at it instead of registering a slot that would stay black.
+  debugStreamInBrowserPane?: boolean;
   provisioning: boolean;
   isPaused: boolean;
   failed: boolean;
@@ -153,6 +156,7 @@ export function RunHero({
   heroLabel,
   running,
   showDebugStream,
+  debugStreamInBrowserPane = false,
   provisioning,
   isPaused,
   failed,
@@ -389,15 +393,21 @@ export function RunHero({
           </div>
         ) : center === "stream" ? (
           showDebugStream ? (
-            // The shell re-parents the persistent debug-session stream into this
-            // slot (the same node as the Browser tab), so a block run shows its
-            // live browser here, view-only. The slot unmounts when the user scrubs
-            // or opens code/recording, which parks the node back offscreen.
-            <div
-              ref={setRunStreamSlot}
-              data-testid="run-stream-slot"
-              className="absolute inset-0"
-            />
+            debugStreamInBrowserPane ? (
+              <div className="absolute inset-0 grid place-items-center px-6 text-center text-sm text-muted-foreground">
+                This block run's live browser is showing in the Browser pane.
+              </div>
+            ) : (
+              // The shell re-parents the persistent debug-session stream into this
+              // slot (the same node as the Browser pane), so a block run shows its
+              // live browser here, view-only. The slot unmounts when the user scrubs
+              // or opens code/recording, which parks the node back offscreen.
+              <div
+                ref={setRunStreamSlot}
+                data-testid="run-stream-slot"
+                className="absolute inset-0"
+              />
+            )
           ) : provisioning ? (
             // Mounting the stream while the run is still queued opens a socket
             // the backend never feeds; wait until the run is actually running.

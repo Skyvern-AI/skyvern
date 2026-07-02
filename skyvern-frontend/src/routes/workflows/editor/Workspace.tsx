@@ -157,11 +157,7 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
-import {
-  STUDIO_COPILOT_RAIL_WIDTH,
-  STUDIO_COPILOT_WIDTH,
-} from "../studio/constants";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
 
@@ -328,18 +324,8 @@ function Workspace({
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
-  const studioCopilotCollapsed = useStudioShellStore((s) => s.copilotCollapsed);
-  const studioSetCopilotCollapsed = useStudioShellStore(
-    (s) => s.setCopilotCollapsed,
-  );
-  const studioSetTab = useStudioShellStore((s) => s.setTab);
-  // The studio canvas sits right of the Copilot column; offset the fit by the
-  // column width so the chain centers on the whole page, not just the pane.
-  const studioCanvasCenterOffset = embedded
-    ? studioCopilotCollapsed
-      ? STUDIO_COPILOT_RAIL_WIDTH
-      : STUDIO_COPILOT_WIDTH
-    : 0;
+  const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
+  const studioCopilotOpen = studioPanes.includes("copilot");
   const location = useLocation();
   const navigate = useNavigate();
   const locationState = location.state as {
@@ -1804,7 +1790,6 @@ function Workspace({
                 onEdgesChange={onEdgesChange}
                 initialTitle={initialTitle}
                 workflow={workflow}
-                centerOffsetX={studioCanvasCenterOffset}
                 embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
@@ -2358,14 +2343,10 @@ function Workspace({
       )}
 
       <WorkflowCopilotChat
-        isOpen={
-          embedded ? !studioCopilotCollapsed : showBrowser && isCopilotOpen
-        }
+        isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
         docked={embedded}
+        chromeless={embedded}
         portalTarget={embedded ? studioCopilotPortalEl : undefined}
-        onCollapse={
-          embedded ? () => studioSetCopilotCollapsed(true) : undefined
-        }
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
@@ -2548,10 +2529,10 @@ function Workspace({
             };
 
             // Hide chat and show comparison. The comparison renders on the
-            // editor canvas, so surface the editor tab when docked in the studio.
+            // editor canvas, so surface the Editor pane when docked in the studio.
             setIsCopilotOpen(false);
             if (embedded) {
-              studioSetTab("editor");
+              openStudioPane("editor");
             }
             setWorkflowPanelState({
               active: false,

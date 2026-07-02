@@ -14,7 +14,6 @@ import {
   isWorkflowRunBlock,
 } from "@/routes/workflows/types/workflowRunTypes";
 import { useRunViewStore } from "@/store/RunViewStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
 import { cn } from "@/util/utils";
@@ -41,6 +40,7 @@ import {
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
+import { useStudioPanes } from "../useStudioPanes";
 import { RunHero } from "./RunHero";
 import { type HeroSelection } from "./HeroScreenshot";
 import { buildRunFixMessage } from "./runFixMessage";
@@ -108,7 +108,9 @@ export function RunView({
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
   const headerCompact = useRunViewStore((s) => s.headerCompact);
-  const studioTab = useStudioShellStore((s) => s.tab);
+  const { panes: studioPanes } = useStudioPanes();
+  const runPaneOpen = studioPanes.includes("run");
+  const browserPaneOpen = studioPanes.includes("browser");
   const [searchParams, setSearchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
@@ -158,12 +160,15 @@ export function RunView({
     }
     setSearchParams(
       (prev) => {
+        // Build on the LIVE URL (prev is this render's closure): a concurrent
+        // navigation (block-run launch, pane toggle) is already visible there.
+        const base = window.location.search || `?${prev.toString()}`;
+        const next = new URLSearchParams(base);
         const desired =
           pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
-        if ((prev.get("active") ?? null) === desired) {
-          return prev;
+        if ((next.get("active") ?? null) === desired) {
+          return next;
         }
-        const next = new URLSearchParams(prev);
         if (desired) {
           next.set("active", desired);
         } else {
@@ -176,15 +181,15 @@ export function RunView({
   }, [pinnedFrameId, workflowRunId, setSearchParams]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
-  // the tab: RunView also mounts under Editor, no ?wr= there.
+  // the Run pane being open: RunView stays mounted while its pane is closed.
   //
   // The guard reads the LIVE URL, not this render's searchParams: a block-run launch
-  // navigates to ?wr=&bl= via a separate router update, and the editor→run transition
-  // can fire this effect from a render whose searchParams closure predates it. Reading
-  // the live URL avoids writing the stale latest-run id back over the new run (which
-  // reverted ?wr= and dropped ?bl=, disabling the debug stream).
+  // navigates to ?wr=&bl= via a separate router update, and this effect can fire from
+  // a render whose searchParams closure predates it. Reading the live URL avoids
+  // writing the stale latest-run id back over the new run (which reverted ?wr= and
+  // dropped ?bl=, disabling the debug stream).
   useEffect(() => {
-    if (studioTab !== "run") {
+    if (!runPaneOpen) {
       return;
     }
     if (!workflowRunId) {
@@ -195,16 +200,17 @@ export function RunView({
     }
     setSearchParams(
       (prev) => {
-        if (prev.get("wr")) {
-          return prev;
+        const base = window.location.search || `?${prev.toString()}`;
+        const next = new URLSearchParams(base);
+        if (next.get("wr")) {
+          return next;
         }
-        const next = new URLSearchParams(prev);
         next.set("wr", workflowRunId);
         return next;
       },
       { replace: true },
     );
-  }, [studioTab, workflowRunId, setSearchParams]);
+  }, [runPaneOpen, workflowRunId, setSearchParams]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
 
@@ -213,12 +219,12 @@ export function RunView({
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
-  // A block run executes in the debug session; on the Run tab show that same live
+  // A block run executes in the debug session; in the Run pane show that same live
   // debug stream (the shared node) instead of a separate run stream — but only when
   // the run's browser session IS the current debug session. A historical block-run
   // link whose debug session is gone/different falls back to the normal run view.
   const showDebugStream =
-    studioTab === "run" &&
+    runPaneOpen &&
     searchParams.has("bl") &&
     workflowRun?.browser_session_id != null &&
     workflowRun.browser_session_id === debugSession?.browser_session_id;
@@ -383,6 +389,7 @@ export function RunView({
             heroLabel={heroLabel}
             running={running}
             showDebugStream={showDebugStream}
+            debugStreamInBrowserPane={browserPaneOpen}
             provisioning={
               workflowRun.status === Status.Created ||
               workflowRun.status === Status.Queued

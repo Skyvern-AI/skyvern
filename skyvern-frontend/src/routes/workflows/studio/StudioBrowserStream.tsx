@@ -3,18 +3,19 @@ import { useParams } from "react-router-dom";
 
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { StreamPresenter } from "./StreamPresenter";
+import { useStudioPanes } from "./useStudioPanes";
 
 /**
  * The studio's single live-browser stream, portaled into a host node re-parented
- * between the PiP and Browser tab so the socket persists instead of re-booting.
+ * between the open panes so the socket persists instead of re-booting.
  */
 export function StudioBrowserStream() {
   const { workflowPermanentId } = useParams();
-  const tab = useStudioShellStore((s) => s.tab);
+  const { panes } = useStudioPanes();
+  const browserPaneOpen = panes.includes("browser");
   const isRecording = useRecordingStore((s) => s.isRecording);
   const reloadNonce = useStudioBrowserStore((s) => s.reloadNonce);
   const setStreamUrl = useStudioBrowserStore((s) => s.setStreamUrl);
@@ -33,10 +34,10 @@ export function StudioBrowserStream() {
   }, [browserSessionId, reset]);
 
   useEffect(() => {
-    if (tab === "browser") {
+    if (browserPaneOpen) {
       clearActivity();
     }
-  }, [clearActivity, tab]);
+  }, [clearActivity, browserPaneOpen]);
 
   const handleUrlChange = useCallback(
     (url: string) => {
@@ -46,12 +47,12 @@ export function StudioBrowserStream() {
   );
 
   const handleActivity = useCallback(() => {
-    if (tab === "browser") {
+    if (browserPaneOpen) {
       clearActivity();
       return;
     }
     markActivity();
-  }, [clearActivity, markActivity, tab]);
+  }, [clearActivity, markActivity, browserPaneOpen]);
 
   if (!browserSessionId) {
     return null;
@@ -62,7 +63,7 @@ export function StudioBrowserStream() {
       key={`${browserSessionId}:${reloadNonce}`}
       browserSessionId={browserSessionId}
       interactive={false}
-      showControlButtons={tab === "browser"}
+      showControlButtons={browserPaneOpen}
       isRecording={isRecording}
       onUrlChange={handleUrlChange}
       onActivity={handleActivity}
