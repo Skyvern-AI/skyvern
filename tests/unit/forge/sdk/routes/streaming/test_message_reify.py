@@ -104,6 +104,31 @@ class TestReifyChannelMessage:
         assert msg.workflow_permanent_id == "wpid_123"
         assert msg.live_interpretation_enabled is True
 
+    def test_begin_exfiltration_defaults_no_delta_support(self) -> None:
+        # An existing client that predates deltas omits the field; it must default
+        # false so the backend keeps sending full snapshots (no breakage).
+        msg = reify_channel_message(
+            {
+                "kind": "begin-exfiltration",
+                "workflow_permanent_id": "wpid_123",
+                "live_interpretation_enabled": True,
+            }
+        )
+        assert isinstance(msg, MessageInBeginExfiltration)
+        assert msg.supports_interpretation_deltas is False
+
+    def test_begin_exfiltration_honors_declared_delta_support(self) -> None:
+        msg = reify_channel_message(
+            {
+                "kind": "begin-exfiltration",
+                "workflow_permanent_id": "wpid_123",
+                "live_interpretation_enabled": True,
+                "supports_interpretation_deltas": True,
+            }
+        )
+        assert isinstance(msg, MessageInBeginExfiltration)
+        assert msg.supports_interpretation_deltas is True
+
     def test_recording_rearm_capture(self) -> None:
         assert isinstance(
             reify_channel_message({"kind": "recording-rearm-capture"}),
