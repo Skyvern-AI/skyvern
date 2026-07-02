@@ -4,6 +4,7 @@ import asyncio
 import textwrap
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisFailureType,
     DiagnosisInput,
     DiagnosisRepairContract,
     DiagnosisResult,
@@ -53,12 +55,14 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     VerificationResult,
     _verification_satisfaction,
+    build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     built_unverified_repair_inert_context,
     outcome_fully_verified,
     verified_goal_satisfied_context,
 )
+from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -92,6 +96,7 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _artifact_health_blocker_from_result,
     _reconcile_download_completion_criterion,
 )
+from skyvern.forge.sdk.copilot.tools.composition_capture import _active_run_terminal_monitor_enabled
 
 
 def _criterion(
@@ -109,6 +114,7 @@ def _criterion(
     expected_output_shape: str | None = None,
     classification_output_key: str | None = None,
     expected_classification: str | bool | None = None,
+    requested_output_corroborator: bool = False,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -124,6 +130,7 @@ def _criterion(
         expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
+        requested_output_corroborator=requested_output_corroborator,
     )
 
 
@@ -480,6 +487,30 @@ def test_structural_requested_output_abstention_without_typed_corroboration_gets
     )
 
     assert result.is_fully_satisfied() is False
+
+
+def test_structural_requested_output_abstention_with_classifier_corroborator_satisfies() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c0__requested_output_corroborator"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:extract_first_three_quotes.quotes",
+                output_path="output.quotes",
+                grounding_mode="missing",
+            ),
+            CriterionVerdict(
+                criterion_id="c0__requested_output_corroborator",
+                state="satisfied",
+                reason_code="evidence_confirms",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is True
 
 
 def test_requested_output_no_evidence_with_observed_end_state_still_blocks() -> None:
@@ -2230,6 +2261,169 @@ def test_visual_prompt_requests_outcome_relevant_page_state() -> None:
     assert "human-verification" in prompt
 
 
+@pytest.mark.asyncio
+async def test_active_run_terminal_monitor_skips_requested_output_only_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {}
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    ctx.browser_session_id = "bs_1"
+    ctx.discovery_mcp_server = object()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_criterion("c0", "return record id", output_path="output.record_id")]
+    )
+
+    assert await _active_run_terminal_monitor_enabled(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_monitor_keeps_mixed_requested_output_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {}
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    ctx.browser_session_id = "bs_1"
+    ctx.discovery_mcp_server = object()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion("c0", "return record id", output_path="output.record_id"),
+            _criterion("c1", "cart page is visible"),
+        ]
+    )
+
+    assert await _active_run_terminal_monitor_enabled(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_monitor_skips_requested_output_corroborator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {}
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    ctx.browser_session_id = "bs_1"
+    ctx.discovery_mcp_server = object()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion("c_requested", "return quotes", output_path="output.quotes"),
+            _criterion(
+                "c_quotes",
+                "The run extracts the first 3 quotes and authors into the returned quotes JSON.",
+                requested_output_corroborator=True,
+            ),
+        ]
+    )
+
+    assert await _active_run_terminal_monitor_enabled(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_monitor_keeps_unmarked_fallback_floor_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {}
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    ctx.browser_session_id = "bs_1"
+    ctx.discovery_mcp_server = object()
+    ctx.request_policy = RequestPolicy(completion_criteria=build_classifier_fallback_floor([]))
+
+    assert await _active_run_terminal_monitor_enabled(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_monitor_skips_marked_fallback_floor_corroborator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {}
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    ctx.browser_session_id = "bs_1"
+    ctx.discovery_mcp_server = object()
+    floor = replace(build_classifier_fallback_floor([])[0], requested_output_corroborator=True)
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion("c_requested", "return record id", output_path="output.record_id"),
+            floor,
+        ]
+    )
+
+    assert await _active_run_terminal_monitor_enabled(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_monitor_keeps_terminal_action_criteria_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {}
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    ctx.browser_session_id = "bs_1"
+    ctx.discovery_mcp_server = object()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "service request is submitted",
+                kind="terminal_action",
+                terminal_action_family="request",
+            )
+        ]
+    )
+
+    assert await _active_run_terminal_monitor_enabled(ctx) is True
+
+
 def test_summarize_unsatisfied_lists_unmet_outcomes() -> None:
     criteria = [_criterion("c0", "item in cart"), _criterion("c1", "added exactly once")]
     result = _evaluated(("c0", True), ("c1", False))
@@ -2816,6 +3010,29 @@ def test_record_run_blocks_keeps_clean_structural_abstention_as_built_unverified
     assert outcome is not None
     assert outcome.verdict == "not_authoritative"
     assert outcome.is_authoritative is False
+
+
+def test_record_run_blocks_verifies_structural_requested_output_with_run_corroborator() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    verification = _mixed(
+        CriterionVerdict(criterion_id="c_quotes", state="satisfied", reason_code="evidence_confirms"),
+        CriterionVerdict(
+            criterion_id="c_requested_output",
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref="block_outputs:extract_first_three_quotes.quotes",
+            output_path="output.quotes",
+            grounding_mode="missing",
+        ),
+    )
+
+    recorded = _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=verification)
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert verified_goal_satisfied_context(ctx) is True
+    assert built_unverified_repair_inert_context(ctx) is False
+    assert outcome_fully_verified(ctx) is True
 
 
 def test_committed_same_run_outcome_survives_later_contradictory_overwrite() -> None:
@@ -3801,8 +4018,85 @@ def test_active_run_terminal_evidence_result_shape_is_not_final_success() -> Non
 
     assert result["ok"] is False
     assert result["data"]["active_run_terminal_evidence_detected"] is True
+    assert result["data"]["active_run_terminal_evidence_reason_code"] == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
     assert result["data"]["full_workflow_verified"] is False
     assert result["data"]["failure_categories"][0]["category"] == ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+
+
+def test_active_run_terminal_evidence_contract_noops_when_outcome_fully_verified() -> None:
+    sample = SimpleNamespace(
+        current_url="https://example.com/cart",
+        page_title="Cart",
+        sample_index=2,
+        completion_verification=_evaluated(("c0", True)),
+        page_evidence={
+            "current_url": "https://example.com/cart",
+            "page_title": "Cart",
+            "visible_text_excerpt": "Cart TESTBRAND PART-001-TEST quantity 1",
+        },
+    )
+    result = _active_run_terminal_evidence_result(
+        workflow_run_id="wr_active",
+        run_status="canceled",
+        sample=sample,
+        requested_block_labels=["search_and_add"],
+        executed_block_labels=["search_and_add"],
+    )
+    ctx = _run_ctx()
+    ctx.completion_verification_result = _evaluated(("c0", True))
+
+    contract = build_diagnosis_repair_contract(source_tool="update_and_run_blocks", result=result, ctx=ctx)
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+
+
+def test_active_run_terminal_evidence_contract_requires_reason_code_for_verified_noop() -> None:
+    sample = SimpleNamespace(
+        current_url="https://example.com/cart",
+        page_title="Cart",
+        sample_index=2,
+        completion_verification=_evaluated(("c0", True)),
+        page_evidence={"current_url": "https://example.com/cart"},
+    )
+    result = _active_run_terminal_evidence_result(
+        workflow_run_id="wr_active",
+        run_status="canceled",
+        sample=sample,
+        requested_block_labels=["search_and_add"],
+        executed_block_labels=["search_and_add"],
+    )
+    result["data"].pop("active_run_terminal_evidence_reason_code")
+    ctx = _run_ctx()
+    ctx.completion_verification_result = _evaluated(("c0", True))
+
+    contract = build_diagnosis_repair_contract(source_tool="update_and_run_blocks", result=result, ctx=ctx)
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+
+
+def test_terminal_challenge_contract_still_stops_when_outcome_fully_verified() -> None:
+    ctx = _run_ctx()
+    ctx.completion_verification_result = _evaluated(("c0", True))
+    result = {
+        "ok": False,
+        "error": "blocked by human verification",
+        "data": {
+            "workflow_run_id": "wr_blocked",
+            "overall_status": "failed",
+            "failure_categories": [{"category": "ANTI_BOT_DETECTION", "confidence_float": 1.0}],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(source_tool="update_and_run_blocks", result=result, ctx=ctx)
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
 
 
 def test_record_active_run_terminal_evidence_keeps_workflow_unverified() -> None:
