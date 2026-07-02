@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import { AxiosError } from "axios";
 import {
   CalendarIcon,
@@ -11,7 +11,6 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
-import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -26,8 +25,6 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useStudioShellStore, type StudioTab } from "@/store/StudioShellStore";
-import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -39,9 +36,7 @@ import { MakeACopyButton } from "../editor/MakeACopyButton";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
-import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
-import { studioPanelId, studioTabId } from "./constants";
-import { finalizedRunStatus, runOutcomeFromStatus } from "./runProjections";
+import { runOutcomeFromStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
 
 function useIsGlobalWorkflow(): boolean {
@@ -51,133 +46,6 @@ function useIsGlobalWorkflow(): boolean {
     globalWorkflows?.some(
       (w) => w.workflow_permanent_id === workflowPermanentId,
     ),
-  );
-}
-
-function StudioTabs() {
-  const tab = useStudioShellStore((s) => s.tab);
-  const setTab = useStudioShellStore((s) => s.setTab);
-  const hasUnseenBrowserActivity = useStudioBrowserStore(
-    (s) => s.hasUnseenActivity,
-  );
-  const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
-  const urlRunId = useStudioRunId();
-  const { workflowPermanentId } = useParams();
-  const { data: urlRun } = useWorkflowRunWithWorkflowQuery(
-    urlRunId ? { workflowRunId: urlRunId } : undefined,
-  );
-  const { data: runs } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    page: 1,
-    pageSize: 1,
-  });
-  const latestRun = runs?.[0];
-  const hasRun = Boolean(urlRunId) || (runs?.length ?? 0) > 0;
-  const runStatus = finalizedRunStatus(
-    urlRunId ? urlRun?.status : latestRun?.status,
-  );
-
-  const tabs: Array<{ id: StudioTab; label: string; disabled: boolean }> = [
-    { id: "editor", label: "Editor", disabled: false },
-    { id: "browser", label: "Browser", disabled: false },
-    { id: "run", label: "Run", disabled: !hasRun },
-  ];
-
-  const selectTab = (nextTab: StudioTab) => {
-    if (nextTab === "browser") {
-      clearBrowserActivity();
-    }
-    setTab(nextTab);
-  };
-
-  // Roving arrow-key navigation across the enabled tabs (WAI-ARIA tabs).
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
-    if (!keys.includes(event.key)) {
-      return;
-    }
-    event.preventDefault();
-    const enabled = tabs.filter((t) => !t.disabled);
-    const current = enabled.findIndex((t) => t.id === tab);
-    const last = enabled.length - 1;
-    const nextIndex =
-      event.key === "ArrowRight"
-        ? (current + 1) % enabled.length
-        : event.key === "ArrowLeft"
-          ? (current - 1 + enabled.length) % enabled.length
-          : event.key === "Home"
-            ? 0
-            : last;
-    const next = enabled[nextIndex];
-    if (next) {
-      selectTab(next.id);
-      document.getElementById(studioTabId(next.id))?.focus();
-    }
-  };
-
-  return (
-    <>
-      <div
-        role="tablist"
-        aria-label="Studio view"
-        className="flex items-center gap-1"
-        onKeyDown={onKeyDown}
-      >
-        {tabs.map((t) => {
-          const selected = tab === t.id;
-          const browserActivityLabel =
-            t.id === "browser" && hasUnseenBrowserActivity
-              ? "Browser, new activity"
-              : undefined;
-          return (
-            <button
-              key={t.id}
-              id={studioTabId(t.id)}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              aria-controls={studioPanelId(t.id)}
-              aria-label={browserActivityLabel}
-              tabIndex={selected ? 0 : -1}
-              disabled={t.disabled}
-              onClick={() => !t.disabled && selectTab(t.id)}
-              className={cn(
-                "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
-                "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                selected
-                  ? "bg-studio-accent/15 text-foreground ring-1 ring-inset ring-studio-accent/40"
-                  : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
-                t.disabled &&
-                  "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
-              )}
-            >
-              {t.label}
-              {t.id === "browser" && hasUnseenBrowserActivity ? (
-                <span
-                  aria-hidden="true"
-                  title="New browser activity"
-                  className="relative flex size-2 shrink-0"
-                >
-                  <span className="absolute inline-flex h-full w-full rounded-full bg-studio-accent opacity-75 motion-safe:animate-ping" />
-                  <span className="relative inline-flex size-2 rounded-full bg-studio-accent shadow-[0_0_0_3px_rgba(109,108,246,0.20)]" />
-                </span>
-              ) : null}
-              {t.id === "run" && runStatus ? (
-                <StatusBadge
-                  status={runStatus}
-                  alwaysShowLabel
-                  // overrides StatusBadge's md:px-2.5 to keep the chip compact in the tab bar
-                  className="h-5 gap-1 px-1.5 py-0 text-[10px] md:w-auto md:px-1.5"
-                />
-              ) : null}
-            </button>
-          );
-        })}
-      </div>
-      <span role="status" aria-live="polite" className="sr-only">
-        {hasUnseenBrowserActivity ? "New browser activity" : ""}
-      </span>
-    </>
   );
 }
 
@@ -353,8 +221,6 @@ export function StudioTopBar() {
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow} />
-      <div className="h-6 w-px bg-border" aria-hidden />
-      <StudioTabs />
       <div className="flex-1" />
       {isGlobalWorkflow ? (
         <MakeACopyButton />

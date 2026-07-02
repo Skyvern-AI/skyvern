@@ -1,27 +1,20 @@
-import {
-  useLocation,
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from "react-router-dom";
-
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { RunView } from "./runview/RunView";
+import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 
 /**
- * Run tab of the studio shell — the fused hero + filmstrip RunView. Shows the
+ * Run pane of the studio shell — the fused hero + filmstrip RunView. Shows the
  * run in the URL when present, otherwise the workflow's most recent run.
  */
 export function RunTab() {
   const navigate = useNavigate();
-  const location = useLocation();
   const urlRunId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
-  const setCopilotCollapsed = useStudioShellStore((s) => s.setCopilotCollapsed);
+  const { openPane } = useStudioPanes();
   // isPending (not isLoading) stays true while the query is disabled waiting for
   // globalWorkflows, so the empty state can't flash before the run lookup settles.
   const { data: runs, isPending: runsPending } = useWorkflowRunsQuery({
@@ -39,13 +32,12 @@ export function RunTab() {
       workflowRunId={runId}
       runIdPending={!urlRunId && runsPending}
       onFix={(seedMessage) => {
-        // Seed via location.state (Workspace reads it as the copilot's initialMessage);
-        // replace so Fix adds no Back-able entry and the message can't re-fire on Back.
-        navigate(`${location.pathname}${location.search}`, {
+        // One replace-navigation opens the Copilot pane and seeds the message via
+        // location.state (Workspace reads it as the copilot's initialMessage), so
+        // the pane write can't race a separate state-only navigation.
+        openPane("copilot", {
           state: { copilotMessage: seedMessage, copilotFixOrigin: true },
-          replace: true,
         });
-        setCopilotCollapsed(false);
       }}
       onRetry={
         isBlockRun

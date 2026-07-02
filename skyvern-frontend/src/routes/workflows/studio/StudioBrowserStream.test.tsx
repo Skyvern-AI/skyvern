@@ -1,19 +1,13 @@
 // @vitest-environment jsdom
 
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioBrowserStream } from "./StudioBrowserStream";
+import { useStudioPanes } from "./useStudioPanes";
 
 const runtimeConfigMock = vi.hoisted(() => ({
   browserStreamingMode: "vnc",
@@ -78,29 +72,47 @@ vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
 
 const initialBrowserState = useStudioBrowserStore.getState();
 
-function renderStudioBrowserStream() {
+// Drives a real pane-state URL write, so the effect chain under test is the
+// same one a spine click goes through.
+function OpenBrowserPaneButton() {
+  const { openPane } = useStudioPanes();
+  return (
+    <button type="button" onClick={() => openPane("browser")}>
+      open browser pane
+    </button>
+  );
+}
+
+// The browser pane's visibility comes from ?panes= in the URL.
+function renderStudioBrowserStream(initialPath: string) {
   return render(
-    <MemoryRouter initialEntries={["/workflows/wpid_test/studio"]}>
+    <MemoryRouter initialEntries={[initialPath]}>
       <Routes>
         <Route
           path="/workflows/:workflowPermanentId/studio"
-          element={<StudioBrowserStream />}
+          element={
+            <>
+              <StudioBrowserStream />
+              <OpenBrowserPaneButton />
+            </>
+          }
         />
       </Routes>
     </MemoryRouter>,
   );
 }
 
+const BROWSER_CLOSED_PATH = "/workflows/wpid_test/studio?panes=editor";
+const BROWSER_OPEN_PATH = "/workflows/wpid_test/studio?panes=editor,browser";
+
 beforeEach(() => {
   runtimeConfigMock.browserStreamingMode = "vnc";
   useStudioBrowserStore.setState(initialBrowserState, true);
-  useStudioShellStore.getState().reset();
 });
 
 describe("StudioBrowserStream browser activity notifications", () => {
-  it("marks activity while the user is away from the Browser tab", () => {
-    useStudioShellStore.getState().setTab("editor");
-    renderStudioBrowserStream();
+  it("marks activity while the Browser pane is closed", () => {
+    renderStudioBrowserStream(BROWSER_CLOSED_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc frame" }));
 
@@ -108,58 +120,66 @@ describe("StudioBrowserStream browser activity notifications", () => {
   });
 
   it("marks VNC activity after the initial stream connection", () => {
-    useStudioShellStore.getState().setTab("editor");
-    renderStudioBrowserStream();
+    renderStudioBrowserStream(BROWSER_CLOSED_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc ready" }));
-    act(() => {
-      useStudioBrowserStore.getState().clearActivity();
-    });
+    useStudioBrowserStore.getState().clearActivity();
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc frame" }));
 
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(true);
   });
 
-  it("clears activity when the Browser tab is active", async () => {
-    useStudioShellStore.getState().setTab("editor");
-    renderStudioBrowserStream();
+  it("clears activity when the Browser pane opens", async () => {
+    renderStudioBrowserStream(BROWSER_CLOSED_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc frame" }));
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(true);
 
-    act(() => {
-      useStudioShellStore.getState().setTab("browser");
-    });
+    fireEvent.click(screen.getByRole("button", { name: "open browser pane" }));
 
     await waitFor(() => {
       expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(false);
     });
   });
 
-  it("keeps browser activity cleared while the Browser tab is visible", () => {
-    useStudioShellStore.getState().setTab("browser");
-    renderStudioBrowserStream();
+  it("keeps browser activity cleared while the Browser pane is open", () => {
+    renderStudioBrowserStream(BROWSER_OPEN_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc frame" }));
 
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(false);
   });
 
-  it("marks CDP activity while the user is away from the Browser tab", () => {
+  it("shows the stream control buttons only while the Browser pane is open", () => {
+    const { unmount } = renderStudioBrowserStream(BROWSER_OPEN_PATH);
+    expect(
+      screen
+        .getByRole("button", { name: "emit vnc frame" })
+        .parentElement?.getAttribute("data-show-control-buttons"),
+    ).toBe("yes");
+    unmount();
+
+    renderStudioBrowserStream(BROWSER_CLOSED_PATH);
+    expect(
+      screen
+        .getByRole("button", { name: "emit vnc frame" })
+        .parentElement?.getAttribute("data-show-control-buttons"),
+    ).toBe("no");
+  });
+
+  it("marks CDP activity while the Browser pane is closed", () => {
     runtimeConfigMock.browserStreamingMode = "cdp";
-    useStudioShellStore.getState().setTab("editor");
-    renderStudioBrowserStream();
+    renderStudioBrowserStream(BROWSER_CLOSED_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit cdp activity" }));
 
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(true);
   });
 
-  it("keeps CDP activity cleared while the Browser tab is visible", () => {
+  it("keeps CDP activity cleared while the Browser pane is open", () => {
     runtimeConfigMock.browserStreamingMode = "cdp";
-    useStudioShellStore.getState().setTab("browser");
-    renderStudioBrowserStream();
+    renderStudioBrowserStream(BROWSER_OPEN_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit cdp activity" }));
 
@@ -168,7 +188,7 @@ describe("StudioBrowserStream browser activity notifications", () => {
 
   it("keeps the latest stream URL separate from unseen activity", () => {
     runtimeConfigMock.browserStreamingMode = "cdp";
-    renderStudioBrowserStream();
+    renderStudioBrowserStream(BROWSER_OPEN_PATH);
 
     fireEvent.click(screen.getByRole("button", { name: "emit url" }));
 

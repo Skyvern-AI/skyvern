@@ -46,7 +46,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
@@ -404,8 +403,7 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       if (studioEnabled) {
-        // Land in the studio shell with the Run tab live.
-        useStudioShellStore.getState().setTab("run");
+        // Land in the studio shell; the ?wr= deep link opens the Run pane.
         navigate(
           `/workflows/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
         );

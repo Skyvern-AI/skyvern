@@ -14,7 +14,6 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
-  ChevronLeftIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
@@ -358,8 +357,9 @@ interface WorkflowCopilotChatProps {
   onInitialMessageConsumed?: () => void;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
-  // Collapse the docked panel to a rail. Only used when `docked`.
-  onCollapse?: () => void;
+  // Render frameless — no border, background, or title; the header keeps only
+  // the controls row. Only used when `docked`.
+  chromeless?: boolean;
   // When docked, render into this element via a portal (keeps the component in
   // its parent's React tree so canvas callbacks stay wired) instead of inline.
   portalTarget?: HTMLElement | null;
@@ -434,7 +434,7 @@ export function WorkflowCopilotChat({
   initialMessageFixOrigin,
   onInitialMessageConsumed,
   docked = false,
-  onCollapse,
+  chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
@@ -2060,7 +2060,9 @@ export function WorkflowCopilotChat({
     <div
       className={
         docked
-          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          ? chromeless
+            ? "relative flex h-full w-full flex-col overflow-hidden text-foreground"
+            : "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
           : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
       }
       style={
@@ -2077,21 +2079,27 @@ export function WorkflowCopilotChat({
       {/* Header */}
       <div
         className={
-          "flex items-center justify-between border-b border-border px-4" +
-          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+          "flex items-center border-b border-border px-4" +
+          (docked
+            ? chromeless
+              ? " h-11 shrink-0 justify-end"
+              : " h-14 shrink-0 justify-between"
+            : " cursor-move justify-between py-2")
         }
         onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <div className="flex items-center gap-2">
-          <h3 className="text-sm font-semibold text-foreground">
-            {docked ? "Copilot" : "Agent Copilot (Beta)"}
-          </h3>
-          {docked ? (
-            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
-              Beta
-            </span>
-          ) : null}
-        </div>
+        {chromeless ? null : (
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-foreground">
+              {docked ? "Copilot" : "Agent Copilot (Beta)"}
+            </h3>
+            {docked ? (
+              <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+                Beta
+              </span>
+            ) : null}
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <WorkflowCopilotHistory
             workflowPermanentId={workflowPermanentId}
@@ -2109,18 +2117,8 @@ export function WorkflowCopilotChat({
           </button>
           <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
           <span className="text-xs text-muted-foreground">Active</span>
-          {docked ? (
-            onCollapse ? (
-              <button
-                type="button"
-                onClick={onCollapse}
-                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                title="Collapse Copilot"
-              >
-                <ChevronLeftIcon className="h-4 w-4" />
-              </button>
-            ) : null
-          ) : (
+          {/* Only the floating window closes itself; docked chrome is external. */}
+          {docked ? null : (
             <button
               type="button"
               onClick={() => onClose?.()}
