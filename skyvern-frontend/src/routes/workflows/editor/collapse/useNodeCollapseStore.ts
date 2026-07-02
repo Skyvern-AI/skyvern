@@ -19,6 +19,8 @@ import {
 type NodeCollapseState = {
   collapsed: Record<string, boolean>;
   toggleBlock: (workflowId: string, blockLabel: string) => void;
+  // Idempotent expand: only removes the collapsed entry, never adds one.
+  expandBlock: (workflowId: string, blockLabel: string) => void;
   collapseAll: (workflowId: string, labels: string[]) => void;
   expandAll: (workflowId: string) => void;
   // Moves a persisted entry from oldLabel to newLabel under the same
@@ -69,6 +71,14 @@ export const useNodeCollapseStore = create<NodeCollapseState>()(
           } else {
             next[k] = true;
           }
+          return { collapsed: next };
+        }),
+      expandBlock: (workflowId, label) =>
+        set((s) => {
+          const k = key(workflowId, label);
+          if (!s.collapsed[k]) return s;
+          const next = { ...s.collapsed };
+          delete next[k];
           return { collapsed: next };
         }),
       collapseAll: (workflowId, labels) =>

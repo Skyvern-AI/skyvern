@@ -1,7 +1,6 @@
 import type { ActionsApiResponse } from "@/api/types";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { FileIcon } from "@radix-ui/react-icons";
-import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
@@ -45,10 +44,6 @@ type Props = {
   timelineReady?: boolean;
   showDownloadedFiles?: boolean;
   workflowRunId?: string;
-  onActionSelect?: (payload: {
-    block: WorkflowRunBlock;
-    action: ActionsApiResponse;
-  }) => void;
   onThoughtSelect?: (thought: ObserverThought) => void;
 };
 
@@ -114,52 +109,9 @@ function BlockDownloadedFiles({
   );
 }
 
-function SelectedActionHeader({
-  action,
-  block,
-  index,
-  onActionSelect,
-}: {
-  action: ActionsApiResponse;
-  block: WorkflowRunBlock;
-  index: number;
-  onActionSelect?: Props["onActionSelect"];
-}) {
-  const [expanded, setExpanded] = useState(true);
-
-  return (
-    <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-2 duration-200 animate-in fade-in slide-in-from-top-1">
-      <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500">
-        Selected action
-      </div>
-      <ActionCardCompact
-        action={action}
-        active
-        index={index}
-        expanded={expanded}
-        onToggleExpanded={() => setExpanded((prev) => !prev)}
-        onSelect={() => onActionSelect?.({ block, action })}
-        cardClassName="bg-slate-800/70"
-      />
-    </div>
-  );
-}
-
-function getActionDisplayIndex(
-  block: WorkflowRunBlock,
-  action: ActionsApiResponse,
-): number {
-  const actionsTopDown = [...(block.actions ?? [])].reverse();
-  const index = actionsTopDown.findIndex(
-    (item) => item.action_id === action.action_id,
-  );
-  return index === -1 ? 1 : index + 1;
-}
-
 function renderBodyForBlock(
   block: WorkflowRunBlock,
   activeItem: WorkflowRunOverviewActiveElement,
-  onActionSelect: Props["onActionSelect"],
   onThoughtSelect: Props["onThoughtSelect"],
   activeIteration: number | null,
   timeline: Array<WorkflowRunTimelineItem>,
@@ -178,19 +130,12 @@ function renderBodyForBlock(
         <BlockDetailTask
           block={block}
           activeItem={activeItem}
-          onActionSelect={onActionSelect}
           onThoughtSelect={onThoughtSelect}
           thoughts={thoughts}
         />
       );
     case "conditional":
-      return (
-        <BlockDetailConditional
-          block={block}
-          activeItem={activeItem}
-          onActionSelect={onActionSelect}
-        />
-      );
+      return <BlockDetailConditional block={block} />;
     case "for_loop":
     case "while_loop":
       return <BlockDetailLoop block={block} iterationIndex={activeIteration} />;
@@ -212,7 +157,6 @@ function WorkflowRunBlockDetail({
   timelineReady = true,
   showDownloadedFiles = false,
   workflowRunId,
-  onActionSelect,
   onThoughtSelect,
 }: Props) {
   // activeIteration is a URL hint scoped to a specific selection. In
@@ -244,7 +188,6 @@ function WorkflowRunBlockDetail({
   // they bypass the block header and render only as the body slot.
   let resolvedBlock: WorkflowRunBlock | null = null;
   let selectedAction: ActionsApiResponse | null = null;
-  let selectedActionIndex = 1;
   let body: React.ReactNode;
 
   if (activeItem === null || activeItem === "stream") {
@@ -258,7 +201,6 @@ function WorkflowRunBlockDetail({
       body = renderBodyForBlock(
         target,
         activeItem,
-        onActionSelect,
         onThoughtSelect,
         effectiveIteration,
         timeline,
@@ -274,11 +216,9 @@ function WorkflowRunBlockDetail({
     if (parentBlock) {
       resolvedBlock = parentBlock;
       selectedAction = activeItem;
-      selectedActionIndex = getActionDisplayIndex(parentBlock, activeItem);
       body = renderBodyForBlock(
         parentBlock,
         activeItem,
-        onActionSelect,
         onThoughtSelect,
         effectiveIteration,
         timeline,
@@ -295,7 +235,6 @@ function WorkflowRunBlockDetail({
     body = renderBodyForBlock(
       activeItem,
       activeItem,
-      onActionSelect,
       onThoughtSelect,
       effectiveIteration,
       timeline,
@@ -322,15 +261,9 @@ function WorkflowRunBlockDetail({
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div>
-          {resolvedBlock && selectedAction && (
-            <SelectedActionHeader
-              action={selectedAction}
-              block={resolvedBlock}
-              index={selectedActionIndex}
-              onActionSelect={onActionSelect}
-            />
+          {resolvedBlock && (
+            <BlockInspector block={resolvedBlock} action={selectedAction} />
           )}
-          {resolvedBlock && <BlockInspector block={resolvedBlock} />}
           {resolvedBlock && showDownloadedFiles && (
             <BlockDownloadedFiles
               block={resolvedBlock}

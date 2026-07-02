@@ -75,7 +75,7 @@ function BrowserModeButton() {
 
   const handleClick = () => {
     const target = debugStore.isDebugMode ? "edit" : "build";
-    navigate(`/workflows/${workflowPermanentId}/${target}`);
+    navigate(`/agents/${workflowPermanentId}/${target}`);
   };
 
   return (
@@ -214,7 +214,7 @@ function RunButton() {
 
   const handleClick = () => {
     closeWorkflowPanel();
-    navigate(`/workflows/${workflowPermanentId}/run`);
+    navigate(`/agents/${workflowPermanentId}/run`);
   };
 
   return (

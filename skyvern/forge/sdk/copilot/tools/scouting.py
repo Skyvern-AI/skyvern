@@ -12,6 +12,10 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    record_build_test_outcome,
+    recorded_outcome_from_loaded_result_evidence,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
@@ -945,6 +949,7 @@ async def _maybe_steer_evaluate_to_action(
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
+            record_build_test_outcome(ctx, recorded_outcome_from_loaded_result_evidence(loaded_results))
             data.pop("actionable_targets", None)
             data["composition_targets"] = loaded_result_composition_target_summary(loaded_results)
             data["next_action"] = "compose_extraction"

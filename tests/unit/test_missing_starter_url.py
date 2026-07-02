@@ -17,11 +17,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import MissingStarterUrl
+from skyvern.exceptions import InvalidWorkflowTaskURLState, MissingStarterUrl
+from skyvern.forge.agent import ForgeAgent, resolve_inherited_workflow_task_page
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 
 def _output_parameter(key: str = "task_output") -> OutputParameter:
@@ -165,6 +167,176 @@ async def test_execute_fails_early_when_first_block_has_no_url(blank_url: str) -
             organization_id="o_test",
             failure_reason=str(excinfo.value),
         )
+
+
+def _workflow_run_for_create_task() -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_run_id="wr_missing_starter_url_test",
+        parent_workflow_run_id=None,
+        organization_id="o_test",
+        proxy_location=None,
+        max_screenshot_scrolls=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        browser_address=None,
+        browser_session_id=None,
+    )
+
+
+def _task_block_without_url() -> TaskBlock:
+    return TaskBlock(
+        label="validate_download",
+        output_parameter=_output_parameter(),
+        title="Validate downloaded file",
+        url=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_about_blank_url_inherited_from_later_block() -> None:
+    """Keep the historical behavior for about:blank inherited task URLs."""
+
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=SimpleNamespace(url="about:blank"))
+    browser_state.list_valid_pages = AsyncMock()
+
+    browser_manager = MagicMock()
+    browser_manager.get_for_workflow_run.return_value = browser_state
+
+    workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
+    workflow_run = _workflow_run_for_create_task()
+    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.BROWSER_MANAGER = browser_manager
+
+        with pytest.raises(InvalidWorkflowTaskURLState):
+            await ForgeAgent().create_task_and_step_from_block(
+                task_block=_task_block_without_url(),
+                workflow=workflow,
+                workflow_run=workflow_run,
+                workflow_run_context=workflow_run_context,
+                task_order=5,
+                task_retry=0,
+            )
+
+    browser_state.get_working_page.assert_awaited_once()
+    browser_state.list_valid_pages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_task_uses_latest_non_blank_page_for_inherited_marker_url() -> None:
+    """Later blocks with url=None inherit the current browser page URL. The
+    ':' marker URL can be left behind after downloads; use the latest non-blank
+    page so scrape/reload runs against the real page."""
+
+    real_page = SimpleNamespace(url="https://example.test/invoices")
+    blank_page = SimpleNamespace(url=":")
+
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=blank_page)
+    browser_state.list_valid_pages = AsyncMock(return_value=[real_page, blank_page])
+    browser_state.set_active_page = AsyncMock()
+
+    browser_manager = MagicMock()
+    browser_manager.get_for_workflow_run.return_value = browser_state
+
+    created_task = SimpleNamespace(
+        task_id="tsk_missing_starter_url_test",
+        organization_id="o_test",
+        url=real_page.url,
+        title="Validate downloaded file",
+        proxy_location=None,
+    )
+    step = SimpleNamespace(order=0, retry_index=0)
+    tasks_db = MagicMock()
+    tasks_db.create_task = AsyncMock(return_value=created_task)
+    tasks_db.update_task = AsyncMock(return_value=created_task)
+    tasks_db.create_step = AsyncMock(return_value=step)
+
+    database = MagicMock()
+    database.tasks = tasks_db
+
+    workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
+    workflow_run = _workflow_run_for_create_task()
+    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.BROWSER_MANAGER = browser_manager
+        mock_app.DATABASE = database
+
+        task, _ = await ForgeAgent().create_task_and_step_from_block(
+            task_block=_task_block_without_url(),
+            workflow=workflow,
+            workflow_run=workflow_run,
+            workflow_run_context=workflow_run_context,
+            task_order=5,
+            task_retry=0,
+        )
+
+    assert task is created_task
+    assert tasks_db.create_task.await_args.kwargs["url"] == real_page.url
+    browser_state.get_working_page.assert_awaited_once()
+    browser_state.list_valid_pages.assert_awaited_once()
+    browser_state.set_active_page.assert_awaited_once_with(real_page)
+
+
+@pytest.mark.asyncio
+async def test_resolved_inherited_marker_page_stays_active() -> None:
+    real_page = MagicMock()
+    real_page.url = "https://example.test/invoices"
+    real_page.is_closed = MagicMock(return_value=False)
+    blank_page = MagicMock()
+    blank_page.url = ":"
+    blank_page.is_closed = MagicMock(return_value=False)
+
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock())
+    browser_state.list_valid_pages = AsyncMock(return_value=[real_page, blank_page])
+    await browser_state.set_working_page(blank_page)
+
+    assert await resolve_inherited_workflow_task_page(browser_state, "wr_missing_starter_url_test") is real_page
+    assert await browser_state.get_working_page() is real_page
+
+
+@pytest.mark.asyncio
+async def test_resolved_inherited_marker_page_raises_when_no_non_blank_page_exists() -> None:
+    about_blank_page = MagicMock()
+    about_blank_page.url = "about:blank"
+    about_blank_page.is_closed = MagicMock(return_value=False)
+    blank_marker_page = MagicMock()
+    blank_marker_page.url = ":"
+    blank_marker_page.is_closed = MagicMock(return_value=False)
+
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=blank_marker_page)
+    browser_state.list_valid_pages = AsyncMock(return_value=[about_blank_page, blank_marker_page])
+    browser_state.set_active_page = AsyncMock()
+
+    with pytest.raises(InvalidWorkflowTaskURLState):
+        await resolve_inherited_workflow_task_page(browser_state, "wr_missing_starter_url_test")
+
+    browser_state.set_active_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolved_inherited_marker_page_preserves_selected_tab() -> None:
+    selected_page = MagicMock()
+    selected_page.url = "https://example.test/selected"
+    selected_page.is_closed = MagicMock(return_value=False)
+    other_page = MagicMock()
+    other_page.url = "https://example.test/other"
+    other_page.is_closed = MagicMock(return_value=False)
+    blank_page = MagicMock()
+    blank_page.url = ":"
+    blank_page.is_closed = MagicMock(return_value=False)
+
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock())
+    browser_state.list_valid_pages = AsyncMock(return_value=[selected_page, other_page])
+    await browser_state.set_active_page(selected_page)
+    browser_state.list_valid_pages = AsyncMock(return_value=[selected_page, other_page, blank_page])
+
+    assert await resolve_inherited_workflow_task_page(browser_state, "wr_missing_starter_url_test") is selected_page
+    assert await browser_state.get_working_page() is selected_page
 
 
 @pytest.mark.asyncio

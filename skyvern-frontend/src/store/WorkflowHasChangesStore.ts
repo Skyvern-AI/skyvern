@@ -8,6 +8,7 @@ import { usePostHog } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import {
   type BlockYAML,
   type ParameterYAML,
@@ -131,7 +132,10 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } catch (error) {
           toast({
             title: "Error",
-            description: "Invalid JSON format in extra http headers",
+            description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
+              saveData.settings.extraHttpHeaders ?? "",
+              error,
+            )}`,
             variant: "destructive",
           });
           return;
@@ -163,7 +167,10 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } catch (error) {
           toast({
             title: "Error",
-            description: "Invalid JSON format in cdp connect headers",
+            description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
+              saveData.settings.cdpConnectHeaders ?? "",
+              error,
+            )}`,
             variant: "destructive",
           });
           return;

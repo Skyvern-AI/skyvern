@@ -10,7 +10,7 @@ export function workflowEditorPath(
   search = "",
 ): string {
   const leaf = studioEnabled ? "studio" : "build";
-  return `/workflows/${workflowPermanentId}/${leaf}${search}`;
+  return `/agents/${workflowPermanentId}/${leaf}${search}`;
 }
 
 /**
@@ -23,5 +23,5 @@ export function legacyRunDetailPath(
 ): string {
   return env.useNewRunsUrl
     ? `/runs/${workflowRunId}`
-    : `/workflows/${workflowPermanentId}/${workflowRunId}/overview`;
+    : `/agents/${workflowPermanentId}/${workflowRunId}/overview`;
 }

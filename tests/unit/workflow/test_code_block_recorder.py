@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -479,6 +480,35 @@ async def test_create_task_and_step_from_code_block_maps_goal_to_task(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_create_task_and_step_from_code_block_fails_partial_task_on_step_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If step creation fails after the container task is running, fail the task before the recorder degrades."""
+    create_task = AsyncMock(return_value=_FakeTask())
+    update_task = AsyncMock(return_value=_FakeTask())
+    create_step = AsyncMock(side_effect=RuntimeError("step unavailable"))
+    monkeypatch.setattr(app.DATABASE.tasks, "get_last_task_for_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.tasks, "create_task", create_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task", update_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "create_step", create_step)
+
+    block = _make_code_block("x = 1", goal="log into the portal")
+
+    with pytest.raises(RuntimeError, match="step unavailable"):
+        await ForgeAgent().create_task_and_step_from_code_block(
+            code_block=block,
+            organization_id="o_test",
+            workflow_run_id="wr_test",
+            task_url="https://example.com/login",
+        )
+
+    assert [call.kwargs["status"] for call in update_task.await_args_list] == [
+        TaskStatus.running,
+        TaskStatus.failed,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_goal_code_block_marks_task_completed_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """The container task must not dangle in 'running'; success drives it to completed."""
     page = FakePage()
@@ -539,6 +569,52 @@ async def test_goal_code_block_finalizes_step_on_cancellation(monkeypatch: pytes
     step_statuses = [call.kwargs.get("status") for call in mocks["update_step"].await_args_list]
     assert TaskStatus.failed in task_statuses
     assert StepStatus.failed in step_statuses
+
+
+@pytest.mark.asyncio
+async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healed code block finalizes its SEAT task to completed — never a completed block over a failed seat."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("rotted selector")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=SimpleNamespace(success=True)))
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
+    assert TaskStatus.completed in statuses
+    assert TaskStatus.failed not in statuses
+
+
+@pytest.mark.asyncio
+async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the heal declines (None), the block fails closed and the seat task is finalized failed."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("rotted selector")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
+    assert TaskStatus.failed in statuses
 
 
 @pytest.mark.asyncio
@@ -651,6 +727,50 @@ async def test_persist_failure_does_not_fail_the_block(monkeypatch: pytest.Monke
     assert result.status == BlockStatus.completed
     assert result.output_parameter_value is not None
     assert result.output_parameter_value["value"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_create_task_failure_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recording is best-effort: a DB hiccup creating the container task must not fail the block, and
+    with no task the recorder degrades to in-memory only (no orphaned actions or screenshots)."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    mocks["create_task_and_step"].side_effect = RuntimeError("db unavailable")
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert result.output_parameter_value is not None
+    assert result.output_parameter_value["value"] == "ok"
+    assert mocks["create_action"].await_count == 0
+    assert mocks["create_artifact"].await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_link_block_failure_fails_task_and_disables_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A task created but not linked to the run block must not stay running or receive orphan actions."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    async def fail_link_only(**kwargs: object) -> None:
+        if kwargs.get("task_id") is not None:
+            raise RuntimeError("db unavailable")
+
+    mocks["update_workflow_run_block"].side_effect = fail_link_only
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert mocks["create_action"].await_count == 0
+    assert mocks["create_artifact"].await_count == 0
+    assert [call.kwargs.get("status") for call in mocks["update_task"].await_args_list] == [TaskStatus.failed]
+    assert [call.kwargs.get("status") for call in mocks["update_step"].await_args_list] == [StepStatus.failed]
 
 
 @pytest.mark.asyncio

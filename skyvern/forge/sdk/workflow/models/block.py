@@ -33,7 +33,10 @@ from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.sandbox import SandboxedEnvironment
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
 
@@ -83,13 +86,17 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, InvalidLLMResponseType
+from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -132,6 +139,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RecordingPage,
     user_code_line_from_exception,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -142,7 +150,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -269,6 +276,16 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.failed: BlockStatus.failed,
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
+}
+
+ENABLE_CODE_BLOCK_SELF_HEALING_FLAG = "ENABLE_CODE_BLOCK_SELF_HEALING"
+
+TASK_TO_BLOCK_STATUS: dict[TaskStatus, BlockStatus] = {
+    TaskStatus.completed: BlockStatus.completed,
+    TaskStatus.terminated: BlockStatus.terminated,
+    TaskStatus.failed: BlockStatus.failed,
+    TaskStatus.canceled: BlockStatus.canceled,
+    TaskStatus.timed_out: BlockStatus.timed_out,
 }
 
 
@@ -1504,13 +1521,7 @@ class BaseTaskBlock(Block):
                 raise UnexpectedTaskStatus(task_id=updated_task.task_id, status=updated_task.status)
             current_running_task = updated_task
 
-            block_status_mapping = {
-                TaskStatus.completed: BlockStatus.completed,
-                TaskStatus.terminated: BlockStatus.terminated,
-                TaskStatus.failed: BlockStatus.failed,
-                TaskStatus.canceled: BlockStatus.canceled,
-                TaskStatus.timed_out: BlockStatus.timed_out,
-            }
+            block_status_mapping = TASK_TO_BLOCK_STATUS
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     "Task completed",
@@ -3978,6 +3989,301 @@ async def wrapper({default_args}):
             )
             return value
 
+    def _match_step_for_failing_line(self, failing_line: int) -> CodeBlockStep | None:
+        """Advisory nearest-preceding-start match; a lone ``line_start`` (``line_end`` None) is
+        open-ended. Step spans are display-oriented and can drift, so a miss never blocks the heal."""
+        best: CodeBlockStep | None = None
+        best_start = -1
+        for step in self.steps or []:
+            if step.line_start is None or step.line_start > failing_line:
+                continue
+            if step.line_end is not None and failing_line > step.line_end:
+                continue
+            if step.line_start > best_start:
+                best = step
+                best_start = step.line_start
+        return best
+
+    async def _self_heal_enabled(self, organization_id: str | None) -> bool:
+        # Per-org PostHog dial over the env default, mirroring the master copilot flags: the env
+        # default is the OSS/standalone fallback and a resolution failure degrades to it, never raising.
+        env_enabled = settings.ENABLE_CODE_BLOCK_SELF_HEALING
+        provider = app.EXPERIMENTATION_PROVIDER
+        if not organization_id or isinstance(provider, NoOpExperimentationProvider):
+            return env_enabled
+        try:
+            flag_enabled = await provider.is_feature_enabled_cached(
+                ENABLE_CODE_BLOCK_SELF_HEALING_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+            return bool(flag_enabled) or env_enabled
+        except Exception:
+            LOG.warning(
+                "Failed to resolve code-block self-heal flag; falling back to env default",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return env_enabled
+
+    def _is_healable_page_failure(self, exception: Exception, recording_page: RecordingPage) -> bool:
+        """Heal genuine page failures only: a recorded page call raised, or an (unmapped) Playwright
+        page error surfaced. A deliberate non-Playwright raise in user logic stays non-healable."""
+        if recording_page.last_recorded_exception() is exception:
+            return True
+        return isinstance(exception, PlaywrightError)  # locator/timeout/navigation errors subclass this
+
+    async def _finalize_recovery_block(
+        self,
+        recovery_block_id: str | None,
+        status: BlockStatus,
+        organization_id: str | None,
+        failure_reason: str | None = None,
+    ) -> None:
+        # The child recovery block surfaces the heal's actions on the run timeline (parented to the code
+        # block); keep its status synced with the heal outcome so it doesn't dangle in `running`.
+        if recovery_block_id is None:
+            return
+        try:
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=recovery_block_id,
+                organization_id=organization_id,
+                status=status,
+                failure_reason=failure_reason,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to finalize self-heal recovery block",
+                workflow_run_block_id=recovery_block_id,
+                exc_info=True,
+            )
+
+    async def _fail_escalation_task(
+        self,
+        escalation_task: Task | None,
+        escalation_step: Step | None,
+        recovery_block_id: str | None,
+        organization_id: str | None,
+    ) -> None:
+        # Best-effort so an aborted heal never strands its escalation task/step/recovery block in `running`.
+        await self._finalize_recovery_block(recovery_block_id, BlockStatus.failed, organization_id)
+        if escalation_task is None:
+            return
+        try:
+            await app.DATABASE.tasks.update_task(
+                task_id=escalation_task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+            )
+            if escalation_step is not None:
+                await app.DATABASE.tasks.update_step(
+                    task_id=escalation_task.task_id,
+                    step_id=escalation_step.step_id,
+                    status=StepStatus.failed,
+                    is_last=True,
+                    organization_id=organization_id,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to finalize stranded self-heal escalation task",
+                task_id=escalation_task.task_id,
+                exc_info=True,
+            )
+
+    async def _attempt_self_heal(
+        self,
+        *,
+        exception: Exception,
+        failing_line: int | None,
+        recording_page: RecordingPage,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> BlockResult | None:
+        """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
+        (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
+        heal was attempted, or None to fall through to the caller's fail-closed path."""
+        if not await self._self_heal_enabled(organization_id):
+            return None
+        if not self._is_healable_page_failure(exception, recording_page):
+            return None
+        if not self.prompt:
+            return None
+        if not organization_id:
+            return None
+        organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+        if organization is None:
+            return None
+
+        escalation_task: Task | None = None
+        escalation_step: Step | None = None
+        recovery_block_id: str | None = None
+        try:
+            # block.prompt is the operative goal; a confidently-matched step only narrows it. The match
+            # is advisory (spans are display-oriented and render-shifted), so any miss heals on the prompt.
+            safe_main = workflow_run_context.mask_secrets_in_data(self.prompt)
+            matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
+            if matched_step is not None and matched_step.description:
+                # The heal owns the failing step plus every subsequent authored step — a
+                # step-only goal would complete the block while trailing steps ran by no one.
+                steps = self.steps or []
+                # Identity scan, not .index(): value equality would match an earlier duplicate step.
+                matched_index = next((i for i, step in enumerate(steps) if step is matched_step), None)
+                if matched_index is None:
+                    matched_index = len(steps) - 1  # defensive; matched_step always comes from self.steps
+                descriptions = [matched_step.description] + [
+                    step.description for step in steps[matched_index + 1 :] if step.description
+                ]
+                safe_mini = "\nThen: ".join(
+                    workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+                )
+                navigation_goal = compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
+            else:
+                navigation_goal = safe_main
+
+            workflow_system_prompt = (
+                None
+                if self.ignore_workflow_system_prompt
+                else workflow_run_context.resolve_effective_workflow_system_prompt()
+            )
+            task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
+            # Bound by the global default but never above the org's per-run cap — execute_step gives
+            # task.max_steps_per_run precedence over organization.max_steps_per_run.
+            heal_max_steps = settings.MAX_STEPS_PER_RUN
+            if organization.max_steps_per_run is not None:
+                heal_max_steps = min(heal_max_steps, organization.max_steps_per_run)
+            # Blank url: the heal takes over the live, half-mutated page rather than re-navigating to it
+            # (a truthy task.url makes the browser manager reload the page on the browser-session path).
+            escalation_task = await app.DATABASE.tasks.create_task(
+                url="",
+                title=self.label,
+                navigation_goal=navigation_goal,
+                data_extraction_goal=None,
+                navigation_payload=None,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                order=task_order,
+                retry=task_retry,
+                max_steps_per_run=heal_max_steps,
+                model=self.model,
+                workflow_system_prompt=workflow_system_prompt,
+                # Heal goals are action-phrased; after the page navigates, only the action
+                # history can evidence completion.
+                include_action_history_in_verification=True,
+            )
+            escalation_task = await app.DATABASE.tasks.update_task(
+                task_id=escalation_task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
+            escalation_step = await app.DATABASE.tasks.create_step(
+                escalation_task.task_id,
+                order=0,
+                retry_index=0,
+                organization_id=organization_id,
+            )
+            # Child block parented to the code block, linked to the escalation task: the timeline attaches
+            # the heal's actions to this nested node (actions join by task_id), while the code block keeps
+            # the seat task so its own pre-failure actions stay visible too.
+            recovery_block = await app.DATABASE.observer.create_workflow_run_block(
+                workflow_run_id=workflow_run_id,
+                parent_workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                task_id=escalation_task.task_id,
+                label="Self-heal recovery",
+                block_type=BlockType.TASK,
+            )
+            recovery_block_id = recovery_block.workflow_run_block_id
+
+            # Attribute the heal's steps to the escalation task for its duration; restored in finally.
+            current_context = skyvern_context.ensure_context()
+            previous_task_id = current_context.task_id
+            current_context.task_id = escalation_task.task_id
+            try:
+                # execute_step self-drives to a terminal across multiple steps (execute_all_steps),
+                # bounded by the task's max_steps_per_run — not a single step.
+                await app.agent.execute_step(
+                    organization=organization,
+                    task=escalation_task,
+                    step=escalation_step,
+                    task_block=None,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=False,
+                )
+            finally:
+                current_context.task_id = previous_task_id
+
+            updated_task = await app.DATABASE.tasks.get_task(
+                task_id=escalation_task.task_id, organization_id=organization_id
+            )
+            if updated_task is None or not updated_task.status.is_final():
+                await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Self-heal escalation did not reach a final status for block {self.label}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if updated_task.status == TaskStatus.completed:
+                downloaded_files: list[FileInfo] = []
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                            organization_id=organization_id,
+                            run_id=current_context.run_id if current_context.run_id else workflow_run_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+                downloaded_files = filter_downloaded_files_for_current_iteration(
+                    downloaded_files,
+                    current_context.loop_internal_state,
+                )
+                task_output = TaskOutput.from_task(updated_task, downloaded_files)
+                output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
+                await self._finalize_recovery_block(recovery_block_id, BlockStatus.completed, organization_id)
+                return await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=output_parameter_value,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            recovery_status = TASK_TO_BLOCK_STATUS.get(updated_task.status, BlockStatus.failed)
+            recovery_failure_reason = (
+                updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}"
+            )
+            await self._finalize_recovery_block(
+                recovery_block_id, recovery_status, organization_id, failure_reason=recovery_failure_reason
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=recovery_failure_reason,
+                output_parameter_value=None,
+                status=recovery_status,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except asyncio.CancelledError:
+            # CancelledError is BaseException, not Exception — finalize explicitly, then never swallow it.
+            await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+            raise
+        except Exception:
+            LOG.warning(
+                "Code block self-heal escalation failed; falling back to fail-closed",
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+            return None
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4150,138 +4456,30 @@ async def wrapper({default_args}):
             if secure_code_block_result is not None:
                 return secure_code_block_result
 
-        workflow_run_block = None
-
         # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
         # the standard action/artifact timeline and the agent can later take over on failure.
         # Promptless blocks have no task and persist neither actions nor screenshots.
-        task: Task | None = None
-        step: Step | None = None
-        if self.prompt:
-            task, step = await app.agent.create_task_and_step_from_code_block(
-                code_block=self,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                task_url=page.url,
-            )
-
-        screenshot_tasks: list[asyncio.Task[None]] = []
-
-        async def _screenshot_sink(action: Action) -> None:
-            # No task means no action row will reference the screenshot, so skip it rather than orphan an artifact.
-            nonlocal workflow_run_block
-            if task is None:
-                return
-            # Every action that reaches this sink is one the recorder chose to surface on the timeline
-            # (goto, click, input, page.evaluate, select, hover, ...), so each one earns a screenshot.
-            # Re-listing eligible types here only drifts from the recorder's maps — which is exactly how
-            # page.evaluate (EXECUTE_JS) ended up with no screenshot.
-            # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
-            # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
-            # only the page-free S3 upload is deferred off the critical path.
-            try:
-                if workflow_run_block is None:
-                    workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
-                        workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
-                    )
-                run_block = workflow_run_block
-                screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
-            except Exception:
-                LOG.warning(
-                    "Code block screenshot capture failed",
-                    workflow_run_block_id=workflow_run_block_id,
-                    exc_info=True,
-                )
-                return
-
-            async def _upload() -> None:
-                try:
-                    action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                        workflow_run_block=run_block,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        data=screenshot,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Code block screenshot upload failed",
-                        workflow_run_block_id=workflow_run_block_id,
-                        exc_info=True,
-                    )
-
-            screenshot_tasks.append(asyncio.create_task(_upload()))
-
-        async def _drain_screenshots() -> None:
-            if screenshot_tasks:
-                await asyncio.gather(*screenshot_tasks, return_exceptions=True)
-
-        recording_page = RecordingPage(page, on_action=_screenshot_sink)
-
-        async def _persist_recorded_actions(recorded: list[Action]) -> None:
-            # Best-effort like the screenshot sink: recording must never change block outcome.
-            await _drain_screenshots()
-            if not recorded or task is None or step is None:
-                return
-            try:
-                masked = workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
-                for raw in masked:
-                    action = Action.model_validate(raw)
-                    action.task_id = task.task_id
-                    action.step_id = step.step_id
-                    action.step_order = step.order
-                    action.organization_id = organization_id
-                    await app.DATABASE.workflow_params.create_action(action)
-            except Exception:
-                LOG.warning(
-                    "Failed to persist recorded code block actions",
-                    workflow_run_block_id=workflow_run_block_id,
-                    exc_info=True,
-                )
-
-        finalized = False
-
-        async def _finalize_code_block_task(success: bool) -> None:
-            # Finalize both task and step on every exit path (incl. CancelledError via the finally); idempotent.
-            nonlocal finalized
-            if task is None or finalized:
-                return
-            finalized = True
-            try:
-                await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=organization_id,
-                    status=TaskStatus.completed if success else TaskStatus.failed,
-                )
-                if step is not None:
-                    await app.DATABASE.tasks.update_step(
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        status=StepStatus.completed if success else StepStatus.failed,
-                        output=AgentStepOutput(action_results=[]) if success else None,
-                        is_last=True,
-                        organization_id=organization_id,
-                    )
-            except Exception:
-                LOG.warning(
-                    "Failed to finalize code block task status",
-                    workflow_run_block_id=workflow_run_block_id,
-                    exc_info=True,
-                )
+        recorder = CodeBlockActionRecording(
+            code_block=self,
+            page=page,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            workflow_run_context=workflow_run_context,
+        )
+        await recorder.create_task_and_step()
+        recording_page = recorder.recording_page
 
         try:
-            if task is not None:
-                await app.DATABASE.observer.update_workflow_run_block(
-                    workflow_run_block_id=workflow_run_block_id,
-                    task_id=task.task_id,
-                    organization_id=organization_id,
-                )
+            await recorder.link_block()
             user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
             )
         except InsecureCodeDetected as e:
-            await _drain_screenshots()
-            await _finalize_code_block_task(success=False)
+            await recorder.persist(recorder.recorded_actions())
+            await recorder.finalize(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
@@ -4291,8 +4489,8 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         except asyncio.TimeoutError:
-            await _persist_recorded_actions(recording_page.recorded_actions())
-            await _finalize_code_block_task(success=False)
+            await recorder.persist(recorder.recorded_actions())
+            await recorder.finalize(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=(
@@ -4310,8 +4508,8 @@ async def wrapper({default_args}):
             # User code can raise an exception carrying a resolved secret (e.g.
             # `raise Exception(await cred.otp())`); mask before it reaches the persisted reason.
             failure_reason = workflow_run_context.mask_secrets_in_data(exc.message)
-            recorded = recording_page.recorded_actions()
-            if recording_page.last_recorded_exception() is not e:
+            recorded = recorder.recorded_actions()
+            if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
                     Action(
@@ -4323,8 +4521,23 @@ async def wrapper({default_args}):
                         output={"code_line": failing_line},
                     )
                 )
-            await _persist_recorded_actions(recorded)
-            await _finalize_code_block_task(success=False)
+            await recorder.persist(recorded)
+            healed = await self._attempt_self_heal(
+                exception=e,
+                failing_line=failing_line,
+                recording_page=recording_page,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            if healed is not None:
+                # Finalize the seat task to the heal outcome before the idempotent `finally` no-ops it,
+                # so a healed success no longer leaves the seat row failed under a completed block.
+                await recorder.finalize(success=healed.success)
+                return healed
+            await recorder.finalize(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=failure_reason,
@@ -4335,11 +4548,11 @@ async def wrapper({default_args}):
             )
 
         else:
-            await _persist_recorded_actions(recording_page.recorded_actions())
-            await _finalize_code_block_task(success=True)
+            await recorder.persist(recorder.recorded_actions())
+            await recorder.finalize(success=True)
         finally:
-            # Safety net for paths the except arms miss (CancelledError, update_workflow_run_block failure).
-            await _finalize_code_block_task(success=False)
+            # Safety net for paths the except arms miss (CancelledError, link_block failure).
+            await recorder.finalize(success=False)
 
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
@@ -4378,6 +4591,173 @@ async def wrapper({default_args}):
         )
 
 
+SCHEMA_VALIDATION_MAX_ATTEMPTS = 2
+SCHEMA_VALIDATION_MAX_ERRORS = 5
+
+
+def _default_structured_output_schema(description: str) -> dict[str, Any]:
+    # The output field is optional to preserve the legacy permissive default schema.
+    return {
+        "type": "object",
+        "properties": {
+            "output": {
+                "type": "object",
+                "description": description,
+            }
+        },
+    }
+
+
+def _default_text_prompt_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "llm_response": {
+                "type": "string",
+                "description": "Your response to the prompt",
+            }
+        },
+    }
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
+
+
+def _schema_type_description(schema_type: Any) -> str:
+    if isinstance(schema_type, list):
+        return " or ".join(str(t) for t in schema_type)
+    return str(schema_type)
+
+
+def _schema_path(error: ValidationError) -> str:
+    schema_path = list(error.absolute_schema_path)
+    path_parts: list[str] = []
+    index = 0
+    while index < len(schema_path):
+        part = schema_path[index]
+        if part == "properties" and index + 1 < len(schema_path):
+            path_parts.append(str(schema_path[index + 1]))
+            index += 2
+            continue
+        if part == "items":
+            path_parts.append("[]")
+            index += 1
+            continue
+        if part == "additionalProperties":
+            path_parts.append("<map value>")
+            index += 1
+            continue
+        if part == "patternProperties":
+            path_parts.append("<map value>")
+            index += 2 if index + 1 < len(schema_path) else 1
+            continue
+        index += 1
+
+    return "root" + "".join(f"{part}" if part == "[]" else f".{part}" for part in path_parts)
+
+
+def _format_schema_validation_error(error: ValidationError) -> str:
+    path = _schema_path(error)
+    actual_type = _json_type_name(error.instance)
+
+    if error.validator == "type":
+        expected_type = _schema_type_description(error.validator_value)
+        return f"{path}: expected type {expected_type}, got {actual_type}"
+
+    if error.validator == "required":
+        match = re.match(r"'([^']+)' is a required property", error.message)
+        if match:
+            return f"{path}: missing required property {match.group(1)}"
+        return f"{path}: missing required property"
+
+    if error.validator == "additionalProperties":
+        unexpected_count: int | None = None
+        schema_properties = error.schema.get("properties", {}) if isinstance(error.schema, dict) else {}
+        if isinstance(error.instance, dict) and isinstance(schema_properties, dict):
+            unexpected_count = sum(1 for field in error.instance if field not in schema_properties)
+        if unexpected_count is not None:
+            return f"{path}: has {unexpected_count} unexpected properties"
+        return f"{path}: has unexpected properties"
+
+    if error.validator in {"minItems", "maxItems"} and isinstance(error.instance, list):
+        return f"{path}: violates {error.validator}={error.validator_value}; item count={len(error.instance)}"
+
+    if error.validator in {"minLength", "maxLength"} and isinstance(error.instance, str):
+        return f"{path}: violates {error.validator}={error.validator_value}; string length={len(error.instance)}"
+
+    if error.validator == "enum":
+        allowed_count = len(error.validator_value) if isinstance(error.validator_value, list) else "configured"
+        return f"{path}: value is not one of {allowed_count} allowed values; got {actual_type}"
+
+    return f"{path}: violates {error.validator} constraint; got {actual_type}"
+
+
+def _validate_response_against_json_schema(
+    response: Any,
+    json_schema: dict[str, Any] | None,
+    schema_label: str,
+    max_errors: int = SCHEMA_VALIDATION_MAX_ERRORS,
+) -> str | None:
+    if not json_schema:
+        return None
+
+    if not validate_schema(json_schema):
+        return f"{schema_label} JSON schema is invalid."
+
+    try:
+        validator = Draft202012Validator(json_schema)
+        validation_errors = [_format_schema_validation_error(error) for error in validator.iter_errors(response)]
+    except Exception as e:
+        LOG.warning(
+            "Failed to validate LLM response against JSON schema",
+            schema_label=schema_label,
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        return f"{schema_label} JSON schema validation failed ({type(e).__name__})."
+
+    validation_errors = list(dict.fromkeys(validation_errors))
+    if not validation_errors:
+        return None
+
+    return f"LLM response does not match {schema_label.lower()} JSON schema: " + "; ".join(
+        validation_errors[:max_errors]
+    )
+
+
+def _is_schema_configuration_failure(failure_reason: str) -> bool:
+    return "JSON schema is invalid" in failure_reason or "JSON schema validation failed" in failure_reason
+
+
+def _llm_response_format_failure_reason(error: Exception) -> str:
+    return f"LLM response could not be parsed or coerced into the required JSON shape ({type(error).__name__})."
+
+
+def _build_schema_validation_retry_prompt(prompt: str, failure_reason: str) -> str:
+    return (
+        f"{prompt}\n\n"
+        "Your previous response failed JSON schema validation.\n"
+        f"Validation error: {failure_reason}\n\n"
+        "Retry the task. Return only valid JSON that exactly matches the schema. "
+        "Do not include markdown, code fences, explanatory text, or extra fields."
+    )
+
+
 class TextPromptBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -4387,6 +4767,8 @@ class TextPromptBlock(Block):
     prompt: str
     parameters: list[PARAMETER_TYPE] = []
     json_schema: dict[str, Any] | None = None
+    schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
+    schema_validation_max_errors: ClassVar[int] = SCHEMA_VALIDATION_MAX_ERRORS
 
     def get_all_parameters(
         self,
@@ -4423,6 +4805,14 @@ class TextPromptBlock(Block):
 
         self._apply_workflow_system_prompt(workflow_run_context)
 
+    def _validate_response_against_json_schema(self, response: Any) -> str | None:
+        return _validate_response_against_json_schema(
+            response,
+            self.json_schema,
+            "Text prompt",
+            max_errors=self.schema_validation_max_errors,
+        )
+
     async def send_prompt(
         self,
         prompt: str,
@@ -4430,28 +4820,23 @@ class TextPromptBlock(Block):
         workflow_run_id: str,
         organization_id: str | None = None,
         workflow_run_block_id: str | None = None,
-    ) -> dict[str, Any]:
+        schema_validation_failure: str | None = None,
+        json_schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
             self.override_llm_key_for_organization(organization_id) or self.llm_key, default=default_llm_handler
         )
-        if not self.json_schema:
-            self.json_schema = {
-                "type": "object",
-                "properties": {
-                    "llm_response": {
-                        "type": "string",
-                        "description": "Your response to the prompt",
-                    }
-                },
-            }
+        schema_to_use = json_schema or self.json_schema or _default_text_prompt_schema()
 
         prompt = prompt_engine.load_prompt_from_string(prompt, **parameter_values)
+        if schema_validation_failure:
+            prompt = _build_schema_validation_retry_prompt(prompt, schema_validation_failure)
         prompt += (
             "\n\n"
             + "Please respond to the prompt above using the following JSON definition:\n\n"
             + "```json\n"
-            + json.dumps(self.json_schema, indent=2)
+            + json.dumps(schema_to_use, indent=2)
             + "\n```\n\n"
         )
 
@@ -4478,6 +4863,8 @@ class TextPromptBlock(Block):
             system_prompt=self.workflow_system_prompt,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+            force_dict=False,
         )
 
         if workflow_run_block:
@@ -4570,33 +4957,111 @@ class TextPromptBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        try:
-            response = await self.send_prompt(
-                self.prompt,
-                parameter_values,
-                workflow_run_id,
-                organization_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-        except Exception as e:
-            try:
-                resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
-            except Exception:
-                resolved_llm_key = self.llm_key
-            LOG.exception(
-                "TextPromptBlock LLM call failed",
-                block_label=self.label,
-                workflow_run_id=workflow_run_id,
-                llm_key=resolved_llm_key,
-            )
+        response: dict[str, Any] | list | str | None = None
+        schema_to_use = self.json_schema or _default_text_prompt_schema()
+        if not validate_schema(schema_to_use):
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"LLM call failed: {e}",
+                failure_reason="Text prompt JSON schema is invalid.",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+        schema_validation_failure_for_retry: str | None = None
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                response = await self.send_prompt(
+                    self.prompt,
+                    parameter_values,
+                    workflow_run_id,
+                    organization_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    schema_validation_failure=schema_validation_failure_for_retry,
+                    json_schema=schema_to_use,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                response_format_failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "TextPromptBlock LLM response failed response-format validation",
+                    block_label=self.label,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=schema_to_use.get("type"),
+                )
+                if not will_retry:
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=response_format_failure_reason,
+                        output_parameter_value=None,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
+                schema_validation_failure_for_retry = response_format_failure_reason
+                continue
+            except Exception as e:
+                try:
+                    resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
+                except Exception:
+                    resolved_llm_key = self.llm_key
+                LOG.exception(
+                    "TextPromptBlock LLM call failed",
+                    block_label=self.label,
+                    workflow_run_id=workflow_run_id,
+                    llm_key=resolved_llm_key,
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"LLM call failed: {e}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            schema_validation_failure = _validate_response_against_json_schema(
+                response,
+                schema_to_use,
+                "Text prompt",
+                max_errors=self.schema_validation_max_errors,
+            )
+            if not schema_validation_failure:
+                break
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "TextPromptBlock LLM response failed schema validation",
+                block_label=self.label,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=schema_to_use.get("type"),
+            )
+            if not will_retry:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=schema_validation_failure,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            schema_validation_failure_for_retry = schema_validation_failure
+            continue
+
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
             success=True,
@@ -5789,6 +6254,8 @@ class FileParserBlock(Block):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
+    ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
 
     def get_failure_error_codes(self) -> list[str]:
         return ["FILE_PARSER_ERROR"]
@@ -5808,6 +6275,38 @@ class FileParserBlock(Block):
         )
 
         self._apply_workflow_system_prompt(workflow_run_context)
+
+    @staticmethod
+    def _validate_ocr_llm_response(llm_response: Any) -> str | None:
+        if not isinstance(llm_response, dict):
+            return (
+                f"OCR response must be a JSON object with extracted_text string; got {_json_type_name(llm_response)}."
+            )
+        if not isinstance(llm_response.get("extracted_text"), str):
+            return (
+                "OCR response must include extracted_text as a string; "
+                f"got {_json_type_name(llm_response.get('extracted_text'))}."
+            )
+        return None
+
+    @staticmethod
+    def _build_ocr_validation_retry_prompt(prompt: str, failure_reason: str) -> str:
+        return (
+            f"{prompt}\n\n"
+            "Your previous OCR response failed JSON validation.\n"
+            f"Validation error: {failure_reason}\n\n"
+            'Retry the task. Return only valid JSON with this exact shape: {"extracted_text": "..."} '
+            "Do not include markdown, code fences, explanatory text, or extra fields."
+        )
+
+    @staticmethod
+    def _validate_ai_response_against_json_schema(response: Any, json_schema: dict[str, Any]) -> str | None:
+        return _validate_response_against_json_schema(
+            response,
+            json_schema,
+            "File parser",
+            max_errors=SCHEMA_VALIDATION_MAX_ERRORS,
+        )
 
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
@@ -6089,6 +6588,9 @@ class FileParserBlock(Block):
         bounded concurrency, reassembled in page order with page markers, and
         truncated at a page boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
         """
+        if self.ocr_validation_max_attempts <= 0:
+            raise ValueError("OCR validation max attempts must be greater than 0.")
+
         llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
         default_handler = await self._resolve_file_parser_handler(
             "extract-text-from-image", workflow_run_block_id, organization_id
@@ -6100,17 +6602,53 @@ class FileParserBlock(Block):
 
         async def _ocr_page(page_image: bytes) -> str:
             async with semaphore:
-                # OCR transcription intentionally skips system_prompt; it still applies
-                # to the downstream extract-information-from-file-text call.
-                llm_response = await llm_api_handler(
-                    prompt=llm_prompt,
-                    prompt_name="extract-text-from-image",
-                    screenshots=[page_image],
-                    force_dict=True,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-                return llm_response.get("extracted_text", "") or ""
+                prompt_for_attempt = llm_prompt
+                for attempt in range(self.ocr_validation_max_attempts):
+                    try:
+                        # OCR transcription intentionally skips system_prompt; it still applies
+                        # to the downstream extract-information-from-file-text call.
+                        llm_response = await llm_api_handler(
+                            prompt=prompt_for_attempt,
+                            prompt_name="extract-text-from-image",
+                            screenshots=[page_image],
+                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                            force_dict=False,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                        failure_reason = _llm_response_format_failure_reason(e)
+                        will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                        LOG.warning(
+                            "FileParserBlock PDF OCR LLM response failed response-format validation",
+                            file_url=self.file_url,
+                            attempt=attempt + 1,
+                            max_attempts=self.ocr_validation_max_attempts,
+                            will_retry=will_retry,
+                            error_type=type(e).__name__,
+                        )
+                        if not will_retry:
+                            raise ValueError(failure_reason) from e
+                        prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, failure_reason)
+                        continue
+
+                    ocr_failure_reason = self._validate_ocr_llm_response(llm_response)
+                    if not ocr_failure_reason:
+                        return llm_response.get("extracted_text", "") or ""
+
+                    will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                    LOG.warning(
+                        "FileParserBlock PDF OCR LLM response failed schema validation",
+                        file_url=self.file_url,
+                        attempt=attempt + 1,
+                        max_attempts=self.ocr_validation_max_attempts,
+                        will_retry=will_retry,
+                        failure_reason=ocr_failure_reason,
+                    )
+                    if not will_retry:
+                        raise ValueError(ocr_failure_reason)
+                    prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
+                raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
         page_results = await asyncio.gather(
             *(_ocr_page(page_image) for page_image in page_images),
@@ -6160,6 +6698,9 @@ class FileParserBlock(Block):
         organization_id: str | None = None,
     ) -> str:
         """Parse image file using vision LLM for OCR."""
+        if self.ocr_validation_max_attempts <= 0:
+            raise ValueError("OCR validation max attempts must be greater than 0.")
+
         try:
             with open(file_path, "rb") as f:
                 image_bytes = f.read()
@@ -6173,15 +6714,52 @@ class FileParserBlock(Block):
             )
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
-            llm_response = await llm_api_handler(
-                prompt=llm_prompt,
-                prompt_name="extract-text-from-image",
-                screenshots=[image_bytes],
-                force_dict=True,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-            return llm_response.get("extracted_text", "")
+            prompt_for_attempt = llm_prompt
+            for attempt in range(self.ocr_validation_max_attempts):
+                try:
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-text-from-image",
+                        screenshots=[image_bytes],
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                        force_dict=False,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                    failure_reason = _llm_response_format_failure_reason(e)
+                    will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                    LOG.warning(
+                        "FileParserBlock image OCR LLM response failed response-format validation",
+                        file_url=self.file_url,
+                        attempt=attempt + 1,
+                        max_attempts=self.ocr_validation_max_attempts,
+                        will_retry=will_retry,
+                        error_type=type(e).__name__,
+                    )
+                    if not will_retry:
+                        raise ValueError(failure_reason) from e
+                    prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, failure_reason)
+                    continue
+
+                ocr_failure_reason = self._validate_ocr_llm_response(llm_response)
+                if not ocr_failure_reason:
+                    return llm_response.get("extracted_text", "") or ""
+
+                will_retry = attempt + 1 < self.ocr_validation_max_attempts
+                LOG.warning(
+                    "FileParserBlock image OCR LLM response failed schema validation",
+                    file_url=self.file_url,
+                    attempt=attempt + 1,
+                    max_attempts=self.ocr_validation_max_attempts,
+                    will_retry=will_retry,
+                    failure_reason=ocr_failure_reason,
+                )
+                if not will_retry:
+                    raise ValueError(ocr_failure_reason)
+                prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
+
+            raise RuntimeError("OCR retry loop exhausted without returning or raising.")
         except Exception:
             LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
             raise
@@ -6262,18 +6840,12 @@ class FileParserBlock(Block):
         workflow_run_context: WorkflowRunContext,
         workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | list | str | None:
         """Extract structured data using AI based on json_schema."""
         # Use local variable to avoid mutating the instance
-        schema_to_use = self.json_schema or {
-            "type": "object",
-            "properties": {
-                "output": {
-                    "type": "object",
-                    "description": "Information extracted from the file",
-                }
-            },
-        }
+        schema_to_use = self.json_schema or _default_structured_output_schema("Information extracted from the file")
+        if not validate_schema(schema_to_use):
+            raise ValueError("File parser JSON schema is invalid.")
 
         # Convert content to string for AI processing
         if isinstance(content, list):
@@ -6291,15 +6863,58 @@ class FileParserBlock(Block):
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
 
-        llm_response = await llm_api_handler(
-            prompt=llm_prompt,
-            prompt_name="extract-information-from-file-text",
-            force_dict=False,
-            system_prompt=self.workflow_system_prompt,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-        )
-        return llm_response
+        prompt_for_attempt = llm_prompt
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                llm_response = await llm_api_handler(
+                    prompt=prompt_for_attempt,
+                    prompt_name="extract-information-from-file-text",
+                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                    force_dict=False,
+                    system_prompt=self.workflow_system_prompt,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "FileParserBlock extraction LLM response failed response-format validation",
+                    file_url=self.file_url,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=schema_to_use.get("type"),
+                )
+                if not will_retry:
+                    raise ValueError(failure_reason) from e
+                prompt_for_attempt = _build_schema_validation_retry_prompt(llm_prompt, failure_reason)
+                continue
+
+            schema_validation_failure = self._validate_ai_response_against_json_schema(llm_response, schema_to_use)
+            if not schema_validation_failure:
+                return llm_response
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "FileParserBlock extraction LLM response failed schema validation",
+                file_url=self.file_url,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=schema_to_use.get("type"),
+            )
+            if not will_retry:
+                raise ValueError(schema_validation_failure)
+            prompt_for_attempt = _build_schema_validation_retry_prompt(
+                llm_prompt,
+                schema_validation_failure,
+            )
+
+        raise AssertionError("unreachable schema validation retry loop exit")
 
     async def _record_failure(
         self,
@@ -6468,7 +7083,7 @@ class FileParserBlock(Block):
             )
 
         # If json_schema is provided, use AI to extract structured data
-        final_data: str | list[dict[str, Any]] | dict[str, Any]
+        final_data: Any
         LOG.debug(
             "FileParserBlock JSON schema check",
             has_json_schema=self.json_schema is not None,
@@ -6521,6 +7136,7 @@ class PDFParserBlock(Block):
 
     file_url: str
     json_schema: dict[str, Any] | None = None
+    schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
 
     def get_all_parameters(
         self,
@@ -6589,27 +7205,92 @@ class PDFParserBlock(Block):
             )
 
         if not self.json_schema:
-            self.json_schema = {
-                "type": "object",
-                "properties": {
-                    "output": {
-                        "type": "object",
-                        "description": "Information extracted from the text",
-                    }
-                },
-            }
+            self.json_schema = _default_structured_output_schema("Information extracted from the text")
+        schema_to_use = self.json_schema
+        assert schema_to_use is not None
+        if not validate_schema(schema_to_use):
+            return await self.build_block_result(
+                success=False,
+                failure_reason="File parser JSON schema is invalid.",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
         llm_prompt = prompt_engine.load_prompt(
-            "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
+            "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=schema_to_use
         )
-        llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt,
-            prompt_name="extract-information-from-file-text",
-            force_dict=False,
-            system_prompt=self.workflow_system_prompt,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-        )
+
+        llm_response: dict[str, Any] | list | str | None = None
+        prompt_for_attempt = llm_prompt
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                llm_response = await app.LLM_API_HANDLER(
+                    prompt=prompt_for_attempt,
+                    prompt_name="extract-information-from-file-text",
+                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                    force_dict=False,
+                    system_prompt=self.workflow_system_prompt,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "PDFParserBlock extraction LLM response failed response-format validation",
+                    file_url=self.file_url,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=schema_to_use.get("type"),
+                )
+                if not will_retry:
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=failure_reason,
+                        output_parameter_value=None,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                prompt_for_attempt = _build_schema_validation_retry_prompt(llm_prompt, failure_reason)
+                continue
+
+            schema_validation_failure = FileParserBlock._validate_ai_response_against_json_schema(
+                llm_response,
+                schema_to_use,
+            )
+            if not schema_validation_failure:
+                break
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "PDFParserBlock extraction LLM response failed schema validation",
+                file_url=self.file_url,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=schema_to_use.get("type"),
+            )
+            if not will_retry:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=schema_validation_failure,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            prompt_for_attempt = _build_schema_validation_retry_prompt(
+                llm_prompt,
+                schema_validation_failure,
+            )
+
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(

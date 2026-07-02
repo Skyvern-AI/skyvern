@@ -34,7 +34,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import pyotp
 import structlog
@@ -112,7 +112,12 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCrea
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.credentials import normalize_totp_config, parse_totp_config
+from skyvern.forge.sdk.services.credentials import (
+    AuthenticatorTotpErrorCode,
+    AuthenticatorTotpParseResult,
+    normalize_totp_config,
+    parse_totp_config,
+)
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -184,6 +189,31 @@ _TOTP_CODE_PREVIEW_CACHE: dict[tuple[str, str], _TotpCodePreviewCacheEntry] = {}
 # across workers; entries are bounded and expire at the active TOTP window.
 
 
+def _authenticator_totp_error_detail(
+    *,
+    error_code: AuthenticatorTotpErrorCode,
+    message: str,
+    vendor: str | None = None,
+) -> dict[str, str]:
+    detail = {"error_code": error_code.value, "message": message}
+    if vendor:
+        detail["vendor"] = vendor
+    return detail
+
+
+def _raise_authenticator_totp_http_error(
+    *,
+    status_code: int,
+    error_code: AuthenticatorTotpErrorCode,
+    message: str,
+    vendor: str | None = None,
+) -> NoReturn:
+    raise HTTPException(
+        status_code=status_code,
+        detail=_authenticator_totp_error_detail(error_code=error_code, message=message, vendor=vendor),
+    )
+
+
 def _parse_authenticator_totp_config_or_raise(
     totp_secret: str | None,
     *,
@@ -192,12 +222,20 @@ def _parse_authenticator_totp_config_or_raise(
 ) -> tuple[pyotp.TOTP, str]:
     raw_totp_secret = (totp_secret or "").strip()
     if raw_totp_secret == "":
-        raise HTTPException(status_code=400, detail=missing_detail)
+        _raise_authenticator_totp_http_error(
+            status_code=400,
+            error_code=AuthenticatorTotpErrorCode.AUTHENTICATOR_KEY_REQUIRED,
+            message=missing_detail,
+        )
 
     normalized_totp_secret = normalize_totp_config(raw_totp_secret)
     totp = parse_totp_config(normalized_totp_secret)
     if not totp:
-        raise HTTPException(status_code=400, detail=invalid_detail)
+        _raise_authenticator_totp_http_error(
+            status_code=400,
+            error_code=AuthenticatorTotpErrorCode.INVALID_AUTHENTICATOR_KEY,
+            message=invalid_detail,
+        )
     return totp, normalized_totp_secret
 
 
@@ -221,13 +259,18 @@ async def _parse_enterprise_totp_secret_or_raise(
     organization_id: str,
     invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
 ) -> str | None:
-    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+    result: AuthenticatorTotpParseResult = await app.AGENT_FUNCTION.parse_enterprise_totp_secret_result(
         totp_secret or "",
         organization_id=organization_id,
     )
-    if enterprise_totp_secret == "":
-        raise HTTPException(status_code=400, detail=invalid_detail)
-    return enterprise_totp_secret
+    if result.error_code is not None:
+        _raise_authenticator_totp_http_error(
+            status_code=400,
+            error_code=result.error_code,
+            message=result.message or invalid_detail,
+            vendor=result.vendor,
+        )
+    return result.secret
 
 
 async def _build_authenticator_totp_for_organization_or_raise(
@@ -283,8 +326,9 @@ async def _normalize_authenticator_totp_for_organization_or_raise(
         organization_id=organization_id,
     )
     if enterprise_totp_secret is not None:
-        # Keep enterprise payloads raw in credential.totp; runtime paths re-parse
-        # them through the cloud parser before generating codes.
+        # The cloud parser has already extracted any vendor QR payload into a
+        # standard TOTP config, so new saves can store the canonical secret.
+        credential.totp = _parse_authenticator_totp_or_raise(enterprise_totp_secret)
         return
 
     _normalize_authenticator_totp_or_raise(credential)
@@ -332,6 +376,8 @@ def _cache_totp_code_preview(
 ) -> None:
     _prune_totp_code_preview_cache(now=now)
     while len(_TOTP_CODE_PREVIEW_CACHE) >= _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES:
+        # Dict iteration order makes this FIFO eviction, which is enough for this
+        # per-process preview cache.
         _TOTP_CODE_PREVIEW_CACHE.pop(next(iter(_TOTP_CODE_PREVIEW_CACHE)))
 
     _TOTP_CODE_PREVIEW_CACHE[(organization_id, credential_id)] = _TotpCodePreviewCacheEntry(

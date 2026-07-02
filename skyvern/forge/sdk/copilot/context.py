@@ -97,6 +97,7 @@ class TurnNarrativePayload(TypedDict):
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
@@ -163,6 +164,10 @@ class CodeAuthoringRepairContext(BaseModel):
     allowed_helper_surface: dict[str, list[str]] = Field(default_factory=dict)
     runtime_failure_reason: str | None = None
     runtime_failure_class: str | None = None
+    output_dependency_failure_class: str | None = None
+    missing_output_key: str | None = None
+    available_output_keys: list[str] = Field(default_factory=list)
+    current_block_parameter_keys: list[str] = Field(default_factory=list)
     failed_block_status: str | None = None
     workflow_run_id: str | None = None
     current_origin: str | None = None
@@ -619,6 +624,8 @@ class CopilotContext(AgentContext):
     last_code_authoring_reject_was_credential_priority: bool = False
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the
     # high-water length of the verified block prefix. A repair that grows either

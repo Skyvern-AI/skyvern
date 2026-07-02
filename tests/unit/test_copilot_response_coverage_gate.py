@@ -53,6 +53,7 @@ class _Ctx:
         self.composition_page_evidence = None
         self.last_update_block_count = None
         self.last_test_ok = None
+        self.last_full_workflow_test_ok = False
         self.last_test_failure_reason = None
         self.last_test_suspicious_success = False
         self.last_test_anti_bot = None

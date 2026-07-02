@@ -14,12 +14,15 @@ Without this wrap:
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+import structlog
 import yaml
 
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.utils.yaml_loader import safe_load_no_dates
+
+LOG = structlog.get_logger()
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -58,6 +61,10 @@ _WRAPPED_GOAL_RE = re.compile(
     rf"{re.escape(_MAIN_GOAL_HEADER)}\s*{_FENCE_RE}\s*(?P<main_goal>.*?)\s*{_FENCE_RE}\s*$",
     re.DOTALL,
 )
+
+
+def compose_mini_goal(main_goal: str, mini_goal: str) -> str:
+    return MINI_GOAL_TEMPLATE.format(main_goal=main_goal, mini_goal=mini_goal)
 
 
 def wrap_block_goals(workflow_yaml: str, user_message: str) -> str:
@@ -136,6 +143,50 @@ def _extract_wrapped_goal(value: str) -> tuple[str, str] | None:
         last = (mini_goal, main_goal)
         current = mini_goal
     return last
+
+
+class UnwrappedGoals(NamedTuple):
+    navigation_goal: str | None
+    complete_criterion: str | None
+    terminate_criterion: str | None
+    big_goal_context: str | None
+
+
+def unwrap_goal_fields(
+    navigation_goal: str | None,
+    complete_criterion: str | None = None,
+    terminate_criterion: str | None = None,
+) -> UnwrappedGoals:
+    """Reduce MINI_GOAL_TEMPLATE-wrapped fields to their mini goals plus one shared
+    big-goal context (first wrapped field's main goal wins). Unwrapped fields pass
+    through untouched, keeping the verify prompts byte-identical to today."""
+    big_goal: str | None = None
+
+    def unwrap_one(value: str | None) -> str | None:
+        nonlocal big_goal
+        if not value:
+            return value
+        parts = _extract_wrapped_goal(value)
+        if parts is None:
+            return value
+        mini_goal, main_goal = parts
+        if big_goal is None:
+            big_goal = main_goal
+        elif main_goal != big_goal:
+            # Goal text can carry user-typed content; log shape only, never the strings.
+            LOG.debug(
+                "Wrapped goal fields carry mismatched main goals; first wins",
+                first_main_goal_length=len(big_goal),
+                conflicting_main_goal_length=len(main_goal),
+            )
+        return mini_goal
+
+    unwrapped_navigation_goal = unwrap_one(navigation_goal)
+    unwrapped_complete_criterion = unwrap_one(complete_criterion)
+    unwrapped_terminate_criterion = unwrap_one(terminate_criterion)
+    return UnwrappedGoals(
+        unwrapped_navigation_goal, unwrapped_complete_criterion, unwrapped_terminate_criterion, big_goal
+    )
 
 
 def _wrapped_field_value(value: Any, main_goal: str) -> str | None:

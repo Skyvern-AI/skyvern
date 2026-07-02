@@ -469,13 +469,13 @@ function WorkflowsFlat() {
   ) {
     if (event.ctrlKey || event.metaKey) {
       window.open(
-        window.location.origin + `/workflows/${workflowPermanentId}/runs`,
+        window.location.origin + `/agents/${workflowPermanentId}/runs`,
         "_blank",
         "noopener,noreferrer",
       );
       return;
     }
-    navigate(`/workflows/${workflowPermanentId}/runs`);
+    navigate(`/agents/${workflowPermanentId}/runs`);
   }
 
   function handleIconClick(
@@ -1132,7 +1132,7 @@ function WorkflowsFlat() {
                                         onClick={(event) => {
                                           handleIconClick(
                                             event,
-                                            `/workflows/${workflow.workflow_permanent_id}/run`,
+                                            `/agents/${workflow.workflow_permanent_id}/run`,
                                           );
                                         }}
                                       >

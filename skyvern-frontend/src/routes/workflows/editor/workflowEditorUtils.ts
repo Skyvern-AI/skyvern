@@ -3,6 +3,7 @@ import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 
 import {
   WorkflowBlockType,
@@ -4603,7 +4604,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
       if (!result.success) {
         errors.push(
-          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+          `${node.data.label}: Data schema has invalid templated JSON: ${getJsonParseErrorDetail(
+            node.data.dataSchema,
+            result.error ?? "Parse error",
+          )}`,
         );
       }
     }
@@ -4689,7 +4693,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
       if (!result.success) {
         errors.push(
-          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+          `${node.data.label}: Data schema has invalid templated JSON: ${getJsonParseErrorDetail(
+            node.data.dataSchema,
+            result.error ?? "Parse error",
+          )}`,
         );
       }
     }
@@ -4699,8 +4706,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   textPromptNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.jsonSchema,
+          error,
+        )}`,
+      );
     }
   });
 
@@ -4708,8 +4720,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   pdfParserNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.jsonSchema,
+          error,
+        )}`,
+      );
     }
   });
 
@@ -4717,8 +4734,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   fileParserNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.jsonSchema,
+          error,
+        )}`,
+      );
     }
   });
 

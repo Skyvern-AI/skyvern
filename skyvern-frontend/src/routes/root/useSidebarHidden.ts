@@ -1,5 +1,7 @@
 import { useMatch, useSearchParams } from "react-router-dom";
 
+import { useAgentsPathMatch } from "@/routes/workflows/useAgentsPathMatch";
+
 type Options = {
   hideBrowserSessions?: boolean;
 };
@@ -7,17 +9,17 @@ type Options = {
 function useSidebarHidden({ hideBrowserSessions = false }: Options = {}) {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
-  const workflowEditMatch = useMatch("/workflows/:workflowPermanentId/edit");
-  const workflowStudioMatch = useMatch(
-    "/workflows/:workflowPermanentId/studio",
+  const workflowEditMatch = useAgentsPathMatch("/:workflowPermanentId/edit");
+  const workflowStudioMatch = useAgentsPathMatch(
+    "/:workflowPermanentId/studio",
   );
-  const workflowBuildMatch = useMatch("/workflows/:workflowPermanentId/build");
-  const workflowBlockBuildMatch = useMatch(
-    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/build",
+  const workflowBuildMatch = useAgentsPathMatch("/:workflowPermanentId/build");
+  const workflowBlockBuildMatch = useAgentsPathMatch(
+    "/:workflowPermanentId/:workflowRunId/:blockLabel/build",
   );
-  const workflowDebugMatch = useMatch("/workflows/:workflowPermanentId/debug");
-  const workflowBlockDebugMatch = useMatch(
-    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/debug",
+  const workflowDebugMatch = useAgentsPathMatch("/:workflowPermanentId/debug");
+  const workflowBlockDebugMatch = useAgentsPathMatch(
+    "/:workflowPermanentId/:workflowRunId/:blockLabel/debug",
   );
   const browserSessionMatch = useMatch("/browser-session/:browserSessionId");
   const nestedBrowserSessionMatch = useMatch(

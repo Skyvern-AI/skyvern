@@ -38,6 +38,7 @@ import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import { getInvalidJsonMessage } from "@/util/jsonParseError";
 import {
   CredentialDataType,
   CredentialSource,
@@ -1040,32 +1041,28 @@ function WorkflowParameterEditPanel({
 
                 // Handle workflow parameters (non-credential)
                 if (type === "workflow" && !isCredentialSelected) {
+                  let defaultValue = defaultValueState.defaultValue;
+
                   if (
                     parameterType === "json" &&
                     typeof defaultValueState.defaultValue === "string"
                   ) {
                     try {
-                      JSON.parse(defaultValueState.defaultValue);
+                      defaultValue = JSON.parse(defaultValueState.defaultValue);
                     } catch (e) {
                       toast({
                         variant: "destructive",
                         title: "Failed to save input",
-                        description: "Invalid JSON for default value",
+                        description: getInvalidJsonMessage(
+                          defaultValueState.defaultValue,
+                          e,
+                        ),
                       });
                       return;
                     }
                   }
-                  let defaultValue = defaultValueState.defaultValue;
-
-                  // Handle JSON parsing
-                  if (
-                    parameterType === "json" &&
-                    typeof defaultValueState.defaultValue === "string"
-                  ) {
-                    defaultValue = JSON.parse(defaultValueState.defaultValue);
-                  }
                   // Convert boolean to string for backend storage
-                  else if (
+                  if (
                     parameterType === "boolean" &&
                     typeof defaultValueState.defaultValue === "boolean"
                   ) {

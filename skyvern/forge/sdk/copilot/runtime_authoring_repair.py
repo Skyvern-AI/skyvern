@@ -9,6 +9,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_sche
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
@@ -16,16 +17,18 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
 LOG = structlog.get_logger()
 
 _RUNTIME_AUTHORING_REASON_CODE = "runtime_block_failure"
+_MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
+_KEY_ERROR_RE = re.compile(r"KeyError(?:\s*:|\()\s*['\"]([^'\"]+)['\"]")
 
 
 def is_runtime_authoring_repair_context(repair_context: object) -> TypeGuard[CodeAuthoringRepairContext]:
-    return (
-        isinstance(repair_context, CodeAuthoringRepairContext)
-        and repair_context.reason_code == _RUNTIME_AUTHORING_REASON_CODE
-    )
+    return isinstance(repair_context, CodeAuthoringRepairContext) and repair_context.reason_code in {
+        _RUNTIME_AUTHORING_REASON_CODE,
+        _MISSING_OUTPUT_DEPENDENCY_REASON_CODE,
+    }
 
 
 def clear_runtime_authoring_repair_context(copilot_ctx: Any) -> None:
@@ -49,6 +52,62 @@ def _runtime_failure_class(reason: str) -> str:
         return "selector_not_found"
     normalized = re.sub(r"[^a-z0-9]+", "_", reason_lower).strip("_")
     return normalized[:80].strip("_") or "runtime_failure"
+
+
+def _missing_key_from_key_error(reason: str) -> str | None:
+    match = _KEY_ERROR_RE.search(reason)
+    if match is None:
+        return None
+    key = match.group(1).strip()
+    return key if key else None
+
+
+def _missing_output_dependency_context(
+    *,
+    copilot_ctx: Any,
+    block_label: str,
+    failed_block_status: str | None,
+    failure_reason: str,
+    run_id: str,
+) -> CodeAuthoringRepairContext | None:
+    missing_key = _missing_key_from_key_error(failure_reason)
+    workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
+    if not missing_key or not isinstance(workflow_yaml, str) or not workflow_yaml.strip():
+        return None
+    contract = code_block_available_contracts_by_label(workflow_yaml).get(block_label)
+    if contract is None:
+        return None
+    if not missing_key.endswith("_output"):
+        return None
+    if missing_key in contract.available_output_keys:
+        return None
+    if missing_key in contract.declared_workflow_parameter_keys:
+        return None
+    if missing_key in contract.available_binding_keys:
+        return None
+    if missing_key not in contract.parameter_keys:
+        return None
+    available_output_keys = list(contract.available_output_keys)
+    return CodeAuthoringRepairContext(
+        block_label=block_label,
+        reason_code=_MISSING_OUTPUT_DEPENDENCY_REASON_CODE,
+        parameter_keys=list(contract.parameter_keys),
+        available_parameter_keys=list(contract.available_binding_keys),
+        binding_candidates=available_output_keys,
+        runtime_failure_reason=failure_reason,
+        runtime_failure_class=_runtime_failure_class(failure_reason),
+        output_dependency_failure_class="missing_prior_block_output",
+        missing_output_key=missing_key,
+        available_output_keys=available_output_keys,
+        current_block_parameter_keys=list(contract.parameter_keys),
+        failed_block_status=failed_block_status or None,
+        workflow_run_id=run_id,
+        repair_instruction=(
+            "repair the missing prior block output dependency by binding to an actual available prior output key "
+            "or changing the producing/current code block so the dependency is real; do not invent a workflow "
+            "parameter for this missing output key."
+        ),
+    )
 
 
 def _origin_from_runtime_url(value: Any) -> str | None:
@@ -192,6 +251,16 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
         return
     if is_runtime_authoring_repair_context(getattr(copilot_ctx, "last_code_authoring_repair_context", None)):
         copilot_ctx.last_code_authoring_repair_context = None
+    missing_output_context = _missing_output_dependency_context(
+        copilot_ctx=copilot_ctx,
+        block_label=block_label,
+        failed_block_status=failed_block_status or None,
+        failure_reason=failure_reason,
+        run_id=run_id,
+    )
+    if missing_output_context is not None:
+        copilot_ctx.pending_code_authoring_runtime_repair_context = missing_output_context
+        return
     copilot_ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
         block_label=block_label,
         reason_code=_RUNTIME_AUTHORING_REASON_CODE,
@@ -317,6 +386,8 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
 ) -> CodeAuthoringRepairContext | None:
     pending = getattr(copilot_ctx, "pending_code_authoring_runtime_repair_context", None)
     if not is_runtime_authoring_repair_context(pending):
+        return None
+    if pending.reason_code != _RUNTIME_AUTHORING_REASON_CODE:
         return None
     if not _policy_allows_runtime_authoring_repair(copilot_ctx) or _pending_state_has_stop_or_ask_precedence(
         copilot_ctx, pending

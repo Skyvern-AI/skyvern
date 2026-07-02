@@ -2,6 +2,12 @@ import { useReactFlow } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -153,13 +159,26 @@ function FileParserEditorBody({
         value={data.model}
         onChange={(value) => update({ model: value })}
       />
-      <IgnoreWorkflowSystemPrompt
-        ignoreWorkflowSystemPrompt={data.ignoreWorkflowSystemPrompt ?? false}
-        editable={editable}
-        onIgnoreWorkflowSystemPromptChange={(ignoreWorkflowSystemPrompt) => {
-          update({ ignoreWorkflowSystemPrompt });
-        }}
-      />
+      <Accordion type="single" collapsible>
+        <AccordionItem value="advanced" className="border-b-0">
+          <AccordionTrigger className="py-0">
+            Advanced Settings
+          </AccordionTrigger>
+          <AccordionContent className="pl-6 pr-1 pt-1">
+            <IgnoreWorkflowSystemPrompt
+              ignoreWorkflowSystemPrompt={
+                data.ignoreWorkflowSystemPrompt ?? false
+              }
+              editable={editable}
+              onIgnoreWorkflowSystemPromptChange={(
+                ignoreWorkflowSystemPrompt,
+              ) => {
+                update({ ignoreWorkflowSystemPrompt });
+              }}
+            />
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
     </div>
   );
 }

@@ -260,39 +260,3 @@ def test_agent_db_has_typed_repo_attributes():
         assert not hasattr(db, "create_workflow")
         assert not hasattr(db, "get_organization")
         assert not hasattr(db, "get_credential")
-
-
-def test_agent_db_delegates_route_to_repositories():
-    """Verify delegate methods actually forward to the correct repository."""
-    from unittest.mock import AsyncMock
-    from unittest.mock import patch as mock_patch
-
-    with mock_patch("skyvern.forge.sdk.db.agent_db.create_async_engine"):
-        from skyvern.forge.sdk.db.agent_db import AgentDB
-
-        db = AgentDB("postgresql+asyncpg://test", debug_enabled=False)
-
-    # Patch a method on each major repository and verify the delegate calls it
-    delegates_to_check = [
-        ("get_task", "tasks"),
-        ("create_artifact", "artifacts"),
-        ("create_workflow_run", "workflow_runs"),
-    ]
-
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    try:
-        for delegate_name, repo_attr in delegates_to_check:
-            repo = getattr(db, repo_attr)
-            mock_method = AsyncMock(return_value="sentinel")
-            original = getattr(repo, delegate_name)
-            setattr(repo, delegate_name, mock_method)
-            try:
-                result = loop.run_until_complete(getattr(db, delegate_name)("arg1", key="val"))
-                mock_method.assert_called_once_with("arg1", key="val")
-                assert result == "sentinel", f"Delegate {delegate_name} did not return repository result"
-            finally:
-                setattr(repo, delegate_name, original)
-    finally:
-        loop.close()

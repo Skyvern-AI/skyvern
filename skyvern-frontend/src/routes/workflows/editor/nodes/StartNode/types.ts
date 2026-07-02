@@ -40,6 +40,10 @@ export type StartNodeData = WorkflowStartNodeData | OtherStartNodeData;
 
 export type StartNode = Node<StartNodeData, "start">;
 
+// Window event asking the root start node to expand its Workflow Settings
+// accordion (dispatched from the canvas when the start node is clicked).
+export const OPEN_WORKFLOW_SETTINGS_EVENT = "open-workflow-settings";
+
 export function isStartNode(node: AppNode): node is StartNode {
   return node.type === "start";
 }

@@ -18,11 +18,16 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
 )
 from skyvern.services.browser_recording.interpretation import RecordingInterpretationSession
 from skyvern.services.browser_recording.service import (
+    DUPLICATE_ACTION_WINDOW_MS,
     Processor,
+    _is_duplicate_action,
+    _recording_enrichment_llm_handler,
+    _resolve_enrichment_handler,
     deterministic_input_text_parameter_key,
     summarize_exfiltrated_recording_events,
 )
 from skyvern.services.browser_recording.types import (
+    ActionClick,
     ActionInputText,
     ActionKind,
     ActionTarget,
@@ -32,6 +37,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEventCdpParams,
     Mouse,
+    RecordingDraftStep,
     RecordingDraftStepStatus,
     RecordingInterpretationUpdate,
 )
@@ -157,6 +163,50 @@ def test_identical_click_events_are_deduped() -> None:
 
     assert len(actions) == 1
     assert actions[0].kind == "click"
+
+
+def _click_action(*, timestamp: float, sky_id: str = "sky-123", target_id: str = "button-1") -> ActionClick:
+    return ActionClick(
+        kind=ActionKind.CLICK,
+        target=ActionTarget(
+            id=target_id,
+            sky_id=sky_id,
+            tag_name="BUTTON",
+            texts=["Click me"],
+            mouse=Mouse(xp=0.5, yp=0.5),
+        ),
+        timestamp_start=timestamp,
+        timestamp_end=timestamp,
+        url="https://example.com",
+    )
+
+
+def test_is_duplicate_action_empty_list_is_not_duplicate() -> None:
+    assert _is_duplicate_action(_click_action(timestamp=1000.0), []) is False
+
+
+def test_is_duplicate_action_suppresses_jittered_recapture() -> None:
+    existing = [_click_action(timestamp=1000.0)]
+    jittered = _click_action(timestamp=1000.0 + 2)
+
+    assert _is_duplicate_action(jittered, existing) is True
+
+
+def test_is_duplicate_action_suppresses_non_adjacent_duplicate() -> None:
+    existing = [
+        _click_action(timestamp=1000.0, sky_id="sky-a", target_id="a"),
+        _click_action(timestamp=1010.0, sky_id="sky-b", target_id="b"),
+    ]
+    duplicate_of_first = _click_action(timestamp=1005.0, sky_id="sky-a", target_id="a")
+
+    assert _is_duplicate_action(duplicate_of_first, existing) is True
+
+
+def test_is_duplicate_action_keeps_intentional_repeat_outside_window() -> None:
+    existing = [_click_action(timestamp=1000.0)]
+    later_repeat = _click_action(timestamp=1000.0 + DUPLICATE_ACTION_WINDOW_MS + 1)
+
+    assert _is_duplicate_action(later_repeat, existing) is False
 
 
 def test_hover() -> None:
@@ -321,6 +371,66 @@ def test_input_text_parameter_key_is_derived_from_target_metadata() -> None:
     assert deterministic_input_text_parameter_key(action) == "customer_email"
 
 
+def test_enrichment_handler_uses_dedicated_key_when_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    dedicated = object()
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", lambda key: True)
+    monkeypatch.setattr(svc.LLMAPIHandlerFactory, "get_llm_api_handler", lambda key: dedicated)
+
+    assert _recording_enrichment_llm_handler() is dedicated
+
+
+def test_enrichment_handler_falls_back_when_key_unregistered(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    default = object()
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", lambda key: False)
+    monkeypatch.setattr(app, "LLM_API_HANDLER", default)
+
+    assert _recording_enrichment_llm_handler() is default
+
+
+def test_enrichment_handler_falls_back_on_resolution_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    default = object()
+
+    def boom(key: str) -> bool:
+        raise RuntimeError("registry blew up")
+
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", boom)
+    monkeypatch.setattr(app, "LLM_API_HANDLER", default)
+
+    assert _recording_enrichment_llm_handler() is default
+
+
+def test_enrichment_handler_memoizes_dedicated_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    dedicated = object()
+    calls = {"is_registered": 0}
+
+    def counting_is_registered(key: str) -> bool:
+        calls["is_registered"] += 1
+        return True
+
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", counting_is_registered)
+    monkeypatch.setattr(svc.LLMAPIHandlerFactory, "get_llm_api_handler", lambda key: dedicated)
+
+    assert _recording_enrichment_llm_handler() is dedicated
+    assert _recording_enrichment_llm_handler() is dedicated
+    assert calls["is_registered"] == 1
+
+
 @pytest.mark.asyncio
 async def test_input_text_placeholder_parameterizes_value_on_enrichment_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -377,10 +487,14 @@ async def test_live_interpretation_emits_placeholder_then_enriched(monkeypatch: 
     session.ingest_events([make_streaming_console_click(timestamp_ms=1000.0)])
     await asyncio.sleep(0.05)
 
-    # the placeholder draft is visible before the LLM responds
-    updates_with_steps = [update for update in updates if update.steps]
+    # the placeholder draft is visible before the LLM responds — it arrives as a
+    # delta (changed_steps), since only snapshots carry the full steps list.
+    def emitted_steps(u: RecordingInterpretationUpdate) -> list[RecordingDraftStep]:
+        return u.steps if u.is_snapshot else u.changed_steps
+
+    updates_with_steps = [update for update in updates if emitted_steps(update)]
     assert updates_with_steps
-    placeholder = updates_with_steps[-1].steps[0]
+    placeholder = emitted_steps(updates_with_steps[-1])[0]
     assert placeholder.status == RecordingDraftStepStatus.INTERPRETING
     assert placeholder.title == "Click 'Click me'"
     assert placeholder.navigation_goal == "Click 'Click me'."
@@ -473,7 +587,8 @@ async def test_live_interpretation_max_wait_fires_during_continuous_events() -> 
         await asyncio.sleep(0.02)
 
     try:
-        assert any(update.steps for update in updates)
+        # steps land in changed_steps (delta) or steps (snapshot) depending on emit type.
+        assert any(update.steps or update.changed_steps for update in updates)
     finally:
         session.cancel()
         # let the cancelled debounce task unwind before the loop closes

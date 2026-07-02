@@ -112,7 +112,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _TIMEOUT_REPLY_TESTED
 
     def test_missing_yaml_drops_untested_proposal(self) -> None:
@@ -241,7 +241,7 @@ class TestBuildMaxTurnsExitResult:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is wf
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _MAX_TURNS_REPLY_TESTED
 
     def test_failed_test_drops_proposal(self) -> None:
@@ -330,7 +330,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _UNEXPECTED_ERROR_REPLY_TESTED
 
     def test_failed_test_drops_proposal(self) -> None:
@@ -471,7 +471,7 @@ class TestBuildCancelExitResult:
         assert result.cancelled is True
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _CANCEL_REPLY_TESTED
 
     def test_failed_test_drops_cancel_proposal(self) -> None:

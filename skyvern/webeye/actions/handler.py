@@ -76,6 +76,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
+from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -2099,6 +2100,45 @@ async def handle_click_action(
     return results
 
 
+async def _build_after_click_verify_prompt(
+    task: Task,
+    scraped_page_after_open: ScrapedPage,
+    new_element_ids: set[str],
+    action_history_str: str,
+) -> str:
+    # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
+    # Skyvern IDs (default html_need_skyvern_attrs=True) because
+    # `new_elements_ids` is threaded and the LLM compares those IDs to what's
+    # rendered. Gate lean on the PostHog flag.
+    _ctx = skyvern_context.current()
+    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
+    slim_output = await get_slim_output_template_value("check-user-goal")
+    # SKY-11295: verify against the mini goal when the task goal is
+    # MINI_GOAL_TEMPLATE-wrapped; see ForgeAgent.complete_verify. Only
+    # navigation_goal is unwrapped — this render passes no criteria fields.
+    unwrapped_goals = unwrap_goal_fields(task.navigation_goal)
+    return load_prompt_with_elements(
+        element_tree_builder=scraped_page_after_open,
+        prompt_engine=prompt_engine,
+        template_name="check-user-goal",
+        navigation_goal=unwrapped_goals.navigation_goal,
+        big_goal_context=unwrapped_goals.big_goal_context,
+        navigation_payload=task.navigation_payload,
+        new_elements_ids=new_element_ids,
+        without_screenshots=True,
+        # No action_history_evidence: this call site judges mid-action continuation, and the
+        # history here is the menu-opening click — evidence-shortcutting it would certify
+        # the dropdown before the actual selection.
+        action_history=action_history_str,
+        slim_output=slim_output,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        lean_compress_long_href=lean_enabled,
+        lean_compress_image_src=lean_enabled,
+        lean_strip_url_query_strings=lean_enabled,
+        lean_compress_nonnavigable_href=lean_enabled,
+    )
+
+
 @traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
@@ -2154,29 +2194,7 @@ async def handle_sequential_click_for_dropdown(
         }
         action_history_str = json.dumps(action_result)
 
-    # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
-    # Skyvern IDs (default html_need_skyvern_attrs=True) because
-    # `new_elements_ids` is threaded and the LLM compares those IDs to what's
-    # rendered. Gate lean on the PostHog flag.
-    _ctx = skyvern_context.current()
-    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
-    slim_output = await get_slim_output_template_value("check-user-goal")
-    prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page_after_open,
-        prompt_engine=prompt_engine,
-        template_name="check-user-goal",
-        navigation_goal=task.navigation_goal,
-        navigation_payload=task.navigation_payload,
-        new_elements_ids=new_element_ids,
-        without_screenshots=True,
-        action_history=action_history_str,
-        slim_output=slim_output,
-        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        lean_compress_long_href=lean_enabled,
-        lean_compress_image_src=lean_enabled,
-        lean_strip_url_query_strings=lean_enabled,
-        lean_compress_nonnavigable_href=lean_enabled,
-    )
+    prompt = await _build_after_click_verify_prompt(task, scraped_page_after_open, new_element_ids, action_history_str)
     distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
     check_user_goal_handler = await resolve_check_user_goal_handler(
         distinct_id_for_override, task.organization_id, app.CHECK_USER_GOAL_LLM_API_HANDLER
