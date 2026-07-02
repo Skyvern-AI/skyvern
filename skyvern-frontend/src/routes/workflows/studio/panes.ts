@@ -14,8 +14,74 @@ export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
   "browser",
 ];
 
+// Width floors from the approved mock; the stage clamps shared links and nudges
+// on over-tight opens against these same numbers (fitPanesToWidth below).
+export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
+  copilot: 260,
+  editor: 220,
+  browser: 260,
+  run: 220,
+};
+
+// Stage chrome for the fit math; must match the p-3 + gap-3 on the stage div
+// in StudioShell.tsx.
+export const STUDIO_STAGE_PADDING_PX = 24;
+export const STUDIO_STAGE_GAP_PX = 12;
+
 function isStudioPaneId(value: string): value is StudioPaneId {
   return (STUDIO_PANE_IDS as readonly string[]).includes(value);
+}
+
+// First-visit defaults: someone who never ran the agent (or has nothing built)
+// starts on the familiar build surface; an agent with history starts on watch.
+export function defaultPanesForWorkflowState(state: {
+  hasRuns: boolean | undefined;
+  hasBlocks: boolean;
+}): StudioPaneId[] {
+  if (state.hasRuns !== undefined) {
+    return state.hasRuns ? ["copilot", "browser"] : ["copilot", "editor"];
+  }
+  return state.hasBlocks ? [...DEFAULT_STUDIO_PANES] : ["copilot", "editor"];
+}
+
+export function panesListEqual(
+  a: readonly StudioPaneId[],
+  b: readonly StudioPaneId[],
+): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+export function panesFitWidth(
+  panes: readonly StudioPaneId[],
+  stageWidth: number,
+): boolean {
+  if (panes.length === 0) {
+    return true;
+  }
+  const total =
+    panes.reduce((sum, id) => sum + STUDIO_PANE_MIN_WIDTH[id], 0) +
+    STUDIO_STAGE_PADDING_PX +
+    STUDIO_STAGE_GAP_PX * (panes.length - 1);
+  return total <= stageWidth;
+}
+
+// Degrade an over-wide open list to its longest leading prefix that fits at
+// min-widths; the first pane always survives so a link never lands on nothing.
+export function fitPanesToWidth(
+  panes: readonly StudioPaneId[],
+  stageWidth: number,
+): StudioPaneId[] {
+  const kept: StudioPaneId[] = [];
+  for (const id of panes) {
+    if (!panesFitWidth([...kept, id], stageWidth)) {
+      break;
+    }
+    kept.push(id);
+  }
+  if (kept.length === 0 && panes.length > 0) {
+    kept.push(panes[0]!);
+  }
+  return kept;
 }
 
 // Ordered open-pane list from an explicit ?panes= value; unknown entries and
@@ -37,33 +103,42 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
 
 // Deep-link → panes mapping when ?panes= is absent: a block run shows its
 // timeline beside the live debug stream; any other run reference lands on Run.
-export function panesFromDeepLink(params: {
-  runId: string | null;
-  active: string | null;
-  blockLabel: string | null;
-}): StudioPaneId[] {
+export function panesFromDeepLink(
+  params: {
+    runId: string | null;
+    active: string | null;
+    blockLabel: string | null;
+  },
+  defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
     return ["run", "browser"];
   }
   if (params.runId || params.active) {
     return ["run"];
   }
-  return [...DEFAULT_STUDIO_PANES];
+  return [...defaultPanes];
 }
 
 // Open panes for a studio search string. An explicit ?panes= wins over the
-// legacy deep-link params (?wr= / ?active= / ?bl=).
-export function resolveOpenPanes(search: string): StudioPaneId[] {
+// legacy deep-link params (?wr= / ?active= / ?bl=); both win over defaultPanes.
+export function resolveOpenPanes(
+  search: string,
+  defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+): StudioPaneId[] {
   const params = new URLSearchParams(search);
   const explicit = parsePanesParam(params.get(STUDIO_PANES_PARAM));
   if (explicit !== null) {
     return explicit;
   }
-  return panesFromDeepLink({
-    runId: params.get("wr"),
-    active: params.get("active"),
-    blockLabel: params.get("bl"),
-  });
+  return panesFromDeepLink(
+    {
+      runId: params.get("wr"),
+      active: params.get("active"),
+      blockLabel: params.get("bl"),
+    },
+    defaultPanes,
+  );
 }
 
 // Open panes append, close panes splice: list order is the layout order.

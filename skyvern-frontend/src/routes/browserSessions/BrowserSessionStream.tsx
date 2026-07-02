@@ -152,6 +152,14 @@ function BrowserSessionStream({
     onActivityRef.current = onActivity;
   }, [onActivity]);
 
+  // Once control can't be offered (input socket torn down), forget any prior
+  // grab so re-enabling doesn't silently restore control without a new click.
+  useEffect(() => {
+    if (!controllable) {
+      setUserIsControlling(false);
+    }
+  }, [controllable, setUserIsControlling]);
+
   useEffect(() => {
     let cancelled = false;
     setStreamImgSrc("");
