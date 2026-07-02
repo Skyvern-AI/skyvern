@@ -392,6 +392,33 @@ def test_authoring_repair_context_produces_structural_recorded_outcome() -> None
     )
 
 
+def test_authoring_repair_context_missing_output_fields_affect_structural_outcome() -> None:
+    context = CodeAuthoringRepairContext(
+        block_label="read_resource_table",
+        reason_code="runtime_missing_output_dependency",
+        missing_output_key="create_resource_output",
+        available_output_keys=["search_output"],
+        current_block_parameter_keys=["create_resource_output"],
+        output_dependency_failure_class="missing_prior_block_output",
+    )
+
+    outcome = recorded_outcome_from_authoring_repair_context(context)
+
+    assert outcome.reason_code == "runtime_missing_output_dependency"
+    assert (
+        outcome.structural_key
+        != recorded_outcome_from_authoring_repair_context(
+            context.model_copy(update={"missing_output_key": "verify_resource_output"})
+        ).structural_key
+    )
+    assert (
+        outcome.structural_key
+        != recorded_outcome_from_authoring_repair_context(
+            context.model_copy(update={"available_output_keys": ["search_output", "verify_resource_output"]})
+        ).structural_key
+    )
+
+
 def test_author_time_reject_structural_payloads_make_distinct_keys() -> None:
     first = recorded_outcome_from_author_time_reject(
         reason_code="schema_incompatibility",
