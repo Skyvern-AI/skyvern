@@ -116,8 +116,9 @@ class PersistencePlan:
 
 
 def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> list[dict[str, Any]]:
-    return [
-        {
+    items: list[dict[str, Any]] = []
+    for criterion in criteria:
+        item = {
             "id": criterion.id,
             "outcome": criterion.outcome,
             "contingent_on": criterion.contingent_on,
@@ -134,8 +135,10 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "classification_output_key": criterion.classification_output_key,
             "expected_classification": criterion.expected_classification,
         }
-        for criterion in criteria
-    ]
+        if criterion.requested_output_corroborator:
+            item["requested_output_corroborator"] = True
+        items.append(item)
+    return items
 
 
 def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
@@ -195,6 +198,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
+                requested_output_corroborator=bool(item.get("requested_output_corroborator")),
             )
         )
     return tuple(criteria)

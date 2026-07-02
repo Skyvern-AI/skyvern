@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     RepairRootCauseIdentity,
     compute_repair_root_cause_signature,
 )
@@ -511,6 +512,8 @@ def _failure_type(
         ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY in categories
         or data.get("active_run_terminal_evidence_detected") is True
     ):
+        if outcome_verified and _active_run_terminal_evidence_reason_code(data):
+            return DiagnosisFailureType.NO_FAILURE
         return DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
     if (
         category_set & _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES
@@ -536,6 +539,10 @@ def _failure_type(
     if "credential" in error_text:
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
+
+
+def _active_run_terminal_evidence_reason_code(data: dict[str, Any]) -> bool:
+    return _safe_str(data.get("active_run_terminal_evidence_reason_code")) == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 
 
 def _next_action(

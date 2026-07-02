@@ -256,6 +256,7 @@ class CompletionCriterion:
     terminal_action_family: TerminalActionFamily | None = None
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
+    requested_output_corroborator: bool = False
 
 
 @dataclass
@@ -1102,6 +1103,8 @@ def _generic_completion_criterion(criterion: CompletionCriterion) -> bool:
 def _criterion_drop_priority(criterion: CompletionCriterion, requested_output_paths: set[str]) -> int:
     if criterion.output_path in requested_output_paths:
         return 0
+    if criterion.requested_output_corroborator:
+        return 0
     if criterion.level == "definition":
         return 0
     if is_fallback_floor_criterion(criterion):
@@ -1153,6 +1156,110 @@ def _preserve_after_requested_output_canonicalization(
     ):
         return False
     return True
+
+
+def _non_requested_output_run_corroborator(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.level == "run"
+        and criterion.kind == "outcome"
+        and not criterion.method_mandated
+        and criterion.output_path is None
+    )
+
+
+def _validation_classification_output_path(output_path: str | None) -> bool:
+    return (
+        output_path in _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS
+        or output_path in _VALIDATION_CLASSIFICATION_LABEL_OUTPUT_TARGETS
+    )
+
+
+def completion_criterion_requires_active_run_terminal_monitor(criterion: CompletionCriterion) -> bool:
+    if criterion.requested_output_corroborator:
+        return False
+    if (
+        criterion.output_path
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.kind != "validation_classification"
+    ):
+        return False
+    return True
+
+
+def _source_requested_output_corroborator(
+    criteria: list[CompletionCriterion],
+    requested_fields: list[str],
+    requested_output_paths: set[str],
+) -> CompletionCriterion | None:
+    for criterion in criteria:
+        if criterion.level != "run" or criterion.kind != "outcome" or criterion.method_mandated:
+            continue
+        if _validation_classification_output_path(criterion.output_path):
+            continue
+        if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
+            criterion, requested_fields
+        ):
+            return replace(
+                criterion,
+                output_path=None,
+                expected_output_value=None,
+                expected_output_shape=None,
+                requested_output_corroborator=True,
+            )
+    for criterion in criteria:
+        if is_fallback_floor_base_criterion(criterion):
+            return replace(criterion, requested_output_corroborator=True)
+    return None
+
+
+def _requested_output_corroborator_id(source_id: str, used_ids: set[str]) -> str:
+    base_id = f"{source_id}__requested_output_corroborator"
+    if base_id not in used_ids:
+        return base_id
+    suffix = 2
+    while f"{base_id}_{suffix}" in used_ids:
+        suffix += 1
+    return f"{base_id}_{suffix}"
+
+
+def _apply_classifier_typed_requested_output_corroborators(policy: RequestPolicy) -> None:
+    if any(_non_requested_output_run_corroborator(criterion) for criterion in policy.completion_criteria):
+        return
+    source_criteria = [
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.level == "run"
+        and criterion.kind == "outcome"
+        and not criterion.method_mandated
+        and criterion.output_path is not None
+        and not _validation_classification_output_path(criterion.output_path)
+        and not criterion.id.startswith(_REQUESTED_OUTPUT_CRITERION_ID_PREFIX)
+    ]
+    if not source_criteria:
+        return
+
+    used_ids = {criterion.id for criterion in policy.completion_criteria}
+    corroborators: list[CompletionCriterion] = []
+    for criterion in source_criteria:
+        corroborator_id = _requested_output_corroborator_id(criterion.id, used_ids)
+        used_ids.add(corroborator_id)
+        corroborators.append(
+            replace(
+                criterion,
+                id=corroborator_id,
+                output_path=None,
+                expected_output_value=None,
+                expected_output_shape=None,
+                requested_output_corroborator=True,
+            )
+        )
+
+    requested_output_paths = {criterion.output_path for criterion in source_criteria if criterion.output_path}
+    policy.completion_criteria = _cap_completion_criteria(
+        policy.completion_criteria + corroborators,
+        requested_output_paths,
+    )
 
 
 def _apply_requested_output_completion_criteria(
@@ -1237,8 +1344,17 @@ def _apply_requested_output_completion_criteria(
         )
         for _field_name, output_path, field_label in requested_specs
     ]
+    criteria = preserved_criteria + canonical_requested_criteria
+    if not any(_non_requested_output_run_corroborator(criterion) for criterion in criteria):
+        corroborator = _source_requested_output_corroborator(
+            policy.completion_criteria,
+            requested_fields,
+            requested_output_paths,
+        )
+        if corroborator is not None:
+            criteria = preserved_criteria + [corroborator] + canonical_requested_criteria
     policy.completion_criteria = _cap_completion_criteria(
-        preserved_criteria + canonical_requested_criteria,
+        criteria,
         requested_output_paths,
     )
 
@@ -1320,6 +1436,8 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["classification_output_key"] = criterion.classification_output_key
         if criterion.expected_classification is not None:
             item["expected_classification"] = criterion.expected_classification
+        if criterion.requested_output_corroborator:
+            item["requested_output_corroborator"] = True
         rendered.append(item)
     return json.dumps(rendered)
 
@@ -1395,6 +1513,7 @@ def _classifier_fallback_policy(
         completion_contract_status="present" if fallback_criteria else "unknown",
     )
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
+    _apply_classifier_typed_requested_output_corroborators(policy)
     if policy.graded_completion_criteria():
         policy.completion_contract_status = "present"
     return policy
@@ -1637,6 +1756,7 @@ async def _classify_request(
         policy.raw_secret_evidence = None
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
     _apply_validation_classification_completion_criteria(policy)
+    _apply_classifier_typed_requested_output_corroborators(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )
