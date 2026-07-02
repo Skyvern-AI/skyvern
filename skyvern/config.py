@@ -200,6 +200,8 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    # Default code_only for MCP block/workflow tools. Off = permissive.
+    MCP_CODE_ONLY_MODE: bool = False
     # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
     # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
     # already-authenticated session (the first run and every login-replaying repair re-run alike).
