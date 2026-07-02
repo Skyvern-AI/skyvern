@@ -927,7 +927,11 @@ def _workflow_output_parameter_indexes(
     if workflow is None:
         return {}, {}
     workflow_definition = getattr(workflow, "workflow_definition", None)
-    blocks = getattr(workflow_definition, "blocks", None)
+    blocks = (
+        workflow_definition.get("blocks")
+        if isinstance(workflow_definition, Mapping)
+        else getattr(workflow_definition, "blocks", None)
+    )
     if not isinstance(blocks, list):
         return {}, {}
 
