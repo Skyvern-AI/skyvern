@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
+    record_pending_runtime_authoring_repair_context,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
@@ -49,6 +50,72 @@ def _ctx() -> CopilotContext:
             authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
         ),
     )
+
+
+def _runtime_output_dependency_yaml(*, available: bool = False) -> str:
+    producer_label = "create_or_verify_resource" if available else "create_resource"
+    return f"""
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: {producer_label}
+    code: |
+      return {{"ok": True}}
+  - block_type: code
+    label: read_resource_table
+    parameter_keys: [create_or_verify_resource_output]
+    code: |
+      resource = create_or_verify_resource_output["id"]
+      return {{"resource": resource}}
+"""
+
+
+def _runtime_declared_output_named_input_yaml() -> str:
+    return """
+workflow_definition:
+  parameters:
+  - key: create_or_verify_resource_output
+    parameter_type: workflow
+    workflow_parameter_type: string
+  blocks:
+  - block_type: code
+    label: read_resource_table
+    parameter_keys: [create_or_verify_resource_output]
+    code: |
+      resource = create_or_verify_resource_output["id"]
+      return {"resource": resource}
+"""
+
+
+def _runtime_declared_non_string_output_named_input_yaml() -> str:
+    return """
+workflow_definition:
+  parameters:
+  - key: create_or_verify_resource_output
+    parameter_type: workflow
+    workflow_parameter_type: number
+  blocks:
+  - block_type: code
+    label: read_resource_table
+    parameter_keys: [create_or_verify_resource_output]
+    code: |
+      resource = create_or_verify_resource_output["id"]
+      return {"resource": resource}
+"""
+
+
+def _runtime_output_substring_only_yaml() -> str:
+    return """
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: read_resource_table
+    code: |
+      # foo_output appears in prose only.
+      data = {"foo_output": {"id": "fixture"}}
+      literal = "foo_output"
+      return data["foo_output"]
+"""
 
 
 def _satisfied_completion_verification() -> CompletionVerificationResult:
@@ -245,6 +312,45 @@ def test_missing_required_output_key_repair_identity_uses_structural_context_onl
     assert contract.diagnosis_result.root_cause_identity.error_class == "code_authoring_missing_required_output_key"
 
 
+def test_runtime_missing_output_dependency_identity_uses_key_and_available_contracts() -> None:
+    base = CodeAuthoringRepairContext(
+        block_label="read_resource_table",
+        reason_code="runtime_missing_output_dependency",
+        missing_output_key="create_resource_output",
+        available_output_keys=["search_output", "verify_output"],
+        current_block_parameter_keys=["create_resource_output"],
+        output_dependency_failure_class="missing_prior_block_output",
+    )
+    reordered = base.model_copy(update={"available_output_keys": ["verify_output", "search_output"]})
+    different_key = base.model_copy(update={"missing_output_key": "verify_resource_output"})
+    different_available = base.model_copy(update={"available_output_keys": ["search_output"]})
+
+    base_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(base),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+    reordered_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(reordered),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+    different_key_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(different_key),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+    different_available_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(different_available),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+
+    assert base_signature == reordered_signature
+    assert different_key_signature != base_signature
+    assert different_available_signature != base_signature
+
+
 def test_runtime_authoring_repair_context_identity_includes_bounded_page_state() -> None:
     base = CodeAuthoringRepairContext(
         block_label="search_registry",
@@ -429,6 +535,153 @@ def test_failed_run_injects_pending_runtime_authoring_context_before_page_observ
     assert contract.diagnosis_result.root_cause_identity.error_class.startswith("code_authoring_runtime_block_failure")
     assert contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert contract.repair_decision.target_blocks == ["search_registry"]
+
+
+def test_runtime_key_error_for_missing_prior_output_records_typed_authoring_context() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _runtime_output_dependency_yaml(available=False)
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_missing_output",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    repair_context = ctx.last_code_authoring_repair_context
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.reason_code == "runtime_missing_output_dependency"
+    assert repair_context.block_label == "read_resource_table"
+    assert repair_context.workflow_run_id == "wr_missing_output"
+    assert repair_context.output_dependency_failure_class == "missing_prior_block_output"
+    assert repair_context.missing_output_key == "create_or_verify_resource_output"
+    assert repair_context.available_output_keys == ["create_resource_output"]
+    assert repair_context.current_block_parameter_keys == ["create_or_verify_resource_output"]
+    assert result["data"]["authoring_repair_context"] == repair_context.model_dump(mode="json")
+
+
+def test_runtime_key_error_for_available_prior_output_keeps_generic_runtime_repair() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _runtime_output_dependency_yaml(available=True)
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_available_output",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.reason_code == "runtime_block_failure"
+    assert pending_context.missing_output_key is None
+
+
+def test_runtime_key_error_for_declared_workflow_input_keeps_generic_runtime_repair() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _runtime_declared_output_named_input_yaml()
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_declared_input",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.reason_code == "runtime_block_failure"
+    assert pending_context.missing_output_key is None
+
+
+def test_runtime_key_error_for_declared_non_string_workflow_input_keeps_generic_runtime_repair() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _runtime_declared_non_string_output_named_input_yaml()
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_declared_number_input",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.reason_code == "runtime_block_failure"
+    assert pending_context.missing_output_key is None
+
+
+def test_runtime_key_error_for_code_substring_only_keeps_generic_runtime_repair() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _runtime_output_substring_only_yaml()
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_substring_only",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": "KeyError: 'foo_output'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.reason_code == "runtime_block_failure"
+    assert pending_context.missing_output_key is None
 
 
 def _injected_repair_log(events: list[dict[str, object]]) -> dict[str, object]:

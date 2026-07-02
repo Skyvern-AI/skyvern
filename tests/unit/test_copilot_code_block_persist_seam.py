@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
     _check_enforcement,
 )
+from skyvern.forge.sdk.copilot.output_contracts import code_block_available_binding_keys_by_label
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -2087,6 +2088,42 @@ class TestCodeBlockParameterPersistSeam:
             workflow_update_module._code_block_parameter_contract_error("workflow_definition: {}")
             == "Workflow YAML nesting is too deep to validate."
         )
+
+    def test_output_contract_graph_preserves_branch_isolation(self) -> None:
+        workflow_yaml = _yaml(
+            """
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: start_search
+                code: |
+                  return {"ok": True}
+              - block_type: task
+                label: choose_path
+                branch_conditions:
+                - blocks:
+                  - block_type: code
+                    label: branch_a
+                    code: |
+                      return start_search_output
+                - blocks:
+                  - block_type: code
+                    label: branch_b
+                    code: |
+                      return start_search_output
+              - block_type: code
+                label: after_choice
+                code: |
+                  return choose_path_output
+            """
+        )
+
+        available_by_label = code_block_available_binding_keys_by_label(workflow_yaml)
+
+        assert available_by_label["branch_a"] == ["start_search_output"]
+        assert available_by_label["branch_b"] == ["start_search_output"]
+        assert "branch_a_output" not in available_by_label["branch_b"]
+        assert available_by_label["after_choice"] == ["choose_path_output", "start_search_output"]
 
     @pytest.mark.asyncio
     async def test_declared_workflow_string_parameter_key_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:

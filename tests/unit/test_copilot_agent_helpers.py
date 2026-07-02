@@ -743,6 +743,35 @@ workflow_definition:
         assert "do not hardcode the eval value" in prompt
         assert "rerun via update_and_run_blocks" in prompt
 
+    def test_missing_output_dependency_prompt_uses_available_outputs_not_workflow_parameters(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="read_resource_table",
+            reason_code="runtime_missing_output_dependency",
+            missing_output_key="create_resource_output",
+            available_output_keys=["search_output"],
+            current_block_parameter_keys=["create_resource_output"],
+            output_dependency_failure_class="missing_prior_block_output",
+            repair_instruction=(
+                "repair the missing prior block output dependency by binding to an actual available prior output key "
+                "or changing the producing/current code block so the dependency is real; do not invent a workflow "
+                "parameter for this missing output key."
+            ),
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "reason_code: runtime_missing_output_dependency" in prompt
+        assert "missing_output_key: create_resource_output" in prompt
+        assert "available_output_keys: search_output" in prompt
+        assert "current_block_parameter_keys: create_resource_output" in prompt
+        assert "bind to an actual available_output_key" in prompt
+        assert "do not create a workflow parameter for missing_output_key" in prompt
+        assert "create workflow string parameter key create_resource_output" not in prompt
+
     def test_synthesized_parameter_binding_prompt_uses_exact_key(self) -> None:
         repair_context = CodeAuthoringRepairContext(
             block_label="order_status",

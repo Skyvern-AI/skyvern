@@ -74,6 +74,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
+from skyvern.forge.sdk.copilot.output_contracts import (
+    code_block_available_binding_keys_by_label,
+    declared_string_workflow_parameter_keys,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
@@ -959,79 +963,11 @@ def _unresolved_symbol_repair_context_enabled(ctx: AgentContext) -> bool:
 
 
 def _declared_string_workflow_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, Mapping):
-        return set()
-    parameters = workflow_definition.get("parameters")
-    if not isinstance(parameters, list):
-        return set()
-    keys: set[str] = set()
-    for parameter in parameters:
-        if not isinstance(parameter, Mapping):
-            continue
-        key = str(parameter.get("key") or "").strip()
-        if not key or _is_credential_parameter(parameter) or is_sensitive_workflow_parameter(dict(parameter)):
-            continue
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type and parameter_type != "workflow":
-            continue
-        if workflow_parameter_type and workflow_parameter_type != "string":
-            continue
-        keys.add(key)
-    return keys
+    return declared_string_workflow_parameter_keys(parsed)
 
 
 def _code_block_available_binding_keys_by_label(workflow_yaml: str | None) -> dict[str, list[str]]:
-    if workflow_yaml is None:
-        return {}
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, Mapping):
-        return {}
-    available_by_label: dict[str, set[str]] = {}
-
-    def block_output_key(block: Mapping[str, Any]) -> str | None:
-        label = str(block.get("label") or "").strip()
-        return f"{label}_output" if label else None
-
-    def visit_branch(branch: Mapping[str, Any], available_keys: set[str]) -> None:
-        for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-            visit_blocks(branch.get(key), set(available_keys))
-        for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-            branches = branch.get(branch_key)
-            if not isinstance(branches, list):
-                continue
-            for nested_branch in branches:
-                if isinstance(nested_branch, Mapping):
-                    visit_branch(nested_branch, set(available_keys))
-
-    def visit_blocks(blocks: Any, available_keys: set[str]) -> set[str]:
-        if not isinstance(blocks, list):
-            return available_keys
-        for block in blocks:
-            if not isinstance(block, Mapping):
-                continue
-            label = str(block.get("label") or "").strip()
-            if label and _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
-                available_by_label.setdefault(label, set()).update(available_keys)
-            for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-                visit_blocks(block.get(key), set(available_keys))
-            for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-                branches = block.get(branch_key)
-                if not isinstance(branches, list):
-                    continue
-                for branch in branches:
-                    if isinstance(branch, Mapping):
-                        visit_branch(branch, set(available_keys))
-            output_key = block_output_key(block)
-            if output_key:
-                available_keys.add(output_key)
-        return available_keys
-
-    workflow_definition = parsed.get("workflow_definition")
-    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, Mapping) else None
-    visit_blocks(blocks, _declared_string_workflow_parameter_keys(parsed))
-    return {label: sorted(keys) for label, keys in available_by_label.items()}
+    return code_block_available_binding_keys_by_label(workflow_yaml)
 
 
 def _code_block_authoring_repair_context(

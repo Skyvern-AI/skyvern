@@ -626,6 +626,17 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
         f"binding_candidates: {_render_authoring_repair_prompt_list(binding_candidates)}",
         f"allowed_global_names: {_render_authoring_repair_prompt_list(repair_context.allowed_global_names)}",
     ]
+    if repair_context.reason_code == "runtime_missing_output_dependency":
+        lines.extend(
+            [
+                f"missing_output_key: {_clean_authoring_repair_prompt_atom(repair_context.missing_output_key or '')}",
+                f"available_output_keys: {_render_authoring_repair_prompt_list(repair_context.available_output_keys)}",
+                "output_dependency_failure_class: "
+                f"{_clean_authoring_repair_prompt_atom(repair_context.output_dependency_failure_class or '')}",
+                "current_block_parameter_keys: "
+                f"{_render_authoring_repair_prompt_list(repair_context.current_block_parameter_keys)}",
+            ]
+        )
     if repair_context.selector:
         lines.append(f"selector: {_clean_authoring_repair_prompt_atom(repair_context.selector)}")
     if repair_context.source_url:
@@ -713,6 +724,11 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
         lines.append(
             "For runtime failures, adapt the next code block to the observed page state and do not re-emit "
             "the same failing selector or name path."
+        )
+    if repair_context.reason_code == "runtime_missing_output_dependency":
+        lines.append(
+            "For missing prior block outputs, bind to an actual available_output_key or repair the producing/current "
+            "code block so the output exists; do not create a workflow parameter for missing_output_key."
         )
     lines.append(_clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=260))
     return "\n\n" + "\n".join(line for line in lines if line)

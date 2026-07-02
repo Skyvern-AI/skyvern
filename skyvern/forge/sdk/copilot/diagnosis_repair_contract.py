@@ -374,6 +374,11 @@ def _repair_context_root_cause_identity(
         payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
         payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
         payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
+    elif reason_code == "runtime_missing_output_dependency":
+        payload["missing_output_key"] = _safe_text(repair_context.missing_output_key, 120)
+        payload["available_output_keys"] = _safe_identity_list(repair_context.available_output_keys)
+        payload["current_block_parameter_keys"] = _safe_identity_list(repair_context.current_block_parameter_keys)
+        payload["output_dependency_failure_class"] = _safe_text(repair_context.output_dependency_failure_class, 80)
     elif repair_context.unresolved_names:
         payload["unresolved_names"] = _safe_identity_list(repair_context.unresolved_names)
 
