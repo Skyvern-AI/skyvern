@@ -41,6 +41,7 @@ import {
   PanOnScrollMode,
   ReactFlow,
   Viewport,
+  getNodesBounds,
   useNodesInitialized,
   useReactFlow,
   NodeChange,
@@ -93,6 +94,12 @@ import {
 import { GlobalCollapseControl } from "./collapse/GlobalCollapseControl";
 import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
 import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
+import {
+  isMeaningfulPaneResize,
+  isViewportStranded,
+  PANE_FIT_DEBOUNCE_MS,
+  paneRefitDuration,
+} from "./paneFit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { RedoControl } from "./controls/RedoControl";
@@ -101,6 +108,7 @@ import { UndoControl } from "./controls/UndoControl";
 import { ZoomInControl } from "./controls/ZoomInControl";
 import { ZoomOutControl } from "./controls/ZoomOutControl";
 import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
+import { OPEN_WORKFLOW_SETTINGS_EVENT } from "./nodes/StartNode/types";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -1701,41 +1709,109 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyApplyTrigger]);
 
-  // Fit once, when first visible (non-zero) and measured — a hidden mount fits at
-  // zero size; once-only so returning to the editor preserves the user's pan/zoom.
-  const hasInitialFitRef = useRef(false);
+  // Studio pane fit. The editor pane can mount hidden (display:none while
+  // closed) and resizes in discrete steps as sibling panes toggle. Fit once
+  // when the initial Dagre pass has settled AND the pane is visible; after
+  // that, a debounced ResizeObserver re-fits only when a real geometry change
+  // leaves the viewport stranded, so it never fights a deliberate pan/zoom.
+  const hasInitialPaneFitRef = useRef(false);
+  const lastPaneSizeRef = useRef<{ width: number; height: number } | null>(
+    null,
+  );
+  const layoutSettledRef = useRef(false);
+  layoutSettledRef.current = layoutPhase !== "pre-layout";
+
+  // "initial-load" lands one frame after Dagre positions commit (mid fade-in),
+  // so fitting here can't read pre-layout node positions. layoutPhase only
+  // advances once nodesInitialized flips, but guard explicitly so a future
+  // layout-phase refactor can't reintroduce a zero-size fit.
   useEffect(() => {
-    // Studio-only: the legacy canvas keeps React Flow's own mount fit and must
-    // not be auto-fit here. centerOffsetX is > 0 only in the studio shell.
-    if (centerOffsetX <= 0) {
+    if (
+      !embedded ||
+      hasInitialPaneFitRef.current ||
+      layoutPhase === "pre-layout" ||
+      !nodesInitialized
+    ) {
       return;
     }
-    if (hasInitialFitRef.current) {
+    const rect = editorElementRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) {
+      return;
+    }
+    hasInitialPaneFitRef.current = true;
+    lastPaneSizeRef.current = { width: rect.width, height: rect.height };
+    runFitView({ duration: 0 });
+  }, [embedded, layoutPhase, nodesInitialized, runFitView]);
+
+  useEffect(() => {
+    if (!embedded) {
       return;
     }
     const el = editorElementRef.current;
     if (!el) {
       return;
     }
-    let observer: ResizeObserver | null = null;
-    const tryFit = () => {
-      if (hasInitialFitRef.current) {
+    let timer: number | null = null;
+    // Covers a pane that was hidden while layout settled; before that, the
+    // layout-phase effect above owns the first fit.
+    const initialFit = (size: { width: number; height: number }) => {
+      if (!layoutSettledRef.current) {
         return;
       }
-      const visible =
-        (editorElementRef.current?.getBoundingClientRect().width ?? 0) > 0;
-      if (!visible || !nodesInitialized) {
-        return;
-      }
-      hasInitialFitRef.current = true;
+      hasInitialPaneFitRef.current = true;
+      lastPaneSizeRef.current = size;
       runFitView({ duration: 0 });
-      observer?.disconnect();
     };
-    observer = new ResizeObserver(tryFit);
+    const strandedRefit = (size: { width: number; height: number }) => {
+      const prev = lastPaneSizeRef.current;
+      if (prev && !isMeaningfulPaneResize(prev, size)) {
+        return;
+      }
+      lastPaneSizeRef.current = size;
+      const visibleNodes = reactFlowInstance
+        .getNodes()
+        .filter((node) => !node.hidden);
+      if (visibleNodes.length === 0) {
+        return;
+      }
+      const stranded = isViewportStranded({
+        pane: size,
+        viewport: reactFlowInstance.getViewport(),
+        bounds: getNodesBounds(visibleNodes),
+      });
+      if (stranded) {
+        runFitView({ duration: paneRefitDuration() });
+      }
+    };
+    const settle = () => {
+      timer = null;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        return;
+      }
+      const size = { width: rect.width, height: rect.height };
+      if (!hasInitialPaneFitRef.current) {
+        initialFit(size);
+      } else {
+        strandedRefit(size);
+      }
+    };
+    const observer = new ResizeObserver(() => {
+      // Settle after the burst; per-frame reactions exhaust the
+      // dimension→layout convergence budget (see dimensionConvergence.ts).
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+      timer = window.setTimeout(settle, PANE_FIT_DEBOUNCE_MS);
+    });
     observer.observe(el);
-    tryFit();
-    return () => observer?.disconnect();
-  }, [runFitView, nodesInitialized, centerOffsetX]);
+    return () => {
+      observer.disconnect();
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [embedded, reactFlowInstance, runFitView]);
 
   const zoomLock = 1 as const;
   const yLockMax = 140 as const;
@@ -2027,6 +2103,12 @@ function FlowRenderer({
                         workflow.workflow_permanent_id ?? "__global__",
                         appNode.data.label,
                       );
+                  }
+                  // The start node's inline editor is its settings accordion.
+                  if (embedded && isWorkflowSettingsStart) {
+                    window.dispatchEvent(
+                      new Event(OPEN_WORKFLOW_SETTINGS_EVENT),
+                    );
                   }
                 }}
                 onPaneClick={() => {

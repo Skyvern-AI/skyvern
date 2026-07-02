@@ -154,6 +154,34 @@ describe("useSelectedBlockUrlSync", () => {
     expect(result.current.location.search).toBe("");
   });
 
+  test("merges mirror writes against the live URL so a concurrent ?panes= write survives", async () => {
+    // Simulate a pane toggle whose navigate() already hit the real URL while
+    // this render's closure params still predate it (the stale-prev race).
+    window.history.replaceState(
+      null,
+      "",
+      "/workflows/wpid_abc/studio?wr=run_1&panes=copilot,editor",
+    );
+    try {
+      const { result } = renderHook(() => useTestHarness(), {
+        wrapper: makeWrapper("/workflows/wpid_abc/studio?wr=run_1"),
+      });
+
+      act(() => {
+        useWorkflowPanelStore.getState().setSelectedBlockId("checkout-node");
+      });
+
+      await waitFor(() => {
+        expect(result.current.search).toContain("selected-block=Checkout+step");
+      });
+      const params = new URLSearchParams(result.current.search);
+      expect(params.get("panes")).toBe("copilot,editor");
+      expect(params.get("wr")).toBe("run_1");
+    } finally {
+      window.history.replaceState(null, "", "/");
+    }
+  });
+
   test("does not touch the URL outside the embedded studio", async () => {
     const { result } = renderHook(() => useTestHarness(false), {
       wrapper: makeWrapper("/workflows/wpid_abc/edit"),

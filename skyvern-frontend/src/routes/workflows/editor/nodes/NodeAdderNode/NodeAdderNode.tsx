@@ -117,7 +117,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
-    debugStore.isDebugMode &&
+    (debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
     settingsStore.isUsingABrowser &&
     workflowStatePanel.workflowPanelState.data?.previous === previous &&
     workflowStatePanel.workflowPanelState.data?.next === id &&

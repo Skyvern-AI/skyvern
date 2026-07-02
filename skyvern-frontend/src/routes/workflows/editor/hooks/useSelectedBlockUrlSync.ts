@@ -87,6 +87,19 @@ export function useSelectedBlockUrlSync({
     return latestNodes && latestNodes.length > 0 ? latestNodes : nodes;
   }, [getNodes, nodes]);
 
+  // Merge writes against the live URL, not this render's closure: pushState is
+  // synchronous, so a concurrent navigate (pane toggles writing ?panes=) is
+  // already visible there while the closure params can be one commit stale and
+  // would clobber it. window.location is blank under a memory router (tests);
+  // fall back to the closure, where no such race exists.
+  const liveParams = useCallback(
+    (closure: URLSearchParams) =>
+      window.location.search !== ""
+        ? new URLSearchParams(window.location.search)
+        : new URLSearchParams(closure),
+    [],
+  );
+
   useEffect(() => {
     if (!enabled || !selectedBlockLabelParam) {
       return;
@@ -100,7 +113,7 @@ export function useSelectedBlockUrlSync({
     if (!matchedNodeId) {
       setSearchParams(
         (prev) => {
-          const next = new URLSearchParams(prev);
+          const next = liveParams(prev);
           next.delete(SELECTED_BLOCK_SEARCH_PARAM);
           return next;
         },
@@ -122,6 +135,7 @@ export function useSelectedBlockUrlSync({
   }, [
     enabled,
     getCurrentNodes,
+    liveParams,
     selectedBlockLabelParam,
     setSearchParams,
     setSelectedBlockId,
@@ -151,7 +165,7 @@ export function useSelectedBlockUrlSync({
 
     setSearchParams(
       (prev) => {
-        const next = new URLSearchParams(prev);
+        const next = liveParams(prev);
         if (selectedBlockLabel) {
           next.set(SELECTED_BLOCK_SEARCH_PARAM, selectedBlockLabel);
         } else {
@@ -164,6 +178,7 @@ export function useSelectedBlockUrlSync({
   }, [
     enabled,
     getCurrentNodes,
+    liveParams,
     searchParams,
     selectedBlockId,
     setSearchParams,
