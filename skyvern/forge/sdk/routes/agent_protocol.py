@@ -111,6 +111,7 @@ from skyvern.forge.sdk.schemas.tasks import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -4473,10 +4474,38 @@ async def reset_workflow_browser_profile(
         workflow_permanent_id=workflow_permanent_id,
     )
     try:
+        # Include soft-deleted rows: their segment digests still address legacy archives
+        # that would otherwise survive the reset and reseed state on the next run.
+        managed_profiles = await app.DATABASE.browser_sessions.list_managed_browser_profiles_for_workflow(
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            include_deleted=True,
+        )
         await app.STORAGE.delete_browser_session(
             organization_id=current_org.organization_id,
             workflow_permanent_id=workflow_permanent_id,
         )
+        segment_digests = {
+            profile.browser_profile_key_digest for profile in managed_profiles if profile.browser_profile_key_digest
+        }
+        for digest in segment_digests:
+            await app.STORAGE.delete_browser_session(
+                organization_id=current_org.organization_id,
+                workflow_permanent_id=build_workflow_browser_session_storage_key_from_digest(
+                    workflow_permanent_id, digest
+                ),
+            )
+        for profile in managed_profiles:
+            if profile.deleted_at is not None:
+                continue
+            await app.STORAGE.delete_browser_profile(
+                organization_id=current_org.organization_id,
+                profile_id=profile.browser_profile_id,
+            )
+            await app.DATABASE.browser_sessions.delete_browser_profile(
+                profile_id=profile.browser_profile_id,
+                organization_id=current_org.organization_id,
+            )
     except SkyvernHTTPException:
         raise
     except Exception as exc:

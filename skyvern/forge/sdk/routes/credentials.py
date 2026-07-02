@@ -118,6 +118,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
     parse_totp_config,
 )
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -1461,16 +1462,13 @@ async def _create_browser_profile_after_workflow(
                     workflow_permanent_id=workflow_permanent_id,
                 )
                 return
-            browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
-                workflow=workflow,
-                workflow_run=workflow_run,
-            )
             session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
-                session_dir = await app.STORAGE.retrieve_browser_session(
+                session_dir = await retrieve_persisted_workflow_browser_state_dir(
                     organization_id=organization_id,
-                    workflow_permanent_id=browser_session_storage_key,
+                    workflow=workflow,
+                    workflow_run=workflow_run,
                 )
                 if session_dir:
                     break
