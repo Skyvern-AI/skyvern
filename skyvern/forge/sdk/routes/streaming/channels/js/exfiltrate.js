@@ -221,13 +221,18 @@
           const binding =
             typeof bindingName === "string" ? window[bindingName] : null;
 
+          // Single transport: prefer the CDP binding; console.log is only the
+          // fallback when the binding is absent. Sending through both delivered
+          // every event 2-3x (the console paths also cost json_value CDP
+          // round-trips per event, queueing seconds of latency under load).
           if (typeof binding === "function") {
             Promise.resolve(binding(eventData)).catch((err) => {
               console.log("[SYS] exfiltration: binding transport failed.", err);
+              console.log("[EXFIL]", JSON.stringify(eventData));
             });
+          } else {
+            console.log("[EXFIL]", JSON.stringify(eventData));
           }
-
-          console.log("[EXFIL]", JSON.stringify(eventData));
         },
         true,
       );
