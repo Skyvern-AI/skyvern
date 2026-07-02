@@ -123,6 +123,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       version.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: version.workflow_definition?.error_code_mapping ?? null,
   };
 
   return getElements(

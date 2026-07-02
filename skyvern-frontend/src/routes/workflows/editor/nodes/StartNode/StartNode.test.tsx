@@ -62,6 +62,7 @@ const startNodeData: WorkflowStartNodeData = {
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
   label: "__start_block__",
   showCode: false,
 };

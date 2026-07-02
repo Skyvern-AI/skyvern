@@ -93,6 +93,7 @@ function Debugger() {
       workflow.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
   };
 
   const elements = getElements(blocksToRender, settings, true);

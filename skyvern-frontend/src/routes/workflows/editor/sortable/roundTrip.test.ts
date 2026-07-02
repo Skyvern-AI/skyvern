@@ -4,7 +4,11 @@ import { describe, expect, test } from "vitest";
 import { ProxyLocation } from "@/api/types";
 
 import type { AppNode } from "../nodes";
-import { getElements, getWorkflowBlocks } from "../workflowEditorUtils";
+import {
+  getElements,
+  getWorkflowBlocks,
+  getWorkflowSettings,
+} from "../workflowEditorUtils";
 import {
   type CodeBlock,
   type OutputParameter,
@@ -54,6 +58,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {
@@ -447,5 +452,39 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     ];
     const { validationError } = getElements(malformed, DEFAULT_SETTINGS, false);
     expect(validationError).toBeNull();
+  });
+
+  // error_code_mapping is not editable in YAML, but it must still ride on the
+  // start node so it's preserved (not cleared) across a load -> save round-trip.
+  test("workflow-level error_code_mapping rides on the start node so it survives a save", () => {
+    const settings: WorkflowSettings = {
+      ...DEFAULT_SETTINGS,
+      errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
+    };
+    const { nodes } = getElements(buildFiveBlockFixture(), settings, true);
+    const startNode = nodes.find((node) => node.type === "start");
+    expect(
+      (startNode?.data as { errorCodeMapping?: unknown } | undefined)
+        ?.errorCodeMapping,
+    ).toEqual({ OUT_OF_STOCK: "item unavailable" });
+  });
+
+  // The full recovery leg the save path relies on: workflow-level settings ride
+  // load -> start node -> getWorkflowSettings with zero field loss, so a YAML
+  // commit (which reattaches settings from this readback) cannot drop them.
+  test("workflow-level settings survive the getElements -> getWorkflowSettings round-trip", () => {
+    const settings: WorkflowSettings = {
+      ...DEFAULT_SETTINGS,
+      errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
+      finallyBlockLabel: "B5",
+      workflowSystemPrompt: "always double-check totals",
+    };
+    const { nodes } = getElements(buildFiveBlockFixture(), settings, true);
+    const recovered = getWorkflowSettings(nodes);
+    expect(recovered.errorCodeMapping).toEqual({
+      OUT_OF_STOCK: "item unavailable",
+    });
+    expect(recovered.finallyBlockLabel).toBe("B5");
+    expect(recovered.workflowSystemPrompt).toBe("always double-check totals");
   });
 });
