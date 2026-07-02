@@ -720,6 +720,7 @@ export type WorkflowRunStatusApiResponse = {
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
+  errors: Array<Record<string, unknown>> | null;
   total_steps: number | null;
   total_cost: number | null;
   credits_used: number;
@@ -757,6 +758,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
+  errors: Array<Record<string, unknown>> | null;
   total_steps: number | null;
   total_cost: number | null;
   credits_used: number;

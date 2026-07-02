@@ -16,6 +16,7 @@ const baseProps = {
   workflowRunId: "wr_1",
   extractedInformation: null,
   files: [],
+  errors: [],
   summary: null,
   onSummary: () => {},
 };
