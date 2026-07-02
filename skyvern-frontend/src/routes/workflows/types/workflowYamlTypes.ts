@@ -38,6 +38,7 @@ export type WorkflowDefinitionYAML = {
   blocks: Array<BlockYAML>;
   finally_block_label?: string | null;
   workflow_system_prompt?: string | null;
+  error_code_mapping?: Record<string, string> | null;
 };
 
 export type ParameterYAML =

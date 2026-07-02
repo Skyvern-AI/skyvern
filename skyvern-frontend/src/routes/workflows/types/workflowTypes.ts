@@ -643,6 +643,7 @@ export type WorkflowDefinition = {
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
   workflow_system_prompt?: string | null;
+  error_code_mapping?: Record<string, string> | null;
 };
 
 export type WorkflowApiResponse = {
@@ -701,6 +702,7 @@ export type WorkflowSettings = {
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
   workflowSystemPrompt: string | null;
+  errorCodeMapping: Record<string, string> | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

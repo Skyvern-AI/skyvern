@@ -2004,6 +2004,7 @@ function getElements(
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
       workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
+      errorCodeMapping: settings.errorCodeMapping ?? null,
     }),
   );
 
@@ -3418,6 +3419,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     sequentialKey: null,
     finallyBlockLabel: null,
     workflowSystemPrompt: null,
+    errorCodeMapping: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -3453,6 +3455,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
       workflowSystemPrompt: data.workflowSystemPrompt ?? null,
+      errorCodeMapping: data.errorCodeMapping ?? null,
     };
   }
   return defaultSettings;

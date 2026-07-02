@@ -64,6 +64,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {
