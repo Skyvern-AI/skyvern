@@ -334,6 +334,39 @@ class TestExfiltrationChannelEvents:
 
         on_event.assert_called_once()
 
+    def test_fingerprint_treats_none_and_absent_keys_as_equal(self) -> None:
+        # The binding transport serializes JS undefined to None while the console
+        # transports drop those keys entirely (JSON.stringify). Both shapes must
+        # dedup as one event or every interaction is delivered 2-3x.
+        channel, _ = _make_channel()
+        via_binding = {
+            **_make_event_data(),
+            "inputValue": None,
+            "mousePosition": {"xa": 10, "ya": 20, "xp": None, "yp": None},
+        }
+        via_console = {
+            **_make_event_data(),
+            "mousePosition": {"xa": 10, "ya": 20},
+        }
+
+        assert channel._console_fingerprint(via_binding) == channel._console_fingerprint(via_console)
+
+    def test_should_emit_console_event_dedupes_none_vs_absent_duplicates(self) -> None:
+        channel, _ = _make_channel()
+        via_binding = {**_make_event_data(), "inputValue": None}
+        via_console = _make_event_data()
+
+        assert channel._should_emit_console_event(via_binding) is True
+        assert channel._should_emit_console_event(via_console) is False
+
+    def test_should_emit_console_event_keeps_distinct_values_over_none(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "inputValue": None}
+        distinct = {**_make_event_data(), "inputValue": "hello"}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(distinct) is True
+
 
 class TestNavigationReExfiltration:
     @pytest.mark.asyncio
