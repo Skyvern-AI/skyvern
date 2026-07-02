@@ -31,6 +31,7 @@ BuildTestOutcomeVerdict = Literal[
 BuildTestOutcomeReasonCode = Literal[
     "loaded_result_targets_observed",
     "runtime_block_failure",
+    "runtime_missing_output_dependency",
     "sandbox_unresolved_name",
     "synthesized_parameter_binding_ambiguous",
     "code_safety_reject",
@@ -186,6 +187,10 @@ def recorded_outcome_from_authoring_repair_context(
         "parameter_keys": sorted(repair_context.parameter_keys),
         "available_parameter_keys": sorted(repair_context.available_parameter_keys),
         "binding_candidates": sorted(repair_context.binding_candidates),
+        "missing_output_key": _bounded_ref(repair_context.missing_output_key),
+        "available_output_keys": sorted(repair_context.available_output_keys),
+        "current_block_parameter_keys": sorted(repair_context.current_block_parameter_keys),
+        "output_dependency_failure_class": _bounded_ref(repair_context.output_dependency_failure_class),
         "selector": _bounded_ref(repair_context.selector),
         "refiner_selector": _bounded_ref(repair_context.refiner_selector),
         "runtime_failure_class": _bounded_ref(repair_context.runtime_failure_class),
@@ -499,6 +504,8 @@ def _authoring_reason_code(value: str) -> BuildTestOutcomeReasonCode:
         return "synthesized_parameter_binding_ambiguous"
     if value == "runtime_block_failure":
         return "runtime_block_failure"
+    if value == "runtime_missing_output_dependency":
+        return "runtime_missing_output_dependency"
     if value == "select_option_interaction_mismatch":
         # Select-option mismatches are author-time policy rejects, not a separate outcome class.
         return "code_safety_reject"
