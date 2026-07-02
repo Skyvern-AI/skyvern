@@ -722,6 +722,15 @@ function BrowserStream({
     }
   }, [interactive]);
 
+  // When control can no longer be offered (buttons hidden and not inherently
+  // interactive), a prior grab must be released or its input keeps flowing.
+  // Recording is exempt: it holds take-control for exfiltration.
+  useEffect(() => {
+    if (!interactive && !showControlButtons && !recordingStore.isRecording) {
+      setUserIsControlling(false);
+    }
+  }, [interactive, showControlButtons, recordingStore.isRecording]);
+
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
 
