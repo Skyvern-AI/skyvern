@@ -48,6 +48,7 @@ BuildTestOutcomeReasonCode = Literal[
     "unchanged_after_recorded_outcome",
     "metadata_reject",
     "output_policy_reject",
+    "scout_act_observe_hollow_after_interaction",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
@@ -172,6 +173,8 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
     for previous in reversed(history[:-1]):
         if not isinstance(previous, dict):
             continue
+        if previous.get("phase") == "scout_evaluate":
+            continue
         previous_key = previous.get("structural_key")
         if isinstance(previous_key, str):
             return previous_key == latest["structural_key"]
@@ -283,6 +286,56 @@ def recorded_outcome_from_loaded_result_evidence(
         key_provenance={
             "structural_failure_identity": "LoadedResultCompositionEvidence.structure_signature",
             "page_evidence_refs": "loaded-result target structural signatures",
+        },
+    )
+
+
+def recorded_outcome_from_scout_act_observe_hollow(
+    *,
+    interaction_tool: str,
+    selector: str,
+    current_url: str,
+    source_url: str | None,
+    page_evidence: Mapping[str, object] | None,
+    recapture_attempted: bool,
+    recapture_result: str,
+) -> RecordedBuildTestOutcome:
+    shape = _hollow_page_shape(page_evidence)
+    source_origin = _origin_ref(source_url)
+    current_origin = _origin_ref(current_url)
+    bounded_recapture_result = _bounded_ref(recapture_result)
+    structural_payload = {
+        "interaction_tool": _bounded_ref(interaction_tool),
+        "selector": _bounded_ref(selector),
+        "source_origin": source_origin,
+        "current_origin": current_origin,
+        "shape": shape,
+        "recapture_attempted": recapture_attempted,
+        "recapture_result": bounded_recapture_result,
+    }
+    page_refs = list(dict.fromkeys(ref for ref in (source_origin, current_origin) if ref))
+    page_refs.extend(
+        [
+            f"forms:{shape['form_count']}",
+            f"navigation_targets:{shape['navigation_target_count']}",
+            f"result_containers:{shape['result_container_count']}",
+            f"clickable_controls:{shape['clickable_control_count']}",
+            f"recapture_attempted:{str(recapture_attempted).lower()}",
+            f"recapture_result:{bounded_recapture_result}",
+        ]
+    )
+    return RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        attempted_tool="scout_interaction",
+        attempted_target=_bounded_ref(selector),
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout_act_observe:" + _stable_hash(structural_payload),
+        page_evidence_refs=page_refs,
+        observed_evidence_summary="Scout interaction reached the page, but bounded page evidence stayed hollow.",
+        key_provenance={
+            "structural_failure_identity": "scout interaction identity and bounded hollow page shape",
+            "page_evidence_refs": "scout interaction source/current URL origins and structural counts",
         },
     )
 
@@ -661,6 +714,27 @@ def _origin_ref(value: object) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
     return f"origin:{parsed.scheme}://{parsed.netloc}"
+
+
+def _hollow_page_shape(page_evidence: Mapping[str, object] | None) -> dict[str, object]:
+    evidence = page_evidence or {}
+    challenge_state = evidence.get("challenge_state")
+    return {
+        "page_title_present": bool(_safe_str(evidence.get("page_title"))),
+        "schema_empty_page": evidence.get("schema_empty_page") is True,
+        "body_has_markup": bool(_safe_str(evidence.get("body")) or _safe_str(evidence.get("html"))),
+        "visible_text_present": bool(_safe_str(evidence.get("visible_text")) or _safe_str(evidence.get("bodyText"))),
+        "form_count": _bounded_len(evidence.get("forms")),
+        "navigation_target_count": _bounded_len(evidence.get("navigation_targets")),
+        "result_container_count": _bounded_len(evidence.get("result_containers")),
+        "clickable_control_count": _bounded_len(evidence.get("clickable_controls")),
+        "modal_overlay_count": _bounded_len(evidence.get("modal_overlays")),
+        "challenge_detected": isinstance(challenge_state, Mapping) and challenge_state.get("detected") is True,
+    }
+
+
+def _bounded_len(value: object) -> int:
+    return len(value) if isinstance(value, list) else 0
 
 
 def _page_refs_from_authoring_context(repair_context: CodeAuthoringRepairContext) -> list[str]:
