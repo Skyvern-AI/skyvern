@@ -155,9 +155,7 @@ class CompletionVerificationResult:
         unmet = [
             verdict
             for verdict in self.verdicts
-            if not verdict.satisfied
-            and not self.is_structural_contingent_abstention(verdict)
-            and not _is_structural_requested_output_abstention(verdict)
+            if not verdict.satisfied and not self.is_structural_contingent_abstention(verdict)
         ]
         missing_evidence: list[str] = []
         for verdict in unmet:
@@ -209,12 +207,7 @@ class CompletionVerificationResult:
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
-            detail = (
-                None
-                if self.is_structural_contingent_abstention(verdict)
-                or _is_structural_requested_output_abstention(verdict)
-                else verdict_missing_evidence(verdict)
-            )
+            detail = None if self.is_structural_contingent_abstention(verdict) else verdict_missing_evidence(verdict)
             if detail:
                 data[f"{prefix}_missing_evidence"] = detail
         return data
