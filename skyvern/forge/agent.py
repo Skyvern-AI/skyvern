@@ -170,9 +170,42 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
+BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
+RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
+
+
+async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
+    working_page = await browser_state.get_working_page()
+    if not working_page:
+        LOG.error(
+            "BrowserState has no page",
+            workflow_run_id=workflow_run_id,
+        )
+        raise MissingBrowserStatePage(workflow_run_id=workflow_run_id)
+
+    if working_page.url not in BLANK_WORKFLOW_TASK_URLS:
+        return working_page
+
+    if working_page.url not in RECOVERABLE_BLANK_WORKFLOW_TASK_URLS:
+        raise InvalidWorkflowTaskURLState(workflow_run_id)
+
+    pages = await browser_state.list_valid_pages()
+    for page_index, page in reversed(list(enumerate(pages))):
+        if page.url not in BLANK_WORKFLOW_TASK_URLS:
+            LOG.warning(
+                "Inherited workflow task URL resolved from latest non-blank page",
+                workflow_run_id=workflow_run_id,
+                blank_url=working_page.url,
+                fallback_url=page.url,
+                page_index=page_index,
+            )
+            await browser_state.set_active_page(page)
+            return page
+
+    raise InvalidWorkflowTaskURLState(workflow_run_id)
 
 
 def should_auto_download_pdf(pdf_src: str) -> bool:
@@ -526,17 +559,10 @@ class ForgeAgent:
                 workflow_run_id=workflow_run.workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
             )
             if browser_state is not None:
-                working_page = await browser_state.get_working_page()
-                if not working_page:
-                    LOG.error(
-                        "BrowserState has no page",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                    )
-                    raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
-
-                if working_page.url == "about:blank":
-                    raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
-
+                working_page = await resolve_inherited_workflow_task_page(
+                    browser_state=browser_state,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
                 task_url = working_page.url
             else:
                 LOG.info("No browser state found for workflow run, setting task url to empty string")
