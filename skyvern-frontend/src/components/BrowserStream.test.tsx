@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   cleanup,
@@ -162,6 +163,26 @@ function renderBrowserStream(props: { onActivity?: () => void } = {}) {
   );
 }
 
+function renderWithRecordingReset(
+  resetRecordingOnUnmount: boolean | undefined,
+  { strict = false }: { strict?: boolean } = {},
+) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const tree = (
+    <QueryClientProvider client={queryClient}>
+      <BrowserStream
+        browserSessionId="pbs_test"
+        interactive={false}
+        showControlButtons={true}
+        resetRecordingOnUnmount={resetRecordingOnUnmount}
+      />
+    </QueryClientProvider>
+  );
+  return render(strict ? <StrictMode>{tree}</StrictMode> : tree);
+}
+
 describe("BrowserStream", () => {
   beforeEach(() => {
     Object.defineProperty(globalThis, "WebSocket", {
@@ -224,5 +245,45 @@ describe("BrowserStream", () => {
     mocks.rfbInstances[0]!._framebufferUpdate();
 
     expect(onActivity).toHaveBeenCalledTimes(1);
+  });
+
+  describe("recording reset lifecycle", () => {
+    it("resets the recording store on unmount by default", async () => {
+      const { unmount } = renderWithRecordingReset(undefined);
+      await waitFor(() => expect(mocks.rfbInstances).toHaveLength(1));
+
+      expect(mocks.recordingStore.reset).not.toHaveBeenCalled();
+      unmount();
+      expect(mocks.recordingStore.reset).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reset the recording store on unmount when opted out", async () => {
+      const { unmount } = renderWithRecordingReset(false);
+      await waitFor(() => expect(mocks.rfbInstances).toHaveLength(1));
+
+      unmount();
+      expect(mocks.recordingStore.reset).not.toHaveBeenCalled();
+    });
+
+    // Pins that StrictMode's transient unmount really fires the cleanup in this
+    // environment, so the opt-out test below cannot pass vacuously.
+    it("runs the unmount cleanup on a StrictMode double-mount by default", async () => {
+      renderWithRecordingReset(undefined, { strict: true });
+      await waitFor(() =>
+        expect(mocks.recordingStore.reset).toHaveBeenCalledTimes(1),
+      );
+    });
+
+    // The local repro: StrictMode remounts the fresh VNC stream (mount -> unmount
+    // -> mount) the instant recording starts. The transient unmount must not
+    // clear the recording that just began.
+    it("survives a StrictMode double-mount when opted out", async () => {
+      renderWithRecordingReset(false, { strict: true });
+      await waitFor(() =>
+        expect(mocks.rfbInstances.length).toBeGreaterThanOrEqual(1),
+      );
+
+      expect(mocks.recordingStore.reset).not.toHaveBeenCalled();
+    });
   });
 });

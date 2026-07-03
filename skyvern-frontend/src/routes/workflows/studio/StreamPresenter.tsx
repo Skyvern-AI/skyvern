@@ -51,6 +51,10 @@ export function StreamPresenter({
       showControlButtons={showControlButtons}
       exfiltrate={isRecording}
       hideRecordingIndicator={hideRecordingIndicator}
+      // The studio swaps CDP<->VNC when recording toggles and StrictMode remounts
+      // this component; the recording must survive those. StudioBrowserStream owns
+      // the session-level reset instead.
+      resetRecordingOnUnmount={false}
       onActivity={onActivity}
     />
   );
