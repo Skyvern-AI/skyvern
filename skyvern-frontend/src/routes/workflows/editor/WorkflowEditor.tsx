@@ -1,7 +1,6 @@
 import { ReactFlowProvider } from "@xyflow/react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { useEffect } from "react";
-import { usePostHog } from "posthog-js/react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
@@ -16,11 +15,10 @@ import { ProductTour } from "@/components/onboarding/ProductTour";
 import { useProductTourShortcut } from "@/hooks/useProductTourShortcut";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
-  const [searchParams] = useSearchParams();
-  const posthog = usePostHog();
   const studioEnabled = useWorkflowStudioEnabled();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -39,12 +37,7 @@ function WorkflowEditor() {
 
   useMountEffect(() => blockOutputStore.reset());
 
-  useMountEffect(() => {
-    const via = searchParams.get("via");
-    if (via) {
-      posthog?.capture("copilot.discover.started", { entry_point: via });
-    }
-  });
+  useViaEntryPointCapture();
 
   useEffect(() => {
     if (workflow) {
@@ -94,12 +87,14 @@ function WorkflowEditor() {
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
+    enableSelfHealing: workflow.enable_self_healing ?? false,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
     finallyBlockLabel:
       workflow.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
   };
 
   const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);

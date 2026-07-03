@@ -42,6 +42,7 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "loop_detected_generic",
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
+        "loop_detected_no_forward_progress_interaction",
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
@@ -89,6 +90,8 @@ _INVOLUNTARY_BLOCKER_REASON_CODES = (
     | _SCHEMA_INCOMPATIBILITY_REASON_CODES
     | frozenset({REPAIR_CEILING_REASON_CODE})
 )
+_VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
+_VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_SOURCES = frozenset({"run_execution"})
 
 
 @dataclass(frozen=True)
@@ -182,9 +185,21 @@ def raise_if_turn_halt(ctx: Any, *, verified: bool = False) -> None:
     halt = getattr(ctx, "turn_halt", None)
     if not isinstance(halt, TurnHalt):
         return
-    if verified and halt.kind in _INVOLUNTARY_TURN_HALT_KINDS:
+    suppressible_reason_codes = _INVOLUNTARY_BLOCKER_REASON_CODES
+    if (
+        halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+        and halt.blocker_signal is not None
+        and halt.blocker_signal.internal_reason_code in _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES
+        and halt.extra.get("source") in _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_SOURCES
+    ):
+        suppressible_reason_codes = (
+            _INVOLUNTARY_BLOCKER_REASON_CODES | _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES
+        )
+    elif halt.kind not in _INVOLUNTARY_TURN_HALT_KINDS:
+        suppressible_reason_codes = frozenset()
+    if verified and suppressible_reason_codes:
         ctx.turn_halt = None
-        clear_tool_blocker_signals_for_reason_codes(ctx, _INVOLUNTARY_BLOCKER_REASON_CODES)
+        clear_tool_blocker_signals_for_reason_codes(ctx, suppressible_reason_codes)
         LOG.info(
             "copilot turn halt suppressed by verified outcome",
             **turn_halt_to_trace_data(halt),

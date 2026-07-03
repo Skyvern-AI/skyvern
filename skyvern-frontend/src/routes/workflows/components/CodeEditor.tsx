@@ -3,15 +3,21 @@ import type { ViewUpdate } from "@codemirror/view";
 import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { html } from "@codemirror/lang-html";
+import { yaml } from "@codemirror/lang-yaml";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { useDebouncedCallback } from "use-debounce";
 
-import { isOversizedDocument } from "./oversizedDocument";
+import {
+  isDeeplyNestedDocument,
+  LARGE_DOCUMENT_CHAR_THRESHOLD,
+} from "./oversizedDocument";
 import "./code-mirror-overrides.css";
 
-function getLanguageExtension(language: "python" | "json" | "html") {
+function getLanguageExtension(
+  language: "python" | "json" | "html" | "yaml",
+): Extension {
   switch (language) {
     case "python":
       return python();
@@ -19,13 +25,15 @@ function getLanguageExtension(language: "python" | "json" | "html") {
       return json();
     case "html":
       return html();
+    case "yaml":
+      return yaml();
   }
 }
 
 type Props = {
   value: string;
   onChange?: (value: string) => void;
-  language?: "python" | "json" | "html";
+  language?: "python" | "json" | "html" | "yaml";
   lineWrap?: boolean;
   readOnly?: boolean;
   minHeight?: string;
@@ -33,6 +41,10 @@ type Props = {
   className?: string;
   fontSize?: number;
   fullHeight?: boolean;
+  // Accessible name applied to the CodeMirror editing surface (the
+  // contenteditable), not the wrapper div.
+  ariaLabel?: string;
+  autoFocus?: boolean;
   /**
    * Additional CodeMirror extensions. Useful for per-use-case concerns
    * like linting — e.g. the error_code_mapping editor passes a linter
@@ -64,11 +76,18 @@ function CodeEditorImpl({
   fontSize = 12,
   fullHeight = false,
   extraExtensions,
+  ariaLabel,
+  autoFocus = false,
   ...restProps
 }: Props) {
+  // `value` is typed `string`, but workflow document panels can pass an
+  // absent/incomplete payload at runtime (SKY-11567). Normalize to a string so
+  // the editor and the oversized-document guard never read `.length` of
+  // undefined.
+  const safeValue = value ?? "";
   const viewRef = useRef<EditorView | null>(null);
-  const [internalValue, setInternalValue] = useState(value);
-  const latestValueRef = useRef(value);
+  const [internalValue, setInternalValue] = useState(safeValue);
+  const latestValueRef = useRef(safeValue);
 
   // Defer EditorView creation until the container is in (or near) the
   // viewport. Block editors mount many CodeEditors at once (script-mode
@@ -103,9 +122,9 @@ function CodeEditorImpl({
   }, [shouldMount]);
 
   useEffect(() => {
-    setInternalValue(value);
-    latestValueRef.current = value;
-  }, [value]);
+    setInternalValue(safeValue);
+    latestValueRef.current = safeValue;
+  }, [safeValue]);
 
   // Capture the latest onChange in a ref so the debounced callback below
   // (and the React.memo wrapper export) stay referentially stable across
@@ -145,9 +164,19 @@ function CodeEditorImpl({
     if (!viewRef.current) viewRef.current = viewUpdate.view;
   }, []);
 
-  const oversized = useMemo(
-    () => isOversizedDocument(internalValue),
+  // Highlighting is only unsafe for deeply nested documents (the stack-overflow
+  // trigger); line-wrapping is additionally guarded by raw size. Keeping these
+  // separate lets large-but-shallow payloads (e.g. webhook bodies) stay
+  // syntax-highlighted while still rendering unwrapped. See SKY-11432 / SKY-11608.
+  const deeplyNested = useMemo(
+    () => isDeeplyNestedDocument(internalValue),
     [internalValue],
+  );
+  // Reuses deeplyNested's scan instead of calling isOversizedDocument, which
+  // would re-run getMaxStructureDepth for values under the size threshold.
+  const oversized = useMemo(
+    () => internalValue.length > LARGE_DOCUMENT_CHAR_THRESHOLD || deeplyNested,
+    [internalValue, deeplyNested],
   );
   const effectiveLineWrap = lineWrap && !oversized;
 
@@ -157,7 +186,7 @@ function CodeEditorImpl({
   // unnecessary editor state reconfiguration.
   const extensions = useMemo<Extension[]>(() => {
     const exts: Extension[] = [];
-    if (language && !oversized) {
+    if (language && !deeplyNested) {
       exts.push(getLanguageExtension(language));
     }
     if (effectiveLineWrap) {
@@ -169,8 +198,18 @@ function CodeEditorImpl({
     if (fullHeight) {
       exts.push(fullHeightExtension);
     }
+    if (ariaLabel) {
+      exts.push(EditorView.contentAttributes.of({ "aria-label": ariaLabel }));
+    }
     return exts;
-  }, [language, oversized, effectiveLineWrap, extraExtensions, fullHeight]);
+  }, [
+    language,
+    deeplyNested,
+    effectiveLineWrap,
+    extraExtensions,
+    fullHeight,
+    ariaLabel,
+  ]);
 
   const style: React.CSSProperties = { fontSize };
   if (fullHeight) {
@@ -242,6 +281,7 @@ function CodeEditorImpl({
       minHeight={minHeight}
       maxHeight={maxHeight}
       readOnly={readOnly}
+      autoFocus={autoFocus}
       className={cn("cursor-auto", className)}
       style={style}
       {...restProps}

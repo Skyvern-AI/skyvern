@@ -187,6 +187,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
     workflow = _workflow([_navigation_block("openai", engine=RunEngine.openai_cua)])
     workflow_run = SimpleNamespace(
         workflow_run_id="wr_1",
+        workflow_id=workflow.workflow_id,
         workflow_permanent_id=workflow.workflow_permanent_id,
         browser_profile_id=None,
         browser_address=None,
@@ -208,7 +209,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
 
     svc = WorkflowService()
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=workflow_run))
-    monkeypatch.setattr(svc, "get_workflow_by_permanent_id", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
     mark_workflow_run_as_failed = AsyncMock(return_value=failed_workflow_run)
     clean_up_workflow = AsyncMock()
     monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_workflow_run_as_failed)

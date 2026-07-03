@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -42,7 +42,15 @@ async def test_agent_step_reraises_cancelled_error(monkeypatch: pytest.MonkeyPat
     )
     scraped_page.screenshots = [b"image"]
 
-    agent.build_and_record_step_prompt = AsyncMock(return_value=(scraped_page, "prompt", False, "extract-actions"))
+    agent.build_and_record_step_prompt = AsyncMock(
+        return_value=StepPromptResult(
+            scraped_page=scraped_page,
+            extract_action_prompt="prompt",
+            use_caching=False,
+            prompt_name="extract-actions",
+            without_page_information=False,
+        )
+    )
     json_response: dict[str, object] = {"actions": [{"action_type": "CLICK", "element_id": "node-1"}]}
     agent.handle_potential_OTP_actions = AsyncMock(return_value=(json_response, []))
 

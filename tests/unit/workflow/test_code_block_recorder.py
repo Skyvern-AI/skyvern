@@ -5,17 +5,23 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    _HIGH_LEVEL_ACTION_MAP,
+    _LOCATOR_ACTION_MAP,
+    _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
     RecordingPage,
@@ -96,6 +102,15 @@ class FakePage:
     async def evaluate(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
         return None
 
+    async def extract(self, prompt, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return {"data": "extracted"}
+
+    async def complete(self, prompt=None, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return None
+
+    async def scroll(self, **kwargs):  # noqa: ANN003, ANN201
+        return None
+
 
 @pytest.mark.asyncio
 async def test_records_goto_click_fill_with_types_and_order() -> None:
@@ -122,6 +137,69 @@ async def test_page_evaluate_records_execute_js_action() -> None:
     assert [a.action_type for a in recorded] == [ActionType.EXECUTE_JS]
     assert recorded[0].description == "page.evaluate () => document.title"
     assert recorded[0].status == ActionStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_extract_high_level_call_records_extract_action_with_prompt() -> None:
+    """page.extract() must surface on the run timeline as an EXTRACT action carrying its
+    prompt, so a navigate+extract code block doesn't render as only repeated 'Goto URL'."""
+    page = RecordingPage(FakePage())
+    await page.goto("https://news.ycombinator.com/")
+    await page.extract(prompt="Extract the URLs of the top 20 posts")
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.GOTO_URL, ActionType.EXTRACT]
+    # The reader-facing prompt is the description verbatim (no "page.extract" prefix), so a
+    # timeline row reads as plain language with or without a matching editor step.
+    assert recorded[1].description == "Extract the URLs of the top 20 posts"
+
+
+@pytest.mark.asyncio
+async def test_extract_positional_prompt_is_recorded_in_description() -> None:
+    """The prompt is positional-or-keyword on extract; a positional prompt is still surfaced."""
+    page = RecordingPage(FakePage())
+    await page.extract("Extract the top visible comment")
+    recorded = page.recorded_actions()
+    assert recorded[0].action_type == ActionType.EXTRACT
+    assert recorded[0].description == "Extract the top visible comment"
+
+
+@pytest.mark.asyncio
+async def test_other_high_level_skyvern_page_calls_are_recorded() -> None:
+    """High-level SkyvernPage methods without a prompt still record their action type."""
+    page = RecordingPage(FakePage())
+    await page.scroll()
+    await page.complete()
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.SCROLL, ActionType.COMPLETE]
+
+
+def test_recorder_maps_cover_every_action_wrapped_skyvern_page_method() -> None:
+    """The recorder and editor-deriver maps are hand-maintained mirrors of SkyvernPage's
+    @action_wrap set. A high-level method added there but absent here would execute
+    unrecorded -- the exact SKY-11463 regression -- so assert every @action_wrap method
+    is mapped (to the same action_type) on both surfaces, or is an explicit no-op exclusion."""
+    live = {}
+    for name in dir(SkyvernPage):
+        action_type = getattr(getattr(SkyvernPage, name), "__skyvern_action_type__", None)
+        if action_type is not None:
+            live[name] = action_type
+    # Guard against a vacuous pass if introspection ever stops finding the decorated surface.
+    assert {"extract", "click", "complete", "scroll"} <= live.keys()
+
+    recorder = {**_PAGE_ACTION_MAP, **_LOCATOR_ACTION_MAP, **_HIGH_LEVEL_ACTION_MAP}
+    excluded = {"null_action"}  # NULL_ACTION is a no-op probe, never a timeline step
+
+    for name, action_type in live.items():
+        if name in excluded:
+            continue
+        assert recorder.get(name) == action_type, (
+            f"SkyvernPage.{name} is @action_wrap({action_type}) but RecordingPage maps it to "
+            f"{recorder.get(name)!r}; add it to code_block_recorder or it executes unrecorded"
+        )
+        assert _METHOD_ACTION_TYPES.get(name) == action_type.value, (
+            f"SkyvernPage.{name} ({action_type}) is missing/mismatched in "
+            f"code_block_steps._METHOD_ACTION_TYPES; the editor step preview will drift from the timeline"
+        )
 
 
 @pytest.mark.asyncio
@@ -281,6 +359,7 @@ class FakeWorkflowRunContext:
     workflow_permanent_id = "wpid_test"
     workflow_run_id = "wr_test"
     browser_session_id = None
+    workflow = None
 
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
@@ -402,6 +481,35 @@ async def test_create_task_and_step_from_code_block_maps_goal_to_task(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_create_task_and_step_from_code_block_fails_partial_task_on_step_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If step creation fails after the container task is running, fail the task before the recorder degrades."""
+    create_task = AsyncMock(return_value=_FakeTask())
+    update_task = AsyncMock(return_value=_FakeTask())
+    create_step = AsyncMock(side_effect=RuntimeError("step unavailable"))
+    monkeypatch.setattr(app.DATABASE.tasks, "get_last_task_for_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.tasks, "create_task", create_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task", update_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "create_step", create_step)
+
+    block = _make_code_block("x = 1", goal="log into the portal")
+
+    with pytest.raises(RuntimeError, match="step unavailable"):
+        await ForgeAgent().create_task_and_step_from_code_block(
+            code_block=block,
+            organization_id="o_test",
+            workflow_run_id="wr_test",
+            task_url="https://example.com/login",
+        )
+
+    assert [call.kwargs["status"] for call in update_task.await_args_list] == [
+        TaskStatus.running,
+        TaskStatus.failed,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_goal_code_block_marks_task_completed_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """The container task must not dangle in 'running'; success drives it to completed."""
     page = FakePage()
@@ -462,6 +570,52 @@ async def test_goal_code_block_finalizes_step_on_cancellation(monkeypatch: pytes
     step_statuses = [call.kwargs.get("status") for call in mocks["update_step"].await_args_list]
     assert TaskStatus.failed in task_statuses
     assert StepStatus.failed in step_statuses
+
+
+@pytest.mark.asyncio
+async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healed code block finalizes its SEAT task to completed — never a completed block over a failed seat."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("rotted selector")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=SimpleNamespace(success=True)))
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
+    assert TaskStatus.completed in statuses
+    assert TaskStatus.failed not in statuses
+
+
+@pytest.mark.asyncio
+async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the heal declines (None), the block fails closed and the seat task is finalized failed."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("rotted selector")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
+    assert TaskStatus.failed in statuses
 
 
 @pytest.mark.asyncio
@@ -574,6 +728,50 @@ async def test_persist_failure_does_not_fail_the_block(monkeypatch: pytest.Monke
     assert result.status == BlockStatus.completed
     assert result.output_parameter_value is not None
     assert result.output_parameter_value["value"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_create_task_failure_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recording is best-effort: a DB hiccup creating the container task must not fail the block, and
+    with no task the recorder degrades to in-memory only (no orphaned actions or screenshots)."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    mocks["create_task_and_step"].side_effect = RuntimeError("db unavailable")
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert result.output_parameter_value is not None
+    assert result.output_parameter_value["value"] == "ok"
+    assert mocks["create_action"].await_count == 0
+    assert mocks["create_artifact"].await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_link_block_failure_fails_task_and_disables_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A task created but not linked to the run block must not stay running or receive orphan actions."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    async def fail_link_only(**kwargs: object) -> None:
+        if kwargs.get("task_id") is not None:
+            raise RuntimeError("db unavailable")
+
+    mocks["update_workflow_run_block"].side_effect = fail_link_only
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert mocks["create_action"].await_count == 0
+    assert mocks["create_artifact"].await_count == 0
+    assert [call.kwargs.get("status") for call in mocks["update_task"].await_args_list] == [TaskStatus.failed]
+    assert [call.kwargs.get("status") for call in mocks["update_step"].await_args_list] == [StepStatus.failed]
 
 
 @pytest.mark.asyncio

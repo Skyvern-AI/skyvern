@@ -8,10 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    only_structural_requested_output_abstentions,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     RepairRootCauseIdentity,
     compute_repair_root_cause_signature,
 )
@@ -23,7 +28,6 @@ from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CopilotContext
 
 _TEXT_MAX = 240
@@ -191,6 +195,7 @@ def build_diagnosis_repair_contract(
     if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
         target_blocks = [repair_context.block_label]
     user_goal_satisfied, completion_contract_satisfied = _verification_satisfaction(
+        ctx,
         run_ok,
         suspicious,
         run_status,
@@ -242,16 +247,23 @@ def build_diagnosis_repair_contract(
             "Stop re-authoring: the edited extraction schema declares fields that map to no output the "
             "workflow produces, so the mismatch is not repairable without user input."
         )
-    completion_check = {
-        RepairNextAction.NO_CHANGE: "Current run already satisfies the goal.",
-        RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
-        RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
-    }.get(
-        next_action,
-        f"Run repaired block labels and confirm success: {', '.join(target_blocks)}"
-        if target_blocks
-        else "Run the repaired workflow path and confirm the requested goal is satisfied.",
-    )
+    if (
+        next_action == RepairNextAction.NO_CHANGE
+        and user_goal_satisfied is True
+        and completion_contract_satisfied is True
+    ):
+        completion_check = "Current run already satisfies the goal."
+    else:
+        completion_check = {
+            RepairNextAction.NO_CHANGE: "No repair selected; completion remains unverified.",
+            RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
+            RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
+        }.get(
+            next_action,
+            f"Run repaired block labels and confirm success: {', '.join(target_blocks)}"
+            if target_blocks
+            else "Run the repaired workflow path and confirm the requested goal is satisfied.",
+        )
     required_authority: list[str] = []
     if next_action == RepairNextAction.ASK:
         required_authority = ["may_answer_without_mutation"]
@@ -350,15 +362,36 @@ def _repair_context_root_cause_identity(
         payload["selector"] = selector
         payload["refiner_selector"] = refiner_selector
         selector_kind = "selector" if selector else ""
+    elif reason_code == "runtime_block_failure":
+        runtime_failure_class = _safe_text(repair_context.runtime_failure_class, 80)
+        payload["runtime_failure_class"] = runtime_failure_class
+        payload["failed_block_status"] = _safe_text(repair_context.failed_block_status, 80)
+        payload["current_origin"] = _safe_text(repair_context.current_origin, 120)
+        payload["current_url_present"] = repair_context.current_url_present
+        payload["current_title_present"] = repair_context.current_title_present
+        payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
+        payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
+        payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
+        payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
+        payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
+        payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
+    elif reason_code == "runtime_missing_output_dependency":
+        payload["missing_output_key"] = _safe_text(repair_context.missing_output_key, 120)
+        payload["available_output_keys"] = _safe_identity_list(repair_context.available_output_keys)
+        payload["current_block_parameter_keys"] = _safe_identity_list(repair_context.current_block_parameter_keys)
+        payload["output_dependency_failure_class"] = _safe_text(repair_context.output_dependency_failure_class, 80)
     elif repair_context.unresolved_names:
         payload["unresolved_names"] = _safe_identity_list(repair_context.unresolved_names)
 
+    error_class_suffix = _identity_token(reason_code)
+    if reason_code == "runtime_block_failure" and repair_context.runtime_failure_class:
+        error_class_suffix = f"{error_class_suffix}_{_identity_token(repair_context.runtime_failure_class)}"
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return RepairRootCauseIdentity(
         root_cause_signature=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         primary_category=_AUTHORING_REPAIR_CATEGORY,
         failure_categories=(_AUTHORING_REPAIR_CATEGORY,),
-        error_class=f"code_authoring_{_identity_token(reason_code)}",
+        error_class=f"code_authoring_{error_class_suffix}",
         selector_kind=selector_kind,
         selector=selector,
     )
@@ -479,6 +512,8 @@ def _failure_type(
         ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY in categories
         or data.get("active_run_terminal_evidence_detected") is True
     ):
+        if outcome_verified and _active_run_terminal_evidence_reason_code(data):
+            return DiagnosisFailureType.NO_FAILURE
         return DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
     if (
         category_set & _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES
@@ -504,6 +539,10 @@ def _failure_type(
     if "credential" in error_text:
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
+
+
+def _active_run_terminal_evidence_reason_code(data: dict[str, Any]) -> bool:
+    return _safe_str(data.get("active_run_terminal_evidence_reason_code")) == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 
 
 def _next_action(
@@ -596,6 +635,7 @@ def _last_test_anti_bot_is_terminal(ctx: CopilotContext, data: dict[str, Any]) -
 
 
 def _verification_satisfaction(
+    ctx: CopilotContext,
     run_ok: bool,
     suspicious: bool,
     run_status: str | None,
@@ -611,6 +651,8 @@ def _verification_satisfaction(
         return fully_satisfied, fully_satisfied
     if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
         return False, False
+    if outcome_fully_verified(ctx):
+        return True, True
     if (
         failure_type == DiagnosisFailureType.NO_FAILURE
         and completion_verification is not None
@@ -631,7 +673,11 @@ def _verification_satisfaction(
 
 
 def _completion_verification_failed(completion_verification: CompletionVerificationResult | None) -> bool:
-    return completion_verification is not None and not completion_verification.is_fully_satisfied()
+    if completion_verification is None or completion_verification.is_fully_satisfied():
+        return False
+    if completion_verification.status != "evaluated" or not completion_verification.criterion_ids:
+        return True
+    return not only_structural_requested_output_abstentions(completion_verification)
 
 
 def _missing_context(result: dict[str, Any], data: dict[str, Any], failure_type: DiagnosisFailureType) -> list[str]:

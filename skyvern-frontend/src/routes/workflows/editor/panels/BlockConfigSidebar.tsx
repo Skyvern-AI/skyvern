@@ -81,6 +81,44 @@ function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {
 
 const FOOTER_TICK_INTERVAL_MS = 10_000;
 
+type SidebarIdentity = {
+  label: string;
+  isStart: boolean;
+  blockType: WorkflowBlockType | null;
+};
+
+function getSidebarIdentity(node: AppNode | null): SidebarIdentity {
+  const isStart = node ? isStartNode(node) : false;
+  const blockType = node ? getBlockTypeFromNode(node) : null;
+  const label = isStart
+    ? "Agent Settings"
+    : typeof node?.data?.label === "string" && node.data.label.length > 0
+      ? node.data.label
+      : blockType
+        ? workflowBlockTitle[blockType]
+        : "";
+  return { label, isStart, blockType };
+}
+
+function SidebarIdentityIcon({
+  identity,
+}: Readonly<{ identity: SidebarIdentity }>) {
+  // The gear doubles as the generic "settings" glyph: it covers both the start
+  // node and the unknown-block fallback (a detached/untyped node has no icon).
+  return (
+    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
+      {!identity.isStart && identity.blockType ? (
+        <WorkflowBlockIcon
+          workflowBlockType={identity.blockType}
+          className="size-4"
+        />
+      ) : (
+        <GearIcon className="size-4" />
+      )}
+    </div>
+  );
+}
+
 function measureElementWidth(element: HTMLElement): number | null {
   const boundingWidth = element.getBoundingClientRect().width;
   if (boundingWidth > 0) {
@@ -193,49 +231,40 @@ function EditableBlockTitle({
 
 function BlockConfigSidebarBody({
   selectedBlockId,
+  identity,
   onClose,
-}: Readonly<{ selectedBlockId: string; onClose: () => void }>) {
-  const reactFlowInstance = useReactFlow<AppNode>();
-  const node = reactFlowInstance.getNode(selectedBlockId);
-
-  const isStart = node ? isStartNode(node) : false;
-  const blockType = node ? getBlockTypeFromNode(node) : null;
-  const label = isStart
-    ? "Agent Settings"
-    : typeof node?.data?.label === "string" && node.data.label.length > 0
-      ? node.data.label
-      : blockType
-        ? workflowBlockTitle[blockType]
-        : "";
-
+}: Readonly<{
+  selectedBlockId: string;
+  identity: SidebarIdentity;
+  onClose: () => void;
+}>) {
   return (
     <>
       <header className="flex h-20 items-center justify-between gap-3 border-b border-border px-6">
         <div className="flex min-w-0 items-center gap-3">
-          {isStart ? (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
-              <GearIcon className="size-4" />
-            </div>
-          ) : blockType ? (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={blockType}
-                className="size-4"
-              />
-            </div>
+          {identity.isStart || identity.blockType ? (
+            <SidebarIdentityIcon identity={identity} />
           ) : null}
           <div className="min-w-0">
-            {isStart ? (
+            {identity.isStart ? (
               <h2 className="truncate text-sm font-medium text-slate-100">
-                {label}
+                {identity.label}
               </h2>
             ) : (
               <EditableBlockTitle
                 key={selectedBlockId}
                 blockId={selectedBlockId}
-                fallbackLabel={label}
+                fallbackLabel={identity.label}
               />
             )}
+            {identity.blockType ? (
+              <p
+                className="truncate text-xs text-slate-400"
+                title={workflowBlockTitle[identity.blockType]}
+              >
+                {workflowBlockTitle[identity.blockType]}
+              </p>
+            ) : null}
             <SubLabel />
           </div>
         </div>
@@ -248,7 +277,10 @@ function BlockConfigSidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div
+        data-testid="block-config-sidebar-body"
+        className="flex-1 overflow-y-auto px-6 py-5"
+      >
         <BlockConfigForm blockId={selectedBlockId} />
       </div>
       <UpdatedAgoFooter blockId={selectedBlockId} />
@@ -288,7 +320,10 @@ function BlockLibrarySidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex min-h-0 flex-1 overflow-hidden px-5 py-4">
+      <div
+        data-testid="block-library-sidebar-body"
+        className="flex min-h-0 flex-1 overflow-hidden px-6 py-5"
+      >
         <WorkflowNodeLibraryPanel onNodeClick={onAddNode} />
       </div>
     </>
@@ -307,6 +342,7 @@ function BlockConfigSidebar({
   embedded = false,
 }: BlockConfigSidebarProps) {
   const resizableRef = useRef<Resizable | null>(null);
+  const reactFlowInstance = useReactFlow<AppNode>();
   const [editorShellMetrics, setEditorShellMetrics] = useState(() => ({
     gutterPx: getBlockSidebarGutterPx(null),
     width: null as number | null,
@@ -363,6 +399,12 @@ function BlockConfigSidebar({
   const sidebarVisible =
     showLibrary || (mode !== "build" && selectedBlockId !== null);
 
+  const selectedNode =
+    !showLibrary && selectedBlockId !== null
+      ? (reactFlowInstance.getNode(selectedBlockId) ?? null)
+      : null;
+  const selectedIdentity = getSidebarIdentity(selectedNode);
+
   useLayoutEffect(() => {
     if (!sidebarVisible) {
       setEditorShellMetrics({
@@ -417,9 +459,11 @@ function BlockConfigSidebar({
     setRenderedWidth(containedWidth);
   }, [containedWidth, setRenderedWidth, sidebarVisible]);
 
-  // In build mode the block-config form is unavailable, but the node library
-  // must still render so users can insert blocks from the canvas.
-  if (mode === "build" && !showLibrary) {
+  // The block-config form only renders when the sidebar shows it directly: build
+  // mode gives each block/start node its own inline editor, and the studio shell
+  // keeps settings inline in the blocks. In both, the sidebar only hosts the
+  // block library (so users can still insert blocks from the canvas).
+  if ((mode === "build" || embedded) && !showLibrary) {
     return null;
   }
 
@@ -447,34 +491,36 @@ function BlockConfigSidebar({
       }}
       style={{
         position: "absolute",
-        top: embedded ? "0.75rem" : mode === "build" ? "7rem" : "2rem",
+        top: mode === "build" ? "7rem" : "2rem",
         right: "1.5rem",
-        bottom: embedded ? "0.75rem" : "1.5rem",
+        bottom: "1.5rem",
       }}
-      className={cn(
-        "z-30 flex flex-col",
-        "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
-      )}
+      className="z-30"
     >
-      <aside
-        data-testid="block-config-sidebar"
+      <div
         className={cn(
-          "flex h-full w-full flex-col",
-          "duration-200 ease-out animate-in slide-in-from-right-5",
+          "relative h-full w-full overflow-hidden",
+          "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
         )}
       >
-        {showLibrary ? (
-          <BlockLibrarySidebarBody
-            onAddNode={(props) => onAddNode?.(props)}
-            onClose={closeWorkflowPanel}
-          />
-        ) : selectedBlockId !== null ? (
-          <BlockConfigSidebarBody
-            selectedBlockId={selectedBlockId}
-            onClose={() => setSelectedBlockId(null)}
-          />
-        ) : null}
-      </aside>
+        <aside
+          data-testid="block-config-sidebar"
+          className="flex h-full w-full flex-col duration-200 ease-out animate-in slide-in-from-right-5"
+        >
+          {showLibrary ? (
+            <BlockLibrarySidebarBody
+              onAddNode={(props) => onAddNode?.(props)}
+              onClose={closeWorkflowPanel}
+            />
+          ) : selectedBlockId !== null ? (
+            <BlockConfigSidebarBody
+              selectedBlockId={selectedBlockId}
+              identity={selectedIdentity}
+              onClose={() => setSelectedBlockId(null)}
+            />
+          ) : null}
+        </aside>
+      </div>
     </Resizable>
   );
 }

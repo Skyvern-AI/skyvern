@@ -195,7 +195,7 @@ function WorkflowPage() {
           {workflow && (
             <WorkflowActions
               workflow={workflow}
-              onSuccessfullyDeleted={() => navigate("/workflows")}
+              onSuccessfullyDeleted={() => navigate("/agents")}
             />
           )}
           {isCloud && analyticsEnabled ? (
@@ -207,7 +207,7 @@ function WorkflowPage() {
             </Button>
           ) : null}
           <Button asChild variant="secondary">
-            <Link to={`/workflows/${workflowPermanentId}/scripts`}>
+            <Link to={`/agents/${workflowPermanentId}/scripts`}>
               <CodeIcon className="mr-2 size-4" />
               Scripts
             </Link>
@@ -222,7 +222,7 @@ function WorkflowPage() {
             </Link>
           </Button>
           <Button asChild>
-            <Link to={`/workflows/${workflowPermanentId}/run`}>
+            <Link to={`/agents/${workflowPermanentId}/run`}>
               <PlayIcon className="mr-2 size-4" />
               Run
             </Link>
@@ -248,8 +248,7 @@ function WorkflowPage() {
               description="Run this workflow to see results here. Each run tracks status, parameters, and duration."
               primaryAction={{
                 label: "Run this workflow",
-                onClick: () =>
-                  navigate(`/workflows/${workflowPermanentId}/run`),
+                onClick: () => navigate(`/agents/${workflowPermanentId}/run`),
               }}
               secondaryAction={{
                 label: "View documentation",
@@ -325,7 +324,7 @@ function WorkflowPage() {
                           <TableRow
                             onClick={(event) => {
                               const url = studioEnabled
-                                ? `/workflows/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
+                                ? `/agents/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
                                 : legacyRunDetailPath(
                                     workflowPermanentId,
                                     workflowRun.workflow_run_id,

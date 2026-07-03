@@ -9,7 +9,7 @@ stays at the route/repository seam; everything here is side-effect free.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -17,6 +17,14 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    CriterionKind,
+    ExpectedOutputShape,
+    TerminalActionFamily,
+    _coerce_classification_output_key,
+    _coerce_expected_classification,
+    _coerce_expected_output_shape,
+    _normalize_contingent_antecedent_output_path,
+    _normalize_deliverable_kind,
     is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
@@ -30,6 +38,8 @@ CRITERIA_SET_STATUS_ACTIVE = "active"
 CRITERIA_SET_STATUS_SUPERSEDED = "superseded"
 TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
+_CRITERION_KINDS = ("outcome", "terminal_action", "validation_classification")
+_TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
 
 
 @dataclass(frozen=True)
@@ -106,17 +116,29 @@ class PersistencePlan:
 
 
 def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> list[dict[str, Any]]:
-    return [
-        {
+    items: list[dict[str, Any]] = []
+    for criterion in criteria:
+        item = {
             "id": criterion.id,
             "outcome": criterion.outcome,
+            "contingent_on": criterion.contingent_on,
+            "contingent_antecedent_output_path": criterion.contingent_antecedent_output_path,
+            "deliverable_kind": criterion.deliverable_kind,
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
             "output_path": criterion.output_path,
+            "expected_output_value": criterion.expected_output_value,
+            "expected_output_shape": criterion.expected_output_shape,
+            "kind": criterion.kind,
+            "terminal_action_family": criterion.terminal_action_family,
+            "classification_output_key": criterion.classification_output_key,
+            "expected_classification": criterion.expected_classification,
         }
-        for criterion in criteria
-    ]
+        if criterion.requested_output_corroborator:
+            item["requested_output_corroborator"] = True
+        items.append(item)
+    return items
 
 
 def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
@@ -132,23 +154,91 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             continue
         level = item.get("level")
         output_path = item.get("output_path")
+        expected_output_value = item.get("expected_output_value")
+        expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        classification_output_key = _coerce_classification_output_key(item.get("classification_output_key"))
+        expected_classification = _coerce_expected_classification(item.get("expected_classification"))
+        contingent_on = item.get("contingent_on")
+        contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
+            item.get("contingent_antecedent_output_path")
+        )
+        kind_raw = item.get("kind")
+        kind = kind_raw if isinstance(kind_raw, str) and kind_raw in _CRITERION_KINDS else "outcome"
+        family_raw = item.get("terminal_action_family")
+        terminal_action_family = (
+            family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
+        )
+        stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
+        stored_expected_output_value = (
+            expected_output_value.strip()
+            if isinstance(expected_output_value, str) and expected_output_value.strip()
+            else None
+        )
+        stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
+        if kind == "validation_classification":
+            stored_output_path = None
+            stored_expected_output_value = None
+            stored_expected_output_shape = None
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
                 outcome=outcome,
+                contingent_on=contingent_on.strip()
+                if isinstance(contingent_on, str) and contingent_on.strip()
+                else None,
+                contingent_antecedent_output_path=contingent_antecedent_output_path,
+                deliverable_kind=_normalize_deliverable_kind(item.get("deliverable_kind")),
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
-                output_path=output_path.strip() if isinstance(output_path, str) and output_path.strip() else None,
+                output_path=stored_output_path,
+                expected_output_value=stored_expected_output_value,
+                expected_output_shape=stored_expected_output_shape,
+                kind=cast(CriterionKind, kind),
+                terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
+                classification_output_key=classification_output_key,
+                expected_classification=expected_classification,
+                requested_output_corroborator=bool(item.get("requested_output_corroborator")),
             )
         )
     return tuple(criteria)
 
 
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
+    contingent_key = criterion.contingent_on or ""
+    contingent_path_key = criterion.contingent_antecedent_output_path or ""
+    deliverable_kind_key = criterion.deliverable_kind or ""
+    expected_output_value_key = criterion.expected_output_value or ""
+    expected_output_shape_key = criterion.expected_output_shape or ""
+    classification_output_key = criterion.classification_output_key or ""
+    expected_classification_key = (
+        str(criterion.expected_classification) if criterion.expected_classification is not None else ""
+    )
     if criterion.output_path:
-        return f"output_path:{criterion.output_path}"
-    return f"outcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+        return (
+            f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1fdeliverable_kind:{deliverable_kind_key}"
+            f"\x1foutput_path:{criterion.output_path}"
+            f"\x1fexpected_output_value:{expected_output_value_key}"
+            f"\x1fexpected_output_shape:{expected_output_shape_key}"
+            f"\x1fkind:{criterion.kind}"
+            f"\x1fclassification_output_key:{classification_output_key}"
+            f"\x1fexpected_classification:{expected_classification_key}"
+        )
+    if criterion.kind == "validation_classification":
+        return (
+            f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1fdeliverable_kind:{deliverable_kind_key}"
+            f"\x1fkind:{criterion.kind}"
+            f"\x1fclassification_output_key:{classification_output_key}"
+            f"\x1fexpected_classification:{expected_classification_key}"
+        )
+    return (
+        f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+        f"\x1fdeliverable_kind:{deliverable_kind_key}"
+        f"\x1fkind:{criterion.kind}"
+        f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+    )
 
 
 def _outcome_key_set(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
@@ -164,7 +254,7 @@ _REQUESTED_OUTPUT_WORDS = frozenset(
 )
 _REQUESTED_OUTPUT_FIELD_TOKENS = frozenset(
     "address addresses date dates email emails id identifier identifiers license licenses location locations name names "
-    "npi number numbers phone phones result specialties specialty status statuses taxonomy".split()
+    "npi number numbers owner owners phone phones result specialties specialty status statuses taxonomy".split()
 )
 _GENERIC_PROFILE_MARKERS = (
     "profile details",

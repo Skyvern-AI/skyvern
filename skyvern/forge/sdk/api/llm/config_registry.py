@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import structlog
 
 from skyvern.config import settings
@@ -13,8 +15,16 @@ LOG = structlog.get_logger()
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
 
 
+@dataclass(frozen=True)
+class LLMConfigRegistrationIssue:
+    llm_key: str
+    missing_env_vars: tuple[str, ...]
+    detail: str
+
+
 class LLMConfigRegistry:
     _configs: dict[str, LLMRouterConfig | LLMConfig] = {}
+    _config_issues: dict[str, LLMConfigRegistrationIssue] = {}
 
     @staticmethod
     def is_router_config(llm_key: str) -> bool:
@@ -32,21 +42,59 @@ class LLMConfigRegistry:
             raise MissingLLMProviderEnvVarsError(llm_key, missing_env_vars)
 
     @classmethod
+    def record_config_issue(cls, llm_key: str, missing_env_vars: list[str], detail: str) -> None:
+        cls._configs.pop(llm_key, None)
+        cls._config_issues[llm_key] = LLMConfigRegistrationIssue(
+            llm_key=llm_key,
+            missing_env_vars=tuple(missing_env_vars),
+            detail=detail,
+        )
+        LOG.warning(
+            "Skipping invalid LLM config",
+            llm_key=llm_key,
+            missing_env_vars=missing_env_vars,
+            detail=detail,
+        )
+
+    @classmethod
+    def get_config_issue(cls, llm_key: str) -> LLMConfigRegistrationIssue | None:
+        return cls._config_issues.get(llm_key)
+
+    @classmethod
+    def get_config_issues(cls) -> list[LLMConfigRegistrationIssue]:
+        return list(cls._config_issues.values())
+
+    @classmethod
     def register_config(cls, llm_key: str, config: LLMRouterConfig | LLMConfig) -> None:
         if llm_key in cls._configs:
             raise DuplicateLLMConfigError(llm_key)
 
-        cls.validate_config(llm_key, config)
+        try:
+            cls.validate_config(llm_key, config)
+        except MissingLLMProviderEnvVarsError as exc:
+            if settings.ENV != "local":
+                raise
+            cls.record_config_issue(
+                llm_key,
+                config.get_missing_env_vars(),
+                str(exc),
+            )
+            return
 
+        cls._config_issues.pop(llm_key, None)
         cls._configs[llm_key] = config
 
     @classmethod
     def deregister_config(cls, llm_key: str) -> None:
         """Remove a registered LLM config. Idempotent — no-op if key doesn't exist."""
         cls._configs.pop(llm_key, None)
+        cls._config_issues.pop(llm_key, None)
 
     @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
+        if issue := cls.get_config_issue(llm_key):
+            raise InvalidLLMConfigError(issue.detail)
+
         if llm_key not in cls._configs:
             # If the key is not found in registered configs, treat it as a general model
             if not llm_key:
@@ -1978,7 +2026,10 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=131072,
+            # MiMo v2.5 is a reasoning model; uncapped it emits 100k+ reasoning/output
+            # tokens (multi-minute calls) on short prompts. Cap output + reasoning effort.
+            max_completion_tokens=16384,
+            reasoning_effort="low",
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
@@ -2053,8 +2104,13 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
     openai_compatible_model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
 
     if not openai_compatible_model_name:
-        raise InvalidLLMConfigError(
-            "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
+        detail = "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
+        if settings.ENV != "local":
+            raise InvalidLLMConfigError(detail)
+        LLMConfigRegistry.record_config_issue(
+            openai_compatible_model_key,
+            ["OPENAI_COMPATIBLE_MODEL_NAME"],
+            detail,
         )
     else:
         # Required environment variables to check

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections.abc import Awaitable, Callable
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -34,6 +35,7 @@ LOG = structlog.get_logger()
 
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
+RECOVERABLE_BLANK_PAGE_URLS = {":"}
 
 
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
@@ -70,6 +72,21 @@ class RealBrowserState(BrowserState):
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
+        # One-shot callbacks fired first inside ``close()``. Cleared after
+        # firing so re-entry into ``close()`` is safe.
+        self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
+
+    def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._on_close_callbacks.append(callback)
+
+    async def _run_on_close_callbacks(self) -> None:
+        callbacks = self._on_close_callbacks
+        self._on_close_callbacks = []
+        for callback in callbacks:
+            try:
+                await callback()
+            except Exception:
+                LOG.debug("on-close callback raised; ignored", exc_info=True)
 
     async def __assert_page(self) -> Page:
         page = await self.get_working_page()
@@ -136,7 +153,15 @@ class RealBrowserState(BrowserState):
         if await self.get_working_page() is None:
             page: Page | None = None
             use_existing_page = False
-            if browser_address and len(self.browser_context.pages) > 0:
+            # Some remote browser sessions bind their capture/streaming to the
+            # CDP target that existed at session creation. Opening a new tab
+            # and then running _close_all_other_pages detaches that binding
+            # from the page the agent actually navigates. Reuse the existing
+            # page so the remote session stays aligned with the active target.
+            has_remote_browser_session = bool(
+                self.browser_artifacts and self.browser_artifacts.remote_browser_session_id
+            )
+            if (browser_address or has_remote_browser_session) and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
                 if pages:
                     page = pages[-1]
@@ -185,21 +210,22 @@ class RealBrowserState(BrowserState):
             LOG.info("No http, https or blank page found in the browser context, return None")
             return None
 
-        # Honor a tab explicitly selected via NEW_TAB/SWITCH_TAB while it is still open and no
-        # new tab has appeared since selection. A newly-opened tab (any page not in the snapshot)
-        # auto-takes focus, preserving the legacy last-page behavior; closing an unrelated tab
-        # does not drop the pin.
+        # Honor a tab explicitly selected via NEW_TAB/SWITCH_TAB while it is still open.
+        # A genuinely new tab auto-takes focus, preserving legacy last-page behavior; a
+        # recoverable blank marker from a download flow does not break the selected-tab pin.
         active_page = self.__active_page
-        if (
-            active_page is not None
-            and not active_page.is_closed()
-            and active_page in pages
-            and all(page in self.__active_page_known_pages for page in pages)
-        ):
-            self.__page = active_page
-            return active_page
+        if active_page is not None and not active_page.is_closed() and active_page in pages:
+            if all(page in self.__active_page_known_pages for page in pages):
+                self.__page = active_page
+                return active_page
 
-        # No (or stale) pin: fall back to the last http/https page as the working page.
+            new_pages = [page for page in pages if page not in self.__active_page_known_pages]
+            if new_pages and all(page.url in RECOVERABLE_BLANK_PAGE_URLS for page in new_pages):
+                # Do not add marker pages to known_pages; they should remain ignored until closed.
+                self.__page = active_page
+                return active_page
+
+        # No (or stale) pin: fall back to the newest valid page.
         self.__active_page = None
         self.__active_page_known_pages = set()
         last_page = pages[-1]
@@ -536,6 +562,12 @@ class RealBrowserState(BrowserState):
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
         LOG.info("Closing browser state", sampling=True)
+        # Only fire on-close observers on a real teardown. Shared / parent-child
+        # close calls pass ``close_browser_on_completion=False`` to leave the
+        # browser alive for another run; firing callbacks then would stop the
+        # surviving run's publisher and freeze its livestream.
+        if close_browser_on_completion:
+            await self._run_on_close_callbacks()
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:

@@ -464,6 +464,10 @@ async def skyvern_block_validate(
         str,
         Field(description="JSON string of a single block definition to validate"),
     ],
+    code_only: Annotated[
+        bool,
+        Field(description="When true, structurally reject non-code browser/page block types (code-only mode)"),
+    ] = False,
 ) -> dict[str, Any]:
     """Validate a workflow block definition before using it in skyvern_workflow_create. Returns field-level errors."""
     action = "skyvern_block_validate"
@@ -491,6 +495,27 @@ async def skyvern_block_validate(
                 "Provide a JSON object with at least block_type and label fields",
             ),
         )
+
+    if code_only:
+        # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
+        from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
+            collect_code_only_banned_items,
+        )
+
+        banned_items = collect_code_only_banned_items([raw])
+        if banned_items:
+            labels = ", ".join(sorted({label for label, _ in banned_items}))
+            types = ", ".join(sorted({block_type for _, block_type in banned_items}))
+            return make_result(
+                action,
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
+                    "In code-only mode, use a `code` block for durable browser/page work instead of "
+                    "task/navigation/extraction/etc.",
+                ),
+            )
 
     adapter = _get_block_adapter()
     try:

@@ -13,12 +13,19 @@ async def test_phone_readback_accepts_matching_ten_digits() -> None:
     locator = MagicMock()
     locator.input_value = AsyncMock(return_value="(224) 555-0199")
 
-    # Matching digit counts must not raise.
     await verify_phone_input_digits(tag_name="input", locator=locator, expected_value="224-555-0199")
 
 
 @pytest.mark.asyncio
-async def test_phone_readback_mismatch_raises() -> None:
+async def test_phone_readback_accepts_country_code_readback() -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(return_value="+1 (224) 555-0199")
+
+    await verify_phone_input_digits(tag_name="input", locator=locator, expected_value="2245550199")
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_digit_drop_raises() -> None:
     locator = MagicMock()
     locator.input_value = AsyncMock(return_value="(224) 555-019")
 

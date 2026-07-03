@@ -158,6 +158,13 @@ describe("TextPromptBlockForm (SKY-9378)", () => {
     expect(
       screen.getByTestId("model-selector").getAttribute("data-value"),
     ).toBe("gpt-4");
+    const advancedSettings = screen.getByText("Advanced Settings");
+    fireEvent.click(advancedSettings);
+    expect(
+      advancedSettings.compareDocumentPosition(
+        screen.getByText("Ignore System Prompt"),
+      ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   test("persists prompt edits immediately via updateNodeData", () => {

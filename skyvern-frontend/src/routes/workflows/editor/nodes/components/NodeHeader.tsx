@@ -27,6 +27,7 @@ import { useOnChange } from "@/hooks/useOnChange";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { useDuplicateNodeCallback } from "@/routes/workflows/hooks/useDuplicateNodeCallback";
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
@@ -57,7 +58,11 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import {
+  STUDIO_PANES_PARAM,
+  resolveOpenPanes,
+  withPanesOpen,
+} from "@/routes/workflows/studio/panes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
@@ -65,6 +70,7 @@ import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
 } from "@/store/WorkflowSettingsStore";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn, formatDate, toDate } from "@/util/utils";
 import {
   statusIsAFailureType,
@@ -187,7 +193,10 @@ const getPayload = (opts: {
     toast({
       variant: "warning",
       title: "Extra HTTP Headers",
-      description: "Invalid extra HTTP Headers JSON",
+      description: `Invalid extra HTTP Headers JSON: ${getJsonParseErrorDetail(
+        String(opts.workflowSettings.extraHttpHeaders ?? ""),
+        e,
+      )}`,
     });
   }
 
@@ -259,6 +268,7 @@ function NodeHeader({
     initialValue: blockLabel,
   });
   const blockTitle = blockTitleOverride ?? workflowBlockTitle[type];
+  const duplicateNodeCallback = useDuplicateNodeCallback();
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
@@ -421,7 +431,7 @@ function NodeHeader({
         throw new ValidationFailureError();
       }
 
-      await saveWorkflow.mutateAsync();
+      await saveWorkflow.mutateAsync(undefined);
 
       if (!workflowPermanentId) {
         log.error("Run block: there is no workflowPermanentId");
@@ -553,13 +563,22 @@ function NodeHeader({
       });
 
       if (studioEnabled) {
-        useStudioShellStore.getState().setTab("browser");
-        navigate(
-          `/workflows/${workflowPermanentId}/studio?wr=${response.data.run_id}&bl=${encodeURIComponent(label)}`,
-        );
+        // One navigation carries the pane state (current panes plus Run and
+        // Browser); other query params intentionally reset for the fresh run.
+        const liveSearch = window.location.search || location.search;
+        const panes = withPanesOpen(resolveOpenPanes(liveSearch), [
+          "run",
+          "browser",
+        ]);
+        const search = new URLSearchParams({
+          wr: response.data.run_id,
+          bl: label,
+        });
+        search.set(STUDIO_PANES_PARAM, panes.join(","));
+        navigate(`/agents/${workflowPermanentId}/studio?${search}`);
       } else {
         navigate(
-          `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
+          `/agents/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
         );
       }
     },
@@ -817,6 +836,12 @@ function NodeHeader({
   const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isCanvasLocked = useIsCanvasLocked();
   const dragGatedByMode = isDragGatedByMode({ isRecording, isCanvasLocked });
+  const duplicateDisabledReason = isBlockFinallyGated(
+    blockLabel,
+    workflowSettingsStore.finallyBlockLabel,
+  )
+    ? "Finally block must run last"
+    : null;
 
   // Read-only canvases (compare/diff) drop the grip entirely - the handle
   // is inert there, so a faded button is just visual noise.
@@ -1045,8 +1070,19 @@ function NodeHeader({
                 })}
               >
                 <NodeActionMenu
+                  duplicateDisabledReason={duplicateDisabledReason}
+                  isDuplicable={
+                    !isReadOnlyScope && Boolean(duplicateNodeCallback)
+                  }
                   isScriptable={isScriptable}
                   isCanvasLocked={isCanvasLocked}
+                  onDuplicate={
+                    isReadOnlyScope || !duplicateNodeCallback
+                      ? undefined
+                      : () => {
+                          duplicateNodeCallback(nodeId);
+                        }
+                  }
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}

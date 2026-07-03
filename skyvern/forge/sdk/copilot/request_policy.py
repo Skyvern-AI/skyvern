@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 from urllib.parse import urlparse
 
@@ -14,7 +14,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.secret_redaction import (
@@ -58,6 +58,13 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "raw_secret_handling",
     "clarification_reason",
 }
+_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
+    {
+        "output.downloaded_files",
+        "output.downloaded_file_urls",
+        "output.downloaded_file_artifact_ids",
+    }
+)
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -144,8 +151,21 @@ _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "
 
 
 _MAX_COMPLETION_CRITERIA = 8
+_MAX_TRACE_COMPLETION_CRITERIA = 8
 _COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
+_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS = 200
+_COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS = 500
+_COMPLETION_CRITERION_CLASSIFICATION_TARGET_MAX_CHARS = 120
+_CLASSIFICATION_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE = re.compile(r"^output\.[A-Za-z_][A-Za-z0-9_]*$")
 _REQUESTED_OUTPUT_CRITERION_ID_PREFIX = "__copilot_requested_output__"
+_VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS: dict[str, tuple[str, bool]] = {
+    "output.login_only": ("login_only", True),
+    "output.login_gated": ("login_gated", True),
+}
+_VALIDATION_CLASSIFICATION_LABEL_OUTPUT_TARGETS: dict[str, str] = {
+    "output.path_classification": "path_classification",
+}
 
 FALLBACK_FLOOR_CRITERION_ID_PREFIX = "__copilot_fallback_floor__"
 _FALLBACK_FLOOR_BASE_ID = f"{FALLBACK_FLOOR_CRITERION_ID_PREFIX}run"
@@ -155,13 +175,28 @@ _FALLBACK_FLOOR_CREDENTIAL_OUTCOME = "The credentialed step authenticates and re
 
 CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
+CriterionKind = Literal["outcome", "terminal_action", "validation_classification"]
+TerminalActionFamily = Literal["request", "application", "form", "order"]
+ClassificationTarget = str | bool
+ExpectedOutputShape = Literal[
+    "reference_code",
+    "numeric_identifier",
+    "date",
+    "address",
+    "status_label",
+    "money_amount",
+    "owner_label",
+]
+_CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
+_TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
+_EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
 
 _OUTPUT_INTENT_RE = re.compile(
     r"\b(?:read|capture|extract|output|return|returns|returned|include|includes|including|"
     r"final\s+(?:extracted\s+)?fields?|result\s+records?|returned\s+records?)\b",
     re.I,
 )
-_OUTPUT_SPAN_END_RE = re.compile(r"[\n.!?]")
+_OUTPUT_SPAN_END_RE = re.compile(r"[\n!?]")
 _OUTPUT_METHOD_TAIL_RE = re.compile(
     r"\b(?:by|via|using|after|before|then|click(?:ing)?|open(?:ing)?|select(?:ing)?|"
     r"choose|choosing|search(?:ing)?|navigate|go\s+to)\b.*",
@@ -172,10 +207,21 @@ _OUTPUT_FIELD_CONNECTOR_RE = re.compile(
     r"\b(?:with|including|include|includes|containing|contains|fields?|result)\b[:\s]+",
     re.I,
 )
+_OUTPUT_NEGATED_INTENT_PREFIX_RE = re.compile(
+    r"(?:\b(?:do|does|did|should|must|can)\s+not\s+|\b(?:don't|doesn't|didn't|shouldn't|mustn't|can't|cannot|never|without)\s+)$",
+    re.I,
+)
+_OUTPUT_EXPLICIT_FIELD_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_OUTPUT_NAMED_FIELD_RE = re.compile(
+    r"\b(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+"
+    r"(?:named|called)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+    re.I,
+)
 _OUTPUT_ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,10}\b")
 _OUTPUT_FIELD_WORDS = frozenset(
     "address addresses date dates email emails id identifier identifiers license licenses location locations "
-    "name names number numbers phone phones specialties specialty status statuses taxonomy".split()
+    "amount amounts domain domains name names number numbers owner owners phone phones rate rates specialties specialty "
+    "status statuses taxonomy total totals url urls website websites".split()
 )
 _OUTPUT_GENERIC_WORDS = frozenset(
     "a all an data detail details each entity final for information its of output outputs profile record records "
@@ -195,12 +241,22 @@ _OUTPUT_OUTCOME_WORDS = frozenset(
 class CompletionCriterion:
     id: str
     outcome: str
+    contingent_on: str | None = None
+    contingent_antecedent_output_path: str | None = None
+    deliverable_kind: Literal["registered_download"] | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
     # YAML; "run": an end state only a run can evidence. Invalid input coerces to "run".
     level: CriterionLevel = "run"
     output_path: str | None = None
+    expected_output_value: str | None = None
+    expected_output_shape: ExpectedOutputShape | None = None
+    kind: CriterionKind = "outcome"
+    terminal_action_family: TerminalActionFamily | None = None
+    classification_output_key: str | None = None
+    expected_classification: ClassificationTarget | None = None
+    requested_output_corroborator: bool = False
 
 
 @dataclass
@@ -238,7 +294,7 @@ class RequestPolicy:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
 
     def to_trace_data(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "testing_intent": self.testing_intent,
             "credential_input_kind": self.credential_input_kind,
             "clarification_reason": self.clarification_reason,
@@ -266,6 +322,19 @@ class RequestPolicy:
                 len(origins) for origins in self.existing_workflow_credential_origins.values()
             ),
         }
+        requested_output_criteria = [
+            criterion for criterion in self.graded_completion_criteria() if criterion.output_path is not None
+        ]
+        data["requested_output_criteria_count"] = len(requested_output_criteria)
+        for index, criterion in enumerate(requested_output_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"requested_output_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_output_path"] = criterion.output_path
+            data[f"{prefix}_grounding_mode"] = _criterion_grounding_mode(criterion)
+            data[f"{prefix}_has_exact_value"] = criterion.expected_output_value is not None
+            if criterion.expected_output_shape:
+                data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
+        return data
 
     def prompt_summary(self) -> str:
         lines = [
@@ -283,6 +352,22 @@ class RequestPolicy:
             lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
+        validation_classification_criteria = [
+            criterion
+            for criterion in self.graded_completion_criteria()
+            if criterion.kind == "validation_classification"
+            and criterion.classification_output_key
+            and criterion.expected_classification is not None
+        ]
+        if validation_classification_criteria:
+            lines.append("validation_classification_output_contracts:")
+            for criterion in validation_classification_criteria:
+                lines.append(
+                    f"- criterion_id: {criterion.id}; "
+                    f"return_key: {criterion.classification_output_key}; "
+                    f"expected_value: {json.dumps(criterion.expected_classification)}; "
+                    "return_location: top_level_block_output"
+                )
         if self.resolved_credentials:
             lines += [
                 "resolved_credentials:",
@@ -291,6 +376,20 @@ class RequestPolicy:
         if self.invalid_credential_ids:
             lines.append("invalid_credential_ids: " + ", ".join(f"`{cid}`" for cid in self.invalid_credential_ids))
         return "\n".join(lines)
+
+
+def request_policy_has_present_completion_contract(request_policy: RequestPolicy | None) -> bool:
+    if request_policy is None:
+        return False
+    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def _criterion_grounding_mode(criterion: CompletionCriterion) -> Literal["exact_value", "shape", "missing"]:
+    if criterion.expected_output_value is not None:
+        return "exact_value"
+    if criterion.expected_output_shape is not None:
+        return "shape"
+    return "missing"
 
 
 _TRANSCRIPT_TOTAL_CHAR_BUDGET = 2048
@@ -482,6 +581,40 @@ def _coerce_raw_secret_handling(value: Any) -> RawSecretHandling:
     return "none"
 
 
+def _coerce_criterion_kind(value: Any) -> CriterionKind:
+    if isinstance(value, str) and value in _CRITERION_KINDS:
+        return cast(CriterionKind, value)
+    return "outcome"
+
+
+def _coerce_terminal_action_family(value: Any, kind: CriterionKind) -> TerminalActionFamily | None:
+    if kind == "terminal_action" and isinstance(value, str) and value in _TERMINAL_ACTION_FAMILIES:
+        return cast(TerminalActionFamily, value)
+    return None
+
+
+def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
+    if isinstance(value, str) and value in _EXPECTED_OUTPUT_SHAPES:
+        return cast(ExpectedOutputShape, value)
+    return None
+
+
+def _coerce_classification_output_key(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    key = value.strip()
+    return key if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(key) else None
+
+
+def _coerce_expected_classification(value: Any) -> ClassificationTarget | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        collapsed = " ".join(value.split())[:_COMPLETION_CRITERION_CLASSIFICATION_TARGET_MAX_CHARS].strip()
+        return collapsed or None
+    return None
+
+
 def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
         raw = parse_final_response(raw)
@@ -555,7 +688,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     if not isinstance(raw, list):
         return []
     criteria: list[CompletionCriterion] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str, str, str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -567,7 +700,48 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             continue
         output_path_raw = item.get("output_path")
         output_path = output_path_raw.strip() if isinstance(output_path_raw, str) and output_path_raw.strip() else None
-        key = output_path or normalized_criterion_outcome_key(outcome)
+        expected_output_value_raw = item.get("expected_output_value")
+        expected_output_value = (
+            " ".join(expected_output_value_raw.split())[:_COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS].strip()
+            if isinstance(expected_output_value_raw, str)
+            else None
+        )
+        expected_output_value = expected_output_value or None
+        expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        contingent_on_raw = item.get("contingent_on")
+        contingent_on = (
+            " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
+            if isinstance(contingent_on_raw, str)
+            else None
+        )
+        contingent_on = contingent_on or None
+        contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
+            item.get("contingent_antecedent_output_path")
+        )
+        deliverable_kind = _normalize_deliverable_kind(item.get("deliverable_kind"))
+        kind = _coerce_criterion_kind(item.get("kind"))
+        classification_output_key = (
+            _coerce_classification_output_key(item.get("classification_output_key"))
+            if kind == "validation_classification"
+            else None
+        )
+        expected_classification = (
+            _coerce_expected_classification(item.get("expected_classification"))
+            if kind == "validation_classification"
+            else None
+        )
+        if kind == "validation_classification":
+            output_path = None
+            expected_output_value = None
+            expected_output_shape = None
+        key = (
+            contingent_on or "",
+            contingent_antecedent_output_path or "",
+            output_path or classification_output_key or normalized_criterion_outcome_key(outcome),
+            deliverable_kind or "",
+            kind,
+            str(expected_classification) if expected_classification is not None else "",
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -576,12 +750,21 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             CompletionCriterion(
                 id=f"c{len(criteria)}",
                 outcome=outcome,
+                contingent_on=contingent_on,
+                contingent_antecedent_output_path=contingent_antecedent_output_path,
+                deliverable_kind=deliverable_kind,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=cast(CriterionLevel, level_raw)
                 if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
                 else "run",
                 output_path=output_path,
+                expected_output_value=expected_output_value,
+                expected_output_shape=expected_output_shape,
+                kind=kind,
+                terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
+                classification_output_key=classification_output_key,
+                expected_classification=expected_classification,
             )
         )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
@@ -589,22 +772,51 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     return criteria
 
 
+def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    path = raw.strip()
+    return path if _CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE.fullmatch(path) else None
+
+
+def _normalize_deliverable_kind(raw: Any) -> Literal["registered_download"] | None:
+    return "registered_download" if raw == "registered_download" else None
+
+
 def normalized_criterion_outcome_key(outcome: str) -> str:
     collapsed = " ".join((outcome or "").split())[:_COMPLETION_CRITERION_OUTCOME_MAX_CHARS]
     return collapsed.strip().lower().rstrip(".!?;:,").strip()
 
 
-def _output_intent_spans(user_message: str) -> list[str]:
+def _output_intent_spans(user_message: str, *, negated: bool = False) -> list[str]:
     message = user_message or ""
     spans: list[str] = []
     for match in _OUTPUT_INTENT_RE.finditer(message):
+        if _output_intent_is_negated(message, match.start()) != negated:
+            continue
         tail = message[match.start() :]
-        end_match = _OUTPUT_SPAN_END_RE.search(tail)
-        span = tail[: end_match.start()] if end_match is not None else tail
+        span = tail[: _output_span_end_index(tail)]
         span = _OUTPUT_METHOD_TAIL_RE.sub("", span).strip(" :,-")
         if span:
             spans.append(span)
     return spans
+
+
+def _output_intent_is_negated(message: str, match_start: int) -> bool:
+    return bool(_OUTPUT_NEGATED_INTENT_PREFIX_RE.search(message[max(0, match_start - 32) : match_start]))
+
+
+def _output_span_end_index(text: str) -> int:
+    for index, char in enumerate(text):
+        if _OUTPUT_SPAN_END_RE.fullmatch(char):
+            return index
+        if char != ".":
+            continue
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if next_char and not next_char.isspace():
+            continue
+        return index + 1
+    return len(text)
 
 
 def _normalize_requested_output_aliases(aliases: dict[str, str] | None) -> dict[str, str]:
@@ -621,7 +833,8 @@ def _normalize_requested_output_aliases(aliases: dict[str, str] | None) -> dict[
     return normalized
 
 
-def _lookup_requested_output_path_alias(field_name: str, aliases: dict[str, str] | None) -> str | None:
+# Shared within the Copilot subsystem; not a general public API.
+def lookup_requested_output_path_alias(field_name: str, aliases: dict[str, str] | None) -> str | None:
     normalized_aliases = _normalize_requested_output_aliases(aliases)
     field_key = " ".join(_word_tokens(field_name))
     if not field_key:
@@ -636,7 +849,7 @@ def _lookup_requested_output_path_alias(field_name: str, aliases: dict[str, str]
     return None
 
 
-def _schema_output_path_aliases_from_criteria(criteria: list[CompletionCriterion]) -> dict[str, str]:
+def schema_output_path_aliases_from_criteria(criteria: list[CompletionCriterion]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for criterion in criteria:
         if criterion.level == "definition" or criterion.method_mandated or not criterion.output_path:
@@ -661,6 +874,9 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not candidate:
         return None
 
+    named_field = _OUTPUT_NAMED_FIELD_RE.search(candidate)
+    if named_field is not None:
+        return named_field.group(1)
     connector_matches = list(_OUTPUT_FIELD_CONNECTOR_RE.finditer(candidate))
     if connector_matches:
         candidate = candidate[connector_matches[-1].end() :]
@@ -668,14 +884,20 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     candidate = " ".join(re.sub(r"[^A-Za-z0-9 _/-]+", " ", candidate).split()).strip(" :-")
     if not candidate:
         return None
+    if "_" in candidate and _OUTPUT_EXPLICIT_FIELD_KEY_RE.fullmatch(candidate):
+        return candidate
     normalized_aliases = _normalize_requested_output_aliases(aliases)
     if " ".join(_word_tokens(candidate)) in normalized_aliases:
         return candidate
+    candidate_tokens = _word_tokens(candidate)
+    for alias_key in sorted(normalized_aliases, key=lambda key: len(key.split()), reverse=True):
+        if _tokens_contain_sequence(candidate_tokens, alias_key.split()):
+            return _matched_alias_phrase(candidate, alias_key) or alias_key
     candidate_words = candidate.split()
     for word in candidate_words:
         if " ".join(_word_tokens(word)) in normalized_aliases:
             return word
-    if _lookup_requested_output_path_alias(candidate, aliases) is not None:
+    if lookup_requested_output_path_alias(candidate, aliases) is not None:
         return candidate
 
     acronyms = [
@@ -683,7 +905,7 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
         for token in _OUTPUT_ACRONYM_RE.findall(candidate)
         if token.casefold() not in _OUTPUT_METHOD_WORDS
         and token.casefold() not in _OUTPUT_GENERIC_WORDS
-        and _lookup_requested_output_path_alias(token, aliases) is not None
+        and lookup_requested_output_path_alias(token, aliases) is not None
     ]
     if acronyms:
         return acronyms[0]
@@ -697,6 +919,8 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
         normalized_words = normalized_words[1:]
     if not normalized_words:
         return None
+    if len(words) == 1 and "_" in words[0] and _OUTPUT_EXPLICIT_FIELD_KEY_RE.fullmatch(words[0]):
+        return words[0]
     if any(word in _OUTPUT_METHOD_WORDS for word in normalized_words):
         return None
     if all(word in _OUTPUT_GENERIC_WORDS for word in normalized_words):
@@ -723,10 +947,26 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     return " ".join(phrase_words)
 
 
-def _requested_output_fields(user_message: str, aliases: dict[str, str] | None = None) -> list[str]:
+def _matched_alias_phrase(candidate: str, alias_key: str) -> str | None:
+    alias_words = alias_key.split()
+    if not alias_words:
+        return None
+    pattern = r"\b" + r"[\W_]+".join(re.escape(word) for word in alias_words) + r"\b"
+    match = re.search(pattern, candidate, re.I)
+    return match.group(0).strip() if match is not None else None
+
+
+def _requested_output_fields(
+    user_message: str, aliases: dict[str, str] | None = None, *, negated: bool = False
+) -> list[str]:
     fields: list[str] = []
     seen: set[str] = set()
-    for span in _output_intent_spans(user_message):
+    for span in _output_intent_spans(user_message, negated=negated):
+        if not negated:
+            for match in _OUTPUT_INTENT_RE.finditer(span):
+                if _output_intent_is_negated(span, match.start()):
+                    span = span[: match.start()]
+                    break
         for segment in _OUTPUT_SPLIT_RE.split(span):
             field_name = _clean_requested_output_candidate(segment, aliases)
             if field_name is None:
@@ -739,8 +979,20 @@ def _requested_output_fields(user_message: str, aliases: dict[str, str] | None =
     return fields
 
 
+def _requested_output_path_for_detected_field(
+    field_name: str, schema_aliases: dict[str, str], config_aliases: dict[str, str]
+) -> str:
+    if "_" in field_name and _OUTPUT_EXPLICIT_FIELD_KEY_RE.fullmatch(field_name.strip()):
+        return requested_output_path_for_field(field_name)
+    return (
+        lookup_requested_output_path_alias(field_name, schema_aliases)
+        or lookup_requested_output_path_alias(field_name, config_aliases)
+        or requested_output_path_for_field(field_name)
+    )
+
+
 def requested_output_path_for_field(field_name: str, aliases: dict[str, str] | None = None) -> str:
-    alias_path = _lookup_requested_output_path_alias(field_name, aliases)
+    alias_path = lookup_requested_output_path_alias(field_name, aliases)
     if alias_path is not None:
         return alias_path
     words = _word_tokens(field_name)
@@ -791,6 +1043,42 @@ def _criterion_text_covers_any_requested_output(criterion: CompletionCriterion, 
     return any(_criterion_text_covers_requested_output(criterion, field_name) for field_name in requested_fields)
 
 
+def _requested_output_expected_values_from_criteria(
+    criteria: list[CompletionCriterion],
+    requested_specs: list[tuple[str, str, str]],
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated:
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path != output_path and not _criterion_text_covers_requested_output(
+                criterion, field_name
+            ):
+                continue
+            value = criterion.expected_output_value
+            if value:
+                values.setdefault(output_path, value)
+    return values
+
+
+def _requested_output_shapes_from_criteria(
+    criteria: list[CompletionCriterion],
+    requested_specs: list[tuple[str, str, str]],
+) -> dict[str, ExpectedOutputShape]:
+    shapes: dict[str, ExpectedOutputShape] = {}
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated or criterion.expected_output_shape is None:
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path != output_path and not _criterion_text_covers_requested_output(
+                criterion, field_name
+            ):
+                continue
+            shapes.setdefault(output_path, criterion.expected_output_shape)
+    return shapes
+
+
 def _requested_output_criterion_id(output_path: str) -> str:
     slug = "_".join(_word_tokens(output_path)) or "field"
     return f"{_REQUESTED_OUTPUT_CRITERION_ID_PREFIX}{slug}"
@@ -814,6 +1102,8 @@ def _generic_completion_criterion(criterion: CompletionCriterion) -> bool:
 
 def _criterion_drop_priority(criterion: CompletionCriterion, requested_output_paths: set[str]) -> int:
     if criterion.output_path in requested_output_paths:
+        return 0
+    if criterion.requested_output_corroborator:
         return 0
     if criterion.level == "definition":
         return 0
@@ -841,42 +1131,203 @@ def _cap_completion_criteria(
     return capped
 
 
+def _preserve_after_requested_output_canonicalization(
+    criterion: CompletionCriterion,
+    requested_fields: list[str],
+    requested_output_paths: set[str],
+    forbidden_fields: list[str] | None = None,
+    forbidden_output_paths: set[str] | None = None,
+) -> bool:
+    if criterion.level == "definition" or criterion.method_mandated:
+        return True
+    if criterion.output_path in (forbidden_output_paths or set()) or _criterion_text_covers_any_requested_output(
+        criterion, forbidden_fields or []
+    ):
+        return False
+    if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
+        criterion, requested_fields
+    ):
+        return False
+    if (
+        requested_output_paths
+        and not criterion.output_path
+        and criterion.kind == "outcome"
+        and _generic_completion_criterion(criterion)
+    ):
+        return False
+    return True
+
+
+def _non_requested_output_run_corroborator(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.level == "run"
+        and criterion.kind == "outcome"
+        and not criterion.method_mandated
+        and criterion.output_path is None
+    )
+
+
+def _validation_classification_output_path(output_path: str | None) -> bool:
+    return (
+        output_path in _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS
+        or output_path in _VALIDATION_CLASSIFICATION_LABEL_OUTPUT_TARGETS
+    )
+
+
+def completion_criterion_requires_active_run_terminal_monitor(criterion: CompletionCriterion) -> bool:
+    if criterion.requested_output_corroborator:
+        return False
+    if (
+        criterion.output_path
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.kind != "validation_classification"
+    ):
+        return False
+    return True
+
+
+def _source_requested_output_corroborator(
+    criteria: list[CompletionCriterion],
+    requested_fields: list[str],
+    requested_output_paths: set[str],
+) -> CompletionCriterion | None:
+    for criterion in criteria:
+        if criterion.level != "run" or criterion.kind != "outcome" or criterion.method_mandated:
+            continue
+        if _validation_classification_output_path(criterion.output_path):
+            continue
+        if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
+            criterion, requested_fields
+        ):
+            return replace(
+                criterion,
+                output_path=None,
+                expected_output_value=None,
+                expected_output_shape=None,
+                requested_output_corroborator=True,
+            )
+    for criterion in criteria:
+        if is_fallback_floor_base_criterion(criterion):
+            return replace(criterion, requested_output_corroborator=True)
+    return None
+
+
+def _requested_output_corroborator_id(source_id: str, used_ids: set[str]) -> str:
+    base_id = f"{source_id}__requested_output_corroborator"
+    if base_id not in used_ids:
+        return base_id
+    suffix = 2
+    while f"{base_id}_{suffix}" in used_ids:
+        suffix += 1
+    return f"{base_id}_{suffix}"
+
+
+def _apply_classifier_typed_requested_output_corroborators(policy: RequestPolicy) -> None:
+    if any(_non_requested_output_run_corroborator(criterion) for criterion in policy.completion_criteria):
+        return
+    source_criteria = [
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.level == "run"
+        and criterion.kind == "outcome"
+        and not criterion.method_mandated
+        and criterion.output_path is not None
+        and not _validation_classification_output_path(criterion.output_path)
+        and not criterion.id.startswith(_REQUESTED_OUTPUT_CRITERION_ID_PREFIX)
+    ]
+    if not source_criteria:
+        return
+
+    used_ids = {criterion.id for criterion in policy.completion_criteria}
+    corroborators: list[CompletionCriterion] = []
+    for criterion in source_criteria:
+        corroborator_id = _requested_output_corroborator_id(criterion.id, used_ids)
+        used_ids.add(corroborator_id)
+        corroborators.append(
+            replace(
+                criterion,
+                id=corroborator_id,
+                output_path=None,
+                expected_output_value=None,
+                expected_output_shape=None,
+                requested_output_corroborator=True,
+            )
+        )
+
+    requested_output_paths = {criterion.output_path for criterion in source_criteria if criterion.output_path}
+    policy.completion_criteria = _cap_completion_criteria(
+        policy.completion_criteria + corroborators,
+        requested_output_paths,
+    )
+
+
 def _apply_requested_output_completion_criteria(
     policy: RequestPolicy, user_message: str, aliases: dict[str, str] | None = None
 ) -> None:
-    schema_aliases = _schema_output_path_aliases_from_criteria(policy.completion_criteria)
+    schema_aliases = schema_output_path_aliases_from_criteria(policy.completion_criteria)
     config_aliases = _normalize_requested_output_aliases(aliases)
     schema_aliases = _normalize_requested_output_aliases(schema_aliases)
     detection_aliases = {**config_aliases, **schema_aliases}
     requested_fields = _requested_output_fields(user_message, detection_aliases)
-    if not requested_fields:
+    forbidden_fields = _requested_output_fields(user_message, detection_aliases, negated=True)
+    if not requested_fields and not forbidden_fields:
         return
 
     requested_specs: list[tuple[str, str, str]] = []
     requested_output_paths: set[str] = set()
     for field_name in requested_fields:
-        output_path = (
-            _lookup_requested_output_path_alias(field_name, schema_aliases)
-            or _lookup_requested_output_path_alias(field_name, config_aliases)
-            or requested_output_path_for_field(field_name)
-        )
+        output_path = _requested_output_path_for_detected_field(field_name, schema_aliases, config_aliases)
         field_label = _requested_output_field_label(field_name, output_path)
         if output_path in requested_output_paths:
             continue
         requested_output_paths.add(output_path)
         requested_specs.append((field_name, output_path, field_label))
 
-    if not requested_output_paths:
+    forbidden_output_paths = {
+        _requested_output_path_for_detected_field(field_name, schema_aliases, config_aliases)
+        for field_name in forbidden_fields
+    }
+
+    if not requested_output_paths and not forbidden_output_paths:
         return
+
+    value_by_output_path = _requested_output_expected_values_from_criteria(policy.completion_criteria, requested_specs)
+    shape_by_output_path = _requested_output_shapes_from_criteria(policy.completion_criteria, requested_specs)
+
+    metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
+    for criterion in policy.completion_criteria:
+        if criterion.level == "definition" or criterion.method_mandated:
+            continue
+        if (
+            not criterion.contingent_on
+            and not criterion.contingent_antecedent_output_path
+            and not criterion.deliverable_kind
+        ):
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path == output_path or _criterion_text_covers_requested_output(criterion, field_name):
+                deliverable_kind = (
+                    criterion.deliverable_kind if output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
+                )
+                metadata_by_output_path.setdefault(
+                    output_path,
+                    (
+                        criterion.contingent_on,
+                        criterion.contingent_antecedent_output_path,
+                        deliverable_kind,
+                    ),
+                )
 
     preserved_criteria = [
         criterion
         for criterion in policy.completion_criteria
-        if criterion.level == "definition"
-        or criterion.method_mandated
-        or (
-            criterion.output_path not in requested_output_paths
-            and not _criterion_text_covers_any_requested_output(criterion, requested_fields)
+        if _preserve_after_requested_output_canonicalization(
+            criterion,
+            requested_fields,
+            requested_output_paths,
+            forbidden_fields,
+            forbidden_output_paths,
         )
     ]
     canonical_requested_criteria = [
@@ -885,13 +1336,75 @@ def _apply_requested_output_completion_criteria(
             outcome=f"The returned record includes {field_label}.",
             level="run",
             output_path=output_path,
+            expected_output_value=value_by_output_path.get(output_path),
+            expected_output_shape=shape_by_output_path.get(output_path),
+            contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
+            contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
+            deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
         )
         for _field_name, output_path, field_label in requested_specs
     ]
+    criteria = preserved_criteria + canonical_requested_criteria
+    if not any(_non_requested_output_run_corroborator(criterion) for criterion in criteria):
+        corroborator = _source_requested_output_corroborator(
+            policy.completion_criteria,
+            requested_fields,
+            requested_output_paths,
+        )
+        if corroborator is not None:
+            criteria = preserved_criteria + [corroborator] + canonical_requested_criteria
     policy.completion_criteria = _cap_completion_criteria(
-        preserved_criteria + canonical_requested_criteria,
+        criteria,
         requested_output_paths,
     )
+
+
+def _validation_classification_target_for_legacy_criterion(
+    criterion: CompletionCriterion,
+) -> tuple[str, ClassificationTarget] | None:
+    if criterion.kind != "outcome" or criterion.level == "definition" or criterion.method_mandated:
+        return None
+    if not criterion.output_path:
+        return None
+    boolean_target = _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS.get(criterion.output_path)
+    if boolean_target is not None:
+        return boolean_target
+    label_key = _VALIDATION_CLASSIFICATION_LABEL_OUTPUT_TARGETS.get(criterion.output_path)
+    if label_key is None or criterion.expected_output_value is None:
+        return None
+    return (label_key, criterion.expected_output_value)
+
+
+def _apply_validation_classification_completion_criteria(policy: RequestPolicy) -> None:
+    """Promote legacy classifier output carriers into typed validation-classification contracts."""
+
+    criteria: list[CompletionCriterion] = []
+    seen_classification_targets: set[tuple[str, str]] = set()
+    for criterion in policy.completion_criteria:
+        target = _validation_classification_target_for_legacy_criterion(criterion)
+        if target is not None:
+            output_key, expected = target
+            criterion = replace(
+                criterion,
+                kind="validation_classification",
+                output_path=None,
+                expected_output_value=None,
+                expected_output_shape=None,
+                deliverable_kind=None,
+                terminal_action_family=None,
+                classification_output_key=output_key,
+                expected_classification=expected,
+            )
+        if criterion.kind == "validation_classification":
+            target_key = (
+                criterion.classification_output_key or "",
+                str(criterion.expected_classification) if criterion.expected_classification is not None else "",
+            )
+            if target_key in seen_classification_targets:
+                continue
+            seen_classification_targets.add(target_key)
+        criteria.append(criterion)
+    policy.completion_criteria = criteria
 
 
 def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | None) -> str:
@@ -904,9 +1417,27 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
+            "kind": criterion.kind,
+            "terminal_action_family": criterion.terminal_action_family,
         }
+        if criterion.contingent_on:
+            item["contingent_on"] = criterion.contingent_on
+        if criterion.contingent_antecedent_output_path:
+            item["contingent_antecedent_output_path"] = criterion.contingent_antecedent_output_path
+        if criterion.deliverable_kind:
+            item["deliverable_kind"] = criterion.deliverable_kind
         if criterion.output_path:
             item["output_path"] = criterion.output_path
+        if criterion.expected_output_value:
+            item["expected_output_value"] = criterion.expected_output_value
+        if criterion.expected_output_shape:
+            item["expected_output_shape"] = criterion.expected_output_shape
+        if criterion.classification_output_key:
+            item["classification_output_key"] = criterion.classification_output_key
+        if criterion.expected_classification is not None:
+            item["expected_classification"] = criterion.expected_classification
+        if criterion.requested_output_corroborator:
+            item["requested_output_corroborator"] = True
         rendered.append(item)
     return json.dumps(rendered)
 
@@ -915,13 +1446,17 @@ def is_fallback_floor_criterion(criterion: CompletionCriterion) -> bool:
     return criterion.id.startswith(FALLBACK_FLOOR_CRITERION_ID_PREFIX)
 
 
+def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id == _FALLBACK_FLOOR_BASE_ID
+
+
 def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
     floor = [
         CompletionCriterion(
             id=_FALLBACK_FLOOR_BASE_ID,
             outcome=_FALLBACK_FLOOR_BASE_OUTCOME,
             implicit=True,
-            method_mandated=True,
+            method_mandated=False,
             level="run",
         )
     ]
@@ -978,6 +1513,7 @@ def _classifier_fallback_policy(
         completion_contract_status="present" if fallback_criteria else "unknown",
     )
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
+    _apply_classifier_typed_requested_output_corroborators(policy)
     if policy.graded_completion_criteria():
         policy.completion_contract_status = "present"
     return policy
@@ -1134,6 +1670,7 @@ async def _classify_request(
     # can distinguish unsafe secret use from redacted draft/spec conversion.
     # Timeout and exception fallbacks remain conservative blocks below.
     safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
@@ -1144,7 +1681,7 @@ async def _classify_request(
         latest_prior_user_turn=transcript.latest_prior_user_turn,
         latest_assistant_turn=transcript.latest_assistant_turn,
         retained_history=transcript.retained_history,
-        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)[:2048]),
+        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
         active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
     )
     raw, failure_kind, retry_count = await _run_request_policy_classifier(handler, prompt)
@@ -1218,6 +1755,8 @@ async def _classify_request(
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
+    _apply_validation_classification_completion_criteria(policy)
+    _apply_classifier_typed_requested_output_corroborators(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )

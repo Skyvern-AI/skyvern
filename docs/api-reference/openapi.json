@@ -3645,10 +3645,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
               "title": "Vault Type"
             },
-            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+            "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')"
           },
           {
             "name": "credential_type",
@@ -4016,6 +4016,256 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/custom-llms": {
+      "get": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "List Custom LLMs",
+        "description": "List the custom LLM configurations available to the current organization.",
+        "operationId": "list_custom_llms_v1_custom_llms_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomLLMListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_custom_llms"
+      },
+      "post": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "Create Custom LLM",
+        "description": "Create a custom LLM configuration for the current organization.",
+        "operationId": "create_custom_llm_v1_custom_llms_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomLLMCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomLLMResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_custom_llm"
+      }
+    },
+    "/v1/custom-llms/{custom_llm_id}": {
+      "put": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "Update Custom LLM",
+        "description": "Update a custom LLM configuration for the current organization.",
+        "operationId": "update_custom_llm_v1_custom_llms__custom_llm_id__put",
+        "parameters": [
+          {
+            "name": "custom_llm_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The custom LLM id.",
+              "title": "Custom Llm Id"
+            },
+            "description": "The custom LLM id."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomLLMUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomLLMResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_custom_llm"
+      },
+      "delete": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "Delete Custom LLM",
+        "description": "Delete a custom LLM configuration for the current organization.",
+        "operationId": "delete_custom_llm_v1_custom_llms__custom_llm_id__delete",
+        "parameters": [
+          {
+            "name": "custom_llm_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The custom LLM id.",
+              "title": "Custom Llm Id"
+            },
+            "description": "The custom LLM id."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClearOrganizationAuthTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_custom_llm"
       }
     },
     "/v1/run/tasks/login": {
@@ -8640,6 +8890,35 @@
             ],
             "title": "Source Browser Type"
           },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -8983,6 +9262,21 @@
           "failed"
         ],
         "title": "BulkCancelRunsResponse"
+      },
+      "ClearOrganizationAuthTokenResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success",
+            "description": "Whether the token was cleared successfully"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "title": "ClearOrganizationAuthTokenResponse",
+        "description": "Response model for clearing an organization auth token."
       },
       "ClickAction": {
         "properties": {
@@ -9753,6 +10047,37 @@
             ],
             "title": "Workflow Run Id",
             "description": "Workflow run whose persisted session should be captured. Omit for a blank profile."
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Explicit sticky-session id for this profile's pinned proxy identity."
           }
         },
         "type": "object",
@@ -9796,6 +10121,18 @@
             ],
             "title": "Proxy Location",
             "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.\n Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}, or a custom proxy URL dict for self-hosted deployments: {\"url\": \"http://user:password@proxy.example.com:8080\"}"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions."
           },
           "extensions": {
             "anyOf": [
@@ -9892,10 +10229,48 @@
             ],
             "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
             "examples": [
+              "skyvern",
               "custom",
               "azure_vault",
               "bitwarden"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Optional advanced reuse key for this credential's pinned proxy identity."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
+            "default": false
           }
         },
         "type": "object",
@@ -10176,7 +10551,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')"
+            "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
           "browser_profile_id": {
             "anyOf": [
@@ -10240,6 +10615,37 @@
             "examples": [
               "cfld_1234567890"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location used for the credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
           }
         },
         "type": "object",
@@ -10265,6 +10671,7 @@
       "CredentialVaultType": {
         "type": "string",
         "enum": [
+          "skyvern",
           "bitwarden",
           "azure_vault",
           "gcp",
@@ -10425,6 +10832,214 @@
         ],
         "title": "CreditCardCredentialResponse",
         "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,\nbilling fields, or metadata."
+      },
+      "CustomLLM": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "config": {
+            "$ref": "#/components/schemas/CustomLLMConfig"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "title": "Modified At"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "organization_id",
+          "config",
+          "created_at",
+          "modified_at",
+          "valid"
+        ],
+        "title": "CustomLLM"
+      },
+      "CustomLLMConfig": {
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Display Name"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/CustomLLMProvider"
+          },
+          "model_name": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Model Name"
+          },
+          "api_base": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Base"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "api_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Version"
+          },
+          "supports_vision": {
+            "type": "boolean",
+            "title": "Supports Vision",
+            "default": true
+          },
+          "add_assistant_prefix": {
+            "type": "boolean",
+            "title": "Add Assistant Prefix",
+            "default": false
+          },
+          "max_completion_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Completion Tokens"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          }
+        },
+        "type": "object",
+        "required": [
+          "display_name",
+          "provider",
+          "model_name"
+        ],
+        "title": "CustomLLMConfig"
+      },
+      "CustomLLMCreateRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/CustomLLMConfig"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "title": "CustomLLMCreateRequest"
+      },
+      "CustomLLMListResponse": {
+        "properties": {
+          "custom_llms": {
+            "items": {
+              "$ref": "#/components/schemas/CustomLLM"
+            },
+            "type": "array",
+            "title": "Custom Llms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "custom_llms"
+        ],
+        "title": "CustomLLMListResponse"
+      },
+      "CustomLLMProvider": {
+        "type": "string",
+        "enum": [
+          "openai_compatible",
+          "ollama",
+          "openrouter"
+        ],
+        "title": "CustomLLMProvider"
+      },
+      "CustomLLMResponse": {
+        "properties": {
+          "custom_llm": {
+            "$ref": "#/components/schemas/CustomLLM"
+          }
+        },
+        "type": "object",
+        "required": [
+          "custom_llm"
+        ],
+        "title": "CustomLLMResponse"
+      },
+      "CustomLLMUpdateRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/CustomLLMConfig"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "title": "CustomLLMUpdateRequest"
       },
       "DeleteScheduleResponse": {
         "properties": {
@@ -12142,7 +12757,8 @@
         "type": "string",
         "enum": [
           "s3",
-          "azure"
+          "azure",
+          "google_drive"
         ],
         "title": "FileStorageType"
       },
@@ -12298,6 +12914,28 @@
               }
             ],
             "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [
@@ -12467,6 +13105,28 @@
               }
             ],
             "title": "Azure Folder Path"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [
@@ -21416,6 +22076,43 @@
             ],
             "title": "Description",
             "description": "New description for the browser profile"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id for this profile.",
+            "default": false
           }
         },
         "type": "object",
@@ -23363,6 +24060,11 @@
             "title": "Adaptive Caching",
             "default": false
           },
+          "enable_self_healing": {
+            "type": "boolean",
+            "title": "Enable Self Healing",
+            "default": false
+          },
           "code_version": {
             "anyOf": [
               {
@@ -23444,6 +24146,11 @@
               }
             ],
             "title": "Edited By"
+          },
+          "copilot_authored": {
+            "type": "boolean",
+            "title": "Copilot Authored",
+            "default": false
           },
           "created_at": {
             "type": "string",
@@ -23686,6 +24393,17 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "enable_self_healing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Self Healing"
           },
           "code_version": {
             "anyOf": [

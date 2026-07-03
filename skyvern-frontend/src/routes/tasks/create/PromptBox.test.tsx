@@ -193,8 +193,11 @@ describe("PromptBox", () => {
     expect(path).toBe("/workflows");
     expect(yaml).toContain("run_with: agent");
     expect(yaml).not.toContain("run_with: code");
-    expect(mockNavigate).toHaveBeenCalledWith("/workflows/wpid_copilot/build", {
-      state: { copilotMessage: "Build this workflow" },
-    });
+    expect(mockNavigate).toHaveBeenCalledWith(
+      "/agents/wpid_copilot/build?via=discover",
+      {
+        state: { copilotMessage: "Build this workflow" },
+      },
+    );
   });
 });

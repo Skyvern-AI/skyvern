@@ -58,11 +58,17 @@ GOOGLE_SHEETS_SCOPES: tuple[str, ...] = (
 )
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_GMAIL_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_READONLY_SCOPE,)
+# Drive uploads accept pasted folder IDs/URLs. drive.file cannot write to
+# arbitrary existing folders unless the app created or Picker-selected them, so
+# this profile intentionally uses full Drive scope until a Picker flow exists.
+GOOGLE_DRIVE_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/drive",)
 GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS = "google_sheets"
 GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL = "gmail"
+GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE = "google_drive"
 GOOGLE_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
     GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS: GOOGLE_SHEETS_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL: GOOGLE_GMAIL_SCOPES,
+    GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE: GOOGLE_DRIVE_SCOPES,
 }
 
 CONSENT_TTL_SECONDS = 600

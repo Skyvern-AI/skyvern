@@ -7,9 +7,11 @@ type StreamPresenterProps = {
   interactive?: boolean;
   showControlButtons?: boolean;
   isRecording?: boolean;
+  hideRecordingIndicator?: boolean;
   // Only the CDP transport carries the page URL; VNC is pixels-only and never
   // calls this.
   onUrlChange?: (url: string) => void;
+  onActivity?: () => void;
 };
 
 /**
@@ -21,7 +23,9 @@ export function StreamPresenter({
   interactive = false,
   showControlButtons = false,
   isRecording = false,
+  hideRecordingIndicator = false,
   onUrlChange,
+  onActivity,
 }: StreamPresenterProps) {
   const { browserStreamingMode } = useBrowserStreamingMode();
   const useCdp = browserStreamingMode === "cdp" && !isRecording;
@@ -34,6 +38,7 @@ export function StreamPresenter({
         interactive={interactive}
         showControlButtons={showControlButtons}
         onUrlChange={onUrlChange}
+        onActivity={onActivity}
         centered
       />
     );
@@ -45,6 +50,8 @@ export function StreamPresenter({
       interactive={interactive}
       showControlButtons={showControlButtons}
       exfiltrate={isRecording}
+      hideRecordingIndicator={hideRecordingIndicator}
+      onActivity={onActivity}
     />
   );
 }

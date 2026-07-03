@@ -1,4 +1,4 @@
-const LARGE_DOCUMENT_CHAR_THRESHOLD = 50_000;
+export const LARGE_DOCUMENT_CHAR_THRESHOLD = 50_000;
 const MAX_STRUCTURE_DEPTH = 200;
 
 function getMaxStructureDepth(text: string, cap: number): number {
@@ -38,14 +38,28 @@ function getMaxStructureDepth(text: string, cap: number): number {
 }
 
 /**
- * Large or deeply nested documents drive CodeMirror's view-layer RangeSet scan
- * and line-wrapping measurement into per-level recursion that overflows the
- * call stack (SKY-11432). Above these bounds the editor falls back to plain,
- * unwrapped text instead of syntax-highlighted, wrapped rendering.
+ * Deeply nested JSON drives CodeMirror's view-layer RangeSet scan into
+ * per-level recursion that overflows the call stack.
  */
-export function isOversizedDocument(value: string): boolean {
+export function isDeeplyNestedDocument(
+  value: string | null | undefined,
+): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  return getMaxStructureDepth(value, MAX_STRUCTURE_DEPTH) > MAX_STRUCTURE_DEPTH;
+}
+
+/**
+ * Large or deeply nested documents drive CodeMirror's line-wrapping measurement
+ * into per-level recursion / expensive reflow.
+ */
+export function isOversizedDocument(value: string | null | undefined): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
   if (value.length > LARGE_DOCUMENT_CHAR_THRESHOLD) {
     return true;
   }
-  return getMaxStructureDepth(value, MAX_STRUCTURE_DEPTH) > MAX_STRUCTURE_DEPTH;
+  return isDeeplyNestedDocument(value);
 }

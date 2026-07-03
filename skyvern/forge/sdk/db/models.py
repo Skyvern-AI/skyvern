@@ -522,6 +522,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    enable_self_healing = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     code_version = Column(Integer, nullable=True, server_default=sqlalchemy.text("2"))
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)
@@ -1188,6 +1189,7 @@ class PersistentBrowserSessionModel(Base):
     ip_address = Column(String, nullable=True)
     ecs_task_arn = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
+    proxy_session_id = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
@@ -1210,7 +1212,24 @@ class BrowserProfileModel(Base):
     __table_args__ = (
         Index("idx_browser_profiles_org", "organization_id"),
         Index("idx_browser_profiles_org_name", "organization_id", "name"),
-        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+        Index(
+            "uq_browser_profiles_org_name_user",
+            "organization_id",
+            "name",
+            unique=True,
+            postgresql_where=text("is_managed = false"),
+            sqlite_where=text("is_managed = false"),
+        ),
+        Index(
+            "uq_browser_profiles_managed_segment",
+            "organization_id",
+            "workflow_permanent_id",
+            "browser_profile_key_digest",
+            unique=True,
+            postgresql_where=text("is_managed = true AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = true AND deleted_at IS NULL"),
+        ),
+        Index("idx_browser_profiles_wpid", "workflow_permanent_id"),
     )
 
     browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
@@ -1218,6 +1237,11 @@ class BrowserProfileModel(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     source_browser_type = Column(String, nullable=True)
+    proxy_location = Column(String, nullable=True)
+    proxy_session_id = Column(String, nullable=True)
+    is_managed = Column(Boolean, nullable=False, server_default=sqlalchemy.false(), default=False)
+    workflow_permanent_id = Column(String, nullable=True)
+    browser_profile_key_digest = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -1350,6 +1374,8 @@ class CredentialModel(Base):
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
+    proxy_location = Column(String, nullable=True)
+    proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

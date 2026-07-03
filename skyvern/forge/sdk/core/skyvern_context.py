@@ -85,6 +85,7 @@ class SkyvernContext:
     task_v2_id: str | None = None
     max_steps_override: int | None = None
     browser_session_id: str | None = None
+    browser_runtime: str | None = None
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None

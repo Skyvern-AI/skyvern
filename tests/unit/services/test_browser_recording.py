@@ -18,11 +18,16 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
 )
 from skyvern.services.browser_recording.interpretation import RecordingInterpretationSession
 from skyvern.services.browser_recording.service import (
+    DUPLICATE_ACTION_WINDOW_MS,
     Processor,
+    _is_duplicate_action,
+    _recording_enrichment_llm_handler,
+    _resolve_enrichment_handler,
     deterministic_input_text_parameter_key,
     summarize_exfiltrated_recording_events,
 )
 from skyvern.services.browser_recording.types import (
+    ActionClick,
     ActionInputText,
     ActionKind,
     ActionTarget,
@@ -32,6 +37,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEventCdpParams,
     Mouse,
+    RecordingDraftStep,
     RecordingDraftStepStatus,
     RecordingInterpretationUpdate,
 )
@@ -68,12 +74,15 @@ def make_console_event(
 
     params = {**default_params, **params}
 
+    # params.timestamp is the client clock (Date.now(), ms); the outer event
+    # timestamp is the server clock (time.time(), seconds). Mirror production so
+    # the Wait machine's client/server offset is ~0 for zero-skew fixtures.
     return ExfiltratedConsoleEvent(
         kind="exfiltrated-event",
         source="console",
         event_name="user_interaction",
         params=params,
-        timestamp=timestamp,
+        timestamp=timestamp / 1000.0,
     )
 
 
@@ -154,6 +163,50 @@ def test_identical_click_events_are_deduped() -> None:
 
     assert len(actions) == 1
     assert actions[0].kind == "click"
+
+
+def _click_action(*, timestamp: float, sky_id: str = "sky-123", target_id: str = "button-1") -> ActionClick:
+    return ActionClick(
+        kind=ActionKind.CLICK,
+        target=ActionTarget(
+            id=target_id,
+            sky_id=sky_id,
+            tag_name="BUTTON",
+            texts=["Click me"],
+            mouse=Mouse(xp=0.5, yp=0.5),
+        ),
+        timestamp_start=timestamp,
+        timestamp_end=timestamp,
+        url="https://example.com",
+    )
+
+
+def test_is_duplicate_action_empty_list_is_not_duplicate() -> None:
+    assert _is_duplicate_action(_click_action(timestamp=1000.0), []) is False
+
+
+def test_is_duplicate_action_suppresses_jittered_recapture() -> None:
+    existing = [_click_action(timestamp=1000.0)]
+    jittered = _click_action(timestamp=1000.0 + 2)
+
+    assert _is_duplicate_action(jittered, existing) is True
+
+
+def test_is_duplicate_action_suppresses_non_adjacent_duplicate() -> None:
+    existing = [
+        _click_action(timestamp=1000.0, sky_id="sky-a", target_id="a"),
+        _click_action(timestamp=1010.0, sky_id="sky-b", target_id="b"),
+    ]
+    duplicate_of_first = _click_action(timestamp=1005.0, sky_id="sky-a", target_id="a")
+
+    assert _is_duplicate_action(duplicate_of_first, existing) is True
+
+
+def test_is_duplicate_action_keeps_intentional_repeat_outside_window() -> None:
+    existing = [_click_action(timestamp=1000.0)]
+    later_repeat = _click_action(timestamp=1000.0 + DUPLICATE_ACTION_WINDOW_MS + 1)
+
+    assert _is_duplicate_action(later_repeat, existing) is False
 
 
 def test_hover() -> None:
@@ -318,6 +371,66 @@ def test_input_text_parameter_key_is_derived_from_target_metadata() -> None:
     assert deterministic_input_text_parameter_key(action) == "customer_email"
 
 
+def test_enrichment_handler_uses_dedicated_key_when_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    dedicated = object()
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", lambda key: True)
+    monkeypatch.setattr(svc.LLMAPIHandlerFactory, "get_llm_api_handler", lambda key: dedicated)
+
+    assert _recording_enrichment_llm_handler() is dedicated
+
+
+def test_enrichment_handler_falls_back_when_key_unregistered(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    default = object()
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", lambda key: False)
+    monkeypatch.setattr(app, "LLM_API_HANDLER", default)
+
+    assert _recording_enrichment_llm_handler() is default
+
+
+def test_enrichment_handler_falls_back_on_resolution_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    default = object()
+
+    def boom(key: str) -> bool:
+        raise RuntimeError("registry blew up")
+
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", boom)
+    monkeypatch.setattr(app, "LLM_API_HANDLER", default)
+
+    assert _recording_enrichment_llm_handler() is default
+
+
+def test_enrichment_handler_memoizes_dedicated_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    _resolve_enrichment_handler.cache_clear()
+    dedicated = object()
+    calls = {"is_registered": 0}
+
+    def counting_is_registered(key: str) -> bool:
+        calls["is_registered"] += 1
+        return True
+
+    monkeypatch.setattr(svc.settings, "RECORDING_ENRICHMENT_LLM_KEY", "SOME_KEY")
+    monkeypatch.setattr(svc.LLMConfigRegistry, "is_registered", counting_is_registered)
+    monkeypatch.setattr(svc.LLMAPIHandlerFactory, "get_llm_api_handler", lambda key: dedicated)
+
+    assert _recording_enrichment_llm_handler() is dedicated
+    assert _recording_enrichment_llm_handler() is dedicated
+    assert calls["is_registered"] == 1
+
+
 @pytest.mark.asyncio
 async def test_input_text_placeholder_parameterizes_value_on_enrichment_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -374,10 +487,14 @@ async def test_live_interpretation_emits_placeholder_then_enriched(monkeypatch: 
     session.ingest_events([make_streaming_console_click(timestamp_ms=1000.0)])
     await asyncio.sleep(0.05)
 
-    # the placeholder draft is visible before the LLM responds
-    updates_with_steps = [update for update in updates if update.steps]
+    # the placeholder draft is visible before the LLM responds — it arrives as a
+    # delta (changed_steps), since only snapshots carry the full steps list.
+    def emitted_steps(u: RecordingInterpretationUpdate) -> list[RecordingDraftStep]:
+        return u.steps if u.is_snapshot else u.changed_steps
+
+    updates_with_steps = [update for update in updates if emitted_steps(update)]
     assert updates_with_steps
-    placeholder = updates_with_steps[-1].steps[0]
+    placeholder = emitted_steps(updates_with_steps[-1])[0]
     assert placeholder.status == RecordingDraftStepStatus.INTERPRETING
     assert placeholder.title == "Click 'Click me'"
     assert placeholder.navigation_goal == "Click 'Click me'."
@@ -470,7 +587,8 @@ async def test_live_interpretation_max_wait_fires_during_continuous_events() -> 
         await asyncio.sleep(0.02)
 
     try:
-        assert any(update.steps for update in updates)
+        # steps land in changed_steps (delta) or steps (snapshot) depending on emit type.
+        assert any(update.steps or update.changed_steps for update in updates)
     finally:
         session.cancel()
         # let the cancelled debounce task unwind before the loop closes
@@ -536,14 +654,15 @@ def test_wait_suppressed_when_page_idle() -> None:
     assert [action.kind for action in actions] == [ActionKind.CLICK]
 
 
-def test_wait_emitted_when_page_showed_network_activity() -> None:
+def test_wait_emitted_and_sized_to_page_busy_span() -> None:
     target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
 
     events = [
         make_click_event(target=target, timestamp=1000.0),
-        # page was loading during the idle gap (cdp timestamps are seconds)
+        # page busy until ~7s after the click (cdp timestamps are seconds)
         make_cdp_event("net:activity", timestamp_seconds=4.0, params={"count": 12}),
-        make_focus_event(target=target, timestamp=8000.0),
+        make_cdp_event("net:activity", timestamp_seconds=7.0, params={"count": 3}),
+        make_focus_event(target=target, timestamp=9000.0),
     ]
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
@@ -552,7 +671,110 @@ def test_wait_emitted_when_page_showed_network_activity() -> None:
     assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
     wait_action = actions[1]
     assert isinstance(wait_action, ActionWait)
-    assert wait_action.duration_ms == 7000
+    # busy span = last activity (7000) - click (1000); the 2s idle tail is excluded.
+    assert wait_action.duration_ms == 6000
+
+
+def test_wait_suppressed_when_page_settles_before_threshold() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        make_click_event(target=target, timestamp=1000.0),
+        # page settles ~1.5s in, then a long idle tail — below the wait threshold
+        make_cdp_event("net:activity", timestamp_seconds=2.5, params={"count": 4}),
+        make_focus_event(target=target, timestamp=12000.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK]
+
+
+def _two_consecutive_wait_events() -> list[t.Any]:
+    # Two busy stretches (focus events produce no action) yield two adjacent waits;
+    # a wait resets the timer, so each stretch needs its own pair of focus events.
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+    return [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_cdp_event("net:activity", timestamp_seconds=6.5, params={"count": 9}),
+        make_focus_event(target=target, timestamp=7000.0),
+        make_focus_event(target=target, timestamp=13000.0),
+        make_cdp_event("net:activity", timestamp_seconds=18.5, params={"count": 9}),
+        make_focus_event(target=target, timestamp=19000.0),
+    ]
+
+
+def test_events_to_actions_keeps_waits_separate_for_live_path() -> None:
+    # events_to_actions feeds the incremental live interpreter, which tracks
+    # actions by index, so it must stay append-only (no collapsing here).
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(_two_consecutive_wait_events())
+
+    assert [action.kind for action in actions] == [ActionKind.WAIT, ActionKind.WAIT]
+
+
+def test_collapse_consecutive_waits_merges_durations() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(_two_consecutive_wait_events())
+
+    collapsed = Processor._collapse_consecutive_waits(actions)
+
+    assert [action.kind for action in collapsed] == [ActionKind.WAIT]
+    wait_action = collapsed[0]
+    assert isinstance(wait_action, ActionWait)
+    # 5500ms + 5500ms busy spans summed into a single wait.
+    assert wait_action.duration_ms == 11000
+
+
+def make_skewed_console_event(
+    event_type: str,
+    target: dict[str, t.Any],
+    client_ms: float,
+    server_skew_seconds: float,
+) -> ExfiltratedConsoleEvent:
+    """A console event whose server clock is offset from the client clock."""
+    params: dict[str, t.Any] = {
+        "type": event_type,
+        "target": target,
+        "timestamp": client_ms,
+        "url": "https://example.com",
+        "activeElement": {"tagName": "BUTTON"},
+        "window": {"height": 800, "width": 1200, "scrollX": 0, "scrollY": 0},
+        "mousePosition": {"xp": 0.5, "yp": 0.5},
+    }
+    return ExfiltratedConsoleEvent(
+        kind="exfiltrated-event",
+        source="console",
+        event_name="user_interaction",
+        params=params,
+        timestamp=client_ms / 1000.0 + server_skew_seconds,
+    )
+
+
+def test_wait_offset_projection_cancels_client_server_clock_skew() -> None:
+    # Server clock runs 60s ahead of the client clock. The Wait machine must
+    # project the server-stamped CDP activity back into the client clock so the
+    # busy span is measured correctly; otherwise the activity falls outside the
+    # client-clock gap and the (real) wait is wrongly suppressed.
+    skew = 60.0
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        make_skewed_console_event("click", target, client_ms=1000.0, server_skew_seconds=skew),
+        # real activity at client 4s/7s -> server-stamped 64s/67s
+        make_cdp_event("net:activity", timestamp_seconds=4.0 + skew, params={"count": 12}),
+        make_cdp_event("net:activity", timestamp_seconds=7.0 + skew, params={"count": 3}),
+        make_skewed_console_event("focus", target, client_ms=9000.0, server_skew_seconds=skew),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
+    wait_action = actions[1]
+    assert isinstance(wait_action, ActionWait)
+    assert wait_action.duration_ms == 6000
 
 
 def test_wait_ignores_activity_outside_the_idle_gap() -> None:

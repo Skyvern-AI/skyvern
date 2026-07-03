@@ -21,6 +21,7 @@ from skyvern.forge.sdk.routes import browser_profiles as browser_profiles_route
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile, CreateBrowserProfileRequest
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.schemas.runs import ProxyLocation
 
 _default_profile_template_candidates = browser_profiles_route._default_browser_profile_template_candidates
 
@@ -71,6 +72,7 @@ def _build_client(
         get_workflow_run=AsyncMock(),
         get_workflow=AsyncMock(),
         create_profile=AsyncMock(return_value=_profile()),
+        get_db_profile=AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wp_1")),
         delete_db_profile=AsyncMock(),
         hard_delete_db_profile=AsyncMock(),
         retrieve_profile=AsyncMock(),
@@ -91,6 +93,7 @@ def _build_client(
                 browser_sessions=SimpleNamespace(
                     get_persistent_browser_session=mocks.get_session,
                     create_browser_profile=mocks.create_profile,
+                    get_browser_profile=mocks.get_db_profile,
                     delete_browser_profile=mocks.delete_db_profile,
                     hard_delete_browser_profile=mocks.hard_delete_db_profile,
                 ),
@@ -204,12 +207,37 @@ def test_create_empty_profile_stores_default_profile_seed(
         organization_id="org_oss",
         name="fresh profile",
         description="blank",
+        proxy_location=None,
+        proxy_session_id=None,
     )
     mocks.store_profile.assert_awaited_once()
     assert captured_directory["path"]
     assert not Path(captured_directory["path"]).exists()
     mocks.delete_db_profile.assert_not_awaited()
     mocks.hard_delete_db_profile.assert_not_awaited()
+
+
+def test_create_empty_profile_persists_requested_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, mocks = _build_client(monkeypatch)
+
+    response = client.post(
+        "/v1/browser_profiles/",
+        json={
+            "name": "fresh profile",
+            "proxy_location": ProxyLocation.RESIDENTIAL_ISP,
+            "proxy_session_id": "abc1234567",
+        },
+    )
+
+    assert response.status_code == 200
+    mocks.create_profile.assert_awaited_once_with(
+        organization_id="org_oss",
+        name="fresh profile",
+        description=None,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+    mocks.store_profile.assert_awaited_once()
 
 
 def test_default_profile_template_candidates_come_from_configured_directory(
@@ -377,6 +405,8 @@ def test_create_profile_route_delegates_workflow_run_source(monkeypatch: pytest.
             "name": "my profile",
             "description": "from workflow",
             "workflow_run_id": "wr_1",
+            "proxy_location": None,
+            "proxy_session_id": None,
         }
     ]
     mocks.rate_limit_submit_run.assert_not_awaited()
@@ -392,6 +422,7 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
     mocks.get_workflow_run.return_value = SimpleNamespace(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
+        browser_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -419,6 +450,107 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
 
 
 @pytest.mark.asyncio
+async def test_create_profile_from_workflow_run_reads_managed_profile_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_workflow_run.return_value = SimpleNamespace(
+        workflow_id="wf_1",
+        workflow_permanent_id="wp_1",
+        browser_profile_id="bp_managed",
+    )
+    mocks.get_workflow.return_value = SimpleNamespace(
+        workflow_permanent_id="wp_1",
+        persist_browser_session=True,
+    )
+    mocks.retrieve_profile.return_value = "/tmp/managed_profile_dir"
+
+    profile = await browser_profiles_route._create_profile_from_workflow_run(
+        organization_id="org_oss",
+        name="my profile",
+        description=None,
+        workflow_run_id="wr_1",
+    )
+
+    assert profile == _profile()
+    mocks.retrieve_profile.assert_awaited_once_with(organization_id="org_oss", profile_id="bp_managed")
+    mocks.retrieve_session.assert_not_awaited()
+    mocks.store_profile.assert_awaited_once_with(
+        organization_id="org_oss",
+        profile_id="bp_new",
+        directory="/tmp/managed_profile_dir",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_profile_from_workflow_run_falls_back_to_legacy_archive_for_managed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_workflow_run.return_value = SimpleNamespace(
+        workflow_id="wf_1",
+        workflow_permanent_id="wp_1",
+        browser_profile_id="bp_managed",
+    )
+    mocks.get_workflow.return_value = SimpleNamespace(
+        workflow_permanent_id="wp_1",
+        persist_browser_session=True,
+    )
+    mocks.retrieve_profile.return_value = None
+    mocks.retrieve_session.return_value = "/tmp/workflow_session_dir"
+
+    await browser_profiles_route._create_profile_from_workflow_run(
+        organization_id="org_oss",
+        name="my profile",
+        description=None,
+        workflow_run_id="wr_1",
+    )
+
+    mocks.retrieve_profile.assert_awaited_once_with(organization_id="org_oss", profile_id="bp_managed")
+    mocks.retrieve_session.assert_awaited_once_with(
+        organization_id="org_oss",
+        workflow_permanent_id="wp_1",
+    )
+    mocks.store_profile.assert_awaited_once_with(
+        organization_id="org_oss",
+        profile_id="bp_new",
+        directory="/tmp/workflow_session_dir",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_profile_from_workflow_run_skips_user_profile_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_workflow_run.return_value = SimpleNamespace(
+        workflow_id="wf_1",
+        workflow_permanent_id="wp_1",
+        browser_profile_id="bp_user",
+    )
+    mocks.get_workflow.return_value = SimpleNamespace(
+        workflow_permanent_id="wp_1",
+        persist_browser_session=True,
+    )
+    mocks.get_db_profile.return_value = SimpleNamespace(is_managed=False)
+    mocks.retrieve_session.return_value = "/tmp/workflow_session_dir"
+
+    await browser_profiles_route._create_profile_from_workflow_run(
+        organization_id="org_oss",
+        name="my profile",
+        description=None,
+        workflow_run_id="wr_1",
+    )
+
+    # A user profile's blob is its curated start state, not the run's end state.
+    mocks.retrieve_profile.assert_not_awaited()
+    mocks.retrieve_session.assert_awaited_once_with(
+        organization_id="org_oss",
+        workflow_permanent_id="wp_1",
+    )
+
+
+@pytest.mark.asyncio
 async def test_failed_workflow_run_profile_creation_hard_deletes_half_created_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -426,6 +558,7 @@ async def test_failed_workflow_run_profile_creation_hard_deletes_half_created_pr
     mocks.get_workflow_run.return_value = SimpleNamespace(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
+        browser_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -457,6 +590,48 @@ def test_promote_deletes_source_session_blob(monkeypatch: pytest.MonkeyPatch) ->
     mocks.rate_limit_submit_run.assert_not_awaited()
     mocks.store_profile.assert_awaited_once()
     mocks.delete_profile_blob.assert_awaited_once_with(organization_id="org_oss", profile_id="pbs_1")
+
+
+def test_promote_inherits_session_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session(
+        generate_browser_profile=True,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+    mocks.retrieve_profile.return_value = "/tmp/session_dir"
+
+    response = client.post("/v1/browser_profiles/", json={"name": "my profile", "browser_session_id": "pbs_1"})
+
+    assert response.status_code == 200
+    assert mocks.create_profile.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
+    assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "abc1234567"
+
+
+def test_promote_inherits_session_proxy_pin_for_blank_residential_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session(
+        generate_browser_profile=True,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+    mocks.retrieve_profile.return_value = "/tmp/session_dir"
+
+    response = client.post(
+        "/v1/browser_profiles/",
+        json={
+            "name": "my profile",
+            "browser_session_id": "pbs_1",
+            "proxy_location": ProxyLocation.RESIDENTIAL_ISP,
+            "proxy_session_id": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert mocks.create_profile.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
+    assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "abc1234567"
 
 
 def test_failed_promote_does_not_delete_source_blob(monkeypatch: pytest.MonkeyPatch) -> None:

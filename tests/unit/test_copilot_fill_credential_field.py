@@ -116,6 +116,12 @@ class TestResolveCredentialFillValue:
         monkeypatch.setattr(
             app_instance, "CREDENTIAL_VAULT_SERVICES", {CredentialVaultType.BITWARDEN: vault}, raising=False
         )
+        monkeypatch.setattr(
+            app_instance,
+            "AGENT_FUNCTION",
+            SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
+            raising=False,
+        )
 
     @pytest.mark.asyncio
     async def test_resolves_username_and_password(self, monkeypatch: pytest.MonkeyPatch) -> None:

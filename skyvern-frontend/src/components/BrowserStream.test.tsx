@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => {
     clipboardPasteFrom: ReturnType<typeof vi.fn>;
     sendKey: ReturnType<typeof vi.fn>;
     disconnect: ReturnType<typeof vi.fn>;
+    _framebufferUpdate: () => boolean;
   }> = [];
   const apiGet = vi.fn(async () => ({
     data: {
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => {
     clipboardPasteFrom = vi.fn();
     sendKey = vi.fn();
     disconnect = vi.fn();
+    _framebufferUpdate = vi.fn(() => true);
 
     private listeners: Record<string, RfbListener[]> = {};
 
@@ -78,10 +80,14 @@ const mocks = vi.hoisted(() => {
 
   const recordingStore = {
     add: vi.fn(),
+    addScreenshot: vi.fn(),
+    applyInterpretationUpdate: vi.fn(),
     compressedChunks: [],
+    draftEditDepth: 0,
     getEventCount: vi.fn(() => 0),
     getSecondsRecording: vi.fn(() => 0),
     isRecording: false,
+    manualCapturePaused: false,
     pendingEvents: [],
     reset: vi.fn(),
     setIsRecording: vi.fn(),
@@ -118,11 +124,24 @@ vi.mock("@/store/SettingsStore", () => ({
   useSettingsStore: () => mocks.settingsStore,
 }));
 
-vi.mock("@/store/useRecordingStore", () => ({
-  useRecordingStore: () => mocks.recordingStore,
-}));
+vi.mock("@/store/useRecordingStore", () => {
+  // Honor the selector: BrowserStream reads slices (e.g. state.isRecording) via
+  // useRecordingStore(selector). Ignoring the selector and returning the whole
+  // store makes primitive selectors yield the store object instead of the field
+  // value — truthy where a boolean was expected — spuriously rendering the
+  // recording UI.
+  const useRecordingStore = (
+    selector?: (state: typeof mocks.recordingStore) => unknown,
+  ) => (selector ? selector(mocks.recordingStore) : mocks.recordingStore);
+  // Also read imperatively (reset/addScreenshot/etc.) via getState().
+  useRecordingStore.getState = () => mocks.recordingStore;
+  return {
+    useRecordingStore,
+    countVisibleDraftSteps: (steps: Array<unknown> = []) => steps.length,
+  };
+});
 
-function renderBrowserStream() {
+function renderBrowserStream(props: { onActivity?: () => void } = {}) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -137,6 +156,7 @@ function renderBrowserStream() {
         browserSessionId="pbs_test"
         interactive={false}
         showControlButtons={true}
+        onActivity={props.onActivity}
       />
     </QueryClientProvider>,
   );
@@ -190,5 +210,19 @@ describe("BrowserStream", () => {
     await waitFor(() => {
       expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(4);
     });
+  });
+
+  it("notifies activity after a VNC framebuffer update completes", async () => {
+    const onActivity = vi.fn();
+
+    renderBrowserStream({ onActivity });
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances).toHaveLength(1);
+    });
+
+    mocks.rfbInstances[0]!._framebufferUpdate();
+
+    expect(onActivity).toHaveBeenCalledTimes(1);
   });
 });

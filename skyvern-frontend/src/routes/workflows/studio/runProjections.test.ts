@@ -10,6 +10,7 @@ import {
   buildActionIndex,
   buildBlockStatusMap,
   buildFilmstrip,
+  finalizedRunStatus,
   runOutcomeFromStatus,
 } from "./runProjections";
 
@@ -108,6 +109,25 @@ describe("runOutcomeFromStatus", () => {
   });
 });
 
+describe("finalizedRunStatus", () => {
+  test("null while there is no status or the run is in-flight", () => {
+    expect(finalizedRunStatus(null)).toBeNull();
+    expect(finalizedRunStatus(undefined)).toBeNull();
+    expect(finalizedRunStatus(Status.Created)).toBeNull();
+    expect(finalizedRunStatus(Status.Queued)).toBeNull();
+    expect(finalizedRunStatus(Status.Running)).toBeNull();
+    expect(finalizedRunStatus(Status.Paused)).toBeNull();
+  });
+
+  test("preserves the real terminal status instead of collapsing it", () => {
+    expect(finalizedRunStatus(Status.Completed)).toBe(Status.Completed);
+    expect(finalizedRunStatus(Status.Failed)).toBe(Status.Failed);
+    expect(finalizedRunStatus(Status.Terminated)).toBe(Status.Terminated);
+    expect(finalizedRunStatus(Status.TimedOut)).toBe(Status.TimedOut);
+    expect(finalizedRunStatus(Status.Canceled)).toBe(Status.Canceled);
+  });
+});
+
 describe("buildFilmstrip", () => {
   test("empty or undefined timeline yields no frames", () => {
     expect(buildFilmstrip(undefined)).toEqual([]);
@@ -129,6 +149,7 @@ describe("buildFilmstrip", () => {
     expect(frames.map((f) => f.id)).toEqual(["oldest", "newest"]);
     expect(frames.map((f) => f.index)).toEqual([1, 2]);
     expect(frames.map((f) => f.isBlockStart)).toEqual([true, false]);
+    expect(frames.map((f) => f.blockType)).toEqual(["task", "task"]);
   });
 
   test("marks block boundaries across a multi-block run", () => {

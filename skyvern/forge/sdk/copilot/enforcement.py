@@ -7,25 +7,33 @@ import copy
 import json
 import re
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
+from agents import ModelSettings, RunConfig
 from agents.run import Runner
 
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
     compose_loop_blocker_user_facing_reason,
     loop_blocker_evidence_from_ctx,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    is_durable_fallback_entry_target,
+    is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
 )
+from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
@@ -67,6 +75,8 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     parse_final_response,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, request_policy_has_present_completion_contract
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -82,10 +92,12 @@ from skyvern.forge.sdk.copilot.terminal_predicates import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
+    blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -140,6 +152,9 @@ MAX_CODE_AUTHORING_GUARDRAIL_REJECTS = 4
 # higher bound, which must stay above MAX_CODE_AUTHORING_GUARDRAIL_REJECTS so the
 # non-credential backstop and the low-count credential deferral are untouched.
 MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS = 8
+# Far under the SDK max-turns cap so the halt arrives first.
+MAX_NO_PROGRESS_INTERACTION_ATTEMPTS = 4
+_NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
@@ -150,6 +165,14 @@ SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
+SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
+_SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS = frozenset(
+    {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "fill_credential_field", "update_workflow"}
+)
+_SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
+    {"click", "press_key", "type_text", "select_option", "navigate_browser"}
+)
+_SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
 # OpenAI detail=high cost per resized image. If we support other providers,
 # pull from model config — this value will silently over/undercount otherwise.
 # See screenshot_utils.resize_screenshot_b64 for the dimension contract this
@@ -176,6 +199,13 @@ _PROGRESS_NARRATION_PATTERNS = [
     re.compile(r"\bi\s+will\s+(?:now\s+)?proceed\b", re.IGNORECASE),
     re.compile(r"\bi\s+have\s+not\s+yet\b", re.IGNORECASE),
 ]
+
+PRESENT_COMPLETION_CONTRACT_ASK_RETRY = (
+    "The final ASK_QUESTION is not an allowed terminal response for this turn: the request already has a typed "
+    "completion contract / completion criteria and no separate required clarification is active. Continue authoring "
+    "the workflow from the existing contract, then run/test it before responding. Only ask the user if a separate "
+    "required input is missing under RequestPolicy or TurnIntent."
+)
 
 
 def _is_progress_narration(user_response: Any) -> bool:
@@ -366,6 +396,54 @@ def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBloc
     )
 
 
+def no_forward_progress_interaction_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
+    count = _get_int(ctx, "consecutive_no_progress_interaction_count")
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "loop_detected_no_forward_progress_interaction", evidence, blocked_tool="click"
+    )
+    agent_steering = (
+        f"Clicking has not advanced the page across {count} attempts; "
+        "stop trying new selectors and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="loop_detected_no_forward_progress_interaction",
+        blocked_tool="click",
+    )
+
+
+def _needs_no_progress_interaction_halt(ctx: Any) -> bool:
+    return _get_int(ctx, "consecutive_no_progress_interaction_count") >= MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+
+
+def reset_no_progress_interaction_count(ctx: Any) -> None:
+    if _get_int(ctx, "consecutive_no_progress_interaction_count") == 0:
+        return
+    ctx.consecutive_no_progress_interaction_count = 0
+    clear_tool_blocker_signals_for_reason_codes(ctx, _NO_PROGRESS_INTERACTION_REASON_CODES)
+    LOG.info("copilot_no_progress_interaction_reset")
+
+
+def register_no_progress_interaction_click(ctx: Any, *, outcome: str) -> None:
+    count = _get_int(ctx, "consecutive_no_progress_interaction_count") + 1
+    ctx.consecutive_no_progress_interaction_count = count
+    LOG.info("copilot_no_progress_interaction_click", outcome=outcome, count=count)
+    if count < MAX_NO_PROGRESS_INTERACTION_ATTEMPTS:
+        return
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    signal = no_forward_progress_interaction_stop_signal(ctx)
+    stash_blocker_signal(ctx, signal)
+    ctx.blocker_signal = signal
+
+
 def _needs_code_authoring_churn_halt(ctx: Any) -> bool:
     count = _get_int(ctx, "code_authoring_guardrail_reject_count")
     if getattr(ctx, "last_code_authoring_reject_was_credential_priority", False) is True:
@@ -545,6 +623,13 @@ class CopilotGoalSatisfied(Exception):
     """Raised when a tool proves the workflow already satisfies the turn."""
 
 
+class CopilotBuiltUnverified(Exception):
+    """Raised when clean tests should stop repair without claiming goal success."""
+
+
+BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON = "built_unverified_repair_inert"
+
+
 def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
     contract = ctx.latest_diagnosis_repair_contract
     if contract is None:
@@ -558,8 +643,18 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
     )
 
 
+def _latest_diagnosis_contract_selects_no_repair(ctx: CopilotContext) -> bool:
+    contract = ctx.latest_diagnosis_repair_contract
+    return contract is not None and contract.repair_decision.next_action is RepairNextAction.NO_CHANGE
+
+
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
     return outcome_criteria_evaluated(ctx)
+
+
+def _completion_verification_only_structural_abstentions(ctx: CopilotContext) -> bool:
+    result = ctx.completion_verification_result
+    return result is not None and only_structural_requested_output_abstentions(result)
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
@@ -580,6 +675,17 @@ def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
     return not _verified_goal_likely_needs_more_work(ctx)
 
 
+def built_unverified_repair_inert_context(ctx: CopilotContext) -> bool:
+    return (
+        ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and _outcome_criteria_evaluated(ctx)
+        and _latest_diagnosis_contract_selects_no_repair(ctx)
+        and _completion_verification_only_structural_abstentions(ctx)
+        and not _verified_goal_likely_needs_more_work(ctx)
+    )
+
+
 def verified_goal_claim_authorized(ctx: CopilotContext) -> bool:
     """Whether the terminal may CLAIM a tested success. Turn completion keeps
     flowing through ``verified_goal_satisfied_context``; the claim tier additionally
@@ -598,6 +704,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     """
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
+        "gate_built_unverified_repair_inert": built_unverified_repair_inert_context(ctx),
         "gate_claim_authorized": verified_goal_claim_authorized(ctx),
         "gate_last_test_ok": ctx.last_test_ok is True,
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
@@ -844,6 +951,69 @@ def _completion_contract_unknown_due_to_policy_fallback(ctx: Any) -> bool:
     return _request_completion_contract_status(ctx) == "unknown"
 
 
+_AUTHORING_TURN_INTENT_MODES = frozenset({TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY})
+
+
+def _turn_intent_can_author_without_user_input(turn_intent: Any) -> bool:
+    if not isinstance(turn_intent, TurnIntent):
+        return False
+    if turn_intent.mode not in _AUTHORING_TURN_INTENT_MODES:
+        return False
+    if turn_intent.authority.requires_user_input:
+        return False
+    return turn_intent.authority.may_update_workflow
+
+
+def _turn_intent_can_update_and_run_without_user_input(turn_intent: Any) -> bool:
+    if not _turn_intent_can_author_without_user_input(turn_intent):
+        return False
+    return bool(turn_intent.authority.may_run_blocks)
+
+
+def _has_current_turn_update_or_test_marker(ctx: Any) -> bool:
+    if bool(getattr(ctx, "update_workflow_called", False)):
+        return True
+    if bool(getattr(ctx, "test_after_update_done", False)):
+        return True
+    if getattr(ctx, "last_update_block_count", None) is not None:
+        return True
+    if getattr(ctx, "last_test_ok", None) is not None:
+        return True
+    for field_name in (
+        "last_run_blocks_workflow_run_id",
+        "last_successful_run_blocks_workflow_run_id",
+        "last_outcome_gate_workflow_run_id",
+    ):
+        marker = getattr(ctx, field_name, None)
+        if isinstance(marker, str) and marker.strip():
+            return True
+    return False
+
+
+def _present_completion_contract_ask_retry(ctx: Any, parsed: dict[str, Any]) -> str | None:
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    request_policy = getattr(ctx, "request_policy", None)
+    if not isinstance(request_policy, RequestPolicy):
+        return None
+    if not request_policy_has_present_completion_contract(request_policy):
+        return None
+    if request_policy.user_response_policy == "ask_clarification":
+        return None
+    if request_policy.clarification_reason not in (None, "none"):
+        return None
+    if not _turn_intent_can_author_without_user_input(getattr(ctx, "turn_intent", None)):
+        return None
+    if _has_current_turn_update_or_test_marker(ctx):
+        return None
+    LOG.info(
+        "copilot.present_completion_contract_ask_retry",
+        reason_code="present_completion_contract_ask_internal_retry",
+        turn_intent_mode=getattr(getattr(ctx, "turn_intent", None), "mode", None),
+    )
+    return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
 def _nudge(config: CopilotConfig | None, key: str) -> str:
     if config is None:
         return DEFAULT_ENFORCEMENT_NUDGES[key]
@@ -980,6 +1150,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
     discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
     if discovery_entrypoint_nudge is not None:
         return discovery_entrypoint_nudge
+
+    present_contract_retry = _present_completion_contract_ask_retry(ctx, parsed)
+    if present_contract_retry is not None:
+        return present_contract_retry
 
     if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
         return None
@@ -1240,8 +1414,10 @@ def _check_enforcement(
     raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    if verified:
+    if verified_goal_satisfied_context(ctx):
         raise CopilotGoalSatisfied()
+    if built_unverified_repair_inert_context(ctx):
+        raise CopilotBuiltUnverified()
 
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
@@ -1349,6 +1525,11 @@ def _check_enforcement(
         if churn_signal is not None:
             stash_blocker_signal(ctx, churn_signal)
             stash_turn_halt_from_blocker_signal(ctx, churn_signal, source="enforcement_backstop")
+            raise_if_turn_halt(ctx)
+        if _needs_no_progress_interaction_halt(ctx):
+            no_progress_signal = no_forward_progress_interaction_stop_signal(ctx)
+            stash_blocker_signal(ctx, no_progress_signal)
+            stash_turn_halt_from_blocker_signal(ctx, no_progress_signal, source="enforcement_backstop")
             raise_if_turn_halt(ctx)
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
@@ -1860,7 +2041,8 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     near-duplicate repeats, but a materially longer scout trajectory can refresh
     the deterministic code before the model authors the workflow.
     """
-    if getattr(ctx, "update_workflow_called", False):
+    reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
+    if getattr(ctx, "update_workflow_called", False) and not reopened_after_failed_run:
         return None
     if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
         BlockAuthoringPolicy.CODE_ONLY_BROWSER
@@ -1873,9 +2055,12 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
         return None
     trajectory_len = len(trajectory)
     previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
+    trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
     if (
         getattr(ctx, "synthesized_block_offered", False)
         and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+        and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
+        and not reopened_after_failed_run
     ):
         return None
     synthesized = synthesize_code_block(
@@ -1886,8 +2071,243 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
 
     ctx.synthesized_block_offered = True
     ctx.synthesized_block_offered_trajectory_len = trajectory_len
+    ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete
+    if reopened_after_failed_run:
+        ctx.synthesized_block_reopened_after_failed_run = True
     goal = getattr(ctx, "block_goal_main_goal", "") or getattr(ctx, "user_message", "") or ""
     return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory, goal=goal)}
+
+
+def _completion_verification_unsatisfied(ctx: Any) -> bool:
+    result = getattr(ctx, "completion_verification_result", None)
+    if result is None or getattr(result, "status", None) != "evaluated":
+        return False
+    is_fully_satisfied = getattr(result, "is_fully_satisfied", None)
+    if callable(is_fully_satisfied) and is_fully_satisfied():
+        return False
+    return True
+
+
+def _last_scout_interaction_commits(trajectory: list[Any]) -> bool:
+    if not trajectory:
+        return False
+    last = trajectory[-1]
+    if not isinstance(last, dict):
+        return False
+    return str(last.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS and not is_generic_entry_opener_click(
+        last
+    )
+
+
+def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
+    if getattr(ctx, "synthesized_block_reopened_after_failed_run", False):
+        return True
+    if not getattr(ctx, "update_workflow_called", False):
+        return False
+    if not getattr(ctx, "test_after_update_done", False):
+        return False
+    if getattr(ctx, "last_test_ok", None) is not False:
+        return False
+    if getattr(ctx, "last_test_non_retriable_nav_error", None):
+        return False
+    if not _completion_verification_unsatisfied(ctx):
+        return False
+    trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(trajectory, list):
+        return False
+    previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
+    if len(trajectory) <= previous_offer_len:
+        return False
+    return _last_scout_interaction_commits(trajectory)
+
+
+def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
+    """True once the scout trajectory covers a durable data entry followed by a commit, or reaches a download target.
+    Reuses the synthesizer's validity helpers so an entry ``synthesize_code_block`` would drop never counts as complete."""
+    trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(trajectory, list) or not trajectory:
+        return False
+    download = getattr(ctx, "reached_download_target", None)
+    if isinstance(download, ReachedDownloadTarget) and download.selector:
+        return True
+    last_entry_index: int | None = None
+    for index, item in enumerate(trajectory):
+        if isinstance(item, dict) and is_durable_fallback_entry_target(item):
+            last_entry_index = index
+    if last_entry_index is None:
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+        and not is_generic_entry_opener_click(item)
+        for item in trajectory[last_entry_index + 1 :]
+    )
+
+
+def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
+    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened_after_failed_run(ctx):
+        return False
+    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
+        return False
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return False
+    if not getattr(ctx, "synthesized_block_offered", False):
+        return False
+    trajectory = getattr(ctx, "scout_trajectory", None) or []
+    if (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) != len(trajectory):
+        return False
+    if not getattr(ctx, "synthesized_block_offered_goal_complete", False):
+        return False
+    return synthesized_trajectory_is_goal_complete(ctx)
+
+
+def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
+        return False
+    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened_after_failed_run(ctx):
+        return False
+    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
+        return False
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return False
+    if not getattr(ctx, "synthesized_block_offered", False):
+        return False
+    trajectory = getattr(ctx, "scout_trajectory", None) or []
+    return (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) == len(trajectory)
+
+
+def _ambiguous_bare_selector_repair_context(ctx: Any) -> Any | None:
+    repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
+    if getattr(repair_context, "reason_code", None) != "ambiguous_bare_selector":
+        return None
+    if getattr(repair_context, "workflow_run_id", None):
+        return None
+    if getattr(ctx, "last_run_blocks_workflow_run_id", None):
+        return None
+    return repair_context
+
+
+def _ambiguous_bare_selector_rescout_key(ctx: Any) -> str | None:
+    repair_context = _ambiguous_bare_selector_repair_context(ctx)
+    if repair_context is None:
+        return None
+    if getattr(repair_context, "refiner_selector", None):
+        return None
+    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
+    if isinstance(selector_alternatives, list) and selector_alternatives:
+        return None
+    payload = {
+        "block_label": str(getattr(repair_context, "block_label", "") or ""),
+        "selector": str(getattr(repair_context, "selector", "") or ""),
+        "source_url": str(getattr(repair_context, "source_url", "") or ""),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> str | None:
+    if tool_name != "evaluate":
+        return None
+    repair_context = _ambiguous_bare_selector_repair_context(ctx)
+    if repair_context is None:
+        return None
+    if getattr(repair_context, "refiner_selector", None):
+        return "block"
+    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
+    if isinstance(selector_alternatives, list) and selector_alternatives:
+        return "block"
+    key = _ambiguous_bare_selector_rescout_key(ctx)
+    if key is None:
+        return None
+    if getattr(ctx, "ambiguous_bare_selector_rescout_context_key", None) == key:
+        return "block"
+    # Track the one allowed same-page rescout for this author-time repair context.
+    ctx.ambiguous_bare_selector_rescout_context_key = key
+    return "allow"
+
+
+def _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
+        return False
+    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
+        return False
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return False
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
+        return False
+    if latest.phase != "persisted_block_run" or latest.reason_code != "outcome_not_demonstrated":
+        return False
+    return _completion_verification_unsatisfied(ctx)
+
+
+def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
+    if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
+        return None
+    ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
+    if ambiguous_selector_rescout_state == "allow":
+        return None
+    if _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx, tool_name):
+        return CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text=(
+                "The last recorded test outcome is authoritative and still has unsatisfied completion criteria. "
+                f"Call {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} with a materially changed authored workflow now; "
+                "do not spend the repair attempt on browser interaction."
+            ),
+            user_facing_reason="I need to revise and test the workflow code instead of interacting with the page.",
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL}),
+            preserves_workflow_draft=True,
+            renders_final_reply=False,
+            internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+            blocked_tool=tool_name,
+            extra={"recorded_outcome_reason_code": "outcome_not_demonstrated"},
+        )
+    if (
+        ambiguous_selector_rescout_state != "block"
+        and not _should_force_synthesized_block_persistence(ctx)
+        and not _should_block_mutating_tool_after_synthesized_offer(ctx, tool_name)
+    ):
+        return None
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            "A synthesized code block offer is already available for this authoring turn. "
+            f"Call {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} with that block now before any more scouting, "
+            "reading, page evaluation, or browser interaction. This blocker clears only after "
+            f"{SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} succeeds."
+        ),
+        user_facing_reason="I need to save and test the drafted workflow before scouting more.",
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL}),
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+        blocked_tool=tool_name,
+        extra={
+            "synthesized_block_offered_trajectory_len": (
+                getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
+            ),
+        },
+    )
+
+
+def _runner_kwargs_with_forced_tool_choice(runner_kwargs: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    run_config = runner_kwargs.get("run_config")
+    if isinstance(run_config, RunConfig):
+        model_settings = run_config.model_settings
+        if isinstance(model_settings, ModelSettings):
+            forced_settings = replace(model_settings, tool_choice=tool_name)
+        else:
+            forced_settings = ModelSettings(tool_choice=tool_name)
+        return {**runner_kwargs, "run_config": replace(run_config, model_settings=forced_settings)}
+    return {**runner_kwargs, "run_config": RunConfig(model_settings=ModelSettings(tool_choice=tool_name))}
 
 
 def _assemble_enforcement_messages(
@@ -1958,6 +2378,39 @@ async def run_with_enforcement(
             "enforcement_iteration",
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
+            force_synthesized_block_persistence = _should_force_synthesized_block_persistence(ctx)
+            current_runner_kwargs = (
+                _runner_kwargs_with_forced_tool_choice(runner_kwargs, SYNTHESIZED_BLOCK_PERSISTENCE_TOOL)
+                if force_synthesized_block_persistence
+                else runner_kwargs
+            )
+            effective_run_config = current_runner_kwargs.get("run_config")
+            effective_model_settings = (
+                effective_run_config.model_settings if isinstance(effective_run_config, RunConfig) else None
+            )
+            turn_intent = getattr(ctx, "turn_intent", None)
+            turn_intent_authority = getattr(turn_intent, "authority", None)
+            LOG.info(
+                "copilot synthesized persistence force decision",
+                force_synthesized_block_persistence=force_synthesized_block_persistence,
+                forced_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_synthesized_block_persistence else None),
+                chosen_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_synthesized_block_persistence else None),
+                turn_intent_mode=getattr(getattr(turn_intent, "mode", None), "value", None),
+                turn_intent_may_update_workflow=getattr(turn_intent_authority, "may_update_workflow", None),
+                turn_intent_may_run_blocks=getattr(turn_intent_authority, "may_run_blocks", None),
+                turn_intent_requires_user_input=getattr(turn_intent_authority, "requires_user_input", None),
+                block_authoring_policy=getattr(
+                    normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)),
+                    "value",
+                    None,
+                ),
+                synthesized_block_offered=getattr(ctx, "synthesized_block_offered", False),
+                synthesized_block_offered_trajectory_len=(
+                    getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
+                ),
+                update_workflow_called=getattr(ctx, "update_workflow_called", False),
+                effective_tool_choice=getattr(effective_model_settings, "tool_choice", None),
+            )
             try:
                 result = await _run_streamed_with_deadline(
                     agent,
@@ -1965,7 +2418,7 @@ async def run_with_enforcement(
                     ctx,
                     session,
                     tracked_stream,
-                    runner_kwargs,
+                    current_runner_kwargs,
                     start_time,
                     iteration,
                 )
@@ -2008,7 +2461,7 @@ async def run_with_enforcement(
                         ctx,
                         session,
                         tracked_stream,
-                        runner_kwargs,
+                        current_runner_kwargs,
                         start_time,
                         iteration,
                     )

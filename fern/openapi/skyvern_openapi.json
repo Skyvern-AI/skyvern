@@ -3343,10 +3343,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
               "title": "Vault Type"
             },
-            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+            "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')"
           },
           {
             "name": "credential_type",
@@ -9678,7 +9678,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')"
+            "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
           "browser_profile_id": {
             "anyOf": [
@@ -9767,6 +9767,7 @@
       "CredentialVaultType": {
         "type": "string",
         "enum": [
+          "skyvern",
           "bitwarden",
           "azure_vault",
           "gcp",
@@ -11517,7 +11518,8 @@
         "type": "string",
         "enum": [
           "s3",
-          "azure"
+          "azure",
+          "google_drive"
         ],
         "title": "FileStorageType"
       },
@@ -11673,6 +11675,28 @@
               }
             ],
             "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [
@@ -11836,6 +11860,28 @@
               }
             ],
             "title": "Azure Folder Path"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
           },
           "path": {
             "anyOf": [

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import quote
 
 import pyotp
 import pytest
@@ -13,6 +14,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     TotpType,
 )
+from skyvern.forge.sdk.services.credentials import AuthenticatorTotpErrorCode, AuthenticatorTotpParseResult
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +55,14 @@ def _mock_totp_preview_dependencies(
     )
     mock_credentials = SimpleNamespace(get_credential=AsyncMock(return_value=db_credential))
     monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            parse_enterprise_totp_secret=AsyncMock(return_value=None),
+            parse_enterprise_totp_secret_result=AsyncMock(return_value=AuthenticatorTotpParseResult()),
+        ),
+    )
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
 
     return db_credential, vault_service, mock_credentials
@@ -112,6 +122,23 @@ def test_authenticator_totp_validation_preserves_uri_configuration() -> None:
     assert credential.totp == totp_uri
 
 
+def test_authenticator_totp_validation_preserves_decoded_uri_configuration() -> None:
+    totp_uri = (
+        "otpauth://totp/Example:user@example.com"
+        "?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA256&digits=8&period=60"
+    )
+    credential = NonEmptyPasswordCredential(
+        username="user@example.com",
+        password="pw",
+        totp=quote(totp_uri, safe=""),
+        totp_type=TotpType.AUTHENTICATOR,
+    )
+
+    credentials._normalize_authenticator_totp_or_raise(credential)
+
+    assert credential.totp == totp_uri
+
+
 def test_authenticator_totp_validation_normalizes_raw_secret() -> None:
     credential = NonEmptyPasswordCredential(
         username="user@example.com",
@@ -137,7 +164,138 @@ def test_authenticator_totp_validation_rejects_invalid_secret() -> None:
         credentials._normalize_authenticator_totp_or_raise(credential)
 
     assert exc_info.value.status_code == 400
-    assert "Invalid authenticator key" in exc_info.value.detail
+    assert exc_info.value.detail == {
+        "error_code": AuthenticatorTotpErrorCode.INVALID_AUTHENTICATOR_KEY.value,
+        "message": credentials._AUTHENTICATOR_SECRET_INVALID_DETAIL,
+    }
+
+
+@pytest.mark.asyncio
+async def test_authenticator_totp_validation_returns_enterprise_required_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parse_result = AsyncMock(
+        return_value=AuthenticatorTotpParseResult(
+            error_code=AuthenticatorTotpErrorCode.AUTHENTICATOR_FEATURE_RESTRICTED,
+            message="Enterprise plan required for this authenticator QR.",
+            vendor="okta",
+        )
+    )
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(parse_enterprise_totp_secret_result=parse_result),
+    )
+    credential = NonEmptyPasswordCredential(
+        username="user@example.com",
+        password="pw",
+        totp="phonefactor://activate_account?sharedSecret=JBSWY3DPEHPK3PXP",
+        totp_type=TotpType.AUTHENTICATOR,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await credentials._normalize_authenticator_totp_for_organization_or_raise(
+            credential,
+            organization_id="org_test",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == {
+        "error_code": AuthenticatorTotpErrorCode.AUTHENTICATOR_FEATURE_RESTRICTED.value,
+        "message": "Enterprise plan required for this authenticator QR.",
+        "vendor": "okta",
+    }
+    parse_result.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authenticator_totp_validation_returns_enterprise_no_code_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            parse_enterprise_totp_secret_result=AsyncMock(
+                return_value=AuthenticatorTotpParseResult(
+                    error_code=AuthenticatorTotpErrorCode.AUTHENTICATOR_NO_CODE_SECRET,
+                    message="This authenticator QR enrolls push approval and has no setup key.",
+                    vendor="microsoft",
+                )
+            )
+        ),
+    )
+    credential = NonEmptyPasswordCredential(
+        username="user@example.com",
+        password="pw",
+        totp="phonefactor://activate_account?code=123456",
+        totp_type=TotpType.AUTHENTICATOR,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await credentials._normalize_authenticator_totp_for_organization_or_raise(
+            credential,
+            organization_id="org_test",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == {
+        "error_code": AuthenticatorTotpErrorCode.AUTHENTICATOR_NO_CODE_SECRET.value,
+        "message": "This authenticator QR enrolls push approval and has no setup key.",
+        "vendor": "microsoft",
+    }
+
+
+@pytest.mark.asyncio
+async def test_authenticator_totp_validation_does_not_require_enterprise_for_generic_totp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parse_result = AsyncMock(return_value=AuthenticatorTotpParseResult())
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(parse_enterprise_totp_secret_result=parse_result),
+    )
+    credential = NonEmptyPasswordCredential(
+        username="user@example.com",
+        password="pw",
+        totp="JBSW Y3DP-EHPK 3PXP",
+        totp_type=TotpType.AUTHENTICATOR,
+    )
+
+    await credentials._normalize_authenticator_totp_for_organization_or_raise(
+        credential,
+        organization_id="org_test",
+    )
+
+    assert credential.totp == "JBSWY3DPEHPK3PXP"
+    parse_result.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authenticator_totp_validation_saves_enterprise_secret_canonically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parse_result = AsyncMock(return_value=AuthenticatorTotpParseResult(secret="JBSW Y3DP-EHPK 3PXP"))
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(parse_enterprise_totp_secret_result=parse_result),
+    )
+    credential = NonEmptyPasswordCredential(
+        username="user@example.com",
+        password="pw",
+        totp='{"methods":[{"type":"totp","sharedSecret":"JBSWY3DPEHPK3PXP"}]}',
+        totp_type=TotpType.AUTHENTICATOR,
+    )
+
+    await credentials._normalize_authenticator_totp_for_organization_or_raise(
+        credential,
+        organization_id="org_test",
+    )
+
+    assert credential.totp == "JBSWY3DPEHPK3PXP"
+    parse_result.assert_awaited_once()
 
 
 def test_authenticator_totp_validation_ignores_non_authenticator_methods() -> None:
@@ -241,7 +399,10 @@ async def test_get_credential_totp_code_logs_invalid_saved_secret(monkeypatch: p
         )
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == credentials._SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL
+    assert exc_info.value.detail == {
+        "error_code": AuthenticatorTotpErrorCode.INVALID_AUTHENTICATOR_KEY.value,
+        "message": credentials._SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL,
+    }
     warning_mock.assert_called_once_with(
         "Saved authenticator key is invalid for TOTP code preview",
         credential_id="cred_test",

@@ -4,7 +4,7 @@ import {
   ReadableActionTypes,
   Status,
 } from "@/api/types";
-import { statusIsAFailureType } from "@/routes/tasks/types";
+import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
 import {
   isBlockItem,
   WorkflowRunTimelineItem,
@@ -53,6 +53,16 @@ export function runOutcomeFromStatus(
   return "running";
 }
 
+// Null while the run is in-flight; the tab shows only the terminal status.
+export function finalizedRunStatus(
+  status: Status | null | undefined,
+): Status | null {
+  if (status == null) {
+    return null;
+  }
+  return statusIsFinalized({ status }) ? status : null;
+}
+
 export type FilmstripFrame = {
   id: string;
   index: number;
@@ -62,12 +72,13 @@ export type FilmstripFrame = {
   actionType: ActionType;
   label: string;
   status: Status;
+  blockType: string | null;
   screenshotArtifactId: string | null;
   stepId: string | null;
   actionOrder: number | null;
 };
 
-function actionLabel(action: ActionsApiResponse): string {
+export function actionLabel(action: ActionsApiResponse): string {
   const candidate =
     action.intention?.trim() ||
     action.description?.trim() ||
@@ -108,6 +119,7 @@ export function buildFilmstrip(
             actionType: action.action_type,
             label: actionLabel(action),
             status: action.status,
+            blockType: block.block_type ?? null,
             screenshotArtifactId: action.screenshot_artifact_id ?? null,
             stepId: action.step_id,
             actionOrder: action.action_order,

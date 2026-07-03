@@ -5,8 +5,37 @@ import { type UnexecutedBlockReason } from "./workflowTimelineUtils";
 
 type Props = {
   block: WorkflowBlock;
+  depth?: number;
   reason?: UnexecutedBlockReason;
 };
+
+const INDENT_PX = 14;
+const MAX_INDENT_RAIL_DEPTH = 6;
+const RAIL_HIGHLIGHT_OFFSET_PX = INDENT_PX / 2;
+const RAIL_CONTENT_PADDING_PX = INDENT_PX - 1;
+
+const railHighlightStyle = {
+  marginLeft: `-${RAIL_HIGHLIGHT_OFFSET_PX}px`,
+  paddingLeft: `${RAIL_CONTENT_PADDING_PX}px`,
+};
+
+function IndentRails({ depth }: { depth: number }) {
+  // Cap rails so deeply nested skipped/unreached rows stay readable.
+  const rails = Math.min(depth, MAX_INDENT_RAIL_DEPTH);
+  return (
+    <>
+      {Array.from({ length: rails }).map((_, i) => (
+        <div
+          key={i}
+          className="relative shrink-0 self-stretch"
+          style={{ width: `${INDENT_PX}px` }}
+        >
+          <div className="absolute inset-y-0 left-1/2 w-px bg-slate-700" />
+        </div>
+      ))}
+    </>
+  );
+}
 
 const reasonBadge: Record<
   UnexecutedBlockReason,
@@ -44,6 +73,7 @@ function getTypeLabel(block: WorkflowBlock): string {
 
 function WorkflowRunTimelineUnexecutedBlockItem({
   block,
+  depth = 0,
   reason = "not_reached",
 }: Props) {
   const typeLabel = getTypeLabel(block);
@@ -52,9 +82,10 @@ function WorkflowRunTimelineUnexecutedBlockItem({
   return (
     <div className="min-w-0 opacity-60">
       <div className="flex min-h-[28px] items-stretch text-xs">
+        <IndentRails depth={depth} />
         <div
           className="flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-1 pr-1.5"
-          style={{ marginLeft: "-7px", paddingLeft: "13px" }}
+          style={railHighlightStyle}
         >
           <div className="size-4 shrink-0" />
           <div className="flex min-w-0 flex-1 items-center gap-1.5">

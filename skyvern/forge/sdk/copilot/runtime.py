@@ -35,6 +35,10 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.build_test_outcome import (
+        RecordedBuildTestOutcome,
+        RecordedOutcomeGroundingRequirement,
+    )
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -204,6 +208,15 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    # Climbs on each click that made no verified forward progress (failed/timed-out
+    # click or a hollow post-click observe); resets on verified progress.
+    consecutive_no_progress_interaction_count: int = 0
+    last_scout_act_observe_outcome: str | None = None
+    last_scout_act_observe_packet: dict[str, Any] | None = None
+    last_scout_act_observe_recapture_attempted: bool = False
+    last_scout_act_observe_recapture_result: str = ""
+    ambiguous_bare_selector_rescout_context_key: str | None = None
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
@@ -235,6 +248,9 @@ class AgentContext:
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
+    latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     completion_verification_result: CompletionVerificationResult | None = None
     verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -284,6 +300,8 @@ class AgentContext:
     reached_download_target: ReachedDownloadTarget | None = None
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
+    synthesized_block_offered_goal_complete: bool = False
+    synthesized_block_reopened_after_failed_run: bool = False
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0
@@ -293,6 +311,9 @@ class AgentContext:
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
     # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
     pending_scout_role_name: tuple[str, str, str] | None = None
+    # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
+    # settle re-perception on whether that selector still resolves to a live element.
+    pending_scout_click_selector: str | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.

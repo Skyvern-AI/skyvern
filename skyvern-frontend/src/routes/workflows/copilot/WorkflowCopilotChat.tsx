@@ -14,7 +14,6 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
-  ChevronRightIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
@@ -246,11 +245,24 @@ interface ChatMessage {
   narrative?: TurnNarrativeState;
 }
 
+const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const narrative = messages[index]?.narrative;
+    if (narrative?.turnId && shouldShowDiffCard(narrative)) {
+      return narrative.turnId;
+    }
+  }
+  return null;
+};
+
 type QueuedPrompt = {
   id: string;
   content: string;
   reason: QueuedPromptReason;
   audioBlob?: Blob | null;
+  // The one-shot fix-origin signal travels with the prompt it was seeded for, so
+  // discarding the queue (new chat, history load, agent switch) drops it too.
+  fixOrigin?: boolean;
 };
 
 type SendOptions = {
@@ -336,14 +348,18 @@ interface WorkflowCopilotChatProps {
   onMessageCountChange?: (count: number) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
+  workflowRunId?: string | null;
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
+  // Sent as fix_origin only on the initial turn; does not propagate to subsequent turns.
+  initialMessageFixOrigin?: boolean;
   onInitialMessageConsumed?: () => void;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
-  // Collapse the docked panel to a rail. Only used when `docked`.
-  onCollapse?: () => void;
+  // Render frameless — no border, background, or title; the header keeps only
+  // the controls row. Only used when `docked`.
+  chromeless?: boolean;
   // When docked, render into this element via a portal (keeps the component in
   // its parent's React tree so canvas callbacks stay wired) instead of inline.
   portalTarget?: HTMLElement | null;
@@ -411,12 +427,14 @@ export function WorkflowCopilotChat({
   onMessageCountChange,
   buttonRef,
   liveBrowserSessionId,
+  workflowRunId: workflowRunIdProp,
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
+  initialMessageFixOrigin,
   onInitialMessageConsumed,
   docked = false,
-  onCollapse,
+  chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
@@ -477,6 +495,11 @@ export function WorkflowCopilotChat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  // Turn IDs the user explicitly rejected. This is client-local because reject
+  // only reverts the local canvas; the backend proposalDisposition stays fixed.
+  const [rejectedTurnIds, setRejectedTurnIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -565,7 +588,11 @@ export function WorkflowCopilotChat({
     posY: 0,
   });
   const credentialGetter = useCredentialGetter();
-  const { workflowRunId, workflowPermanentId } = useParams();
+  const { workflowRunId: routeWorkflowRunId, workflowPermanentId } =
+    useParams();
+  // The studio focuses a run via ?wr= (not a path param), so the route param is
+  // empty there; an explicit prop grounds the chat in that run and wins.
+  const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -675,6 +702,7 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
+    setRejectedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
@@ -707,6 +735,10 @@ export function WorkflowCopilotChat({
           return hydrated;
         })(),
       }));
+      const pendingProposalTurnId = data.proposed_workflow
+        ? getLatestDiffCardTurnId(historyMessages)
+        : null;
+      latestTurnId.current = pendingProposalTurnId;
       setMessages(historyMessages);
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
@@ -721,6 +753,7 @@ export function WorkflowCopilotChat({
       if (!workflowPermanentId) return;
       setIsLoadingHistory(true);
       updateQueuedPrompt(null);
+      setRejectedTurnIds(new Set());
       setNarrative(EMPTY_NARRATIVE);
       turnSnapshots.current.clear();
       pendingSubmitSnapshot.current = null;
@@ -866,10 +899,13 @@ export function WorkflowCopilotChat({
     // The staged proposal was rendered onto the canvas mid-turn (via
     // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
     // canvas state captured client-side at submit time.
-    const turnId = latestTurnId.current;
+    const turnId = latestTurnId.current ?? getLatestDiffCardTurnId(messages);
     const entry = turnId ? turnSnapshots.current.get(turnId) : null;
     if (entry?.snapshot) {
       applyWorkflowUpdate(entry.snapshot);
+    }
+    if (turnId) {
+      setRejectedTurnIds((prev) => new Set(prev).add(turnId));
     }
     setProposedWorkflow(null);
     void clearProposedWorkflow(false);
@@ -1105,8 +1141,11 @@ export function WorkflowCopilotChat({
     }
 
     updateQueuedPrompt(null);
-    // Discard the queued block-build's target so it can't leak into the next normal message.
+    // Drop the queued block-build target so it doesn't leak into the next message.
+    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
+    // a future path set it without queuing.
     blockBuildTargetLabelRef.current = null;
+    fixOriginPendingRef.current = false;
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -1139,6 +1178,7 @@ export function WorkflowCopilotChat({
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
   const blockBuildTargetLabelRef = useRef<string | null>(null);
+  const fixOriginPendingRef = useRef(false);
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
@@ -1179,11 +1219,18 @@ export function WorkflowCopilotChat({
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
         const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        // Move the pending fix-origin signal off the bare ref and onto the
+        // queued prompt so a discard of the queue (new chat, history load)
+        // can't leave it set to leak into the next, unrelated turn. The drain
+        // restores it onto the ref before re-entering handleSend.
+        const queuedFixOrigin = fixOriginPendingRef.current;
+        fixOriginPendingRef.current = false;
         updateQueuedPrompt({
           id: queuedId,
           content: candidate,
           reason,
           audioBlob: messageAudioBlob,
+          fixOrigin: queuedFixOrigin,
         });
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
@@ -1303,6 +1350,7 @@ export function WorkflowCopilotChat({
             run_with: saveData.settings.runWith,
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
+            enable_self_healing: saveData.settings.enableSelfHealing ?? false,
             code_version:
               saveData.settings.runWith === "code"
                 ? (saveData.settings.codeVersion ?? 2)
@@ -1470,6 +1518,10 @@ export function WorkflowCopilotChat({
           }
         };
 
+        // Consume the one-shot fix-origin signal before any awaitable send step so a pre-stream
+        // failure (e.g. getSseClient throwing) can't leave it set to leak into the next turn.
+        const fixOrigin = fixOriginPendingRef.current;
+        fixOriginPendingRef.current = false;
         const client = await getSseClient(credentialGetter);
         const targetBlockLabel = blockBuildTargetLabelRef.current;
         blockBuildTargetLabelRef.current = null;
@@ -1492,6 +1544,7 @@ export function WorkflowCopilotChat({
               isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
             cancel_token: cancelToken,
             target_block_label: targetBlockLabel,
+            fix_origin: fixOrigin,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -1735,6 +1788,9 @@ export function WorkflowCopilotChat({
     // prompt that still needs the browser re-queues under the same id and
     // drains via the live_browser path once the session arrives.
     updateQueuedPrompt(null);
+    // Restore the fix-origin signal the prompt carried so the drained turn
+    // sends it; a re-queue (working → live_browser) re-captures it off the ref.
+    fixOriginPendingRef.current = promptToSend.fixOrigin ?? false;
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
@@ -1775,12 +1831,16 @@ export function WorkflowCopilotChat({
     // live browser isn't ready yet.
     hasAutoSentRef.current = true;
     onInitialMessageConsumedRef.current?.();
+    if (initialMessageFixOrigin) {
+      fixOriginPendingRef.current = true;
+    }
     handleSend(initialMessage).catch((error) => {
       console.error("Auto-send failed:", error);
     });
   }, [
     handleSend,
     initialMessage,
+    initialMessageFixOrigin,
     isLoading,
     isLoadingHistory,
     queuedPrompt,
@@ -1792,7 +1852,12 @@ export function WorkflowCopilotChat({
     if (!initialMessage || hasAutoSentRef.current) {
       return;
     }
-    if (isLoadingHistory || isWaitingForLiveBrowser || queuedPrompt) {
+    if (
+      isLoadingHistory ||
+      isLoading ||
+      isWaitingForLiveBrowser ||
+      queuedPrompt
+    ) {
       return;
     }
     const saveData = getSaveData();
@@ -1816,6 +1881,7 @@ export function WorkflowCopilotChat({
   }, [
     initialMessage,
     isLoadingHistory,
+    isLoading,
     isWaitingForLiveBrowser,
     queuedPrompt,
     getSaveData,
@@ -1981,9 +2047,9 @@ export function WorkflowCopilotChat({
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working — message will queue…"
+      ? "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
-        ? "Live browser is starting. Send now to queue your prompt."
+        ? "Live browser is starting. Your next send will wait until it connects."
         : null;
   const inputStatusText = isSpeechListening
     ? browserStatusText
@@ -1995,7 +2061,9 @@ export function WorkflowCopilotChat({
     <div
       className={
         docked
-          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          ? chromeless
+            ? "relative flex h-full w-full flex-col overflow-hidden text-foreground"
+            : "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
           : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
       }
       style={
@@ -2012,21 +2080,27 @@ export function WorkflowCopilotChat({
       {/* Header */}
       <div
         className={
-          "flex items-center justify-between border-b border-border px-4" +
-          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+          "flex items-center border-b border-border px-4" +
+          (docked
+            ? chromeless
+              ? " h-11 shrink-0 justify-end"
+              : " h-14 shrink-0 justify-between"
+            : " cursor-move justify-between py-2")
         }
         onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <div className="flex items-center gap-2">
-          <h3 className="text-sm font-semibold text-foreground">
-            {docked ? "Copilot" : "Agent Copilot (Beta)"}
-          </h3>
-          {docked ? (
-            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
-              Beta
-            </span>
-          ) : null}
-        </div>
+        {chromeless ? null : (
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-foreground">
+              {docked ? "Copilot" : "Agent Copilot (Beta)"}
+            </h3>
+            {docked ? (
+              <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+                Beta
+              </span>
+            ) : null}
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <WorkflowCopilotHistory
             workflowPermanentId={workflowPermanentId}
@@ -2044,18 +2118,8 @@ export function WorkflowCopilotChat({
           </button>
           <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
           <span className="text-xs text-muted-foreground">Active</span>
-          {docked ? (
-            onCollapse ? (
-              <button
-                type="button"
-                onClick={onCollapse}
-                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                title="Collapse Copilot"
-              >
-                <ChevronRightIcon className="h-4 w-4" />
-              </button>
-            ) : null
-          ) : (
+          {/* Only the floating window closes itself; docked chrome is external. */}
+          {docked ? null : (
             <button
               type="button"
               onClick={() => onClose?.()}
@@ -2153,7 +2217,14 @@ export function WorkflowCopilotChat({
                       </div>
                     ) : null}
                     {docked && shouldShowDiffCard(message.narrative) ? (
-                      <DiffCard turn={message.narrative} />
+                      <DiffCard
+                        pendingProposal={showProposalActions}
+                        rejected={
+                          message.narrative.turnId !== null &&
+                          rejectedTurnIds.has(message.narrative.turnId)
+                        }
+                        turn={message.narrative}
+                      />
                     ) : null}
                     {docked &&
                     isLastMessage &&
@@ -2272,9 +2343,9 @@ export function WorkflowCopilotChat({
               queuedPrompt
                 ? "Prompt queued..."
                 : isLoading
-                  ? "Type a message to queue for the next turn…"
+                  ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
-                    ? "Type a prompt to queue..."
+                    ? "Type a prompt to send when ready..."
                     : "Message Skyvern Copilot…"
             }
             value={inputValue}
@@ -2309,13 +2380,15 @@ export function WorkflowCopilotChat({
           ) : isLoading ? (
             <>
               <button
+                type="button"
                 onClick={() => handleSend()}
-                title="Queue for the next turn"
+                title="Send after this turn finishes"
                 className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
-                Queue
+                Send next
               </button>
               <button
+                type="button"
                 onClick={cancelSend}
                 title="Cancel run"
                 className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"

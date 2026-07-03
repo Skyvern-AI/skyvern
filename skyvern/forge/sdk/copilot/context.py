@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -12,6 +14,10 @@ from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
+    loaded_result_target_structure_signature,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -91,6 +97,10 @@ class TurnNarrativePayload(TypedDict):
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.build_test_outcome import (
+        RecordedBuildTestOutcome,
+        RecordedOutcomeGroundingRequirement,
+    )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
@@ -134,6 +144,14 @@ class ObservedPage(BaseModel):
     reached_via: str = ""
 
 
+class LoadedResultTargetContext(BaseModel):
+    selector: str = ""
+    is_table: bool = False
+    row_selector: str = ""
+    row_count: int | None = None
+    structure_signature: str = ""
+
+
 class CodeAuthoringRepairContext(BaseModel):
     block_label: str
     reason_code: str
@@ -147,6 +165,23 @@ class CodeAuthoringRepairContext(BaseModel):
     selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
     allowed_global_names: list[str] = Field(default_factory=list)
     allowed_helper_surface: dict[str, list[str]] = Field(default_factory=dict)
+    runtime_failure_reason: str | None = None
+    runtime_failure_class: str | None = None
+    output_dependency_failure_class: str | None = None
+    missing_output_key: str | None = None
+    available_output_keys: list[str] = Field(default_factory=list)
+    current_block_parameter_keys: list[str] = Field(default_factory=list)
+    failed_block_status: str | None = None
+    workflow_run_id: str | None = None
+    current_origin: str | None = None
+    current_url_present: bool = False
+    current_title_present: bool = False
+    page_evidence_source: str | None = None
+    observed_after_workflow_run: bool = False
+    page_form_summaries: list[str] = Field(default_factory=list)
+    page_result_summaries: list[str] = Field(default_factory=list)
+    page_action_summaries: list[str] = Field(default_factory=list)
+    page_challenge_summaries: list[str] = Field(default_factory=list)
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
@@ -163,9 +198,14 @@ class StructuredContext(BaseModel):
     discovery_calls_made: int = 0
     page_inspection_calls_made: int = 0
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
+    loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
-        return self.model_dump_json(indent=2)
+        payload = self.model_dump(mode="json")
+        payload["loaded_result_targets"] = [
+            _sanitized_loaded_result_target_payload(target) for target in self.loaded_result_targets
+        ]
+        return json.dumps(payload, indent=2)
 
     @classmethod
     def from_json_str(cls, raw: str | None) -> StructuredContext:
@@ -250,6 +290,65 @@ class StructuredContext(BaseModel):
             self.credentials_checked = self.credentials_checked[-40:]
 
 
+def _sanitized_loaded_result_target_payload(
+    target: LoadedResultTargetContext,
+) -> dict[str, object]:
+    structure_signature = loaded_result_target_structure_signature(
+        is_table=target.is_table,
+        row_count=target.row_count,
+    )
+    return {
+        "is_table": target.is_table,
+        "row_count": target.row_count,
+        "structure_signature": structure_signature,
+    }
+
+
+def sanitize_global_llm_context_for_prompt(global_llm_context: str | None) -> str:
+    raw = global_llm_context or ""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    targets = payload.get("loaded_result_targets")
+    if not isinstance(targets, list):
+        return raw
+
+    sanitized_targets: list[dict[str, object]] = []
+    for target in targets:
+        if not isinstance(target, Mapping):
+            continue
+        try:
+            target_context = LoadedResultTargetContext.model_validate(target)
+        except Exception:
+            continue
+        sanitized_targets.append(_sanitized_loaded_result_target_payload(target_context))
+    payload["loaded_result_targets"] = sanitized_targets
+    return json.dumps(payload, indent=2)
+
+
+def render_loaded_result_context_for_prompt(global_llm_context: str) -> str:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    if not structured.loaded_result_targets:
+        return ""
+    lines = [
+        "Author an extraction or validation block from these loaded-result targets.",
+        "Do not call evaluate just to re-read the same loaded results.",
+    ]
+    for index, target in enumerate(structured.loaded_result_targets, start=1):
+        lines.append(f"- target {index}:")
+        lines.append(f"  table: {str(target.is_table).lower()}")
+        if target.row_count is not None:
+            lines.append(f"  row_count: {target.row_count}")
+        if target.structure_signature:
+            lines.append(f"  structure_signature: {target.structure_signature}")
+    return "\n".join(lines)
+
+
 _MAX_OBSERVED_ACTED_PAGES = 20
 
 
@@ -277,6 +376,21 @@ def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[d
     return list(by_url.values())[-_MAX_OBSERVED_ACTED_PAGES:]
 
 
+def _loaded_result_targets_from_steer(
+    steer: LoadedResultCompositionEvidence | None,
+) -> list[LoadedResultTargetContext]:
+    if steer is None:
+        return []
+    return [
+        LoadedResultTargetContext(
+            is_table=target.is_table,
+            row_count=target.row_count,
+            structure_signature=target.structure_signature,
+        )
+        for target in steer.targets
+    ]
+
+
 def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
     """Fold the per-chat discovery counter into the outgoing global_llm_context.
 
@@ -294,12 +408,23 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
     inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
     flow_evidence = getattr(ctx, "flow_evidence", None) or []
-    if not raw_context and this_turn == 0 and inspections_this_turn == 0 and not flow_evidence:
+    loaded_result_targets = _loaded_result_targets_from_steer(
+        getattr(ctx, "latest_evaluate_result_composition_steer", None)
+    )
+    if (
+        not raw_context
+        and this_turn == 0
+        and inspections_this_turn == 0
+        and not flow_evidence
+        and not loaded_result_targets
+    ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
+    # Replace with this turn's targets so stale extraction hints do not persist.
+    sc.loaded_result_targets = loaded_result_targets
     return sc.to_json_str()
 
 
@@ -480,6 +605,7 @@ class CopilotContext(AgentContext):
     # state untouched, because the browser session is now in post-failure
     # state and the prefix labels can no longer be trusted as an anchor.
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
+    verified_terminal_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
     verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
@@ -499,7 +625,11 @@ class CopilotContext(AgentContext):
     # True when the most-recent such rejection deferred to the credential-scout
     # gate, so the churn backstop yields to that message instead of pre-empting it.
     last_code_authoring_reject_was_credential_priority: bool = False
+    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the
     # high-water length of the verified block prefix. A repair that grows either

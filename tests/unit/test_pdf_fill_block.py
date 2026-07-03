@@ -20,7 +20,9 @@ from pypdf.generic import (
 )
 
 from skyvern.forge import app
+from skyvern.forge.sdk.utils.tesseract_languages import tesseract_language_arg, tesseract_ocr_packages
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models import pdf_fill_block
 from skyvern.forge.sdk.workflow.models.block import PdfFillBlock, extract_file_url_from_block_output
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import FlatPdfAnchor, FlatPlacement, PdfFieldInventory
@@ -587,6 +589,37 @@ def test_parse_tesseract_tsv_skips_malformed_numeric_rows() -> None:
     anchors = PdfFillBlock._parse_tesseract_tsv(tsv, page_index=0, id_offset=0)
 
     assert [a.text for a in anchors] == ["City:"]
+
+
+def test_tesseract_command_includes_configured_languages(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pdf_fill_block, "FLAT_FILL_OCR_LANGUAGES", "eng+spa+fra")
+
+    assert PdfFillBlock._tesseract_command("/tmp/page.png") == [
+        "tesseract",
+        "/tmp/page.png",
+        "stdout",
+        "-l",
+        "eng+spa+fra",
+        "tsv",
+    ]
+
+
+def test_tesseract_command_allows_empty_language_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pdf_fill_block, "FLAT_FILL_OCR_LANGUAGES", "")
+
+    assert PdfFillBlock._tesseract_command("/tmp/page.png") == ["tesseract", "/tmp/page.png", "stdout", "tsv"]
+
+
+def test_tesseract_language_helpers_share_package_defaults() -> None:
+    language_packs = ("eng", "spa", "chi-sim", "chi-tra")
+
+    assert tesseract_ocr_packages(language_packs) == [
+        "tesseract-ocr-eng",
+        "tesseract-ocr-spa",
+        "tesseract-ocr-chi-sim",
+        "tesseract-ocr-chi-tra",
+    ]
+    assert tesseract_language_arg(language_packs) == "eng+spa+chi_sim+chi_tra"
 
 
 def test_escape_pdf_text() -> None:

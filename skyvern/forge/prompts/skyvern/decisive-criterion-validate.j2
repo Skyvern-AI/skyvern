@@ -1,10 +1,11 @@
-Your are here to help the user determine if the current page has met the complete/terminate criterion. Use the criterions of complete/terminate, the content of the elements parsed from the page, the screenshots of the page, and user details to determine whether the criterions has been met.
-
+{% if without_page_information %}You are here to help the user determine if the complete/terminate criterion has been met. Use ONLY the criterion text and the user details / prior workflow data shown below. The current page is not relevant to this validation — do not reason about page content, URLs, or visual evidence.
+{% else %}You are here to help the user determine if the current page has met the complete/terminate criterion. Use the criterions of complete/terminate, the content of the elements parsed from the page, the screenshots of the page, and user details to determine whether the criterions has been met.
+{% endif %}
 
 Reply in JSON format with the following keys:
 {
-    "page_info": str, // Think step by step. Describe all the useful information in the page related to the complete/terminate criterion.
-    "thoughts": str, // Think step by step. What information makes you believe whether and which criterion has been met. Use information you see on the site to explain.
+    "page_info": str, // Think step by step. Describe all the useful information {% if without_page_information %}from the criterion and user details{% else %}in the page{% endif %} related to the complete/terminate criterion.
+    "thoughts": str, // Think step by step. What information makes you believe whether and which criterion has been met. {% if without_page_information %}Use only the criterion text and user details below to explain.{% else %}Use information you see on the site to explain.{% endif %}
     "actions": array // You are supposed to give only one action("COMPLETE" or "TERMINATE") in the action list. Here's the format of the action:
     [{
         "reasoning": str, // The reasoning behind the action. This reasoning must be user information agnostic. Mention why you chose the action type, and why you chose the element id. Keep the reasoning short and to the point.
@@ -12,14 +13,14 @@ Reply in JSON format with the following keys:
         "action_type": str, // It's a string enum: "COMPLETE", "TERMINATE". Use "COMPLETE" when the complete criterion is met (if provided). Use "TERMINATE" when the terminate criterion is met (if provided), or when a complete criterion is provided but not met.
     }]
 }
-
+{% if not without_page_information %}
 HTML elements from `{{ current_url }}`:
 ```
 {{ elements }}
 ```
 
 The URL of the page you're on right now is `{{ current_url }}`.
-
+{% endif %}
 {% if complete_criterion %}
 Complete Criterion:
 ```

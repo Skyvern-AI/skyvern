@@ -93,7 +93,14 @@ describe("CredentialItem TOTP code preview", () => {
     mockedGetClient.mockResolvedValue({
       get: vi.fn().mockRejectedValue({
         isAxiosError: true,
-        response: { data: { detail: "Saved authenticator key is invalid." } },
+        response: {
+          data: {
+            detail: {
+              error_code: "invalid_authenticator_key",
+              message: "Saved authenticator key is invalid.",
+            },
+          },
+        },
       }),
     } as never);
 

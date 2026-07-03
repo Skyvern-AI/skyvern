@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import json
 import keyword
 import re
 import textwrap
 import tokenize
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Annotated, Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -25,6 +26,15 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_terminal_evidence_on_workflow_edit,
     stash_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestOutcomeReasonCode,
+    RecordedBuildTestOutcome,
+    authored_structure_signature_from_workflow,
+    latest_recorded_build_test_outcome_repeated,
+    record_build_test_outcome,
+    recorded_outcome_from_author_time_reject,
+    recorded_outcome_from_authoring_repair_context,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
@@ -64,6 +74,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
+from skyvern.forge.sdk.copilot.output_contracts import (
+    code_block_available_binding_keys_by_label,
+    declared_string_workflow_parameter_keys,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
@@ -144,6 +158,13 @@ class BlockObservationRef(BaseModel):
 
 
 ArtifactEvidenceStatus = Literal["satisfied", "missing", "diagnostic_only", "observed_not_verified"]
+ExtractionSchemaProvenance = Literal["self_authored", "user_edited"]
+SelectedExtractionMetadataDisposition = Literal[
+    "none",
+    "browser_spine_replaced_metadata_stale",
+    "self_authored_extraction_preserved",
+    "sibling_or_suffix_extraction_preserved",
+]
 
 
 class CodeArtifactClaimedOutcome(BaseModel):
@@ -170,6 +191,7 @@ class CodeArtifactClaimedOutcome(BaseModel):
             "and validated against it. Same dialect as the legacy `data_schema` lever."
         ),
     )
+    extraction_schema_provenance: ExtractionSchemaProvenance = "self_authored"
     evidence_refs: list[str] = Field(default_factory=list)
     observation_refs: list[str] = Field(default_factory=list)
     required_tokens: list[str] = Field(default_factory=list)
@@ -226,6 +248,7 @@ class CodeArtifactTerminalVerifierExpectation(BaseModel):
         default=None,
         description="JSON Schema (serialized JSON string) of the confirmed extraction shape terminal verification expects.",
     )
+    extraction_schema_provenance: ExtractionSchemaProvenance = "self_authored"
 
 
 class CodeArtifactExplorationObservation(BaseModel):
@@ -379,12 +402,14 @@ def _normalize_code_artifact_metadata(
     *,
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
+    verified_runtime_output_paths_by_label: Mapping[str, set[str]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     result = _normalize_code_artifact_metadata_detailed(
         raw_metadata,
         workflow_yaml,
         impose_defaults=impose_defaults,
         scout_trajectory=scout_trajectory,
+        verified_runtime_output_paths_by_label=verified_runtime_output_paths_by_label,
     )
     return result.normalized, result.error
 
@@ -395,6 +420,7 @@ def _normalize_code_artifact_metadata_detailed(
     *,
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
+    verified_runtime_output_paths_by_label: Mapping[str, set[str]] | None = None,
 ) -> CodeArtifactNormalization:
     """Normalize submitted artifact metadata at the persist seam.
 
@@ -416,6 +442,7 @@ def _normalize_code_artifact_metadata_detailed(
     seen_labels: set[str] = set()
     for raw_item in items:
         try:
+            raw_item = _default_missing_extraction_schema_provenance(raw_item)
             metadata = (
                 raw_item
                 if isinstance(raw_item, CodeArtifactMetadata)
@@ -506,7 +533,14 @@ def _normalize_code_artifact_metadata_detailed(
         schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
         if schema_conformance_error is not None:
             item_violations.append(schema_conformance_error)
-        schema_incompatibility = _extraction_schema_incompatibility(label, dumped, block_code)
+        schema_incompatibility = _extraction_schema_incompatibility(
+            label,
+            dumped,
+            block_code,
+            verified_runtime_output_paths=(
+                verified_runtime_output_paths_by_label.get(label) if verified_runtime_output_paths_by_label else None
+            ),
+        )
         if schema_incompatibility is not None:
             schema_incompatibilities.append(schema_incompatibility)
             item_violations.append(render_schema_incompatibility_agent_steer(schema_incompatibility))
@@ -765,6 +799,77 @@ def _code_artifact_metadata_items(raw_metadata: Any) -> list[Any]:
     return [raw_metadata]
 
 
+def _default_missing_extraction_schema_provenance(raw_item: Any) -> Any:
+    if isinstance(raw_item, CodeArtifactMetadata) or not isinstance(raw_item, Mapping):
+        return raw_item
+    item = copy.deepcopy(raw_item)
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        rows = item.get(field_name)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            schema = row.get("extraction_schema")
+            if schema is None or (isinstance(schema, str) and not schema.strip()):
+                continue
+            row.setdefault("extraction_schema_provenance", "user_edited")
+    return item
+
+
+def _downgrade_stale_selected_metadata_item(item: dict[str, Any], selected_label: str) -> None:
+    if str(item.get("block_label") or "").strip() != selected_label:
+        return
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_mutable_rows(item.get(field_name)):
+            row.pop("goal_value_paths", None)
+            if field_name == "terminal_verifier_expectations":
+                row.pop("criteria_ids", None)
+                row.pop("claimed_outcome_ids", None)
+    criteria = _artifact_mutable_rows(item.get("completion_criteria"))
+    if not criteria:
+        item["completion_criteria"] = [
+            {
+                "id": f"criterion:{_artifact_label_fragment(selected_label)}_diagnostic",
+                "text": str(item.get("declared_goal") or selected_label).strip() or selected_label,
+                "level": "outcome",
+                "terminal": False,
+            }
+        ]
+        criteria = _artifact_mutable_rows(item.get("completion_criteria"))
+    for criterion in criteria:
+        criterion["level"] = "outcome"
+        criterion["terminal"] = False
+    criterion_ids = [str(criterion.get("id") or "").strip() for criterion in criteria]
+    criterion_ids = [criterion_id for criterion_id in criterion_ids if criterion_id]
+    for row in _artifact_mutable_rows(item.get("claimed_outcomes")):
+        row.pop("criteria_ids", None)
+        if criterion_ids:
+            row["covered_criteria"] = list(criterion_ids)
+    for row in _artifact_mutable_rows(item.get("terminal_verifier_expectations")):
+        if criterion_ids:
+            row["criteria_ids"] = list(criterion_ids)
+
+
+def _downgrade_stale_selected_goal_value_paths(raw_metadata: Any, selected_label: str) -> Any:
+    if raw_metadata in (None, [], {}) or not selected_label:
+        return raw_metadata
+    scrubbed = copy.deepcopy(raw_metadata)
+    if isinstance(scrubbed, list):
+        for item in scrubbed:
+            if isinstance(item, dict):
+                _downgrade_stale_selected_metadata_item(item, selected_label)
+    elif isinstance(scrubbed, dict):
+        if "block_label" in scrubbed:
+            _downgrade_stale_selected_metadata_item(scrubbed, selected_label)
+        else:
+            for block_label, value in scrubbed.items():
+                if block_label == selected_label and isinstance(value, dict):
+                    value.setdefault("block_label", selected_label)
+                    _downgrade_stale_selected_metadata_item(value, selected_label)
+    return scrubbed
+
+
 def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, Mapping[str, Any]]:
     if workflow_yaml is None:
         return {}
@@ -858,79 +963,11 @@ def _unresolved_symbol_repair_context_enabled(ctx: AgentContext) -> bool:
 
 
 def _declared_string_workflow_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, Mapping):
-        return set()
-    parameters = workflow_definition.get("parameters")
-    if not isinstance(parameters, list):
-        return set()
-    keys: set[str] = set()
-    for parameter in parameters:
-        if not isinstance(parameter, Mapping):
-            continue
-        key = str(parameter.get("key") or "").strip()
-        if not key or _is_credential_parameter(parameter) or is_sensitive_workflow_parameter(dict(parameter)):
-            continue
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type and parameter_type != "workflow":
-            continue
-        if workflow_parameter_type and workflow_parameter_type != "string":
-            continue
-        keys.add(key)
-    return keys
+    return declared_string_workflow_parameter_keys(parsed)
 
 
 def _code_block_available_binding_keys_by_label(workflow_yaml: str | None) -> dict[str, list[str]]:
-    if workflow_yaml is None:
-        return {}
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, Mapping):
-        return {}
-    available_by_label: dict[str, set[str]] = {}
-
-    def block_output_key(block: Mapping[str, Any]) -> str | None:
-        label = str(block.get("label") or "").strip()
-        return f"{label}_output" if label else None
-
-    def visit_branch(branch: Mapping[str, Any], available_keys: set[str]) -> None:
-        for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-            visit_blocks(branch.get(key), set(available_keys))
-        for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-            branches = branch.get(branch_key)
-            if not isinstance(branches, list):
-                continue
-            for nested_branch in branches:
-                if isinstance(nested_branch, Mapping):
-                    visit_branch(nested_branch, set(available_keys))
-
-    def visit_blocks(blocks: Any, available_keys: set[str]) -> set[str]:
-        if not isinstance(blocks, list):
-            return available_keys
-        for block in blocks:
-            if not isinstance(block, Mapping):
-                continue
-            label = str(block.get("label") or "").strip()
-            if label and _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
-                available_by_label.setdefault(label, set()).update(available_keys)
-            for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-                visit_blocks(block.get(key), set(available_keys))
-            for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-                branches = block.get(branch_key)
-                if not isinstance(branches, list):
-                    continue
-                for branch in branches:
-                    if isinstance(branch, Mapping):
-                        visit_branch(branch, set(available_keys))
-            output_key = block_output_key(block)
-            if output_key:
-                available_keys.add(output_key)
-        return available_keys
-
-    workflow_definition = parsed.get("workflow_definition")
-    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, Mapping) else None
-    visit_blocks(blocks, _declared_string_workflow_parameter_keys(parsed))
-    return {label: sorted(keys) for label, keys in available_by_label.items()}
+    return code_block_available_binding_keys_by_label(workflow_yaml)
 
 
 def _code_block_authoring_repair_context(
@@ -1043,6 +1080,7 @@ def _repair_context_log_values(values: list[str], *, max_items: int = 20) -> lis
 def _set_code_authoring_repair_context(ctx: AgentContext, repair_context: CodeAuthoringRepairContext | None) -> None:
     ctx.last_code_authoring_repair_context = repair_context
     if repair_context is not None:
+        record_build_test_outcome(ctx, recorded_outcome_from_authoring_repair_context(repair_context))
         LOG.info(
             "copilot code authoring repair context stored",
             reason_code=repair_context.reason_code,
@@ -1066,6 +1104,10 @@ _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_p
 
 
 def _record_code_authoring_guardrail_reject(ctx: AgentContext, *, defer_churn_stop: bool = False) -> None:
+    # Callers record the current build-test outcome first so repeat detection compares that key to history.
+    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
+    if repeated_outcome is False:
+        ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
     LOG.info(
@@ -1087,6 +1129,809 @@ def _record_code_authoring_guardrail_reject(ctx: AgentContext, *, defer_churn_st
         return
     stash_blocker_signal(ctx, signal)
     ctx.blocker_signal = signal
+
+
+def _record_author_time_reject_outcome(
+    ctx: AgentContext,
+    *,
+    reason_code: BuildTestOutcomeReasonCode,
+    summary: str,
+    structural_payload: Mapping[str, object] | None = None,
+    authored_structure_signature: str | None = None,
+    block_labels: list[str] | None = None,
+    missing_requested_output_facts: list[dict[str, object]] | None = None,
+) -> None:
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_author_time_reject(
+            reason_code=reason_code,
+            block_labels=block_labels or [],
+            structural_payload=structural_payload,
+            authored_structure_signature=authored_structure_signature,
+            observed_evidence_summary=summary,
+            missing_requested_output_facts=missing_requested_output_facts or [],
+        ),
+    )
+
+
+def _code_safety_reject_payload(errors: list[str | CodeBlockSecurityError]) -> Mapping[str, object] | None:
+    entries: list[dict[str, object]] = []
+    for error in errors:
+        if isinstance(error, CodeBlockSecurityError):
+            entries.append(
+                {
+                    "block_label": error.block_label,
+                    "reason_code": error.reason_code,
+                    "surface": error.surface,
+                }
+            )
+    if not entries:
+        return None
+    return {"code_safety_errors": entries}
+
+
+def _credential_scout_reject_payload(workflow_yaml: str) -> Mapping[str, object] | None:
+    entries: list[dict[str, object]] = []
+    for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items():
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        accesses = [
+            {
+                "parameter_key": access.parameter_key,
+                "field": access.field,
+                "requires_live_scout": access.requires_live_scout,
+            }
+            for access in _credential_field_accesses(code)
+        ]
+        if accesses or _CODE_SUBMIT_ACTION_RE.search(code):
+            entries.append(
+                {
+                    "block_label": label,
+                    "credential_field_accesses": accesses,
+                    "requires_submit": bool(_CODE_SUBMIT_ACTION_RE.search(code)),
+                }
+            )
+    if not entries:
+        return None
+    return {"credential_scout_requirements": entries}
+
+
+def _code_artifact_metadata_reject_payload(
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    offending_labels: list[str],
+    violation_categories: list[str],
+    missing_labels: list[str] | None = None,
+) -> Mapping[str, object] | None:
+    labels = sorted(dict.fromkeys([*offending_labels, *(missing_labels or [])]))
+    if not labels:
+        labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+    payload = {
+        "reason_code": "metadata_reject",
+        "offending_labels": labels,
+        "required_fields": [
+            "declared_goal",
+            *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS,
+            "evidence_refs_or_observation_refs",
+        ],
+        "missing_fields_by_label": _metadata_missing_required_fields_by_label(
+            raw_metadata,
+            labels=labels,
+            missing_labels=missing_labels or [],
+        ),
+        "output_path_roots": _metadata_output_path_roots(raw_metadata),
+        "output_path_roots_by_label": _metadata_output_path_roots_by_label(raw_metadata),
+        "code_block_output_status": _metadata_reject_code_block_output_status(
+            workflow_yaml,
+            raw_metadata=raw_metadata,
+            labels=labels,
+        ),
+        "violation_categories": sorted(dict.fromkeys(violation_categories)),
+    }
+    return payload
+
+
+def _metadata_missing_required_fields_by_label(
+    raw_metadata: object,
+    *,
+    labels: list[str],
+    missing_labels: list[str],
+) -> dict[str, list[str]]:
+    items_by_label: dict[str, Mapping[str, Any]] = {}
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if label and label not in items_by_label:
+            items_by_label[label] = item
+
+    missing_label_set = set(missing_labels)
+    missing_by_label: dict[str, list[str]] = {}
+    for label in labels:
+        item = items_by_label.get(label)
+        if item is None or label in missing_label_set:
+            missing_by_label[label] = [
+                "declared_goal",
+                *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS,
+                "evidence_refs_or_observation_refs",
+            ]
+            continue
+        missing_fields: list[str] = []
+        if not str(item.get("declared_goal") or "").strip():
+            missing_fields.append("declared_goal")
+        for field_name in _CODE_ARTIFACT_REQUIRED_LIST_FIELDS:
+            value = item.get(field_name)
+            if not isinstance(value, list) or not value:
+                missing_fields.append(field_name)
+        if not item.get("evidence_refs") and not item.get("observation_refs"):
+            missing_fields.append("evidence_refs_or_observation_refs")
+        if missing_fields:
+            missing_by_label[label] = missing_fields
+    return missing_by_label
+
+
+def _metadata_output_path_roots(raw_metadata: object) -> list[str]:
+    roots: set[str] = set()
+    for label_roots in _metadata_output_path_roots_by_label(raw_metadata).values():
+        roots.update(label_roots)
+    return sorted(roots)
+
+
+def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list[str]]:
+    roots_by_label: dict[str, set[str]] = {}
+    for label, paths in _metadata_output_paths_by_label(raw_metadata).items():
+        roots = roots_by_label.setdefault(label, set())
+        for path in paths:
+            root = _top_level_path_segment(path)
+            if root:
+                roots.add(root)
+    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+
+
+def _metadata_output_paths_by_label(raw_metadata: object) -> dict[str, list[str]]:
+    paths_by_label: dict[str, set[str]] = {}
+    unlabeled_index = 0
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if not label:
+            unlabeled_index += 1
+            label = f"<unlabeled:{unlabeled_index}>"
+        paths = paths_by_label.setdefault(label, set())
+        paths.update(_metadata_item_output_paths(item))
+    return {label: sorted(paths) for label, paths in sorted(paths_by_label.items()) if paths}
+
+
+def _metadata_item_output_path_roots(item: Mapping[str, Any]) -> set[str]:
+    roots: set[str] = set()
+    for path in _metadata_item_output_paths(item):
+        root = _top_level_path_segment(path)
+        if root:
+            roots.add(root)
+    return roots
+
+
+def _metadata_item_output_paths(item: Mapping[str, Any]) -> set[str]:
+    """Return declared output paths plus schema property roots used for static root matching."""
+    paths: set[str] = set()
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(item.get(field_name)):
+            paths.update(_artifact_goal_value_paths(row.get("goal_value_paths")))
+            schema = _parse_extraction_schema(row.get("extraction_schema"))
+            if schema is not None:
+                paths.update(_schema_property_roots(schema))
+    return paths
+
+
+def _metadata_reject_code_block_output_status(
+    workflow_yaml: str,
+    *,
+    raw_metadata: object,
+    labels: list[str],
+) -> dict[str, Mapping[str, object]]:
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    metadata_by_label: dict[str, Mapping[str, Any]] = {}
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if label and label not in metadata_by_label:
+            metadata_by_label[label] = item
+
+    status: dict[str, Mapping[str, object]] = {}
+    for label in labels:
+        block = code_blocks.get(label)
+        if block is None:
+            continue
+        block_code = str(block.get("code") or "")
+        metadata = metadata_by_label.get(label)
+        status[label] = {
+            "block_type": _enum_or_string_name(block.get("block_type")) or str(block.get("block_type") or ""),
+            "has_code": bool(block_code.strip()),
+            "declares_output_intent": _block_declares_output_intent(block),
+            "declares_output_roots": sorted(_metadata_item_output_path_roots(metadata)) if metadata else [],
+            "has_meaningful_output": _code_block_has_meaningful_output(block_code, metadata),
+        }
+    return status
+
+
+def _schema_property_roots(schema: Mapping[str, object]) -> set[str]:
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping):
+        return {str(key) for key in properties if str(key)}
+    items = schema.get("items")
+    if isinstance(items, Mapping):
+        return _schema_property_roots(items)
+    return set()
+
+
+def _metadata_violation_categories(violations: list[str]) -> list[str]:
+    categories: list[str] = []
+    for violation in violations:
+        if "requires non-empty" in violation:
+            categories.append("missing_required_list")
+        elif "requires a non-empty `declared_goal`" in violation:
+            categories.append("missing_declared_goal")
+        elif "requires `evidence_refs` or `observation_refs`" in violation:
+            categories.append("missing_artifact_refs")
+        elif "requires `source_tool`" in violation:
+            categories.append("missing_source_tool")
+        elif "goal_value_paths" in violation:
+            categories.append("invalid_goal_value_paths")
+        elif "extraction_schema" in violation:
+            categories.append("invalid_extraction_schema")
+        elif "return" in violation or "output" in violation:
+            categories.append("invalid_output_shape")
+        else:
+            categories.append("metadata_contract_violation")
+    return categories
+
+
+def _unchanged_after_recorded_outcome_signature(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    code_artifact_metadata: object,
+) -> str | None:
+    latest = ctx.latest_recorded_build_test_outcome
+    if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
+        return None
+    candidate_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
+    if candidate_signature is None or candidate_signature != latest.authored_structure_signature:
+        return None
+    return candidate_signature
+
+
+def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
+    latest = ctx.latest_recorded_build_test_outcome
+    if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
+        return False
+    if latest.phase != "persisted_block_run" or latest.reason_code != "outcome_not_demonstrated":
+        return False
+    if latest.missing_requested_output_facts:
+        return True
+    verification = getattr(ctx, "completion_verification_result", None)
+    if verification is None or getattr(verification, "status", None) != "evaluated":
+        return False
+    return not verification.is_fully_satisfied()
+
+
+def _recorded_outcome_missing_output_paths(ctx: AgentContext) -> set[str]:
+    latest = ctx.latest_recorded_build_test_outcome
+    paths: set[str] = set()
+    if isinstance(latest, RecordedBuildTestOutcome) and latest.reason_code == "outcome_not_demonstrated":
+        for fact in latest.missing_requested_output_facts:
+            path = str(fact.get("output_path") or fact.get("output_root") or "").strip()
+            if path:
+                paths.add(path)
+    if paths:
+        return paths
+    verification = getattr(ctx, "completion_verification_result", None)
+    if verification is None or getattr(verification, "status", None) != "evaluated":
+        return set()
+    for verdict in getattr(verification, "verdicts", []):
+        if getattr(verdict, "satisfied", False):
+            continue
+        output_path = str(getattr(verdict, "output_path", "") or "").strip()
+        if output_path:
+            paths.add(output_path)
+    return paths
+
+
+def _candidate_missing_required_output_paths(
+    workflow_yaml: str,
+    code_artifact_metadata: object,
+    *,
+    required_paths: set[str],
+) -> list[str]:
+    if not required_paths:
+        return []
+    required_paths = {path for path in (str(item).strip() for item in required_paths) if path}
+    declared_paths_by_label = {
+        label: set(paths) for label, paths in _metadata_output_paths_by_label(code_artifact_metadata).items()
+    }
+    produced_by_label = _workflow_yaml_produced_output_roots_by_label(workflow_yaml)
+    covered_paths: set[str] = set()
+    abstained_declared_paths: set[str] = set()
+    for label, declared_paths in declared_paths_by_label.items():
+        produced = produced_by_label.get(label)
+        if produced is None:
+            continue
+        for required_path in required_paths & declared_paths:
+            if _top_level_path_segment(required_path) in produced.roots:
+                covered_paths.add(required_path)
+        if produced.abstained:
+            abstained_declared_paths.update(required_paths & declared_paths)
+    missing_paths = required_paths - covered_paths
+    if missing_paths:
+        missing_paths -= abstained_declared_paths
+    return sorted(missing_paths)
+
+
+class _ProducedOutputRoots(NamedTuple):
+    roots: set[str]
+    abstained: bool = False
+
+
+def _workflow_yaml_produced_output_roots_by_label(workflow_yaml: str) -> dict[str, _ProducedOutputRoots]:
+    return {
+        label: _code_block_produced_output_roots(str(block.get("code") or ""))
+        for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items()
+    }
+
+
+def _code_block_produced_output_roots(code: str) -> _ProducedOutputRoots:
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return _ProducedOutputRoots(set(), True)
+    scope_statements = list(_iter_top_level_scope(tree.body))
+    assigned_roots = _assigned_top_level_names(tree.body)
+    dict_assignments: dict[str, set[str]] = {}
+    dynamic_dict_assignment_names: set[str] = set()
+    helper_return_roots = _helper_function_literal_return_roots(tree.body)
+    returned_roots: set[str] = set()
+    abstained = False
+    saw_return = False
+    for node in scope_statements:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if isinstance(node.value, ast.Dict):
+                produced = _dict_literal_output_roots(node.value)
+                dict_assignments[node.targets[0].id] = produced.roots
+                if produced.abstained:
+                    dynamic_dict_assignment_names.add(node.targets[0].id)
+        elif isinstance(node, ast.Assign):
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and isinstance(node.value, ast.Dict):
+                produced = _dict_literal_output_roots(node.value)
+                dict_assignments[node.target.id] = produced.roots
+                if produced.abstained:
+                    dynamic_dict_assignment_names.add(node.target.id)
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
+        elif isinstance(node, ast.AugAssign):
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
+        elif isinstance(node, ast.Return):
+            saw_return = True
+            if node.value is not None:
+                returned = _return_output_roots(
+                    node.value,
+                    dict_assignments,
+                    dynamic_dict_assignment_names,
+                    helper_return_roots,
+                )
+                returned_roots.update(returned.roots)
+                abstained = abstained or returned.abstained
+    roots = returned_roots if saw_return else assigned_roots
+    return _ProducedOutputRoots(roots, abstained)
+
+
+def _apply_literal_dict_key_assignment(
+    dict_assignments: dict[str, set[str]],
+    dynamic_dict_assignment_names: set[str],
+    node: ast.Assign | ast.AnnAssign | ast.AugAssign,
+) -> None:
+    targets: list[ast.expr] = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    else:
+        targets = [node.target]
+    for target in targets:
+        assignment = _literal_dict_key_assignment(target)
+        target_name = _dict_subscript_target_name(target)
+        if assignment is None:
+            if target_name in dict_assignments:
+                dynamic_dict_assignment_names.add(target_name)
+            continue
+        name, key = assignment
+        if name in dict_assignments:
+            dict_assignments[name].add(key)
+
+
+def _dict_subscript_target_name(target: ast.expr) -> str | None:
+    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        return target.value.id
+    return None
+
+
+def _literal_dict_key_assignment(target: ast.expr) -> tuple[str, str] | None:
+    if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+        return None
+    key_node = target.slice
+    if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str) and key_node.value.strip():
+        return target.value.id, key_node.value.strip()
+    return None
+
+
+def _return_output_roots(
+    node: ast.expr,
+    dict_assignments: Mapping[str, set[str]],
+    dynamic_dict_assignment_names: set[str],
+    helper_return_roots: Mapping[str, _ProducedOutputRoots],
+) -> _ProducedOutputRoots:
+    if isinstance(node, ast.Await):
+        return _return_output_roots(node.value, dict_assignments, dynamic_dict_assignment_names, helper_return_roots)
+    if isinstance(node, ast.Name):
+        if node.id in dict_assignments:
+            return _ProducedOutputRoots(
+                set(dict_assignments.get(node.id, set())), node.id in dynamic_dict_assignment_names
+            )
+        return _ProducedOutputRoots(set(), True)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return helper_return_roots.get(node.func.id, _ProducedOutputRoots(set(), True))
+    if isinstance(node, ast.Dict):
+        return _dict_literal_output_roots(node)
+    if isinstance(node, ast.List):
+        return _list_literal_output_roots(node)
+    if isinstance(node, (ast.Constant, ast.Tuple, ast.Set)):
+        return _ProducedOutputRoots(set(), False)
+    return _ProducedOutputRoots(set(), True)
+
+
+def _list_literal_output_roots(node: ast.List) -> _ProducedOutputRoots:
+    if not node.elts:
+        return _ProducedOutputRoots(set(), False)
+    if all(isinstance(element, ast.Dict) for element in node.elts):
+        roots: set[str] = set()
+        abstained = False
+        for element in node.elts:
+            produced = _dict_literal_output_roots(cast(ast.Dict, element))
+            roots.update(produced.roots)
+            abstained = abstained or produced.abstained
+        return _ProducedOutputRoots(roots, abstained)
+    if all(isinstance(element, ast.Constant) for element in node.elts):
+        return _ProducedOutputRoots(set(), False)
+    return _ProducedOutputRoots(set(), True)
+
+
+def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[str, _ProducedOutputRoots]:
+    helpers: dict[str, _ProducedOutputRoots] = {}
+    for statement in statements:
+        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        dict_assignments: dict[str, set[str]] = {}
+        dynamic_dict_assignment_names: set[str] = set()
+        roots: set[str] = set()
+        abstained = False
+        saw_return = False
+        for helper_statement in _iter_top_level_scope(statement.body):
+            if (
+                isinstance(helper_statement, ast.Assign)
+                and len(helper_statement.targets) == 1
+                and isinstance(helper_statement.targets[0], ast.Name)
+            ):
+                if isinstance(helper_statement.value, ast.Dict):
+                    produced = _dict_literal_output_roots(helper_statement.value)
+                    dict_assignments[helper_statement.targets[0].id] = produced.roots
+                    if produced.abstained:
+                        dynamic_dict_assignment_names.add(helper_statement.targets[0].id)
+            elif isinstance(helper_statement, ast.Assign):
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
+            elif isinstance(helper_statement, ast.AnnAssign):
+                if isinstance(helper_statement.target, ast.Name) and isinstance(helper_statement.value, ast.Dict):
+                    produced = _dict_literal_output_roots(helper_statement.value)
+                    dict_assignments[helper_statement.target.id] = produced.roots
+                    if produced.abstained:
+                        dynamic_dict_assignment_names.add(helper_statement.target.id)
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
+            elif isinstance(helper_statement, ast.AugAssign):
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
+            elif isinstance(helper_statement, ast.Return):
+                saw_return = True
+                if helper_statement.value is not None:
+                    returned = _return_output_roots(
+                        helper_statement.value,
+                        dict_assignments,
+                        dynamic_dict_assignment_names,
+                        {},
+                    )
+                    roots.update(returned.roots)
+                    abstained = abstained or returned.abstained
+        if roots or abstained or saw_return:
+            helpers[statement.name] = _ProducedOutputRoots(roots, abstained)
+    return helpers
+
+
+def _dict_literal_output_roots(node: ast.Dict) -> _ProducedOutputRoots:
+    roots: set[str] = set()
+    abstained = False
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
+            roots.add(key.value.strip())
+        else:
+            abstained = True
+    return _ProducedOutputRoots(roots, abstained)
+
+
+def _dict_literal_string_key_roots(node: ast.expr) -> set[str]:
+    if not isinstance(node, ast.Dict):
+        return set()
+    roots: set[str] = set()
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
+            roots.add(key.value.strip())
+    return roots
+
+
+def _output_empty_code_block_labels(workflow_yaml: str, code_artifact_metadata: object) -> list[str]:
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    if not code_blocks:
+        return []
+    metadata_by_label = code_artifact_metadata if isinstance(code_artifact_metadata, Mapping) else {}
+    labels_without_output = [
+        label
+        for label, block in code_blocks.items()
+        if not _code_block_has_meaningful_output(
+            str(block.get("code") or ""),
+            metadata_by_label.get(label),
+        )
+    ]
+    return sorted(labels_without_output) if len(labels_without_output) == len(code_blocks) else []
+
+
+def _code_block_has_meaningful_output(code: str, artifact: object) -> bool:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    helper_return_roots = _helper_function_literal_return_roots(tree.body)
+
+    class ReturnVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.has_meaningful_return = False
+
+        def visit_Return(self, node: ast.Return) -> None:
+            if _return_value_is_meaningful(node.value, helper_return_roots):
+                self.has_meaningful_return = True
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    visitor = ReturnVisitor()
+    visitor.visit(tree)
+    if visitor.has_meaningful_return:
+        return True
+    if _code_block_has_top_level_return(tree):
+        return False
+    if isinstance(artifact, Mapping):
+        goal_roots = _artifact_goal_value_roots(artifact)
+        if goal_roots and _missing_declared_output_roots(code, goal_roots) is None:
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class _ScoutedSelectOptionInteraction:
+    selector: str
+    source_origin: str
+    value_present: bool
+    label_present: bool
+
+
+def _scouted_select_option_interactions(ctx: AgentContext) -> list[_ScoutedSelectOptionInteraction]:
+    trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(trajectory, list):
+        return []
+    interactions: list[_ScoutedSelectOptionInteraction] = []
+    seen: set[tuple[str, str, bool, bool]] = set()
+    for interaction in trajectory:
+        if not isinstance(interaction, Mapping):
+            continue
+        if str(interaction.get("tool_name") or "").strip() != "select_option":
+            continue
+        selector = _safe_selector_repair_atom(interaction.get("selector"))
+        if not selector:
+            continue
+        raw_source_url = str(interaction.get("source_url") or "").strip()
+        source_origin = (url_origin(raw_source_url) or "") if raw_source_url else ""
+        entry = _ScoutedSelectOptionInteraction(
+            selector=selector,
+            source_origin=source_origin,
+            value_present=bool(str(interaction.get("value") or "").strip()),
+            label_present=bool(str(interaction.get("label") or interaction.get("option_label") or "").strip()),
+        )
+        key = (entry.selector, entry.source_origin, entry.value_present, entry.label_present)
+        if key in seen:
+            continue
+        seen.add(key)
+        interactions.append(entry)
+    return interactions
+
+
+def _select_option_text_click_repair_context(
+    workflow_yaml: str, ctx: AgentContext
+) -> CodeAuthoringRepairContext | None:
+    expected_interactions = _scouted_select_option_interactions(ctx)
+    if not expected_interactions:
+        return None
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    candidate_selectors = _workflow_select_option_call_selectors(code_blocks.values())
+    if None in candidate_selectors:
+        return None
+    missing_interactions = [
+        interaction for interaction in expected_interactions if interaction.selector not in candidate_selectors
+    ]
+    if not missing_interactions:
+        return None
+    for label, block in code_blocks.items():
+        tree = _parsed_code_tree(str(block.get("code") or ""))
+        if tree is None or not _code_contains_get_by_text_click(tree):
+            continue
+        missing_interaction = missing_interactions[0]
+        return CodeAuthoringRepairContext(
+            block_label=label,
+            reason_code="select_option_interaction_mismatch",
+            selector=missing_interaction.selector,
+            source_url=missing_interaction.source_origin or None,
+            current_origin=missing_interaction.source_origin or None,
+            binding_candidates=[
+                "expected_tool:select_option",
+                "authored_tool:get_by_text_click",
+                f"value_present:{missing_interaction.value_present}",
+                f"label_present:{missing_interaction.label_present}",
+            ],
+            repair_instruction=(
+                "Use the captured select element API for this interaction, for example "
+                "page.locator(selector).select_option(...), instead of clicking option text."
+            ),
+        )
+    return None
+
+
+def _workflow_select_option_call_selectors(code_blocks: Iterable[Mapping[str, Any]]) -> set[str | None]:
+    selectors: set[str | None] = set()
+    for block in code_blocks:
+        tree = _parsed_code_tree(str(block.get("code") or ""))
+        if tree is not None:
+            selectors.update(_select_option_call_selectors(tree))
+    return selectors
+
+
+def _parsed_code_tree(code: str) -> ast.AST | None:
+    try:
+        return ast.parse(code)
+    except SyntaxError:
+        return None
+
+
+def _code_contains_get_by_text_click(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "click"
+            and _call_chain_contains_method(node.func.value, "get_by_text")
+        ):
+            return True
+    return False
+
+
+def _select_option_call_selectors(tree: ast.AST) -> set[str | None]:
+    locator_aliases = _locator_alias_selectors(tree)
+    selectors: set[str | None] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "select_option":
+            continue
+        resolved = _locator_receiver_selectors(node.func.value, locator_aliases)
+        if resolved:
+            selectors.update(resolved)
+        else:
+            selectors.add(None)
+    return selectors
+
+
+def _locator_alias_selectors(tree: ast.AST) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+
+    def record(target: ast.AST, value: ast.AST | None) -> None:
+        if not isinstance(target, ast.Name) or value is None:
+            return
+        selectors = _locator_receiver_selectors(value, aliases)
+        if selectors:
+            aliases[target.id] = selectors
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                record(target, node.value)
+            continue
+        if isinstance(node, ast.AnnAssign):
+            record(node.target, node.value)
+    return aliases
+
+
+def _locator_receiver_selectors(node: ast.AST, aliases: Mapping[str, set[str]]) -> set[str]:
+    while isinstance(node, ast.Attribute) and node.attr in {"first", "last"}:
+        node = node.value
+    if isinstance(node, ast.Name):
+        return set(aliases.get(node.id, set()))
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return set()
+    if node.func.attr in {"first", "last", "nth", "filter"}:
+        return _locator_receiver_selectors(node.func.value, aliases)
+    if node.func.attr != "locator" or not node.args:
+        return set()
+    receiver = node.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id != "page":
+        return set()
+    selector = node.args[0]
+    if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
+        value = selector.value.strip()
+        return {value} if value else set()
+    return set()
+
+
+def _call_chain_contains_method(node: ast.AST, method_name: str) -> bool:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr == method_name:
+            return True
+        return _call_chain_contains_method(node.func.value, method_name)
+    if isinstance(node, ast.Attribute):
+        return _call_chain_contains_method(node.value, method_name)
+    return False
+
+
+def _code_block_has_top_level_return(tree: ast.AST) -> bool:
+    body = tree.body if isinstance(tree, ast.Module) else []
+    return any(isinstance(statement, ast.Return) for statement in _iter_top_level_scope(body))
+
+
+def _return_value_is_meaningful(
+    node: ast.expr | None,
+    helper_return_roots: Mapping[str, _ProducedOutputRoots],
+) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, ast.Await):
+        return _return_value_is_meaningful(node.value, helper_return_roots)
+    if isinstance(node, ast.Constant) and node.value is None:
+        return False
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        produced = helper_return_roots.get(node.func.id)
+        if produced is not None:
+            return bool(produced.roots) or produced.abstained
+        return True
+    if (
+        isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set))
+        and not getattr(node, "elts", None)
+        and not getattr(node, "keys", None)
+    ):
+        return False
+    return True
 
 
 def _signal_is_churn(signal: CopilotToolBlockerSignal | None) -> bool:
@@ -1275,6 +2120,8 @@ class _SynthesizedCodeImpositionResult:
     substitutions: dict[str, Any] | None = None
     violations: list[str] = dataclass_field(default_factory=list)
     repair_context: CodeAuthoringRepairContext | None = None
+    scrubbed_selected_metadata_label: str | None = None
+    selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -1437,15 +2284,15 @@ def _existing_metadata_covers_output(label: str, existing_metadata: Any) -> bool
     return isinstance(metadata, Mapping) and _artifact_declares_goal_values(metadata)
 
 
-def _missing_code_artifact_metadata_error(workflow_yaml: str, ctx: AgentContext, raw_metadata: Any) -> str | None:
+def _missing_code_artifact_metadata_labels(workflow_yaml: str, ctx: AgentContext, raw_metadata: Any) -> list[str]:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
+        return []
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, Mapping):
-        return None
+        return []
     code_blocks = _workflow_code_blocks(dict(parsed))
     if not code_blocks:
-        return None
+        return []
     has_workflow_output = _workflow_declares_output_parameter(parsed)
     output_intent_blocks = [block for block in code_blocks if _block_declares_output_intent(block)]
     if has_workflow_output and not output_intent_blocks and len(code_blocks) == 1:
@@ -1456,16 +2303,17 @@ def _missing_code_artifact_metadata_error(workflow_yaml: str, ctx: AgentContext,
         if has_workflow_output or _block_declares_output_intent(block)
     ]
     if not labels:
-        return None
+        return []
     existing_metadata = getattr(ctx, "code_artifact_metadata", None)
     if _raw_code_artifact_metadata_empty(raw_metadata):
-        missing = [label for label in labels if not _existing_metadata_covers_output(label, existing_metadata)]
-    else:
-        missing = [
-            label
-            for label in labels
-            if not _raw_metadata_covers_output_label(raw_metadata, label, candidate_labels=labels)
-        ]
+        return [label for label in labels if not _existing_metadata_covers_output(label, existing_metadata)]
+    return [
+        label for label in labels if not _raw_metadata_covers_output_label(raw_metadata, label, candidate_labels=labels)
+    ]
+
+
+def _missing_code_artifact_metadata_error(workflow_yaml: str, ctx: AgentContext, raw_metadata: Any) -> str | None:
+    missing = _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_metadata)
     if not missing:
         return None
     joined = ", ".join(f"`{label}`" for label in missing)
@@ -1546,6 +2394,333 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         name = str(provenance.get("name") or "")
         return bool(role) and bool(name) and _get_by_role_expr_strict(role, name) == provenance.get("emitted_literal")
     return False
+
+
+_PAGE_MUTATION_METHODS = frozenset(
+    {
+        "goto",
+        "reload",
+        "go_back",
+        "go_forward",
+        "set_content",
+    }
+)
+_LOCATOR_MUTATION_METHODS = frozenset(
+    {
+        "check",
+        "click",
+        "dblclick",
+        "dispatch_event",
+        "drag_to",
+        "fill",
+        "focus",
+        "hover",
+        "press",
+        "select_option",
+        "set_checked",
+        "tap",
+        "type",
+        "uncheck",
+    }
+)
+_PAGE_FACTORY_METHODS = frozenset({"frame_locator", "get_by_role", "locator"})
+_PAGE_READ_METHODS = frozenset(
+    {
+        "get_attribute",
+        "inner_html",
+        "inner_text",
+        "input_value",
+        "is_checked",
+        "is_disabled",
+        "is_editable",
+        "is_enabled",
+        "is_hidden",
+        "is_visible",
+        "text_content",
+        "wait_for_load_state",
+    }
+)
+_LOCATOR_READ_METHODS = frozenset(
+    {
+        "all_inner_texts",
+        "all_text_contents",
+        "count",
+        "get_attribute",
+        "inner_html",
+        "inner_text",
+        "input_value",
+        "is_checked",
+        "is_disabled",
+        "is_editable",
+        "is_enabled",
+        "is_hidden",
+        "is_visible",
+        "text_content",
+        "wait_for",
+    }
+)
+
+
+class _BrowserSurfaceValidation(NamedTuple):
+    violations: list[str]
+
+
+class _BrowserMutationSignature(NamedTuple):
+    method: str
+    receiver: str
+    call_shape: str
+
+
+class _BrowserBindings(NamedTuple):
+    page_aliases: set[str]
+    locator_aliases: set[str]
+    method_aliases: set[str]
+
+
+def _code_block_label(block: Mapping[str, Any]) -> str:
+    return str(block.get("label") or "").strip() or "unlabeled code block"
+
+
+def _call_name(node: ast.AST) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return node.__class__.__name__
+
+
+def _locator_receiver_for_signature(node: ast.AST) -> ast.AST:
+    while isinstance(node, ast.Attribute) and node.attr in {"first", "last"}:
+        node = node.value
+    return node
+
+
+def _direct_locator_receiver_signature(node: ast.AST) -> str | None:
+    receiver = _locator_receiver_for_signature(node)
+    if _is_page_locator_expression(receiver):
+        return _call_name(receiver)
+    return None
+
+
+def _direct_page_method_signature(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Name) or node.id != "page":
+        return None
+    return "page"
+
+
+def _browser_mutation_signature_for_call(node: ast.Call) -> _BrowserMutationSignature | None:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr in _LOCATOR_MUTATION_METHODS:
+        receiver = _direct_locator_receiver_signature(func.value)
+        if receiver is not None:
+            return _BrowserMutationSignature(func.attr, receiver, ast.dump(node, include_attributes=False))
+        return None
+    if func.attr in _PAGE_MUTATION_METHODS:
+        receiver = _direct_page_method_signature(func.value)
+        if receiver is not None:
+            return _BrowserMutationSignature(func.attr, receiver, ast.dump(node, include_attributes=False))
+    return None
+
+
+def _assigned_value_is_page(value: ast.AST, page_aliases: set[str]) -> bool:
+    return isinstance(value, ast.Name) and (value.id == "page" or value.id in page_aliases)
+
+
+def _collect_page_aliases(tree: ast.AST) -> set[str]:
+    aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _assigned_value_is_page(node.value, aliases):
+                for target in node.targets:
+                    before = len(aliases)
+                    aliases.update(_target_names(target))
+                    changed = changed or len(aliases) != before
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and _assigned_value_is_page(node.value, aliases)
+            ):
+                before = len(aliases)
+                aliases.update(_target_names(node.target))
+                changed = changed or len(aliases) != before
+            elif isinstance(node, ast.NamedExpr) and _assigned_value_is_page(node.value, aliases):
+                before = len(aliases)
+                aliases.update(_target_names(node.target))
+                changed = changed or len(aliases) != before
+    return aliases
+
+
+def _assigned_value_is_locator(value: ast.AST, locator_aliases: set[str]) -> bool:
+    return _direct_locator_receiver_signature(value) is not None or (
+        isinstance(value, ast.Name) and value.id in locator_aliases
+    )
+
+
+def _collect_locator_aliases(tree: ast.AST) -> set[str]:
+    aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _assigned_value_is_locator(node.value, aliases):
+                for target in node.targets:
+                    before = len(aliases)
+                    aliases.update(_target_names(target))
+                    changed = changed or len(aliases) != before
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and _assigned_value_is_locator(node.value, aliases)
+            ):
+                before = len(aliases)
+                aliases.update(_target_names(node.target))
+                changed = changed or len(aliases) != before
+            elif isinstance(node, ast.NamedExpr) and _assigned_value_is_locator(node.value, aliases):
+                before = len(aliases)
+                aliases.update(_target_names(node.target))
+                changed = changed or len(aliases) != before
+    return aliases
+
+
+def _expr_contains_browser_receiver(node: ast.AST, bindings: _BrowserBindings) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "page" or node.id in bindings.page_aliases or node.id in bindings.locator_aliases
+    if _direct_locator_receiver_signature(node) is not None:
+        return True
+    if isinstance(node, ast.Attribute):
+        return _expr_contains_browser_receiver(node.value, bindings)
+    return any(_expr_contains_browser_receiver(child, bindings) for child in ast.iter_child_nodes(node))
+
+
+def _collect_browser_method_aliases(tree: ast.AST, page_aliases: set[str], locator_aliases: set[str]) -> set[str]:
+    aliases: set[str] = set()
+    bindings = _BrowserBindings(page_aliases, locator_aliases, set())
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            value: ast.AST | None = None
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets.extend(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                targets.append(node.target)
+            elif isinstance(node, ast.NamedExpr):
+                value = node.value
+                targets.append(node.target)
+            if (isinstance(value, ast.Attribute) and _expr_contains_browser_receiver(value.value, bindings)) or (
+                isinstance(value, ast.Name) and value.id in aliases
+            ):
+                for target in targets:
+                    before = len(aliases)
+                    aliases.update(_target_names(target))
+                    changed = changed or len(aliases) != before
+    return aliases
+
+
+def _is_dynamic_browser_dispatch(node: ast.Call, bindings: _BrowserBindings) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Call):
+        return False
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr" or not func.args:
+        return False
+    return _expr_contains_browser_receiver(func.args[0], bindings)
+
+
+def _is_allowed_browser_read_call(node: ast.Call, bindings: _BrowserBindings) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr in _PAGE_FACTORY_METHODS:
+        return isinstance(func.value, ast.Name) and func.value.id == "page"
+    if func.attr in _PAGE_READ_METHODS and isinstance(func.value, ast.Name) and func.value.id == "page":
+        return True
+    if func.attr in _LOCATOR_READ_METHODS:
+        return _direct_locator_receiver_signature(func.value) is not None or (
+            isinstance(func.value, ast.Name) and func.value.id in bindings.locator_aliases
+        )
+    return False
+
+
+def _browser_surface_for_code(code: str) -> tuple[list[_BrowserMutationSignature], list[str], list[str]]:
+    tree = _wrapped_code_ast(code)
+    if tree is None:
+        return [], [], []
+    direct_mutations: list[_BrowserMutationSignature] = []
+    unscouted: list[str] = []
+    ambiguous: list[str] = []
+    page_aliases = _collect_page_aliases(tree)
+    locator_aliases = _collect_locator_aliases(tree)
+    method_aliases = _collect_browser_method_aliases(tree, page_aliases, locator_aliases)
+    bindings = _BrowserBindings(page_aliases, locator_aliases, method_aliases)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in bindings.method_aliases:
+            ambiguous.append(_call_name(node))
+            continue
+        signature = _browser_mutation_signature_for_call(node)
+        if signature is not None:
+            direct_mutations.append(signature)
+            continue
+        if _is_dynamic_browser_dispatch(node, bindings):
+            ambiguous.append(_call_name(node))
+            continue
+        if _is_allowed_browser_read_call(node, bindings):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            if _expr_contains_browser_receiver(func.value, bindings):
+                ambiguous.append(_call_name(node))
+        elif isinstance(func, ast.Name) and (
+            any(_expr_contains_browser_receiver(arg, bindings) for arg in node.args)
+            or any(_expr_contains_browser_receiver(keyword.value, bindings) for keyword in node.keywords)
+        ):
+            ambiguous.append(_call_name(node))
+    for signature in direct_mutations:
+        unscouted.append(f"{signature.receiver}.{signature.method}")
+    return direct_mutations, sorted(unscouted), sorted(set(ambiguous))
+
+
+def _whole_trajectory_browser_surface_violations(
+    *,
+    code_blocks: list[dict[str, Any]],
+    selected_code_block: dict[str, Any],
+    submitted_selected_code: str,
+    synthesized_code: str,
+) -> _BrowserSurfaceValidation:
+    violations: list[str] = []
+    for block in code_blocks:
+        if block is selected_code_block:
+            continue
+        label = _code_block_label(block)
+        block_code = str(block.get("code") or "")
+        block_mutations, _, block_ambiguous = _browser_surface_for_code(block_code)
+        if block_mutations:
+            action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(block_mutations))
+            violations.append(
+                f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): {action_text}."
+            )
+        if block_ambiguous:
+            violations.append(
+                f"Unable to impose synthesized code block: `{label}` contains ambiguous browser action(s): "
+                + ", ".join(block_ambiguous)
+                + "."
+            )
+    return _BrowserSurfaceValidation(violations)
+
+
+def _browser_surface_contains_full_action_spine(submitted_code: str, synthesized_code: str) -> bool:
+    synthesized_mutations, _, _ = _browser_surface_for_code(synthesized_code)
+    submitted_mutations, _, submitted_ambiguous = _browser_surface_for_code(submitted_code)
+    if submitted_ambiguous:
+        return False
+    return bool(synthesized_mutations) and submitted_mutations == synthesized_mutations
 
 
 _IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
@@ -2027,7 +3202,6 @@ def _string_parameter_row(default_value: str, key: str) -> dict[str, Any]:
 
 
 def _required_string_parameter_row(key: str) -> dict[str, Any]:
-    # No default_value: direct scout fills become required workflow inputs at runtime.
     return {
         "parameter_type": "workflow",
         "workflow_parameter_type": "string",
@@ -2222,49 +3396,6 @@ def _is_credential_parameter(parameter: Mapping[str, Any]) -> bool:
     )
 
 
-def _submitted_string_parameter_default(
-    parameters: list[Any],
-    *,
-    synthesized_key: str,
-    typed_length: int | None,
-) -> tuple[dict[str, Any] | None, str | None]:
-    candidates: list[dict[str, Any]] = []
-    for parameter in parameters:
-        if not isinstance(parameter, dict):
-            continue
-        candidate_key = str(parameter.get("key") or "").strip()
-        if not candidate_key or candidate_key == synthesized_key:
-            continue
-        if _is_credential_parameter(parameter):
-            continue
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type and parameter_type != "workflow":
-            continue
-        if workflow_parameter_type and workflow_parameter_type != "string":
-            continue
-        default_value = parameter.get("default_value")
-        if isinstance(default_value, str):
-            candidates.append(parameter)
-
-    if len(candidates) != 1:
-        return None, None
-
-    candidate = candidates[0]
-    default_value = str(candidate.get("default_value") or "")
-    if _SECRET_LIKE_LITERAL_RE.search(default_value):
-        return (
-            None,
-            f"Unable to bind synthesized parameter `{synthesized_key}`: submitted parameter default looks credential-like.",
-        )
-    if typed_length is not None and typed_length > 0 and len(default_value) != typed_length:
-        return (
-            None,
-            f"Unable to bind synthesized parameter `{synthesized_key}`: submitted parameter default length does not match the scout record.",
-        )
-    return candidate, None
-
-
 def _string_parameter_default_value(parameter: Mapping[str, Any]) -> str | None:
     if _is_credential_parameter(parameter):
         return None
@@ -2294,29 +3425,6 @@ def _matching_string_parameter_key_by_default(
         if not key or key == exclude_key:
             continue
         if _string_parameter_default_value(parameter) == default_value:
-            matches.append(key)
-    return matches[0] if len(matches) == 1 else None
-
-
-def _matching_string_parameter_key_by_default_length(
-    parameters: list[Any],
-    *,
-    default_length: int | None,
-    exclude_key: str,
-) -> str | None:
-    if default_length is None or default_length <= 0:
-        return None
-    matches: list[str] = []
-    for parameter in parameters:
-        if not isinstance(parameter, dict):
-            continue
-        key = str(parameter.get("key") or "").strip()
-        if not key or key == exclude_key:
-            continue
-        default_value = _string_parameter_default_value(parameter)
-        if not default_value or _SECRET_LIKE_LITERAL_RE.search(default_value):
-            continue
-        if len(default_value) == default_length:
             matches.append(key)
     return matches[0] if len(matches) == 1 else None
 
@@ -2358,53 +3466,77 @@ def _is_python_identifier(value: str) -> bool:
     return value.isidentifier() and not keyword.iskeyword(value)
 
 
-def _combined_string_default_expression(
-    parameters: list[Any],
-    *,
-    synthesized_default: str,
-    typed_length: int | None,
-) -> tuple[list[str], str] | None:
-    if not synthesized_default and typed_length is None:
-        return None
-
-    candidates: list[tuple[str, str]] = []
-    for parameter in parameters:
-        if not isinstance(parameter, dict):
-            continue
-        key = str(parameter.get("key") or "").strip()
-        if not _is_python_identifier(key):
-            continue
-        default_value = _string_parameter_default_value(parameter)
-        if not default_value or _SECRET_LIKE_LITERAL_RE.search(default_value):
-            continue
-        candidates.append((key, default_value))
-
-    matches: list[tuple[list[str], str]] = []
-    for first_index, (first_key, first_default) in enumerate(candidates):
-        for last_key, last_default in candidates[first_index + 1 :]:
-            combined_default = f"{first_default} {last_default}".strip()
-            if synthesized_default:
-                if combined_default != synthesized_default:
-                    continue
-            elif len(combined_default) != typed_length:
-                continue
-            matches.append(([first_key, last_key], f'(str({first_key}) + " " + str({last_key}))'))
-    if len(matches) > 1:
-        LOG.debug(
-            "copilot_synthesized_parameter_combined_default_ambiguous",
-            match_count=len(matches),
-            synthesized_default_present=bool(synthesized_default),
-            typed_length=typed_length,
-        )
-        return None
-    return matches[0] if matches else None
-
-
 class _SynthesizedParameterReconciliation(NamedTuple):
     parameter_keys: list[str]
     violations: list[str]
     aliases: dict[str, str]
-    expressions: dict[str, str]
+    repair_context: CodeAuthoringRepairContext | None = None
+
+
+def _apply_parameter_reconciliation_to_code(code: str, reconciliation: _SynthesizedParameterReconciliation) -> str:
+    reconciled = code
+    for old_key, new_key in reconciliation.aliases.items():
+        reconciled = _replace_python_identifier(reconciled, old_key, new_key)
+    return reconciled
+
+
+_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE = "synthesized_parameter_binding_ambiguous"
+
+
+def _synthesized_parameter_binding_repair_context(
+    *,
+    parsed: Mapping[str, Any],
+    code_block: Mapping[str, Any],
+    synthesized_key: str,
+    parameter_keys: list[str],
+    scout_trajectory: list[ScoutedInteraction],
+    synthesized_parameters: list[dict[str, str]],
+) -> CodeAuthoringRepairContext:
+    available_parameter_keys = sorted(_declared_string_workflow_parameter_keys(parsed))
+    binding_candidates = [synthesized_key] + [key for key in available_parameter_keys if key != synthesized_key]
+    matched_scout = _scout_interaction_for_synthesized_parameter(
+        synthesized_key=synthesized_key,
+        scout_trajectory=scout_trajectory,
+        synthesized_parameters=synthesized_parameters,
+    )
+    selector = _safe_selector_repair_atom(matched_scout.get("selector")) if matched_scout is not None else ""
+    source_url = str(matched_scout.get("source_url") or "").strip() if matched_scout is not None else ""
+    return CodeAuthoringRepairContext(
+        block_label=str(code_block.get("label") or ""),
+        reason_code=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+        unresolved_names=[synthesized_key],
+        parameter_keys=list(parameter_keys),
+        available_parameter_keys=available_parameter_keys,
+        binding_candidates=binding_candidates,
+        selector=selector or None,
+        source_url=url_origin(source_url) if source_url else None,
+        repair_instruction=(
+            f"Declare and use workflow string parameter `{synthesized_key}` exactly, include it in parameter_keys, "
+            "reference it as a bare Python variable in code, and rerun via update_and_run_blocks."
+        ),
+    )
+
+
+def _scout_interaction_for_synthesized_parameter(
+    *,
+    synthesized_key: str,
+    scout_trajectory: list[ScoutedInteraction],
+    synthesized_parameters: list[dict[str, str]],
+) -> ScoutedInteraction | None:
+    non_credential_keys = [
+        str(parameter.get("key") or "").strip()
+        for parameter in synthesized_parameters
+        if str(parameter.get("key") or "").strip() and not parameter.get("credential_id")
+    ]
+    typed_interactions = [
+        interaction for interaction in scout_trajectory if str(interaction.get("tool_name") or "") == "type_text"
+    ]
+    if non_credential_keys.count(synthesized_key) != 1:
+        return None
+    index = non_credential_keys.index(synthesized_key)
+    if index >= len(typed_interactions):
+        return None
+    return typed_interactions[index]
 
 
 def _reconcile_synthesized_parameters(
@@ -2418,7 +3550,7 @@ def _reconcile_synthesized_parameters(
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return _SynthesizedParameterReconciliation(
-            [], ["Unable to bind synthesized parameters: workflow_definition is missing."], {}, {}
+            [], ["Unable to bind synthesized parameters: workflow_definition is missing."], {}
         )
     parameters = workflow_definition.get("parameters")
     if parameters is None:
@@ -2426,7 +3558,7 @@ def _reconcile_synthesized_parameters(
         workflow_definition["parameters"] = parameters
     if not isinstance(parameters, list):
         return _SynthesizedParameterReconciliation(
-            [], ["Unable to bind synthesized parameters: workflow_definition.parameters must be a list."], {}, {}
+            [], ["Unable to bind synthesized parameters: workflow_definition.parameters must be a list."], {}
         )
 
     existing_by_key = {
@@ -2436,7 +3568,7 @@ def _reconcile_synthesized_parameters(
     parameter_keys: list[str] = []
     violations: list[str] = []
     aliases: dict[str, str] = {}
-    expressions: dict[str, str] = {}
+    repair_context: CodeAuthoringRepairContext | None = None
     non_credential_synthesized = [param for param in synthesized_parameters if not param.get("credential_id")]
     typed_lengths = [
         int(interaction.get("typed_length") or 0)
@@ -2444,13 +3576,26 @@ def _reconcile_synthesized_parameters(
         if str(interaction.get("tool_name") or "") == "type_text"
     ]
 
+    def add_binding_violation(key: str, message: str) -> None:
+        nonlocal repair_context
+        violations.append(message)
+        if repair_context is None:
+            repair_context = _synthesized_parameter_binding_repair_context(
+                parsed=parsed,
+                code_block=code_block,
+                synthesized_key=key,
+                parameter_keys=parameter_keys,
+                scout_trajectory=scout_trajectory,
+                synthesized_parameters=synthesized_parameters,
+            )
+
     for synthesized_param in synthesized_parameters:
         key = str(synthesized_param.get("key") or "").strip()
         if not key:
             violations.append("Unable to bind synthesized parameter: parameter key is missing.")
             continue
         if key in parameter_keys:
-            violations.append(f"Unable to bind synthesized parameter `{key}`: duplicate synthesized key.")
+            add_binding_violation(key, f"Unable to bind synthesized parameter `{key}`: duplicate synthesized key.")
             continue
         parameter_keys.append(key)
 
@@ -2458,6 +3603,15 @@ def _reconcile_synthesized_parameters(
         existing = existing_by_key.get(key)
         synthesized_default = str(synthesized_param.get("default_value") or "").strip()
         typed_length = _coerce_positive_int(synthesized_param.get("typed_length"))
+        matched_scout = _scout_interaction_for_synthesized_parameter(
+            synthesized_key=key,
+            scout_trajectory=scout_trajectory,
+            synthesized_parameters=synthesized_parameters,
+        )
+        scout_typed_length = (
+            _coerce_positive_int(matched_scout.get("typed_length")) if matched_scout is not None else None
+        )
+        typed_length = typed_length or scout_typed_length
         if credential_id:
             if existing is not None:
                 if existing_credentials.get(key) != credential_id:
@@ -2486,26 +3640,18 @@ def _reconcile_synthesized_parameters(
                 parameter_keys[-1] = alias_key
                 _drop_parameter_key(parameters, key)
                 continue
-            alias_key = _matching_string_parameter_key_by_default_length(
-                parameters,
-                default_length=typed_length,
-                exclude_key=key,
-            )
-            if alias_key is not None:
-                aliases[key] = alias_key
-                parameter_keys[-1] = alias_key
-                _drop_parameter_key(parameters, key)
-                continue
             if _is_credential_parameter(existing):
-                violations.append(
-                    f"Unable to bind synthesized parameter `{key}`: submitted parameter is credential-typed."
+                add_binding_violation(
+                    key,
+                    f"Unable to bind synthesized parameter `{key}`: submitted parameter is credential-typed.",
                 )
             elif synthesized_default:
                 existing_default = _string_parameter_default_value(existing)
                 if existing_default != synthesized_default:
-                    violations.append(
+                    add_binding_violation(
+                        key,
                         f"Unable to bind synthesized parameter `{key}`: "
-                        "submitted parameter default does not match the scout record."
+                        "submitted parameter default does not match the scout record.",
                     )
             continue
 
@@ -2514,8 +3660,9 @@ def _reconcile_synthesized_parameters(
             # captured from live type_text scouting are fully screened by
             # safe_typed_default_value before they enter the scout trajectory.
             if _SECRET_LIKE_LITERAL_RE.search(synthesized_default):
-                violations.append(
-                    f"Unable to bind synthesized parameter `{key}`: synthesized default looks credential-like."
+                add_binding_violation(
+                    key,
+                    f"Unable to bind synthesized parameter `{key}`: synthesized default looks credential-like.",
                 )
                 continue
             alias_key = _matching_string_parameter_key_by_default(
@@ -2527,84 +3674,33 @@ def _reconcile_synthesized_parameters(
                 aliases[key] = alias_key
                 parameter_keys[-1] = alias_key
                 continue
-            combined_expression = _combined_string_default_expression(
-                parameters,
-                synthesized_default=synthesized_default,
-                typed_length=typed_length,
-            )
-            if combined_expression is not None:
-                expression_keys, expression = combined_expression
-                parameter_keys.pop()
-                for expression_key in expression_keys:
-                    if expression_key not in parameter_keys:
-                        parameter_keys.append(expression_key)
-                expressions[key] = expression
-                continue
             parameters.append(_string_parameter_row(synthesized_default, key))
             continue
 
         if len(non_credential_synthesized) != 1:
-            alias_key = _matching_string_parameter_key_by_default_length(
-                parameters,
-                default_length=typed_length,
-                exclude_key=key,
-            )
-            if alias_key is not None:
-                aliases[key] = alias_key
-                parameter_keys[-1] = alias_key
-                continue
-
-        combined_expression = _combined_string_default_expression(
-            parameters,
-            synthesized_default=synthesized_default,
-            typed_length=typed_length,
-        )
-        if combined_expression is not None:
-            expression_keys, expression = combined_expression
-            parameter_keys.pop()
-            for expression_key in expression_keys:
-                if expression_key not in parameter_keys:
-                    parameter_keys.append(expression_key)
-            expressions[key] = expression
-            continue
-
-        if len(non_credential_synthesized) != 1:
-            # Fall through only after length aliasing and combined-expression binding both miss.
-            violations.append(
-                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous."
+            add_binding_violation(
+                key,
+                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
             )
             continue
 
-        typed_length = typed_lengths[0] if len(typed_lengths) == 1 else None
-        submitted_parameter, error = _submitted_string_parameter_default(
-            parameters,
-            synthesized_key=key,
-            typed_length=typed_length,
-        )
-        if error:
-            violations.append(error)
-            continue
-        if submitted_parameter is not None:
-            submitted_parameter["parameter_type"] = "workflow"
-            submitted_parameter["workflow_parameter_type"] = "string"
-            submitted_parameter["key"] = key
-            continue
-
+        typed_length = typed_length or scout_typed_length or (typed_lengths[0] if len(typed_lengths) == 1 else None)
         direct_fill_usage = _submitted_direct_fill_type_usage(submitted_code, key)
-        if direct_fill_usage.matched and not direct_fill_usage.mismatched:
-            parameters.append(_required_string_parameter_row(key))
-            continue
         if direct_fill_usage.matched and direct_fill_usage.mismatched:
-            violations.append(
+            add_binding_violation(
+                key,
                 f"Unable to bind synthesized parameter `{key}`: submitted code mixes direct fills using `{key}` "
                 "with other browser-locator fill/type values. Use the synthesized parameter for every scout-input "
-                "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values."
+                "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values.",
             )
+            continue
+        if direct_fill_usage.matched:
+            parameters.append(_required_string_parameter_row(key))
             continue
 
         literal, error = _safe_singleton_literal_for_parameter(submitted_code, key, typed_length)
         if error:
-            violations.append(error)
+            add_binding_violation(key, error)
             continue
         parameters.append(
             {
@@ -2618,7 +3714,7 @@ def _reconcile_synthesized_parameters(
     code_block["parameter_keys"] = parameter_keys
     # Submitted synthesized parameter rows are re-derived from scout evidence before persistence.
     code_block.pop("parameters", None)
-    return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, expressions)
+    return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, repair_context)
 
 
 def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
@@ -2693,6 +3789,29 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         if not _locator_provenance_is_self_validating(provenance):
             violations.append("Unable to impose synthesized code block: locator provenance was not byte-equal.")
             break
+    surface_validation = _whole_trajectory_browser_surface_violations(
+        code_blocks=code_blocks,
+        selected_code_block=code_block,
+        submitted_selected_code=submitted_code,
+        synthesized_code=synthesized.code,
+    )
+    violations.extend(surface_validation.violations)
+    extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
+    if extraction_suffix:
+        suffix_mutations, _, suffix_ambiguous = _browser_surface_for_code(extraction_suffix)
+        if suffix_mutations:
+            action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(suffix_mutations))
+            violations.append(
+                "Unable to impose synthesized code block: extraction suffix contains unscouted browser action(s): "
+                + action_text
+                + "."
+            )
+        if suffix_ambiguous:
+            violations.append(
+                "Unable to impose synthesized code block: extraction suffix contains ambiguous browser action(s): "
+                + ", ".join(suffix_ambiguous)
+                + "."
+            )
 
     parameter_reconciliation = _reconcile_synthesized_parameters(
         parsed=parsed,
@@ -2702,6 +3821,8 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         scout_trajectory=scout_trajectory,
     )
     violations.extend(parameter_reconciliation.violations)
+    if repair_context is None:
+        repair_context = parameter_reconciliation.repair_context
     if violations:
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
@@ -2709,21 +3830,60 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             repair_context=repair_context,
         )
 
-    extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
     raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
+    metadata_declares_goal_values = bool(raw_metadata) and _raw_metadata_declares_goal_values_for_block(
+        raw_metadata, str(code_block.get("label") or "")
+    )
+    reconciled_submitted_code = _apply_parameter_reconciliation_to_code(
+        textwrap.dedent(submitted_code), parameter_reconciliation
+    )
+    reconciled_synthesized_code = _apply_parameter_reconciliation_to_code(
+        textwrap.dedent(synthesized.code), parameter_reconciliation
+    )
+    submitted_contains_full_spine = _browser_surface_contains_full_action_spine(
+        reconciled_submitted_code, reconciled_synthesized_code
+    )
+    assigned_submitted_parameter_keys = _assigned_submitted_parameter_keys(
+        reconciled_submitted_code,
+        parameter_reconciliation.parameter_keys,
+    )
+    if metadata_declares_goal_values and submitted_contains_full_spine and assigned_submitted_parameter_keys:
+        joined = ", ".join(f"`{key}`" for key in assigned_submitted_parameter_keys)
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=[
+                "Unable to impose synthesized code block: submitted extraction code assigns synthesized "
+                f"parameter key(s) {joined} before the scout browser spine."
+            ],
+            repair_context=repair_context,
+        )
+    selected_mutations, _, selected_ambiguous = _browser_surface_for_code(submitted_code)
     preserve_submitted_extraction = (
-        bool(raw_metadata)
-        and _raw_metadata_declares_goal_values_for_block(raw_metadata, str(code_block.get("label") or ""))
+        metadata_declares_goal_values
+        and submitted_contains_full_spine
         and not extraction_suffix
         and not _is_submitted_code_synthesized_only(submitted_code, synthesized.code)
+    )
+    append_selected_extraction = (
+        metadata_declares_goal_values
+        and not submitted_contains_full_spine
+        and not selected_mutations
+        and not selected_ambiguous
+    )
+    scrubbed_selected_metadata_label = (
+        str(code_block.get("label") or "")
+        if metadata_declares_goal_values
+        and not preserve_submitted_extraction
+        and not extraction_suffix
+        and not append_selected_extraction
+        else None
     )
     imposed_code = textwrap.dedent(submitted_code if preserve_submitted_extraction else synthesized.code).lstrip("\n")
     if extraction_suffix:
         imposed_code = imposed_code.rstrip() + "\n" + extraction_suffix.rstrip() + "\n"
-    for old_key, new_key in parameter_reconciliation.aliases.items():
-        imposed_code = _replace_python_identifier(imposed_code, old_key, new_key)
-    for old_key, expression in parameter_reconciliation.expressions.items():
-        imposed_code = _replace_python_identifier(imposed_code, old_key, expression)
+    elif append_selected_extraction:
+        imposed_code = imposed_code.rstrip() + "\n" + textwrap.dedent(submitted_code).strip() + "\n"
+    imposed_code = _apply_parameter_reconciliation_to_code(imposed_code, parameter_reconciliation)
     code_block["code"] = imposed_code
     credential_parameter_keys = [
         str(param.get("key") or "") for param in synthesized.parameters if str(param.get("credential_id") or "").strip()
@@ -2738,17 +3898,26 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     }
     if parameter_reconciliation.aliases:
         substitutions["parameter_aliases"] = parameter_reconciliation.aliases
-    if parameter_reconciliation.expressions:
-        substitutions["parameter_expressions"] = parameter_reconciliation.expressions
     if extraction_suffix:
         substitutions["preserved_extraction_suffix"] = True
     if preserve_submitted_extraction:
         substitutions["preserved_submitted_extraction_code"] = True
+    if scrubbed_selected_metadata_label:
+        substitutions["scrubbed_stale_selected_goal_value_paths"] = True
     if forgiven_superseded_bare_drops:
         substitutions["forgiven_superseded_bare_drops"] = forgiven_superseded_bare_drops
+    selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
+    if scrubbed_selected_metadata_label:
+        selected_extraction_metadata_disposition = "browser_spine_replaced_metadata_stale"
+    elif preserve_submitted_extraction:
+        selected_extraction_metadata_disposition = "self_authored_extraction_preserved"
+    elif extraction_suffix or append_selected_extraction:
+        selected_extraction_metadata_disposition = "sibling_or_suffix_extraction_preserved"
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
         substitutions=substitutions,
+        scrubbed_selected_metadata_label=scrubbed_selected_metadata_label,
+        selected_extraction_metadata_disposition=selected_extraction_metadata_disposition,
     )
 
 
@@ -2918,12 +4087,29 @@ def _artifact_goal_value_roots(artifact: Mapping[str, Any]) -> set[str]:
 def _target_names(target: ast.expr) -> set[str]:
     if isinstance(target, ast.Name):
         return {target.id}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
     if isinstance(target, (ast.Tuple, ast.List)):
         names: set[str] = set()
         for element in target.elts:
             names.update(_target_names(element))
         return names
     return set()
+
+
+def _pattern_bound_names(pattern: ast.pattern) -> set[str]:
+    if isinstance(pattern, ast.MatchAs):
+        bound_names = {pattern.name} if pattern.name else set()
+        if pattern.pattern is not None:
+            bound_names.update(_pattern_bound_names(pattern.pattern))
+        return bound_names
+    if isinstance(pattern, ast.MatchStar):
+        return {pattern.name} if pattern.name else set()
+    names: set[str] = set()
+    for child in ast.iter_child_nodes(pattern):
+        if isinstance(child, ast.pattern):
+            names.update(_pattern_bound_names(child))
+    return names
 
 
 def _assigned_top_level_names(statements: list[ast.stmt]) -> set[str]:
@@ -2939,6 +4125,36 @@ def _assigned_top_level_names(statements: list[ast.stmt]) -> set[str]:
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             names.update(_target_names(node.target))
     return names
+
+
+def _assigned_submitted_parameter_keys(code: str, parameter_keys: list[str]) -> list[str]:
+    protected = {key for key in parameter_keys if key}
+    if not protected:
+        return []
+    tree = _wrapped_code_ast(code)
+    if tree is None:
+        return []
+    assigned: set[str] = set()
+    for node in _submitted_scope_nodes(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                assigned.update(_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            assigned.update(_target_names(node.target))
+        elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+            assigned.update(_target_names(node.target))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            assigned.update(_target_names(node.target))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    assigned.update(_target_names(item.optional_vars))
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            assigned.add(node.name)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                assigned.update(_pattern_bound_names(case.pattern))
+    return sorted(assigned & protected)
 
 
 def _missing_declared_output_roots(code: str, goal_roots: set[str]) -> set[str] | None:
@@ -3020,12 +4236,19 @@ def _parse_extraction_schema(value: Any) -> dict[str, Any] | None:
 
 
 def _artifact_extraction_schema_values(artifact: Mapping[str, Any]) -> list[Any]:
-    values: list[Any] = []
+    return [value for value, _provenance in _artifact_extraction_schema_entries(artifact)]
+
+
+def _artifact_extraction_schema_entries(artifact: Mapping[str, Any]) -> list[tuple[Any, ExtractionSchemaProvenance]]:
+    values: list[tuple[Any, ExtractionSchemaProvenance]] = []
     for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
         for row in _artifact_rows(artifact.get(field_name)):
             schema = row.get("extraction_schema")
             if schema is not None and not (isinstance(schema, str) and not schema.strip()):
-                values.append(schema)
+                provenance: ExtractionSchemaProvenance = (
+                    "self_authored" if row.get("extraction_schema_provenance") == "self_authored" else "user_edited"
+                )
+                values.append((schema, provenance))
     return values
 
 
@@ -3136,6 +4359,51 @@ def _top_level_path_segment(path: str) -> str:
     return head.strip()
 
 
+_STRUCTURAL_RUNTIME_OUTPUT_KEY_RE = re.compile(r"^[a-z]+(?:_[a-z]+)*(?:_[0-9])?$")
+_SENSITIVE_RUNTIME_OUTPUT_KEY_TERMS = frozenset(
+    {"api_key", "access_key", "password", "secret", "token", "credential", "email"}
+)
+
+
+def _is_structural_runtime_output_key(key: str) -> bool:
+    return (
+        _STRUCTURAL_RUNTIME_OUTPUT_KEY_RE.fullmatch(key) is not None
+        and not keyword.iskeyword(key)
+        and key not in _SENSITIVE_RUNTIME_OUTPUT_KEY_TERMS
+        and not any(part in _SENSITIVE_RUNTIME_OUTPUT_KEY_TERMS for part in key.split("_"))
+    )
+
+
+def _verified_runtime_output_contract_paths(value: object, *, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip()
+            if not _is_structural_runtime_output_key(key):
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            paths.add(path)
+            paths |= _verified_runtime_output_contract_paths(child, prefix=path)
+        return paths
+    if isinstance(value, list):
+        for item in value:
+            paths |= _verified_runtime_output_contract_paths(item, prefix=prefix)
+    return paths
+
+
+def _verified_runtime_output_contract_paths_by_label(ctx: AgentContext, workflow_yaml: str) -> dict[str, set[str]]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return {}
+    code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+    return {
+        label: paths
+        for label, output in ctx.verified_block_outputs.items()
+        if label in code_block_labels and (paths := _verified_runtime_output_contract_paths(output))
+    }
+
+
 def _known_output_contract_paths(artifact: Mapping[str, Any], code: str) -> set[str]:
     """Top-level field names the block is known to produce: the snippet's return-dict
     keys plus the confirmed `goal_value_paths`' top-level segments. Empty when neither
@@ -3162,7 +4430,11 @@ def _schema_property_summary(schema: Mapping[str, Any]) -> str:
 
 
 def _extraction_schema_incompatibility(
-    label: str, artifact: Mapping[str, Any], code: str
+    label: str,
+    artifact: Mapping[str, Any],
+    code: str,
+    *,
+    verified_runtime_output_paths: set[str] | None = None,
 ) -> SchemaIncompatibility | None:
     """Detect an edited `extraction_schema` whose object property names overlap NONE of
     the block's known output contract. Unlike `_extraction_schema_conformance_error`,
@@ -3172,11 +4444,15 @@ def _extraction_schema_incompatibility(
     if _is_download_intent(artifact, code) or not code.strip():
         return None
     known_paths = _known_output_contract_paths(artifact, code)
+    if verified_runtime_output_paths:
+        known_paths |= {_top_level_path_segment(path) for path in verified_runtime_output_paths}
     if not known_paths:
         return None
     incompatible: set[str] = set()
     summaries: list[str] = []
-    for value in _artifact_extraction_schema_values(artifact):
+    for value, provenance in _artifact_extraction_schema_entries(artifact):
+        if provenance != "user_edited":
+            continue
         if isinstance(value, str) and _is_unfilled_artifact_placeholder(value.strip()):
             continue
         parsed = _parse_extraction_schema(value)
@@ -3612,6 +4888,13 @@ def _reject_schema_incompatibility(
     falling through to repair churn), record it on the context, and reject without
     persisting the incompatible draft."""
     signal = build_schema_incompatibility_blocker_signal(incompatibility)
+    _record_author_time_reject_outcome(
+        ctx,
+        reason_code="schema_incompatibility",
+        summary=signal.user_facing_reason,
+        structural_payload=incompatibility.to_summary_dict(),
+        block_labels=[incompatibility.block_label],
+    )
     stash_blocker_signal(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
     ctx.latest_schema_incompatibility = incompatibility
@@ -3689,6 +4972,16 @@ async def _update_workflow(
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml = _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml)
     params["workflow_yaml"] = workflow_yaml
+    if (
+        imposition.selected_extraction_metadata_disposition == "browser_spine_replaced_metadata_stale"
+        and imposition.scrubbed_selected_metadata_label
+    ):
+        scrubbed_metadata = _downgrade_stale_selected_goal_value_paths(
+            params.get("code_artifact_metadata"),
+            imposition.scrubbed_selected_metadata_label,
+        )
+        params["code_artifact_metadata"] = scrubbed_metadata
+        ctx.raw_code_artifact_metadata = scrubbed_metadata
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
     if parameter_contract_error is not None:
         return reject(
@@ -3702,6 +4995,22 @@ async def _update_workflow(
         params.get("code_artifact_metadata"),
     )
     if missing_metadata_error is not None:
+        missing_labels = _missing_code_artifact_metadata_labels(
+            workflow_yaml, ctx, params.get("code_artifact_metadata")
+        )
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="metadata_reject",
+            summary=missing_metadata_error,
+            structural_payload=_code_artifact_metadata_reject_payload(
+                workflow_yaml=workflow_yaml,
+                raw_metadata=params.get("code_artifact_metadata"),
+                offending_labels=[],
+                missing_labels=missing_labels,
+                violation_categories=["missing_code_artifact_metadata"],
+            ),
+            block_labels=missing_labels,
+        )
         return reject(
             error=missing_metadata_error,
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -3713,11 +5022,24 @@ async def _update_workflow(
         workflow_yaml,
         impose_defaults=_copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         scout_trajectory=scout_trajectory if isinstance(scout_trajectory, list) else None,
+        verified_runtime_output_paths_by_label=_verified_runtime_output_contract_paths_by_label(ctx, workflow_yaml),
     )
     code_artifact_metadata = normalization.normalized
     code_artifact_metadata_error = normalization.error
     if code_artifact_metadata_error is not None:
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="metadata_reject",
+            summary=code_artifact_metadata_error,
+            structural_payload=_code_artifact_metadata_reject_payload(
+                workflow_yaml=workflow_yaml,
+                raw_metadata=params.get("code_artifact_metadata"),
+                offending_labels=normalization.offending_labels,
+                violation_categories=_metadata_violation_categories(normalization.violations),
+            ),
+            block_labels=normalization.offending_labels,
+        )
     if normalization.schema_incompatibilities:
         incompatibility = merge_schema_incompatibilities(normalization.schema_incompatibilities)
         if incompatibility is not None:
@@ -3740,6 +5062,13 @@ async def _update_workflow(
     )
     if code_safety_errors:
         _set_code_authoring_repair_context(ctx, code_authoring_repair_context)
+        if code_authoring_repair_context is None:
+            _record_author_time_reject_outcome(
+                ctx,
+                reason_code="code_safety_reject",
+                summary="Code authoring guardrail rejected the submitted code block.",
+                structural_payload=_code_safety_reject_payload(code_safety_errors),
+            )
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=credential_priority_reject)
     # Per-label salvage keeps conforming metadata across a rejection; a
     # rejected code block keeps nothing, since its yaml never becomes the
@@ -3807,6 +5136,12 @@ async def _update_workflow(
             repair_context=code_authoring_repair_context,
         )
     if credential_scout_errors:
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="credential_scout_reject",
+            summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
+            structural_payload=_credential_scout_reject_payload(workflow_yaml),
+        )
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
         return reject(
             error="\n".join(credential_scout_errors),
@@ -3836,16 +5171,25 @@ async def _update_workflow(
         tool_arguments=params,
     )
     if not output_policy_verdict.allowed:
+        output_policy_trace_data = output_policy_verdict_to_trace_data(
+            output_policy_verdict,
+            surface="tool_body",
+            tool_name="update_workflow",
+        )
+        output_policy_error = format_output_policy_tool_error(output_policy_verdict)
         _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
             "copilot output policy tool body verdict",
-            **output_policy_verdict_to_trace_data(
-                output_policy_verdict,
-                surface="tool_body",
-                tool_name="update_workflow",
-            ),
+            **output_policy_trace_data,
         )
-        return reject(error=format_output_policy_tool_error(output_policy_verdict))
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="output_policy_reject",
+            summary=output_policy_error,
+            structural_payload=output_policy_trace_data,
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(error=output_policy_error)
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
@@ -3897,6 +5241,145 @@ async def _update_workflow(
     # New data-write blocks default to surfacing failures rather than swallowing them.
     workflow_yaml = default_data_write_continue_on_failure(workflow_yaml, ctx.workflow_yaml)
 
+    authored_structure_signature = _unchanged_after_recorded_outcome_signature(
+        ctx,
+        workflow_yaml=workflow_yaml,
+        code_artifact_metadata=getattr(ctx, "code_artifact_metadata", None),
+    )
+    if authored_structure_signature is not None:
+        block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="unchanged_after_recorded_outcome",
+            summary="The authored code and output structure are unchanged after the last recorded test outcome.",
+            structural_payload={
+                "reason_code": "unchanged_after_recorded_outcome",
+                "authored_structure_signature": authored_structure_signature,
+                "block_labels": block_labels,
+            },
+            authored_structure_signature=authored_structure_signature,
+            block_labels=block_labels,
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(
+            error=(
+                "Submitted workflow is unchanged after the last recorded test outcome. "
+                "Revise the code block or output metadata before testing again."
+            ),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
+
+    recorded_output_paths_required = _recorded_outcome_requires_output_candidate(ctx)
+    recorded_missing_output_paths = (
+        _recorded_outcome_missing_output_paths(ctx) if recorded_output_paths_required else set()
+    )
+    unresolved_recorded_output_paths = recorded_missing_output_paths
+
+    output_empty_labels = (
+        _output_empty_code_block_labels(workflow_yaml, getattr(ctx, "code_artifact_metadata", None))
+        if recorded_output_paths_required and (not recorded_missing_output_paths or unresolved_recorded_output_paths)
+        else []
+    )
+    if output_empty_labels:
+        authored_structure_signature = authored_structure_signature_from_workflow(
+            workflow_yaml,
+            getattr(ctx, "code_artifact_metadata", None),
+        )
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="metadata_reject",
+            summary="Submitted workflow does not return any keyed output after the last recorded test outcome.",
+            structural_payload={
+                "reason_code": "recorded_outcome_requires_output_candidate",
+                "authored_structure_signature": authored_structure_signature,
+                "empty_output_block_labels": output_empty_labels,
+                "recorded_reason_code": "outcome_not_demonstrated",
+            },
+            authored_structure_signature=authored_structure_signature,
+            block_labels=output_empty_labels,
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(
+            error=(
+                "Submitted workflow does not return any keyed output after the last recorded test outcome. "
+                "Add structured output for the unsatisfied completion criteria before testing again."
+            ),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
+
+    missing_output_paths = (
+        _candidate_missing_required_output_paths(
+            workflow_yaml,
+            getattr(ctx, "code_artifact_metadata", None),
+            required_paths=unresolved_recorded_output_paths,
+        )
+        if recorded_output_paths_required
+        else []
+    )
+    if missing_output_paths:
+        authored_structure_signature = authored_structure_signature_from_workflow(
+            workflow_yaml,
+            getattr(ctx, "code_artifact_metadata", None),
+        )
+        block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+        missing_output_roots = sorted(
+            {root for path in missing_output_paths if (root := _top_level_path_segment(path))}
+        )
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="metadata_reject",
+            summary=(
+                "Submitted workflow does not cover the missing requested output paths "
+                "from the last recorded test outcome."
+            ),
+            structural_payload={
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "authored_structure_signature": authored_structure_signature,
+                "missing_output_paths": missing_output_paths,
+                "missing_output_roots": missing_output_roots,
+                "block_labels": block_labels,
+                "recorded_reason_code": "outcome_not_demonstrated",
+            },
+            authored_structure_signature=authored_structure_signature,
+            block_labels=block_labels,
+            missing_requested_output_facts=[
+                {
+                    "output_path": path,
+                    "output_root": _top_level_path_segment(path),
+                    "reason_code": "recorded_outcome_missing_output_coverage",
+                    "value_status": "no_typed_value",
+                }
+                for path in missing_output_paths
+            ],
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        missing_path_text = ", ".join(missing_output_paths[:8])
+        return reject(
+            error=(
+                "Submitted workflow does not cover the missing requested output paths from the last recorded test "
+                f"outcome: {missing_path_text}. Declare those exact output_path values in goal_value_paths and "
+                "produce matching structured output before testing again; output_root is diagnostic only."
+            ),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
+
+    select_option_mismatch_context = _select_option_text_click_repair_context(workflow_yaml, ctx)
+    if select_option_mismatch_context is not None:
+        _set_code_authoring_repair_context(ctx, select_option_mismatch_context)
+        _record_code_authoring_guardrail_reject(ctx)
+        return {
+            "ok": False,
+            "error": (
+                "Submitted workflow replaces a captured select-option interaction with a text click. "
+                "Use the select element API for the captured selector before testing again."
+            ),
+            "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(select_option_mismatch_context),
+        }
+
     try:
         # A code block renders code-first (goal + plain step timeline) only when it
         # carries a `prompt`; the model authors the goal as artifact `declared_goal`
@@ -3913,11 +5396,12 @@ async def _update_workflow(
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
         workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
-        workflow = _process_workflow_yaml(
+        workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
+            settings_fallback_yaml=prior_yaml,
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
@@ -3949,6 +5433,7 @@ async def _update_workflow(
                 ai_fallback=workflow.ai_fallback,
                 cache_key=workflow.cache_key,
                 adaptive_caching=workflow.adaptive_caching,
+                enable_self_healing=workflow.enable_self_healing,
                 code_version=workflow.code_version,
                 run_sequentially=workflow.run_sequentially,
                 sequential_key=workflow.sequential_key,
@@ -4056,6 +5541,10 @@ def _record_workflow_update_result(
         block_count = data.get("block_count")
         if isinstance(block_count, int):
             copilot_ctx.last_update_block_count = block_count
+    copilot_ctx.update_workflow_called = True
+    copilot_ctx.synthesized_block_reopened_after_failed_run = False
+    copilot_ctx.test_after_update_done = False
+    copilot_ctx.post_update_nudge_count = 0
     copilot_ctx.last_test_ok = None
     copilot_ctx.last_test_failure_reason = None
     clear_terminal_evidence_on_workflow_edit(copilot_ctx)

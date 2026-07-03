@@ -127,7 +127,12 @@ class RecordingDraftStep(BaseModel):
 class RecordingInterpretationUpdate(BaseModel):
     interpretation_session_id: str
     session_revision: int
+    # Authoritative full list when is_snapshot is true. Empty on delta updates.
     steps: list[RecordingDraftStep] = Field(default_factory=list)
+    # Per-step upserts (by step_id) when is_snapshot is false. Keeps each update
+    # O(1) instead of re-sending the whole growing steps list.
+    changed_steps: list[RecordingDraftStep] = Field(default_factory=list)
+    is_snapshot: bool = True
     pending: bool = False
     finalized: bool = False
 
@@ -238,6 +243,9 @@ class ExfiltratedCdpEvent(BaseModel):
     params: ExfiltratedEventCdpParams
     source: Literal["cdp"]
     timestamp: float
+    # Monotonic server-receipt order, assigned before async materialization can
+    # reorder events. -1 for payloads that predate the field (legacy/batch replay).
+    capture_seq: int = -1
 
 
 class ExfiltratedConsoleEvent(BaseModel):
@@ -246,6 +254,7 @@ class ExfiltratedConsoleEvent(BaseModel):
     params: ExfiltratedEventConsoleParams
     source: Literal["console"]
     timestamp: float
+    capture_seq: int = -1
 
 
 ExfiltratedEvent = ExfiltratedCdpEvent | ExfiltratedConsoleEvent

@@ -14,24 +14,39 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from agents import RunConfig
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
+    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotGoalSatisfied,
     _check_enforcement,
+    _maybe_synthesized_block_offer_msg,
     _needs_suspicious_success_nudge,
     _prune_input_list,
+    _should_force_synthesized_block_persistence,
     _summarize_tool_output,
+    run_with_enforcement,
+    synthesized_block_persistence_signal,
+    synthesized_persistence_reopened_after_failed_run,
+    synthesized_trajectory_is_goal_complete,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _analyze_run_blocks,
     _is_meaningful_extracted_data,
     _record_run_blocks_result,
+    _record_workflow_update_result,
 )
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
@@ -67,6 +82,842 @@ class _Ctx:
         self.completion_verification_result = None
         self.last_artifact_health_blocker_reason = None
         self.latest_diagnosis_repair_contract = None
+        self.synthesized_block_reopened_after_failed_run = False
+
+
+class TestSynthesizedOfferPersistenceGate:
+    @staticmethod
+    def _unsatisfied_verification() -> CompletionVerificationResult:
+        return CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["fallback"],
+            verdicts=[
+                CriterionVerdict(
+                    criterion_id="fallback",
+                    state="unsatisfied",
+                    reason_code="evidence_contradicts",
+                )
+            ],
+        )
+
+    def _authoring_ctx(
+        self,
+        *,
+        trajectory: list[dict[str, object]],
+        download_target: ReachedDownloadTarget | None,
+    ) -> _Ctx:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(trajectory)
+        ctx.scout_trajectory = trajectory
+        ctx.reached_download_target = download_target
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_offer_retry_forces_update_and_run_blocks_tool_choice(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "input[name='q']",
+                "source_url": "https://example.test/start",
+                "accessible_name": "Search",
+            },
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='search']",
+                "accessible_name": "Search",
+            },
+        ]
+        ctx.synthesized_block_offered = False
+        ctx.synthesized_block_offered_trajectory_len = 0
+        ctx.reached_download_target = None
+        stream = MagicMock()
+        stream.is_disconnected = AsyncMock(return_value=False)
+
+        fake_result = MagicMock()
+        fake_result.final_output = None
+        fake_result.new_items = []
+        fake_result.to_input_list.return_value = []
+        run_configs: list[RunConfig | None] = []
+
+        def fake_run_streamed(*args: Any, **kwargs: Any) -> Any:
+            run_configs.append(kwargs.get("run_config"))
+            return fake_result
+
+        async def fake_stream_to_sse(result: Any, s: Any, c: Any) -> None:
+            if len(run_configs) >= 2:
+                c.update_workflow_called = True
+                c.test_after_update_done = True
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse",
+            fake_stream_to_sse,
+        )
+
+        returned = await run_with_enforcement(
+            agent=MagicMock(),
+            initial_input="hello",
+            ctx=ctx,
+            stream=stream,
+            run_config=RunConfig(),
+        )
+
+        assert returned is fake_result
+        assert len(run_configs) == 2
+        assert run_configs[0].model_settings is None
+        assert run_configs[1].model_settings is not None
+        assert run_configs[1].model_settings.tool_choice == "update_and_run_blocks"
+
+    @pytest.mark.asyncio
+    async def test_diagnose_offer_retry_does_not_force_update_and_run_blocks_tool_choice(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.DIAGNOSE,
+            authority=TurnIntentAuthority(may_read_run_context=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='continue']",
+                "source_url": "https://example.test/start",
+            }
+        ]
+        ctx.synthesized_block_offered = False
+        ctx.synthesized_block_offered_trajectory_len = 0
+        ctx.reached_download_target = None
+        stream = MagicMock()
+        stream.is_disconnected = AsyncMock(return_value=False)
+
+        fake_result = MagicMock()
+        fake_result.final_output = None
+        fake_result.new_items = []
+        fake_result.to_input_list.return_value = []
+        run_configs: list[RunConfig | None] = []
+
+        def fake_run_streamed(*args: Any, **kwargs: Any) -> Any:
+            run_configs.append(kwargs.get("run_config"))
+            return fake_result
+
+        async def fake_stream_to_sse(result: Any, s: Any, c: Any) -> None:
+            if len(run_configs) >= 2:
+                c.update_workflow_called = True
+                c.test_after_update_done = True
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse",
+            fake_stream_to_sse,
+        )
+
+        returned = await run_with_enforcement(
+            agent=MagicMock(),
+            initial_input="hello",
+            ctx=ctx,
+            stream=stream,
+            run_config=RunConfig(),
+        )
+
+        assert returned is fake_result
+        assert len(run_configs) == 2
+        assert run_configs[0].model_settings is None
+        assert run_configs[1].model_settings is None
+
+    def test_authoring_offer_blocks_non_persistence_tool_until_update_and_run_blocks(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 2
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+
+        signal = synthesized_block_persistence_signal(ctx, "evaluate")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert signal.blocked_tool == "evaluate"
+        assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
+        assert signal.recovery_hint == "retry_with_different_tool"
+        assert signal.renders_final_reply is False
+        assert synthesized_block_persistence_signal(ctx, "update_and_run_blocks") is None
+
+    def test_authoring_offer_blocks_page_mutating_tool_before_loop_detection(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = False
+        ctx.scout_trajectory = [{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}]
+
+        signal = synthesized_block_persistence_signal(ctx, "click")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert signal.blocked_tool == "click"
+        assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
+        assert signal.renders_final_reply is False
+
+    def test_prerun_ambiguous_bare_selector_repair_allows_one_evaluate(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button"}]
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="lookup",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_repeated_ambiguous_bare_selector_context_blocks_second_evaluate(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button"}]
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="lookup",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+        signal = synthesized_block_persistence_signal(ctx, "evaluate")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_ambiguous_bare_selector_with_stable_alternative_still_requires_persistence(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button"}]
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="lookup",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+            selector_alternatives=[{"tool_name": "click", "selector": 'role=button[name="Search"]'}],
+        )
+
+        signal = synthesized_block_persistence_signal(ctx, "evaluate")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["update_and_run_blocks", "update_workflow", "fill_credential_field"],
+    )
+    def test_authoring_offer_keeps_allowed_tools_unblocked(self, tool_name: str) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = False
+        ctx.scout_trajectory = [{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}]
+
+        assert synthesized_block_persistence_signal(ctx, tool_name) is None
+
+    def test_authoring_offer_does_not_block_mutating_tool_when_trajectory_changed(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = False
+        ctx.scout_trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_authoring_offer_does_not_block_mutating_tool_without_offer(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = False
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}]
+
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_unresolved_recorded_outcome_blocks_page_mutating_tool_until_update_and_run_blocks(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.completion_verification_result = self._unsatisfied_verification()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:partial",
+        )
+
+        signal = synthesized_block_persistence_signal(ctx, "click")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert signal.blocked_tool == "click"
+        assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
+        assert "last recorded test outcome" in signal.agent_steering_text
+        assert synthesized_block_persistence_signal(ctx, "update_and_run_blocks") is None
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    @pytest.mark.parametrize(
+        "ctx_attrs",
+        [
+            {"synthesized_block_offered": False, "synthesized_block_offered_trajectory_len": 0},
+            {"synthesized_block_offered": True, "synthesized_block_offered_trajectory_len": 0},
+            {
+                "synthesized_block_offered": True,
+                "synthesized_block_offered_trajectory_len": 4,
+                "update_workflow_called": True,
+            },
+        ],
+        ids=["no_offer", "zero_trajectory", "update_called"],
+    )
+    def test_non_persistence_tool_unaffected_without_active_offer_or_after_update(
+        self,
+        ctx_attrs: dict[str, object],
+    ) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        for key, value in ctx_attrs.items():
+            setattr(ctx, key, value)
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_recorded_workflow_update_clears_synthesized_persistence_gate(self) -> None:
+        ctx = CopilotContext(
+            organization_id="o",
+            workflow_id="w",
+            workflow_permanent_id="wp",
+            workflow_yaml="title: Updated",
+            browser_session_id=None,
+            stream=SimpleNamespace(),
+        )
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 2
+        ctx.scout_trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx.synthesized_block_offered_goal_complete = True
+
+        _record_workflow_update_result(
+            ctx,
+            {
+                "ok": True,
+                "data": {"block_count": 1},
+                "_workflow": SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            },
+        )
+
+        assert ctx.update_workflow_called is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_recorded_workflow_update_clears_reopened_synthesized_persistence_latch(self) -> None:
+        ctx = CopilotContext(
+            organization_id="o",
+            workflow_id="w",
+            workflow_permanent_id="wp",
+            workflow_yaml="title: Updated",
+            browser_session_id=None,
+            stream=SimpleNamespace(),
+        )
+        ctx.synthesized_block_reopened_after_failed_run = True
+
+        _record_workflow_update_result(
+            ctx,
+            {
+                "ok": True,
+                "data": {"block_count": 1},
+                "_workflow": SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            },
+        )
+
+        assert ctx.synthesized_block_reopened_after_failed_run is False
+
+    def test_stale_shorter_offer_does_not_force_current_goal_complete_trajectory(self) -> None:
+        previous_trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+        ]
+        trajectory = [
+            *previous_trajectory,
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.synthesized_block_offered_trajectory_len = len(previous_trajectory)
+        ctx.synthesized_block_offered_goal_complete = False
+
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_refreshed_goal_complete_offer_forces_current_trajectory(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+
+        assert ctx.synthesized_block_offered_trajectory_len == len(trajectory)
+        assert ctx.synthesized_block_offered_goal_complete is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_failed_verified_run_with_new_commit_reopens_synthesized_persistence_gate(self) -> None:
+        previous_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#username",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+            },
+            {"tool_name": "click", "selector": "button[data-action='login']", "accessible_name": "Log in"},
+        ]
+        trajectory = [
+            *previous_trajectory,
+            {"tool_name": "click", "selector": "button[data-action='businessToggle']", "accessible_name": "Business"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.update_workflow_called = True
+        ctx.test_after_update_done = True
+        ctx.last_test_ok = False
+        ctx.completion_verification_result = self._unsatisfied_verification()
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(previous_trajectory)
+        ctx.synthesized_block_offered_goal_complete = True
+
+        assert synthesized_persistence_reopened_after_failed_run(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+        assert _maybe_synthesized_block_offer_msg(ctx) is not None
+        assert ctx.synthesized_block_offered_trajectory_len == len(trajectory)
+        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_failed_verified_run_without_new_commit_keeps_synthesized_persistence_gate_clear(self) -> None:
+        previous_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#username",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+            },
+            {"tool_name": "click", "selector": "button[data-action='login']", "accessible_name": "Log in"},
+        ]
+        trajectory = [
+            *previous_trajectory,
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#password",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+            },
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.update_workflow_called = True
+        ctx.test_after_update_done = True
+        ctx.last_test_ok = False
+        ctx.completion_verification_result = self._unsatisfied_verification()
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(previous_trajectory)
+        ctx.synthesized_block_offered_goal_complete = True
+
+        assert synthesized_persistence_reopened_after_failed_run(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_diagnose_offer_does_not_block_non_persistence_tool(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.DIAGNOSE,
+            authority=TurnIntentAuthority(may_read_run_context=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 4
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    @pytest.mark.parametrize(
+        "trajectory, download_target, expected_complete",
+        [
+            ([], None, False),
+            ([{"tool_name": "click", "selector": "a.home", "accessible_name": "Home"}], None, False),
+            ([{"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"}], None, False),
+            (
+                [
+                    {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+                    {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+                ],
+                None,
+                True,
+            ),
+            (
+                [
+                    {"tool_name": "select_option", "selector": "select#state", "value": "CA"},
+                    {"tool_name": "click", "selector": "button[type='submit']", "accessible_name": "Continue"},
+                ],
+                None,
+                True,
+            ),
+            (
+                [
+                    {"tool_name": "select_option", "selector": "select#state", "value": ""},
+                    {"tool_name": "click", "selector": "button[type='submit']", "accessible_name": "Continue"},
+                ],
+                None,
+                False,
+            ),
+            (
+                [
+                    {"tool_name": "fill_credential_field", "credential_field": "username"},
+                    {"tool_name": "click", "selector": "button[type='submit']", "accessible_name": "Log in"},
+                ],
+                None,
+                False,
+            ),
+            (
+                [
+                    {"tool_name": "fill_credential_field", "credential_id": "cred", "credential_field": "username"},
+                    {"tool_name": "fill_credential_field", "credential_id": "cred", "credential_field": "password"},
+                    {"tool_name": "click", "selector": "button[type='submit']", "accessible_name": "Log in"},
+                ],
+                None,
+                True,
+            ),
+            (
+                [
+                    {"tool_name": "fill_credential_field", "credential_id": "cred", "credential_field": "username"},
+                    {"tool_name": "click", "selector": "button"},
+                ],
+                None,
+                False,
+            ),
+            (
+                [
+                    {"tool_name": "fill_credential_field", "credential_id": "cred", "credential_field": "username"},
+                    {"tool_name": "fill_credential_field", "credential_id": "cred", "credential_field": "password"},
+                    {"tool_name": "click", "selector": "button[type='submit']", "accessible_name": "Log in"},
+                    {"tool_name": "type_text", "selector": "input[name='amount']", "accessible_name": "Amount"},
+                    {"tool_name": "click", "selector": "button[data-action='pay']", "accessible_name": "Pay"},
+                ],
+                None,
+                True,
+            ),
+            (
+                [{"tool_name": "click", "selector": "a.report", "accessible_name": "Report"}],
+                ReachedDownloadTarget(
+                    selector="a.report",
+                    affordance_text="Report",
+                    download_kind="extension",
+                    source_step="trajectory_recency",
+                    already_registered=False,
+                ),
+                True,
+            ),
+        ],
+        ids=[
+            "empty",
+            "navigate_only",
+            "type_text_only",
+            "type_text_then_commit",
+            "select_with_value_then_commit",
+            "select_empty_value_dropped",
+            "credential_missing_id_dropped",
+            "valid_login_fill_and_submit",
+            "valid_fill_generic_opener_only",
+            "post_login_durable_entry_then_commit",
+            "reached_download_target",
+        ],
+    )
+    def test_goal_completeness_drives_force_and_blocker_in_lockstep(
+        self,
+        trajectory: list[dict[str, object]],
+        download_target: ReachedDownloadTarget | None,
+        expected_complete: bool,
+    ) -> None:
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=download_target)
+
+        assert synthesized_trajectory_is_goal_complete(ctx) is expected_complete
+        assert _should_force_synthesized_block_persistence(ctx) is expected_complete
+        blocked = synthesized_block_persistence_signal(ctx, "evaluate") is not None
+        assert blocked is expected_complete
+
+    def test_extract_shaped_lookup_submit_is_goal_complete_without_extract_step(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='reference']", "accessible_name": "Reference"},
+            {"tool_name": "click", "selector": "button[data-action='lookup']", "accessible_name": "Look up"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+
+        assert not any(
+            str(item.get("tool_name") or "") in {"extract", "get_run_results", "evaluate"} for item in trajectory
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+
+    @pytest.mark.parametrize(
+        "guard_attrs",
+        [
+            {"update_workflow_called": True},
+            {"synthesized_block_offered": False},
+            {"block_authoring_policy": BlockAuthoringPolicy.STANDARD},
+        ],
+        ids=["already_authored", "not_offered", "policy_not_code_only"],
+    )
+    def test_early_guards_never_force_even_when_goal_complete(self, guard_attrs: dict[str, object]) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        for key, value in guard_attrs.items():
+            setattr(ctx, key, value)
+
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_diagnose_turn_intent_never_forces_even_when_goal_complete(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.DIAGNOSE,
+            authority=TurnIntentAuthority(may_read_run_context=True),
+        )
+
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_update_only_turn_intent_never_forces_update_and_run_blocks_even_when_goal_complete(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.DRAFT_ONLY,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+        )
+
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_goal_complete_commit_refreshes_offer_below_threshold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        trajectory = [
+            {"tool_name": "click", "selector": "a.home", "accessible_name": "Home"},
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 2
+        ctx.synthesized_block_offered_goal_complete = False
+        assert len(trajectory) < 2 + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        assert ctx.synthesized_block_offered_trajectory_len == len(trajectory)
+        assert ctx.synthesized_block_offered_goal_complete is True
+
+    def test_goal_complete_offer_refresh_suppresses_near_duplicate_followup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='open']", "accessible_name": "Open"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 2
+        ctx.synthesized_block_offered_goal_complete = True
+        assert len(trajectory) < 2 + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is None
+        assert ctx.synthesized_block_offered_trajectory_len == 2
+
+    def test_failed_verified_run_with_new_commit_refreshes_offer_below_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        previous_trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        trajectory = [
+            *previous_trajectory,
+            {"tool_name": "click", "selector": "button[data-action='details']", "accessible_name": "Details"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.update_workflow_called = True
+        ctx.test_after_update_done = True
+        ctx.last_test_ok = False
+        ctx.completion_verification_result = self._unsatisfied_verification()
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(previous_trajectory)
+        ctx.synthesized_block_offered_goal_complete = True
+        assert len(trajectory) < len(previous_trajectory) + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        assert ctx.synthesized_block_offered_trajectory_len == len(trajectory)
+        assert ctx.synthesized_block_reopened_after_failed_run is True
+
+    def test_sub_threshold_offer_stays_suppressed_when_not_goal_complete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        trajectory = [
+            {"tool_name": "click", "selector": "a.home", "accessible_name": "Home"},
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        assert len(trajectory) < 1 + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is None
+        assert ctx.synthesized_block_offered_trajectory_len == 1
+
+    def test_terminal_blocker_replaces_nonterminal_synthesized_persistence_blocker(self) -> None:
+        ctx = _Ctx()
+        persistence_signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="Persist the drafted workflow before more scouting.",
+            user_facing_reason="I need to save and test the drafted workflow before scouting more.",
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=frozenset({"update_and_run_blocks"}),
+            preserves_workflow_draft=True,
+            renders_final_reply=False,
+            internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+            blocked_tool="click",
+        )
+        terminal_signal = CopilotToolBlockerSignal(
+            blocker_kind="loop_detected",
+            agent_steering_text="Report that repeated repair attempts did not verify the workflow outcome.",
+            user_facing_reason="The workflow was saved and tested, but repeated repairs did not reach the required review page.",
+            recovery_hint="report_blocker_to_user",
+            cleared_by_tools=frozenset(),
+            preserves_workflow_draft=True,
+            renders_final_reply=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+
+        stash_blocker_signal(ctx, persistence_signal)
+        stash_blocker_signal(ctx, terminal_signal)
+
+        assert ctx.blocker_signal is terminal_signal
 
 
 # ---------------------------------------------------------------------------

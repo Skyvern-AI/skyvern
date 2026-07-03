@@ -436,6 +436,56 @@ def _validate_definition_structure(json_def: dict[str, Any] | None, action: str)
     return None
 
 
+def _extract_workflow_blocks(definition: dict[str, Any]) -> list[Any]:
+    block_lists: list[list[Any]] = []
+    top_level_blocks = definition.get("blocks")
+    if isinstance(top_level_blocks, list):
+        block_lists.append(top_level_blocks)
+
+    workflow_definition = definition.get("workflow_definition")
+    if isinstance(workflow_definition, dict):
+        workflow_blocks = workflow_definition.get("blocks")
+        if isinstance(workflow_blocks, list) and workflow_blocks is not top_level_blocks:
+            block_lists.append(workflow_blocks)
+
+    return [block for blocks in block_lists for block in blocks]
+
+
+def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str) -> dict[str, Any] | None:
+    blocks = _extract_workflow_blocks(definition)
+    if not blocks:
+        return None
+
+    # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
+    from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
+        collect_code_only_banned_items,
+    )
+
+    banned_items = collect_code_only_banned_items(blocks)
+    if not banned_items:
+        return None
+
+    labels = ", ".join(sorted({label for label, _ in banned_items}))
+    types = ", ".join(sorted({block_type for _, block_type in banned_items}))
+    return make_result(
+        action,
+        ok=False,
+        error=make_error(
+            ErrorCode.INVALID_INPUT,
+            f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
+            "In code-only mode, use a `code` block for durable browser/page work instead of "
+            "task/navigation/extraction/etc.",
+        ),
+    )
+
+
+def _validate_code_only_definition(definition: str, fmt: str, action: str) -> dict[str, Any] | None:
+    raw, _ = _load_definition_dict(definition, fmt)
+    if raw is None:
+        return None
+    return _validate_code_only_workflow_blocks(raw, action)
+
+
 _CODE_V2_DEFAULTS: dict[str, Any] = {
     "code_version": 2,
     "run_with": "agent",
@@ -1289,6 +1339,13 @@ async def skyvern_workflow_create(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto' (tries JSON first, falls back to YAML)")
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
+    code_only: Annotated[
+        bool,
+        Field(
+            description="When true, structurally reject non-code browser/page block types before persisting "
+            "(code-only mode)"
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
@@ -1333,6 +1390,13 @@ async def skyvern_workflow_create(
     if err := _validate_definition_structure(json_def, "skyvern_workflow_create"):
         return err
 
+    if code_only:
+        if json_def is not None:
+            if err := _validate_code_only_workflow_blocks(json_def, "skyvern_workflow_create"):
+                return err
+        elif err := _validate_code_only_definition(definition, format, "skyvern_workflow_create"):
+            return err
+
     with Timer() as timer:
         try:
             workflow = await create_workflow_raw(
@@ -1368,6 +1432,13 @@ async def skyvern_workflow_update(
     format: Annotated[  # noqa: A002
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
+    code_only: Annotated[
+        bool,
+        Field(
+            description="When true, structurally reject non-code browser/page block types before persisting "
+            "(code-only mode)"
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow."""
@@ -1384,6 +1455,10 @@ async def skyvern_workflow_update(
                 "Use 'json', 'yaml', or 'auto'",
             ),
         )
+
+    if code_only:
+        if err := _validate_code_only_definition(definition, format, "skyvern_workflow_update"):
+            return err
 
     param_warnings: list[str] = []
     try:

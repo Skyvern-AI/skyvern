@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.forge.sdk.copilot.build_test_outcome import maybe_satisfy_recorded_outcome_grounding_requirement
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     RunEvidenceSnapshot,
@@ -25,9 +26,16 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.request_policy import completion_criterion_requires_active_run_terminal_monitor
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    finalize_runtime_authoring_repair_context_from_page_observation,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -76,7 +84,10 @@ async def _active_run_terminal_monitor_enabled(copilot_ctx: Any) -> bool:
         return False
     if not getattr(copilot_ctx, "discovery_mcp_server", None):
         return False
-    if not _completion_verification_criteria(copilot_ctx):
+    criteria = _completion_verification_criteria(copilot_ctx)
+    if not criteria:
+        return False
+    if not any(completion_criterion_requires_active_run_terminal_monitor(criterion) for criterion in criteria):
         return False
     return await _completion_verification_handler(copilot_ctx) is not None
 
@@ -191,6 +202,7 @@ def _active_run_terminal_evidence_result(
             "current_url": observed_url,
             "page_title": observed_title,
             "active_run_terminal_evidence_detected": True,
+            "active_run_terminal_evidence_reason_code": ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
             "active_run_terminal_evidence_sample_index": getattr(sample, "sample_index", None),
             "full_workflow_verified": False,
             "current_page_evidence": getattr(sample, "page_evidence", None),
@@ -650,6 +662,23 @@ async def _capture_composition_evidence(
     return evidence, None
 
 
+def store_post_run_page_evidence(
+    copilot_ctx: Any,
+    evidence: dict[str, Any],
+    *,
+    run_id: str,
+    current_url: str,
+) -> dict[str, Any]:
+    stamped = {**evidence, "workflow_run_id": run_id, "observed_after_workflow_run": True}
+    if current_url and not stamped.get("current_url"):
+        stamped["current_url"] = current_url
+    copilot_ctx.composition_page_evidence = stamped
+    page_title = stamped.get("page_title")
+    if isinstance(page_title, str) and page_title:
+        _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
+    return stamped
+
+
 def _normalized_inspect_url(url: str | None) -> str | None:
     """Normalized full URL for strict same-page comparison, or None when not comparable.
 
@@ -825,21 +854,17 @@ async def _inspect_page_for_composition_impl(
 
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if isinstance(run_id, str) and run_id:
-        evidence = {
-            **evidence,
-            "workflow_run_id": run_id,
-            "observed_after_workflow_run": True,
-        }
+        evidence = store_post_run_page_evidence(copilot_ctx, evidence, run_id=run_id, current_url=current_url)
         _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
-        page_title = evidence.get("page_title")
-        if isinstance(page_title, str) and page_title:
-            _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
+    else:
+        copilot_ctx.composition_page_evidence = evidence
 
     if not bypass_budget_for_post_run_current_page:
         copilot_ctx.page_inspection_calls_this_turn += 1
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
-    copilot_ctx.composition_page_evidence = evidence
+    finalize_runtime_authoring_repair_context_from_page_observation(copilot_ctx)
+    maybe_satisfy_recorded_outcome_grounding_requirement(copilot_ctx)
     if (
         isinstance(run_id, str)
         and run_id

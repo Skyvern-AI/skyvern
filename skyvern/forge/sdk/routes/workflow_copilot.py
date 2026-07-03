@@ -19,6 +19,7 @@ from sse_starlette import EventSourceResponse
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
+from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -37,7 +38,13 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     plan_persistence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import (
+    AgentResult,
+    ProposalDisposition,
+    TurnNarrativePayload,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
+)
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
@@ -932,6 +939,7 @@ async def _commit_staged_workflow(
         ai_fallback=staged_workflow.ai_fallback,
         cache_key=staged_workflow.cache_key,
         adaptive_caching=staged_workflow.adaptive_caching,
+        enable_self_healing=staged_workflow.enable_self_healing,
         code_version=staged_workflow.code_version,
         run_sequentially=staged_workflow.run_sequentially,
         sequential_key=staged_workflow.sequential_key,
@@ -969,6 +977,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         ai_fallback=original_workflow.ai_fallback,
         cache_key=original_workflow.cache_key,
         adaptive_caching=original_workflow.adaptive_caching,
+        enable_self_healing=original_workflow.enable_self_healing,
         code_version=original_workflow.code_version,
         run_sequentially=original_workflow.run_sequentially,
         sequential_key=original_workflow.sequential_key,
@@ -1107,12 +1116,15 @@ async def copilot_call_llm(
 
     # Render user prompt (untrusted content, each variable in code fences)
     # Escape triple backticks to prevent code fence breakout
+    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(chat_request.workflow_yaml or ""),
         user_message=escape_code_fences(chat_request.message),
         chat_history=escape_code_fences(chat_history_text),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
+        global_llm_context=escape_code_fences(prompt_global_llm_context),
+        loaded_result_context=escape_code_fences(loaded_result_context),
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1174,7 +1186,7 @@ async def copilot_call_llm(
 
     global_llm_context = action_data.get("global_llm_context")
     if global_llm_context is not None:
-        global_llm_context = str(global_llm_context)
+        global_llm_context = sanitize_global_llm_context_for_prompt(str(global_llm_context))
 
     if action_type == "REPLACE_WORKFLOW":
         llm_workflow_yaml = default_data_write_continue_on_failure(
@@ -1182,11 +1194,12 @@ async def copilot_call_llm(
         )
         applied_workflow_yaml = llm_workflow_yaml
         try:
-            updated_workflow = _process_workflow_yaml(
+            updated_workflow = await _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 organization_id=organization_id,
                 workflow_yaml=llm_workflow_yaml,
+                settings_fallback_yaml=chat_request.workflow_yaml,
             )
         except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
             await stream.send(
@@ -1209,11 +1222,12 @@ async def copilot_call_llm(
                 ),
                 chat_request.workflow_yaml,
             )
-            updated_workflow = _process_workflow_yaml(
+            updated_workflow = await _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 organization_id=organization_id,
                 workflow_yaml=corrected_workflow_yaml,
+                settings_fallback_yaml=chat_request.workflow_yaml,
             )
             applied_workflow_yaml = corrected_workflow_yaml
 
@@ -1262,12 +1276,15 @@ async def _auto_correct_workflow_yaml(
         security_rules=security_rules,
     )
 
+    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         user_message=escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
         chat_history=escape_code_fences(_format_chat_history(new_chat_history)),
-        global_llm_context=escape_code_fences(global_llm_context or ""),
+        global_llm_context=escape_code_fences(prompt_global_llm_context),
+        loaded_result_context=escape_code_fences(loaded_result_context),
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1547,11 +1564,25 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
     return workflow_yaml_request
 
 
-def _process_workflow_yaml(
+def _yaml_enable_self_healing(workflow_yaml: str | None) -> bool | None:
+    if not workflow_yaml:
+        return None
+    try:
+        parsed = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get("enable_self_healing")
+    return value if isinstance(value, bool) else None
+
+
+async def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
     organization_id: str,
     workflow_yaml: str,
+    settings_fallback_yaml: str | None = None,
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
@@ -1564,6 +1595,24 @@ def _process_workflow_yaml(
         workflow_definition_yaml=workflow_yaml_request.workflow_definition,
         workflow_id=workflow_id,
     )
+
+    enable_self_healing = workflow_yaml_request.enable_self_healing
+    if enable_self_healing is None:
+        # Copilot YAML routinely omits settings it didn't touch; omission must inherit —
+        # the canonical-persist comparison would otherwise read the schema default as an
+        # explicit disable. The submitted draft YAML wins over persisted state so an
+        # unsaved editor toggle survives an unrelated copilot edit. A persisted-lookup
+        # failure propagates: failing the save is safer than writing an implicit disable.
+        enable_self_healing = _yaml_enable_self_healing(settings_fallback_yaml)
+    if enable_self_healing is None:
+        try:
+            current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        except WorkflowNotFound:
+            current_workflow = None
+        enable_self_healing = bool(current_workflow and current_workflow.enable_self_healing)
 
     now = datetime.now(timezone.utc)
     return Workflow(
@@ -1590,6 +1639,7 @@ def _process_workflow_yaml(
         ai_fallback=workflow_yaml_request.ai_fallback,
         cache_key=workflow_yaml_request.cache_key,
         adaptive_caching=workflow_yaml_request.adaptive_caching,
+        enable_self_healing=enable_self_healing,
         code_version=workflow_yaml_request.code_version,
         run_sequentially=workflow_yaml_request.run_sequentially,
         sequential_key=workflow_yaml_request.sequential_key,

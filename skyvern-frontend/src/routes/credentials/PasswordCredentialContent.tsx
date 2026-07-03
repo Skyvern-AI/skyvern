@@ -1,3 +1,4 @@
+import googleAuthenticatorIcon from "@/assets/authenticators/google-authenticator.jpg";
 import { QRCodeIcon } from "@/components/icons/QRCodeIcon";
 import {
   Accordion,
@@ -15,14 +16,28 @@ import {
   EnvelopeClosedIcon,
   EyeNoneIcon,
   EyeOpenIcon,
+  MagicWandIcon,
   MobileIcon,
   Pencil1Icon,
   ReloadIcon,
   UploadIcon,
 } from "@radix-ui/react-icons";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link } from "react-router-dom";
+import {
+  type CredentialAuthenticatorQrCodeType,
+  useCredentialAuthenticatorSupport,
+} from "./CredentialAuthenticatorSupportContext";
+import { AuthenticatorAppLogo } from "./AuthenticatorAppLogo";
 import { decodeQrCodeImage } from "./decodeQrCodeImage";
+import { type AuthenticatorSaveError } from "./authenticatorSaveError";
 
 type Props = {
   values: {
@@ -57,7 +72,38 @@ type Props = {
   onEnableEditName?: () => void;
   onEnableEditValues?: () => void;
   totpError?: string | null;
+  /** Server-side authenticator setup error surfaced inline near the key field */
+  authenticatorSaveError?: AuthenticatorSaveError | null;
 };
+
+const STANDARD_AUTHENTICATOR_TYPE_ID = "standard";
+
+const STANDARD_AUTHENTICATOR_TYPE: CredentialAuthenticatorQrCodeType = {
+  id: STANDARD_AUTHENTICATOR_TYPE_ID,
+  label: "Google Authenticator",
+  description: "Standard TOTP setup code",
+  logo: <AuthenticatorAppLogo src={googleAuthenticatorIcon} />,
+};
+
+type AuthenticatorTypeDetectionSource = "qr" | "typed" | "saved" | "backend";
+
+function compactAuthenticatorSecret(value: string): string {
+  return value.replace(/[\s-]/g, "");
+}
+
+function isStandardAuthenticatorValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (/^otpauth:\/\/totp\//i.test(trimmed)) {
+    return true;
+  }
+
+  const compact = compactAuthenticatorSecret(trimmed);
+  return compact.length >= 16 && /^[A-Z2-7]+=*$/i.test(compact);
+}
 
 function PasswordCredentialContent({
   values,
@@ -73,8 +119,29 @@ function PasswordCredentialContent({
   onEnableEditName,
   onEnableEditValues,
   totpError,
+  authenticatorSaveError,
 }: Props) {
+  const { enterpriseApps } = useCredentialAuthenticatorSupport();
   const { name, username, password, totp, totp_type, totp_identifier } = values;
+
+  const enterpriseUpgradeError =
+    authenticatorSaveError?.code === "enterprise_required"
+      ? authenticatorSaveError
+      : null;
+  const enterpriseUpgradeVendorLabel = enterpriseUpgradeError?.vendor
+    ? enterpriseApps?.vendorLabels?.[
+        enterpriseUpgradeError.vendor.toLowerCase()
+      ]
+    : null;
+  const enterpriseUpgradeMessage = enterpriseUpgradeVendorLabel
+    ? `${enterpriseUpgradeVendorLabel} requires a Skyvern enterprise plan.`
+    : enterpriseUpgradeError?.message;
+  const enterpriseContactUrl = enterpriseApps?.contactUrl;
+  const destructiveSaveError =
+    authenticatorSaveError &&
+    authenticatorSaveError.code !== "enterprise_required"
+      ? authenticatorSaveError
+      : null;
   const nameReadOnly = editMode && !editingGroups?.name;
   const valuesReadOnly = editMode && !editingGroups?.values;
 
@@ -87,7 +154,101 @@ function PasswordCredentialContent({
   const [showPassword, setShowPassword] = useState(false);
   const [qrCodeScanError, setQrCodeScanError] = useState<string | null>(null);
   const [isScanningQrCode, setIsScanningQrCode] = useState(false);
+  const [selectedAuthenticatorTypeId, setSelectedAuthenticatorTypeId] =
+    useState<string | null>(STANDARD_AUTHENTICATOR_TYPE_ID);
+  const [inferredAuthenticatorTypeId, setInferredAuthenticatorTypeId] =
+    useState<string | null>(null);
+  const [
+    authenticatorTypeDetectionSource,
+    setAuthenticatorTypeDetectionSource,
+  ] = useState<AuthenticatorTypeDetectionSource | null>(null);
+  const inferredAuthenticatorValueRef = useRef("");
   const qrCodeInputRef = useRef<HTMLInputElement>(null);
+  const authenticatorKeyErrorId = useId();
+  const enterpriseUpgradeErrorId = useId();
+
+  const authenticatorTypeOptions = useMemo(
+    () => [STANDARD_AUTHENTICATOR_TYPE, ...(enterpriseApps?.qrCodeTypes ?? [])],
+    [enterpriseApps?.qrCodeTypes],
+  );
+  const authenticatorTypeOptionIds = useMemo(
+    () => new Set(authenticatorTypeOptions.map(({ id }) => id)),
+    [authenticatorTypeOptions],
+  );
+  const detectionStatusLabel =
+    authenticatorTypeDetectionSource === "qr"
+      ? "Detected from QR"
+      : authenticatorTypeDetectionSource === "typed"
+        ? "Detected from value"
+        : authenticatorTypeDetectionSource === "saved"
+          ? "Detected from saved key"
+          : authenticatorTypeDetectionSource === "backend"
+            ? "Detected on save"
+            : null;
+  const inferredAuthenticatorTypeLabel = useMemo(
+    () =>
+      authenticatorTypeOptions.find(
+        ({ id }) => id === inferredAuthenticatorTypeId,
+      )?.label ?? null,
+    [authenticatorTypeOptions, inferredAuthenticatorTypeId],
+  );
+  const destructiveAuthenticatorMessages = (
+    [totpError, qrCodeScanError, destructiveSaveError?.message] as const
+  ).filter((message): message is string => Boolean(message));
+  const hasAuthenticatorKeyError = Boolean(
+    destructiveAuthenticatorMessages.length,
+  );
+  const authenticatorKeyDescriptionIds = [
+    hasAuthenticatorKeyError ? authenticatorKeyErrorId : null,
+    enterpriseUpgradeError ? enterpriseUpgradeErrorId : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const inferAuthenticatorTypeId = useCallback(
+    (value: string): string | null => {
+      if (isStandardAuthenticatorValue(value)) {
+        return STANDARD_AUTHENTICATOR_TYPE_ID;
+      }
+
+      const inferredEnterpriseType = enterpriseApps?.inferQrCodeType?.(value);
+      if (
+        inferredEnterpriseType &&
+        authenticatorTypeOptionIds.has(inferredEnterpriseType)
+      ) {
+        return inferredEnterpriseType;
+      }
+
+      return null;
+    },
+    [authenticatorTypeOptionIds, enterpriseApps],
+  );
+
+  const applyAuthenticatorTypeInference = useCallback(
+    (
+      value: string,
+      source: AuthenticatorTypeDetectionSource,
+      {
+        clearUnknownSelection = false,
+      }: { clearUnknownSelection?: boolean } = {},
+    ) => {
+      const inferredTypeId = inferAuthenticatorTypeId(value);
+      if (inferredTypeId) {
+        inferredAuthenticatorValueRef.current = value;
+        setSelectedAuthenticatorTypeId(inferredTypeId);
+        setInferredAuthenticatorTypeId(inferredTypeId);
+        setAuthenticatorTypeDetectionSource(source);
+        return;
+      }
+
+      setInferredAuthenticatorTypeId(null);
+      setAuthenticatorTypeDetectionSource(null);
+      if (clearUnknownSelection) {
+        setSelectedAuthenticatorTypeId(null);
+      }
+    },
+    [inferAuthenticatorTypeId],
+  );
 
   // Sync totpMethod and auto-expand accordion when totp_type prop changes
   // (e.g. edit data arriving after mount)
@@ -101,6 +262,53 @@ function PasswordCredentialContent({
       setTotpAccordionValue("two-factor-authentication");
     }
   }, [totp_type]);
+
+  useEffect(() => {
+    if (
+      selectedAuthenticatorTypeId &&
+      !authenticatorTypeOptionIds.has(selectedAuthenticatorTypeId)
+    ) {
+      setSelectedAuthenticatorTypeId(STANDARD_AUTHENTICATOR_TYPE_ID);
+    }
+    if (
+      inferredAuthenticatorTypeId &&
+      !authenticatorTypeOptionIds.has(inferredAuthenticatorTypeId)
+    ) {
+      setInferredAuthenticatorTypeId(null);
+      setAuthenticatorTypeDetectionSource(null);
+    }
+  }, [
+    authenticatorTypeOptionIds,
+    inferredAuthenticatorTypeId,
+    selectedAuthenticatorTypeId,
+  ]);
+
+  useEffect(() => {
+    if (totpMethod !== "authenticator" || !totp) {
+      return;
+    }
+    if (totp === inferredAuthenticatorValueRef.current) {
+      return;
+    }
+
+    const inferredTypeId = inferAuthenticatorTypeId(totp);
+    if (inferredTypeId) {
+      inferredAuthenticatorValueRef.current = totp;
+      setSelectedAuthenticatorTypeId(inferredTypeId);
+      setInferredAuthenticatorTypeId(inferredTypeId);
+      setAuthenticatorTypeDetectionSource("saved");
+    }
+  }, [inferAuthenticatorTypeId, totp, totpMethod]);
+
+  useEffect(() => {
+    const vendor = enterpriseUpgradeError?.vendor?.toLowerCase();
+    if (vendor && authenticatorTypeOptionIds.has(vendor)) {
+      setSelectedAuthenticatorTypeId(vendor);
+      setInferredAuthenticatorTypeId(vendor);
+      setAuthenticatorTypeDetectionSource("backend");
+    }
+  }, [authenticatorTypeOptionIds, enterpriseUpgradeError?.vendor]);
+
   const prevUsernameRef = useRef(username);
   const totpIdentifierLabel =
     totpMethod === "text"
@@ -196,6 +404,14 @@ function PasswordCredentialContent({
     onEnableEditValues?.();
     setQrCodeScanError(null);
     setTotpMethod("authenticator");
+    if (!value) {
+      inferredAuthenticatorValueRef.current = "";
+      setSelectedAuthenticatorTypeId(STANDARD_AUTHENTICATOR_TYPE_ID);
+      setInferredAuthenticatorTypeId(null);
+      setAuthenticatorTypeDetectionSource(null);
+    } else {
+      applyAuthenticatorTypeInference(value, "typed");
+    }
     updateValues({ totp: value, totp_type: "authenticator" });
   };
 
@@ -214,6 +430,9 @@ function PasswordCredentialContent({
     try {
       const qrCodeValue = await decodeQrCodeImage(file);
       setTotpMethod("authenticator");
+      applyAuthenticatorTypeInference(qrCodeValue, "qr", {
+        clearUnknownSelection: true,
+      });
       updateValues({ totp: qrCodeValue, totp_type: "authenticator" });
     } catch (caught) {
       setQrCodeScanError(
@@ -225,6 +444,94 @@ function PasswordCredentialContent({
       setIsScanningQrCode(false);
     }
   };
+
+  const authenticatorTypeSelector = (
+    <div className="space-y-2" data-testid="authenticator-qr-type-selector">
+      <div className="flex items-center justify-between gap-3">
+        <Label className="text-xs font-medium text-slate-400">
+          Authenticator app
+        </Label>
+        <div role="status" aria-live="polite" className="min-h-4">
+          {detectionStatusLabel && inferredAuthenticatorTypeId && (
+            <>
+              <span
+                data-testid="authenticator-qr-type-detection"
+                className="text-xs text-blue-300"
+              >
+                {detectionStatusLabel}
+              </span>
+              {inferredAuthenticatorTypeLabel && (
+                <span className="sr-only">
+                  {` — ${inferredAuthenticatorTypeLabel}`}
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+      <div
+        role="group"
+        aria-label="Authenticator app type"
+        className="grid grid-cols-2 gap-2 sm:grid-cols-4"
+      >
+        {authenticatorTypeOptions.map((option) => {
+          const selected = selectedAuthenticatorTypeId === option.id;
+          const inferred = inferredAuthenticatorTypeId === option.id;
+          return (
+            <button
+              key={option.id}
+              type="button"
+              aria-pressed={selected}
+              data-inferred={inferred ? "true" : undefined}
+              className={cn(
+                "inline-flex h-14 w-full min-w-0 items-center gap-2 rounded-md border px-3 text-left text-xs font-medium leading-tight transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                selected
+                  ? "border-blue-400 bg-blue-500/10 text-foreground"
+                  : "border-slate-700 bg-slate-elevation1 text-slate-300 hover:border-slate-500 hover:bg-slate-elevation3 hover:text-slate-100",
+                inferred &&
+                  "border-blue-300 bg-blue-500/15 ring-1 ring-blue-400/70",
+              )}
+              onClick={() => {
+                onEnableEditValues?.();
+                setSelectedAuthenticatorTypeId(option.id);
+                setInferredAuthenticatorTypeId(null);
+                setAuthenticatorTypeDetectionSource(null);
+              }}
+            >
+              <span
+                aria-hidden="true"
+                data-testid="authenticator-type-logo"
+                className={cn(
+                  "flex size-8 shrink-0 items-center justify-center rounded-md border",
+                  selected || inferred
+                    ? "border-blue-400/50 bg-blue-500/10"
+                    : "border-slate-700 bg-background/40",
+                )}
+              >
+                {option.logo ?? <QRCodeIcon className="size-4" />}
+              </span>
+              <span className="min-w-0 flex-1">{option.label}</span>
+              <span className="ml-auto flex size-4 shrink-0 items-center justify-center">
+                {inferred ? (
+                  <MagicWandIcon className="size-3 text-blue-300" />
+                ) : (
+                  selected && <CheckIcon className="size-3" />
+                )}
+              </span>
+              {inferred && detectionStatusLabel && (
+                <span className="sr-only">{detectionStatusLabel}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+      {enterpriseApps?.description && (
+        <p className="text-xs leading-5 text-slate-400">
+          {enterpriseApps.description}
+        </p>
+      )}
+    </div>
+  );
 
   return (
     <div className="space-y-5">
@@ -448,24 +755,28 @@ function PasswordCredentialContent({
                     </p>
                   </div>
                   <p className="text-sm text-slate-400">
-                    <Link
-                      to="https://www.skyvern.com/contact"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="underline underline-offset-2"
-                    >
-                      Contact us to set up two-factor authentication in
-                      workflows
-                    </Link>{" "}
-                    or{" "}
+                    {enterpriseContactUrl && (
+                      <>
+                        <Link
+                          to={enterpriseContactUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="underline underline-offset-2"
+                        >
+                          Contact us to set up two-factor authentication in
+                          workflows
+                        </Link>{" "}
+                        or{" "}
+                      </>
+                    )}
                     <Link
                       to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline underline-offset-2"
                     >
-                      see our documentation on how to set up two-factor
-                      authentication in workflows
+                      {enterpriseContactUrl ? "see" : "See"} our documentation
+                      on how to set up two-factor authentication in workflows
                     </Link>{" "}
                     to get started.
                   </p>
@@ -473,6 +784,7 @@ function PasswordCredentialContent({
               )}
               {totpMethod === "authenticator" && (
                 <div className="space-y-4">
+                  {authenticatorTypeSelector}
                   <div className="flex items-center gap-12">
                     <div className="w-40 shrink-0">
                       <Label className="whitespace-nowrap">
@@ -504,9 +816,12 @@ function PasswordCredentialContent({
                             handleAuthenticatorTotpChange(e.target.value)
                           }
                           placeholder="e.g. JBSWY3DPEHPK3PXP"
-                          aria-invalid={Boolean(totpError)}
+                          aria-invalid={hasAuthenticatorKeyError}
+                          aria-describedby={
+                            authenticatorKeyDescriptionIds || undefined
+                          }
                           className={cn(
-                            totpError &&
+                            hasAuthenticatorKeyError &&
                               "border-destructive bg-destructive/10 focus-visible:ring-destructive/30",
                           )}
                         />
@@ -537,12 +852,49 @@ function PasswordCredentialContent({
                       </div>
                     )}
                   </div>
-                  {(totpError || qrCodeScanError) && (
-                    <div className="space-y-1 text-xs text-destructive">
-                      {totpError && <p>{totpError}</p>}
-                      {qrCodeScanError && <p>{qrCodeScanError}</p>}
+                  {destructiveAuthenticatorMessages.length > 0 && (
+                    <div
+                      id={authenticatorKeyErrorId}
+                      className="space-y-1 text-xs text-destructive"
+                    >
+                      {destructiveAuthenticatorMessages.map(
+                        (message, index) => (
+                          <p key={`${index}-${message}`}>{message}</p>
+                        ),
+                      )}
                     </div>
                   )}
+                  {enterpriseUpgradeError && (
+                    <div
+                      id={enterpriseUpgradeErrorId}
+                      data-testid="enterprise-authenticator-upgrade"
+                      className="rounded-md border border-warning/50 bg-warning/10 px-3 py-2 text-sm leading-5 text-foreground"
+                    >
+                      <span className="font-medium">
+                        {enterpriseUpgradeMessage}
+                      </span>
+                      {enterpriseContactUrl && (
+                        <>
+                          {" "}
+                          <span className="text-muted-foreground">
+                            <Link
+                              to={enterpriseContactUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="font-medium text-warning underline underline-offset-2"
+                            >
+                              Contact us
+                            </Link>{" "}
+                            to enable enterprise authenticator support.
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  <p className="text-sm text-slate-400">
+                    Works with Google Authenticator, Authy, 1Password, and any
+                    standard TOTP authenticator app.
+                  </p>
                   <p className="text-sm text-slate-400">
                     You need to find the authenticator key from the website
                     where you are using the credential. Here are some guides

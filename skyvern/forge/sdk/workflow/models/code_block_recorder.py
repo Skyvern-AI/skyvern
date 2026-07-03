@@ -48,6 +48,32 @@ _LOCATOR_FACTORY_METHODS = frozenset(
         "filter",
     }
 )
+# SkyvernPage high-level API (page.extract / page.complete / ...). These are not raw
+# Playwright calls, so they fall through the maps above and used to execute unrecorded —
+# a navigate+extract block then rendered as only repeated "Goto URL" on the timeline.
+# Mirror skyvern_page.py's @action_wrap table and the editor deriver
+# (code_block_steps._METHOD_ACTION_TYPES) so extraction and the rest of the surface
+# record as distinct, reader-facing steps.
+_HIGH_LEVEL_ACTION_MAP: dict[str, ActionType] = {
+    "extract": ActionType.EXTRACT,
+    "complete": ActionType.COMPLETE,
+    "terminate": ActionType.TERMINATE,
+    "wait": ActionType.WAIT,
+    "reload_page": ActionType.RELOAD_PAGE,
+    "scroll": ActionType.SCROLL,
+    "keypress": ActionType.KEYPRESS,
+    "move": ActionType.MOVE,
+    "drag": ActionType.DRAG,
+    "left_mouse": ActionType.LEFT_MOUSE,
+    "download_file": ActionType.DOWNLOAD_FILE,
+    "solve_captcha": ActionType.SOLVE_CAPTCHA,
+    "verification_code": ActionType.VERIFICATION_CODE,
+    "upload_file": ActionType.UPLOAD_FILE,
+    "fill_autocomplete": ActionType.INPUT_TEXT,
+}
+# High-level methods whose natural-language `prompt` (positional or keyword) is the
+# reader-facing description; mirrors code_block_steps._PROMPT_POSITIONAL_METHODS.
+_PROMPT_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
 
 OnAction = Callable[[Action], Awaitable[None]]
 
@@ -101,6 +127,7 @@ class _Recorder:
         target: str | None,
         call: Callable[[], Awaitable[Any]],
         args: tuple[Any, ...],
+        description: str | None = None,
     ) -> Any:
         started = time.monotonic()
         # Input values may be credentials (incl. derived TOTP codes); never describe them.
@@ -109,7 +136,10 @@ class _Recorder:
             action_type=action_type,
             status=ActionStatus.completed,
             action_order=len(self.actions),
-            description=_describe(name, target, describe_args),
+            # A reader-facing prompt (page.extract/complete) is the action's own copy; prefer it over
+            # the "page.method arg" form so the timeline reads as plain language even when the editor's
+            # derived step is missing or stale and the UI falls back to this description.
+            description=description if description is not None else _describe(name, target, describe_args),
             output={"code_line": _frame_user_line()},
         )
         try:
@@ -219,13 +249,21 @@ class RecordingPage:
                 return RecordingLocator(attr(*args, **kwargs), self.__recorder, _factory_selector(name, args))
 
             return factory
-        # Record direct page-level interactions (page.click/fill/press/...) with the same
-        # redaction as the locator path, alongside navigation calls.
-        action_type = _LOCATOR_ACTION_MAP.get(name) or _PAGE_ACTION_MAP.get(name)
+        # Record direct page-level interactions (page.click/fill/press/...) and the high-level
+        # SkyvernPage API (page.extract/complete/...) with the same redaction as the locator path.
+        action_type = _LOCATOR_ACTION_MAP.get(name) or _PAGE_ACTION_MAP.get(name) or _HIGH_LEVEL_ACTION_MAP.get(name)
         if action_type is None or not callable(attr):
             return attr
+        record_prompt = name in _PROMPT_METHODS
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
-            return await self.__recorder.record(action_type, f"page.{name}", None, lambda: attr(*args, **kwargs), args)
+            description: str | None = None
+            if record_prompt:
+                prompt = kwargs.get("prompt", args[0] if args else None)
+                if isinstance(prompt, str) and prompt.strip():
+                    description = " ".join(prompt.split())[:200]
+            return await self.__recorder.record(
+                action_type, f"page.{name}", None, lambda: attr(*args, **kwargs), args, description=description
+            )
 
         return recorded

@@ -9,7 +9,7 @@ import {
   MutableRefObject,
 } from "react";
 import { nanoid } from "nanoid";
-import { stringify as convertToYAML } from "yaml";
+import { parse as parseYAML, stringify as convertToYAML } from "yaml";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -34,12 +34,17 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
 
+import {
+  useWorkflowYamlEditorStore,
+  isWorkflowYamlDirty,
+} from "@/store/WorkflowYamlEditorStore";
 import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
+import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
@@ -86,27 +91,38 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
 import { BrowserStream } from "@/components/BrowserStream";
+import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
+import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
+import { RecentActivityRunSelector } from "@/routes/workflows/debugger/recentActivity/RecentActivityRunSelector";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   BranchContext,
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  useWorkflowHasChangesStore,
+  useWorkflowSave,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
-import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
+import {
+  getInitialSelectedBlockId,
+  useSelectedBlockUrlSync,
+} from "./hooks/useSelectedBlockUrlSync";
 import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useWorkspaceMountInitialization } from "./hooks/useWorkspaceMountInitialization";
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
@@ -129,6 +145,9 @@ import {
   generateNodeLabel,
   layout,
   startNode,
+  getWorkflowBlocks,
+  getWorkflowErrors,
+  upgradeWorkflowDefinitionToVersionTwo,
 } from "./workflowEditorUtils";
 import { replayPersistedCollapseVisibility } from "./collapse/applyDescendantCollapseVisibility";
 import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
@@ -144,21 +163,27 @@ import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
-import { WorkflowSettings } from "../types/workflowTypes";
+import { WorkflowDefinition, WorkflowSettings } from "../types/workflowTypes";
 import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
+import { useStudioRunId } from "../studio/useStudioRunId";
+import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
-import {
-  STUDIO_COPILOT_RAIL_WIDTH,
-  STUDIO_COPILOT_WIDTH,
-} from "../studio/constants";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
 
 import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
+import { WorkflowYamlEditor } from "./WorkflowYamlEditor";
+import { YamlModeToggle } from "./YamlModeToggle";
+import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLifecycle";
+import {
+  preservedFinallyBlockLabel,
+  workflowVersionFromSaveData,
+} from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
 function getAxiosErrorDetail(error: unknown): string | undefined {
@@ -321,25 +346,19 @@ function Workspace({
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
-  const studioCopilotCollapsed = useStudioShellStore((s) => s.copilotCollapsed);
-  const studioSetCopilotCollapsed = useStudioShellStore(
-    (s) => s.setCopilotCollapsed,
-  );
-  const studioSetTab = useStudioShellStore((s) => s.setTab);
-  // The studio canvas sits right of the Copilot column; offset the fit by the
-  // column width so the chain centers on the whole page, not just the pane.
-  const studioCanvasCenterOffset = embedded
-    ? studioCopilotCollapsed
-      ? STUDIO_COPILOT_RAIL_WIDTH
-      : STUDIO_COPILOT_WIDTH
-    : 0;
+  const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
+  const studioCopilotOpen = studioPanes.includes("copilot");
   const location = useLocation();
   const navigate = useNavigate();
-  const locationState = location.state as { copilotMessage?: unknown } | null;
+  const locationState = location.state as {
+    copilotMessage?: unknown;
+    copilotFixOrigin?: unknown;
+  } | null;
   const initialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
       : null;
+  const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
     navigate(location.pathname + location.search, {
@@ -394,6 +413,10 @@ function Workspace({
     (s) => s.renderedWidth,
   );
   const handleOnSave = useSaveWorkflow();
+  const saveWorkflow = useWorkflowSave({ status: "published" });
+  // Global/read-only workflows can't be edited in place (the header offers
+  // "Make a Copy"), so the YAML editor must not open or commit for them.
+  const isGlobalWorkflow = useIsGlobalWorkflow();
   const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
@@ -443,6 +466,7 @@ function Workspace({
 
   const { getNodes, getEdges } = useReactFlow();
   const { data: workflowRun } = useWorkflowRunQuery();
+  const studioRunId = useStudioRunId();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const { browserStreamingMode } = useBrowserStreamingMode();
 
@@ -482,6 +506,13 @@ function Workspace({
   const [isReloading, setIsReloading] = useState(false);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const yamlEditorActive = useWorkflowYamlEditorStore((s) => s.active);
+  const yamlEditorDirty = useWorkflowYamlEditorStore(
+    (s) => s.active && isWorkflowYamlDirty(s),
+  );
+  // hasChanges at the moment YAML mode opened, so reverting a YAML edit
+  // restores the pre-YAML dirty state instead of leaving it stuck true.
+  const yamlEntryHadChangesRef = useRef(false);
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
@@ -821,7 +852,7 @@ function Workspace({
   // Per-workflow store reset. Earlier revisions did this from
   // `useMountEffect`, but the Workspace instance can be reused across
   // workflows when the parent route doesn't key by workflowPermanentId
-  // (e.g. /workflows/A/build → /workflows/B/build); in that case the
+  // (e.g. /agents/A/build → /agents/B/build); in that case the
   // mount-only initializer would skip and selectedBlockId / showAllCode /
   // sidebar save timestamps would leak from A into B. Keying this on
   // `workflowPermanentId` fires the reset on every workflow change,
@@ -838,12 +869,14 @@ function Workspace({
   // payload resolves.
   const cacheKeyInitWpidRef = useRef<string | null>(null);
   useEffect(() => {
-    // Studio defaults the selection to the start node on open (legacy keeps it
-    // empty); fires only on workflow change, so tab-switch selection persists.
-    const startNodeId = embedded
-      ? (initialNodes.find((node) => node.type === "start")?.id ?? null)
-      : null;
-    useWorkflowPanelStore.getState().setSelectedBlockId(startNodeId);
+    // empty), unless the URL asks for a specific block; fires only on workflow
+    // change, so tab-switch selection persists.
+    const initialSelectedBlockId = getInitialSelectedBlockId({
+      enabled: embedded,
+      nodes: initialNodes,
+      searchParams,
+    });
+    useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     cacheKeyInitWpidRef.current = null;
@@ -932,6 +965,11 @@ function Workspace({
   });
 
   useCacheKeyValueUrlSync(cacheKeyInitWpidRef.current === workflowPermanentId);
+  useSelectedBlockUrlSync({
+    enabled: embedded,
+    nodes,
+    getNodes: getNodes as () => Array<AppNode>,
+  });
 
   // Centralized function to manage comparison and panel states
   const clearComparisonViewAndShowFreshIfActive = useCallback(
@@ -1206,6 +1244,63 @@ function Workspace({
     [setNodes, setEdges, blockLabel],
   );
 
+  useApplyRecordedBlocks({
+    // Recording runs in the debugger (build + showBrowser), not only on /edit.
+    enabled: !workflowPanelState.data?.showComparison,
+    nodes,
+    edges,
+    doLayout,
+  });
+
+  // Studio entry point for recording: the Browser-tab Record button lives outside
+  // the canvas, so the canvas-aware Workspace registers a launcher that resolves
+  // the append-at-end insertion point (the trailing top-level NodeAdder, same as
+  // clicking its "+") and starts recording. MVP only appends at the end.
+  const setStartRecordingAtEnd = useRecordingLauncherStore(
+    (s) => s.setStartRecordingAtEnd,
+  );
+  // Stable action ref (vs the whole-store `recordingStore` object, which gets a
+  // new reference on every store write and would re-register the launcher).
+  const setIsRecording = useRecordingStore((s) => s.setIsRecording);
+  const startRecordingAtEnd = useCallback(() => {
+    const currentNodes = getNodes() as Array<AppNode>;
+    const currentEdges = getEdges();
+    const trailingAdder = currentNodes.find(
+      (node) => node.type === "nodeAdder" && !node.parentId,
+    );
+    const incomingEdge = trailingAdder
+      ? currentEdges.find((edge) => edge.target === trailingAdder.id)
+      : undefined;
+    setWorkflowPanelState({
+      active: false,
+      content: "nodeLibrary",
+      data: {
+        previous: incomingEdge?.source ?? null,
+        next: trailingAdder?.id ?? null,
+        parent: undefined,
+        connectingEdgeType: "default",
+      },
+    });
+    setIsRecording(true, {
+      workflowPermanentId: workflowPermanentId ?? null,
+      browserSessionId: liveBrowserSessionId,
+    });
+  }, [
+    getNodes,
+    getEdges,
+    setWorkflowPanelState,
+    setIsRecording,
+    workflowPermanentId,
+    liveBrowserSessionId,
+  ]);
+  useEffect(() => {
+    if (!embedded) {
+      return;
+    }
+    setStartRecordingAtEnd(startRecordingAtEnd);
+    return () => setStartRecordingAtEnd(null);
+  }, [embedded, startRecordingAtEnd, setStartRecordingAtEnd]);
+
   // Listen for conditional branch changes to trigger re-layout
   useEffect(() => {
     const handleBranchChange = () => {
@@ -1433,12 +1528,15 @@ function Workspace({
       codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
+      enableSelfHealing: workflowData.enable_self_healing ?? false,
       runSequentially: workflowData.run_sequentially ?? false,
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
         workflowData.workflow_definition?.finally_block_label ?? null,
       workflowSystemPrompt:
         workflowData.workflow_definition?.workflow_system_prompt ?? null,
+      errorCodeMapping:
+        workflowData.workflow_definition?.error_code_mapping ?? null,
     };
 
     const elements = getElements(
@@ -1476,6 +1574,205 @@ function Workspace({
     }
   };
 
+  // Serialize the live workflow_definition to YAML and open the full-screen
+  // editor. Only the definition round-trips; settings stay in the visual panels.
+  const enterYamlMode = () => {
+    if (isGlobalWorkflow) {
+      return;
+    }
+    const saveData = workflowChangesStore.getSaveData?.();
+    if (!saveData) {
+      toast({
+        title: "Cannot edit YAML",
+        description: "The workflow is still loading. Try again in a moment.",
+        variant: "destructive",
+      });
+      return;
+    }
+    // The schema `version` and workflow-level settings (finally_block_label,
+    // workflow_system_prompt, error_code_mapping) are intentionally NOT
+    // serialized — the YAML editor edits parameters + blocks; the rest is
+    // preserved from the current workflow on commit.
+    const yaml = convertToYAML({
+      parameters: saveData.parameters,
+      blocks: saveData.blocks,
+    });
+    yamlEntryHadChangesRef.current =
+      useWorkflowHasChangesStore.getState().hasChanges;
+    useWorkflowYamlEditorStore.getState().open(yaml);
+  };
+
+  // Commit-on-switch: reparse the edited YAML into the graph via the Copilot's
+  // non-persisting convert endpoint. Returns false on invalid YAML (stays open).
+  const commitYaml = async (persist: boolean = false): Promise<boolean> => {
+    const yamlStore = useWorkflowYamlEditorStore.getState();
+    // Never rebuild an editable canvas from YAML for a read-only workflow.
+    if (isGlobalWorkflow) {
+      yamlStore.close();
+      return false;
+    }
+    const saveData = workflowChangesStore.getSaveData?.();
+    if (!saveData) {
+      return false;
+    }
+    if (!isWorkflowYamlDirty(yamlStore)) {
+      // The YAML is unchanged, but a save must still persist any pending
+      // pre-YAML (visual-editor) edits — validate the frozen graph the same way
+      // the normal visual save does, so invalid edits can't slip through here.
+      if (persist) {
+        const errors = getWorkflowErrors(nodes);
+        if (errors.length > 0) {
+          toast({
+            title: "Can not save workflow because of errors:",
+            description: errors.join(" "),
+            variant: "destructive",
+          });
+          return false;
+        }
+        try {
+          await saveWorkflow.mutateAsync(undefined);
+        } catch {
+          // Surfaced by the save mutation's own error toast; keep the editor
+          // open and honor the Promise<boolean> contract instead of throwing.
+          return false;
+        }
+      }
+      yamlStore.close();
+      return true;
+    }
+    let parsed: {
+      parameters?: WorkflowSaveData["parameters"];
+      blocks?: WorkflowSaveData["blocks"];
+    };
+    try {
+      parsed = parseYAML(yamlStore.draft);
+    } catch (error) {
+      yamlStore.setError(
+        error instanceof Error ? error.message : "Could not parse YAML.",
+      );
+      return false;
+    }
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post<WorkflowYAMLConversionResponse>(
+        "/workflow/copilot/convert-yaml-to-blocks",
+        {
+          workflow_definition_yaml: yamlStore.draft,
+          workflow_id: saveData.workflow.workflow_id,
+        },
+      );
+      let extraHttpHeaders: Record<string, string> | null;
+      let cdpConnectHeaders: Record<string, string> | null;
+      try {
+        extraHttpHeaders = saveData.settings.extraHttpHeaders
+          ? parseHeaderJson(saveData.settings.extraHttpHeaders)
+          : null;
+        cdpConnectHeaders = saveData.settings.cdpConnectHeaders
+          ? parseHeaderJson(saveData.settings.cdpConnectHeaders)
+          : null;
+      } catch {
+        yamlStore.setError(
+          "Couldn't parse the workflow's HTTP headers — fix them in the visual editor before switching.",
+        );
+        return false;
+      }
+      // Workflow-level settings aren't in the YAML; carry the current values
+      // back so the round-trip preserves them. finally_block_label points at a
+      // top-level block, so drop it if the edit removed/renamed that block —
+      // otherwise the next save fails on a dangling reference.
+      const finallyBlockLabel = preservedFinallyBlockLabel(
+        saveData.settings.finallyBlockLabel,
+        (response.data.workflow_definition.blocks ?? []).map(
+          (block) => block.label,
+        ),
+      );
+      const definition: WorkflowDefinition = {
+        ...response.data.workflow_definition,
+        // Keep the convert's detected schema version (it upgrades to 2 for
+        // conditional / next_block_label routing) so it matches the converted
+        // graph — the omitted YAML `version` lets the backend detect it.
+        finally_block_label: finallyBlockLabel,
+        workflow_system_prompt: saveData.settings.workflowSystemPrompt ?? null,
+        error_code_mapping: saveData.settings.errorCodeMapping ?? null,
+      };
+      const version = workflowVersionFromSaveData(saveData, definition, {
+        extraHttpHeaders,
+        cdpConnectHeaders,
+      });
+      if (persist) {
+        // Persist the repaired graph, not the raw draft: the convert endpoint
+        // repairs dangling next_block_label links, so run its blocks through the
+        // same getElements -> getWorkflowBlocks normalization the canvas gets.
+        // Reading the response (not the graph) keeps this race-free vs setNodes.
+        const { nodes: repairedNodes, edges: repairedEdges } = getElements(
+          response.data.workflow_definition.blocks ?? [],
+          { ...saveData.settings, finallyBlockLabel },
+          true,
+        );
+        // Gate the persist the same way the visual save is gated (a parseable
+        // draft can still be an editor-invalid workflow, e.g. an empty
+        // navigation prompt). A plain switch to Visual stays ungated so the
+        // errors can be fixed on the canvas.
+        const repairedErrors = getWorkflowErrors(repairedNodes);
+        if (repairedErrors.length > 0) {
+          toast({
+            title: "Can not save workflow because of errors:",
+            description: repairedErrors.join(" "),
+            variant: "destructive",
+          });
+          return false;
+        }
+        // getWorkflowBlocks emits explicit next_block_label routing from the
+        // graph, so run the same version upgrade the visual save runs — a
+        // version-1 payload with routing is rejected by the backend.
+        const { blocks: upgradedBlocks, version: upgradedVersion } =
+          upgradeWorkflowDefinitionToVersionTwo(
+            getWorkflowBlocks(repairedNodes, repairedEdges),
+            response.data.workflow_definition.version ??
+              saveData.workflowDefinitionVersion,
+          );
+        try {
+          await saveWorkflow.mutateAsync({
+            blocks: upgradedBlocks,
+            parameters: parsed?.parameters ?? [],
+            workflowDefinitionVersion: upgradedVersion,
+            settings: { ...saveData.settings, finallyBlockLabel },
+          });
+        } catch {
+          // A persist/network failure is already surfaced by the save
+          // mutation's own error toast — don't relabel it "Invalid YAML" in the
+          // overlay (the outer catch), and keep the editor open with the draft.
+          return false;
+        }
+      }
+      applyWorkflowUpdate(version, { persisted: persist });
+      yamlStore.close();
+      return true;
+    } catch (error) {
+      const detail =
+        error instanceof AxiosError
+          ? (error.response?.data?.detail ?? error.message)
+          : error instanceof Error
+            ? error.message
+            : "Could not convert YAML into workflow blocks.";
+      yamlStore.setError(detail);
+      return false;
+    }
+  };
+
+  useWorkflowYamlEditorLifecycle(commitYaml);
+
+  // Reflect YAML-draft dirtiness in the unsaved-changes flag so the existing
+  // tab-close / navigation guards protect the draft — two-way, so reverting the
+  // draft restores the dirty state from when YAML mode opened.
+  useEffect(() => {
+    if (yamlEditorActive) {
+      useWorkflowHasChangesStore
+        .getState()
+        .setHasChanges(yamlEntryHadChangesRef.current || yamlEditorDirty);
+    }
+  }, [yamlEditorActive, yamlEditorDirty]);
+
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     // Close panels
     setWorkflowPanelState({
@@ -1509,12 +1806,15 @@ function Workspace({
       codeVersion: selectedVersion.code_version ?? null,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
+      enableSelfHealing: selectedVersion.enable_self_healing ?? false,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
         selectedVersion.workflow_definition?.finally_block_label ?? null,
       workflowSystemPrompt:
         selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
+      errorCodeMapping:
+        selectedVersion.workflow_definition?.error_code_mapping ?? null,
     };
 
     const elements = getElements(
@@ -1536,7 +1836,12 @@ function Workspace({
       className="relative h-full w-full"
       style={
         {
-          [BLOCK_SIDEBAR_WIDTH_VAR]: `${renderedBlockSidebarWidth}px`,
+          // Studio has no block-config settings sidebar (settings are inline in
+          // the blocks), so zero the var; the on-canvas sidebar-offset consumers
+          // are suppressed there anyway. Legacy keeps the overlay's measured width.
+          [BLOCK_SIDEBAR_WIDTH_VAR]: embedded
+            ? "0px"
+            : `${renderedBlockSidebarWidth}px`,
         } as React.CSSProperties
       }
     >
@@ -1703,7 +2008,9 @@ function Workspace({
               className={cn(
                 "absolute z-30 transition-all duration-300 ease-out",
                 embedded ? "top-3" : "top-[8.5rem]",
-                blockSidebarOpen
+                // Studio: the settings panel is a separate grid column, so
+                // in-stage sub-panels anchor to the Stage edge, never offset.
+                !embedded && blockSidebarOpen
                   ? HEADER_RIGHT_INSET_OPEN
                   : HEADER_RIGHT_INSET_CLOSED,
               )}
@@ -1767,7 +2074,12 @@ function Workspace({
         <>
           {/* infinite canvas and sub panels when not in debug mode */}
           {!showBrowser && (
-            <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
+            <div
+              className="relative flex h-full w-full overflow-hidden overflow-x-hidden"
+              // The YAML surface covers this subtree visually but it would stay
+              // in the tab order; inert removes it (pane variant has no trap).
+              {...(yamlEditorActive ? { inert: "" } : {})}
+            >
               {/* infinite canvas */}
               <FlowRenderer
                 nodes={nodes}
@@ -1778,7 +2090,6 @@ function Workspace({
                 onEdgesChange={onEdgesChange}
                 initialTitle={initialTitle}
                 workflow={workflow}
-                centerOffsetX={studioCanvasCenterOffset}
                 embedded={embedded}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
@@ -1801,7 +2112,7 @@ function Workspace({
                       // Studio's top bar is above the canvas, so the panel drops
                       // from the canvas top; legacy's header is inside it.
                       embedded ? "top-3" : "top-[8.5rem]",
-                      blockSidebarOpen
+                      !embedded && blockSidebarOpen
                         ? HEADER_RIGHT_INSET_OPEN
                         : HEADER_RIGHT_INSET_CLOSED,
                     )}
@@ -1940,7 +2251,7 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code, infinite canvas, and block runs */}
+            {/* code + canvas; recording overlays the panel without unmounting FlowRenderer */}
             <div className="relative h-full w-full">
               <div
                 className={cn(
@@ -1952,7 +2263,9 @@ function Workspace({
                   {
                     "translate-x-0": showAllCode,
                   },
+                  recordingStore.isRecording && "pointer-events-none invisible",
                 )}
+                aria-hidden={recordingStore.isRecording}
                 ref={dom.splitLeft}
               >
                 {/* code */}
@@ -1980,7 +2293,7 @@ function Workspace({
                 </div>
                 {/* infinite canvas */}
                 <div
-                  className={cn("h-full w-[50%]", {
+                  className={cn("relative h-full w-[50%]", {
                     "w-[100%]":
                       leftSideLayoutMode === "side-by-side" && !showAllCode,
                   })}
@@ -2002,18 +2315,24 @@ function Workspace({
                     historyApplyTrigger={historyApplyTrigger}
                     onLayoutPhaseChange={setFlowLayoutPhase}
                   />
+                  {!blockLabel && (
+                    <div className="pointer-events-none absolute bottom-3 left-1/2 z-20 w-[20rem] max-w-[calc(100%-2rem)] -translate-x-1/2 [&>*]:pointer-events-auto">
+                      <RecentActivityRunSelector
+                        contentSide="top"
+                        contentAlign="center"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
-              {/* block runs history for current debug session id*/}
-              {/*
-                pointer-events-none on the wrapper so clicks pass through to
-                the FlowRenderer's bottom-left Controls (FitView, Lock,
-                GlobalCollapse) that sit in the same corner; the actual
-                debugger chip re-enables pointer events on itself.
-              */}
-              <div className="pointer-events-none absolute bottom-[0.5rem] left-[0.75rem] flex w-full items-start justify-center [&>*]:pointer-events-auto">
-                <DebuggerBlockRuns />
-              </div>
+              {/* In Studio (embedded) the shell owns the single RecordingPanel
+                  in the copilot pane; rendering one here too would mount two
+                  panels that each fire their own commit. */}
+              {!embedded && recordingStore.isRecording && (
+                <div className="absolute inset-0 z-20 h-full px-6 pb-4 pt-[8.5rem]">
+                  <RecordingPanel browserSessionId={liveBrowserSessionId} />
+                </div>
+              )}
             </div>
 
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-neutral-50 p-4 pl-6 dark:bg-background">
@@ -2080,13 +2399,19 @@ function Workspace({
                             }}
                           />
                         )
-                      ) : isFlowCanvasReady ? (
+                      ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserStream
                           key={liveBrowserSessionId}
-                          exfiltrate={recordingStore.isRecording}
+                          exfiltrate={
+                            recordingStore.isRecording &&
+                            !recordingStore.finishRequested
+                          }
                           interactive={true}
                           browserSessionId={liveBrowserSessionId}
                           showControlButtons={true}
+                          // The recording panel overlays the canvas whenever a
+                          // recording is live here, so the REC pill is redundant.
+                          hideRecordingIndicator={true}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={!!workflowRun && !isFinalized}
                           onReadyChange={handleLiveBrowserReadyChange}
@@ -2169,7 +2494,7 @@ function Workspace({
                             }}
                           />
                         )
-                      ) : isFlowCanvasReady ? (
+                      ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserSessionStream
                           browserSessionId={liveBrowserSessionId}
                           interactive={true}
@@ -2332,23 +2657,21 @@ function Workspace({
       )}
 
       <WorkflowCopilotChat
-        isOpen={
-          embedded ? !studioCopilotCollapsed : showBrowser && isCopilotOpen
-        }
+        isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
         docked={embedded}
+        chromeless={embedded}
         portalTarget={embedded ? studioCopilotPortalEl : undefined}
-        onCollapse={
-          embedded ? () => studioSetCopilotCollapsed(true) : undefined
-        }
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
         liveBrowserSessionId={
           copilotLiveBrowserReady ? liveBrowserSessionId : null
         }
+        workflowRunId={copilotRunId({ embedded, studioRunId })}
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
+        initialMessageFixOrigin={initialCopilotFixOrigin}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>
@@ -2403,7 +2726,10 @@ function Workspace({
               } catch (error) {
                 toast({
                   title: "Error",
-                  description: "Invalid JSON format in extra http headers",
+                  description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
+                    saveData.settings.extraHttpHeaders ?? "",
+                    error,
+                  )}`,
                   variant: "destructive",
                 });
                 return;
@@ -2419,7 +2745,10 @@ function Workspace({
               } catch (error) {
                 toast({
                   title: "Error",
-                  description: "Invalid JSON format in cdp connect headers",
+                  description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
+                    saveData.settings.cdpConnectHeaders ?? "",
+                    error,
+                  )}`,
                   variant: "destructive",
                 });
                 return;
@@ -2458,6 +2787,7 @@ function Workspace({
               run_with: saveData.settings.runWith,
               cache_key: saveData.settings.scriptCacheKey,
               ai_fallback: saveData.settings.aiFallback,
+              enable_self_healing: saveData.settings.enableSelfHealing ?? false,
               adaptive_caching: false,
               code_version:
                 saveData.settings.runWith === "code"
@@ -2514,10 +2844,10 @@ function Workspace({
             };
 
             // Hide chat and show comparison. The comparison renders on the
-            // editor canvas, so surface the editor tab when docked in the studio.
+            // editor canvas, so surface the Editor pane when docked in the studio.
             setIsCopilotOpen(false);
             if (embedded) {
-              studioSetTab("editor");
+              openStudioPane("editor");
             }
             setWorkflowPanelState({
               active: false,
@@ -2584,6 +2914,17 @@ function Workspace({
           });
         }}
       />
+
+      {!yamlEditorActive && !isGlobalWorkflow ? (
+        <div className="absolute right-4 top-3 z-30">
+          <YamlModeToggle mode="visual" onCode={enterYamlMode} />
+        </div>
+      ) : null}
+      {/* Studio: Code mode swaps the Editor pane's content (sibling panes stay
+          usable); legacy keeps the original full-screen modal overlay. */}
+      {yamlEditorActive ? (
+        <WorkflowYamlEditor variant={embedded ? "pane" : "fullscreen"} />
+      ) : null}
     </div>
   );
 }

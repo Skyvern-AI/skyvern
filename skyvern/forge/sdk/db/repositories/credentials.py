@@ -8,8 +8,18 @@ from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel
-from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
+from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
+from skyvern.forge.sdk.db.utils import serialize_proxy_location
+from skyvern.forge.sdk.schemas.credentials import (
+    Credential,
+    CredentialType,
+    CredentialVaultType,
+)
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
+from skyvern.schemas.proxy_pinning import generate_proxy_session_id, should_generate_proxy_session_id
+from skyvern.schemas.runs import ProxyLocationInput
+
+_UNSET = object()
 
 
 class CredentialRepository(BaseRepository):
@@ -29,7 +39,14 @@ class CredentialRepository(BaseRepository):
         card_brand: str | None,
         totp_identifier: str | None = None,
         secret_label: str | None = None,
+        proxy_location: ProxyLocationInput = None,
+        proxy_session_id: str | None = None,
     ) -> Credential:
+        proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+        )
+        serialized_proxy_location = serialize_proxy_location(proxy_location)
         async with self.Session() as session:
             credential = CredentialModel(
                 organization_id=organization_id,
@@ -43,8 +60,13 @@ class CredentialRepository(BaseRepository):
                 card_last4=card_last4,
                 card_brand=card_brand,
                 secret_label=secret_label,
+                proxy_location=serialized_proxy_location,
+                proxy_session_id=proxy_session_id,
             )
             session.add(credential)
+            await session.flush()
+            if should_generate_proxy_session_id(proxy_location) and credential.proxy_session_id is None:
+                credential.proxy_session_id = generate_proxy_session_id(credential.credential_id)
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
@@ -132,6 +154,9 @@ class CredentialRepository(BaseRepository):
         tested_url: str | None = None,
         user_context: str | None = None,
         save_browser_session_intent: bool | None = None,
+        proxy_location: ProxyLocationInput | object = _UNSET,
+        proxy_session_id: str | None | object = _UNSET,
+        rotate_proxy_session_id: bool = False,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -154,6 +179,14 @@ class CredentialRepository(BaseRepository):
                 credential.user_context = user_context
             if save_browser_session_intent is not None:
                 credential.save_browser_session_intent = save_browser_session_intent
+            apply_proxy_pin_to_model(
+                credential,
+                entity_id=credential_id,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                unset=_UNSET,
+                rotate_proxy_session_id=rotate_proxy_session_id,
+            )
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
@@ -172,6 +205,9 @@ class CredentialRepository(BaseRepository):
         card_last4: str | None = None,
         card_brand: str | None = None,
         secret_label: str | None = None,
+        proxy_location: ProxyLocationInput | object = _UNSET,
+        proxy_session_id: str | None | object = _UNSET,
+        rotate_proxy_session_id: bool = False,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -194,6 +230,14 @@ class CredentialRepository(BaseRepository):
             credential.card_last4 = card_last4
             credential.card_brand = card_brand
             credential.secret_label = secret_label
+            apply_proxy_pin_to_model(
+                credential,
+                entity_id=credential_id,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                unset=_UNSET,
+                rotate_proxy_session_id=rotate_proxy_session_id,
+            )
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)

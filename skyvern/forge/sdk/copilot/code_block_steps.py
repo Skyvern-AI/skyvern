@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 import structlog
@@ -53,6 +53,19 @@ _METHOD_ACTION_TYPES: dict[str, str] = {
     "drag": "drag",
     "left_mouse": "left_mouse",
 }
+# Non-state-changing DOM reads -> an extract step in the editor outline only; deliberately absent
+# from the runtime recorder maps so a read never fires a run-timeline action. Predicates, count(),
+# and all() are excluded so a control-flow check never fabricates an extraction step.
+_READ_METHODS: dict[str, str] = {
+    "text_content": "extract",
+    "all_text_contents": "extract",
+    "inner_text": "extract",
+    "all_inner_texts": "extract",
+    "inner_html": "extract",
+    "get_attribute": "extract",
+    "input_value": "extract",
+    "content": "extract",
+}
 # Methods whose natural-language `prompt` is the first positional argument (it is keyword-only on the
 # interaction methods, which the keyword scan below already covers).
 _PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
@@ -101,7 +114,7 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
         method = call.func.attr
         if method in _IGNORED_METHODS:
             continue
-        action_type = _METHOD_ACTION_TYPES.get(method)
+        action_type = _METHOD_ACTION_TYPES.get(method) or _READ_METHODS.get(method)
         if action_type is None:
             continue
         spans.append(
@@ -251,6 +264,18 @@ def _describe(span: CodeActionSpan) -> str:
     return "Run a step"
 
 
+def _consolidate_read_spans(spans: list[CodeActionSpan]) -> list[CodeActionSpan]:
+    """Merge adjacent raw DOM reads into one extract span; an explicit page.extract() is not a read and stays separate."""
+    consolidated: list[CodeActionSpan] = []
+    for span in spans:
+        prev = consolidated[-1] if consolidated else None
+        if span.method in _READ_METHODS and prev is not None and prev.method in _READ_METHODS:
+            consolidated[-1] = replace(prev, line_end=max(prev.line_end, span.line_end))
+            continue
+        consolidated.append(span)
+    return consolidated
+
+
 def derive_code_block_steps(code: str, goal: str | None = None) -> list[dict[str, Any]]:
     """Derive the ordered plain-language steps for a code block from its code (deterministic)."""
     return [
@@ -260,7 +285,7 @@ def derive_code_block_steps(code: str, goal: str | None = None) -> list[dict[str
             "line_start": span.line_start,
             "line_end": span.line_end,
         }
-        for span in analyze_code_actions(code)
+        for span in _consolidate_read_spans(analyze_code_actions(code))
     ]
 
 

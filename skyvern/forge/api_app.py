@@ -30,12 +30,13 @@ from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
-from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
@@ -240,11 +241,23 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         except Exception:
             LOG.exception("Failed to execute api app startup event")
 
+    try:
+        await load_custom_llm_configs_from_database(forge_app.DATABASE)
+    except Exception:
+        LOG.exception("Failed to load custom LLM configs")
+
     # Close browser sessions left active by a previous process
     try:
         await forge_app.PERSISTENT_SESSIONS_MANAGER.cleanup_stale_sessions()
     except Exception:
         LOG.exception("Failed to clean up stale browser sessions")
+
+    # Reap idle/abandoned persistent sessions on a timer so their in-process Chromium +
+    # record_video ffmpeg encoders don't leak (nothing else closes a session once it stops renewing).
+    try:
+        forge_app.PERSISTENT_SESSIONS_MANAGER.start_reaper()
+    except Exception:
+        LOG.exception("Failed to start persistent browser session reaper")
 
     # Start cleanup scheduler if enabled
     cleanup_task = start_cleanup_scheduler()
@@ -359,6 +372,9 @@ def create_api_app() -> FastAPI:
         fastapi_app.include_router(internal_auth.router, prefix="/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_llms.router, prefix="/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)

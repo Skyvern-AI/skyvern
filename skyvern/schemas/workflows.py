@@ -503,6 +503,7 @@ class PDFFormat(StrEnum):
 class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
 
 
 class FileUploadDestination(BaseModel):
@@ -527,6 +528,9 @@ class FileUploadDestination(BaseModel):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_blob_name: str | None = None
+
+    google_access_token: str | None = None
+    google_drive_folder_id: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -906,6 +910,8 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
     path: str | None = None
 
 
@@ -1313,6 +1319,10 @@ class WorkflowCreateYAMLRequest(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
+    # None = inherit from the existing workflow on update (mirrors code_version);
+    # treated as False on first create. Prevents older clients that omit the field
+    # from silently disabling self-healing on save.
+    enable_self_healing: bool | None = None
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
     run_sequentially: bool = Field(default=False, title="Prevent Overlapping Runs")
