@@ -1,50 +1,44 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Share1Icon } from "@radix-ui/react-icons";
-import { usePostHog } from "posthog-js/react";
+import {
+  ActivityLogIcon,
+  ClockIcon,
+  CodeIcon,
+  Cross2Icon,
+  ExclamationTriangleIcon,
+  FileTextIcon,
+  ListBulletIcon,
+  ReaderIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { useParams, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
-import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
-import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
-import { useApiCredential } from "@/hooks/useApiCredential";
+import { Button } from "@/components/ui/button";
 import { statusIsFinalized } from "@/routes/tasks/types";
-import {
-  isAction,
-  isObserverThought,
-  isWorkflowRunBlock,
-} from "@/routes/workflows/types/workflowRunTypes";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { type ApiCommandOptions } from "@/util/apiCommands";
-import { runsApiBaseUrl } from "@/util/env";
-import { cn, isRecord } from "@/util/utils";
+import { isRecord } from "@/util/utils";
 
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
-import { useDebugSessionQuery } from "../../hooks/useDebugSessionQuery";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
+import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { pickDownloadedFileFilename } from "../../workflowRun/blockDownloadedFiles";
-import { getRecordingUrls } from "../../workflowRun/recordingUrls";
-import {
-  findActiveItem,
-  findTimelineBlock,
-  resolveScreenshotBlockId,
-} from "../../workflowRun/workflowTimelineUtils";
+import { findActiveItem } from "../../workflowRun/workflowTimelineUtils";
 import { getOrderedRunParameters } from "../../utils";
 import {
-  actionLabel,
   buildFilmstrip,
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
 import { studioPanelId } from "../constants";
 import { useStudioPanes } from "../useStudioPanes";
-import { RunHero } from "./RunHero";
-import { type HeroSelection } from "./HeroScreenshot";
+import { ViewToggle } from "../ViewToggle";
+import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
 import {
@@ -52,9 +46,8 @@ import {
   type RunOutputError,
   type RunOutputFile,
 } from "./RunOutputsSection";
-import { RunOverviewButton } from "./RunOverviewButton";
+import { RunOverviewSection } from "./RunOverviewSection";
 import { RunPlaceholder } from "./RunPlaceholder";
-import { getSelectedRunFrameId } from "./runFrameSelection";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -65,18 +58,11 @@ type RunViewProps = {
   onRetry?: () => void;
 };
 
-function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
-  if (!selection) {
-    return false;
-  }
-  if (selection.kind === "action") {
-    return Boolean(
-      selection.artifactId ||
-      (selection.stepId && selection.actionOrder != null),
-    );
-  }
-  return true;
-}
+type RunPaneView = "timeline" | "overview" | "inputs" | "outputs" | "code";
+
+// Below this row width the view-toggle labels collapse to icons — the pane,
+// not the viewport, decides (studio panes share the stage side by side).
+const TOGGLE_ROW_COMPACT_BELOW_PX = 440;
 
 function isRunOutputError(value: unknown): value is RunOutputError {
   return isRecord(value);
@@ -90,8 +76,10 @@ function normalizeRunOutputErrors(value: unknown): RunOutputError[] {
 }
 
 /**
- * Fused run view: browser hero on the left, run timeline tree + block detail on
- * the right, sharing one pinned item via RunViewStore.
+ * Run pane body: the run timeline + step detail, with Overview / Inputs /
+ * Outputs / Code as sibling views. Visuals (live stream, screenshots,
+ * recordings) live in the Browser pane, which follows this pane's selection
+ * via RunViewStore and ?active=.
  */
 export function RunView({
   workflowRunId,
@@ -117,51 +105,28 @@ export function RunView({
     workflowPermanentId,
     workflowRunId,
   });
-  const { data: debugSession } = useDebugSessionQuery({
-    workflowPermanentId,
-    enabled: false,
-  });
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
-  const centerView = useRunViewStore((s) => s.centerView);
+  const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
+  const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const resetRunView = useRunViewStore((s) => s.reset);
-  const headerCompact = useRunViewStore((s) => s.headerCompact);
+  const setBrowserPaneView = useStudioBrowserStore((s) => s.setView);
   const { panes: studioPanes, openPane } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("run");
-  const browserPaneOpen = studioPanes.includes("browser");
   const [searchParams, setSearchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
-  const postHog = usePostHog();
-  const apiCredential = useApiCredential();
-  const [activeIteration, setActiveIteration] = useState<number | null>(null);
-  const [replayOpen, setReplayOpen] = useState(false);
+  const [view, setView] = useState<RunPaneView>("timeline");
+  const [failureDismissed, setFailureDismissed] = useState(false);
   const [outputSummary, setOutputSummary] = useState<string | null>(null);
-
-  const recordingUrls = useMemo(
-    () => getRecordingUrls(workflowRun),
-    [workflowRun],
-  );
-  const onRecordingPlay = useCallback(
-    (index: number) => {
-      if (!workflowRun) {
-        return;
-      }
-      postHog.capture("run.recording.viewed", {
-        org_id: workflowRun.workflow?.organization_id,
-        run_id: workflowRun.workflow_run_id,
-        recording_index: index,
-        recording_count: recordingUrls.length,
-      });
-    },
-    [postHog, workflowRun, recordingUrls.length],
-  );
 
   // A pinned frame belongs to one run; drop it when the run changes, then re-seed
   // from ?active= to restore a deep-linked selection.
   useEffect(() => {
     resetRunView();
     setOutputSummary(null);
+    setView("timeline");
+    setFailureDismissed(false);
     const active = searchParamsRef.current.get("active");
     if (active) {
       pinFrame(active);
@@ -231,27 +196,37 @@ export function RunView({
   }, [runPaneOpen, workflowRunId, setSearchParams]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
+  const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   const running = outcome === "running";
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
-  // A block run executes in the debug session; in the Run pane show that same live
-  // debug stream (the shared node) instead of a separate run stream — but only when
-  // the run's browser session IS the current debug session. A historical block-run
-  // link whose debug session is gone/different falls back to the normal run view.
-  const showDebugStream =
-    runPaneOpen &&
-    searchParams.has("bl") &&
-    workflowRun?.browser_session_id != null &&
-    workflowRun.browser_session_id === debugSession?.browser_session_id;
-  // The open Browser pane outranks the hero for the singleton debug-stream
-  // node (StudioShell priority); the hero then points at it instead.
-  const debugStreamInBrowserPane = showDebugStream && browserPaneOpen;
+  const provisioning =
+    workflowRun?.status === Status.Created ||
+    workflowRun?.status === Status.Queued;
+
+  const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const finallyBlockLabel =
+    workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
+  // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
+  // the live edge — the same resolution the Browser pane applies in useRunVisuals.
+  const selectedId =
+    pinnedFrameId && pinnedFrameId !== "stream"
+      ? pinnedFrameId
+      : (lastFrame?.id ?? null);
+  const activeItem = useMemo(
+    () =>
+      findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
+    [timeline, selectedId, finalized, finallyBlockLabel],
+  );
+
   const focusBrowserPane = useCallback(() => {
-    // The pane may sit on a pinned replay view; this CTA promises live.
-    useStudioBrowserStore.getState().setView("live");
+    // An explicit "watch live": unpin back to the live edge and hand the
+    // Browser pane a live intent (it may be sitting on a replay view).
+    jumpToLive();
+    setBrowserPaneView("live");
     openPane("browser");
     // Defer past the pane-open commit so the scroll sees the visible panel.
     requestAnimationFrame(() => {
@@ -264,90 +239,11 @@ export function RunView({
         inline: "nearest",
       });
     });
-  }, [openPane]);
+  }, [jumpToLive, setBrowserPaneView, openPane]);
   const fixSeedMessage = useMemo(
     () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
     [workflowRun?.failure_reason],
   );
-
-  const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
-  const showingScreenshots = centerView === "screenshots";
-
-  const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
-  const finallyBlockLabel =
-    workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
-  const selectedId = getSelectedRunFrameId({
-    pinnedFrameId,
-    running,
-    showingScreenshots,
-    debugStreamInBrowserPane,
-    lastFrameId: lastFrame?.id ?? null,
-  });
-  const activeItem = useMemo(
-    () =>
-      findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
-    [timeline, selectedId, finalized, finallyBlockLabel],
-  );
-
-  // Mirror the legacy run page: an action shows its own screenshot, a block shows
-  // its representative screenshot (a loop/conditional container resolves to its leaf).
-  const heroSelection = useMemo<HeroSelection | null>(() => {
-    if (isAction(activeItem)) {
-      return {
-        kind: "action",
-        artifactId: activeItem.screenshot_artifact_id ?? null,
-        stepId: activeItem.step_id ?? null,
-        actionOrder: activeItem.action_order ?? null,
-      };
-    }
-    if (isWorkflowRunBlock(activeItem)) {
-      const screenshotBlockId = resolveScreenshotBlockId(
-        timeline ?? [],
-        activeItem,
-        activeIteration,
-      );
-      const blockType =
-        findTimelineBlock(timeline ?? [], screenshotBlockId)?.block_type ??
-        activeItem.block_type ??
-        null;
-      return {
-        kind: "block",
-        workflowRunBlockId: screenshotBlockId,
-        blockType,
-      };
-    }
-    if (isObserverThought(activeItem)) {
-      return { kind: "thought", thoughtId: activeItem.thought_id };
-    }
-    return null;
-  }, [activeItem, timeline, activeIteration]);
-  const hasScreenshotFrame = useMemo(
-    () =>
-      frames.some(
-        (frame) =>
-          frame.screenshotArtifactId != null ||
-          (frame.stepId != null && frame.actionOrder != null),
-      ),
-    [frames],
-  );
-  const activeSelectionHasScreenshot = useMemo(
-    () => hasScreenshotCandidate(heroSelection),
-    [heroSelection],
-  );
-  // Frames are the usual source; the selection keeps the toggle visible while
-  // filmstrip data is still catching up.
-  const hasScreenshots = useMemo(
-    () => hasScreenshotFrame || activeSelectionHasScreenshot,
-    [hasScreenshotFrame, activeSelectionHasScreenshot],
-  );
-
-  const heroLabel = isAction(activeItem)
-    ? actionLabel(activeItem)
-    : isWorkflowRunBlock(activeItem)
-      ? (activeItem.label ?? "Screenshot")
-      : isObserverThought(activeItem)
-        ? (activeItem.thought ?? "Thought")
-        : "Screenshot";
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
     const outputs = workflowRun?.outputs;
@@ -433,6 +329,26 @@ export function RunView({
     observerOutput != null ||
     webhookFailureReason != null;
 
+  // Collapse toggle labels to icons by the row's own width.
+  const hasRun = workflowRun != null;
+  const toggleRowRef = useRef<HTMLDivElement>(null);
+  const [toggleCompact, setToggleCompact] = useState(false);
+  useEffect(() => {
+    const el = toggleRowRef.current;
+    if (!hasRun || !el || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0;
+      // A closed pane measures 0 (display:none); keep its last real state.
+      if (width > 0) {
+        setToggleCompact(width < TOGGLE_ROW_COMPACT_BELOW_PX);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasRun]);
+
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
   }
@@ -442,132 +358,152 @@ export function RunView({
     finalized ? (workflowRun.finished_at ?? null) : null,
   );
 
+  // A selected view whose data vanished (run change settles late) falls back
+  // to the timeline instead of rendering an empty body.
+  const resolvedView =
+    (view === "inputs" && !hasInputs) || (view === "outputs" && !hasOutputs)
+      ? "timeline"
+      : view;
+
   return (
-    <div className="flex h-full min-h-0 w-full flex-col p-3">
-      <div className="flex min-h-0 flex-1 items-stretch gap-3 overflow-hidden">
-        <div className="flex min-w-0 flex-1 flex-col gap-3 overflow-hidden">
-          <WorkflowRunVerificationCodeForm
-            workflowRunId={workflowRun.workflow_run_id}
+    <div className="flex h-full min-h-0 w-full flex-col">
+      <div
+        ref={toggleRowRef}
+        className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2"
+      >
+        <div
+          role="group"
+          aria-label="Run view"
+          className="flex min-w-0 shrink items-center gap-0.5 overflow-hidden rounded-md border border-slate-700 bg-slate-elevation2 p-0.5"
+        >
+          <ViewToggle
+            active={resolvedView === "timeline"}
+            onClick={() => setView("timeline")}
+            compact={toggleCompact}
+            label="Timeline"
+            icon={<ActivityLogIcon className="h-3 w-3" />}
           />
-          <RunHero
-            workflowRunId={workflowRun.workflow_run_id}
-            heroSelection={heroSelection}
-            heroLabel={heroLabel}
-            running={running}
-            showDebugStream={showDebugStream}
-            debugStreamInBrowserPane={debugStreamInBrowserPane}
-            onFocusBrowserPane={focusBrowserPane}
-            paneOpen={runPaneOpen}
-            provisioning={
-              workflowRun.status === Status.Created ||
-              workflowRun.status === Status.Queued
+          <ViewToggle
+            active={resolvedView === "overview"}
+            onClick={() => setView("overview")}
+            compact={toggleCompact}
+            label="Overview"
+            icon={<ReaderIcon className="h-3 w-3" />}
+          />
+          {hasInputs ? (
+            <ViewToggle
+              active={resolvedView === "inputs"}
+              onClick={() => setView("inputs")}
+              compact={toggleCompact}
+              label="Inputs"
+              icon={<ListBulletIcon className="h-3 w-3" />}
+            />
+          ) : null}
+          {hasOutputs ? (
+            <ViewToggle
+              active={resolvedView === "outputs"}
+              onClick={() => setView("outputs")}
+              compact={toggleCompact}
+              label="Outputs"
+              icon={<FileTextIcon className="h-3 w-3" />}
+            />
+          ) : null}
+          <ViewToggle
+            active={resolvedView === "code"}
+            onClick={() => setView("code")}
+            compact={toggleCompact}
+            label="Code"
+            title={
+              codeGenerating ? "Generating cached code for this run" : undefined
             }
-            isPaused={workflowRun.status === Status.Paused}
-            failed={failed}
-            failureReason={workflowRun.failure_reason ?? null}
-            codeGenerating={codeGenerating}
-            browserSessionId={workflowRun.browser_session_id ?? null}
-            recordingUrls={recordingUrls}
-            recordingArchived={workflowRun.recording_archived ?? false}
-            hasScreenshots={hasScreenshots}
-            elapsed={elapsed}
-            overview={
-              <RunOverviewButton
-                status={workflowRun.status}
-                elapsed={elapsed}
-                startedAt={workflowRun.started_at ?? null}
-                finishedAt={workflowRun.finished_at ?? null}
-                failureReason={workflowRun.failure_reason ?? null}
-                failureCategory={workflowRun.failure_category ?? null}
-                workflowRunId={workflowRun.workflow_run_id}
-                browserSessionId={workflowRun.browser_session_id ?? null}
-                browserProfileId={workflowRun.browser_profile_id ?? null}
-              />
-            }
-            inputs={
-              hasInputs ? (
-                <RunInputsSection
-                  parameters={runInputs.parameters}
-                  meta={runInputs.meta}
+            icon={
+              codeGenerating ? (
+                <ReloadIcon
+                  data-testid="code-generating-spinner"
+                  className="h-3 w-3 animate-spin"
                 />
-              ) : undefined
+              ) : (
+                <CodeIcon className="h-3 w-3" />
+              )
             }
-            outputs={
-              hasOutputs ? (
-                <RunOutputsSection
-                  workflowRunId={workflowRun.workflow_run_id}
-                  workflowTitle={workflowRun.workflow?.title}
-                  extractedInformation={extractedInformation}
-                  files={downloadedFiles}
-                  errors={runErrors}
-                  observerOutput={observerOutput}
-                  webhookFailureReason={webhookFailureReason}
-                  summary={outputSummary}
-                  onSummary={setOutputSummary}
-                />
-              ) : undefined
-            }
-            actions={
-              <>
-                <ApiWebhookActionsMenu
-                  trigger={
-                    <button
-                      type="button"
-                      title={headerCompact ? "API & Webhooks" : undefined}
-                      aria-label="API & Webhooks"
-                      className={cn(
-                        "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium",
-                        "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
-                        "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                      )}
-                    >
-                      <Share1Icon className="h-4 w-4" />
-                      {headerCompact ? null : "API & Webhooks"}
-                    </button>
-                  }
-                  getOptions={() => {
-                    const headers: Record<string, string> = {
-                      "Content-Type": "application/json",
-                      "x-api-key": apiCredential ?? "<your-api-key>",
-                    };
-                    const body: Record<string, unknown> = {
-                      workflow_id: workflowRun.workflow?.workflow_permanent_id,
-                      parameters: workflowRun.parameters,
-                      proxy_location: workflowRun.proxy_location,
-                    };
-                    if (workflowRun.max_screenshot_scrolls != null) {
-                      body.max_screenshot_scrolls =
-                        workflowRun.max_screenshot_scrolls;
-                    }
-                    if (workflowRun.webhook_callback_url) {
-                      body.webhook_url = workflowRun.webhook_callback_url;
-                    }
-                    return {
-                      method: "POST",
-                      url: `${runsApiBaseUrl}/run/workflows`,
-                      body,
-                      headers,
-                    } satisfies ApiCommandOptions;
-                  }}
-                  webhookDisabled={!finalized}
-                  onTestWebhook={() => setReplayOpen(true)}
-                />
-                <WebhookReplayDialog
-                  runId={workflowRun.workflow_run_id}
-                  disabled={!finalized}
-                  open={replayOpen}
-                  onOpenChange={setReplayOpen}
-                  hideTrigger
-                />
-              </>
-            }
-            onRecordingPlay={onRecordingPlay}
-            onFix={onFix ? () => onFix(fixSeedMessage) : undefined}
-            onRetry={onRetry}
           />
         </div>
-        <div className="relative w-[26rem] shrink-0">
-          <div className="absolute inset-0 grid grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
+        <span className="min-w-0 flex-1" />
+        {running && !provisioning ? (
+          <button
+            type="button"
+            onClick={focusBrowserPane}
+            title="Watch live in the Browser pane"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
+            Live
+          </button>
+        ) : null}
+      </div>
+
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden p-3">
+        <WorkflowRunVerificationCodeForm
+          workflowRunId={workflowRun.workflow_run_id}
+        />
+
+        {provisioning ? (
+          <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-slate-elevation2 px-3 py-1.5 text-xs text-muted-foreground">
+            <ClockIcon className="h-3.5 w-3.5 shrink-0" />
+            <span>Run queued — waiting to start</span>
+          </div>
+        ) : null}
+
+        {failed && !failureDismissed ? (
+          <div className="shrink-0 rounded-lg border border-destructive/40 bg-slate-elevation1 p-4">
+            <div className="flex items-start gap-2 text-sm font-semibold text-foreground">
+              <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <span className="min-w-0 flex-1">
+                {workflowRun.failure_reason ?? "The run failed."}
+                {matchFailureTips(workflowRun.failure_reason ?? null).map(
+                  (tip) => (
+                    <span
+                      key={tip}
+                      className="mt-1.5 block text-xs font-normal italic text-muted-foreground"
+                    >
+                      {tip}
+                    </span>
+                  ),
+                )}
+              </span>
+              <button
+                type="button"
+                onClick={() => setFailureDismissed(true)}
+                className="-mr-1 -mt-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                aria-label="Dismiss"
+                title="Dismiss"
+              >
+                <Cross2Icon className="h-4 w-4" />
+              </button>
+            </div>
+            {onFix || onRetry ? (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {onFix ? (
+                  <Button
+                    size="sm"
+                    className="bg-studio-accent text-foreground hover:bg-studio-accent/90"
+                    onClick={() => onFix(fixSeedMessage)}
+                  >
+                    Fix with Copilot
+                  </Button>
+                ) : null}
+                {onRetry ? (
+                  <Button size="sm" variant="secondary" onClick={onRetry}>
+                    Retry as-is
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {resolvedView === "timeline" ? (
+          <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
             <div className="min-h-0 overflow-hidden">
               <WorkflowRunTimeline
                 workflowRunId={workflowRunId}
@@ -575,24 +511,19 @@ export function RunView({
                 activeItem={activeItem}
                 activeIteration={activeIteration}
                 onActionItemSelected={(item) => {
-                  setActiveIteration(null);
                   pinFrame(item.action.action_id);
                 }}
                 onBlockItemSelected={(block) => {
-                  setActiveIteration(null);
                   pinFrame(block.workflow_run_block_id);
                 }}
                 onThoughtItemSelected={(thought) => {
-                  setActiveIteration(null);
                   pinFrame(thought.thought_id);
                 }}
                 onLiveStreamSelected={() => {
-                  setActiveIteration(null);
                   pinFrame("stream");
                 }}
                 onIterationSelected={(loopBlock, iterationIndex) => {
-                  setActiveIteration(iterationIndex);
-                  pinFrame(loopBlock.workflow_run_block_id);
+                  pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
                 }}
               />
             </div>
@@ -608,7 +539,43 @@ export function RunView({
               />
             </div>
           </div>
-        </div>
+        ) : resolvedView === "overview" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
+            <RunOverviewSection
+              workflowRun={workflowRun}
+              actionCount={frames.length}
+              elapsed={elapsed}
+            />
+          </div>
+        ) : resolvedView === "inputs" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
+            <RunInputsSection
+              parameters={runInputs.parameters}
+              meta={runInputs.meta}
+            />
+          </div>
+        ) : resolvedView === "outputs" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
+            <RunOutputsSection
+              workflowRunId={workflowRun.workflow_run_id}
+              workflowTitle={workflowRun.workflow?.title}
+              extractedInformation={extractedInformation}
+              files={downloadedFiles}
+              errors={runErrors}
+              observerOutput={observerOutput}
+              webhookFailureReason={webhookFailureReason}
+              summary={outputSummary}
+              onSummary={setOutputSummary}
+            />
+          </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 p-2">
+            <WorkflowRunCode
+              workflowRunId={workflowRun.workflow_run_id}
+              showCacheKeyValueSelector
+            />
+          </div>
+        )}
       </div>
     </div>
   );
