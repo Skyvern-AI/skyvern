@@ -191,7 +191,7 @@ const constructCacheKeyValueFromParameters = (opts: {
       continue;
     }
 
-    codeKey = codeKey.replace(`{{${name}}}`, value.toString());
+    codeKey = codeKey.replaceAll(`{{${name}}}`, value.toString());
   }
 
   if (codeKey.includes("{") || codeKey.includes("}")) {
