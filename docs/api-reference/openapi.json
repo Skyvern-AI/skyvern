@@ -2684,6 +2684,24 @@
             "description": "Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches."
           },
           {
+            "name": "managed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.",
+              "title": "Managed"
+            },
+            "description": "Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -8918,6 +8936,36 @@
               }
             ],
             "title": "Proxy Session Id"
+          },
+          "is_managed": {
+            "type": "boolean",
+            "title": "Is Managed",
+            "default": false,
+            "description": "True when the profile is auto-managed by a Save & Reuse Session workflow rather than created directly by a user."
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id",
+            "description": "For auto-managed profiles, the workflow this profile is associated with."
+          },
+          "browser_profile_key_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key Digest",
+            "description": "For auto-managed profiles, the digest of the browser-profile segment key that determines which auto-managed profile a workflow run resolves to."
           },
           "created_at": {
             "type": "string",
