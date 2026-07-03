@@ -27,17 +27,19 @@ export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
   "timeline",
 ];
 
-// Width floors from the approved mock; the stage clamps shared links and nudges
-// on over-tight opens against these same numbers (fitPanesToWidth below).
+// Copilot / Editor / Timeline share one narrow floor; the browser viewport
+// keeps a little more room. The stage clamps shared links and nudges on
+// over-tight opens against these numbers (fitPanesToWidth below), and divider
+// resizes clamp against them too.
 export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
   copilot: 260,
-  editor: 220,
-  browser: 260,
-  timeline: 220,
+  editor: 260,
+  browser: 300,
+  timeline: 260,
 };
 
-// Stage chrome for the fit math; must match the p-3 + gap-3 on the stage div
-// in StudioShell.tsx.
+// Stage chrome for the fit math; must match the stage p-3 and the divider
+// width (the resize dividers are the inter-pane gap) in StudioShell.tsx.
 export const STUDIO_STAGE_PADDING_PX = 24;
 export const STUDIO_STAGE_GAP_PX = 12;
 

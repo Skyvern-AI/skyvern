@@ -16,6 +16,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { cn } from "@/util/utils";
 
+import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
@@ -26,8 +27,21 @@ import { RunPaneActions, RunPaneStatusBadge } from "./runview/RunPaneHeader";
 import { StudioBrowserStream } from "./StudioBrowserStream";
 import { StudioCoachMark } from "./StudioCoachMark";
 import { studioPanelId, studioTabId } from "./constants";
+import {
+  clampResizeDelta,
+  movePaneBy,
+  movePaneTo,
+  paneFlex,
+  paneResizable,
+  type PaneWidths,
+} from "./paneLayout";
 import { STUDIO_PANE_META } from "./paneMeta";
-import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
+import {
+  panesListEqual,
+  STUDIO_PANE_MIN_WIDTH,
+  STUDIO_STAGE_GAP_PX,
+  type StudioPaneId,
+} from "./panes";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import {
@@ -40,18 +54,32 @@ import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
 import { useStudioPanes } from "./useStudioPanes";
 
-// The Copilot pane holds a ceiling so a lone chat doesn't stretch across the
-// whole stage; the shared floors live in panes.ts next to the fit math.
-const COPILOT_MAX_WIDTH = 440;
-
 // Below this header width, pane header chrome (view pills, badges) collapses
 // to icons — same idea as the run hero, measured per pane, not per viewport.
 const PANE_HEADER_COMPACT_BELOW_PX = 480;
 
-function StudioPane({
+// Keyboard step (px) for divider arrow-key resizing.
+const DIVIDER_KEY_STEP_PX = 24;
+
+const PANE_DRAG_MIME = "application/x-skyvern-studio-pane";
+
+type PaneReorder = {
+  draggingId: StudioPaneId | null;
+  // Which edge of this pane the dragged pane would land on; static per drag
+  // (arrayMove semantics, same as the editor's block drag).
+  placement: "above" | "below" | null;
+  onStart: () => void;
+  onEnd: () => void;
+  onDrop: () => void;
+  onMove: (direction: -1 | 1) => void;
+};
+
+export function StudioPane({
   id,
   open,
   order,
+  flex,
+  reorder,
   onClose,
   headerExtras,
   headerActions,
@@ -60,6 +88,8 @@ function StudioPane({
   id: StudioPaneId;
   open: boolean;
   order: number | undefined;
+  flex: string | undefined;
+  reorder: PaneReorder;
   onClose: () => void;
   // Rendered after the pane label (badges, view pills).
   headerExtras?: ReactNode;
@@ -92,26 +122,93 @@ function StudioPane({
     observer.observe(el);
     return () => observer.disconnect();
   }, [hasChrome]);
+
+  const isDragSource = reorder.draggingId === id;
+  const reorderActive = reorder.draggingId !== null;
+  // Header buttons (pills, actions, close) must keep working normally: a drag
+  // that starts on one is cancelled before it begins.
+  const pointerOnControl = useRef(false);
+  // Chromium aborts a native drag when the DOM changes inside the dragstart
+  // task, and dragstart is a discrete event (sync React flush) — so revealing
+  // the drop overlays must wait for the next task.
+  const dragEngageTimer = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (dragEngageTimer.current !== null) {
+        window.clearTimeout(dragEngageTimer.current);
+      }
+    };
+  }, []);
+  const [dropHover, setDropHover] = useState(false);
+  useEffect(() => {
+    if (!reorderActive) {
+      setDropHover(false);
+    }
+  }, [reorderActive]);
+  const showDropIndicator =
+    dropHover && !isDragSource && reorder.placement !== null;
+
   return (
     <section
       id={studioPanelId(id)}
       role="region"
       aria-label={label}
-      style={{
-        order,
-        minWidth: STUDIO_PANE_MIN_WIDTH[id],
-        maxWidth: id === "copilot" ? COPILOT_MAX_WIDTH : undefined,
-      }}
+      style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
-        "min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1",
+        "relative min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1",
         open
           ? "flex duration-200 motion-safe:animate-in motion-safe:fade-in"
           : "hidden",
+        isDragSource && "opacity-60 motion-safe:transition-opacity",
       )}
     >
       <div
         ref={headerRef}
-        className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-3"
+        role="group"
+        tabIndex={0}
+        draggable
+        aria-label={`${label} pane header`}
+        aria-keyshortcuts="Control+Shift+ArrowLeft Control+Shift+ArrowRight"
+        title={`Drag to reorder the ${label} pane (or Ctrl/Cmd+Shift+←/→)`}
+        onPointerDownCapture={(event) => {
+          pointerOnControl.current =
+            event.target instanceof Element &&
+            event.target.closest("button, a, input, select, textarea") !== null;
+        }}
+        onDragStart={(event) => {
+          if (pointerOnControl.current) {
+            event.preventDefault();
+            return;
+          }
+          // Firefox refuses to start a drag without setData; the drop side
+          // also checks this type so foreign drags can't trigger a reorder.
+          event.dataTransfer.setData(PANE_DRAG_MIME, id);
+          event.dataTransfer.effectAllowed = "move";
+          dragEngageTimer.current = window.setTimeout(() => {
+            dragEngageTimer.current = null;
+            reorder.onStart();
+          }, 0);
+        }}
+        onDragEnd={() => {
+          // An instantly-cancelled drag can fire dragend before the engage
+          // timer; clearing it keeps the overlays from sticking on.
+          if (dragEngageTimer.current !== null) {
+            window.clearTimeout(dragEngageTimer.current);
+            dragEngageTimer.current = null;
+          }
+          reorder.onEnd();
+        }}
+        onKeyDown={(event) => {
+          if (!(event.metaKey || event.ctrlKey) || !event.shiftKey) {
+            return;
+          }
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+            return;
+          }
+          event.preventDefault();
+          reorder.onMove(event.key === "ArrowLeft" ? -1 : 1);
+        }}
+        className="flex h-9 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing"
       >
         <Icon className="size-3.5 shrink-0 text-studio-accent" aria-hidden />
         <span className="min-w-0 truncate text-xs font-medium text-foreground">
@@ -133,7 +230,251 @@ function StudioPane({
         </button>
       </div>
       <div className="min-h-0 min-w-0 flex-1">{children}</div>
+      {/* Full-pane drop surface while a header drag is live; sits over iframe /
+          canvas content that would otherwise swallow dragover events. */}
+      {reorderActive ? (
+        <div
+          data-testid="pane-drop-overlay"
+          className={cn(
+            "absolute inset-0 z-30 rounded-lg",
+            showDropIndicator &&
+              "outline-dashed outline-2 -outline-offset-2 outline-blue-500/60",
+          )}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+          }}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setDropHover(true);
+          }}
+          onDragLeave={() => setDropHover(false)}
+          onDrop={(event) => {
+            event.preventDefault();
+            setDropHover(false);
+            if (!event.dataTransfer.types.includes(PANE_DRAG_MIME)) {
+              return;
+            }
+            reorder.onDrop();
+          }}
+        >
+          {showDropIndicator ? (
+            <div
+              data-testid="pane-drop-indicator"
+              data-placement={reorder.placement}
+              aria-hidden
+              className={cn(
+                "pointer-events-none absolute inset-y-2 w-1 rounded-full bg-blue-500 shadow-[0_0_6px_rgba(59,130,246,0.6)] motion-safe:animate-in motion-safe:fade-in",
+                reorder.placement === "above" ? "left-1" : "right-1",
+              )}
+            />
+          ) : null}
+        </div>
+      ) : null}
     </section>
+  );
+}
+
+/**
+ * Pointer-drag divider between two open panes. It is exactly the inter-pane
+ * gap (STUDIO_STAGE_GAP_PX wide), so the fit math in panes.ts still holds.
+ * During the drag it writes flex pins straight to the pane elements (no React
+ * re-render per frame); the result commits to the store on release.
+ */
+function StudioPaneDivider({
+  leftId,
+  rightId,
+  order,
+  panes,
+  onCommit,
+  onReset,
+}: {
+  leftId: StudioPaneId;
+  rightId: StudioPaneId;
+  order: number;
+  panes: readonly StudioPaneId[];
+  onCommit: (widths: PaneWidths) => void;
+  onReset: () => void;
+}) {
+  const [active, setActive] = useState(false);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    left: HTMLElement;
+    right: HTMLElement;
+    leftStart: number;
+    rightStart: number;
+    leftFlexBefore: string;
+    rightFlexBefore: string;
+    leftPinned: boolean;
+    rightPinned: boolean;
+    lastDelta: number;
+  } | null>(null);
+
+  const paneElements = () => {
+    const left = document.getElementById(studioPanelId(leftId));
+    const right = document.getElementById(studioPanelId(rightId));
+    return left && right ? { left, right } : null;
+  };
+
+  // A pane close/navigation can unmount the divider mid-drag; put back the
+  // cursor and transitions it was holding onto.
+  useEffect(() => {
+    return () => {
+      const drag = dragRef.current;
+      if (drag) {
+        dragRef.current = null;
+        drag.left.style.transition = "";
+        drag.right.style.transition = "";
+        document.body.style.cursor = "";
+      }
+    };
+  }, []);
+
+  const beginDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || dragRef.current) {
+      return;
+    }
+    const els = paneElements();
+    if (!els) {
+      return;
+    }
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      left: els.left,
+      right: els.right,
+      leftStart: els.left.offsetWidth,
+      rightStart: els.right.offsetWidth,
+      leftFlexBefore: els.left.style.flex,
+      rightFlexBefore: els.right.style.flex,
+      leftPinned: paneResizable(leftId, panes),
+      rightPinned: paneResizable(rightId, panes),
+      lastDelta: 0,
+    };
+    // Freeze any width transition so the per-frame pins land instantly.
+    els.left.style.transition = "none";
+    els.right.style.transition = "none";
+    document.body.style.cursor = "col-resize";
+    setActive(true);
+  };
+
+  const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    const delta = Math.round(
+      clampResizeDelta(
+        event.clientX - drag.startX,
+        { id: leftId, width: drag.leftStart },
+        { id: rightId, width: drag.rightStart },
+      ),
+    );
+    drag.lastDelta = delta;
+    // Only non-greedy neighbors get pinned; a greedy neighbor keeps flexing so
+    // the row always fills (the neighbors' total is preserved either way).
+    if (drag.leftPinned) {
+      drag.left.style.flex = `0 1 ${drag.leftStart + delta}px`;
+    }
+    if (drag.rightPinned) {
+      drag.right.style.flex = `0 1 ${drag.rightStart - delta}px`;
+    }
+  };
+
+  const endDrag = () => {
+    const drag = dragRef.current;
+    if (!drag) {
+      return;
+    }
+    dragRef.current = null;
+    drag.left.style.transition = "";
+    drag.right.style.transition = "";
+    document.body.style.cursor = "";
+    setActive(false);
+    if (drag.lastDelta === 0) {
+      // Nothing moved: put back whatever React had written so the DOM and the
+      // (unchanged) store stay in agreement.
+      drag.left.style.flex = drag.leftFlexBefore;
+      drag.right.style.flex = drag.rightFlexBefore;
+      return;
+    }
+    const widths: PaneWidths = {};
+    if (drag.leftPinned) {
+      widths[leftId] = drag.leftStart + drag.lastDelta;
+    }
+    if (drag.rightPinned) {
+      widths[rightId] = drag.rightStart - drag.lastDelta;
+    }
+    if (Object.keys(widths).length === 0) {
+      return;
+    }
+    onCommit(widths);
+  };
+
+  const keyResize = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+      return;
+    }
+    event.preventDefault();
+    const els = paneElements();
+    if (!els) {
+      return;
+    }
+    const delta = Math.round(
+      clampResizeDelta(
+        event.key === "ArrowLeft" ? -DIVIDER_KEY_STEP_PX : DIVIDER_KEY_STEP_PX,
+        { id: leftId, width: els.left.offsetWidth },
+        { id: rightId, width: els.right.offsetWidth },
+      ),
+    );
+    if (delta === 0) {
+      return;
+    }
+    const widths: PaneWidths = {};
+    if (paneResizable(leftId, panes)) {
+      widths[leftId] = els.left.offsetWidth + delta;
+    }
+    if (paneResizable(rightId, panes)) {
+      widths[rightId] = els.right.offsetWidth - delta;
+    }
+    if (Object.keys(widths).length === 0) {
+      return;
+    }
+    onCommit(widths);
+  };
+
+  const leftLabel = STUDIO_PANE_META[leftId].label;
+  const rightLabel = STUDIO_PANE_META[rightId].label;
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={`Resize ${leftLabel} and ${rightLabel}`}
+      tabIndex={0}
+      title="Drag to resize · double-click to reset all widths · arrow keys to adjust"
+      style={{ order, width: STUDIO_STAGE_GAP_PX }}
+      onPointerDown={beginDrag}
+      onPointerMove={moveDrag}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
+      onDoubleClick={onReset}
+      onKeyDown={keyResize}
+      className="group relative shrink-0 cursor-col-resize touch-none focus-visible:outline-none"
+    >
+      <span
+        aria-hidden
+        className={cn(
+          "absolute inset-y-3 left-1/2 w-0.5 -translate-x-1/2 rounded-full motion-safe:transition-colors",
+          active
+            ? "bg-muted-foreground"
+            : "bg-transparent group-hover:bg-border group-focus-visible:bg-ring",
+        )}
+      />
+    </div>
   );
 }
 
@@ -153,7 +494,7 @@ export function StudioShell(props: StudioWorkspaceProps) {
 }
 
 function StudioStage(props: StudioWorkspaceProps) {
-  const { panes, closePane, openPane } = useStudioPanes();
+  const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
   const { registerStageElement } = useStudioPaneDefaults();
   const { workflowPermanentId } = useParams();
   const isRecording = useRecordingStore((s) => s.isRecording);
@@ -163,6 +504,12 @@ function StudioStage(props: StudioWorkspaceProps) {
   });
   const browserSessionId = debugSession?.browser_session_id ?? null;
   const pipMinimized = useStudioShellStore((s) => s.pipMinimized);
+  const paneWidths = useStudioShellStore((s) => s.paneWidths);
+  const setPaneWidths = useStudioShellStore((s) => s.setPaneWidths);
+  const resetPaneWidths = useStudioShellStore((s) => s.resetPaneWidths);
+  const [draggingPaneId, setDraggingPaneId] = useState<StudioPaneId | null>(
+    null,
+  );
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
   );
@@ -233,6 +580,21 @@ function StudioStage(props: StudioWorkspaceProps) {
     document.getElementById(studioTabId(id))?.focus();
   };
 
+  // Reorder is otherwise invisible to assistive tech (only CSS order moves),
+  // so voice the result through the polite live region below.
+  const [reorderAnnouncement, setReorderAnnouncement] = useState("");
+  const commitOrder = (movedId: StudioPaneId, next: StudioPaneId[]) => {
+    if (panesListEqual(next, panes)) {
+      return;
+    }
+    setPanesOrder(next);
+    setReorderAnnouncement(
+      `${STUDIO_PANE_META[movedId].label} pane moved to position ${
+        next.indexOf(movedId) + 1
+      } of ${next.length}`,
+    );
+  };
+
   // Recording lives in the Browser pane (the live stream is there) with the
   // live-drafts panel taking over the Copilot pane. Once a commit is in flight
   // or its blocks are landing, reveal the Editor pane (it shows the loading
@@ -267,8 +629,31 @@ function StudioStage(props: StudioWorkspaceProps) {
     return {
       id,
       open: index >= 0,
-      order: index >= 0 ? index : undefined,
+      // Panes take even slots and the dividers between them take odd slots.
+      order: index >= 0 ? index * 2 : undefined,
+      flex: index >= 0 ? paneFlex(id, panes, paneWidths) : undefined,
       onClose: () => closeWithFocus(id),
+      reorder: {
+        draggingId: draggingPaneId,
+        placement:
+          draggingPaneId === null
+            ? null
+            : (deriveDropIndicator({
+                order: [...panes],
+                activeId: draggingPaneId,
+                overId: id,
+              })?.placement ?? null),
+        onStart: () => setDraggingPaneId(id),
+        onEnd: () => setDraggingPaneId(null),
+        onDrop: () => {
+          if (draggingPaneId !== null && draggingPaneId !== id) {
+            commitOrder(draggingPaneId, movePaneTo(panes, draggingPaneId, id));
+          }
+          setDraggingPaneId(null);
+        },
+        onMove: (direction: -1 | 1) =>
+          commitOrder(id, movePaneBy(panes, id, direction)),
+      },
     };
   };
 
@@ -279,11 +664,13 @@ function StudioStage(props: StudioWorkspaceProps) {
         <div className="flex min-h-0 min-w-0 flex-1">
           <StudioSpine />
           {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
-              stream slots); the CSS order carries the click order instead, so
-              screen-reader/Tab order stays the fixed order, not the visual one. */}
+              stream slots); the CSS order carries the layout order instead, so
+              screen-reader/Tab order stays the fixed order, not the visual one.
+              Reordering (drag or keyboard) only rewrites CSS order — panes and
+              the stream singleton never remount. */}
           <div
             ref={registerStageElement}
-            className="relative flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden p-3"
+            className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden p-3"
           >
             <StudioPane {...paneProps("copilot")}>
               <div className="relative h-full w-full">
@@ -323,9 +710,30 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <RunTab />
             </StudioPane>
+            {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
+                they can re-render freely as the open list changes. */}
+            {panes.slice(1).map((rightId, index) => (
+              <StudioPaneDivider
+                key={`${panes[index]}:${rightId}`}
+                leftId={panes[index]!}
+                rightId={rightId}
+                order={index * 2 + 1}
+                panes={panes}
+                onCommit={setPaneWidths}
+                onReset={resetPaneWidths}
+              />
+            ))}
             {panes.length === 0 ? <StudioStageLauncher /> : null}
             <StudioCoachMark />
             <StudioWorkflowPanels />
+            <span
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="sr-only"
+            >
+              {reorderAnnouncement}
+            </span>
           </div>
         </div>
         <div
