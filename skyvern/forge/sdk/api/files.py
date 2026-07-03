@@ -220,19 +220,20 @@ async def download_file(
 
                 # Get the file name
                 if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                    download_dir = output_dir
+                    download_dir_path = Path(output_dir)
+                    download_dir_path.mkdir(parents=True, exist_ok=True)
                 else:
-                    download_dir = make_temp_directory(prefix="skyvern_downloads_")
+                    download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
-                # Determine filename - use provided filename or derive from response/URL
-                file_name = _determine_download_filename(filename, dict(response.headers), url)
-                file_path = os.path.join(download_dir, file_name)
-                if not os.path.abspath(file_path).startswith(os.path.abspath(download_dir) + os.sep):
-                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                download_dir_resolved = download_dir_path.resolve()
+                temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
+                file_path = Path(temp_file.name).resolve()
+                if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
+                    temp_file.close()
+                    raise ValueError("Unsafe temporary file path created for download")
 
-                LOG.info(f"Downloading file to {file_path}")
-                with open(file_path, "wb") as f:
+                LOG.info("Downloading file to temporary path", file_path=str(file_path))
+                with temp_file as f:
                     # Write the content of the request into the file
                     total_bytes_downloaded = 0
                     async for chunk in response.content.iter_chunked(1024):
@@ -242,7 +243,7 @@ async def download_file(
                             raise DownloadFileMaxSizeExceeded(max_size_mb)
 
                 LOG.info(f"File downloaded successfully to {file_path}")
-                return file_path
+                return str(file_path)
     except aiohttp.ClientResponseError as e:
         LOG.exception(f"Failed to download file, status code: {e.status}")
         raise
@@ -260,6 +261,27 @@ async def download_file(
     except Exception:
         LOG.exception("Failed to download file")
         raise
+
+
+async def resolve_local_or_download_file(
+    file_url: str,
+    run_id: str | None,
+    organization_id: str | None = None,
+    max_size_mb: int | None = None,
+) -> str:
+    """Resolve a file input to a local path.
+
+    Absolute paths are validated against the run's download directory; anything else is downloaded.
+    """
+    # Absolute paths are the run-local convention; treating all non-remote strings as paths would misroute bad URLs.
+    if file_url.startswith("/"):
+        resolved = validate_local_file_path(file_url, run_id)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"Local file not found: {file_url}")
+        if max_size_mb is not None and os.path.getsize(resolved) > max_size_mb * 1024 * 1024:
+            raise DownloadFileMaxSizeExceeded(max_size_mb)
+        return resolved
+    return await download_file(file_url, max_size_mb=max_size_mb, organization_id=organization_id)
 
 
 def zip_files(files_path: str, zip_file_path: str) -> str:
