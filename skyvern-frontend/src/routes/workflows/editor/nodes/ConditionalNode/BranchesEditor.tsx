@@ -22,6 +22,10 @@ import { AppNode, isWorkflowBlockNode } from "..";
 import { updateNodeAndDescendantsVisibility } from "../../workflowEditorUtils";
 import { applyEdgeVisibility } from "./applyEdgeVisibility";
 import {
+  getConditionLabel,
+  orderBranchesWithDefaultsLast,
+} from "./branchDisplayUtils";
+import {
   ConditionalNodeData,
   createBranchCondition,
   defaultBranchCriteria,
@@ -61,11 +65,10 @@ function BranchesEditor({ nodeId, data }: Props) {
     editable: data.editable,
   });
 
-  const orderedBranches = useMemo(() => {
-    const defaultBranch = data.branches.find((branch) => branch.is_default);
-    const nonDefault = data.branches.filter((branch) => !branch.is_default);
-    return defaultBranch ? [...nonDefault, defaultBranch] : nonDefault;
-  }, [data.branches]);
+  const orderedBranches = useMemo(
+    () => orderBranchesWithDefaultsLast(data.branches),
+    [data.branches],
+  );
 
   const activeBranch =
     orderedBranches.find((branch) => branch.id === data.activeBranchId) ??
@@ -204,12 +207,10 @@ function BranchesEditor({ nodeId, data }: Props) {
     if (!data.editable) {
       return;
     }
-    const defaultBranch = data.branches.find((branch) => branch.is_default);
+    const defaultBranches = data.branches.filter((branch) => branch.is_default);
     const otherBranches = data.branches.filter((branch) => !branch.is_default);
     const newBranch = createBranchCondition();
-    const updatedBranches = defaultBranch
-      ? [...otherBranches, newBranch, defaultBranch]
-      : [...otherBranches, newBranch];
+    const updatedBranches = [...otherBranches, newBranch, ...defaultBranches];
 
     // Find the START and NodeAdder nodes inside this conditional
     const startNode = nodes.find(
@@ -335,11 +336,9 @@ function BranchesEditor({ nodeId, data }: Props) {
       newNonDefaultBranches[currentIndex]!,
     ];
 
-    // Reconstruct the array with default branch at the end
-    const defaultBranch = data.branches.find((b) => b.is_default);
-    const reorderedBranches = defaultBranch
-      ? [...newNonDefaultBranches, defaultBranch]
-      : newNonDefaultBranches;
+    // Reconstruct the array with default branch(es) at the end.
+    const defaultBranches = data.branches.filter((b) => b.is_default);
+    const reorderedBranches = [...newNonDefaultBranches, ...defaultBranches];
 
     update({ branches: reorderedBranches });
   };
@@ -366,11 +365,9 @@ function BranchesEditor({ nodeId, data }: Props) {
       newNonDefaultBranches[currentIndex]!,
     ];
 
-    // Reconstruct with default branch at the end
-    const defaultBranch = data.branches.find((b) => b.is_default);
-    const reorderedBranches = defaultBranch
-      ? [...newNonDefaultBranches, defaultBranch]
-      : newNonDefaultBranches;
+    // Reconstruct with default branch(es) at the end.
+    const defaultBranches = data.branches.filter((b) => b.is_default);
+    const reorderedBranches = [...newNonDefaultBranches, ...defaultBranches];
 
     update({ branches: reorderedBranches });
   };
@@ -393,34 +390,6 @@ function BranchesEditor({ nodeId, data }: Props) {
         };
       }),
     });
-  };
-
-  // Convert number to Excel-style letter (A, B, C... Z, AA, AB, AC...)
-  const getExcelStyleLetter = (index: number): string => {
-    let result = "";
-    let num = index;
-
-    while (num >= 0) {
-      result = String.fromCharCode(65 + (num % 26)) + result;
-      num = Math.floor(num / 26) - 1;
-    }
-
-    return result;
-  };
-
-  // Generate condition label: A • If, B • Else, C • Else If, etc.
-  const getConditionLabel = (branch: BranchCondition, index: number) => {
-    const letter = getExcelStyleLetter(index);
-
-    if (branch.is_default) {
-      return `${letter} • Else`;
-    }
-
-    if (index === 0) {
-      return `${letter} • If`;
-    }
-
-    return `${letter} • Else If`;
   };
 
   return (

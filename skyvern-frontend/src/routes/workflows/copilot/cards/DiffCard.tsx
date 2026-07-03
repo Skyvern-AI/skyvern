@@ -36,7 +36,7 @@ export function DiffCard({
 
   return (
     <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
-      <div className="flex items-center gap-2 text-xs font-semibold text-studio-accent-2">
+      <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
         <MagicWandIcon className="h-3.5 w-3.5" />
         {getDiffCardTitle(turn, { pendingProposal, rejected })}
       </div>
