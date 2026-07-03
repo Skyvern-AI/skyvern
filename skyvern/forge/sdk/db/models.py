@@ -68,6 +68,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
+    generate_workflow_run_credential_selection_id,
     generate_workflow_run_id,
     generate_workflow_schedule_id,
     generate_workflow_script_id,
@@ -823,10 +824,35 @@ class CredentialParameterModel(Base):
     description = Column(String, nullable=True)
 
     credential_id = Column(String, nullable=False)
+    credential_ids = Column(JSON, nullable=True)
+    selection_strategy = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunCredentialSelectionModel(Base):
+    __tablename__ = "workflow_run_credential_selections"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "parameter_key", name="uq_wrcs_workflow_run_parameter_key"),
+        Index(
+            "idx_wrcs_lru_lookup",
+            "organization_id",
+            "workflow_permanent_id",
+            "parameter_key",
+            "credential_id",
+            "created_at",
+        ),
+    )
+
+    selection_id = Column(String, primary_key=True, default=generate_workflow_run_credential_selection_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    parameter_key = Column(String, nullable=False)
+    credential_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
 class OnePasswordCredentialParameterModel(Base):
