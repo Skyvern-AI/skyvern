@@ -5076,6 +5076,8 @@ class WorkflowService:
         search_key: str | None = None,
         error_code: str | None = None,
         exclude_child_runs: bool = False,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -5086,6 +5088,8 @@ class WorkflowService:
             search_key=search_key,
             error_code=error_code,
             exclude_child_runs=exclude_child_runs,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
         )
 
     async def get_workflow_runs_for_browser_session(
