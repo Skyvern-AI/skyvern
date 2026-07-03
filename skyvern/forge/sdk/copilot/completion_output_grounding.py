@@ -55,11 +55,15 @@ def grade_requested_output_criteria(
     snapshot: RunEvidenceSnapshot,
 ) -> list[CriterionVerdict]:
     requested_path_aliases = schema_output_path_aliases_from_criteria(criteria)
-    authored_paths = _authored_output_contract_paths(copilot_ctx, requested_path_aliases)
+    raw_authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx)
+    authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, requested_path_aliases)
     verdicts: list[CriterionVerdict] = []
     for criterion in criteria:
         path = _normalize_output_path(criterion.output_path)
-        if not path or path not in authored_paths:
+        accepted_labels = (
+            {label for label, paths in authored_paths_by_label.items() if path in paths} if path else set()
+        )
+        if not path or not accepted_labels:
             verdicts.append(
                 CriterionVerdict(
                     criterion_id=criterion.id,
@@ -69,16 +73,24 @@ def grade_requested_output_criteria(
                 )
             )
             continue
+        accepted_runtime_outputs = dict(_accepted_runtime_outputs(snapshot.block_outputs, accepted_labels))
+        accepted_authored_paths = set().union(*(authored_paths_by_label[label] for label in accepted_labels))
+        accepted_raw_authored_paths = set().union(
+            *(raw_authored_paths_by_label.get(label, set()) for label in accepted_labels)
+        )
+        projection_roots = _runtime_projection_roots(accepted_authored_paths | accepted_raw_authored_paths)
         expected_value = criterion.expected_output_value
         expected_shape = criterion.expected_output_shape
         grounding_mode = _criterion_grounding_mode(criterion)
         trace_fields = _criterion_trace_fields(criterion, grounding_mode)
         if expected_value is not None:
-            match_state, evidence_ref = _runtime_output_path_match(snapshot.block_outputs, path, expected_value)
+            match_state, evidence_ref = _runtime_output_path_match(
+                accepted_runtime_outputs, path, expected_value, projection_roots
+            )
         elif expected_shape is not None:
-            match_state, evidence_ref = _runtime_output_path_presence(snapshot.block_outputs, path)
+            match_state, evidence_ref = _runtime_output_path_presence(accepted_runtime_outputs, path, projection_roots)
         else:
-            match_state, evidence_ref = _runtime_output_path_presence(snapshot.block_outputs, path)
+            match_state, evidence_ref = _runtime_output_path_presence(accepted_runtime_outputs, path, projection_roots)
             if match_state == "present" and evidence_ref is not None:
                 verdicts.append(
                     CriterionVerdict(
@@ -87,8 +99,8 @@ def grade_requested_output_criteria(
                         reason_code=_STRUCTURAL_ABSTENTION_REASON_CODE,
                         evidence_ref=evidence_ref,
                         missing_evidence=(
-                            "requested-output field is present, but the criterion has no typed expected_output_value "
-                            "that can prove or refute the value"
+                            "requested-output field is present, but the criterion lacks typed expected_output_value "
+                            "or expected_output_shape to prove the value"
                         ),
                         **trace_fields,
                     )
@@ -178,20 +190,28 @@ def _criterion_trace_fields(criterion: CompletionCriterion, grounding_mode: str)
     }
 
 
-def _authored_output_contract_paths(copilot_ctx: _GroundingCtx, aliases: dict[str, str] | None = None) -> set[str]:
+def _authored_output_contract_paths_by_label(
+    copilot_ctx: _GroundingCtx, aliases: dict[str, str] | None = None
+) -> dict[str, set[str]]:
     metadata = copilot_ctx.code_artifact_metadata
-    if not isinstance(metadata, Mapping):
-        return set()
     code_by_label = _code_blocks_by_label(copilot_ctx)
-    paths: set[str] = set()
-    for label, artifact in metadata.items():
-        if not isinstance(label, str) or not isinstance(artifact, Mapping):
-            continue
-        paths.update(_artifact_contract_paths(artifact))
-        code = code_by_label.get(label)
-        if code:
-            paths.update(_static_return_paths(code))
-    return _canonical_output_paths(paths, aliases)
+    paths_by_label: dict[str, set[str]] = {}
+    if isinstance(metadata, Mapping):
+        for label, artifact in metadata.items():
+            if not isinstance(label, str) or not isinstance(artifact, Mapping):
+                continue
+            paths = set(_artifact_contract_paths(artifact))
+            code = code_by_label.get(label)
+            if code:
+                paths.update(_static_return_paths(code))
+            canonical_paths = _canonical_output_paths(paths, aliases)
+            if canonical_paths:
+                paths_by_label[label] = canonical_paths
+    for label, code in code_by_label.items():
+        static_paths = _canonical_output_paths(_static_return_paths(code), aliases)
+        if static_paths:
+            paths_by_label.setdefault(label, set()).update(static_paths)
+    return paths_by_label
 
 
 def _canonical_output_paths(paths: set[str], aliases: dict[str, str] | None) -> set[str]:
@@ -303,6 +323,21 @@ def _static_return_paths(code: str) -> set[str]:
     return {key for key in (_top_level_return_dict_keys(code) or set()) if key}
 
 
+def _runtime_projection_roots(authored_paths: set[str]) -> set[str]:
+    return {parts[0] for path in authored_paths if len(parts := _path_parts(path)) > 1}
+
+
+def _accepted_runtime_outputs(block_outputs: Mapping[str, Any], accepted_labels: set[str]) -> list[tuple[str, Any]]:
+    if not accepted_labels:
+        return []
+    accepted_output_keys = {f"{label}_output" for label in accepted_labels}
+    return [
+        (label, payload)
+        for label, payload in block_outputs.items()
+        if label in accepted_labels or label in accepted_output_keys
+    ]
+
+
 def _top_level_return_dict_keys(code: str) -> set[str] | None:
     wrapped = "async def __copilot_block__():\n" + textwrap.indent(textwrap.dedent(code).strip() or "pass", "    ")
     try:
@@ -334,14 +369,14 @@ def _dict_keys(node: ast.Dict) -> set[str]:
 
 
 def _runtime_output_path_match(
-    block_outputs: Mapping[str, Any], path: str, expected_value: str | None
+    block_outputs: Mapping[str, Any], path: str, expected_value: str | None, projection_roots: set[str] | None = None
 ) -> tuple[str, str | None]:
     parts = _path_parts(path)
     if not parts or expected_value is None:
         return "missing", None
     contradicted_ref: str | None = None
     for label, payload in block_outputs.items():
-        values, source_path = _runtime_path_values(payload, parts, path)
+        values, source_path = _runtime_path_values(payload, parts, path, projection_roots or set())
         if not values:
             continue
         evidence_ref = f"block_outputs:{label}.{source_path}"
@@ -353,12 +388,14 @@ def _runtime_output_path_match(
     return "missing", None
 
 
-def _runtime_output_path_presence(block_outputs: Mapping[str, Any], path: str) -> tuple[str, str | None]:
+def _runtime_output_path_presence(
+    block_outputs: Mapping[str, Any], path: str, projection_roots: set[str] | None = None
+) -> tuple[str, str | None]:
     parts = _path_parts(path)
     if not parts:
         return "missing", None
     for label, payload in block_outputs.items():
-        values, source_path = _runtime_present_path_values(payload, parts, path)
+        values, source_path = _runtime_present_path_values(payload, parts, path, projection_roots or set())
         if not values:
             continue
         evidence_ref = f"block_outputs:{label}.{source_path}"
@@ -366,7 +403,9 @@ def _runtime_output_path_presence(block_outputs: Mapping[str, Any], path: str) -
     return "missing", None
 
 
-def _runtime_path_values(payload: Any, parts: list[str], path: str) -> tuple[list[Any], str]:
+def _runtime_path_values(
+    payload: Any, parts: list[str], path: str, projection_roots: set[str]
+) -> tuple[list[Any], str]:
     canonical_values = _path_values(payload, parts)
     if canonical_values:
         filtered_canonical_values = [value for value in canonical_values if _is_meaningful_requested_value(value)]
@@ -374,10 +413,22 @@ def _runtime_path_values(payload: Any, parts: list[str], path: str) -> tuple[lis
     wrapped_parts = ["output", *parts]
     wrapped_path = ".".join(wrapped_parts)
     wrapped_values = [value for value in _path_values(payload, wrapped_parts) if _is_meaningful_requested_value(value)]
-    return wrapped_values, wrapped_path
+    if wrapped_values:
+        return wrapped_values, wrapped_path
+    for root in sorted(projection_roots):
+        projected_parts = [root, *parts]
+        projected_path = ".".join(projected_parts)
+        projected_values = [
+            value for value in _path_values(payload, projected_parts) if _is_meaningful_requested_value(value)
+        ]
+        if projected_values:
+            return projected_values, projected_path
+    return [], wrapped_path
 
 
-def _runtime_present_path_values(payload: Any, parts: list[str], path: str) -> tuple[list[Any], str]:
+def _runtime_present_path_values(
+    payload: Any, parts: list[str], path: str, projection_roots: set[str]
+) -> tuple[list[Any], str]:
     raw_canonical_values = _path_values(payload, parts)
     if raw_canonical_values:
         canonical_values = [value for value in raw_canonical_values if _is_meaningful_requested_value(value)]
@@ -385,7 +436,17 @@ def _runtime_present_path_values(payload: Any, parts: list[str], path: str) -> t
     wrapped_parts = ["output", *parts]
     wrapped_path = ".".join(wrapped_parts)
     wrapped_values = [value for value in _path_values(payload, wrapped_parts) if _is_meaningful_requested_value(value)]
-    return wrapped_values, wrapped_path
+    if wrapped_values:
+        return wrapped_values, wrapped_path
+    for root in sorted(projection_roots):
+        projected_parts = [root, *parts]
+        projected_path = ".".join(projected_parts)
+        projected_values = [
+            value for value in _path_values(payload, projected_parts) if _is_meaningful_requested_value(value)
+        ]
+        if projected_values:
+            return projected_values, projected_path
+    return [], wrapped_path
 
 
 def _path_values(value: Any, parts: list[str]) -> list[Any]:

@@ -58,7 +58,11 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import {
+  STUDIO_PANES_PARAM,
+  resolveOpenPanes,
+  withPanesOpen,
+} from "@/routes/workflows/studio/panes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
@@ -427,7 +431,7 @@ function NodeHeader({
         throw new ValidationFailureError();
       }
 
-      await saveWorkflow.mutateAsync();
+      await saveWorkflow.mutateAsync(undefined);
 
       if (!workflowPermanentId) {
         log.error("Run block: there is no workflowPermanentId");
@@ -559,13 +563,22 @@ function NodeHeader({
       });
 
       if (studioEnabled) {
-        useStudioShellStore.getState().setTab("run");
-        navigate(
-          `/workflows/${workflowPermanentId}/studio?wr=${response.data.run_id}&bl=${encodeURIComponent(label)}`,
-        );
+        // One navigation carries the pane state (current panes plus Run and
+        // Browser); other query params intentionally reset for the fresh run.
+        const liveSearch = window.location.search || location.search;
+        const panes = withPanesOpen(resolveOpenPanes(liveSearch), [
+          "run",
+          "browser",
+        ]);
+        const search = new URLSearchParams({
+          wr: response.data.run_id,
+          bl: label,
+        });
+        search.set(STUDIO_PANES_PARAM, panes.join(","));
+        navigate(`/agents/${workflowPermanentId}/studio?${search}`);
       } else {
         navigate(
-          `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
+          `/agents/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
         );
       }
     },

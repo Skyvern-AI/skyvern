@@ -1,11 +1,13 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import {
+  ClockIcon,
   CodeIcon,
   CounterClockwiseClockIcon,
   Cross2Icon,
   ExclamationTriangleIcon,
   FileTextIcon,
   GlobeIcon,
+  ImageIcon,
   ListBulletIcon,
   PlayIcon,
   ReloadIcon,
@@ -18,8 +20,10 @@ import { cn } from "@/util/utils";
 
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { useStudioShellContext } from "../StudioShellContext";
+import { matchFailureTips } from "./failureTips";
 import { HeroRecording } from "./HeroRecording";
 import { HeroScreenshot, type HeroSelection } from "./HeroScreenshot";
+import { resolveRunHeroCenterView } from "./runHeroCenter";
 import { RunLiveStream } from "./RunLiveStream";
 
 type RunHeroProps = {
@@ -30,6 +34,13 @@ type RunHeroProps = {
   // A block run shows the shared debug-session stream (re-parented in by the
   // shell), view-only, instead of mounting a separate run stream.
   showDebugStream: boolean;
+  // The open Browser pane outranks this hero for the single stream node; the
+  // Live affordance points there instead of registering a slot that stays black.
+  debugStreamInBrowserPane?: boolean;
+  onFocusBrowserPane?: () => void;
+  // The pane keeps rendering while closed (display:none); never mount a stream
+  // socket into a hidden pane.
+  paneOpen?: boolean;
   provisioning: boolean;
   isPaused: boolean;
   failed: boolean;
@@ -37,6 +48,8 @@ type RunHeroProps = {
   codeGenerating?: boolean;
   browserSessionId: string | null;
   recordingUrls: string[];
+  recordingArchived?: boolean;
+  hasScreenshots?: boolean;
   elapsed: string;
   inputs?: ReactNode;
   outputs?: ReactNode;
@@ -47,16 +60,11 @@ type RunHeroProps = {
   onRetry?: () => void;
 };
 
-type CenterView =
-  | "code"
-  | "inputs"
-  | "outputs"
-  | "stream"
-  | "recording"
-  | "screenshot";
-
 // Below this header width the toggle/dropdown labels collapse to icons.
 const HEADER_COMPACT_BELOW_PX = 640;
+
+const RECORDING_ARCHIVED_LABEL =
+  "Recording archived — contact support@skyvern.com to request restoration";
 
 function ViewToggle({
   active,
@@ -100,6 +108,9 @@ export function RunHero({
   heroLabel,
   running,
   showDebugStream,
+  debugStreamInBrowserPane = false,
+  onFocusBrowserPane,
+  paneOpen = true,
   provisioning,
   isPaused,
   failed,
@@ -107,6 +118,8 @@ export function RunHero({
   codeGenerating = false,
   browserSessionId,
   recordingUrls,
+  recordingArchived = false,
+  hasScreenshots = false,
   elapsed,
   inputs,
   outputs,
@@ -157,26 +170,27 @@ export function RunHero({
   const scrubbing = pinnedFrameId != null && pinnedFrameId !== "stream";
   const hasRecording = recordingUrls.length > 0;
 
-  // An explicit tab wins; otherwise a block run defaults to the live debug
-  // stream and a full run to its stream (running) / recording / screenshot.
-  const center: CenterView =
-    centerView === "code"
-      ? "code"
-      : centerView === "inputs" && inputs
-        ? "inputs"
-        : centerView === "outputs" && outputs
-          ? "outputs"
-          : scrubbing
-            ? "screenshot"
-            : showDebugStream
-              ? recordingOpen && hasRecording
-                ? "recording"
-                : "stream"
-              : running
-                ? "stream"
-                : hasRecording && !failed
-                  ? "recording"
-                  : "screenshot";
+  const center = resolveRunHeroCenterView({
+    centerView,
+    hasScreenshots,
+    hasInputs: Boolean(inputs),
+    hasOutputs: Boolean(outputs),
+    hasRecording,
+    scrubbing,
+    showDebugStream,
+    debugStreamInBrowserPane,
+    recordingOpen,
+    running,
+    failed,
+  });
+
+  const focusBrowserPane = () => {
+    setRecordingOpen(false);
+    // Unpin instead of pinning "stream": the hero can't host the debug node,
+    // so its screenshot surface follows the live edge while the pane streams.
+    jumpToLive();
+    onFocusBrowserPane?.();
+  };
 
   // The right-side toggles own the view identity (Live/Recording/Code) and the
   // in-card "Inspecting step" bar owns a scrubbed action's description; the
@@ -191,6 +205,8 @@ export function RunHero({
 
   const toggleCenter = (view: "code" | "inputs" | "outputs") =>
     setCenterView(centerView === view ? "default" : view);
+  const showRunToggle =
+    Boolean(heroSelection) || centerView === "screenshot" || failed;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
@@ -206,13 +222,22 @@ export function RunHero({
           {showDebugStream ? (
             <>
               <ViewToggle
-                active={center === "stream"}
-                onClick={() => {
-                  setRecordingOpen(false);
-                  pinFrame("stream");
-                }}
+                active={!debugStreamInBrowserPane && center === "stream"}
+                onClick={
+                  debugStreamInBrowserPane
+                    ? focusBrowserPane
+                    : () => {
+                        setRecordingOpen(false);
+                        pinFrame("stream");
+                      }
+                }
                 compact={compact}
                 label="Live"
+                title={
+                  debugStreamInBrowserPane
+                    ? "Watch live in the Browser pane"
+                    : undefined
+                }
                 icon={
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
                 }
@@ -241,12 +266,43 @@ export function RunHero({
               }
             />
           ) : hasRecording ? (
+            <>
+              {showRunToggle ? (
+                <ViewToggle
+                  active={center === "screenshot"}
+                  onClick={() => setCenterView("screenshot")}
+                  compact={compact}
+                  label="Run"
+                  icon={<CounterClockwiseClockIcon className="h-3 w-3" />}
+                />
+              ) : null}
+              <ViewToggle
+                active={center === "recording"}
+                onClick={() => setCenterView("recording")}
+                compact={compact}
+                label="Recording"
+                icon={<PlayIcon className="h-3 w-3" />}
+              />
+            </>
+          ) : recordingArchived ? (
+            <button
+              type="button"
+              disabled
+              title={RECORDING_ARCHIVED_LABEL}
+              aria-label={RECORDING_ARCHIVED_LABEL}
+              className="inline-flex cursor-not-allowed items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium text-muted-foreground opacity-60"
+            >
+              <PlayIcon className="h-3 w-3" />
+              {compact ? null : "Recording archived"}
+            </button>
+          ) : null}
+          {hasScreenshots ? (
             <ViewToggle
-              active={center === "recording"}
-              onClick={jumpToLive}
+              active={center === "screenshot"}
+              onClick={() => setCenterView("screenshots")}
               compact={compact}
-              label="Recording"
-              icon={<PlayIcon className="h-3 w-3" />}
+              label="Screenshots"
+              icon={<ImageIcon className="h-3 w-3" />}
             />
           ) : null}
           <ViewToggle
@@ -331,9 +387,9 @@ export function RunHero({
             {outputs}
           </div>
         ) : center === "stream" ? (
-          showDebugStream ? (
+          !paneOpen ? null : showDebugStream ? (
             // The shell re-parents the persistent debug-session stream into this
-            // slot (the same node as the Browser tab), so a block run shows its
+            // slot (the same node as the Browser pane), so a block run shows its
             // live browser here, view-only. The slot unmounts when the user scrubs
             // or opens code/recording, which parks the node back offscreen.
             <div
@@ -374,6 +430,18 @@ export function RunHero({
           </div>
         )}
 
+        {provisioning &&
+        showDebugStream &&
+        !scrubbing &&
+        (center === "stream" || center === "screenshot") ? (
+          // A block run can queue behind a running full run (run_sequentially);
+          // the debug browser is already live, so say why nothing moves yet.
+          <div className="absolute left-3 top-3 flex items-center gap-2 rounded-md bg-black/70 px-3 py-1.5 text-xs text-white backdrop-blur">
+            <ClockIcon className="h-3.5 w-3.5 shrink-0" />
+            <span>Run queued — waiting to start</span>
+          </div>
+        ) : null}
+
         {center === "screenshot" && scrubbing && heroSelection ? (
           <div className="absolute left-3 top-3 flex max-w-[26rem] items-center gap-2 rounded-md bg-black/70 px-3 py-1.5 text-xs text-white backdrop-blur">
             <CounterClockwiseClockIcon className="h-3.5 w-3.5 shrink-0" />
@@ -383,10 +451,14 @@ export function RunHero({
             {running || showDebugStream ? (
               <button
                 type="button"
-                onClick={() => {
-                  setRecordingOpen(false);
-                  pinFrame("stream");
-                }}
+                onClick={
+                  showDebugStream && debugStreamInBrowserPane
+                    ? focusBrowserPane
+                    : () => {
+                        setRecordingOpen(false);
+                        pinFrame("stream");
+                      }
+                }
                 className="ml-1 inline-flex items-center gap-1.5 rounded-full bg-white/15 px-2 py-0.5 text-[11px] hover:bg-white/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white"
               >
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
@@ -395,7 +467,10 @@ export function RunHero({
             ) : hasRecording ? (
               <button
                 type="button"
-                onClick={jumpToLive}
+                onClick={() => {
+                  // Preserve the inspected frame so "Run" returns to this step.
+                  setCenterView("recording");
+                }}
                 className="ml-1 inline-flex items-center gap-1.5 rounded-full bg-white/15 px-2 py-0.5 text-[11px] hover:bg-white/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white"
               >
                 <PlayIcon className="h-3 w-3" />
@@ -415,6 +490,14 @@ export function RunHero({
               <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
               <span className="min-w-0 flex-1">
                 {failureReason ?? "The run failed."}
+                {matchFailureTips(failureReason).map((tip) => (
+                  <span
+                    key={tip}
+                    className="mt-1.5 block text-xs font-normal italic text-muted-foreground"
+                  >
+                    {tip}
+                  </span>
+                ))}
               </span>
               <button
                 type="button"

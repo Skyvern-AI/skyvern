@@ -66,7 +66,10 @@ export function HeroScreenshot({
 
   // Fallback path only when the action carries no explicit screenshot id: the
   // step's action screenshots, indexed by action order (newest-first), like legacy.
-  const useStepFallback = Boolean(action?.stepId) && !action?.artifactId;
+  const useStepFallback =
+    Boolean(action?.stepId) &&
+    action?.actionOrder != null &&
+    !action?.artifactId;
   const { data: stepArtifacts, isLoading: loadingStep } = useQuery<
     Array<ArtifactApiResponse>
   >({

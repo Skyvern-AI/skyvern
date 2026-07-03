@@ -14,10 +14,9 @@ import {
   isWorkflowRunBlock,
 } from "@/routes/workflows/types/workflowRunTypes";
 import { useRunViewStore } from "@/store/RunViewStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
-import { cn } from "@/util/utils";
+import { cn, isRecord } from "@/util/utils";
 
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
@@ -41,13 +40,20 @@ import {
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
+import { studioPanelId } from "../constants";
+import { useStudioPanes } from "../useStudioPanes";
 import { RunHero } from "./RunHero";
 import { type HeroSelection } from "./HeroScreenshot";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
-import { RunOutputsSection, type RunOutputFile } from "./RunOutputsSection";
+import {
+  RunOutputsSection,
+  type RunOutputError,
+  type RunOutputFile,
+} from "./RunOutputsSection";
 import { RunOverviewButton } from "./RunOverviewButton";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { getSelectedRunFrameId } from "./runFrameSelection";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -57,6 +63,30 @@ type RunViewProps = {
   onFix?: (seedMessage?: string) => void;
   onRetry?: () => void;
 };
+
+function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
+  if (!selection) {
+    return false;
+  }
+  if (selection.kind === "action") {
+    return Boolean(
+      selection.artifactId ||
+      (selection.stepId && selection.actionOrder != null),
+    );
+  }
+  return true;
+}
+
+function isRunOutputError(value: unknown): value is RunOutputError {
+  return isRecord(value);
+}
+
+function normalizeRunOutputErrors(value: unknown): RunOutputError[] {
+  if (Array.isArray(value)) {
+    return value.filter(isRunOutputError);
+  }
+  return [];
+}
 
 /**
  * Fused run view: browser hero on the left, run timeline tree + block detail on
@@ -91,10 +121,13 @@ export function RunView({
     enabled: false,
   });
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
+  const centerView = useRunViewStore((s) => s.centerView);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
   const headerCompact = useRunViewStore((s) => s.headerCompact);
-  const studioTab = useStudioShellStore((s) => s.tab);
+  const { panes: studioPanes, openPane } = useStudioPanes();
+  const runPaneOpen = studioPanes.includes("run");
+  const browserPaneOpen = studioPanes.includes("browser");
   const [searchParams, setSearchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
@@ -144,12 +177,15 @@ export function RunView({
     }
     setSearchParams(
       (prev) => {
+        // Build on the LIVE URL (prev is this render's closure): a concurrent
+        // navigation (block-run launch, pane toggle) is already visible there.
+        const base = window.location.search || `?${prev.toString()}`;
+        const next = new URLSearchParams(base);
         const desired =
           pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
-        if ((prev.get("active") ?? null) === desired) {
-          return prev;
+        if ((next.get("active") ?? null) === desired) {
+          return next;
         }
-        const next = new URLSearchParams(prev);
         if (desired) {
           next.set("active", desired);
         } else {
@@ -162,15 +198,15 @@ export function RunView({
   }, [pinnedFrameId, workflowRunId, setSearchParams]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
-  // the tab: RunView also mounts under Editor, no ?wr= there.
+  // the Run pane being open: RunView stays mounted while its pane is closed.
   //
   // The guard reads the LIVE URL, not this render's searchParams: a block-run launch
-  // navigates to ?wr=&bl= via a separate router update, and the editor→run transition
-  // can fire this effect from a render whose searchParams closure predates it. Reading
-  // the live URL avoids writing the stale latest-run id back over the new run (which
-  // reverted ?wr= and dropped ?bl=, disabling the debug stream).
+  // navigates to ?wr=&bl= via a separate router update, and this effect can fire from
+  // a render whose searchParams closure predates it. Reading the live URL avoids
+  // writing the stale latest-run id back over the new run (which reverted ?wr= and
+  // dropped ?bl=, disabling the debug stream).
   useEffect(() => {
-    if (studioTab !== "run") {
+    if (!runPaneOpen) {
       return;
     }
     if (!workflowRunId) {
@@ -181,16 +217,17 @@ export function RunView({
     }
     setSearchParams(
       (prev) => {
-        if (prev.get("wr")) {
-          return prev;
+        const base = window.location.search || `?${prev.toString()}`;
+        const next = new URLSearchParams(base);
+        if (next.get("wr")) {
+          return next;
         }
-        const next = new URLSearchParams(prev);
         next.set("wr", workflowRunId);
         return next;
       },
       { replace: true },
     );
-  }, [studioTab, workflowRunId, setSearchParams]);
+  }, [runPaneOpen, workflowRunId, setSearchParams]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
 
@@ -199,27 +236,50 @@ export function RunView({
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
-  // A block run executes in the debug session; on the Run tab show that same live
+  // A block run executes in the debug session; in the Run pane show that same live
   // debug stream (the shared node) instead of a separate run stream — but only when
   // the run's browser session IS the current debug session. A historical block-run
   // link whose debug session is gone/different falls back to the normal run view.
   const showDebugStream =
-    studioTab === "run" &&
+    runPaneOpen &&
     searchParams.has("bl") &&
     workflowRun?.browser_session_id != null &&
     workflowRun.browser_session_id === debugSession?.browser_session_id;
+  // The open Browser pane outranks the hero for the singleton debug-stream
+  // node (StudioShell priority); the hero then points at it instead.
+  const debugStreamInBrowserPane = showDebugStream && browserPaneOpen;
+  const focusBrowserPane = useCallback(() => {
+    openPane("browser");
+    // Defer past the pane-open commit so the scroll sees the visible panel.
+    requestAnimationFrame(() => {
+      const reduceMotion =
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      document.getElementById(studioPanelId("browser"))?.scrollIntoView({
+        behavior: reduceMotion ? "auto" : "smooth",
+        block: "nearest",
+        inline: "nearest",
+      });
+    });
+  }, [openPane]);
   const fixSeedMessage = useMemo(
     () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
     [workflowRun?.failure_reason],
   );
 
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
+  const showingScreenshots = centerView === "screenshots";
 
   const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
-  const selectedId =
-    pinnedFrameId ?? (running ? "stream" : lastFrame?.id) ?? null;
+  const selectedId = getSelectedRunFrameId({
+    pinnedFrameId,
+    running,
+    showingScreenshots,
+    debugStreamInBrowserPane,
+    lastFrameId: lastFrame?.id ?? null,
+  });
   const activeItem = useMemo(
     () =>
       findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
@@ -258,6 +318,25 @@ export function RunView({
     }
     return null;
   }, [activeItem, timeline, activeIteration]);
+  const hasScreenshotFrame = useMemo(
+    () =>
+      frames.some(
+        (frame) =>
+          frame.screenshotArtifactId != null ||
+          (frame.stepId != null && frame.actionOrder != null),
+      ),
+    [frames],
+  );
+  const activeSelectionHasScreenshot = useMemo(
+    () => hasScreenshotCandidate(heroSelection),
+    [heroSelection],
+  );
+  // Frames are the usual source; the selection keeps the toggle visible while
+  // filmstrip data is still catching up.
+  const hasScreenshots = useMemo(
+    () => hasScreenshotFrame || activeSelectionHasScreenshot,
+    [hasScreenshotFrame, activeSelectionHasScreenshot],
+  );
 
   const heroLabel = isAction(activeItem)
     ? actionLabel(activeItem)
@@ -269,25 +348,40 @@ export function RunView({
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
     const outputs = workflowRun?.outputs;
-    return typeof outputs === "object" &&
-      outputs !== null &&
-      "extracted_information" in outputs
+    return isRecord(outputs) && "extracted_information" in outputs
       ? (outputs.extracted_information as Record<string, unknown>)
       : null;
   }, [workflowRun]);
 
   const downloadedFiles = useMemo<RunOutputFile[]>(() => {
-    const urls = workflowRun?.downloaded_file_urls ?? [];
     const filenameByUrl = new Map<string, string>();
+    const files: RunOutputFile[] = [];
+    const seen = new Set<string>();
+    const pushFile = (url: string, filename?: string | null) => {
+      if (seen.has(url)) {
+        return;
+      }
+      seen.add(url);
+      files.push({
+        url,
+        filename: filename || pickDownloadedFileFilename(url, filenameByUrl),
+      });
+    };
     for (const file of workflowRun?.downloaded_files ?? []) {
       if (file.filename) {
         filenameByUrl.set(file.url, file.filename);
       }
+      pushFile(file.url, file.filename);
     }
-    return urls.map((url) => ({
-      url,
-      filename: pickDownloadedFileFilename(url, filenameByUrl),
-    }));
+    // Prefer rich metadata first; URL fallback only fills gaps without duplicating.
+    for (const url of workflowRun?.downloaded_file_urls ?? []) {
+      pushFile(url);
+    }
+    return files;
+  }, [workflowRun]);
+
+  const runErrors = useMemo<RunOutputError[]>(() => {
+    return normalizeRunOutputErrors(workflowRun?.errors);
   }, [workflowRun]);
 
   const runInputs = useMemo(() => {
@@ -318,12 +412,23 @@ export function RunView({
     return { parameters, meta };
   }, [workflowRun]);
 
+  // Task 2.0 runs carry their output (and any webhook failure) on task_v2,
+  // not on the workflow-run outputs field.
+  const observerOutput = workflowRun?.task_v2?.output ?? null;
+  const webhookFailureReason =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason ??
+    null;
+
   const hasInputs =
     runInputs.parameters.length > 0 || runInputs.meta.length > 0;
   const hasOutputs =
+    runErrors.length > 0 ||
     (extractedInformation != null &&
       Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0;
+    downloadedFiles.length > 0 ||
+    observerOutput != null ||
+    webhookFailureReason != null;
 
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
@@ -347,6 +452,9 @@ export function RunView({
             heroLabel={heroLabel}
             running={running}
             showDebugStream={showDebugStream}
+            debugStreamInBrowserPane={debugStreamInBrowserPane}
+            onFocusBrowserPane={focusBrowserPane}
+            paneOpen={runPaneOpen}
             provisioning={
               workflowRun.status === Status.Created ||
               workflowRun.status === Status.Queued
@@ -357,6 +465,8 @@ export function RunView({
             codeGenerating={codeGenerating}
             browserSessionId={workflowRun.browser_session_id ?? null}
             recordingUrls={recordingUrls}
+            recordingArchived={workflowRun.recording_archived ?? false}
+            hasScreenshots={hasScreenshots}
             elapsed={elapsed}
             overview={
               <RunOverviewButton
@@ -386,6 +496,9 @@ export function RunView({
                   workflowTitle={workflowRun.workflow?.title}
                   extractedInformation={extractedInformation}
                   files={downloadedFiles}
+                  errors={runErrors}
+                  observerOutput={observerOutput}
+                  webhookFailureReason={webhookFailureReason}
                   summary={outputSummary}
                   onSummary={setOutputSummary}
                 />

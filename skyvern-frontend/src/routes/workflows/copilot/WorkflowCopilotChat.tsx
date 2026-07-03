@@ -14,7 +14,6 @@ import {
   ReloadIcon,
   Cross2Icon,
   ChevronDownIcon,
-  ChevronLeftIcon,
   CheckIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
@@ -246,6 +245,16 @@ interface ChatMessage {
   narrative?: TurnNarrativeState;
 }
 
+const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const narrative = messages[index]?.narrative;
+    if (narrative?.turnId && shouldShowDiffCard(narrative)) {
+      return narrative.turnId;
+    }
+  }
+  return null;
+};
+
 type QueuedPrompt = {
   id: string;
   content: string;
@@ -348,8 +357,9 @@ interface WorkflowCopilotChatProps {
   onInitialMessageConsumed?: () => void;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
-  // Collapse the docked panel to a rail. Only used when `docked`.
-  onCollapse?: () => void;
+  // Render frameless — no border, background, or title; the header keeps only
+  // the controls row. Only used when `docked`.
+  chromeless?: boolean;
   // When docked, render into this element via a portal (keeps the component in
   // its parent's React tree so canvas callbacks stay wired) instead of inline.
   portalTarget?: HTMLElement | null;
@@ -424,7 +434,7 @@ export function WorkflowCopilotChat({
   initialMessageFixOrigin,
   onInitialMessageConsumed,
   docked = false,
-  onCollapse,
+  chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
@@ -485,6 +495,11 @@ export function WorkflowCopilotChat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  // Turn IDs the user explicitly rejected. This is client-local because reject
+  // only reverts the local canvas; the backend proposalDisposition stays fixed.
+  const [rejectedTurnIds, setRejectedTurnIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -687,6 +702,7 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
+    setRejectedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
@@ -719,6 +735,10 @@ export function WorkflowCopilotChat({
           return hydrated;
         })(),
       }));
+      const pendingProposalTurnId = data.proposed_workflow
+        ? getLatestDiffCardTurnId(historyMessages)
+        : null;
+      latestTurnId.current = pendingProposalTurnId;
       setMessages(historyMessages);
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
@@ -733,6 +753,7 @@ export function WorkflowCopilotChat({
       if (!workflowPermanentId) return;
       setIsLoadingHistory(true);
       updateQueuedPrompt(null);
+      setRejectedTurnIds(new Set());
       setNarrative(EMPTY_NARRATIVE);
       turnSnapshots.current.clear();
       pendingSubmitSnapshot.current = null;
@@ -878,10 +899,13 @@ export function WorkflowCopilotChat({
     // The staged proposal was rendered onto the canvas mid-turn (via
     // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
     // canvas state captured client-side at submit time.
-    const turnId = latestTurnId.current;
+    const turnId = latestTurnId.current ?? getLatestDiffCardTurnId(messages);
     const entry = turnId ? turnSnapshots.current.get(turnId) : null;
     if (entry?.snapshot) {
       applyWorkflowUpdate(entry.snapshot);
+    }
+    if (turnId) {
+      setRejectedTurnIds((prev) => new Set(prev).add(turnId));
     }
     setProposedWorkflow(null);
     void clearProposedWorkflow(false);
@@ -1326,6 +1350,7 @@ export function WorkflowCopilotChat({
             run_with: saveData.settings.runWith,
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
+            enable_self_healing: saveData.settings.enableSelfHealing ?? false,
             code_version:
               saveData.settings.runWith === "code"
                 ? (saveData.settings.codeVersion ?? 2)
@@ -2022,9 +2047,9 @@ export function WorkflowCopilotChat({
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working — message will queue…"
+      ? "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
-        ? "Live browser is starting. Send now to queue your prompt."
+        ? "Live browser is starting. Your next send will wait until it connects."
         : null;
   const inputStatusText = isSpeechListening
     ? browserStatusText
@@ -2036,7 +2061,9 @@ export function WorkflowCopilotChat({
     <div
       className={
         docked
-          ? "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
+          ? chromeless
+            ? "relative flex h-full w-full flex-col overflow-hidden text-foreground"
+            : "relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 text-foreground"
           : "fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
       }
       style={
@@ -2053,21 +2080,27 @@ export function WorkflowCopilotChat({
       {/* Header */}
       <div
         className={
-          "flex items-center justify-between border-b border-border px-4" +
-          (docked ? " h-14 shrink-0" : " cursor-move py-2")
+          "flex items-center border-b border-border px-4" +
+          (docked
+            ? chromeless
+              ? " h-11 shrink-0 justify-end"
+              : " h-14 shrink-0 justify-between"
+            : " cursor-move justify-between py-2")
         }
         onMouseDown={docked ? undefined : handleMouseDown}
       >
-        <div className="flex items-center gap-2">
-          <h3 className="text-sm font-semibold text-foreground">
-            {docked ? "Copilot" : "Agent Copilot (Beta)"}
-          </h3>
-          {docked ? (
-            <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
-              Beta
-            </span>
-          ) : null}
-        </div>
+        {chromeless ? null : (
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-foreground">
+              {docked ? "Copilot" : "Agent Copilot (Beta)"}
+            </h3>
+            {docked ? (
+              <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
+                Beta
+              </span>
+            ) : null}
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <WorkflowCopilotHistory
             workflowPermanentId={workflowPermanentId}
@@ -2085,18 +2118,8 @@ export function WorkflowCopilotChat({
           </button>
           <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
           <span className="text-xs text-muted-foreground">Active</span>
-          {docked ? (
-            onCollapse ? (
-              <button
-                type="button"
-                onClick={onCollapse}
-                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                title="Collapse Copilot"
-              >
-                <ChevronLeftIcon className="h-4 w-4" />
-              </button>
-            ) : null
-          ) : (
+          {/* Only the floating window closes itself; docked chrome is external. */}
+          {docked ? null : (
             <button
               type="button"
               onClick={() => onClose?.()}
@@ -2194,7 +2217,14 @@ export function WorkflowCopilotChat({
                       </div>
                     ) : null}
                     {docked && shouldShowDiffCard(message.narrative) ? (
-                      <DiffCard turn={message.narrative} />
+                      <DiffCard
+                        pendingProposal={showProposalActions}
+                        rejected={
+                          message.narrative.turnId !== null &&
+                          rejectedTurnIds.has(message.narrative.turnId)
+                        }
+                        turn={message.narrative}
+                      />
                     ) : null}
                     {docked &&
                     isLastMessage &&
@@ -2313,9 +2343,9 @@ export function WorkflowCopilotChat({
               queuedPrompt
                 ? "Prompt queued..."
                 : isLoading
-                  ? "Type a message to queue for the next turn…"
+                  ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
-                    ? "Type a prompt to queue..."
+                    ? "Type a prompt to send when ready..."
                     : "Message Skyvern Copilot…"
             }
             value={inputValue}
@@ -2350,13 +2380,15 @@ export function WorkflowCopilotChat({
           ) : isLoading ? (
             <>
               <button
+                type="button"
                 onClick={() => handleSend()}
-                title="Queue for the next turn"
+                title="Send after this turn finishes"
                 className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
-                Queue
+                Send next
               </button>
               <button
+                type="button"
                 onClick={cancelSend}
                 title="Cancel run"
                 className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"

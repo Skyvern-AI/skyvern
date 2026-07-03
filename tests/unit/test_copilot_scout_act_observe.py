@@ -26,9 +26,12 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _consume_pending_browser_interaction_observation,
     _mark_pending_browser_interaction_observation,
+    _register_scout_interaction_observation,
+    _scout_act_observe_page_evidence,
     account_no_progress_interaction_click,
 )
 
@@ -89,6 +92,27 @@ def _server_returning(payload: dict[str, Any]) -> SimpleNamespace:
     server = SimpleNamespace()
     server.call_internal_tool = AsyncMock(return_value={"ok": True, "data": {"result": payload}})
     return server
+
+
+def _server_returning_sequence(payloads: list[dict[str, Any] | None | BaseException]) -> SimpleNamespace:
+    server = SimpleNamespace()
+    side_effects = [
+        payload if isinstance(payload, BaseException) else {"ok": True, "data": {"result": payload}}
+        for payload in payloads
+    ]
+    server.call_internal_tool = AsyncMock(side_effect=side_effects)
+    return server
+
+
+def _monotonic_sequence(values: list[float]) -> Any:
+    calls = {"n": 0}
+
+    def fake() -> float:
+        index = calls["n"]
+        calls["n"] += 1
+        return values[index] if index < len(values) else values[-1]
+
+    return fake
 
 
 async def _run_click(ctx: SimpleNamespace) -> dict[str, Any]:
@@ -153,6 +177,106 @@ class TestActObserveSuccess:
 
 class TestActObserveDegrade:
     @pytest.mark.asyncio
+    async def test_first_hollow_then_bounded_recapture_attaches_schema(self) -> None:
+        ctx = _ctx(
+            server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
+        )
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert result["ok"] is True
+        assert "page" in result["data"]
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is True
+        assert ctx.flow_evidence[0]["evidence"]["forms"][0]["fields"][0]["label"] == "NPI number"
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+    @pytest.mark.asyncio
+    async def test_persistent_post_interaction_hollow_records_build_test_outcome(self) -> None:
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>", "visible_text": "Still loading"}
+        ctx = _ctx(
+            server=_server_returning_sequence([payload, payload]), source_url="https://example.com/path?secret=1"
+        )
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert result["ok"] is True
+        assert "page" not in result["data"]
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.verdict == "repairable_failure"
+        assert outcome.is_authoritative is True
+        assert outcome.attempted_tool == "scout_interaction"
+        assert outcome.attempted_target == "#open-details"
+        assert "secret" not in str(outcome.structural_key_payload)
+        assert "recapture_attempted:true" in outcome.page_evidence_refs
+        assert "recapture_result:hollow" in outcome.page_evidence_refs
+        assert ctx.recorded_build_test_outcome_history[-1]["reason_code"] == outcome.reason_code
+
+    @pytest.mark.asyncio
+    async def test_first_hollow_with_no_recapture_budget_records_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 1.0)
+        monkeypatch.setattr(scouting_module.time, "monotonic", _monotonic_sequence([0.0, 2.0, 2.0]))
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
+        ctx = _ctx(server=_server_returning_sequence([payload]))
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.is_authoritative is True
+        assert "recapture_attempted:false" in outcome.page_evidence_refs
+        assert "recapture_result:not_attempted_no_budget" in outcome.page_evidence_refs
+
+    @pytest.mark.asyncio
+    async def test_first_hollow_with_recapture_none_records_outcome(self) -> None:
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
+        ctx = _ctx(server=_server_returning_sequence([payload, None]))
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.is_authoritative is True
+        assert "recapture_attempted:true" in outcome.page_evidence_refs
+        assert "recapture_result:no_payload" in outcome.page_evidence_refs
+
+    @pytest.mark.asyncio
+    async def test_first_hollow_with_recapture_error_records_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
+        calls = {"n": 0}
+
+        async def fake_extract(
+            _ctx: Any, *, inspected_url: str, current_url: str, timeout_seconds: float
+        ) -> dict[str, Any] | None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return payload
+            raise RuntimeError("browser gone")
+
+        monkeypatch.setattr(scouting_module, "_composition_get_structured_evidence", fake_extract)
+        ctx = _ctx(server=SimpleNamespace())
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.is_authoritative is True
+        assert "recapture_attempted:true" in outcome.page_evidence_refs
+        assert "recapture_result:error" in outcome.page_evidence_refs
+
+    @pytest.mark.asyncio
     async def test_timeout_degrades_to_schema_less_packet_and_keeps_marker(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -183,6 +307,7 @@ class TestActObserveDegrade:
         assert ctx.pending_browser_interaction_observation is not None
         assert ctx.pending_browser_interaction_observation.tool_name == "click"
         assert ctx.pending_browser_interaction_observation.url == _LANDING_URL
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
 
     @pytest.mark.asyncio
     async def test_hollow_parse_degrades_to_schema_less_packet(self) -> None:
@@ -195,6 +320,7 @@ class TestActObserveDegrade:
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
         assert set(ctx.flow_evidence[0]["evidence"].keys()) == _SCHEMA_LESS_PACKET_KEYS
         assert ctx.pending_browser_interaction_observation is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "scout_act_observe_hollow_after_interaction"
 
     @pytest.mark.asyncio
     async def test_extractor_error_never_fails_the_click(self) -> None:
@@ -207,6 +333,32 @@ class TestActObserveDegrade:
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+    @pytest.mark.asyncio
+    async def test_initial_none_without_first_hollow_does_not_record_outcome(self) -> None:
+        ctx = _ctx(server=_server_returning_sequence([None]))
+
+        result = await _run_click(ctx)
+
+        assert result["ok"] is True
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+    @pytest.mark.asyncio
+    async def test_hollow_without_interaction_proof_does_not_record_outcome(self) -> None:
+        ctx = _ctx(server=_server_returning({"page_title": "Loading", "forms": []}))
+
+        parsed = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+        step, page_evidence = await _register_scout_interaction_observation(
+            ctx, tool_name="click", selector="", source_url=_SOURCE_URL, url=_LANDING_URL
+        )
+
+        assert parsed is not None
+        assert not has_bounded_page_schema(parsed)
+        assert step is None
+        assert page_evidence is None
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
 
 
 class TestActObserveNoRace:

@@ -1,74 +1,127 @@
 import {
-  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { useSearchParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
+import { Cross2Icon } from "@radix-ui/react-icons";
 
-import {
-  BLOCK_SIDEBAR_WIDTH_MAX,
-  BLOCK_SIDEBAR_WIDTH_MIN,
-  useBlockSidebarWidthStore,
-} from "@/store/BlockSidebarWidthStore";
+import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { cn } from "@/util/utils";
 
-import { useSettingsSidebarLayout } from "../editor/hooks/useSettingsSidebarLayout";
+import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
 import { BrowserTab } from "./BrowserTab";
-import { CopilotRail } from "./CopilotRail";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
 import { StudioBrowserStream } from "./StudioBrowserStream";
-import {
-  STUDIO_COPILOT_COLLAPSE_EASE,
-  STUDIO_COPILOT_RAIL_WIDTH,
-  STUDIO_COPILOT_TRANSITION_EASE,
-  STUDIO_COPILOT_TRANSITION_MS,
-  STUDIO_COPILOT_WIDTH,
-  initialStudioTab,
-  studioPanelId,
-  studioTabId,
-} from "./constants";
+import { StudioCoachMark } from "./StudioCoachMark";
+import { studioPanelId, studioTabId } from "./constants";
+import { STUDIO_PANE_META } from "./paneMeta";
+import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
+import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { StudioShellContext } from "./StudioShellContext";
+import { StudioSpine } from "./StudioSpine";
+import { StudioStageLauncher } from "./StudioStageLauncher";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
+import { useStudioPanes } from "./useStudioPanes";
 
-// Keyboard arrow-key resize step for the settings separator (px).
-const SETTINGS_RESIZE_STEP = 24;
+// The Copilot pane holds a ceiling so a lone chat doesn't stretch across the
+// whole stage; the shared floors live in panes.ts next to the fit math.
+const COPILOT_MAX_WIDTH = 440;
 
-function clampSettingsWidth(next: number): number {
-  return Math.min(
-    BLOCK_SIDEBAR_WIDTH_MAX,
-    Math.max(BLOCK_SIDEBAR_WIDTH_MIN, Math.round(next)),
+function StudioPane({
+  id,
+  open,
+  order,
+  onClose,
+  children,
+}: {
+  id: StudioPaneId;
+  open: boolean;
+  order: number | undefined;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const { label, icon: Icon } = STUDIO_PANE_META[id];
+  return (
+    <section
+      id={studioPanelId(id)}
+      role="region"
+      aria-label={label}
+      style={{
+        order,
+        minWidth: STUDIO_PANE_MIN_WIDTH[id],
+        maxWidth: id === "copilot" ? COPILOT_MAX_WIDTH : undefined,
+      }}
+      className={cn(
+        "min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1",
+        open
+          ? "flex duration-200 motion-safe:animate-in motion-safe:fade-in"
+          : "hidden",
+      )}
+    >
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-3">
+        <Icon className="size-3.5 shrink-0 text-studio-accent" aria-hidden />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+          {label}
+        </span>
+        <button
+          type="button"
+          onClick={onClose}
+          title={`Close ${label}`}
+          aria-label={`Close ${label} pane`}
+          className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          <Cross2Icon className="size-3.5" />
+        </button>
+      </div>
+      <div className="min-h-0 min-w-0 flex-1">{children}</div>
+    </section>
   );
 }
 
 /**
- * Spine + Stage shell: a persistent Copilot column beside a Stage that swaps the
- * Editor and Run tabs. The Copilot is portaled in from the embedded Workspace.
+ * Spine + panes shell: one vertical spine whose tabs (Copilot, Editor, Browser,
+ * Run) each toggle a pane; open panes share the stage side by side in click
+ * order (?panes=). The Copilot chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
-  const tab = useStudioShellStore((s) => s.tab);
-  const setTab = useStudioShellStore((s) => s.setTab);
-  const copilotCollapsed = useStudioShellStore((s) => s.copilotCollapsed);
-  const setCopilotCollapsed = useStudioShellStore((s) => s.setCopilotCollapsed);
+  return (
+    <StudioPaneDefaultsProvider
+      hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
+    >
+      <StudioStage {...props} />
+    </StudioPaneDefaultsProvider>
+  );
+}
+
+function StudioStage(props: StudioWorkspaceProps) {
+  const { panes, closePane, openPane } = useStudioPanes();
+  const { registerStageElement } = useStudioPaneDefaults();
+  const { workflowPermanentId } = useParams();
+  const isRecording = useRecordingStore((s) => s.isRecording);
+  const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+    enabled: false,
+  });
+  const browserSessionId = debugSession?.browser_session_id ?? null;
   const pipMinimized = useStudioShellStore((s) => s.pipMinimized);
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
   );
-  const [settingsPortalEl, setSettingsPortalEl] = useState<HTMLElement | null>(
-    null,
-  );
-  const [settingsRailPortalEl, setSettingsRailPortalEl] =
-    useState<HTMLElement | null>(null);
 
   // The live browser stream is mounted once into this detached host and
-  // re-parented into the active surface, so it never remounts on tab switch.
+  // re-parented into the owning pane, so it never remounts on pane changes.
   const [streamHostEl] = useState(() => {
     const el = document.createElement("div");
     el.className = "h-full w-full";
@@ -84,19 +137,21 @@ export function StudioShell(props: StudioWorkspaceProps) {
     null,
   );
 
-  // Move the persistent stream node into the showing surface (PiP / Browser tab /
-  // Run tab for a block run), parking it in the offscreen holder otherwise so the
-  // socket stays warm. runStreamSlot is registered only for a block run, so a full
-  // run on the Run tab falls through to the holder and keeps its own RunLiveStream.
+  const browserOpen = panes.includes("browser");
+  const editorOpen = panes.includes("editor");
+  const runOpen = panes.includes("run");
+
+  // Move the persistent stream node into the highest-priority open surface:
+  // Browser pane > Run pane with a live block run (runStreamSlot registers only
+  // then) > Editor PiP > offscreen park, which keeps the socket warm.
   useLayoutEffect(() => {
-    const activeSlot =
-      tab === "browser"
-        ? browserStreamSlot
-        : tab === "editor" && !pipMinimized
+    const activeSlot = browserOpen
+      ? browserStreamSlot
+      : runOpen && runStreamSlot
+        ? runStreamSlot
+        : editorOpen && !pipMinimized
           ? editorStreamSlot
-          : tab === "run"
-            ? runStreamSlot
-            : null;
+          : null;
     const dest = activeSlot ?? streamHolderEl;
     if (dest && streamHostEl.parentElement !== dest) {
       // BrowserStream re-asserts scaleViewport on its own resize, so it rescales
@@ -104,7 +159,9 @@ export function StudioShell(props: StudioWorkspaceProps) {
       dest.appendChild(streamHostEl);
     }
   }, [
-    tab,
+    browserOpen,
+    editorOpen,
+    runOpen,
     pipMinimized,
     editorStreamSlot,
     browserStreamSlot,
@@ -116,241 +173,104 @@ export function StudioShell(props: StudioWorkspaceProps) {
   const shellContextValue = useMemo(
     () => ({
       copilotPortalEl,
-      settingsPortalEl,
-      settingsRailPortalEl,
       setEditorStreamSlot,
       setBrowserStreamSlot,
       setRunStreamSlot,
     }),
-    [copilotPortalEl, settingsPortalEl, settingsRailPortalEl],
+    [copilotPortalEl],
   );
 
-  // Pick the initial tab from the deep link ONCE per mount; must not re-fire on
-  // later URL writes (the Run tab writes ?wr=/?active=) or it fights manual switches.
-  const [searchParams] = useSearchParams();
-  const deepLinkRunId = searchParams.get("wr");
-  const deepLinkActive = searchParams.get("active");
-  const initialTabAppliedRef = useRef(false);
+  // The ✕ unmounts with its pane, so hand focus back to the pane's spine tab.
+  const closeWithFocus = (id: StudioPaneId) => {
+    closePane(id);
+    document.getElementById(studioTabId(id))?.focus();
+  };
+
+  // Recording lives in the Browser pane (the live stream is there) with the
+  // live-drafts panel taking over the Copilot pane. Once a commit is in flight
+  // or its blocks are landing, reveal the Editor pane (it shows the loading
+  // overlay). Gated on lifecycle transitions so manual pane changes made
+  // mid-recording are preserved.
+  const isCommitting = useRecordingStore((s) => s.isCommitting);
+  const recordedBlocksPending = useRecordedBlocksStore(
+    (s) => (s.blocks?.length ?? 0) > 0,
+  );
+  const processingRecording = isCommitting || recordedBlocksPending;
+  const prevIsRecordingRef = useRef(false);
+  const prevProcessingRef = useRef(false);
   useEffect(() => {
-    if (initialTabAppliedRef.current) {
-      return;
+    const wasRecording = prevIsRecordingRef.current;
+    const wasProcessing = prevProcessingRef.current;
+    if (processingRecording && !wasProcessing) {
+      openPane("editor");
+    } else if (isRecording && !wasRecording) {
+      // Recording or finalizing → live browser + drafts.
+      openPane("copilot");
+      openPane("browser");
+    } else if (!isRecording && wasRecording && !processingRecording) {
+      // Recording ended (commit or discard) → back to the canvas.
+      openPane("editor");
     }
-    initialTabAppliedRef.current = true;
-    setTab(initialStudioTab({ runId: deepLinkRunId, active: deepLinkActive }));
-  }, [deepLinkRunId, deepLinkActive, setTab]);
+    prevIsRecordingRef.current = isRecording;
+    prevProcessingRef.current = processingRecording;
+  }, [isRecording, processingRecording, openPane]);
 
-  const copilotWidth = copilotCollapsed
-    ? STUDIO_COPILOT_RAIL_WIDTH
-    : STUDIO_COPILOT_WIDTH;
-
-  // Settings sidebar as a third grid column (mirrors the Copilot): the panel is
-  // portaled in from FlowRenderer, but its column width lives here so opening,
-  // collapsing, and resizing it reflow the Stage instead of overlaying it.
-  const { open: settingsOpen, collapsed: settingsCollapsed } =
-    useSettingsSidebarLayout();
-  const committedSettingsWidth = useBlockSidebarWidthStore((s) => s.width);
-  const setBlockSidebarWidth = useBlockSidebarWidthStore((s) => s.setWidth);
-  const [settingsDragWidth, setSettingsDragWidth] = useState<number | null>(
-    null,
-  );
-  const isResizingSettings = settingsDragWidth !== null;
-  const expandedSettingsWidth = settingsDragWidth ?? committedSettingsWidth;
-  // The settings panel lives in the (CSS-hidden but still mounted) Editor tab,
-  // so only reserve its column there — otherwise it'd float over Browser/Run.
-  const settingsColumnActive = settingsOpen && tab === "editor";
-  const settingsColumnWidth = !settingsColumnActive
-    ? 0
-    : settingsCollapsed
-      ? STUDIO_COPILOT_RAIL_WIDTH
-      : expandedSettingsWidth;
-  // The body is interactive only on the Editor tab while expanded, the rail only
-  // while collapsed there. Mark the other (still-mounted, clipped) subtree inert
-  // so keyboard/screen-reader users can't reach off-screen controls.
-  const settingsBodyInert = !(settingsColumnActive && !settingsCollapsed);
-  const settingsRailInert = !(settingsColumnActive && settingsCollapsed);
-
-  // Teardown for an in-progress drag, invoked on drop AND on unmount, so the
-  // window listeners + body cursor lock never leak if the shell unmounts mid-drag.
-  const settingsDragTeardownRef = useRef<(() => void) | null>(null);
-  useEffect(() => () => settingsDragTeardownRef.current?.(), []);
-
-  const handleSettingsResizePointerDown = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      const startX = event.clientX;
-      const startWidth = committedSettingsWidth;
-      // Dragging left (toward the Stage) widens the right-docked panel.
-      const widthAt = (clientX: number) =>
-        clampSettingsWidth(startWidth + startX - clientX);
-      const previousCursor = document.body.style.cursor;
-      const previousUserSelect = document.body.style.userSelect;
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-      const handleMove = (moveEvent: PointerEvent) => {
-        setSettingsDragWidth(widthAt(moveEvent.clientX));
-      };
-      function handleUp(upEvent?: PointerEvent) {
-        window.removeEventListener("pointermove", handleMove);
-        window.removeEventListener("pointerup", handleUp);
-        document.body.style.cursor = previousCursor;
-        document.body.style.userSelect = previousUserSelect;
-        settingsDragTeardownRef.current = null;
-        if (upEvent) {
-          setBlockSidebarWidth(widthAt(upEvent.clientX));
-        }
-        setSettingsDragWidth(null);
-      }
-      settingsDragTeardownRef.current = () => handleUp();
-      window.addEventListener("pointermove", handleMove);
-      window.addEventListener("pointerup", handleUp);
-    },
-    [committedSettingsWidth, setBlockSidebarWidth],
-  );
-
-  const handleSettingsResizeKeyDown = useCallback(
-    (event: React.KeyboardEvent<HTMLDivElement>) => {
-      if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        setBlockSidebarWidth(
-          clampSettingsWidth(committedSettingsWidth + SETTINGS_RESIZE_STEP),
-        );
-      } else if (event.key === "ArrowRight") {
-        event.preventDefault();
-        setBlockSidebarWidth(
-          clampSettingsWidth(committedSettingsWidth - SETTINGS_RESIZE_STEP),
-        );
-      }
-    },
-    [committedSettingsWidth, setBlockSidebarWidth],
-  );
+  const paneProps = (id: StudioPaneId) => {
+    const index = panes.indexOf(id);
+    return {
+      id,
+      open: index >= 0,
+      order: index >= 0 ? index : undefined,
+      onClose: () => closeWithFocus(id),
+    };
+  };
 
   return (
     <StudioShellContext.Provider value={shellContextValue}>
       <div className="flex h-full w-full flex-col">
         <StudioTopBar />
-        <div
-          className="grid min-h-0 flex-1"
-          style={{
-            gridTemplateColumns: `${copilotWidth}px minmax(0, 1fr) ${settingsColumnWidth}px`,
-            gridTemplateRows: "minmax(0, 1fr)",
-            // Dropped mid-drag so a settings resize tracks the handle 1:1.
-            transition: isResizingSettings
-              ? "none"
-              : `grid-template-columns ${STUDIO_COPILOT_TRANSITION_MS}ms ${
-                  copilotCollapsed || settingsCollapsed
-                    ? STUDIO_COPILOT_COLLAPSE_EASE
-                    : STUDIO_COPILOT_TRANSITION_EASE
-                }`,
-          }}
-        >
-          {/* Copilot portal target. Kept mounted (parked offscreen) when
-              collapsed so an in-flight Copilot stream isn't torn down. */}
-          <div className="relative h-full min-w-0 overflow-hidden">
-            {/* Fixed width so the chat doesn't reflow; the widening column clip
-                reveals it left→right, so no opacity fade is needed. */}
-            <div
-              ref={setCopilotPortalEl}
-              style={{ width: STUDIO_COPILOT_WIDTH }}
-              className={cn(
-                "h-full py-3 pl-3",
-                copilotCollapsed && "pointer-events-none",
-              )}
-            />
-            {/* Rail renders only while collapsed and unmounts immediately on
-                expand, so the collapsed UI can't linger over the content the
-                widening column is revealing (the open-flicker). */}
-            {copilotCollapsed ? (
-              <div
-                style={{ width: STUDIO_COPILOT_RAIL_WIDTH }}
-                className="absolute left-0 top-0 h-full py-3 pl-3 duration-300 animate-in fade-in"
-              >
-                <CopilotRail onExpand={() => setCopilotCollapsed(false)} />
+        <div className="flex min-h-0 min-w-0 flex-1">
+          <StudioSpine />
+          {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
+              stream slots); the CSS order carries the click order instead, so
+              screen-reader/Tab order stays the fixed order, not the visual one. */}
+          <div
+            ref={registerStageElement}
+            className="relative flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden p-3"
+          >
+            <StudioPane {...paneProps("copilot")}>
+              <div className="relative h-full w-full">
+                {/* Copilot portal target. Kept mounted while the pane is closed
+                    — or while recording, when the live-drafts panel covers it —
+                    so an in-flight Copilot turn isn't torn down. */}
+                <div
+                  ref={setCopilotPortalEl}
+                  className={cn(
+                    "h-full w-full",
+                    isRecording && "pointer-events-none",
+                  )}
+                />
+                {isRecording && browserSessionId ? (
+                  <div className="absolute inset-0 duration-150 animate-in fade-in slide-in-from-left-2">
+                    <RecordingPanel browserSessionId={browserSessionId} />
+                  </div>
+                ) : null}
               </div>
-            ) : null}
-          </div>
-          <div className="relative h-full min-h-0 min-w-0 overflow-hidden">
-            <div
-              role="tabpanel"
-              id={studioPanelId("editor")}
-              aria-labelledby={studioTabId("editor")}
-              className={
-                tab === "editor" ? "h-full w-full" : "hidden h-full w-full"
-              }
-            >
+            </StudioPane>
+            <StudioPane {...paneProps("editor")}>
               <EditorTab {...props} />
-            </div>
+            </StudioPane>
             {/* Kept mounted (CSS-hidden) so its stream slot stays registered;
                 the persistent stream node is re-parented in, not remounted. */}
-            <div
-              role="tabpanel"
-              id={studioPanelId("browser")}
-              aria-labelledby={studioTabId("browser")}
-              className={
-                tab === "browser" ? "h-full w-full" : "hidden h-full w-full"
-              }
-            >
+            <StudioPane {...paneProps("browser")}>
               <BrowserTab />
-            </div>
-            <div
-              role="tabpanel"
-              id={studioPanelId("run")}
-              aria-labelledby={studioTabId("run")}
-              className={
-                tab === "run" ? "h-full w-full" : "hidden h-full w-full"
-              }
-            >
+            </StudioPane>
+            <StudioPane {...paneProps("run")}>
               <RunTab />
-            </div>
+            </StudioPane>
+            {panes.length === 0 ? <StudioStageLauncher /> : null}
+            <StudioCoachMark />
             <StudioWorkflowPanels />
-          </div>
-          {/* Settings portal target. The agent/block settings panel is portaled
-              in here from FlowRenderer (it needs React Flow context), so it lives
-              as a grid column that reflows the Stage like the Copilot does. The
-              inner target is fixed at the expanded width and right-pinned so the
-              open/collapse clip never reflows the panel body. */}
-          <div className="relative h-full min-w-0 overflow-hidden">
-            {/* Expanded panel: fixed width, right-pinned, clipped by the column.
-                pr-3 mirrors the Copilot's outer inset (gap to the window edge). */}
-            <div
-              ref={setSettingsPortalEl}
-              style={{ width: expandedSettingsWidth }}
-              className="absolute inset-y-0 right-0 py-3 pr-3"
-              // inert removes the clipped body from a11y tree + tab order when
-              // it's hidden (off the Editor tab, or collapsed under the rail).
-              {...(settingsBodyInert ? { inert: "" } : {})}
-            />
-            {/* Collapsed rail: a self-contained card overlay (mirrors CopilotRail).
-                Kept mounted so its portal target is stable; only interactive while
-                collapsed so it never blocks the expanded panel underneath. */}
-            <div
-              style={{ width: STUDIO_COPILOT_RAIL_WIDTH }}
-              className="pointer-events-none absolute inset-y-0 right-0 py-3 pr-3"
-            >
-              <div
-                ref={setSettingsRailPortalEl}
-                className={cn(
-                  "h-full w-full",
-                  settingsRailInert
-                    ? "pointer-events-none"
-                    : "pointer-events-auto",
-                )}
-                {...(settingsRailInert ? { inert: "" } : {})}
-              />
-            </div>
-            {settingsColumnActive && !settingsCollapsed ? (
-              <div
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="Resize settings"
-                aria-valuenow={expandedSettingsWidth}
-                aria-valuemin={BLOCK_SIDEBAR_WIDTH_MIN}
-                aria-valuemax={BLOCK_SIDEBAR_WIDTH_MAX}
-                tabIndex={0}
-                onPointerDown={handleSettingsResizePointerDown}
-                onKeyDown={handleSettingsResizeKeyDown}
-                className="absolute inset-y-0 left-0 z-40 w-3 cursor-col-resize focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              />
-            ) : null}
           </div>
         </div>
         <div

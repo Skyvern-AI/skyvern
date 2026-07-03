@@ -575,6 +575,7 @@ def convert_to_workflow(
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
+        enable_self_healing=workflow_model.enable_self_healing,
         code_version=workflow_model.code_version,
         generate_script_on_terminal=workflow_model.generate_script_on_terminal,
         run_sequentially=workflow_model.run_sequentially,

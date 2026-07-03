@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     render_synthesized_offer_text,
     synthesize_code_block,
 )
+from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
@@ -622,6 +623,13 @@ class CopilotGoalSatisfied(Exception):
     """Raised when a tool proves the workflow already satisfies the turn."""
 
 
+class CopilotBuiltUnverified(Exception):
+    """Raised when clean tests should stop repair without claiming goal success."""
+
+
+BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON = "built_unverified_repair_inert"
+
+
 def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
     contract = ctx.latest_diagnosis_repair_contract
     if contract is None:
@@ -635,8 +643,18 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
     )
 
 
+def _latest_diagnosis_contract_selects_no_repair(ctx: CopilotContext) -> bool:
+    contract = ctx.latest_diagnosis_repair_contract
+    return contract is not None and contract.repair_decision.next_action is RepairNextAction.NO_CHANGE
+
+
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
     return outcome_criteria_evaluated(ctx)
+
+
+def _completion_verification_only_structural_abstentions(ctx: CopilotContext) -> bool:
+    result = ctx.completion_verification_result
+    return result is not None and only_structural_requested_output_abstentions(result)
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
@@ -657,6 +675,17 @@ def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
     return not _verified_goal_likely_needs_more_work(ctx)
 
 
+def built_unverified_repair_inert_context(ctx: CopilotContext) -> bool:
+    return (
+        ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and _outcome_criteria_evaluated(ctx)
+        and _latest_diagnosis_contract_selects_no_repair(ctx)
+        and _completion_verification_only_structural_abstentions(ctx)
+        and not _verified_goal_likely_needs_more_work(ctx)
+    )
+
+
 def verified_goal_claim_authorized(ctx: CopilotContext) -> bool:
     """Whether the terminal may CLAIM a tested success. Turn completion keeps
     flowing through ``verified_goal_satisfied_context``; the claim tier additionally
@@ -675,6 +704,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     """
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
+        "gate_built_unverified_repair_inert": built_unverified_repair_inert_context(ctx),
         "gate_claim_authorized": verified_goal_claim_authorized(ctx),
         "gate_last_test_ok": ctx.last_test_ok is True,
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
@@ -1384,8 +1414,10 @@ def _check_enforcement(
     raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    if verified:
+    if verified_goal_satisfied_context(ctx):
         raise CopilotGoalSatisfied()
+    if built_unverified_repair_inert_context(ctx):
+        raise CopilotBuiltUnverified()
 
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
@@ -2148,6 +2180,55 @@ def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str
     return (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) == len(trajectory)
 
 
+def _ambiguous_bare_selector_repair_context(ctx: Any) -> Any | None:
+    repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
+    if getattr(repair_context, "reason_code", None) != "ambiguous_bare_selector":
+        return None
+    if getattr(repair_context, "workflow_run_id", None):
+        return None
+    if getattr(ctx, "last_run_blocks_workflow_run_id", None):
+        return None
+    return repair_context
+
+
+def _ambiguous_bare_selector_rescout_key(ctx: Any) -> str | None:
+    repair_context = _ambiguous_bare_selector_repair_context(ctx)
+    if repair_context is None:
+        return None
+    if getattr(repair_context, "refiner_selector", None):
+        return None
+    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
+    if isinstance(selector_alternatives, list) and selector_alternatives:
+        return None
+    payload = {
+        "block_label": str(getattr(repair_context, "block_label", "") or ""),
+        "selector": str(getattr(repair_context, "selector", "") or ""),
+        "source_url": str(getattr(repair_context, "source_url", "") or ""),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> str | None:
+    if tool_name != "evaluate":
+        return None
+    repair_context = _ambiguous_bare_selector_repair_context(ctx)
+    if repair_context is None:
+        return None
+    if getattr(repair_context, "refiner_selector", None):
+        return "block"
+    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
+    if isinstance(selector_alternatives, list) and selector_alternatives:
+        return "block"
+    key = _ambiguous_bare_selector_rescout_key(ctx)
+    if key is None:
+        return None
+    if getattr(ctx, "ambiguous_bare_selector_rescout_context_key", None) == key:
+        return "block"
+    # Track the one allowed same-page rescout for this author-time repair context.
+    ctx.ambiguous_bare_selector_rescout_context_key = key
+    return "allow"
+
+
 def _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
     if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
         return False
@@ -2168,6 +2249,9 @@ def _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx: Any, tool
 def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
     if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
         return None
+    ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
+    if ambiguous_selector_rescout_state == "allow":
+        return None
     if _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx, tool_name):
         return CopilotToolBlockerSignal(
             blocker_kind="tool_error",
@@ -2185,8 +2269,10 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
             blocked_tool=tool_name,
             extra={"recorded_outcome_reason_code": "outcome_not_demonstrated"},
         )
-    if not _should_force_synthesized_block_persistence(ctx) and not _should_block_mutating_tool_after_synthesized_offer(
-        ctx, tool_name
+    if (
+        ambiguous_selector_rescout_state != "block"
+        and not _should_force_synthesized_block_persistence(ctx)
+        and not _should_block_mutating_tool_after_synthesized_offer(ctx, tool_name)
     ):
         return None
     return CopilotToolBlockerSignal(

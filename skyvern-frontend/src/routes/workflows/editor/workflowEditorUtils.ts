@@ -1998,12 +1998,14 @@ function getElements(
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
+      enableSelfHealing: settings.enableSelfHealing ?? false,
       label: "__start_block__",
       showCode: false,
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
       workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
+      errorCodeMapping: settings.errorCodeMapping ?? null,
     }),
   );
 
@@ -3414,10 +3416,12 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
+    enableSelfHealing: false,
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
     workflowSystemPrompt: null,
+    errorCodeMapping: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -3449,10 +3453,12 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
+      enableSelfHealing: data.enableSelfHealing,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
       workflowSystemPrompt: data.workflowSystemPrompt ?? null,
+      errorCodeMapping: data.errorCodeMapping ?? null,
     };
   }
   return defaultSettings;
@@ -4540,6 +4546,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
+    enable_self_healing: workflow.enable_self_healing ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
     sequential_key: workflow.sequential_key ?? undefined,
   };

@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
+    _is_structural_requested_output_abstention,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
@@ -1242,7 +1243,10 @@ def _outcome_failure_warrants_repair(
         return True
     # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
     # (absent judge signal, unmappable definition checks) never warrants repair.
-    if not any(verdict.state == "unsatisfied" for verdict in completion_verification.verdicts):
+    if not any(
+        verdict.state == "unsatisfied" and not _is_structural_requested_output_abstention(verdict)
+        for verdict in completion_verification.verdicts
+    ):
         return False
     return _current_workflow_has_evidence_block(copilot_ctx)
 

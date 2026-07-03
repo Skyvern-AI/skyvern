@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import { AxiosError } from "axios";
 import {
   CalendarIcon,
@@ -7,11 +7,10 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
-import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -26,7 +25,6 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useStudioShellStore, type StudioTab } from "@/store/StudioShellStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -36,118 +34,10 @@ import { EditableNodeTitle } from "../editor/nodes/components/EditableNodeTitle"
 import { EditorOverflowMenu } from "../editor/header/EditorOverflowMenu";
 import { MakeACopyButton } from "../editor/MakeACopyButton";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
-import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
-import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
-import { studioPanelId, studioTabId } from "./constants";
-import { finalizedRunStatus, runOutcomeFromStatus } from "./runProjections";
+import { runOutcomeFromStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
-
-function useIsGlobalWorkflow(): boolean {
-  const { workflowPermanentId } = useParams();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  return Boolean(
-    globalWorkflows?.some(
-      (w) => w.workflow_permanent_id === workflowPermanentId,
-    ),
-  );
-}
-
-function StudioTabs() {
-  const tab = useStudioShellStore((s) => s.tab);
-  const setTab = useStudioShellStore((s) => s.setTab);
-  const urlRunId = useStudioRunId();
-  const { workflowPermanentId } = useParams();
-  const { data: urlRun } = useWorkflowRunWithWorkflowQuery(
-    urlRunId ? { workflowRunId: urlRunId } : undefined,
-  );
-  const { data: runs } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    page: 1,
-    pageSize: 1,
-  });
-  const latestRun = runs?.[0];
-  const hasRun = Boolean(urlRunId) || (runs?.length ?? 0) > 0;
-  const runStatus = finalizedRunStatus(
-    urlRunId ? urlRun?.status : latestRun?.status,
-  );
-
-  const tabs: Array<{ id: StudioTab; label: string; disabled: boolean }> = [
-    { id: "editor", label: "Editor", disabled: false },
-    { id: "browser", label: "Browser", disabled: false },
-    { id: "run", label: "Run", disabled: !hasRun },
-  ];
-
-  // Roving arrow-key navigation across the enabled tabs (WAI-ARIA tabs).
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
-    if (!keys.includes(event.key)) {
-      return;
-    }
-    event.preventDefault();
-    const enabled = tabs.filter((t) => !t.disabled);
-    const current = enabled.findIndex((t) => t.id === tab);
-    const last = enabled.length - 1;
-    const nextIndex =
-      event.key === "ArrowRight"
-        ? (current + 1) % enabled.length
-        : event.key === "ArrowLeft"
-          ? (current - 1 + enabled.length) % enabled.length
-          : event.key === "Home"
-            ? 0
-            : last;
-    const next = enabled[nextIndex];
-    if (next) {
-      setTab(next.id);
-      document.getElementById(studioTabId(next.id))?.focus();
-    }
-  };
-
-  return (
-    <div
-      role="tablist"
-      aria-label="Studio view"
-      className="flex items-center gap-1"
-      onKeyDown={onKeyDown}
-    >
-      {tabs.map((t) => {
-        const selected = tab === t.id;
-        return (
-          <button
-            key={t.id}
-            id={studioTabId(t.id)}
-            type="button"
-            role="tab"
-            aria-selected={selected}
-            aria-controls={studioPanelId(t.id)}
-            tabIndex={selected ? 0 : -1}
-            disabled={t.disabled}
-            onClick={() => !t.disabled && setTab(t.id)}
-            className={cn(
-              "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
-              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-              selected
-                ? "bg-studio-accent/15 text-foreground ring-1 ring-inset ring-studio-accent/40"
-                : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
-              t.disabled &&
-                "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
-            )}
-          >
-            {t.label}
-            {t.id === "run" && runStatus ? (
-              <StatusBadge
-                status={runStatus}
-                alwaysShowLabel
-                // overrides StatusBadge's md:px-2.5 to keep the chip compact in the tab bar
-                className="h-5 gap-1 px-1.5 py-0 text-[10px] md:w-auto md:px-1.5"
-              />
-            ) : null}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
 
 function TitleSection({ editable = true }: { editable?: boolean }) {
   const { title, setTitle } = useWorkflowTitleStore();
@@ -225,10 +115,11 @@ function PanelToggle({
   );
 }
 
-function RunStopButton() {
+export function RunStopButton() {
   const navigate = useNavigate();
   const { workflowPermanentId } = useParams();
   const runId = useStudioRunId();
+  const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
@@ -237,6 +128,9 @@ function RunStopButton() {
   );
   const activeRunId = workflowRun?.workflow_run_id;
   const running = runOutcomeFromStatus(workflowRun?.status) === "running";
+  // ?bl= marks the URL run as a block run; a full run can start alongside it
+  // (they execute concurrently), so Run stays available next to Stop.
+  const isBlockRun = searchParams.has("bl");
 
   const cancelRun = useMutation({
     mutationFn: async () => {
@@ -266,8 +160,10 @@ function RunStopButton() {
     },
   });
 
+  const startFullRun = () => navigate(`/agents/${workflowPermanentId}/run`);
+
   if (running && activeRunId) {
-    return (
+    const stopDialog = (
       <Dialog>
         <DialogTrigger asChild>
           <Button
@@ -304,13 +200,42 @@ function RunStopButton() {
         </DialogContent>
       </Dialog>
     );
+    if (!isBlockRun) {
+      return stopDialog;
+    }
+    return (
+      <>
+        {stopDialog}
+        <Dialog>
+          <DialogTrigger asChild>
+            <Button size="default" disabled={isRecording}>
+              <PlayIcon className="mr-2 size-4" /> Run
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Start a full run?</DialogTitle>
+              <DialogDescription>
+                A block run is still executing. It will keep running — you can
+                watch it in the Browser pane while the Run pane switches to the
+                new full run.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="secondary">Not now</Button>
+              </DialogClose>
+              <DialogClose asChild>
+                <Button onClick={startFullRun}>Start full run</Button>
+              </DialogClose>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </>
+    );
   }
   return (
-    <Button
-      size="default"
-      disabled={isRecording}
-      onClick={() => navigate(`/workflows/${workflowPermanentId}/run`)}
-    >
+    <Button size="default" disabled={isRecording} onClick={startFullRun}>
       <PlayIcon className="mr-2 size-4" /> Run
     </Button>
   );
@@ -321,8 +246,6 @@ export function StudioTopBar() {
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow} />
-      <div className="h-6 w-px bg-border" aria-hidden />
-      <StudioTabs />
       <div className="flex-1" />
       {isGlobalWorkflow ? (
         <MakeACopyButton />

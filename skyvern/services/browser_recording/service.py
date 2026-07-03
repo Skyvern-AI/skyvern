@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import functools
 import json
 import pathlib
 import re
@@ -16,8 +17,12 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
@@ -65,6 +70,37 @@ LOG = structlog.get_logger(__name__)
 # avoid decompression bombs
 MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
 DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_enrichment_handler(key: str) -> LLMAPIHandler | None:
+    """Resolve the dedicated enrichment handler for `key`, or None if it isn't registered.
+
+    Memoized because the key is static config and the registry is populated at startup;
+    exceptions propagate uncached so a transient resolution failure isn't pinned.
+    """
+    if LLMConfigRegistry.is_registered(key):
+        return LLMAPIHandlerFactory.get_llm_api_handler(key)
+    return None
+
+
+def _recording_enrichment_llm_handler() -> LLMAPIHandler:
+    """Dedicated (fast) LLM for draft enrichment; falls back to the default handler on any resolution failure."""
+    key = settings.RECORDING_ENRICHMENT_LLM_KEY
+    if key:
+        try:
+            handler = _resolve_enrichment_handler(key)
+        except Exception:
+            LOG.warning(
+                "record_browser.enrichment_llm_fallback",
+                enrichment_llm_key=key,
+                exc_info=True,
+            )
+        else:
+            if handler is not None:
+                return handler
+    return app.LLM_API_HANDLER
+
 
 # Re-captures of one interaction land within this browser-clock (ms) window; genuine repeats fall outside it.
 DUPLICATE_ACTION_WINDOW_MS = 250
@@ -521,7 +557,7 @@ class Processor:
             action=action,
         )
 
-        metadata_response = await app.LLM_API_HANDLER(
+        metadata_response = await _recording_enrichment_llm_handler()(
             prompt=metadata_prompt,
             prompt_name=prompt_name,
             organization_id=self.organization_id,

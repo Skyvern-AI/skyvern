@@ -41,6 +41,7 @@ from skyvern.forge.sdk.services.credential.bitwarden_credential_service import B
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.services.credential.gcp_credential_vault_service import GcpCredentialVaultService
+from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -95,6 +96,7 @@ class ForgeApp:
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
+    SKYVERN_CREDENTIAL_VAULT_SERVICE: SkyvernCredentialVaultService | None
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     GCP_CREDENTIAL_VAULT_SERVICE: GcpCredentialVaultService | None
@@ -177,7 +179,7 @@ def create_forge_app() -> ForgeApp:
             azure_deployment=settings.AZURE_CUA_DEPLOYMENT,
         )
 
-    app.ANTHROPIC_CLIENT = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    app.ANTHROPIC_CLIENT = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY or "dummy")
     if settings.ENABLE_BEDROCK_ANTHROPIC:
         app.ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
 
@@ -283,6 +285,9 @@ def create_forge_app() -> ForgeApp:
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.GCP_CLIENT_FACTORY = RealGcpClientFactory()
+    app.SKYVERN_CREDENTIAL_VAULT_SERVICE = (
+        SkyvernCredentialVaultService() if settings.is_local_credential_vault_enabled() else None
+    )
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
 
     # Azure Credential Vault Service
@@ -329,6 +334,7 @@ def create_forge_app() -> ForgeApp:
         else CustomCredentialVaultService()  # Create service without client for organization-based configuration
     )
     app.CREDENTIAL_VAULT_SERVICES = {
+        CredentialVaultType.SKYVERN: app.SKYVERN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,

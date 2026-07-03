@@ -5,11 +5,13 @@ from types import SimpleNamespace
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_structure_signature_from_workflow,
+    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_run_blocks_result,
+    recorded_outcome_from_scout_act_observe_hollow,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -111,6 +113,39 @@ def test_structural_key_does_not_require_fixture_slug_or_raw_transcript_text() -
     assert "synthetic transcript excerpt" not in str(key_payload)
 
 
+def test_scout_act_observe_hollow_outcome_is_structural_and_privacy_bounded() -> None:
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#search",
+        current_url="https://example.com/customers/acme-inc/results?token=secret",
+        source_url="https://example.com/accounts/claim-123/search?name=customer",
+        page_evidence={
+            "page_title": "Private Account Search",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "clickable_controls": [],
+            "visible_text": "Customer name should not persist",
+            "body": "<main></main>",
+            "schema_empty_page": True,
+        },
+        recapture_attempted=True,
+        recapture_result="timeout",
+    )
+
+    dumped = outcome.model_dump(mode="json")
+    key_payload = outcome.structural_key_payload
+
+    assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+    assert outcome.structural_key is not None
+    assert outcome.is_authoritative is True
+    assert "recapture_attempted:true" in outcome.page_evidence_refs
+    assert "recapture_result:timeout" in outcome.page_evidence_refs
+    for sensitive in ("token=secret", "name=customer", "acme-inc", "claim-123", "Customer name", "Private Account"):
+        assert sensitive not in str(dumped)
+        assert sensitive not in str(key_payload)
+
+
 def test_prose_or_label_only_typed_outcome_is_not_authoritative() -> None:
     outcome = RecordedBuildTestOutcome(
         phase="author_time_reject",
@@ -144,6 +179,51 @@ def test_record_none_clears_stale_latest_outcome() -> None:
     record_build_test_outcome(ctx, None)
 
     assert ctx.latest_recorded_build_test_outcome is None
+
+
+def test_repeated_outcome_ignores_intervening_scout_evaluate_history() -> None:
+    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    author_reject = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        structural_failure_identity="author:missing-output",
+    )
+    scout_hollow = RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout:hollow",
+    )
+
+    record_build_test_outcome(ctx, author_reject)
+    record_build_test_outcome(ctx, scout_hollow)
+    record_build_test_outcome(ctx, author_reject)
+
+    assert latest_recorded_build_test_outcome_repeated(ctx) is True
+
+
+def test_repeated_outcome_still_detects_different_author_reject_after_scout_evaluate() -> None:
+    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    first_reject = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        structural_failure_identity="author:missing-output",
+    )
+    scout_hollow = RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout:hollow",
+    )
+    second_reject = first_reject.model_copy(update={"structural_failure_identity": "author:different-output"})
+
+    record_build_test_outcome(ctx, first_reject)
+    record_build_test_outcome(ctx, scout_hollow)
+    record_build_test_outcome(ctx, second_reject)
+
+    assert latest_recorded_build_test_outcome_repeated(ctx) is False
 
 
 def test_authored_structure_signature_is_stable_and_excludes_raw_code_or_prose() -> None:
@@ -330,6 +410,146 @@ def test_outcome_not_demonstrated_keeps_authoritative_unsatisfied_criteria_ident
     assert "address and statuses" not in payload_text
 
 
+def test_not_evaluated_recorded_outcome_is_not_authoritative_repair_failure() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_structural",
+            "blocks": [
+                {
+                    "label": "publish_result",
+                    "status": "completed",
+                    "extracted_data": {"document_name": "Resale Demand Package"},
+                }
+            ],
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                output_path="output.document_name",
+            )
+        ],
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_structural"),
+        completion_verification=verification,
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.reason_code == "failed_run"
+    assert outcome.is_authoritative is False
+
+
+def test_outcome_not_demonstrated_does_not_mark_presence_only_abstention_as_missing_output() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_top_post",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "extract_top_hn_post",
+                    "status": "completed",
+                    "extracted_data": {"output": {"top_post": "Claude Sonnet 5"}},
+                }
+            ],
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["top_post"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="top_post",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                output_path="output.top_post",
+                grounding_mode="missing",
+                evidence_ref="block_outputs:extract_top_hn_post.output.top_post",
+            )
+        ],
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_top_post",
+        ),
+        completion_verification=verification,
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.is_authoritative is True
+    assert outcome.missing_requested_output_facts == []
+
+
+def test_outcome_not_demonstrated_keeps_missing_fact_for_absent_requested_output() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_no_top_post",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "extract_top_hn_post",
+                    "status": "completed",
+                    "extracted_data": {"output": {}},
+                }
+            ],
+        },
+    }
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["top_post"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="top_post",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                output_path="output.top_post",
+                grounding_mode="missing",
+            )
+        ],
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_no_top_post",
+        ),
+        completion_verification=verification,
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.missing_requested_output_facts == [
+        {
+            "criterion_id": "top_post",
+            "output_path": "output.top_post",
+            "output_root": "output",
+            "reason_code": "no_evidence",
+            "value_status": "no_typed_value",
+            "grounding_mode": "missing",
+        }
+    ]
+    assert outcome.structural_key_payload is not None
+    assert "output.top_post" in str(outcome.structural_key_payload)
+
+
 def test_authoring_repair_context_produces_structural_recorded_outcome() -> None:
     context = CodeAuthoringRepairContext(
         block_label="search_records",
@@ -349,6 +569,33 @@ def test_authoring_repair_context_produces_structural_recorded_outcome() -> None
         outcome.structural_key
         == recorded_outcome_from_authoring_repair_context(
             context.model_copy(update={"unresolved_names": ["row_text", "confirmation_number"]})
+        ).structural_key
+    )
+
+
+def test_authoring_repair_context_missing_output_fields_affect_structural_outcome() -> None:
+    context = CodeAuthoringRepairContext(
+        block_label="read_resource_table",
+        reason_code="runtime_missing_output_dependency",
+        missing_output_key="create_resource_output",
+        available_output_keys=["search_output"],
+        current_block_parameter_keys=["create_resource_output"],
+        output_dependency_failure_class="missing_prior_block_output",
+    )
+
+    outcome = recorded_outcome_from_authoring_repair_context(context)
+
+    assert outcome.reason_code == "runtime_missing_output_dependency"
+    assert (
+        outcome.structural_key
+        != recorded_outcome_from_authoring_repair_context(
+            context.model_copy(update={"missing_output_key": "verify_resource_output"})
+        ).structural_key
+    )
+    assert (
+        outcome.structural_key
+        != recorded_outcome_from_authoring_repair_context(
+            context.model_copy(update={"available_output_keys": ["search_output", "verify_resource_output"]})
         ).structural_key
     )
 
@@ -488,6 +735,40 @@ def test_metadata_reject_key_uses_typed_fields_not_wording() -> None:
     assert changed_label.structural_key != first.structural_key
     assert changed_required_field.structural_key != first.structural_key
     assert changed_missing_field.structural_key != first.structural_key
+
+
+def test_output_policy_reject_key_uses_stable_trace_payload() -> None:
+    payload = {
+        "surface": "tool_body",
+        "tool_name": "update_workflow",
+        "allowed": False,
+        "output_kind": "workflow_update_proposal",
+        "reason_codes": ["raw_secret_leak"],
+    }
+    first = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload=payload,
+        observed_evidence_summary="Output policy blocked this Copilot output before persistence.",
+    )
+    same_structure = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload=dict(payload),
+        observed_evidence_summary="Different wording for the same output-policy reject.",
+    )
+    changed_reason = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload={**payload, "reason_codes": ["unapproved_credential_reference"]},
+    )
+    changed_surface = recorded_outcome_from_author_time_reject(
+        reason_code="output_policy_reject",
+        structural_payload={**payload, "surface": "final_response"},
+    )
+
+    assert first.reason_code == "output_policy_reject"
+    assert first.is_authoritative is True
+    assert first.structural_key == same_structure.structural_key
+    assert changed_reason.structural_key != first.structural_key
+    assert changed_surface.structural_key != first.structural_key
 
 
 def test_runtime_block_failure_outcome_includes_bounded_page_state_and_run_id() -> None:

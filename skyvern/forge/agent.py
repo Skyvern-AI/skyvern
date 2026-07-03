@@ -93,6 +93,7 @@ from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
+from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -170,9 +171,42 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
 LOG = structlog.get_logger()
+BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
+RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
+
+
+async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
+    working_page = await browser_state.get_working_page()
+    if not working_page:
+        LOG.error(
+            "BrowserState has no page",
+            workflow_run_id=workflow_run_id,
+        )
+        raise MissingBrowserStatePage(workflow_run_id=workflow_run_id)
+
+    if working_page.url not in BLANK_WORKFLOW_TASK_URLS:
+        return working_page
+
+    if working_page.url not in RECOVERABLE_BLANK_WORKFLOW_TASK_URLS:
+        raise InvalidWorkflowTaskURLState(workflow_run_id)
+
+    pages = await browser_state.list_valid_pages()
+    for page_index, page in reversed(list(enumerate(pages))):
+        if page.url not in BLANK_WORKFLOW_TASK_URLS:
+            LOG.warning(
+                "Inherited workflow task URL resolved from latest non-blank page",
+                workflow_run_id=workflow_run_id,
+                blank_url=working_page.url,
+                fallback_url=page.url,
+                page_index=page_index,
+            )
+            await browser_state.set_active_page(page)
+            return page
+
+    raise InvalidWorkflowTaskURLState(workflow_run_id)
 
 
 def should_auto_download_pdf(pdf_src: str) -> bool:
@@ -526,17 +560,10 @@ class ForgeAgent:
                 workflow_run_id=workflow_run.workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
             )
             if browser_state is not None:
-                working_page = await browser_state.get_working_page()
-                if not working_page:
-                    LOG.error(
-                        "BrowserState has no page",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                    )
-                    raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
-
-                if working_page.url == "about:blank":
-                    raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
-
+                working_page = await resolve_inherited_workflow_task_page(
+                    browser_state=browser_state,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
                 task_url = working_page.url
             else:
                 LOG.info("No browser state found for workflow run, setting task url to empty string")
@@ -617,28 +644,39 @@ class ForgeAgent:
     ) -> tuple[Task, Step]:
         """Container task v1 for a code block's recorded actions, also the seat for future agent fallback."""
         task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
-        task = await app.DATABASE.tasks.create_task(
-            url=task_url,
-            title=code_block.label,
-            navigation_goal=code_block.prompt,
-            data_extraction_goal=None,
-            navigation_payload=None,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            order=task_order,
-            retry=task_retry,
-        )
-        task = await app.DATABASE.tasks.update_task(
-            task_id=task.task_id,
-            organization_id=organization_id,
-            status=TaskStatus.running,
-        )
-        step = await app.DATABASE.tasks.create_step(
-            task.task_id,
-            order=0,
-            retry_index=0,
-            organization_id=organization_id,
-        )
+        task: Task | None = None
+        try:
+            task = await app.DATABASE.tasks.create_task(
+                url=task_url,
+                title=code_block.label,
+                navigation_goal=code_block.prompt,
+                data_extraction_goal=None,
+                navigation_payload=None,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                order=task_order,
+                retry=task_retry,
+            )
+            task = await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
+            step = await app.DATABASE.tasks.create_step(
+                task.task_id,
+                order=0,
+                retry_index=0,
+                organization_id=organization_id,
+            )
+        except Exception:
+            if task is not None:
+                with contextlib.suppress(Exception):
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=organization_id,
+                        status=TaskStatus.failed,
+                    )
+            raise
         return task, step
 
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
@@ -2906,9 +2944,30 @@ class ForgeAgent:
             )
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
+        # SKY-11295: verify MINI_GOAL_TEMPLATE-wrapped goals against the mini goal only —
+        # passed verbatim, the verifier judges the big goal and under-claims to max-steps.
+        unwrapped_goals = unwrap_goal_fields(
+            task.navigation_goal,
+            task.complete_criterion,
+            task.terminate_criterion,
+        )
+        if unwrapped_goals.big_goal_context is not None:
+            LOG.info(
+                "Unwrapped mini-goal for completion verification",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+
         actions_and_results_str = ""
-        if task.include_action_history_in_verification:
-            actions_and_results_str = await self._get_action_results(task, current_step=step)
+        # A step-scale mini goal is often action-phrased ("Click X"); once the page
+        # navigates, page state alone can't certify it — wrapped goals verify with history.
+        if task.include_action_history_in_verification or unwrapped_goals.big_goal_context is not None:
+            # Evidence must be complete: the default 1-step window drops earlier actions of a
+            # multi-step goal, making every-action verification unsatisfiable on 3+-step heals.
+            full_run_window = task.max_steps_per_run or settings.MAX_STEPS_PER_RUN
+            actions_and_results_str = await self._get_action_results(
+                task, current_step=step, history_window=full_run_window
+            )
 
         # Check if we should use the termination-aware prompt (experiment)
         use_termination_prompt = False
@@ -2952,11 +3011,13 @@ class ForgeAgent:
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
             template_name=template_name,
-            navigation_goal=task.navigation_goal,
+            navigation_goal=unwrapped_goals.navigation_goal,
             navigation_payload=task.navigation_payload,
-            complete_criterion=task.complete_criterion,
-            terminate_criterion=task.terminate_criterion,
+            complete_criterion=unwrapped_goals.complete_criterion,
+            terminate_criterion=unwrapped_goals.terminate_criterion,
+            big_goal_context=unwrapped_goals.big_goal_context,
             action_history=actions_and_results_str,
+            action_history_evidence=bool(actions_and_results_str),
             slim_output=slim_output,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             without_screenshots=not llm_screenshots_enabled,
@@ -3021,6 +3082,7 @@ class ForgeAgent:
         span = otel_trace.get_current_span()
         span.set_attribute("verification.status", verification_status.value)
         span.set_attribute("verification.template", template_name)
+        span.set_attribute("verification.goal_unwrapped", unwrapped_goals.big_goal_context is not None)
         record_verification_span_attrs(span, result.thoughts)
         return result
 
@@ -4402,8 +4464,12 @@ class ForgeAgent:
 
         return final_navigation_payload
 
-    async def _get_action_results(self, task: Task, current_step: Step | None = None) -> str:
-        return json.dumps(await get_action_history(task=task, current_step=current_step))
+    async def _get_action_results(
+        self, task: Task, current_step: Step | None = None, history_window: int | None = None
+    ) -> str:
+        if history_window is None:
+            return json.dumps(await get_action_history(task=task, current_step=current_step))
+        return json.dumps(await get_action_history(task=task, current_step=current_step, history_window=history_window))
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """

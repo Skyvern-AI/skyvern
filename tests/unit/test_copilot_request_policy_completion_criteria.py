@@ -21,6 +21,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classify_request,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
+    build_classifier_fallback_floor,
+    is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
 )
 
@@ -106,6 +108,17 @@ def _requested_output_subset(policy: RequestPolicy, requested_output_paths: set[
         if criterion.level == "run"
         and not criterion.method_mandated
         and criterion.output_path in requested_output_paths
+    ]
+
+
+def _run_outcome_corroborators(policy: RequestPolicy) -> list[CompletionCriterion]:
+    return [
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.level == "run"
+        and criterion.kind == "outcome"
+        and not criterion.method_mandated
+        and criterion.output_path is None
     ]
 
 
@@ -317,6 +330,212 @@ async def test_requested_output_criteria_preserve_stable_paths_without_derived_c
         None,
     ]
     assert [criterion.expected_output_shape for criterion in canonical_subsets[0]] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_resale_docs_requested_output_uses_explicit_document_name_and_blocks_terminal_record_fields() -> None:
+    policy = await _policy_for_message(
+        (
+            "I need a reusable workflow that retrieves the resale demand document name from the mock ResaleDocs Hub "
+            "order-status page. The confirmation number should be a reusable input; for this eval run use "
+            "DEMO-RESALE-1842. The workflow should look up the order, open the order-level View / Download document "
+            "list, choose the highest-priority HOA demand or resale statement document row, and output one "
+            "requested-output field named document_name containing the selected row's visible document name. Do not "
+            "include an exact expected value for document_name in the workflow output contract, and do not output "
+            "confirmation_number, order_id, request_id, submission_id, or a terminal-record identifier."
+        ),
+        [
+            {
+                "outcome": "The returned record includes visible document name.",
+                "output_path": "output.visible_document_name",
+            },
+            {
+                "outcome": "The returned record includes terminal record identifier.",
+                "output_path": "output.terminal_record_identifier",
+            },
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+            },
+            {
+                "outcome": "The returned record includes order id.",
+                "output_path": "output.order_id",
+            },
+        ],
+    )
+
+    requested_outputs = [criterion for criterion in policy.completion_criteria if criterion.output_path is not None]
+    assert [criterion.output_path for criterion in requested_outputs] == ["output.document_name"]
+    assert requested_outputs[0].expected_output_value is None
+    assert requested_outputs[0].expected_output_shape is None
+    assert _run_outcome_corroborators(policy)[0].requested_output_corroborator is True
+
+
+@pytest.mark.asyncio
+async def test_named_customer_prose_does_not_become_requested_output_field_name() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with customer named Acme and status.",
+        [],
+    )
+
+    assert not _criteria_for_path(policy, "output.acme")
+    assert _criteria_for_path(policy, "output.status")
+
+
+@pytest.mark.asyncio
+async def test_requested_output_canonicalization_preserves_output_corroborator() -> None:
+    policy = await _policy_for_message(
+        "Extract the first 3 quotes and authors, then return JSON with quotes.",
+        [
+            {
+                "id": "c_quotes",
+                "outcome": "The run extracts the first 3 quotes and authors into the returned quotes JSON.",
+                "output_path": "output.quotes",
+            }
+        ],
+    )
+
+    requested = _requested_output_subset(policy, {"output.quotes"})
+    corroborators = _run_outcome_corroborators(policy)
+
+    assert len(requested) == 1
+    assert requested[0].id == "__copilot_requested_output__output_quotes"
+    assert len(corroborators) == 1
+    assert corroborators[0].requested_output_corroborator is True
+    assert corroborators[0].outcome == "The run extracts the first 3 quotes and authors into the returned quotes JSON."
+
+
+@pytest.mark.asyncio
+async def test_classifier_typed_requested_output_adds_distinct_corroborator() -> None:
+    policy = await _policy_for_message(
+        "Run the read-only extraction.",
+        [
+            {
+                "outcome": "The returned JSON contains the first three public quotes and authors.",
+                "output_path": "output.quotes",
+            }
+        ],
+    )
+
+    requested = _requested_output_subset(policy, {"output.quotes"})
+    corroborators = _run_outcome_corroborators(policy)
+
+    assert len(requested) == 1
+    assert requested[0].id == "c0"
+    assert requested[0].output_path == "output.quotes"
+    assert requested[0].requested_output_corroborator is False
+    assert len(corroborators) == 1
+    assert corroborators[0].id != requested[0].id
+    assert corroborators[0].id == "c0__requested_output_corroborator"
+    assert corroborators[0].output_path is None
+    assert corroborators[0].expected_output_value is None
+    assert corroborators[0].expected_output_shape is None
+    assert corroborators[0].requested_output_corroborator is True
+    assert corroborators[0].outcome == requested[0].outcome
+
+
+@pytest.mark.asyncio
+async def test_plain_requested_output_text_does_not_fabricate_corroborator() -> None:
+    policy = await _policy_for_message("Return a final record with record id.", [])
+
+    requested = _requested_output_subset(policy, {"output.record_id"})
+
+    assert len(requested) == 1
+    assert requested[0].id == "__copilot_requested_output__output_record_id"
+    assert _run_outcome_corroborators(policy) == []
+
+
+def test_requested_output_canonicalization_preserves_fallback_floor_base_when_it_is_source() -> None:
+    policy = RequestPolicy(completion_criteria=build_classifier_fallback_floor([]))
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with record id.")
+
+    assert len(_requested_output_subset(policy, {"output.record_id"})) == 1
+    fallback = [
+        criterion for criterion in _run_outcome_corroborators(policy) if is_fallback_floor_base_criterion(criterion)
+    ]
+    assert len(fallback) == 1
+    assert fallback[0].requested_output_corroborator is True
+
+
+def test_requested_output_canonicalization_does_not_promote_method_mandated_only_corroborator() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="method_floor",
+                outcome="The workflow runs to its intended end state with the expected output.",
+                method_mandated=True,
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with record id.")
+
+    assert len(_requested_output_subset(policy, {"output.record_id"})) == 1
+    assert _run_outcome_corroborators(policy) == []
+
+
+def test_requested_output_corroborator_respects_completion_criteria_cap() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id=f"specific_{index}", outcome=f"Specific retained outcome {index}.")
+            for index in range(7)
+        ]
+        + [
+            CompletionCriterion(
+                id="quotes",
+                outcome="The run extracts the requested record id into the returned JSON.",
+                output_path="output.record_id",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with record id and status.")
+
+    assert len(policy.completion_criteria) == 8
+    assert {
+        criterion.output_path for criterion in _requested_output_subset(policy, {"output.record_id", "output.status"})
+    } == {
+        "output.record_id",
+        "output.status",
+    }
+
+
+def test_requested_output_corroborator_survives_when_requested_outputs_exceed_cap() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="name_source",
+                outcome="The run extracts the requested name into the returned JSON.",
+                output_path="output.name",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Return a final record with name, record id, status, phone, email, license, taxonomy, specialty, and date.",
+    )
+
+    requested_output_paths = {
+        "output.name",
+        "output.record_id",
+        "output.status",
+        "output.phone",
+        "output.email",
+        "output.license",
+        "output.taxonomy",
+        "output.specialty",
+        "output.date",
+    }
+    corroborators = _run_outcome_corroborators(policy)
+
+    assert {
+        criterion.output_path for criterion in _requested_output_subset(policy, requested_output_paths)
+    } == requested_output_paths
+    assert len(corroborators) == 1
+    assert corroborators[0].id == "name_source"
+    assert corroborators[0].requested_output_corroborator is True
 
 
 @pytest.mark.asyncio

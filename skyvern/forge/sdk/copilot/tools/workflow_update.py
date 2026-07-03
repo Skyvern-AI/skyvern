@@ -11,7 +11,7 @@ import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Annotated, Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -74,6 +74,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
+from skyvern.forge.sdk.copilot.output_contracts import (
+    code_block_available_binding_keys_by_label,
+    declared_string_workflow_parameter_keys,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
@@ -959,79 +963,11 @@ def _unresolved_symbol_repair_context_enabled(ctx: AgentContext) -> bool:
 
 
 def _declared_string_workflow_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, Mapping):
-        return set()
-    parameters = workflow_definition.get("parameters")
-    if not isinstance(parameters, list):
-        return set()
-    keys: set[str] = set()
-    for parameter in parameters:
-        if not isinstance(parameter, Mapping):
-            continue
-        key = str(parameter.get("key") or "").strip()
-        if not key or _is_credential_parameter(parameter) or is_sensitive_workflow_parameter(dict(parameter)):
-            continue
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type and parameter_type != "workflow":
-            continue
-        if workflow_parameter_type and workflow_parameter_type != "string":
-            continue
-        keys.add(key)
-    return keys
+    return declared_string_workflow_parameter_keys(parsed)
 
 
 def _code_block_available_binding_keys_by_label(workflow_yaml: str | None) -> dict[str, list[str]]:
-    if workflow_yaml is None:
-        return {}
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, Mapping):
-        return {}
-    available_by_label: dict[str, set[str]] = {}
-
-    def block_output_key(block: Mapping[str, Any]) -> str | None:
-        label = str(block.get("label") or "").strip()
-        return f"{label}_output" if label else None
-
-    def visit_branch(branch: Mapping[str, Any], available_keys: set[str]) -> None:
-        for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-            visit_blocks(branch.get(key), set(available_keys))
-        for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-            branches = branch.get(branch_key)
-            if not isinstance(branches, list):
-                continue
-            for nested_branch in branches:
-                if isinstance(nested_branch, Mapping):
-                    visit_branch(nested_branch, set(available_keys))
-
-    def visit_blocks(blocks: Any, available_keys: set[str]) -> set[str]:
-        if not isinstance(blocks, list):
-            return available_keys
-        for block in blocks:
-            if not isinstance(block, Mapping):
-                continue
-            label = str(block.get("label") or "").strip()
-            if label and _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
-                available_by_label.setdefault(label, set()).update(available_keys)
-            for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-                visit_blocks(block.get(key), set(available_keys))
-            for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-                branches = block.get(branch_key)
-                if not isinstance(branches, list):
-                    continue
-                for branch in branches:
-                    if isinstance(branch, Mapping):
-                        visit_branch(branch, set(available_keys))
-            output_key = block_output_key(block)
-            if output_key:
-                available_keys.add(output_key)
-        return available_keys
-
-    workflow_definition = parsed.get("workflow_definition")
-    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, Mapping) else None
-    visit_blocks(blocks, _declared_string_workflow_parameter_keys(parsed))
-    return {label: sorted(keys) for label, keys in available_by_label.items()}
+    return code_block_available_binding_keys_by_label(workflow_yaml)
 
 
 def _code_block_authoring_repair_context(
@@ -1346,6 +1282,17 @@ def _metadata_output_path_roots(raw_metadata: object) -> list[str]:
 
 def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list[str]]:
     roots_by_label: dict[str, set[str]] = {}
+    for label, paths in _metadata_output_paths_by_label(raw_metadata).items():
+        roots = roots_by_label.setdefault(label, set())
+        for path in paths:
+            root = _top_level_path_segment(path)
+            if root:
+                roots.add(root)
+    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+
+
+def _metadata_output_paths_by_label(raw_metadata: object) -> dict[str, list[str]]:
+    paths_by_label: dict[str, set[str]] = {}
     unlabeled_index = 0
     for raw_item in _code_artifact_metadata_items(raw_metadata):
         item = _raw_metadata_item_mapping(raw_item)
@@ -1355,23 +1302,30 @@ def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list
         if not label:
             unlabeled_index += 1
             label = f"<unlabeled:{unlabeled_index}>"
-        roots = roots_by_label.setdefault(label, set())
-        roots.update(_metadata_item_output_path_roots(item))
-    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+        paths = paths_by_label.setdefault(label, set())
+        paths.update(_metadata_item_output_paths(item))
+    return {label: sorted(paths) for label, paths in sorted(paths_by_label.items()) if paths}
 
 
 def _metadata_item_output_path_roots(item: Mapping[str, Any]) -> set[str]:
     roots: set[str] = set()
+    for path in _metadata_item_output_paths(item):
+        root = _top_level_path_segment(path)
+        if root:
+            roots.add(root)
+    return roots
+
+
+def _metadata_item_output_paths(item: Mapping[str, Any]) -> set[str]:
+    """Return declared output paths plus schema property roots used for static root matching."""
+    paths: set[str] = set()
     for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
         for row in _artifact_rows(item.get(field_name)):
-            for path in _artifact_string_list(row.get("goal_value_paths")):
-                root = path.split(".", 1)[0].split("[", 1)[0].strip()
-                if root:
-                    roots.add(root)
+            paths.update(_artifact_goal_value_paths(row.get("goal_value_paths")))
             schema = _parse_extraction_schema(row.get("extraction_schema"))
             if schema is not None:
-                roots.update(_schema_property_roots(schema))
-    return roots
+                paths.update(_schema_property_roots(schema))
+    return paths
 
 
 def _metadata_reject_code_block_output_status(
@@ -1468,16 +1422,16 @@ def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
     return not verification.is_fully_satisfied()
 
 
-def _recorded_outcome_missing_output_roots(ctx: AgentContext) -> set[str]:
+def _recorded_outcome_missing_output_paths(ctx: AgentContext) -> set[str]:
     latest = ctx.latest_recorded_build_test_outcome
-    roots: set[str] = set()
+    paths: set[str] = set()
     if isinstance(latest, RecordedBuildTestOutcome) and latest.reason_code == "outcome_not_demonstrated":
         for fact in latest.missing_requested_output_facts:
-            root = str(fact.get("output_root") or "").strip()
-            if root:
-                roots.add(root)
-    if roots:
-        return roots
+            path = str(fact.get("output_path") or fact.get("output_root") or "").strip()
+            if path:
+                paths.add(path)
+    if paths:
+        return paths
     verification = getattr(ctx, "completion_verification_result", None)
     if verification is None or getattr(verification, "status", None) != "evaluated":
         return set()
@@ -1485,109 +1439,102 @@ def _recorded_outcome_missing_output_roots(ctx: AgentContext) -> set[str]:
         if getattr(verdict, "satisfied", False):
             continue
         output_path = str(getattr(verdict, "output_path", "") or "").strip()
-        root = output_path.split(".", 1)[0].split("[", 1)[0].strip()
-        if root:
-            roots.add(root)
-    return roots
+        if output_path:
+            paths.add(output_path)
+    return paths
 
 
-def _candidate_missing_required_output_roots(
+def _candidate_missing_required_output_paths(
     workflow_yaml: str,
     code_artifact_metadata: object,
     *,
-    required_roots: set[str],
-    runtime_produced_roots: set[str] | None = None,
+    required_paths: set[str],
 ) -> list[str]:
-    if not required_roots:
+    if not required_paths:
         return []
-    declared_roots = set(_metadata_output_path_roots(code_artifact_metadata))
-    produced_roots = _workflow_yaml_produced_output_roots(workflow_yaml)
-    covered_roots = (declared_roots & produced_roots) | (runtime_produced_roots or set())
-    return sorted(required_roots - covered_roots)
-
-
-def _recorded_runtime_produced_output_roots(ctx: AgentContext, workflow_yaml: str) -> set[str]:
-    verified_outputs = getattr(ctx, "verified_block_outputs", None)
-    if not isinstance(verified_outputs, Mapping):
-        return set()
-    code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-    roots: set[str] = set()
-    for label, output in verified_outputs.items():
-        if not isinstance(label, str) or label not in code_block_labels:
+    required_paths = {path for path in (str(item).strip() for item in required_paths) if path}
+    declared_paths_by_label = {
+        label: set(paths) for label, paths in _metadata_output_paths_by_label(code_artifact_metadata).items()
+    }
+    produced_by_label = _workflow_yaml_produced_output_roots_by_label(workflow_yaml)
+    covered_paths: set[str] = set()
+    abstained_declared_paths: set[str] = set()
+    for label, declared_paths in declared_paths_by_label.items():
+        produced = produced_by_label.get(label)
+        if produced is None:
             continue
-        roots.update(_meaningful_runtime_output_roots(output))
-    return roots
+        for required_path in required_paths & declared_paths:
+            if _top_level_path_segment(required_path) in produced.roots:
+                covered_paths.add(required_path)
+        if produced.abstained:
+            abstained_declared_paths.update(required_paths & declared_paths)
+    missing_paths = required_paths - covered_paths
+    if missing_paths:
+        missing_paths -= abstained_declared_paths
+    return sorted(missing_paths)
 
 
-def _meaningful_runtime_output_roots(value: object, *, prefix: str = "") -> set[str]:
-    roots: set[str] = set()
-    if isinstance(value, Mapping):
-        for raw_key, child in value.items():
-            if not isinstance(raw_key, str):
-                continue
-            key = raw_key.strip()
-            if not key or key == "evidence_text" or not _is_structural_runtime_output_key(key):
-                continue
-            path = f"{prefix}.{key}" if prefix else key
-            if _runtime_output_value_is_meaningful(child):
-                roots.add(path.split(".", 1)[0])
-                roots.update(_meaningful_runtime_output_roots(child, prefix=path))
-        return roots
-    if isinstance(value, list):
-        for item in value:
-            roots.update(_meaningful_runtime_output_roots(item, prefix=prefix))
-    return roots
+class _ProducedOutputRoots(NamedTuple):
+    roots: set[str]
+    abstained: bool = False
 
 
-def _runtime_output_value_is_meaningful(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, Mapping):
-        return any(_runtime_output_value_is_meaningful(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_runtime_output_value_is_meaningful(item) for item in value)
-    return True
+def _workflow_yaml_produced_output_roots_by_label(workflow_yaml: str) -> dict[str, _ProducedOutputRoots]:
+    return {
+        label: _code_block_produced_output_roots(str(block.get("code") or ""))
+        for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items()
+    }
 
 
-def _workflow_yaml_produced_output_roots(workflow_yaml: str) -> set[str]:
-    roots: set[str] = set()
-    for block in _workflow_yaml_code_blocks_by_label(workflow_yaml).values():
-        roots.update(_code_block_produced_output_roots(str(block.get("code") or "")))
-    return roots
-
-
-def _code_block_produced_output_roots(code: str) -> set[str]:
+def _code_block_produced_output_roots(code: str) -> _ProducedOutputRoots:
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
     except SyntaxError:
-        return set()
+        return _ProducedOutputRoots(set(), True)
     scope_statements = list(_iter_top_level_scope(tree.body))
     assigned_roots = _assigned_top_level_names(tree.body)
     dict_assignments: dict[str, set[str]] = {}
+    dynamic_dict_assignment_names: set[str] = set()
     helper_return_roots = _helper_function_literal_return_roots(tree.body)
     returned_roots: set[str] = set()
+    abstained = False
+    saw_return = False
     for node in scope_statements:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            dict_roots = _dict_literal_string_key_roots(node.value)
             if isinstance(node.value, ast.Dict):
-                dict_assignments[node.targets[0].id] = dict_roots
+                produced = _dict_literal_output_roots(node.value)
+                dict_assignments[node.targets[0].id] = produced.roots
+                if produced.abstained:
+                    dynamic_dict_assignment_names.add(node.targets[0].id)
         elif isinstance(node, ast.Assign):
-            _apply_literal_dict_key_assignment(dict_assignments, node)
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and isinstance(node.value, ast.Dict):
-                dict_assignments[node.target.id] = _dict_literal_string_key_roots(node.value)
-            _apply_literal_dict_key_assignment(dict_assignments, node)
+                produced = _dict_literal_output_roots(node.value)
+                dict_assignments[node.target.id] = produced.roots
+                if produced.abstained:
+                    dynamic_dict_assignment_names.add(node.target.id)
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
         elif isinstance(node, ast.AugAssign):
-            _apply_literal_dict_key_assignment(dict_assignments, node)
-        elif isinstance(node, ast.Return) and node.value is not None:
-            returned_roots.update(_return_output_roots(node.value, dict_assignments, helper_return_roots))
-    return returned_roots or assigned_roots
+            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
+        elif isinstance(node, ast.Return):
+            saw_return = True
+            if node.value is not None:
+                returned = _return_output_roots(
+                    node.value,
+                    dict_assignments,
+                    dynamic_dict_assignment_names,
+                    helper_return_roots,
+                )
+                returned_roots.update(returned.roots)
+                abstained = abstained or returned.abstained
+    roots = returned_roots if saw_return else assigned_roots
+    return _ProducedOutputRoots(roots, abstained)
 
 
 def _apply_literal_dict_key_assignment(
     dict_assignments: dict[str, set[str]],
+    dynamic_dict_assignment_names: set[str],
     node: ast.Assign | ast.AnnAssign | ast.AugAssign,
 ) -> None:
     targets: list[ast.expr] = []
@@ -1597,11 +1544,20 @@ def _apply_literal_dict_key_assignment(
         targets = [node.target]
     for target in targets:
         assignment = _literal_dict_key_assignment(target)
+        target_name = _dict_subscript_target_name(target)
         if assignment is None:
+            if target_name in dict_assignments:
+                dynamic_dict_assignment_names.add(target_name)
             continue
         name, key = assignment
         if name in dict_assignments:
             dict_assignments[name].add(key)
+
+
+def _dict_subscript_target_name(target: ast.expr) -> str | None:
+    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        return target.value.id
+    return None
 
 
 def _literal_dict_key_assignment(target: ast.expr) -> tuple[str, str] | None:
@@ -1616,50 +1572,101 @@ def _literal_dict_key_assignment(target: ast.expr) -> tuple[str, str] | None:
 def _return_output_roots(
     node: ast.expr,
     dict_assignments: Mapping[str, set[str]],
-    helper_return_roots: Mapping[str, set[str]],
-) -> set[str]:
+    dynamic_dict_assignment_names: set[str],
+    helper_return_roots: Mapping[str, _ProducedOutputRoots],
+) -> _ProducedOutputRoots:
     if isinstance(node, ast.Await):
-        return _return_output_roots(node.value, dict_assignments, helper_return_roots)
+        return _return_output_roots(node.value, dict_assignments, dynamic_dict_assignment_names, helper_return_roots)
     if isinstance(node, ast.Name):
-        return set(dict_assignments.get(node.id, set()))
+        if node.id in dict_assignments:
+            return _ProducedOutputRoots(
+                set(dict_assignments.get(node.id, set())), node.id in dynamic_dict_assignment_names
+            )
+        return _ProducedOutputRoots(set(), True)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        return set(helper_return_roots.get(node.func.id, set()))
-    return _dict_literal_string_key_roots(node)
+        return helper_return_roots.get(node.func.id, _ProducedOutputRoots(set(), True))
+    if isinstance(node, ast.Dict):
+        return _dict_literal_output_roots(node)
+    if isinstance(node, ast.List):
+        return _list_literal_output_roots(node)
+    if isinstance(node, (ast.Constant, ast.Tuple, ast.Set)):
+        return _ProducedOutputRoots(set(), False)
+    return _ProducedOutputRoots(set(), True)
 
 
-def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[str, set[str]]:
-    helpers: dict[str, set[str]] = {}
+def _list_literal_output_roots(node: ast.List) -> _ProducedOutputRoots:
+    if not node.elts:
+        return _ProducedOutputRoots(set(), False)
+    if all(isinstance(element, ast.Dict) for element in node.elts):
+        roots: set[str] = set()
+        abstained = False
+        for element in node.elts:
+            produced = _dict_literal_output_roots(cast(ast.Dict, element))
+            roots.update(produced.roots)
+            abstained = abstained or produced.abstained
+        return _ProducedOutputRoots(roots, abstained)
+    if all(isinstance(element, ast.Constant) for element in node.elts):
+        return _ProducedOutputRoots(set(), False)
+    return _ProducedOutputRoots(set(), True)
+
+
+def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[str, _ProducedOutputRoots]:
+    helpers: dict[str, _ProducedOutputRoots] = {}
     for statement in statements:
         if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         dict_assignments: dict[str, set[str]] = {}
+        dynamic_dict_assignment_names: set[str] = set()
         roots: set[str] = set()
+        abstained = False
+        saw_return = False
         for helper_statement in _iter_top_level_scope(statement.body):
             if (
                 isinstance(helper_statement, ast.Assign)
                 and len(helper_statement.targets) == 1
                 and isinstance(helper_statement.targets[0], ast.Name)
             ):
-                dict_roots = _dict_literal_string_key_roots(helper_statement.value)
                 if isinstance(helper_statement.value, ast.Dict):
-                    dict_assignments[helper_statement.targets[0].id] = dict_roots
+                    produced = _dict_literal_output_roots(helper_statement.value)
+                    dict_assignments[helper_statement.targets[0].id] = produced.roots
+                    if produced.abstained:
+                        dynamic_dict_assignment_names.add(helper_statement.targets[0].id)
             elif isinstance(helper_statement, ast.Assign):
-                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
             elif isinstance(helper_statement, ast.AnnAssign):
                 if isinstance(helper_statement.target, ast.Name) and isinstance(helper_statement.value, ast.Dict):
-                    dict_assignments[helper_statement.target.id] = _dict_literal_string_key_roots(
-                        helper_statement.value
-                    )
-                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+                    produced = _dict_literal_output_roots(helper_statement.value)
+                    dict_assignments[helper_statement.target.id] = produced.roots
+                    if produced.abstained:
+                        dynamic_dict_assignment_names.add(helper_statement.target.id)
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
             elif isinstance(helper_statement, ast.AugAssign):
-                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
-            elif isinstance(helper_statement, ast.Return) and helper_statement.value is not None:
-                roots.update(_dict_literal_string_key_roots(helper_statement.value))
-                if isinstance(helper_statement.value, ast.Name):
-                    roots.update(dict_assignments.get(helper_statement.value.id, set()))
-        if roots:
-            helpers[statement.name] = roots
+                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
+            elif isinstance(helper_statement, ast.Return):
+                saw_return = True
+                if helper_statement.value is not None:
+                    returned = _return_output_roots(
+                        helper_statement.value,
+                        dict_assignments,
+                        dynamic_dict_assignment_names,
+                        {},
+                    )
+                    roots.update(returned.roots)
+                    abstained = abstained or returned.abstained
+        if roots or abstained or saw_return:
+            helpers[statement.name] = _ProducedOutputRoots(roots, abstained)
     return helpers
+
+
+def _dict_literal_output_roots(node: ast.Dict) -> _ProducedOutputRoots:
+    roots: set[str] = set()
+    abstained = False
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
+            roots.add(key.value.strip())
+        else:
+            abstained = True
+    return _ProducedOutputRoots(roots, abstained)
 
 
 def _dict_literal_string_key_roots(node: ast.expr) -> set[str]:
@@ -1693,13 +1700,14 @@ def _code_block_has_meaningful_output(code: str, artifact: object) -> bool:
         tree = ast.parse(code)
     except SyntaxError:
         return False
+    helper_return_roots = _helper_function_literal_return_roots(tree.body)
 
     class ReturnVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.has_meaningful_return = False
 
         def visit_Return(self, node: ast.Return) -> None:
-            if _return_value_is_meaningful(node.value):
+            if _return_value_is_meaningful(node.value, helper_return_roots):
                 self.has_meaningful_return = True
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -1902,11 +1910,21 @@ def _code_block_has_top_level_return(tree: ast.AST) -> bool:
     return any(isinstance(statement, ast.Return) for statement in _iter_top_level_scope(body))
 
 
-def _return_value_is_meaningful(node: ast.expr | None) -> bool:
+def _return_value_is_meaningful(
+    node: ast.expr | None,
+    helper_return_roots: Mapping[str, _ProducedOutputRoots],
+) -> bool:
     if node is None:
         return False
+    if isinstance(node, ast.Await):
+        return _return_value_is_meaningful(node.value, helper_return_roots)
     if isinstance(node, ast.Constant) and node.value is None:
         return False
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        produced = helper_return_roots.get(node.func.id)
+        if produced is not None:
+            return bool(produced.roots) or produced.abstained
+        return True
     if (
         isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set))
         and not getattr(node, "elts", None)
@@ -5153,16 +5171,25 @@ async def _update_workflow(
         tool_arguments=params,
     )
     if not output_policy_verdict.allowed:
+        output_policy_trace_data = output_policy_verdict_to_trace_data(
+            output_policy_verdict,
+            surface="tool_body",
+            tool_name="update_workflow",
+        )
+        output_policy_error = format_output_policy_tool_error(output_policy_verdict)
         _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
             "copilot output policy tool body verdict",
-            **output_policy_verdict_to_trace_data(
-                output_policy_verdict,
-                surface="tool_body",
-                tool_name="update_workflow",
-            ),
+            **output_policy_trace_data,
         )
-        return reject(error=format_output_policy_tool_error(output_policy_verdict))
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="output_policy_reject",
+            summary=output_policy_error,
+            structural_payload=output_policy_trace_data,
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(error=output_policy_error)
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
@@ -5243,18 +5270,15 @@ async def _update_workflow(
             data=_code_repair_progress_data(),
         )
 
-    recorded_output_roots_required = _recorded_outcome_requires_output_candidate(ctx)
-    recorded_missing_output_roots = (
-        _recorded_outcome_missing_output_roots(ctx) if recorded_output_roots_required else set()
+    recorded_output_paths_required = _recorded_outcome_requires_output_candidate(ctx)
+    recorded_missing_output_paths = (
+        _recorded_outcome_missing_output_paths(ctx) if recorded_output_paths_required else set()
     )
-    runtime_produced_output_roots = (
-        _recorded_runtime_produced_output_roots(ctx, workflow_yaml) if recorded_output_roots_required else set()
-    )
-    unresolved_recorded_output_roots = recorded_missing_output_roots - runtime_produced_output_roots
+    unresolved_recorded_output_paths = recorded_missing_output_paths
 
     output_empty_labels = (
         _output_empty_code_block_labels(workflow_yaml, getattr(ctx, "code_artifact_metadata", None))
-        if recorded_output_roots_required and (not recorded_missing_output_roots or unresolved_recorded_output_roots)
+        if recorded_output_paths_required and (not recorded_missing_output_paths or unresolved_recorded_output_paths)
         else []
     )
     if output_empty_labels:
@@ -5285,29 +5309,35 @@ async def _update_workflow(
             data=_code_repair_progress_data(),
         )
 
-    missing_output_roots = (
-        _candidate_missing_required_output_roots(
+    missing_output_paths = (
+        _candidate_missing_required_output_paths(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
-            required_roots=unresolved_recorded_output_roots,
-            runtime_produced_roots=runtime_produced_output_roots,
+            required_paths=unresolved_recorded_output_paths,
         )
-        if recorded_output_roots_required
+        if recorded_output_paths_required
         else []
     )
-    if missing_output_roots:
+    if missing_output_paths:
         authored_structure_signature = authored_structure_signature_from_workflow(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
         )
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+        missing_output_roots = sorted(
+            {root for path in missing_output_paths if (root := _top_level_path_segment(path))}
+        )
         _record_author_time_reject_outcome(
             ctx,
             reason_code="metadata_reject",
-            summary="Submitted workflow does not cover the missing requested output roots from the last recorded test outcome.",
+            summary=(
+                "Submitted workflow does not cover the missing requested output paths "
+                "from the last recorded test outcome."
+            ),
             structural_payload={
                 "reason_code": "recorded_outcome_missing_output_coverage",
                 "authored_structure_signature": authored_structure_signature,
+                "missing_output_paths": missing_output_paths,
                 "missing_output_roots": missing_output_roots,
                 "block_labels": block_labels,
                 "recorded_reason_code": "outcome_not_demonstrated",
@@ -5316,19 +5346,21 @@ async def _update_workflow(
             block_labels=block_labels,
             missing_requested_output_facts=[
                 {
-                    "output_path": root,
-                    "output_root": root,
+                    "output_path": path,
+                    "output_root": _top_level_path_segment(path),
                     "reason_code": "recorded_outcome_missing_output_coverage",
                     "value_status": "no_typed_value",
                 }
-                for root in missing_output_roots
+                for path in missing_output_paths
             ],
         )
         _record_code_authoring_guardrail_reject(ctx)
+        missing_path_text = ", ".join(missing_output_paths[:8])
         return reject(
             error=(
-                "Submitted workflow does not cover the missing requested output roots from the last recorded test "
-                "outcome. Declare and produce structured output for those roots before testing again."
+                "Submitted workflow does not cover the missing requested output paths from the last recorded test "
+                f"outcome: {missing_path_text}. Declare those exact output_path values in goal_value_paths and "
+                "produce matching structured output before testing again; output_root is diagnostic only."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
@@ -5364,11 +5396,12 @@ async def _update_workflow(
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
         workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
-        workflow = _process_workflow_yaml(
+        workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
+            settings_fallback_yaml=prior_yaml,
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
@@ -5400,6 +5433,7 @@ async def _update_workflow(
                 ai_fallback=workflow.ai_fallback,
                 cache_key=workflow.cache_key,
                 adaptive_caching=workflow.adaptive_caching,
+                enable_self_healing=workflow.enable_self_healing,
                 code_version=workflow.code_version,
                 run_sequentially=workflow.run_sequentially,
                 sequential_key=workflow.sequential_key,

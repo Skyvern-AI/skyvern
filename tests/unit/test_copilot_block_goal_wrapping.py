@@ -9,6 +9,7 @@ from __future__ import annotations
 import textwrap
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from skyvern.constants import MINI_GOAL_TEMPLATE
@@ -347,8 +348,10 @@ def test_returns_input_unchanged_when_blocks_not_list() -> None:
     assert out == src
 
 
-def test_wrap_workflow_block_goals_wraps_runtime_copy_only() -> None:
-    workflow = _process_workflow_yaml(
+@pytest.mark.asyncio
+async def test_wrap_workflow_block_goals_wraps_runtime_copy_only() -> None:
+    workflow = await _process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
         workflow_id="w_test",
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
@@ -373,8 +376,10 @@ def test_wrap_workflow_block_goals_wraps_runtime_copy_only() -> None:
     assert wrapped is not workflow
 
 
-def test_wrap_workflow_block_goals_recurses_into_loop_blocks() -> None:
-    workflow = _process_workflow_yaml(
+@pytest.mark.asyncio
+async def test_wrap_workflow_block_goals_recurses_into_loop_blocks() -> None:
+    workflow = await _process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
         workflow_id="w_test",
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
@@ -425,8 +430,10 @@ def test_wrap_workflow_block_goals_recurses_into_loop_blocks() -> None:
     assert wrapped_loop_blocks[1].complete_criterion == _wrapped("The item is processed.")
 
 
-def test_wrap_workflow_block_goals_skips_copy_when_no_runtime_mutation_needed() -> None:
-    parsed_workflow = _process_workflow_yaml(
+@pytest.mark.asyncio
+async def test_wrap_workflow_block_goals_skips_copy_when_no_runtime_mutation_needed() -> None:
+    parsed_workflow = await _process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
         workflow_id="w_test",
         workflow_permanent_id="wpid_test",
         organization_id="o_test",

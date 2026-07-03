@@ -643,6 +643,7 @@ export type WorkflowDefinition = {
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
   workflow_system_prompt?: string | null;
+  error_code_mapping?: Record<string, string> | null;
 };
 
 export type WorkflowApiResponse = {
@@ -674,12 +675,16 @@ export type WorkflowApiResponse = {
   run_with: string; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
+  enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
   code_version: number | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
   import_error: string | null;
+  created_by?: string | null;
+  edited_by?: string | null;
+  copilot_authored?: boolean | null;
 };
 
 export type WorkflowSettings = {
@@ -697,10 +702,12 @@ export type WorkflowSettings = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
+  enableSelfHealing: boolean | null;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
   workflowSystemPrompt: string | null;
+  errorCodeMapping: Record<string, string> | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

@@ -46,7 +46,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
@@ -404,16 +403,15 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       if (studioEnabled) {
-        // Land in the studio shell with the Run tab live.
-        useStudioShellStore.getState().setTab("run");
+        // Land in the studio shell; the ?wr= deep link opens the Run pane.
         navigate(
-          `/workflows/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
+          `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
         );
       } else {
         navigate(
           env.useNewRunsUrl
             ? `/runs/${response.data.workflow_run_id}`
-            : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+            : `/agents/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
         );
       }
     },
@@ -991,7 +989,7 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          AI Fallback (self-healing)
+                          AI Fallback (cached scripts)
                         </div>
                         <h2 className="text-sm text-slate-400">
                           If the run fails when running with code, keep this on

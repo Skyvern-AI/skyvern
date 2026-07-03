@@ -25,6 +25,7 @@ export type WorkflowCreateYAMLRequest = {
   run_with?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
+  enable_self_healing?: boolean;
   adaptive_caching?: boolean;
   code_version?: number | null;
   run_sequentially?: boolean;
@@ -38,6 +39,7 @@ export type WorkflowDefinitionYAML = {
   blocks: Array<BlockYAML>;
   finally_block_label?: string | null;
   workflow_system_prompt?: string | null;
+  error_code_mapping?: Record<string, string> | null;
 };
 
 export type ParameterYAML =

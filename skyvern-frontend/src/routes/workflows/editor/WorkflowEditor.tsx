@@ -87,12 +87,14 @@ function WorkflowEditor() {
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
+    enableSelfHealing: workflow.enable_self_healing ?? false,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
     finallyBlockLabel:
       workflow.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
   };
 
   const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);

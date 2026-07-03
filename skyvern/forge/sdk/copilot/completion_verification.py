@@ -155,9 +155,7 @@ class CompletionVerificationResult:
         unmet = [
             verdict
             for verdict in self.verdicts
-            if not verdict.satisfied
-            and not self.is_structural_contingent_abstention(verdict)
-            and not _is_structural_requested_output_abstention(verdict)
+            if not verdict.satisfied and not self.is_structural_contingent_abstention(verdict)
         ]
         missing_evidence: list[str] = []
         for verdict in unmet:
@@ -209,12 +207,7 @@ class CompletionVerificationResult:
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
-            detail = (
-                None
-                if self.is_structural_contingent_abstention(verdict)
-                or _is_structural_requested_output_abstention(verdict)
-                else verdict_missing_evidence(verdict)
-            )
+            detail = None if self.is_structural_contingent_abstention(verdict) else verdict_missing_evidence(verdict)
             if detail:
                 data[f"{prefix}_missing_evidence"] = detail
         return data
@@ -1396,9 +1389,13 @@ def _review_page_with_final_controls_visible(record: dict[str, Any]) -> bool:
     if not _has_review_page_evidence(record):
         return False
     final_controls = record.get("final_controls_visible")
+    expected_controls = {"submit request", "submit", "back"}
+    if not isinstance(final_controls, list):
+        final_controls = record.get("submit_controls_visible")
+        expected_controls = {"submit request", "submit"}
     if isinstance(final_controls, list):
         visible = {_normalize_present_value(str(value)) for value in final_controls if isinstance(value, str)}
-        if visible & {"submit request", "submit", "back"}:
+        if visible & expected_controls:
             return True
     return any(
         "final" in _key_word_tokens(key)
@@ -1913,6 +1910,20 @@ def _is_corroborated_structural_requested_output_abstention(verdict: CriterionVe
         and bool(verdict.output_path)
         and not verdict.has_exact_value
     )
+
+
+def only_structural_requested_output_abstentions(result: CompletionVerificationResult) -> bool:
+    if result.status != "evaluated" or not result.criterion_ids or result.is_fully_satisfied():
+        return False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    unmet: list[CriterionVerdict] = []
+    for criterion_id in result.criterion_ids:
+        verdict = verdict_by_id.get(criterion_id)
+        if verdict is None:
+            return False
+        if not verdict.satisfied:
+            unmet.append(verdict)
+    return bool(unmet) and all(_is_structural_requested_output_abstention(verdict) for verdict in unmet)
 
 
 def _is_contingent_abstention(

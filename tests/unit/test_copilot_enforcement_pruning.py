@@ -21,7 +21,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcom
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
@@ -294,6 +294,74 @@ class TestSynthesizedOfferPersistenceGate:
         assert signal.blocked_tool == "click"
         assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
         assert signal.renders_final_reply is False
+
+    def test_prerun_ambiguous_bare_selector_repair_allows_one_evaluate(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button"}]
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="lookup",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_repeated_ambiguous_bare_selector_context_blocks_second_evaluate(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button"}]
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="lookup",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+        signal = synthesized_block_persistence_signal(ctx, "evaluate")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_ambiguous_bare_selector_with_stable_alternative_still_requires_persistence(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button"}]
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="lookup",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+            selector_alternatives=[{"tool_name": "click", "selector": 'role=button[name="Search"]'}],
+        )
+
+        signal = synthesized_block_persistence_signal(ctx, "evaluate")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
 
     @pytest.mark.parametrize(
         "tool_name",

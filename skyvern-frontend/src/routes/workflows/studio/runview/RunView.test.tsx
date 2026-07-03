@@ -1,21 +1,30 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
-import { Status } from "@/api/types";
+import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import { useRunViewStore } from "@/store/RunViewStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
 import { RunView } from "./RunView";
+import { getSelectedRunFrameId } from "./runFrameSelection";
 
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
+  debugSession: undefined as unknown,
+  runHeroProps: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -31,12 +40,23 @@ vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
   }),
 }));
 vi.mock("../../hooks/useDebugSessionQuery", () => ({
-  useDebugSessionQuery: () => ({ data: undefined }),
+  useDebugSessionQuery: () => ({ data: mocks.debugSession }),
 }));
 vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
   useIsGeneratingCode: () => false,
 }));
-vi.mock("./RunHero", () => ({ RunHero: () => <div data-testid="run-hero" /> }));
+vi.mock("./RunHero", () => ({
+  RunHero: (props: Record<string, unknown> & { outputs?: ReactNode }) => {
+    mocks.runHeroProps.push(props);
+    return (
+      <div data-testid="run-hero">
+        {props.outputs ? (
+          <div data-testid="run-outputs">{props.outputs}</div>
+        ) : null}
+      </div>
+    );
+  },
+}));
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: () => null,
 }));
@@ -102,6 +122,23 @@ function buildBlockItem(
   };
 }
 
+function buildAction(
+  overrides: Partial<ActionsApiResponse> = {},
+): ActionsApiResponse {
+  return {
+    action_id: "act_default",
+    action_type: ActionTypes.Click,
+    status: Status.Completed,
+    intention: null,
+    description: null,
+    reasoning: null,
+    step_id: "step_default",
+    action_order: 0,
+    screenshot_artifact_id: null,
+    ...overrides,
+  } as ActionsApiResponse;
+}
+
 function seedForLoopRun() {
   // current_index 0 keeps the header's fallback chip on "Iteration 1" so the
   // timeline's "Iteration 2" row is the only "Iteration 2" before selection.
@@ -143,12 +180,166 @@ function seedForLoopRun() {
   };
 }
 
+function seedCompletedRun(overrides: Record<string, unknown> = {}) {
+  mocks.timeline = [];
+  mocks.workflowRun = {
+    workflow_run_id: "wr_1",
+    status: Status.Completed,
+    downloaded_file_urls: [],
+    downloaded_files: [],
+    errors: null,
+    outputs: null,
+    workflow: {
+      workflow_definition: { blocks: [], finally_block_label: null },
+    },
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
+  mocks.debugSession = undefined;
+  mocks.runHeroProps = [];
 });
 beforeEach(() => useRunViewStore.getState().reset());
+
+describe("getSelectedRunFrameId", () => {
+  test("defaults to live stream while a run is running", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: true,
+        lastFrameId: "action_1",
+      }),
+    ).toBe("stream");
+  });
+
+  test("preserves an explicit pinned frame while a run is running", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: "action_1",
+        running: true,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_1");
+  });
+
+  test("uses the latest frame while a running run shows screenshots", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: true,
+        showingScreenshots: true,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+
+  test("uses the final frame after a live stream pin outlives a completed run", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: "stream",
+        running: false,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+
+  test("preserves an explicit pinned frame after a run finalizes", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: "action_1",
+        running: false,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_1");
+  });
+
+  test("defaults to the final frame after a run finalizes without a pin", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: false,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+
+  test("uses the latest frame while the Browser pane owns a live debug stream", () => {
+    expect(
+      getSelectedRunFrameId({
+        pinnedFrameId: null,
+        running: true,
+        debugStreamInBrowserPane: true,
+        lastFrameId: "action_2",
+      }),
+    ).toBe("action_2");
+  });
+});
+
+function seedLiveBlockRun() {
+  mocks.debugSession = { browser_session_id: "pbs_1" };
+  mocks.timeline = [
+    buildBlockItem(
+      buildBlock({
+        workflow_run_block_id: "wrb_1",
+        actions: [
+          buildAction({
+            action_id: "act_1",
+            action_order: 0,
+            screenshot_artifact_id: "art_1",
+          }),
+        ],
+      }),
+    ),
+  ];
+  mocks.workflowRun = {
+    workflow_run_id: "wr_1",
+    status: Status.Running,
+    browser_session_id: "pbs_1",
+    workflow: {
+      workflow_definition: { blocks: [], finally_block_label: null },
+    },
+  };
+}
+
+describe("RunView block run and the Browser pane", () => {
+  test("Browser pane open: the hero gets live-edge screenshots, not the stream selection", () => {
+    seedLiveBlockRun();
+    render(
+      <MemoryRouter
+        initialEntries={["/?wr=wr_1&bl=Block%201&panes=run,browser"]}
+      >
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.showDebugStream).toBe(true);
+    expect(props?.debugStreamInBrowserPane).toBe(true);
+    // Without the remap the "stream" selection would leave heroSelection null.
+    expect(props?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: "art_1",
+    });
+  });
+
+  test("Browser pane closed, Run pane open: the hero stays self-sufficient", () => {
+    seedLiveBlockRun();
+    render(
+      <MemoryRouter initialEntries={["/?wr=wr_1&bl=Block%201&panes=run"]}>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.showDebugStream).toBe(true);
+    expect(props?.debugStreamInBrowserPane).toBe(false);
+    expect(props?.paneOpen).toBe(true);
+  });
+});
 
 describe("RunView iteration selection", () => {
   test("selecting the loop block after an iteration clears the iteration scope", () => {
@@ -175,5 +366,208 @@ describe("RunView iteration selection", () => {
     fireEvent.click(scope.getByText(/Loop over 2 values/));
     expect(scope.queryByText(/Iterable values/)).not.toBeNull();
     expect(scope.queryByText("Iteration 2 value")).toBeNull();
+  }, 20_000);
+});
+
+describe("RunView screenshot center view", () => {
+  test("selects the latest action frame when a running run opens Screenshots", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          actions: [
+            buildAction({
+              action_id: "act_1",
+              action_order: 0,
+              screenshot_artifact_id: "art_1",
+            }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.heroSelection).toBeNull();
+
+    act(() => {
+      useRunViewStore.getState().pinFrame("stream");
+      useRunViewStore.getState().setCenterView("screenshots");
+    });
+
+    const screenshotProps = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(screenshotProps?.hasScreenshots).toBe(true);
+    expect(screenshotProps?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: "art_1",
+      stepId: "step_default",
+      actionOrder: 0,
+    });
+  });
+
+  test("does not advertise screenshots for actions without screenshot candidates", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          actions: [
+            buildAction({
+              action_id: "act_1",
+              step_id: null,
+              screenshot_artifact_id: null,
+            }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.hasScreenshots).toBe(false);
+    expect(props?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: null,
+      stepId: null,
+    });
+  });
+
+  test("does not advertise step screenshots without an action order", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          actions: [
+            buildAction({
+              action_id: "act_1",
+              action_order: null,
+              screenshot_artifact_id: null,
+            }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    expect(props?.hasScreenshots).toBe(false);
+    expect(props?.heroSelection).toMatchObject({
+      kind: "action",
+      artifactId: null,
+      stepId: "step_default",
+      actionOrder: null,
+    });
+  });
+});
+
+describe("RunView output signals", () => {
+  test("surfaces run errors, error codes, and rich downloaded files", () => {
+    seedCompletedRun({
+      errors: [
+        {
+          error_code: "E_INVOICE_MISSING",
+          reasoning: "The expected invoice was not available.",
+        },
+        {
+          error_code: "E_PAYMENT_BLOCKED",
+          confidence_float: 0.91,
+        },
+      ],
+      downloaded_files: [
+        {
+          url: "https://example.test/downloads/report.pdf",
+          filename: "report.pdf",
+          checksum: null,
+          file_size: null,
+          modified_at: null,
+          artifact_id: null,
+        },
+      ],
+      downloaded_file_urls: null,
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+    const scope = within(container);
+
+    expect(scope.getByText("Run errors")).not.toBeNull();
+    expect(scope.getAllByText("E_INVOICE_MISSING").length).toBeGreaterThan(0);
+    expect(scope.getByText("E_PAYMENT_BLOCKED")).not.toBeNull();
+    expect(
+      scope.getByText("The expected invoice was not available."),
+    ).not.toBeNull();
+    expect(scope.queryByText("confidence_float")).toBeNull();
+    expect(scope.getByText("Downloaded files")).not.toBeNull();
+    expect(scope.getByText("report.pdf")).not.toBeNull();
+  });
+
+  test("does not treat a user output parameter named errors as run errors", () => {
+    seedCompletedRun({
+      outputs: {
+        errors: [{ message: "This is ordinary user output data." }],
+      },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+    const scope = within(container);
+
+    expect(scope.queryByText("Run errors")).toBeNull();
+  });
+
+  test("does not add an output slot when run signals are absent", () => {
+    seedCompletedRun();
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+    const scope = within(container);
+
+    expect(scope.queryByTestId("run-outputs")).toBeNull();
+    expect(scope.queryByText("Run errors")).toBeNull();
+    expect(scope.queryByText("Downloaded files")).toBeNull();
   });
 });
