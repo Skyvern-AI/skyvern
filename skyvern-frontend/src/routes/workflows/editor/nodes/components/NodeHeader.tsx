@@ -59,10 +59,11 @@ import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStor
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import {
+  RUN_APPEND_PANES,
   STUDIO_PANES_PARAM,
-  resolveOpenPanes,
   withPanesOpen,
 } from "@/routes/workflows/studio/panes";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
@@ -277,6 +278,7 @@ function NodeHeader({
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
+  const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -563,13 +565,10 @@ function NodeHeader({
       });
 
       if (studioEnabled) {
-        // One navigation carries the pane state (current panes plus Run and
-        // Browser); other query params intentionally reset for the fresh run.
-        const liveSearch = window.location.search || location.search;
-        const panes = withPanesOpen(resolveOpenPanes(liveSearch), [
-          "run",
-          "browser",
-        ]);
+        // One navigation carries the pane state (open panes never move or
+        // close; the run surfaces append); other query params intentionally
+        // reset for the fresh run.
+        const panes = withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
         const search = new URLSearchParams({
           wr: response.data.run_id,
           bl: label,

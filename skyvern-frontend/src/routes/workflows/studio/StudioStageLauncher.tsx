@@ -8,7 +8,7 @@ import { useStudioRunSignals } from "./useStudioRunSignals";
 
 /**
  * Zero-panes stage: every pane stays one labeled click away instead of the
- * stage dead-ending. Mirrors the spine's Run gating.
+ * stage dead-ending. Mirrors the spine's Timeline gating.
  */
 export function StudioStageLauncher() {
   const { openPane } = useStudioPanes();
@@ -31,7 +31,7 @@ export function StudioStageLauncher() {
         <div className="flex flex-wrap items-center justify-center gap-2">
           {STUDIO_PANE_IDS.map((id) => {
             const { label, icon: Icon } = STUDIO_PANE_META[id];
-            const disabled = id === "run" && !hasRun;
+            const disabled = id === "timeline" && !hasRun;
             return (
               <Button
                 key={id}
@@ -39,7 +39,7 @@ export function StudioStageLauncher() {
                 variant="secondary"
                 size="sm"
                 disabled={disabled}
-                title={disabled ? "Run: no runs yet" : `Open ${label}`}
+                title={disabled ? "Timeline: no runs yet" : `Open ${label}`}
                 onClick={() => open(id)}
                 className="gap-2"
               >

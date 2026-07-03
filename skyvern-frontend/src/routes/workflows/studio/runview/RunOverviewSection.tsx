@@ -30,7 +30,7 @@ type RunOverviewSectionProps = {
 };
 
 /**
- * Overview body view of the Run pane: step / action / credit stat blocks plus
+ * Overview body view of the Timeline pane: step / action / credit stat blocks plus
  * the run metadata that used to live in the header's Overview popover.
  */
 export function RunOverviewSection({

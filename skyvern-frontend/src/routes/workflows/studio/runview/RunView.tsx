@@ -76,7 +76,7 @@ function normalizeRunOutputErrors(value: unknown): RunOutputError[] {
 }
 
 /**
- * Run pane body: the run timeline + step detail, with Overview / Inputs /
+ * Timeline pane body: the run timeline + step detail, with Overview / Inputs /
  * Outputs / Code as sibling views. Visuals (live stream, screenshots,
  * recordings) live in the Browser pane, which follows this pane's selection
  * via RunViewStore and ?active=.
@@ -112,7 +112,7 @@ export function RunView({
   const resetRunView = useRunViewStore((s) => s.reset);
   const setBrowserPaneView = useStudioBrowserStore((s) => s.setView);
   const { panes: studioPanes, openPane } = useStudioPanes();
-  const runPaneOpen = studioPanes.includes("run");
+  const runPaneOpen = studioPanes.includes("timeline");
   const [searchParams, setSearchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
@@ -164,7 +164,7 @@ export function RunView({
   }, [pinnedFrameId, workflowRunId, setSearchParams]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
-  // the Run pane being open: RunView stays mounted while its pane is closed.
+  // the Timeline pane being open: RunView stays mounted while its pane is closed.
   //
   // The guard reads the LIVE URL, not this render's searchParams: a block-run launch
   // navigates to ?wr=&bl= via a separate router update, and this effect can fire from

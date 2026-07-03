@@ -50,28 +50,28 @@ beforeEach(() => {
 describe("StudioStageLauncher", () => {
   test("offers every pane as a labeled button", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Run"]) {
+    for (const label of ["Copilot", "Editor", "Browser", "Timeline"]) {
       expect(
         screen.getByRole("button", { name: new RegExp(`^${label}`) }),
       ).toBeTruthy();
     }
   });
 
-  test("keeps the Run launcher gated until a run exists, with the reason readable", () => {
+  test("keeps the Timeline launcher gated until a run exists, with the reason readable", () => {
     renderAt();
-    const run = screen.getByRole("button", { name: /no runs yet/ });
-    expect((run as HTMLButtonElement).disabled).toBe(true);
+    const timeline = screen.getByRole("button", { name: /no runs yet/ });
+    expect((timeline as HTMLButtonElement).disabled).toBe(true);
   });
 
-  test("enables the Run launcher once a run exists", () => {
+  test("enables the Timeline launcher once a run exists", () => {
     runSignalsMock.mockReturnValue({
       hasRun: true,
       runStatus: undefined,
       knownHasRuns: true,
     });
     renderAt();
-    const run = screen.getByRole("button", { name: "Run" });
-    expect((run as HTMLButtonElement).disabled).toBe(false);
+    const timeline = screen.getByRole("button", { name: "Timeline" });
+    expect((timeline as HTMLButtonElement).disabled).toBe(false);
   });
 
   test("opens the clicked pane", () => {

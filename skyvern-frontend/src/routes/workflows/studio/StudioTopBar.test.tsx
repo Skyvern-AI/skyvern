@@ -23,7 +23,12 @@ import { RunStopButton } from "./StudioTopBar";
 
 function LocationProbe() {
   const location = useLocation();
-  return <div data-testid="location">{location.pathname}</div>;
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
+  );
 }
 
 function renderAt(path: string) {
@@ -75,8 +80,9 @@ describe("RunStopButton concurrency with a live block run", () => {
     expect(screen.queryByTestId("location")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
+    // ?panes= round-trips through the run form.
     expect(screen.getByTestId("location").textContent).toBe(
-      "/agents/wpid_1/run",
+      "/agents/wpid_1/run?panes=editor,browser,timeline",
     );
   });
 
@@ -104,7 +110,18 @@ describe("RunStopButton concurrency with a live block run", () => {
 
     expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.getByTestId("location").textContent).toBe(
-      "/agents/wpid_1/run",
+      "/agents/wpid_1/run?panes=copilot,browser,timeline",
+    );
+  });
+
+  test("an explicit open-panes list is carried through to the run form", () => {
+    mockRun(Status.Completed);
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,copilot");
+
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run?panes=editor,copilot",
     );
   });
 });
