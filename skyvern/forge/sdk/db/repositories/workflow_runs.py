@@ -1155,6 +1155,8 @@ class WorkflowRunsRepository(BaseRepository):
         search_key: str | None = None,
         error_code: str | None = None,
         exclude_child_runs: bool = False,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -1175,6 +1177,10 @@ class WorkflowRunsRepository(BaseRepository):
             query = self._apply_error_code_filter(query, error_code)
             if status:
                 query = query.filter(WorkflowRunModel.status.in_(status))
+            if created_at_start is not None:
+                query = query.filter(WorkflowRunModel.created_at >= created_at_start)
+            if created_at_end is not None:
+                query = query.filter(WorkflowRunModel.created_at < created_at_end)
             query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             workflow_runs_and_titles_tuples = (await session.execute(query)).all()
             workflow_runs = [

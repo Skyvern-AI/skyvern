@@ -227,6 +227,8 @@ class WorkflowParametersRepository(BaseRepository):
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):
