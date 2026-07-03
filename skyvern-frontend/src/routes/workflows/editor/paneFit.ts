@@ -82,3 +82,74 @@ export function paneRefitDuration(): number {
     ? 0
     : 150;
 }
+
+// The legacy editor renders blocks at 1:1; the start anchor only zooms out
+// when the chain can't fit the pane width. The floor is also the canvas's
+// minZoom prop, so the computed x-centering matches the zoom actually applied.
+export const START_ANCHOR_MAX_ZOOM = 1;
+export const START_ANCHOR_MIN_ZOOM = 0.5;
+
+export const START_ANCHOR_MARGIN_X_PX = 24;
+export const START_ANCHOR_TOP_PX = 24;
+
+/**
+ * Viewport that anchors the flow's START at the pane top, horizontally
+ * centered, at a legacy-like zoom (1:1, or fit-width when the pane is
+ * narrower than the chain). Unlike a whole-graph fitView, a long flow loads
+ * reading from its first block instead of centered on its middle.
+ */
+export function startAnchoredViewport({
+  pane,
+  bounds,
+}: {
+  pane: Size;
+  bounds: Rect;
+}): Viewport | null {
+  if (pane.width <= 0 || pane.height <= 0) {
+    return null;
+  }
+  if (bounds.width <= 0 || bounds.height <= 0) {
+    return null;
+  }
+  const fitWidthZoom =
+    (pane.width - 2 * START_ANCHOR_MARGIN_X_PX) / bounds.width;
+  const zoom = Math.min(
+    START_ANCHOR_MAX_ZOOM,
+    Math.max(START_ANCHOR_MIN_ZOOM, fitWidthZoom),
+  );
+  return {
+    x: (pane.width - bounds.width * zoom) / 2 - bounds.x * zoom,
+    y: START_ANCHOR_TOP_PX - bounds.y * zoom,
+    zoom,
+  };
+}
+
+/**
+ * Viewport for a pane-layout change (panes opened/closed/reordered):
+ * re-fits horizontally at the start-anchor zoom while keeping the content
+ * point at the pane's top edge fixed, so the user's scroll position through
+ * the flow survives the new geometry. Idempotent for an already-anchored
+ * viewport, so back-to-back layout events converge.
+ */
+export function paneRecenterViewport({
+  pane,
+  bounds,
+  viewport,
+}: {
+  pane: Size;
+  bounds: Rect;
+  viewport: Viewport;
+}): Viewport | null {
+  if (viewport.zoom <= 0) {
+    return null;
+  }
+  const target = startAnchoredViewport({ pane, bounds });
+  if (target === null) {
+    return null;
+  }
+  return {
+    x: target.x,
+    y: viewport.y * (target.zoom / viewport.zoom),
+    zoom: target.zoom,
+  };
+}

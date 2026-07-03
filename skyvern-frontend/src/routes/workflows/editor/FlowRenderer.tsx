@@ -101,7 +101,10 @@ import {
   isMeaningfulPaneResize,
   isViewportStranded,
   PANE_FIT_DEBOUNCE_MS,
+  paneRecenterViewport,
   paneRefitDuration,
+  START_ANCHOR_MIN_ZOOM,
+  startAnchoredViewport,
 } from "./paneFit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
@@ -414,6 +417,8 @@ type Props = {
   // Embedded in the studio shell: aligns the block-config sidebar's top/bottom
   // edges with the Copilot column instead of the legacy header offsets.
   embedded?: boolean;
+  // Studio open-pane key; a change recenters the canvas once the layout settles.
+  paneLayoutKey?: string;
 };
 
 function FlowRenderer({
@@ -439,6 +444,7 @@ function FlowRenderer({
   onLayoutPhaseChange,
   centerOffsetX = 0,
   embedded = false,
+  paneLayoutKey,
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
@@ -485,6 +491,10 @@ function FlowRenderer({
   // animation frame back to the lock and cancel the in-flight fit. Set
   // before invoking the API and cleared after the animation duration.
   const fitViewInProgressRef = useRef(false);
+
+  // Last wheel/pointer/keyboard-zoom touch on the canvas; a pane-layout
+  // recenter yields to any interaction newer than the layout change.
+  const lastCanvasInteractionAtRef = useRef(0);
 
   const runFitView = useCallback(
     (options?: { maxZoom?: number; duration?: number }) => {
@@ -625,11 +635,13 @@ function FlowRenderer({
       }
       if (meta && (event.key === "=" || event.key === "+")) {
         event.preventDefault();
+        lastCanvasInteractionAtRef.current = Date.now();
         reactFlowInstance.zoomIn({ duration: 200 });
         return;
       }
       if (meta && (event.key === "-" || event.key === "_")) {
         event.preventDefault();
+        lastCanvasInteractionAtRef.current = Date.now();
         reactFlowInstance.zoomOut({ duration: 200 });
         return;
       }
@@ -1601,14 +1613,87 @@ function FlowRenderer({
   // Studio pane fit. The editor pane can mount hidden (display:none while
   // closed) and resizes in discrete steps as sibling panes toggle. Fit once
   // when the initial Dagre pass has settled AND the pane is visible; after
-  // that, a debounced ResizeObserver re-fits only when a real geometry change
-  // leaves the viewport stranded, so it never fights a deliberate pan/zoom.
+  // that, a pane-layout change (?panes=) recenters once the flex layout
+  // settles, and a debounced ResizeObserver re-fits only when a real
+  // geometry change leaves the viewport stranded, so neither path fights a
+  // deliberate pan/zoom.
   const hasInitialPaneFitRef = useRef(false);
   const lastPaneSizeRef = useRef<{ width: number; height: number } | null>(
     null,
   );
+  const pendingPaneRecenterRef = useRef(false);
+  const paneLayoutChangedAtRef = useRef(0);
+  const paneSettleTimerRef = useRef<number | null>(null);
+  const paneSettleRef = useRef<(() => void) | null>(null);
   const layoutSettledRef = useRef(false);
   layoutSettledRef.current = layoutPhase !== "pre-layout";
+
+  // One debounce shared by the ResizeObserver and pane-layout changes, so a
+  // recenter fires once, after the last of the layout event and its resize
+  // burst (per-frame reactions exhaust the dimension→layout budget).
+  const schedulePaneSettle = useCallback(() => {
+    if (paneSettleTimerRef.current !== null) {
+      window.clearTimeout(paneSettleTimerRef.current);
+    }
+    paneSettleTimerRef.current = window.setTimeout(() => {
+      paneSettleTimerRef.current = null;
+      paneSettleRef.current?.();
+    }, PANE_FIT_DEBOUNCE_MS);
+  }, []);
+
+  // Anchors the flow's start at the pane top instead of centering the whole
+  // graph, matching the legacy editor's default zoom on long workflows.
+  const runStartAnchoredFit = useCallback(
+    (pane: { width: number; height: number }) => {
+      const visibleNodes = reactFlowInstance
+        .getNodes()
+        .filter((node) => !node.hidden);
+      if (visibleNodes.length === 0) {
+        return;
+      }
+      const viewport = startAnchoredViewport({
+        pane,
+        bounds: getNodesBounds(visibleNodes),
+      });
+      if (viewport === null) {
+        return;
+      }
+      // The initial anchor is deliberately instant (no animation, unlike the
+      // recenter below); 50ms just covers the viewport state flush.
+      fitViewInProgressRef.current = true;
+      reactFlowInstance.setViewport(viewport);
+      window.setTimeout(() => {
+        fitViewInProgressRef.current = false;
+      }, 50);
+    },
+    [reactFlowInstance],
+  );
+
+  const runPaneRecenter = useCallback(
+    (pane: { width: number; height: number }) => {
+      const visibleNodes = reactFlowInstance
+        .getNodes()
+        .filter((node) => !node.hidden);
+      if (visibleNodes.length === 0) {
+        return;
+      }
+      const viewport = paneRecenterViewport({
+        pane,
+        bounds: getNodesBounds(visibleNodes),
+        viewport: reactFlowInstance.getViewport(),
+      });
+      if (viewport === null) {
+        return;
+      }
+      const duration = paneRefitDuration();
+      fitViewInProgressRef.current = true;
+      reactFlowInstance.setViewport(viewport, { duration });
+      window.setTimeout(() => {
+        fitViewInProgressRef.current = false;
+      }, duration + 50);
+    },
+    [reactFlowInstance],
+  );
 
   // "initial-load" lands one frame after Dagre positions commit (mid fade-in),
   // so fitting here can't read pre-layout node positions. layoutPhase only
@@ -1629,8 +1714,25 @@ function FlowRenderer({
     }
     hasInitialPaneFitRef.current = true;
     lastPaneSizeRef.current = { width: rect.width, height: rect.height };
-    runFitView({ duration: 0 });
-  }, [embedded, layoutPhase, nodesInitialized, runFitView]);
+    runStartAnchoredFit({ width: rect.width, height: rect.height });
+  }, [embedded, layoutPhase, nodesInitialized, runStartAnchoredFit]);
+
+  // Pane-set/order changes are explicit recenter triggers: a sibling pane
+  // toggling shifts the canvas without tripping the stranded threshold, but
+  // the flow should read as centered again once the layout settles.
+  const prevPaneLayoutKeyRef = useRef(paneLayoutKey);
+  useEffect(() => {
+    if (!embedded || paneLayoutKey === undefined) {
+      return;
+    }
+    if (prevPaneLayoutKeyRef.current === paneLayoutKey) {
+      return;
+    }
+    prevPaneLayoutKeyRef.current = paneLayoutKey;
+    pendingPaneRecenterRef.current = true;
+    paneLayoutChangedAtRef.current = Date.now();
+    schedulePaneSettle();
+  }, [embedded, paneLayoutKey, schedulePaneSettle]);
 
   useEffect(() => {
     if (!embedded) {
@@ -1640,7 +1742,6 @@ function FlowRenderer({
     if (!el) {
       return;
     }
-    let timer: number | null = null;
     // Covers a pane that was hidden while layout settled; before that, the
     // layout-phase effect above owns the first fit.
     const initialFit = (size: { width: number; height: number }) => {
@@ -1648,8 +1749,17 @@ function FlowRenderer({
         return;
       }
       hasInitialPaneFitRef.current = true;
+      pendingPaneRecenterRef.current = false;
       lastPaneSizeRef.current = size;
-      runFitView({ duration: 0 });
+      runStartAnchoredFit(size);
+    };
+    const paneRecenter = (size: { width: number; height: number }) => {
+      lastPaneSizeRef.current = size;
+      // A deliberate pan/zoom after the layout change wins over the recenter.
+      if (lastCanvasInteractionAtRef.current > paneLayoutChangedAtRef.current) {
+        return;
+      }
+      runPaneRecenter(size);
     };
     const strandedRefit = (size: { width: number; height: number }) => {
       const prev = lastPaneSizeRef.current;
@@ -1673,7 +1783,6 @@ function FlowRenderer({
       }
     };
     const settle = () => {
-      timer = null;
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) {
         return;
@@ -1681,26 +1790,48 @@ function FlowRenderer({
       const size = { width: rect.width, height: rect.height };
       if (!hasInitialPaneFitRef.current) {
         initialFit(size);
-      } else {
-        strandedRefit(size);
+        return;
       }
+      if (pendingPaneRecenterRef.current) {
+        pendingPaneRecenterRef.current = false;
+        paneRecenter(size);
+        return;
+      }
+      strandedRefit(size);
     };
+    paneSettleRef.current = settle;
+    const markInteraction = () => {
+      lastCanvasInteractionAtRef.current = Date.now();
+    };
+    el.addEventListener("wheel", markInteraction, {
+      capture: true,
+      passive: true,
+    });
+    el.addEventListener("pointerdown", markInteraction, { capture: true });
     const observer = new ResizeObserver(() => {
-      // Settle after the burst; per-frame reactions exhaust the
-      // dimension→layout convergence budget (see dimensionConvergence.ts).
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
-      timer = window.setTimeout(settle, PANE_FIT_DEBOUNCE_MS);
+      schedulePaneSettle();
     });
     observer.observe(el);
     return () => {
       observer.disconnect();
-      if (timer !== null) {
-        window.clearTimeout(timer);
+      el.removeEventListener("wheel", markInteraction, { capture: true });
+      el.removeEventListener("pointerdown", markInteraction, {
+        capture: true,
+      });
+      paneSettleRef.current = null;
+      if (paneSettleTimerRef.current !== null) {
+        window.clearTimeout(paneSettleTimerRef.current);
+        paneSettleTimerRef.current = null;
       }
     };
-  }, [embedded, reactFlowInstance, runFitView]);
+  }, [
+    embedded,
+    reactFlowInstance,
+    runFitView,
+    runPaneRecenter,
+    runStartAnchoredFit,
+    schedulePaneSettle,
+  ]);
 
   const zoomLock = 1 as const;
   const yLockMax = 140 as const;
@@ -2028,7 +2159,7 @@ function FlowRenderer({
                   }
                 }}
                 maxZoom={flowIsConstrained ? 1 : 2}
-                minZoom={flowIsConstrained ? 1 : 0.5}
+                minZoom={flowIsConstrained ? 1 : START_ANCHOR_MIN_ZOOM}
                 panOnDrag={true}
                 panOnScroll={true}
                 panOnScrollMode={PanOnScrollMode.Vertical}

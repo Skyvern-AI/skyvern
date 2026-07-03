@@ -2091,6 +2091,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 embedded={embedded}
+                paneLayoutKey={embedded ? studioPanes.join(",") : undefined}
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
