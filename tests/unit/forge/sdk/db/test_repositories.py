@@ -1,5 +1,6 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -255,8 +256,19 @@ def test_agent_db_has_typed_repo_attributes():
         assert isinstance(db.tasks, TasksRepository)
         assert isinstance(db.credentials, CredentialRepository)
         assert isinstance(db.credential_folders, CredentialFoldersRepository)
-        assert hasattr(db, "get_task")  # backward compat delegate
         # Migrated domains no longer have delegates on AgentDB:
         assert not hasattr(db, "create_workflow")
         assert not hasattr(db, "get_organization")
         assert not hasattr(db, "get_credential")
+
+
+def test_agent_db_defines_no_delegator_methods():
+    """All data access goes through typed repository attributes; AgentDB itself defines no forwarding methods."""
+    from skyvern.forge.sdk.db.agent_db import AgentDB
+
+    defined = {name for name, member in vars(AgentDB).items() if inspect.isfunction(member)}
+    assert defined == {"__init__", "is_retryable_error"}, (
+        f"Unexpected methods on AgentDB: {sorted(defined - {'__init__', 'is_retryable_error'})}. "
+        "Add data-access methods to the domain repository and call it via the typed attribute "
+        "(e.g. db.tasks.get_task) instead of adding delegators to AgentDB."
+    )
