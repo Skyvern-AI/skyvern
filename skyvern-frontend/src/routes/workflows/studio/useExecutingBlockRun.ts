@@ -8,9 +8,9 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 
 /**
  * True while a block-scoped run (?wr= + ?bl=) is executing inside the current
- * debug session: the agent owns the shared debug browser, so user take-control
- * stays off until the run finalizes. Paused runs release the gate — a pause
- * can be waiting on human input (2FA, verification).
+ * debug session: the agent is driving the shared debug browser, so the stream
+ * flags that the user is co-driving. Paused runs don't count — a pause can be
+ * waiting on human input (2FA, verification).
  */
 export function useExecutingBlockRun(): boolean {
   const { workflowPermanentId } = useParams();

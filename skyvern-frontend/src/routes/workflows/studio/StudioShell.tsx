@@ -18,6 +18,7 @@ import { cn } from "@/util/utils";
 
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
+import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
@@ -28,7 +29,10 @@ import { STUDIO_PANE_META } from "./paneMeta";
 import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
-import { StudioShellContext } from "./StudioShellContext";
+import {
+  StudioPaneCompactContext,
+  StudioShellContext,
+} from "./StudioShellContext";
 import { StudioSpine } from "./StudioSpine";
 import { StudioStageLauncher } from "./StudioStageLauncher";
 import { StudioTopBar } from "./StudioTopBar";
@@ -39,20 +43,54 @@ import { useStudioPanes } from "./useStudioPanes";
 // whole stage; the shared floors live in panes.ts next to the fit math.
 const COPILOT_MAX_WIDTH = 440;
 
+// Below this header width, pane header chrome (view pills, badges) collapses
+// to icons — same idea as the run hero, measured per pane, not per viewport.
+const PANE_HEADER_COMPACT_BELOW_PX = 480;
+
 function StudioPane({
   id,
   open,
   order,
   onClose,
+  headerExtras,
+  headerActions,
   children,
 }: {
   id: StudioPaneId;
   open: boolean;
   order: number | undefined;
   onClose: () => void;
+  // Rendered after the pane label (badges, view pills).
+  headerExtras?: ReactNode;
+  // Rendered right-aligned, before the close button.
+  headerActions?: ReactNode;
   children: ReactNode;
 }) {
   const { label, icon: Icon } = STUDIO_PANE_META[id];
+  const headerRef = useRef<HTMLDivElement>(null);
+  const hasChrome = headerExtras != null || headerActions != null;
+  const [compact, setCompact] = useState(false);
+  // Layout effect + an immediate measure so a narrow pane never paints one
+  // frame of full-width labels before the observer's first callback.
+  useLayoutEffect(() => {
+    const el = headerRef.current;
+    if (!hasChrome || !el || typeof ResizeObserver === "undefined") {
+      setCompact(false);
+      return;
+    }
+    const apply = (width: number) => {
+      // A closed pane measures 0 (display:none); keep its last real state.
+      if (width > 0) {
+        setCompact(width < PANE_HEADER_COMPACT_BELOW_PX);
+      }
+    };
+    apply(el.getBoundingClientRect().width);
+    const observer = new ResizeObserver((entries) => {
+      apply(entries[0]?.contentRect.width ?? 0);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasChrome]);
   return (
     <section
       id={studioPanelId(id)}
@@ -70,17 +108,25 @@ function StudioPane({
           : "hidden",
       )}
     >
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-3">
+      <div
+        ref={headerRef}
+        className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-3"
+      >
         <Icon className="size-3.5 shrink-0 text-studio-accent" aria-hidden />
-        <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+        <span className="min-w-0 truncate text-xs font-medium text-foreground">
           {label}
         </span>
+        <StudioPaneCompactContext.Provider value={compact}>
+          {headerExtras}
+          <span className="min-w-0 flex-1" />
+          {headerActions}
+        </StudioPaneCompactContext.Provider>
         <button
           type="button"
           onClick={onClose}
           title={`Close ${label}`}
           aria-label={`Close ${label} pane`}
-          className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         >
           <Cross2Icon className="size-3.5" />
         </button>
@@ -262,7 +308,11 @@ function StudioStage(props: StudioWorkspaceProps) {
             </StudioPane>
             {/* Kept mounted (CSS-hidden) so its stream slot stays registered;
                 the persistent stream node is re-parented in, not remounted. */}
-            <StudioPane {...paneProps("browser")}>
+            <StudioPane
+              {...paneProps("browser")}
+              headerExtras={<BrowserPaneViewPills />}
+              headerActions={<BrowserPaneActions />}
+            >
               <BrowserTab />
             </StudioPane>
             <StudioPane {...paneProps("run")}>

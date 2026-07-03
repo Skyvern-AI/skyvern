@@ -28,6 +28,14 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
     workflowRunQueryMock(options),
 }));
 
+vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
+  useWorkflowRunTimelineQuery: () => ({ data: undefined }),
+}));
+
+vi.mock("../hooks/useWorkflowRunsQuery", () => ({
+  useWorkflowRunsQuery: () => ({ data: [], isPending: false }),
+}));
+
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({
     browserStreamingMode: runtimeConfigMock.browserStreamingMode,
@@ -227,29 +235,29 @@ describe("StudioBrowserStream browser activity notifications", () => {
   });
 });
 
-describe("StudioBrowserStream block-run take-control gating", () => {
-  it("locks take-control while a block run executes in the debug session", () => {
+describe("StudioBrowserStream block-run co-drive", () => {
+  it("keeps take-control available while a block run executes (co-drive)", () => {
     mockWorkflowRun(Status.Running, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
 
-    expect(controlButtonsAttr("emit vnc frame")).toBe("no");
+    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
     expect(screen.getByRole("status").textContent).toContain(
-      "Skyvern is running this block",
+      "Agent is running — you're sharing the browser",
     );
   });
 
-  it("locks the CDP stream the same way (input socket keys off the same prop)", () => {
+  it("keeps the CDP stream controllable the same way", () => {
     runtimeConfigMock.browserStreamingMode = "cdp";
     mockWorkflowRun(Status.Running, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
 
-    expect(controlButtonsAttr("emit cdp activity")).toBe("no");
+    expect(controlButtonsAttr("emit cdp activity")).toBe("yes");
     expect(screen.getByRole("status").textContent).toContain(
-      "Skyvern is running this block",
+      "Agent is running — you're sharing the browser",
     );
   });
 
-  it("re-enables take-control once the block run finalizes", () => {
+  it("drops the sharing pill once the block run finalizes", () => {
     mockWorkflowRun(Status.Completed, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
 
@@ -257,7 +265,7 @@ describe("StudioBrowserStream block-run take-control gating", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("releases the lock while the block run is paused (may need human input)", () => {
+  it("shows no sharing pill while the block run is paused (needs human input)", () => {
     mockWorkflowRun(Status.Paused, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
 
@@ -265,11 +273,24 @@ describe("StudioBrowserStream block-run take-control gating", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("ignores a block run executing in a different browser session", () => {
+  it("parks controls when the block run streams from a different session", () => {
+    // The pane's live surface is the run's own stream; the debug singleton is
+    // parked, so it must withdraw take-control (and show no pill).
     mockWorkflowRun(Status.Running, "pbs_other");
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
 
-    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+    expect(controlButtonsAttr("emit vnc frame")).toBe("no");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("cedes control while the pane shows a replay view", () => {
+    // ?active= pins a step -> Screenshots view; the singleton is parked, so
+    // the control offer (and any held grab) is withdrawn.
+    mockWorkflowRun(Status.Running, "pbs_test");
+    renderStudioBrowserStream(`${BLOCK_RUN_OPEN_PATH}&active=act_1`);
+
+    expect(controlButtonsAttr("emit vnc frame")).toBe("no");
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("ignores a full (non-block) run even when its session matches", () => {
@@ -277,9 +298,10 @@ describe("StudioBrowserStream block-run take-control gating", () => {
     renderStudioBrowserStream(`${BROWSER_OPEN_PATH}&wr=run_1`);
 
     expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("shows no lock pill while the Browser pane is closed", () => {
+  it("keeps other surfaces view-only while the Browser pane is closed", () => {
     mockWorkflowRun(Status.Running, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_CLOSED_PATH);
 
@@ -287,7 +309,7 @@ describe("StudioBrowserStream block-run take-control gating", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("defers to an active recording instead of yanking its control", () => {
+  it("shows no sharing pill during a recording (the recorder is driving)", () => {
     useRecordingStore.setState({ isRecording: true });
     mockWorkflowRun(Status.Running, "pbs_test");
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
