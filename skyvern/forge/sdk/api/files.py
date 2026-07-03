@@ -220,19 +220,20 @@ async def download_file(
 
                 # Get the file name
                 if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                    download_dir = output_dir
+                    download_dir_path = Path(output_dir)
+                    download_dir_path.mkdir(parents=True, exist_ok=True)
                 else:
-                    download_dir = make_temp_directory(prefix="skyvern_downloads_")
+                    download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
                 # Determine filename - use provided filename or derive from response/URL
                 file_name = _determine_download_filename(filename, dict(response.headers), url)
-                file_path = os.path.join(download_dir, file_name)
-                if not os.path.abspath(file_path).startswith(os.path.abspath(download_dir) + os.sep):
+                download_dir_resolved = download_dir_path.resolve()
+                file_path = (download_dir_path / file_name).resolve()
+                if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
                     raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
 
                 LOG.info(f"Downloading file to {file_path}")
-                with open(file_path, "wb") as f:
+                with file_path.open("wb") as f:
                     # Write the content of the request into the file
                     total_bytes_downloaded = 0
                     async for chunk in response.content.iter_chunked(1024):
@@ -242,7 +243,7 @@ async def download_file(
                             raise DownloadFileMaxSizeExceeded(max_size_mb)
 
                 LOG.info(f"File downloaded successfully to {file_path}")
-                return file_path
+                return str(file_path)
     except aiohttp.ClientResponseError as e:
         LOG.exception(f"Failed to download file, status code: {e.status}")
         raise
@@ -322,21 +323,21 @@ def validate_local_file_path(candidate_path: str, run_id: str | None) -> str:
         LOG.warning("Empty path provided for file access validation", run_id=run_id)
         raise PermissionError(f"File access denied: path must not be empty for run {run_id}")
 
-    allowed_dir = os.path.realpath(os.path.join(settings.DOWNLOAD_PATH, str(run_id)))
-    resolved = os.path.realpath(candidate_path)
+    allowed_dir = Path(settings.DOWNLOAD_PATH, str(run_id)).resolve()
+    resolved = Path(candidate_path).resolve()
 
     # The resolved path must be the allowed dir itself or a child of it
-    if resolved != allowed_dir and not resolved.startswith(allowed_dir + os.sep):
+    if resolved != allowed_dir and not resolved.is_relative_to(allowed_dir):
         LOG.warning(
             "Path traversal attempt blocked",
             candidate_path=candidate_path,
-            resolved_path=resolved,
-            allowed_dir=allowed_dir,
+            resolved_path=str(resolved),
+            allowed_dir=str(allowed_dir),
             run_id=run_id,
         )
         raise PermissionError(f"File access denied: path is outside the allowed download directory for run {run_id}")
 
-    return resolved
+    return str(resolved)
 
 
 def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
