@@ -379,7 +379,7 @@ def _enable_imposition(ctx: CopilotContext) -> None:
 
 
 def _stub_successful_update(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fake_process_workflow_yaml(**_kwargs: object) -> SimpleNamespace:
+    async def _fake_process_workflow_yaml(**_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
             workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="search_registry")]),
             proxy_location=None,
