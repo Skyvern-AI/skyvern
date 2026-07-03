@@ -649,19 +649,24 @@ blocks:
 
 ** FILE PARSER BLOCK (file_url_parser) **
 
-Purpose: Parse PDFs, CSVs, Excel files, images, and DOCX files. This is the "File Parser Block" in the UI.
+Purpose: Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives. This is the "File Parser Block" in the UI.
 
 Structure:
 block_type: file_url_parser
 label: <unique_label>
 file_url: <https_url_or_file_url>             # Required: URL to the file
-file_type: <auto_detect|csv|excel|pdf|image|docx>  # Optional: defaults to auto_detect (infer from URL/content)
+file_type: <auto_detect|csv|excel|pdf|image|docx|zip>  # Optional: defaults to auto_detect (infer from URL/content)
 json_schema: <json_schema>                     # Optional: Structure of parsed output
 
 Use Cases:
 - Parse a PDF invoice into structured fields
 - Extract rows from a CSV file
 - Read Excel sheets for downstream processing
+- Unzip a ZIP archive of PDFs and extract structured data across all of them
+
+ZIP behavior:
+- Without json_schema: outputs the list of extracted files as [{file_name, file_path, file_size}]. Loop over the output and pass each file_path as the file_url of another file_url_parser block to parse files individually.
+- With json_schema: parses every supported file inside the archive (CSV/Excel/PDF/image/DOCX) and extracts against the schema from the combined content.
 
 Example:
 blocks:

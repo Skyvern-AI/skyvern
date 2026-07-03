@@ -262,6 +262,27 @@ async def download_file(
         raise
 
 
+async def resolve_local_or_download_file(
+    file_url: str,
+    run_id: str | None,
+    organization_id: str | None = None,
+    max_size_mb: int | None = None,
+) -> str:
+    """Resolve a file input to a local path.
+
+    Absolute paths are validated against the run's download directory; anything else is downloaded.
+    """
+    # Absolute paths are the run-local convention; treating all non-remote strings as paths would misroute bad URLs.
+    if file_url.startswith("/"):
+        resolved = validate_local_file_path(file_url, run_id)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"Local file not found: {file_url}")
+        if max_size_mb is not None and os.path.getsize(resolved) > max_size_mb * 1024 * 1024:
+            raise DownloadFileMaxSizeExceeded(max_size_mb)
+        return resolved
+    return await download_file(file_url, max_size_mb=max_size_mb, organization_id=organization_id)
+
+
 def zip_files(files_path: str, zip_file_path: str) -> str:
     with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(files_path):
