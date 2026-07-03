@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from skyvern.exceptions import ImaginarySecretValue
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
 
 def _make_context(secrets: dict[str, str]) -> WorkflowRunContext:
@@ -13,6 +16,7 @@ def _make_context(secrets: dict[str, str]) -> WorkflowRunContext:
     ctx.secrets = dict(secrets)
     ctx.values = {}
     ctx.parameters = {}
+    ctx.workflow_run_outputs = {}
     ctx.credential_totp_identifiers = {}
     return ctx
 
@@ -103,6 +107,31 @@ class TestMultiPlaceholderResolution:
         )
         result = ctx.get_original_secret_value_or_none("Name: placeholder_aaaa_first placeholder_bbbb_last (verified)")
         assert result == "Name: John Doe (verified)"
+
+    @pytest.mark.asyncio
+    async def test_registered_output_placeholder_resolves_at_action_time(self) -> None:
+        ctx = _make_context({})
+        placeholder = ctx.register_secret_value("real-token")
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="http_output",
+            description=None,
+            output_parameter_id="output-http",
+            workflow_id="workflow-1",
+            created_at=now,
+            modified_at=now,
+            deleted_at=None,
+        )
+
+        await ctx.register_output_parameter_value_post_execution(
+            output_parameter,
+            {"body": {"token": placeholder}},
+        )
+
+        assert ctx.values["http_output"]["body"]["token"] == placeholder
+        assert ctx.values["http"]["body"]["token"] == placeholder
+        assert ctx.get_original_secret_value_or_none(ctx.values["http"]["body"]["token"]) == "real-token"
 
 
 class TestActiveCredentialParameterKey:
