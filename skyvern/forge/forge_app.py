@@ -179,7 +179,7 @@ def create_forge_app() -> ForgeApp:
             azure_deployment=settings.AZURE_CUA_DEPLOYMENT,
         )
 
-    app.ANTHROPIC_CLIENT = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    app.ANTHROPIC_CLIENT = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY or "dummy")
     if settings.ENABLE_BEDROCK_ANTHROPIC:
         app.ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
 
