@@ -5396,11 +5396,12 @@ async def _update_workflow(
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
         workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
-        workflow = _process_workflow_yaml(
+        workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
+            settings_fallback_yaml=prior_yaml,
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
@@ -5432,6 +5433,7 @@ async def _update_workflow(
                 ai_fallback=workflow.ai_fallback,
                 cache_key=workflow.cache_key,
                 adaptive_caching=workflow.adaptive_caching,
+                enable_self_healing=workflow.enable_self_healing,
                 code_version=workflow.code_version,
                 run_sequentially=workflow.run_sequentially,
                 sequential_key=workflow.sequential_key,

@@ -522,6 +522,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    enable_self_healing = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     code_version = Column(Integer, nullable=True, server_default=sqlalchemy.text("2"))
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)

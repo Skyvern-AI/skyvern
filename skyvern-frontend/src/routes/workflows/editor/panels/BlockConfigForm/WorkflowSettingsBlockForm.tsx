@@ -34,6 +34,7 @@ function WorkflowSettingsBlockFormBody({
       proxyLocation: data.proxyLocation,
       runWith: data.runWith,
       aiFallback: data.aiFallback,
+      enableSelfHealing: data.enableSelfHealing,
       scriptCacheKey: data.scriptCacheKey,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,

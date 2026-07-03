@@ -1350,6 +1350,7 @@ export function WorkflowCopilotChat({
             run_with: saveData.settings.runWith,
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
+            enable_self_healing: saveData.settings.enableSelfHealing ?? false,
             code_version:
               saveData.settings.runWith === "code"
                 ? (saveData.settings.codeVersion ?? 2)

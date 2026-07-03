@@ -4355,6 +4355,7 @@ class WorkflowService:
         sequential_key: str | None = None,
         folder_id: str | None = None,
         adaptive_caching: bool = False,
+        enable_self_healing: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
         created_by: str | None = None,
@@ -4389,6 +4390,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 folder_id=folder_id,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
                 created_by=created_by,
@@ -4776,6 +4778,7 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         cache_key: str | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         code_version: int | None | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
@@ -4805,6 +4808,7 @@ class WorkflowService:
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
@@ -4834,6 +4838,7 @@ class WorkflowService:
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
@@ -6863,6 +6868,7 @@ class WorkflowService:
             run_sequentially=runtime_workflow.run_sequentially or False,
             sequential_key=runtime_workflow.sequential_key,
             adaptive_caching=runtime_workflow.adaptive_caching,
+            enable_self_healing=runtime_workflow.enable_self_healing,
             generate_script_on_terminal=runtime_workflow.generate_script_on_terminal,
             folder_id=runtime_workflow.folder_id,
             is_saved_task=runtime_workflow.is_saved_task,
@@ -7002,6 +7008,9 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=existing_latest_workflow.folder_id,
                     adaptive_caching=request.adaptive_caching,
+                    enable_self_healing=request.enable_self_healing
+                    if request.enable_self_healing is not None
+                    else existing_latest_workflow.enable_self_healing,
                     code_version=request.code_version
                     if request.code_version is not None
                     else existing_latest_workflow.code_version,
@@ -7041,6 +7050,9 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=request.folder_id,
                     adaptive_caching=request.adaptive_caching,
+                    enable_self_healing=request.enable_self_healing
+                    if request.enable_self_healing is not None
+                    else False,
                     code_version=request.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
                     created_by=created_by,

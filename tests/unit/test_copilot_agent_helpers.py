@@ -1910,7 +1910,8 @@ workflow_definition:
         async def fake_update_workflow(payload, ctx, allow_missing_credentials=False):
             captured["workflow_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]
-            workflow = _process_workflow_yaml(
+            workflow = await _process_workflow_yaml(
+                settings_fallback_yaml="enable_self_healing: false",
                 workflow_id=ctx.workflow_id,
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 organization_id=ctx.organization_id,
@@ -2142,7 +2143,7 @@ class TestTranslateToAgentResultGating:
         new_wf = SimpleNamespace(name="new-from-replace")
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
-            lambda **kwargs: new_wf,
+            AsyncMock(return_value=new_wf),
         )
 
         ctx = _ctx(
@@ -2212,7 +2213,7 @@ class TestTranslateToAgentResultGating:
         # Inline REPLACE_WORKFLOW bypasses _update_workflow, so it must also
         # reject a corrected workflow whose labels/titles still describe the
         # prior subject.
-        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
         prior_yaml = """
@@ -2257,7 +2258,7 @@ workflow_definition:
         assert agent_result.workflow_yaml is None
 
     def test_inline_replace_workflow_rejects_page_dependent_blocks_without_inspection(self, monkeypatch) -> None:
-        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
         submitted_yaml = """
@@ -2299,7 +2300,7 @@ workflow_definition:
     def test_code_only_inline_replace_workflow_rejects_native_browser_block(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.output_policy import OutputPolicyVerdict
 
-        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
         monkeypatch.setattr(agent_module, "evaluate_output_policy", lambda **kwargs: OutputPolicyVerdict())
 
@@ -3059,7 +3060,7 @@ workflow_definition:
     def test_inline_replace_workflow_persists_clean_agent_yaml(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
-        def fake_process(**kwargs):
+        async def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
@@ -3081,7 +3082,7 @@ workflow_definition:
     def test_inline_replace_workflow_does_not_denormalize_resolved_goal(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
-        def fake_process(**kwargs):
+        async def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
@@ -4910,7 +4911,7 @@ workflow_definition:
 
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
-            lambda **kwargs: workflow,
+            AsyncMock(return_value=workflow),
         )
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",

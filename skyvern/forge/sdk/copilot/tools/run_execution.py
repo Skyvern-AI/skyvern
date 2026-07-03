@@ -12,8 +12,6 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import structlog
-import yaml
-from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -110,7 +108,6 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -765,20 +762,21 @@ def _workflow_has_blocks(workflow: Workflow | None) -> bool:
     return bool(definition.blocks)
 
 
-def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> Workflow | None:
+async def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> Workflow | None:
     """Returns None on empty/malformed yaml or when it still misses a label, so the
     caller falls through to the existing not-found error."""
     workflow_yaml = ctx.prior_copilot_workflow_yaml
     if not workflow_yaml or not workflow_yaml.strip():
         return None
     try:
-        workflow = _process_workflow_yaml(
+        workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml,
         )
-    except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException):
+    except Exception:
+        # Prior-parse is best-effort; a settings-inherit lookup failure must not block the run tool.
         LOG.warning("Could not parse prior copilot draft for run-tool label resolution", exc_info=True)
         return None
     return workflow if _workflow_covers_labels(workflow, labels) else None
@@ -1153,7 +1151,7 @@ async def _run_blocks_and_collect_debug(
     # a populated workflow missing a requested label still reports not-found.
     resolved_from_prior_draft = False
     if not _workflow_has_blocks(workflow):
-        prior_draft_workflow = _workflow_from_prior_draft(ctx, block_labels)
+        prior_draft_workflow = await _workflow_from_prior_draft(ctx, block_labels)
         if prior_draft_workflow is not None:
             workflow = prior_draft_workflow
             resolved_from_prior_draft = True
