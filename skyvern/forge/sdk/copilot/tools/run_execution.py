@@ -25,7 +25,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
+    arm_recorded_outcome_grounding_requirement,
     authored_structure_signature_from_workflow,
+    clear_recorded_outcome_grounding_requirement,
+    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
 )
@@ -2755,6 +2758,19 @@ def _repair_non_convergence_signature(copilot_ctx: Any, contract: DiagnosisRepai
     return "repair_no_verified_progress"
 
 
+def _should_arm_recorded_outcome_grounding(copilot_ctx: Any) -> bool:
+    latest = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
+    if not isinstance(latest, RecordedBuildTestOutcome):
+        return False
+    if not latest.is_authoritative:
+        return False
+    if latest.verdict == "progress_observed":
+        return False
+    if latest_recorded_build_test_outcome_repeated(copilot_ctx) is True:
+        return True
+    return bool(latest.workflow_run_id or getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
+
+
 def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContract) -> None:
     """Count consecutive REPAIR verdicts that made no newly-verified forward progress.
 
@@ -2791,6 +2807,7 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     if signature is None or progressed:
         copilot_ctx.consecutive_non_converging_repair_count = 0
         copilot_ctx.last_repair_non_convergence_signature = None
+        clear_recorded_outcome_grounding_requirement(copilot_ctx)
         contract.repair_loop_state = RepairLoopState(
             streak_token=None,
             consecutive_identical_repair_count=0,
@@ -2801,6 +2818,11 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     prior_count = getattr(copilot_ctx, "consecutive_non_converging_repair_count", 0)
     prior_count = prior_count if isinstance(prior_count, int) else 0
     count = prior_count + 1 if signature == prior_signature else 1
+    requirement = getattr(copilot_ctx, "recorded_outcome_grounding_requirement", None)
+    if isinstance(
+        getattr(copilot_ctx, "latest_recorded_build_test_outcome", None), RecordedBuildTestOutcome
+    ) and not signature.endswith(getattr(requirement, "structural_key", "")):
+        clear_recorded_outcome_grounding_requirement(copilot_ctx)
     copilot_ctx.consecutive_non_converging_repair_count = count
     copilot_ctx.last_repair_non_convergence_signature = signature
     contract.repair_loop_state = RepairLoopState(
@@ -2808,6 +2830,8 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
         consecutive_identical_repair_count=count,
         ceiling_reached=count >= settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL,
     )
+    if _should_arm_recorded_outcome_grounding(copilot_ctx):
+        arm_recorded_outcome_grounding_requirement(copilot_ctx)
     if contract.repair_loop_state.ceiling_reached:
         signal = repair_ceiling_stop_signal(copilot_ctx, contract)
         stash_blocker_signal(copilot_ctx, signal)
