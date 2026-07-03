@@ -340,11 +340,7 @@ def test_pdf_parser_block_forwards_system_prompt(monkeypatch) -> None:
 
     # Patch the app-level handler directly since PDFParserBlock uses app.LLM_API_HANDLER.
     monkeypatch.setattr(block_module.app, "LLM_API_HANDLER", fake_llm)
-    monkeypatch.setattr(
-        block_module,
-        "download_file",
-        AsyncMock(return_value="/tmp/file.pdf"),
-    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value="/tmp/file.pdf"))
     monkeypatch.setattr(block_module, "extract_pdf_file", lambda *a, **k: "extracted text")
 
     workflow_run_context = MagicMock()
