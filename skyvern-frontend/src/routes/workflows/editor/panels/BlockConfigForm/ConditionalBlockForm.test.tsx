@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { ConditionalNode } from "../../nodes/ConditionalNode/types";
@@ -10,43 +16,65 @@ const mockNodes = new Map<
   { id: string; type: string; data?: Record<string, unknown> } | undefined
 >();
 const updateNodeData = vi.fn();
+const isWorkflowBlockNodeMock = vi.fn<(node: { type: string }) => boolean>(
+  (node) => node.type !== "nodeAdder" && node.type !== "start",
+);
 
 vi.mock("@xyflow/react", async () => {
   const actual =
     await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   return {
     ...actual,
+    useNodesData: (id: string) => {
+      const node = mockNodes.get(id);
+      return node ? { id: node.id, type: node.type, data: node.data } : null;
+    },
     useReactFlow: () => ({
-      getNode: (id: string) => mockNodes.get(id),
       updateNodeData,
     }),
-    useNodes: () => Array.from(mockNodes.values()),
-    useEdges: () => [],
   };
 });
 
-vi.mock("../../nodes/ConditionalNode/BranchesEditor", () => ({
-  BranchesEditor: (props: {
+vi.mock("../../nodes", () => ({
+  isWorkflowBlockNode: (node: { type: string }) =>
+    isWorkflowBlockNodeMock(node),
+}));
+
+vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
+  WorkflowBlockInputTextarea: ({
+    value,
+    disabled,
+    onChange,
+    placeholder,
+  }: {
+    value: string;
+    disabled?: boolean;
+    onChange: (v: string) => void;
+    placeholder?: string;
     nodeId: string;
-    data: { branches: Array<unknown>; activeBranchId: string | null };
+    className?: string;
   }) => (
-    <div
-      data-testid="branches-editor"
-      data-node-id={props.nodeId}
-      data-branches-count={String(props.data.branches.length)}
-      data-active-branch={props.data.activeBranchId ?? ""}
+    <textarea
+      aria-label={placeholder}
+      disabled={disabled}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
     />
   ),
 }));
 
-import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
+import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { ConditionalBlockForm } from "./ConditionalBlockForm";
 
 beforeEach(() => {
   vi.useFakeTimers();
   mockNodes.clear();
   updateNodeData.mockReset();
+  isWorkflowBlockNodeMock.mockReset();
+  isWorkflowBlockNodeMock.mockImplementation(
+    (node) => node.type !== "nodeAdder" && node.type !== "start",
+  );
   usePendingCommitsStore.setState({ commits: {} });
   useSidebarSaveStateStore.getState().reset();
 });
@@ -75,7 +103,7 @@ function setConditionalNode(
           id: "branch_a",
           criteria: {
             criteria_type: "jinja2_template",
-            expression: "",
+            expression: "{{ total > 100 }}",
             description: null,
           },
           next_block_label: null,
@@ -97,7 +125,7 @@ function setConditionalNode(
   });
 }
 
-describe("ConditionalBlockForm (SKY-9361)", () => {
+describe("ConditionalBlockForm", () => {
   test("returns null for missing node", () => {
     const { container } = render(<ConditionalBlockForm blockId="missing" />);
     expect(container.firstChild).toBeNull();
@@ -109,14 +137,121 @@ describe("ConditionalBlockForm (SKY-9361)", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  test("renders BranchesEditor with the blockId and node data", () => {
+  test("returns null for non-workflow conditional nodes", () => {
+    isWorkflowBlockNodeMock.mockReturnValue(false);
+    setConditionalNode("c1");
+
+    const { container } = render(<ConditionalBlockForm blockId="c1" />);
+
+    expect(container.firstChild).toBeNull();
+    expect(isWorkflowBlockNodeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "conditional" }),
+    );
+  });
+
+  test("renders branch prompts and the default branch in the sidebar", () => {
     setConditionalNode("c1");
     render(<ConditionalBlockForm blockId="c1" />);
 
-    const editor = screen.getByTestId("branches-editor");
-    expect(editor.getAttribute("data-node-id")).toBe("c1");
-    expect(editor.getAttribute("data-branches-count")).toBe("2");
-    expect(editor.getAttribute("data-active-branch")).toBe("branch_a");
+    expect(screen.getByText("A • If")).toBeDefined();
+    expect(screen.getByText("B • Else")).toBeDefined();
+    expect(screen.getByText("Active")).toBeDefined();
+    expect(screen.getByDisplayValue("{{ total > 100 }}")).toBeDefined();
+    expect(
+      (
+        screen.getByDisplayValue(
+          "Executed when no other condition matches",
+        ) as HTMLTextAreaElement
+      ).disabled,
+    ).toBe(true);
+  });
+
+  test("preserves every default branch when ordering branch prompts", () => {
+    setConditionalNode("c1", {
+      branches: [
+        {
+          id: "branch_a",
+          criteria: {
+            criteria_type: "jinja2_template",
+            expression: "{{ total > 100 }}",
+            description: null,
+          },
+          next_block_label: null,
+          description: null,
+          is_default: false,
+        },
+        {
+          id: "branch_default_1",
+          criteria: null,
+          next_block_label: null,
+          description: null,
+          is_default: true,
+        },
+        {
+          id: "branch_b",
+          criteria: {
+            criteria_type: "jinja2_template",
+            expression: "{{ total > 250 }}",
+            description: null,
+          },
+          next_block_label: null,
+          description: null,
+          is_default: false,
+        },
+        {
+          id: "branch_default_2",
+          criteria: null,
+          next_block_label: null,
+          description: null,
+          is_default: true,
+        },
+      ],
+    });
+
+    render(<ConditionalBlockForm blockId="c1" />);
+
+    expect(screen.getByText("A • If")).toBeDefined();
+    expect(screen.getByText("B • Else If")).toBeDefined();
+    expect(screen.getByText("C • Else")).toBeDefined();
+    expect(screen.getByText("D • Else")).toBeDefined();
+    expect(
+      screen.getAllByDisplayValue("Executed when no other condition matches"),
+    ).toHaveLength(2);
+  });
+
+  test("editing a branch prompt propagates via updateNodeData", () => {
+    setConditionalNode("c1");
+    render(<ConditionalBlockForm blockId="c1" />);
+
+    fireEvent.change(screen.getByDisplayValue("{{ total > 100 }}"), {
+      target: { value: "{{ total > 250 }}" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("c1", {
+      branches: [
+        expect.objectContaining({
+          id: "branch_a",
+          criteria: expect.objectContaining({
+            expression: "{{ total > 250 }}",
+          }),
+        }),
+        expect.objectContaining({
+          id: "branch_default",
+          criteria: null,
+        }),
+      ],
+    });
+  });
+
+  test("non-editable branch prompts do not propagate edits", () => {
+    setConditionalNode("c1", { editable: false });
+    render(<ConditionalBlockForm blockId="c1" />);
+
+    fireEvent.change(screen.getByDisplayValue("{{ total > 100 }}"), {
+      target: { value: "{{ total > 250 }}" },
+    });
+
+    expect(updateNodeData).not.toHaveBeenCalled();
   });
 
   test("registers/unregisters commit on mount/unmount", () => {
@@ -136,20 +271,5 @@ describe("ConditionalBlockForm (SKY-9361)", () => {
       ok = usePendingCommitsStore.getState().flush("c1");
     });
     expect(ok).toBe(true);
-  });
-
-  test("propagates updated activeBranchId to BranchesEditor on rerender", () => {
-    setConditionalNode("c1", { activeBranchId: "branch_a" });
-    const { rerender } = render(<ConditionalBlockForm blockId="c1" />);
-    expect(
-      screen.getByTestId("branches-editor").getAttribute("data-active-branch"),
-    ).toBe("branch_a");
-
-    setConditionalNode("c1", { activeBranchId: "branch_default" });
-    rerender(<ConditionalBlockForm blockId="c1" />);
-
-    expect(
-      screen.getByTestId("branches-editor").getAttribute("data-active-branch"),
-    ).toBe("branch_default");
   });
 });

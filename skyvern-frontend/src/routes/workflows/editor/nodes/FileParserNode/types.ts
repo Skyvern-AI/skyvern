@@ -12,7 +12,8 @@ export type FileParserFileType =
   | "excel"
   | "pdf"
   | "image"
-  | "docx";
+  | "docx"
+  | "zip";
 
 export type FileParserNodeData = NodeBaseData & {
   fileUrl: string;
