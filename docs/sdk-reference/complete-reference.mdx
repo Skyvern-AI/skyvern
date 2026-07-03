@@ -538,7 +538,7 @@ create_browser_profile(name, description?, workflow_run_id?, browser_session_id?
 ### list_browser_profiles
 
 ```
-list_browser_profiles(include_deleted?) → list[BrowserProfile]
+list_browser_profiles(include_deleted?, managed?) → list[BrowserProfile]
 ```
 
 ### get_browser_profile
@@ -553,7 +553,7 @@ get_browser_profile(profile_id) → BrowserProfile
 delete_browser_profile(profile_id)
 ```
 
-**BrowserProfile fields:** `browser_profile_id`, `name`, `description`, `created_at`
+**BrowserProfile fields:** `browser_profile_id`, `name`, `description`, `is_managed`, `workflow_permanent_id`, `browser_profile_key_digest`, `created_at`
 
 ---
 

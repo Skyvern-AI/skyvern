@@ -25,6 +25,7 @@ for (const p of profiles) {
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include_deleted` | `bool` | No | `None` | Include soft-deleted profiles in the results. |
+| `managed` | `bool` | No | `None` | Omit to return all profiles; `False` returns only user-created profiles; `True` returns only auto-managed profiles created by Save & Reuse Session workflows. |
 | `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
 
 ### Returns `list[BrowserProfile]`
