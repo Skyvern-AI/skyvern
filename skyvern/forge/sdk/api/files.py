@@ -327,7 +327,7 @@ def validate_local_file_path(candidate_path: str, run_id: str | None) -> str:
     resolved = os.path.realpath(candidate_path)
 
     # The resolved path must be the allowed dir itself or a child of it
-    if os.path.commonpath([allowed_dir, resolved]) != allowed_dir:
+    if resolved != allowed_dir and not resolved.startswith(allowed_dir + os.sep):
         LOG.warning(
             "Path traversal attempt blocked",
             candidate_path=candidate_path,
