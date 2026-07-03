@@ -86,5 +86,30 @@ export function useStudioPanes() {
     [applyPanes],
   );
 
-  return { panes, resolveLivePanes, togglePane, openPane, closePane };
+  // Reorder-only write (drag-and-drop / keyboard move): the live URL keeps
+  // deciding WHICH panes are open; `order` only decides where they sit.
+  const setPanesOrder = useCallback(
+    (order: readonly StudioPaneId[]) =>
+      applyPanes((current) => {
+        const next = order.filter(
+          (id, index) => current.includes(id) && order.indexOf(id) === index,
+        );
+        for (const id of current) {
+          if (!next.includes(id)) {
+            next.push(id);
+          }
+        }
+        return next;
+      }),
+    [applyPanes],
+  );
+
+  return {
+    panes,
+    resolveLivePanes,
+    togglePane,
+    openPane,
+    closePane,
+    setPanesOrder,
+  };
 }
