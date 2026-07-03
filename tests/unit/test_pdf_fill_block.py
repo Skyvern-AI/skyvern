@@ -69,6 +69,14 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, run_id: str = "run_pdf_fil
     return context
 
 
+def _run_local_pdf_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, run_id: str, name: str) -> Path:
+    download_root = tmp_path / "downloads"
+    monkeypatch.setattr(pdf_fill_block.settings, "DOWNLOAD_PATH", str(download_root))
+    run_dir = download_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir / name
+
+
 def _add_empty_appearance(writer: PdfWriter, states: list[str]) -> DictionaryObject:
     normal_appearances = DictionaryObject()
     for state in states:
@@ -159,7 +167,7 @@ async def _fake_llm_response(**_: Any) -> dict[str, Any]:
 async def test_skyvern_engine_fills_pdf_with_llm_mapping(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_skyvern_pdf_fill"
     _install_context(monkeypatch, run_id)
-    source_pdf = tmp_path / "source.pdf"
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "source.pdf")
     _write_fillable_pdf(source_pdf)
     assert PdfReader(str(source_pdf)).get_fields()
 
@@ -312,7 +320,7 @@ def test_checkbox_without_known_state_is_skipped_not_silently_unchecked() -> Non
 async def test_empty_field_mapping_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_empty_mapping"
     _install_context(monkeypatch, run_id)
-    source_pdf = tmp_path / "source.pdf"
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "source.pdf")
     _write_fillable_pdf(source_pdf)
 
     async def _unmappable_llm_response(**_: Any) -> dict[str, Any]:
@@ -330,12 +338,13 @@ async def test_empty_field_mapping_fails(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_local_path_rejected_outside_local_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_absolute_path_rejected_outside_run_download_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_non_local_path"
     _install_context(monkeypatch, run_id)
     source_pdf = tmp_path / "source.pdf"
     _write_fillable_pdf(source_pdf)
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.settings.ENV", "production")
+    monkeypatch.setattr(pdf_fill_block.settings, "DOWNLOAD_PATH", str(tmp_path / "downloads"))
 
     block = _make_block(file_url=str(source_pdf))
     result = await block.execute(workflow_run_id=run_id, workflow_run_block_id="", organization_id=None)
@@ -345,10 +354,27 @@ async def test_local_path_rejected_outside_local_env(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_resolve_source_pdf_accepts_run_local_absolute_path_in_non_local_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_id = "run_cloud_local_path"
+    _install_context(monkeypatch, run_id)
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "source.pdf")
+    _write_fillable_pdf(source_pdf)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.settings.ENV", "production")
+
+    block = _make_block(file_url=str(source_pdf))
+    resolved, is_temp = await block._resolve_source_pdf(run_id, organization_id="org-1")
+
+    assert resolved == str(source_pdf.resolve())
+    assert is_temp is False
+
+
+@pytest.mark.asyncio
 async def test_flat_pdf_without_tesseract_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_flat_pdf_no_ocr"
     _install_context(monkeypatch, run_id)
-    flat_pdf = tmp_path / "flat.pdf"
+    flat_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "flat.pdf")
     _write_flat_pdf(flat_pdf)
     monkeypatch.setattr(PdfFillBlock, "_tesseract_available", staticmethod(lambda: False))
 
@@ -364,7 +390,7 @@ async def test_flat_pdf_without_tesseract_fails(monkeypatch: pytest.MonkeyPatch,
 async def test_flat_pdf_overlay_fills_with_ocr_anchors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_flat_pdf_overlay"
     _install_context(monkeypatch, run_id)
-    flat_pdf = tmp_path / "flat.pdf"
+    flat_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "flat.pdf")
     _write_flat_pdf(flat_pdf)
 
     anchor = FlatPdfAnchor(
@@ -415,7 +441,7 @@ async def test_flat_pdf_overlay_fills_with_ocr_anchors(monkeypatch: pytest.Monke
 async def test_flat_pdf_over_page_limit_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_flat_pdf_too_many_pages"
     _install_context(monkeypatch, run_id)
-    big_pdf = tmp_path / "big.pdf"
+    big_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "big.pdf")
     writer = PdfWriter()
     for _ in range(26):
         writer.add_blank_page(width=300, height=200)
@@ -651,7 +677,7 @@ def test_parse_tesseract_tsv_groups_lines() -> None:
 async def test_loop_iterations_get_unique_filenames(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_id = "run_unique_filename"
     _install_context(monkeypatch, run_id)
-    source_pdf = tmp_path / "source.pdf"
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "source.pdf")
     _write_fillable_pdf(source_pdf)
     monkeypatch.setattr(PdfFillBlock, "_resolve_default_llm_handler", AsyncMock(return_value=_fake_llm_response))
     monkeypatch.setattr(
