@@ -97,7 +97,10 @@ class TurnNarrativePayload(TypedDict):
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-    from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+    from skyvern.forge.sdk.copilot.build_test_outcome import (
+        RecordedBuildTestOutcome,
+        RecordedOutcomeGroundingRequirement,
+    )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
@@ -626,6 +629,7 @@ class CopilotContext(AgentContext):
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the
     # high-water length of the verified block prefix. A repair that grows either

@@ -35,7 +35,10 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-    from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+    from skyvern.forge.sdk.copilot.build_test_outcome import (
+        RecordedBuildTestOutcome,
+        RecordedOutcomeGroundingRequirement,
+    )
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -247,6 +250,7 @@ class AgentContext:
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     completion_verification_result: CompletionVerificationResult | None = None
     verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
