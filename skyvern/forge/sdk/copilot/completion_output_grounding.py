@@ -9,7 +9,7 @@ from typing import Any, Literal, Protocol
 
 import yaml
 
-from skyvern.forge.sdk.copilot.completion_verification import CriterionVerdict, RunEvidenceSnapshot
+from skyvern.forge.sdk.copilot.completion_verification import CriterionVerdict, EvidenceSourceKind, RunEvidenceSnapshot
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     lookup_requested_output_path_alias,
@@ -74,6 +74,11 @@ def grade_requested_output_criteria(
             )
             continue
         accepted_runtime_outputs = dict(_accepted_runtime_outputs(snapshot.block_outputs, accepted_labels))
+        accepted_output_sources = {
+            label: source
+            for label, source in snapshot.block_output_sources.items()
+            if label in accepted_runtime_outputs
+        }
         accepted_authored_paths = set().union(*(authored_paths_by_label[label] for label in accepted_labels))
         accepted_raw_authored_paths = set().union(
             *(raw_authored_paths_by_label.get(label, set()) for label in accepted_labels)
@@ -84,6 +89,27 @@ def grade_requested_output_criteria(
         grounding_mode = _criterion_grounding_mode(criterion)
         trace_fields = _criterion_trace_fields(criterion, grounding_mode)
         if expected_value is not None:
+            refutation = _independent_evidence_text_refutation(
+                accepted_runtime_outputs,
+                accepted_output_sources,
+                path,
+                expected_value,
+                projection_roots,
+            )
+            if refutation is not None:
+                refutation_evidence_ref, evidence_source = refutation
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="unsatisfied",
+                        reason_code="evidence_contradicts",
+                        evidence_ref=refutation_evidence_ref,
+                        missing_evidence=f"independent page evidence refuted emitted output.{path}",
+                        evidence_source=evidence_source,
+                        **trace_fields,
+                    )
+                )
+                continue
             match_state, evidence_ref = _runtime_output_path_match(
                 accepted_runtime_outputs, path, expected_value, projection_roots
             )
@@ -102,6 +128,7 @@ def grade_requested_output_criteria(
                             "requested-output field is present, but the criterion lacks typed expected_output_value "
                             "or expected_output_shape to prove the value"
                         ),
+                        evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
                         **trace_fields,
                     )
                 )
@@ -130,11 +157,28 @@ def grade_requested_output_criteria(
                         "requested-output field is present with a typed expected_output_shape, but no exact "
                         "expected_output_value can prove or refute the value"
                     ),
+                    evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
                     **trace_fields,
                 )
             )
             continue
         if match_state == "satisfied" and evidence_ref is not None:
+            if criterion.requested_output_evidence_source == "independent_run_evidence":
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="unsatisfied",
+                        reason_code=_STRUCTURAL_ABSTENTION_REASON_CODE,
+                        evidence_ref=evidence_ref,
+                        missing_evidence=(
+                            "self-emitted requested output is not independent evidence for this criterion"
+                        ),
+                        evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
+                        self_emitted_judgment_not_independent=True,
+                        **trace_fields,
+                    )
+                )
+                continue
             verdicts.append(
                 CriterionVerdict(
                     criterion_id=criterion.id,
@@ -142,6 +186,7 @@ def grade_requested_output_criteria(
                     reason_code="evidence_confirms",
                     evidence_ref=evidence_ref,
                     **trace_fields,
+                    evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
                 )
             )
             continue
@@ -152,6 +197,7 @@ def grade_requested_output_criteria(
                     state="unsatisfied",
                     reason_code="evidence_contradicts",
                     evidence_ref=evidence_ref,
+                    evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
                     missing_evidence=(
                         f"run output included output.{path} but it did not match the expected value"
                         if expected_value is not None
@@ -173,6 +219,47 @@ def grade_requested_output_criteria(
     return verdicts
 
 
+def _evidence_source_for_ref(
+    output_sources: Mapping[str, EvidenceSourceKind],
+    evidence_ref: str | None,
+) -> EvidenceSourceKind | None:
+    label = _evidence_ref_label(evidence_ref)
+    return output_sources.get(label) if label else None
+
+
+def _evidence_ref_label(evidence_ref: str | None) -> str | None:
+    if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
+        return None
+    return evidence_ref.removeprefix("block_outputs:").split(".", 1)[0]
+
+
+def _independent_evidence_text_refutation(
+    block_outputs: Mapping[str, Any],
+    output_sources: Mapping[str, EvidenceSourceKind],
+    path: str,
+    expected_value: str,
+    projection_roots: set[str],
+) -> tuple[str, EvidenceSourceKind] | None:
+    parts = _path_parts(path)
+    for label, payload in block_outputs.items():
+        source = output_sources.get(label)
+        if source != "independent_page_evidence" or not isinstance(payload, Mapping):
+            continue
+        evidence_text = payload.get("evidence_text")
+        if not isinstance(evidence_text, str) or not _expected_value_in_text(evidence_text, expected_value):
+            continue
+        values, _source_path = _runtime_path_values(payload, parts, path, projection_roots)
+        if values and not any(_value_matches_expected(value, expected_value) for value in values):
+            return f"block_outputs:{label}.evidence_text", source
+    return None
+
+
+def _expected_value_in_text(text: str, expected: str) -> bool:
+    observed = _normalized_expected_text(text)
+    target = _normalized_expected_text(expected)
+    return bool(target) and (target in observed or _compact_expected_text(target) in _compact_expected_text(observed))
+
+
 def _criterion_grounding_mode(criterion: CompletionCriterion) -> Literal["exact_value", "shape", "missing"]:
     if criterion.expected_output_value is not None:
         return "exact_value"
@@ -187,6 +274,7 @@ def _criterion_trace_fields(criterion: CompletionCriterion, grounding_mode: str)
         "grounding_mode": grounding_mode,
         "expected_output_shape": criterion.expected_output_shape,
         "has_exact_value": criterion.expected_output_value is not None,
+        "requested_output_evidence_source": criterion.requested_output_evidence_source,
     }
 
 
@@ -375,16 +463,21 @@ def _runtime_output_path_match(
     if not parts or expected_value is None:
         return "missing", None
     contradicted_ref: str | None = None
+    satisfied_ref: str | None = None
     for label, payload in block_outputs.items():
         values, source_path = _runtime_path_values(payload, parts, path, projection_roots or set())
         if not values:
             continue
         evidence_ref = f"block_outputs:{label}.{source_path}"
+        if any(not _value_matches_expected(value, expected_value) for value in values):
+            contradicted_ref = contradicted_ref or evidence_ref
+            continue
         if any(_value_matches_expected(value, expected_value) for value in values):
-            return "satisfied", evidence_ref
-        contradicted_ref = contradicted_ref or evidence_ref
+            satisfied_ref = satisfied_ref or evidence_ref
     if contradicted_ref is not None:
         return "contradicted", contradicted_ref
+    if satisfied_ref is not None:
+        return "satisfied", satisfied_ref
     return "missing", None
 
 
