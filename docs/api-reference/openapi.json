@@ -10229,6 +10229,7 @@
             ],
             "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
             "examples": [
+              "skyvern",
               "custom",
               "azure_vault",
               "bitwarden"
@@ -24059,6 +24060,11 @@
             "title": "Adaptive Caching",
             "default": false
           },
+          "enable_self_healing": {
+            "type": "boolean",
+            "title": "Enable Self Healing",
+            "default": false
+          },
           "code_version": {
             "anyOf": [
               {
@@ -24140,6 +24146,11 @@
               }
             ],
             "title": "Edited By"
+          },
+          "copilot_authored": {
+            "type": "boolean",
+            "title": "Copilot Authored",
+            "default": false
           },
           "created_at": {
             "type": "string",
@@ -24382,6 +24393,17 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "enable_self_healing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Self Healing"
           },
           "code_version": {
             "anyOf": [
