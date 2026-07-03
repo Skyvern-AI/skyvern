@@ -78,6 +78,43 @@ def test_truncate_dict_preserves_value_types_when_under_per_key_budget() -> None
     assert isinstance(result["small_str"], str)
 
 
+def test_truncate_dict_under_total_budget_preserves_uneven_value() -> None:
+    import json
+
+    from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
+    from skyvern.utils.token_counter import count_tokens
+
+    # A dict that fits the total budget but has one value larger than
+    # max_tokens / num_keys. It must pass through unchanged, exactly like the
+    # str and list branches — not get its list value cropped and coerced into a
+    # truncated, invalid-JSON string.
+    value = {
+        "results": [{"id": i, "name": f"row{i}"} for i in range(40)],
+        "summary": "ok",
+    }
+    total_tokens = count_tokens(json.dumps(value, default=str))
+    result = truncate_previous_extracted_information(value, max_tokens=total_tokens + 50)
+    assert result == value
+    assert isinstance(result["results"], list)
+    assert len(result["results"]) == 40
+
+
+def test_truncate_empty_list_stays_a_list() -> None:
+    from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
+
+    result = truncate_previous_extracted_information([], max_tokens=100)
+    assert result == []
+    assert isinstance(result, list)
+
+
+def test_truncate_empty_dict_stays_a_dict() -> None:
+    from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
+
+    result = truncate_previous_extracted_information({}, max_tokens=100)
+    assert result == {}
+    assert isinstance(result, dict)
+
+
 def test_truncate_respects_default_budget() -> None:
     from skyvern.utils.prompt_truncation import PREVIOUS_EXTRACTED_INFO_MAX_TOKENS
 
