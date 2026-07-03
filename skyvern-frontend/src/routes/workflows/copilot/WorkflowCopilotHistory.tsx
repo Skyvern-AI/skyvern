@@ -11,6 +11,11 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { Skeleton } from "@/components/ui/skeleton";
 import { handleInfiniteScroll } from "@/util/utils";
 import { compactLocalDateTime } from "@/util/timeFormat";
@@ -23,6 +28,8 @@ interface WorkflowCopilotHistoryProps {
   currentChatId: string | null;
   onSelect: (chat: WorkflowCopilotChatSummary) => void;
   disabled?: boolean;
+  // Icon-only trigger (narrow pane headers); the label moves to a tooltip.
+  compact?: boolean;
 }
 
 interface WorkflowCopilotHistoryContentProps {
@@ -138,6 +145,7 @@ function WorkflowCopilotHistory({
   currentChatId,
   onSelect,
   disabled = false,
+  compact = false,
 }: WorkflowCopilotHistoryProps) {
   const [open, setOpen] = useState(false);
 
@@ -154,19 +162,38 @@ function WorkflowCopilotHistory({
     onSelect(chat);
   }
 
+  const trigger = (
+    <PopoverTrigger asChild>
+      <button
+        type="button"
+        disabled={disabled}
+        aria-label="History"
+        onMouseDown={(e) => e.stopPropagation()}
+        className={
+          compact
+            ? "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+            : "flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+        }
+      >
+        <CounterClockwiseClockIcon
+          className={compact ? "h-3.5 w-3.5" : "h-3 w-3"}
+          aria-hidden="true"
+        />
+        {compact ? null : "History"}
+      </button>
+    </PopoverTrigger>
+  );
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          onMouseDown={(e) => e.stopPropagation()}
-          className="flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-        >
-          <CounterClockwiseClockIcon className="h-3 w-3" aria-hidden="true" />
-          History
-        </button>
-      </PopoverTrigger>
+      {compact ? (
+        <Tooltip>
+          <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+          <TooltipContent side="bottom">History</TooltipContent>
+        </Tooltip>
+      ) : (
+        trigger
+      )}
       <PopoverContent
         className="w-80 p-0"
         align="end"

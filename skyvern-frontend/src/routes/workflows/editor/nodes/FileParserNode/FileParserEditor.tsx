@@ -37,6 +37,7 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
   { value: "pdf", label: "PDF" },
   { value: "image", label: "Image" },
   { value: "docx", label: "DOCX" },
+  { value: "zip", label: "ZIP" },
 ];
 
 const FILE_EXTENSION_TO_TYPE: Record<string, FileParserFileType> = {
@@ -50,6 +51,7 @@ const FILE_EXTENSION_TO_TYPE: Record<string, FileParserFileType> = {
   gif: "image",
   webp: "image",
   docx: "docx",
+  zip: "zip",
 };
 
 function detectFileTypeFromUrl(url: string): FileParserFileType | null {

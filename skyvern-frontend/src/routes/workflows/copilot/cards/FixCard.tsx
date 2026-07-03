@@ -47,7 +47,7 @@ export function FixCard({ turn, onFix, onExplain }: FixCardProps) {
         <button
           type="button"
           onClick={onFix}
-          className="rounded-md bg-studio-accent px-3 py-1 text-xs font-medium text-foreground hover:bg-studio-accent/90"
+          className="rounded-md bg-cta px-3 py-1 text-xs font-medium text-cta-foreground hover:bg-cta-hover"
         >
           Fix with Copilot
         </button>

@@ -1,6 +1,7 @@
 import { useEffect } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
+import { toReadableSearch } from "@/routes/workflows/studio/panes";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 
 /**
@@ -10,7 +11,8 @@ import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
  * A's filter into B's URL before B's init lands.
  */
 export function useCacheKeyValueUrlSync(ready: boolean): void {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const cacheKeyValue = useCacheKeyValueStore((s) => s.cacheKeyValue);
   const isExplicit = useCacheKeyValueStore((s) => s.isExplicit);
 
@@ -21,14 +23,9 @@ export function useCacheKeyValueUrlSync(ready: boolean): void {
 
     if (!isExplicit) {
       if (currentUrlValue !== null) {
-        setSearchParams(
-          (prev) => {
-            const newParams = new URLSearchParams(prev);
-            newParams.delete("cache-key-value");
-            return newParams;
-          },
-          { replace: true },
-        );
+        const newParams = new URLSearchParams(searchParams);
+        newParams.delete("cache-key-value");
+        navigate({ search: toReadableSearch(newParams) }, { replace: true });
       }
       return;
     }
@@ -36,18 +33,13 @@ export function useCacheKeyValueUrlSync(ready: boolean): void {
     const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
 
     if (currentUrlValue !== targetValue) {
-      setSearchParams(
-        (prev) => {
-          const newParams = new URLSearchParams(prev);
-          if (cacheKeyValue === "") {
-            newParams.delete("cache-key-value");
-          } else {
-            newParams.set("cache-key-value", cacheKeyValue);
-          }
-          return newParams;
-        },
-        { replace: true },
-      );
+      const newParams = new URLSearchParams(searchParams);
+      if (cacheKeyValue === "") {
+        newParams.delete("cache-key-value");
+      } else {
+        newParams.set("cache-key-value", cacheKeyValue);
+      }
+      navigate({ search: toReadableSearch(newParams) }, { replace: true });
     }
-  }, [ready, cacheKeyValue, isExplicit, searchParams, setSearchParams]);
+  }, [ready, cacheKeyValue, isExplicit, searchParams, navigate]);
 }

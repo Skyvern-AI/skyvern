@@ -43,6 +43,7 @@ function HttpRequestBlockFormBody({
       parameterKeys: data.parameterKeys,
       downloadFilename: data.downloadFilename,
       saveResponseAsFile: data.saveResponseAsFile,
+      secretResponsePaths: data.secretResponsePaths ?? [],
       continueOnFailure: data.continueOnFailure,
     }),
     [
@@ -56,6 +57,7 @@ function HttpRequestBlockFormBody({
       data.parameterKeys,
       data.downloadFilename,
       data.saveResponseAsFile,
+      data.secretResponsePaths,
       data.continueOnFailure,
     ],
   );

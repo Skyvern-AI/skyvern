@@ -7,9 +7,9 @@ import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 import { liveSearch } from "./liveSearch";
 
 /**
- * One-time callout beside the spine teaching that tabs open side-by-side
- * panes. Suppressed on deep-linked visits (a shared run link is the wrong
- * moment to teach layout); the first pane toggle also dismisses it for good.
+ * One-time callout under the top bar's pane toggles teaching that they open
+ * side-by-side panes. Suppressed on deep-linked visits (a shared run link is
+ * the wrong moment to teach layout); the first pane toggle also dismisses it.
  */
 export function StudioCoachMark() {
   const coachMarkSeen = useStudioFirstRunStore((s) => s.coachMarkSeen);
@@ -30,16 +30,16 @@ export function StudioCoachMark() {
     <div
       role="note"
       aria-label="Studio panes tip"
-      className="absolute left-3 top-8 z-50 w-64 rounded-md border bg-popover p-3 text-popover-foreground shadow-md duration-200 motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-left-2"
+      className="absolute left-1/2 top-3 z-50 w-64 -translate-x-1/2 rounded-md border bg-popover p-3 text-popover-foreground shadow-md duration-200 motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-2"
     >
       <span
         aria-hidden
-        className="absolute -left-1 top-5 size-2 rotate-45 border-b border-l bg-popover"
+        className="absolute -top-1 left-1/2 size-2 -translate-x-1/2 rotate-45 border-l border-t bg-popover"
       />
       <p className="text-xs font-medium">Panes open side by side</p>
       <p className="mt-1 text-xs text-muted-foreground">
-        Each tab on this rail toggles a pane, so you can watch the browser while
-        you edit, or keep Copilot next to a run.
+        Each toggle in the top bar opens a pane, so you can watch the browser
+        while you edit, or keep Copilot next to a run.
       </p>
       <Button
         variant="secondary"
