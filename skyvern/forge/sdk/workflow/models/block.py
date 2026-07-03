@@ -3782,8 +3782,81 @@ class CodeBlock(Block):
             "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
             "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
+            "NameError": NameError,
             "otp": _code_block_otp_builtin,
         }
+
+    @staticmethod
+    def _extract_target_names(target: ast.AST, names: set[str]) -> None:
+        """Recursively extract Name identifiers from an assignment target."""
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                CodeBlock._extract_target_names(elt, names)
+        elif isinstance(target, ast.Starred):
+            CodeBlock._extract_target_names(target.value, names)
+
+    @staticmethod
+    def _extract_assigned_names(code: str) -> set[str]:
+        """Extract variable names assigned in user code for explicit return capture.
+
+        Analyzes the AST to find all assigned variable names at the function-scope
+        level (not inside nested functions/classes). This replaces the use of
+        locals() for variable capture, eliminating a sandbox-escape vector.
+
+        Covers: simple assignment, annotated assignment, augmented assignment,
+        for/asyncio loop targets, with/as targets, except-as targets, and
+        walrus-operator targets. Variables that may not exist at return time
+        (conditional branches) are handled at runtime via try/except NameError.
+        """
+        tree = ast.parse(code)
+
+        nested_ids: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node is not tree:
+                    for child in ast.walk(node):
+                        nested_ids.add(id(child))
+
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if id(node) in nested_ids:
+                continue
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    CodeBlock._extract_target_names(target, names)
+            elif isinstance(node, ast.AnnAssign):
+                CodeBlock._extract_target_names(node.target, names)
+            elif isinstance(node, ast.AugAssign):
+                CodeBlock._extract_target_names(node.target, names)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                CodeBlock._extract_target_names(node.target, names)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars:
+                        CodeBlock._extract_target_names(item.optional_vars, names)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.NamedExpr):
+                CodeBlock._extract_target_names(node.target, names)
+
+        return names
+
+    @staticmethod
+    def _build_capture_return_code(var_names: set[str]) -> str:
+        """Build a return statement that captures assigned variables without using locals().
+
+        Uses try/except NameError for each variable so that conditionally-assigned
+        variables (e.g. assigned inside an if-block) do not crash the function.
+        """
+        if not var_names:
+            return "return {}"
+        lines = ["__captured: dict[str, object] = {}"]
+        for name in sorted(var_names):
+            lines.append(f"try:\n    __captured[{name!r}] = {name}\nexcept NameError:\n    pass")
+        lines.append("return __captured")
+        return "\n".join(lines)
 
     def generate_async_user_function(
         self, code: str, page: Page | RecordingPage, parameters: dict[str, Any] | None = None
@@ -3791,6 +3864,10 @@ class CodeBlock(Block):
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
         self.is_safe_code(code)
+        # Extract assigned names from raw (un-indented) code — ast.parse() rejects
+        # module-level leading whitespace.
+        assigned_names = self._extract_assigned_names(code)
+        capture_return = self._build_capture_return_code(assigned_names)
         code = textwrap.indent(textwrap.dedent(code), "    ")
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
@@ -3805,10 +3882,9 @@ class CodeBlock(Block):
         full_code = f"""
 async def wrapper({default_args}):
 {code}
-    return __capture_locals()
+{textwrap.indent(capture_return, "    ")}
 """
         safe_vars["page"] = page
-        safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
         # Compile under a recognizable filename so tracebacks map back to user code lines.
         compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
@@ -3822,7 +3898,7 @@ async def wrapper({default_args}):
         async def filtered_user_function() -> dict[str, Any]:
             result: Any = await user_function()
             # An explicit `return <non-dict>` in user code yields that value directly,
-            # not the __capture_locals() dict; only the implicit dict needs the injected
+            # not the implicit capture dict; only the implicit dict needs the injected
             # parameter keys stripped. SKY-10789: this guard avoids result.items() on a list.
             if not isinstance(result, dict):
                 return result
