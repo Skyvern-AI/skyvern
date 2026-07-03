@@ -22,6 +22,7 @@ import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
+import { RunPaneActions, RunPaneStatusBadge } from "./runview/RunPaneHeader";
 import { StudioBrowserStream } from "./StudioBrowserStream";
 import { StudioCoachMark } from "./StudioCoachMark";
 import { studioPanelId, studioTabId } from "./constants";
@@ -315,7 +316,11 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <BrowserTab />
             </StudioPane>
-            <StudioPane {...paneProps("run")}>
+            <StudioPane
+              {...paneProps("run")}
+              headerExtras={<RunPaneStatusBadge />}
+              headerActions={<RunPaneActions />}
+            >
               <RunTab />
             </StudioPane>
             {panes.length === 0 ? <StudioStageLauncher /> : null}

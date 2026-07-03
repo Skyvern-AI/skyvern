@@ -9,6 +9,7 @@ import {
   isWorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "@/routes/workflows/types/workflowRunTypes";
+import { useRunViewStore } from "@/store/RunViewStore";
 
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
@@ -67,6 +68,9 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
   const [searchParams] = useSearchParams();
   const activeParam = searchParams.get("active");
+  // The Run pane's loop-iteration selection isn't in the URL; read it from the
+  // shared store so a selected iteration's screenshot resolves here too.
+  const activeIteration = useRunViewStore((s) => s.activeIteration);
 
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   const running = outcome === "running";
@@ -114,7 +118,7 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
       const screenshotBlockId = resolveScreenshotBlockId(
         timeline ?? [],
         activeItem,
-        null,
+        activeIteration,
       );
       const blockType =
         findTimelineBlock(timeline ?? [], screenshotBlockId)?.block_type ??
@@ -130,7 +134,7 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
       return { kind: "thought", thoughtId: activeItem.thought_id };
     }
     return null;
-  }, [activeItem, timeline]);
+  }, [activeItem, timeline, activeIteration]);
 
   const hasScreenshotFrame = useMemo(
     () =>
