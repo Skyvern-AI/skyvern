@@ -491,6 +491,7 @@ class FileType(StrEnum):
     PDF = "pdf"
     IMAGE = "image"
     DOCX = "docx"
+    ZIP = "zip"
 
 
 class PDFFormat(StrEnum):
