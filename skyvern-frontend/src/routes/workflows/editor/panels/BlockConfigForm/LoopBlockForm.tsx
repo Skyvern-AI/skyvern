@@ -23,27 +23,39 @@ function LoopBlockFormBody({
   node: LoopNode;
 }) {
   const {
+    loopKind,
     loopVariableReference,
     dataSchema,
     completeIfEmpty,
     continueOnFailure,
     nextLoopOnFailure,
+    whileConditionExpression,
+    whileConditionCriteriaType,
+    whileConditionDescription,
   } = node.data;
 
   const value = useMemo(
     () => ({
+      loopKind,
       loopVariableReference,
       dataSchema,
       completeIfEmpty,
       continueOnFailure,
       nextLoopOnFailure,
+      whileConditionExpression,
+      whileConditionCriteriaType,
+      whileConditionDescription,
     }),
     [
+      loopKind,
       loopVariableReference,
       dataSchema,
       completeIfEmpty,
       continueOnFailure,
       nextLoopOnFailure,
+      whileConditionExpression,
+      whileConditionCriteriaType,
+      whileConditionDescription,
     ],
   );
   const { commit } = useDebouncedSidebarSave({
