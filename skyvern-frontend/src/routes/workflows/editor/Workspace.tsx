@@ -91,6 +91,8 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
 import { BrowserStream } from "@/components/BrowserStream";
+import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
+import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
@@ -169,6 +171,7 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
@@ -1241,6 +1244,63 @@ function Workspace({
     [setNodes, setEdges, blockLabel],
   );
 
+  useApplyRecordedBlocks({
+    // Recording runs in the debugger (build + showBrowser), not only on /edit.
+    enabled: !workflowPanelState.data?.showComparison,
+    nodes,
+    edges,
+    doLayout,
+  });
+
+  // Studio entry point for recording: the Browser-tab Record button lives outside
+  // the canvas, so the canvas-aware Workspace registers a launcher that resolves
+  // the append-at-end insertion point (the trailing top-level NodeAdder, same as
+  // clicking its "+") and starts recording. MVP only appends at the end.
+  const setStartRecordingAtEnd = useRecordingLauncherStore(
+    (s) => s.setStartRecordingAtEnd,
+  );
+  // Stable action ref (vs the whole-store `recordingStore` object, which gets a
+  // new reference on every store write and would re-register the launcher).
+  const setIsRecording = useRecordingStore((s) => s.setIsRecording);
+  const startRecordingAtEnd = useCallback(() => {
+    const currentNodes = getNodes() as Array<AppNode>;
+    const currentEdges = getEdges();
+    const trailingAdder = currentNodes.find(
+      (node) => node.type === "nodeAdder" && !node.parentId,
+    );
+    const incomingEdge = trailingAdder
+      ? currentEdges.find((edge) => edge.target === trailingAdder.id)
+      : undefined;
+    setWorkflowPanelState({
+      active: false,
+      content: "nodeLibrary",
+      data: {
+        previous: incomingEdge?.source ?? null,
+        next: trailingAdder?.id ?? null,
+        parent: undefined,
+        connectingEdgeType: "default",
+      },
+    });
+    setIsRecording(true, {
+      workflowPermanentId: workflowPermanentId ?? null,
+      browserSessionId: liveBrowserSessionId,
+    });
+  }, [
+    getNodes,
+    getEdges,
+    setWorkflowPanelState,
+    setIsRecording,
+    workflowPermanentId,
+    liveBrowserSessionId,
+  ]);
+  useEffect(() => {
+    if (!embedded) {
+      return;
+    }
+    setStartRecordingAtEnd(startRecordingAtEnd);
+    return () => setStartRecordingAtEnd(null);
+  }, [embedded, startRecordingAtEnd, setStartRecordingAtEnd]);
+
   // Listen for conditional branch changes to trigger re-layout
   useEffect(() => {
     const handleBranchChange = () => {
@@ -2189,7 +2249,7 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code, infinite canvas, and block runs */}
+            {/* code + canvas; recording overlays the panel without unmounting FlowRenderer */}
             <div className="relative h-full w-full">
               <div
                 className={cn(
@@ -2201,7 +2261,9 @@ function Workspace({
                   {
                     "translate-x-0": showAllCode,
                   },
+                  recordingStore.isRecording && "pointer-events-none invisible",
                 )}
+                aria-hidden={recordingStore.isRecording}
                 ref={dom.splitLeft}
               >
                 {/* code */}
@@ -2261,6 +2323,14 @@ function Workspace({
                   )}
                 </div>
               </div>
+              {/* In Studio (embedded) the shell owns the single RecordingPanel
+                  in the copilot pane; rendering one here too would mount two
+                  panels that each fire their own commit. */}
+              {!embedded && recordingStore.isRecording && (
+                <div className="absolute inset-0 z-20 h-full px-6 pb-4 pt-[8.5rem]">
+                  <RecordingPanel browserSessionId={liveBrowserSessionId} />
+                </div>
+              )}
             </div>
 
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-neutral-50 p-4 pl-6 dark:bg-background">
@@ -2327,13 +2397,19 @@ function Workspace({
                             }}
                           />
                         )
-                      ) : isFlowCanvasReady ? (
+                      ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserStream
                           key={liveBrowserSessionId}
-                          exfiltrate={recordingStore.isRecording}
+                          exfiltrate={
+                            recordingStore.isRecording &&
+                            !recordingStore.finishRequested
+                          }
                           interactive={true}
                           browserSessionId={liveBrowserSessionId}
                           showControlButtons={true}
+                          // The recording panel overlays the canvas whenever a
+                          // recording is live here, so the REC pill is redundant.
+                          hideRecordingIndicator={true}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={!!workflowRun && !isFinalized}
                           onReadyChange={handleLiveBrowserReadyChange}
@@ -2416,7 +2492,7 @@ function Workspace({
                             }}
                           />
                         )
-                      ) : isFlowCanvasReady ? (
+                      ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserSessionStream
                           browserSessionId={liveBrowserSessionId}
                           interactive={true}

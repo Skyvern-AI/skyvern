@@ -80,10 +80,14 @@ const mocks = vi.hoisted(() => {
 
   const recordingStore = {
     add: vi.fn(),
+    addScreenshot: vi.fn(),
+    applyInterpretationUpdate: vi.fn(),
     compressedChunks: [],
+    draftEditDepth: 0,
     getEventCount: vi.fn(() => 0),
     getSecondsRecording: vi.fn(() => 0),
     isRecording: false,
+    manualCapturePaused: false,
     pendingEvents: [],
     reset: vi.fn(),
     setIsRecording: vi.fn(),
@@ -120,9 +124,22 @@ vi.mock("@/store/SettingsStore", () => ({
   useSettingsStore: () => mocks.settingsStore,
 }));
 
-vi.mock("@/store/useRecordingStore", () => ({
-  useRecordingStore: () => mocks.recordingStore,
-}));
+vi.mock("@/store/useRecordingStore", () => {
+  // Honor the selector: BrowserStream reads slices (e.g. state.isRecording) via
+  // useRecordingStore(selector). Ignoring the selector and returning the whole
+  // store makes primitive selectors yield the store object instead of the field
+  // value — truthy where a boolean was expected — spuriously rendering the
+  // recording UI.
+  const useRecordingStore = (
+    selector?: (state: typeof mocks.recordingStore) => unknown,
+  ) => (selector ? selector(mocks.recordingStore) : mocks.recordingStore);
+  // Also read imperatively (reset/addScreenshot/etc.) via getState().
+  useRecordingStore.getState = () => mocks.recordingStore;
+  return {
+    useRecordingStore,
+    countVisibleDraftSteps: (steps: Array<unknown> = []) => steps.length,
+  };
+});
 
 function renderBrowserStream(props: { onActivity?: () => void } = {}) {
   const queryClient = new QueryClient({

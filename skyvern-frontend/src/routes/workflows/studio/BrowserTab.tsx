@@ -30,6 +30,8 @@ import {
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useStudioShellContext } from "./StudioShellContext";
@@ -55,6 +57,11 @@ export function BrowserTab() {
 
   const streamUrl = useStudioBrowserStore((s) => s.streamUrl);
   const reload = useStudioBrowserStore((s) => s.reload);
+  const isRecording = useRecordingStore((s) => s.isRecording);
+  const manualCapturePaused = useRecordingStore((s) => s.manualCapturePaused);
+  const startRecordingAtEnd = useRecordingLauncherStore(
+    (s) => s.startRecordingAtEnd,
+  );
   const [confirmOff, setConfirmOff] = useState(false);
 
   const cycleBrowser = useMutation({
@@ -106,6 +113,30 @@ export function BrowserTab() {
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
           {streamUrl || "Live browser"}
         </span>
+        {isRecording ? (
+          manualCapturePaused ? (
+            <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-500">
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              Paused
+            </span>
+          ) : (
+            <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-500">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-red-500" />
+              Recording
+            </span>
+          )
+        ) : (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="shrink-0 gap-1.5"
+            disabled={!browserSessionId || !startRecordingAtEnd}
+            onClick={() => startRecordingAtEnd?.()}
+          >
+            <span className="h-2 w-2 rounded-full bg-red-500" />
+            Record
+          </Button>
+        )}
         <button
           type="button"
           title="Reconnect"

@@ -1,9 +1,22 @@
-import { useLayoutEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
+import { useParams } from "react-router-dom";
 import { Cross2Icon } from "@radix-ui/react-icons";
 
+import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { cn } from "@/util/utils";
+
+import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
@@ -93,8 +106,15 @@ export function StudioShell(props: StudioWorkspaceProps) {
 }
 
 function StudioStage(props: StudioWorkspaceProps) {
-  const { panes, closePane } = useStudioPanes();
+  const { panes, closePane, openPane } = useStudioPanes();
   const { registerStageElement } = useStudioPaneDefaults();
+  const { workflowPermanentId } = useParams();
+  const isRecording = useRecordingStore((s) => s.isRecording);
+  const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+    enabled: false,
+  });
+  const browserSessionId = debugSession?.browser_session_id ?? null;
   const pipMinimized = useStudioShellStore((s) => s.pipMinimized);
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
@@ -166,6 +186,35 @@ function StudioStage(props: StudioWorkspaceProps) {
     document.getElementById(studioTabId(id))?.focus();
   };
 
+  // Recording lives in the Browser pane (the live stream is there) with the
+  // live-drafts panel taking over the Copilot pane. Once a commit is in flight
+  // or its blocks are landing, reveal the Editor pane (it shows the loading
+  // overlay). Gated on lifecycle transitions so manual pane changes made
+  // mid-recording are preserved.
+  const isCommitting = useRecordingStore((s) => s.isCommitting);
+  const recordedBlocksPending = useRecordedBlocksStore(
+    (s) => (s.blocks?.length ?? 0) > 0,
+  );
+  const processingRecording = isCommitting || recordedBlocksPending;
+  const prevIsRecordingRef = useRef(false);
+  const prevProcessingRef = useRef(false);
+  useEffect(() => {
+    const wasRecording = prevIsRecordingRef.current;
+    const wasProcessing = prevProcessingRef.current;
+    if (processingRecording && !wasProcessing) {
+      openPane("editor");
+    } else if (isRecording && !wasRecording) {
+      // Recording or finalizing → live browser + drafts.
+      openPane("copilot");
+      openPane("browser");
+    } else if (!isRecording && wasRecording && !processingRecording) {
+      // Recording ended (commit or discard) → back to the canvas.
+      openPane("editor");
+    }
+    prevIsRecordingRef.current = isRecording;
+    prevProcessingRef.current = processingRecording;
+  }, [isRecording, processingRecording, openPane]);
+
   const paneProps = (id: StudioPaneId) => {
     const index = panes.indexOf(id);
     return {
@@ -190,9 +239,23 @@ function StudioStage(props: StudioWorkspaceProps) {
             className="relative flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden p-3"
           >
             <StudioPane {...paneProps("copilot")}>
-              {/* Copilot portal target. Kept mounted while the pane is closed so
-                  an in-flight Copilot turn isn't torn down. */}
-              <div ref={setCopilotPortalEl} className="h-full w-full" />
+              <div className="relative h-full w-full">
+                {/* Copilot portal target. Kept mounted while the pane is closed
+                    — or while recording, when the live-drafts panel covers it —
+                    so an in-flight Copilot turn isn't torn down. */}
+                <div
+                  ref={setCopilotPortalEl}
+                  className={cn(
+                    "h-full w-full",
+                    isRecording && "pointer-events-none",
+                  )}
+                />
+                {isRecording && browserSessionId ? (
+                  <div className="absolute inset-0 duration-150 animate-in fade-in slide-in-from-left-2">
+                    <RecordingPanel browserSessionId={browserSessionId} />
+                  </div>
+                ) : null}
+              </div>
             </StudioPane>
             <StudioPane {...paneProps("editor")}>
               <EditorTab {...props} />
