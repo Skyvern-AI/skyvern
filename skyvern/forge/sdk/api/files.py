@@ -225,15 +225,15 @@ async def download_file(
                 else:
                     download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
-                # Determine filename - use provided filename or derive from response/URL
-                file_name = _determine_download_filename(filename, dict(response.headers), url)
                 download_dir_resolved = download_dir_path.resolve()
-                file_path = (download_dir_path / file_name).resolve()
+                temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
+                file_path = Path(temp_file.name).resolve()
                 if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
-                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                    temp_file.close()
+                    raise ValueError("Unsafe temporary file path created for download")
 
-                LOG.info(f"Downloading file to {file_path}")
-                with file_path.open("wb") as f:
+                LOG.info("Downloading file to temporary path", file_path=str(file_path))
+                with temp_file as f:
                     # Write the content of the request into the file
                     total_bytes_downloaded = 0
                     async for chunk in response.content.iter_chunked(1024):
