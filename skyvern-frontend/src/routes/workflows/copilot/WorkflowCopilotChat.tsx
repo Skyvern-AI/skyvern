@@ -20,6 +20,7 @@ import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -805,6 +806,32 @@ export function WorkflowCopilotChat({
     },
     [loadChatInPlace],
   );
+
+  // Hand the studio's Copilot pane header its History/New-chat controls.
+  // Stable wrappers over refs keep the registration limited to value changes.
+  const headerHandlersRef = useRef({ handleSelectHistoryChat, handleNewChat });
+  headerHandlersRef.current = { handleSelectHistoryChat, handleNewChat };
+  const headerControlsDisabled = isLoading || isLoadingHistory;
+  useEffect(() => {
+    if (!docked) {
+      return;
+    }
+    const store = useCopilotHeaderStore.getState();
+    store.setControls({
+      workflowPermanentId,
+      currentChatId: workflowCopilotChatId,
+      onSelectChat: (chat) =>
+        headerHandlersRef.current.handleSelectHistoryChat(chat),
+      onNewChat: () => headerHandlersRef.current.handleNewChat(),
+      disabled: headerControlsDisabled,
+    });
+    return () => store.setControls(null);
+  }, [
+    docked,
+    workflowPermanentId,
+    workflowCopilotChatId,
+    headerControlsDisabled,
+  ]);
 
   const applyWorkflowUpdate = useCallback(
     (
@@ -2085,61 +2112,62 @@ export function WorkflowCopilotChat({
             }
       }
     >
-      {/* Header */}
-      <div
-        className={
-          "flex items-center border-b border-border px-4" +
-          (docked
-            ? chromeless
-              ? " h-11 shrink-0 justify-end"
-              : " h-14 shrink-0 justify-between"
-            : " cursor-move justify-between py-2")
-        }
-        onMouseDown={docked ? undefined : handleMouseDown}
-      >
-        {chromeless ? null : (
+      {/* Header. The studio (chromeless) hosts History/New chat in its
+          Copilot pane header via useCopilotHeaderStore — no row here. */}
+      {chromeless ? null : (
+        <div
+          className={
+            "flex items-center border-b border-border px-4" +
+            (docked
+              ? " h-14 shrink-0 justify-between"
+              : " cursor-move justify-between py-2")
+          }
+          onMouseDown={docked ? undefined : handleMouseDown}
+        >
+          {chromeless ? null : (
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground">
+                {docked ? "Copilot" : "Agent Copilot (Beta)"}
+              </h3>
+              {docked ? (
+                <span className="rounded bg-slate-elevation3 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Beta
+                </span>
+              ) : null}
+            </div>
+          )}
           <div className="flex items-center gap-2">
-            <h3 className="text-sm font-semibold text-foreground">
-              {docked ? "Copilot" : "Agent Copilot (Beta)"}
-            </h3>
-            {docked ? (
-              <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
-                Beta
-              </span>
-            ) : null}
-          </div>
-        )}
-        <div className="flex items-center gap-2">
-          <WorkflowCopilotHistory
-            workflowPermanentId={workflowPermanentId}
-            currentChatId={workflowCopilotChatId}
-            onSelect={handleSelectHistoryChat}
-            disabled={isLoading || isLoadingHistory}
-          />
-          <button
-            type="button"
-            onClick={handleNewChat}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            New chat
-          </button>
-          <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
-          <span className="text-xs text-muted-foreground">Active</span>
-          {/* Only the floating window closes itself; docked chrome is external. */}
-          {docked ? null : (
+            <WorkflowCopilotHistory
+              workflowPermanentId={workflowPermanentId}
+              currentChatId={workflowCopilotChatId}
+              onSelect={handleSelectHistoryChat}
+              disabled={isLoading || isLoadingHistory}
+            />
             <button
               type="button"
-              onClick={() => onClose?.()}
+              onClick={handleNewChat}
               onMouseDown={(e) => e.stopPropagation()}
-              className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-              title="Close"
+              className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             >
-              <Cross2Icon className="h-4 w-4" />
+              New chat
             </button>
-          )}
+            <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
+            <span className="text-xs text-muted-foreground">Active</span>
+            {/* Only the floating window closes itself; docked chrome is external. */}
+            {docked ? null : (
+              <button
+                type="button"
+                onClick={() => onClose?.()}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Close"
+              >
+                <Cross2Icon className="h-4 w-4" />
+              </button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Messages */}
       <div className="relative min-h-0 flex-1">

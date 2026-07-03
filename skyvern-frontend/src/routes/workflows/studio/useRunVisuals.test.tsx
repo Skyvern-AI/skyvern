@@ -139,7 +139,7 @@ describe("useRunVisuals loop-iteration threading", () => {
     });
   });
 
-  test("resolves the Timeline pane's selected iteration from the shared store", () => {
+  test("resolves the Overview pane's selected iteration from the shared store", () => {
     seedLoopRun();
     useRunViewStore.getState().pinFrame("wrb_loop", 1);
     const { result } = renderHook(() => useRunVisuals("wr_1"), { wrapper });

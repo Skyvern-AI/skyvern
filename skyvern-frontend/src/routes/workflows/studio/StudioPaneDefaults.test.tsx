@@ -24,7 +24,7 @@ function PanesProbe() {
   return (
     <div>
       <output data-testid="panes">{panes.join(",")}</output>
-      <button onClick={() => togglePane("timeline")}>toggle-timeline</button>
+      <button onClick={() => togglePane("overview")}>toggle-overview</button>
       <button onClick={() => openPane("editor")}>open-editor</button>
       <button onClick={() => openPane("browser")}>open-browser</button>
     </div>
@@ -90,14 +90,14 @@ describe("cold-entry default panes (the four contexts)", () => {
     expect(panesText()).toBe("copilot,browser,editor");
   });
 
-  test("a run in the URL lands on Copilot + Browser + Timeline", () => {
+  test("a run in the URL lands on Copilot + Browser + Overview", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
-    expect(panesText()).toBe("copilot,browser,timeline");
+    expect(panesText()).toBe("copilot,browser,overview");
   });
 
-  test("a block-run deep link lands on Editor + Browser + Timeline", () => {
+  test("a block-run deep link lands on Editor + Browser + Overview", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1&bl=block_1" });
-    expect(panesText()).toBe("editor,browser,timeline");
+    expect(panesText()).toBe("editor,browser,overview");
   });
 
   test("a blocks signal that changes after mount does not reshuffle the panes", () => {
@@ -118,9 +118,9 @@ describe("cold-entry default panes (the four contexts)", () => {
     expect(panesText()).toBe("browser");
   });
 
-  test("the pre-rename ?panes=run alias presents the Timeline pane", () => {
+  test("the pre-rename ?panes=run alias presents the Overview pane", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?panes=copilot,run" });
-    expect(panesText()).toBe("copilot,timeline");
+    expect(panesText()).toBe("copilot,overview");
   });
 
   test("toggling from the state default writes the default plus the change", () => {
@@ -132,7 +132,7 @@ describe("cold-entry default panes (the four contexts)", () => {
 
 describe("narrow-viewport clamp of shared links", () => {
   const FOUR_PANES =
-    "/workflows/wpid_1/studio?panes=copilot,editor,browser,timeline";
+    "/workflows/wpid_1/studio?panes=copilot,editor,browser,overview";
 
   test("an over-wide shared link degrades to its fitting prefix", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 600 });
@@ -141,18 +141,18 @@ describe("narrow-viewport clamp of shared links", () => {
 
   test("a wide viewport presents the shared link untouched", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 2000 });
-    expect(panesText()).toBe("copilot,editor,browser,timeline");
+    expect(panesText()).toBe("copilot,editor,browser,overview");
   });
 
   test("without a measurable stage the list is presented as-is", () => {
     renderStudio({ path: FOUR_PANES });
-    expect(panesText()).toBe("copilot,editor,browser,timeline");
+    expect(panesText()).toBe("copilot,editor,browser,overview");
   });
 
   test("the first pane write clears the clamp and builds on what is shown", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 600 });
-    fireEvent.click(screen.getByText("toggle-timeline"));
-    expect(panesText()).toBe("copilot,editor,timeline");
+    fireEvent.click(screen.getByText("toggle-overview"));
+    expect(panesText()).toBe("copilot,editor,overview");
   });
 });
 
@@ -162,9 +162,9 @@ describe("narrow-viewport nudge", () => {
       path: "/workflows/wpid_1/studio?panes=copilot,editor",
       stageWidth: 600,
     });
-    fireEvent.click(screen.getByText("toggle-timeline"));
+    fireEvent.click(screen.getByText("toggle-overview"));
     expect(toastMock).toHaveBeenCalledTimes(1);
-    expect(panesText()).toBe("copilot,editor,timeline");
+    expect(panesText()).toBe("copilot,editor,overview");
     fireEvent.click(screen.getByText("open-browser"));
     expect(toastMock).toHaveBeenCalledTimes(1);
     expect(useStudioFirstRunStore.getState().narrowNudgeSeen).toBe(true);
@@ -181,10 +181,10 @@ describe("narrow-viewport nudge", () => {
 
   test("closing a pane never nudges", () => {
     renderStudio({
-      path: "/workflows/wpid_1/studio?panes=copilot,timeline",
+      path: "/workflows/wpid_1/studio?panes=copilot,overview",
       stageWidth: 600,
     });
-    fireEvent.click(screen.getByText("toggle-timeline"));
+    fireEvent.click(screen.getByText("toggle-overview"));
     expect(panesText()).toBe("copilot");
     expect(toastMock).not.toHaveBeenCalled();
   });

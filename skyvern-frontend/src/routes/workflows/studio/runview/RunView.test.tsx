@@ -7,12 +7,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { RunPaneViewToggles } from "./RunPaneHeader";
 import { RunView } from "./RunView";
 
 const mocks = vi.hoisted(() => ({
@@ -51,6 +54,15 @@ vi.mock("@/components/ui/scroll-area", () => ({
 }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
+}));
+// The header toggles resolve the inspected run themselves; pin it to the same
+// run the RunView under test renders (avoids the latest-run fallback query).
+vi.mock("../useStudioInspectedRun", () => ({
+  useStudioInspectedRun: () => ({
+    runId: "wr_1",
+    explicit: true,
+    pending: false,
+  }),
 }));
 
 function buildBlock(
@@ -215,14 +227,24 @@ function renderRunView(
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  // Fresh elements per (re)render so React re-runs the mocked hooks; the
+  // component instances (and the MemoryRouter's URL state) are preserved.
+  const makeUi = () => (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[initialEntry]}>
-        <RunView workflowRunId="wr_1" {...props} />
+        {/* The toggles live in the pane header (StudioShell); render them
+            alongside the body, under a TooltipProvider, the way the shell
+            composes them. */}
+        <TooltipProvider delayDuration={0}>
+          <RunPaneViewToggles />
+          <RunView workflowRunId="wr_1" {...props} />
+        </TooltipProvider>
         <LocationSpy />
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const view = render(makeUi());
+  return { ...view, rerenderRunView: () => view.rerender(makeUi()) };
 }
 
 afterEach(() => {
@@ -233,6 +255,7 @@ afterEach(() => {
 });
 beforeEach(() => {
   useRunViewStore.getState().reset();
+  useRunPaneViewStore.getState().reset();
   useStudioBrowserStore.setState({ view: "auto" });
 });
 
@@ -247,12 +270,11 @@ describe("RunView view toggles", () => {
     expect(scope.queryAllByText("checkout-loop").length).toBeGreaterThan(0);
   });
 
-  test("Overview view shows the run stat blocks and metadata", () => {
+  test("the Timeline view leads with the summary meta line", () => {
     seedCompletedRun({
       total_steps: 12,
       credits_used: 3,
       cached_credits_used: 2,
-      webhook_callback_url: "https://example.test/hook",
     });
     mocks.timeline = [
       buildBlockItem(
@@ -265,27 +287,14 @@ describe("RunView view toggles", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    fireEvent.click(scope.getByRole("button", { name: "Overview" }));
-
-    expect(scope.getByText("Steps")).not.toBeNull();
-    expect(scope.getByText("12")).not.toBeNull();
-    expect(scope.getByText("Actions")).not.toBeNull();
-    // total credits = credits_used + cached_credits_used
-    expect(scope.getByText("5")).not.toBeNull();
+    // status · duration · run id — the counts live in the timeline's own
+    // header row, so the strip carries no stat boxes.
     expect(scope.getByText("wr_1")).not.toBeNull();
-    expect(scope.getByText("delivered")).not.toBeNull();
-  });
-
-  test("Overview reports a failed webhook delivery", () => {
-    seedCompletedRun({
-      webhook_callback_url: "https://example.test/hook",
-      webhook_failure_reason: "410 gone",
-    });
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    fireEvent.click(scope.getByRole("button", { name: "Overview" }));
-    expect(scope.getByText("failed")).not.toBeNull();
+    expect(
+      scope.getAllByText("completed", { exact: false }).length,
+    ).toBeGreaterThan(0);
+    expect(scope.queryByText("Steps")).toBeNull();
+    expect(scope.queryByText("Credits")).toBeNull();
   });
 
   test("Inputs view shows the run's input metadata", () => {
@@ -319,13 +328,136 @@ describe("RunView view toggles", () => {
     expect(scope.queryByTestId("code-generating-spinner")).not.toBeNull();
   });
 
-  test("hides the Inputs and Outputs toggles when the run has neither", () => {
+  test("Inputs and Outputs stay visible without data and show empty states", () => {
     seedCompletedRun();
     const { container } = renderRunView();
     const scope = within(container);
 
-    expect(scope.queryByRole("button", { name: "Inputs" })).toBeNull();
-    expect(scope.queryByRole("button", { name: "Outputs" })).toBeNull();
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("No inputs for this run")).not.toBeNull();
+
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+    expect(scope.getByText("No outputs for this run")).not.toBeNull();
+  });
+});
+
+describe("RunView cold-open selection", () => {
+  function seedTerminalRunWithActions() {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          label: "goto-block",
+          // Newest-first, matching the API; the filmstrip reverses per block.
+          actions: [
+            buildAction({ action_id: "act_2", action_order: 1 }),
+            buildAction({ action_id: "act_1", action_order: 0 }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  test("a terminal ?wr= deep link with no ?active= selects the last item", () => {
+    seedTerminalRunWithActions();
+    const { getByTestId } = renderRunView({}, "/?wr=wr_1");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
+    expect(getByTestId("location-search").textContent).toContain("active=");
+  });
+
+  test("an explicit ?active= deep link wins over the last-item default", () => {
+    seedTerminalRunWithActions();
+    renderRunView({}, "/?wr=wr_1&active=act_1");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
+  });
+
+  test("a still-running run keeps following the live edge", () => {
+    seedRunningRun();
+    renderRunView({}, "/?wr=wr_1");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+  });
+
+  test("a block-iterate link (?bl=) keeps its live surface unselected", () => {
+    seedTerminalRunWithActions();
+    renderRunView({}, "/?wr=wr_1&bl=goto-block");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+  });
+});
+
+describe("RunView live-watch terminal transition", () => {
+  function seedWatchedRun(status: Status) {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_1",
+          label: "goto-block",
+          // Newest-first, matching the API; the filmstrip reverses per block.
+          actions: [
+            buildAction({ action_id: "act_2", action_order: 1 }),
+            buildAction({ action_id: "act_1", action_order: 0 }),
+          ],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status,
+      browser_session_id: "pbs_1",
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  test("a watched run finishing lands the selection on the last item", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1");
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+
+    // The pin + ?active= hand the Browser pane's auto view to the machine,
+    // which resolves scrubbing to Screenshots on the final item.
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
+    expect(view.getByTestId("location-search").textContent).toContain(
+      "active=act_2",
+    );
+    expect(useStudioBrowserStore.getState().view).toBe("auto");
+  });
+
+  test("a view pill pinned mid-watch is never overridden at run end", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1");
+    useStudioBrowserStore.getState().setView("recording");
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(useStudioBrowserStore.getState().view).toBe("recording");
+  });
+
+  test("a timeline pin made mid-watch is never overridden at run end", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1");
+    useRunViewStore.getState().pinFrame("act_1");
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
   });
 });
 
@@ -485,17 +617,18 @@ describe("RunView output signals", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    expect(scope.queryByRole("button", { name: "Outputs" })).toBeNull();
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
     expect(scope.queryByText("Run errors")).toBeNull();
   });
 
-  test("does not offer an Outputs view when run signals are absent", () => {
+  test("shows the Outputs empty state when run signals are absent", () => {
     seedCompletedRun();
 
     const { container } = renderRunView();
     const scope = within(container);
 
-    expect(scope.queryByRole("button", { name: "Outputs" })).toBeNull();
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+    expect(scope.getByText("No outputs for this run")).not.toBeNull();
     expect(scope.queryByText("Run errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
   });

@@ -6,7 +6,7 @@ import { finalizedRunStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
 
 /**
- * The run facts the shell keys UI off: Run-tab gating, the spine status dot,
+ * The run facts the shell keys UI off: Run-tab gating, the toggle status dot,
  * and the first-visit pane default. `knownHasRuns` stays undefined until the
  * runs page-1 probe has data, so callers can tell "no runs" from "not loaded".
  */
