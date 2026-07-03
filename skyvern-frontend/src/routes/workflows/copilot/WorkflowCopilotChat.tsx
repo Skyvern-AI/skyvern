@@ -329,11 +329,17 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
   );
 });
 
+// `persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
+// `applied` marks a turn's accepted terminal apply; drafts and snap-backs omit it.
+export type WorkflowUpdateOptions = {
+  persisted?: boolean;
+  applied?: boolean;
+};
+
 interface WorkflowCopilotChatProps {
-  // `options.persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
   onWorkflowUpdate?: (
     workflow: WorkflowApiResponse,
-    options?: { persisted?: boolean },
+    options?: WorkflowUpdateOptions,
   ) => void;
   onReviewWorkflow?: (
     workflow: WorkflowApiResponse,
@@ -803,7 +809,7 @@ export function WorkflowCopilotChat({
   const applyWorkflowUpdate = useCallback(
     (
       workflow: WorkflowApiResponse,
-      options?: { persisted?: boolean },
+      options?: WorkflowUpdateOptions,
     ): boolean => {
       if (!onWorkflowUpdate) {
         return true;
@@ -842,7 +848,7 @@ export function WorkflowCopilotChat({
 
     if (!chatId) {
       // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
-      if (!applyWorkflowUpdate(workflow)) {
+      if (!applyWorkflowUpdate(workflow, { applied: true })) {
         return;
       }
       setProposedWorkflow(null);
@@ -863,7 +869,9 @@ export function WorkflowCopilotChat({
         } as WorkflowCopilotApplyProposedWorkflowRequest,
       );
       // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
-      if (!applyWorkflowUpdate(response.data, { persisted: true })) {
+      if (
+        !applyWorkflowUpdate(response.data, { persisted: true, applied: true })
+      ) {
         return;
       }
       setProposedWorkflow(null);
@@ -879,7 +887,7 @@ export function WorkflowCopilotChat({
         "Atomic apply failed; falling back to client-side apply:",
         applyError,
       );
-      if (!applyWorkflowUpdate(workflow)) {
+      if (!applyWorkflowUpdate(workflow, { applied: true })) {
         toast({
           title: "Accept failed",
           description: "Could not apply the proposed agent. Please try again.",
@@ -1468,7 +1476,7 @@ export function WorkflowCopilotChat({
               userCancelledThisTurn,
             )
           ) {
-            applyWorkflowUpdate(response.updated_workflow);
+            applyWorkflowUpdate(response.updated_workflow, { applied: true });
           } else if (response.updated_workflow) {
             setProposedWorkflow(response.updated_workflow);
           } else if (

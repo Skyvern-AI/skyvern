@@ -348,6 +348,12 @@ function Workspace({
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
   const studioCopilotOpen = studioPanes.includes("copilot");
+  // Armed iff the workflow has no blocks at mount — the studio shell remounts
+  // Workspace per workflow, so `workflow` is always populated here. The first
+  // copilot build that lands blocks auto-opens the Editor pane, exactly once.
+  const editorAutoOpenArmedRef = useRef(
+    workflow.workflow_definition.blocks.length === 0,
+  );
   const location = useLocation();
   const navigate = useNavigate();
   const locationState = location.state as {
@@ -2874,6 +2880,15 @@ function Workspace({
         onWorkflowUpdate={(workflowData, options) => {
           try {
             applyWorkflowUpdate(workflowData, options);
+            if (
+              embedded &&
+              options?.applied &&
+              editorAutoOpenArmedRef.current &&
+              workflowData.workflow_definition.blocks.length > 0
+            ) {
+              editorAutoOpenArmedRef.current = false;
+              openStudioPane("editor");
+            }
           } catch (error) {
             console.error(
               "Failed to parse and apply agent",

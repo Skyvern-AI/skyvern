@@ -1,17 +1,30 @@
-export type StudioPaneId = "copilot" | "editor" | "browser" | "run";
+export type StudioPaneId = "copilot" | "editor" | "browser" | "timeline";
 
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "copilot",
   "editor",
   "browser",
-  "run",
+  "timeline",
 ];
 
 export const STUDIO_PANES_PARAM = "panes";
 
+// Accepted forever on parse so pre-rename ?panes= links keep working; the
+// canonical id ("timeline") is what serializes back out.
+const STUDIO_PANE_ID_ALIASES: Record<string, StudioPaneId> = {
+  run: "timeline",
+};
+
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
   "copilot",
   "browser",
+];
+
+// In-app run starts (full run or block ▶) append the run surfaces to whatever
+// is already open — they never rearrange or close panes.
+export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
+  "browser",
+  "timeline",
 ];
 
 // Width floors from the approved mock; the stage clamps shared links and nudges
@@ -20,7 +33,7 @@ export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
   copilot: 260,
   editor: 220,
   browser: 260,
-  run: 220,
+  timeline: 220,
 };
 
 // Stage chrome for the fit math; must match the p-3 + gap-3 on the stage div
@@ -32,16 +45,15 @@ function isStudioPaneId(value: string): value is StudioPaneId {
   return (STUDIO_PANE_IDS as readonly string[]).includes(value);
 }
 
-// First-visit defaults: someone who never ran the agent (or has nothing built)
-// starts on the familiar build surface; an agent with history starts on watch.
+// Cold-entry defaults when no deep link decides: an empty agent starts on
+// prompt-and-watch (Copilot builds, the Browser shows it work — the Editor
+// auto-appends once a build lands); a built agent adds the Editor.
 export function defaultPanesForWorkflowState(state: {
-  hasRuns: boolean | undefined;
   hasBlocks: boolean;
 }): StudioPaneId[] {
-  if (state.hasRuns !== undefined) {
-    return state.hasRuns ? ["copilot", "browser"] : ["copilot", "editor"];
-  }
-  return state.hasBlocks ? [...DEFAULT_STUDIO_PANES] : ["copilot", "editor"];
+  return state.hasBlocks
+    ? ["copilot", "browser", "editor"]
+    : [...DEFAULT_STUDIO_PANES];
 }
 
 export function panesListEqual(
@@ -93,7 +105,8 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
   }
   const result: StudioPaneId[] = [];
   for (const token of raw.split(",")) {
-    const id = token.trim();
+    const name = token.trim();
+    const id = STUDIO_PANE_ID_ALIASES[name] ?? name;
     if (isStudioPaneId(id) && !result.includes(id)) {
       result.push(id);
     }
@@ -101,8 +114,8 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
   return result;
 }
 
-// Deep-link → panes mapping when ?panes= is absent: a block run shows its
-// timeline beside the live debug stream; any other run reference lands on Run.
+// Deep-link → panes mapping when ?panes= is absent: a block-run link lands on
+// iterate (Editor leads); any other run reference lands on watch-and-review.
 export function panesFromDeepLink(
   params: {
     runId: string | null;
@@ -112,10 +125,10 @@ export function panesFromDeepLink(
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
 ): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
-    return ["run", "browser"];
+    return ["editor", "browser", "timeline"];
   }
   if (params.runId || params.active) {
-    return ["run"];
+    return ["copilot", "browser", "timeline"];
   }
   return [...defaultPanes];
 }

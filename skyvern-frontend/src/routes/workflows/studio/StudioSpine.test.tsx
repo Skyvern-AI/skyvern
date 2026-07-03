@@ -57,7 +57,7 @@ beforeEach(() => {
 describe("StudioSpine structure", () => {
   test("renders the four peer tabs with icon + label", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Run"]) {
+    for (const label of ["Copilot", "Editor", "Browser", "Timeline"]) {
       expect(tab(new RegExp(`^${label}`))).toBeTruthy();
     }
   });
@@ -80,13 +80,14 @@ describe("StudioSpine structure", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=copilot");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Run/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Timeline/).getAttribute("aria-expanded")).toBe("false");
   });
 
-  test("a block-run deep link opens Run and Browser together", () => {
+  test("a block-run deep link opens Editor, Browser and Timeline", () => {
     renderAt("/workflows/wpid_abc/studio?wr=run_1&bl=block_1");
-    expect(tab(/^Run/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Timeline/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
 });
@@ -119,25 +120,25 @@ describe("StudioSpine pane toggling", () => {
     const params = new URLSearchParams(search);
     expect(params.get("wr")).toBe("run_1");
     expect(params.get("bl")).toBe("block_1");
-    expect(params.get("panes")).toBe("run,browser,copilot");
+    expect(params.get("panes")).toBe("editor,browser,timeline,copilot");
   });
 });
 
-describe("StudioSpine Run gating", () => {
-  test("disables the Run tab until a run exists", () => {
+describe("StudioSpine Timeline gating", () => {
+  test("disables the Timeline tab until a run exists", () => {
     renderAt();
-    expect(tab(/^Run/).disabled).toBe(true);
+    expect(tab(/^Timeline/).disabled).toBe(true);
   });
 
-  test("enables the Run tab when the workflow has a prior run", () => {
+  test("enables the Timeline tab when the workflow has a prior run", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Running }] });
     renderAt();
-    expect(tab(/^Run/).disabled).toBe(false);
+    expect(tab(/^Timeline/).disabled).toBe(false);
   });
 
-  test("enables the Run tab when the URL points at a run (?wr=)", () => {
+  test("enables the Timeline tab when the URL points at a run (?wr=)", () => {
     renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=copilot");
-    expect(tab(/^Run/).disabled).toBe(false);
+    expect(tab(/^Timeline/).disabled).toBe(false);
   });
 });
 
@@ -145,23 +146,25 @@ describe("StudioSpine run-status dot", () => {
   test("shows a status-colored dot for a finalized run", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt();
-    const dot = tab(/^Run/).querySelector(
+    const dot = tab(/^Timeline/).querySelector(
       "span.absolute.right-1",
     ) as HTMLElement | null;
     expect(dot).not.toBeNull();
     expect(dot?.className).toContain("bg-badge-success");
   });
 
-  test("includes the finalized run status in the Run tab accessible name", () => {
+  test("includes the finalized run status in the Timeline tab accessible name", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.TimedOut }] });
     renderAt();
-    expect(screen.getByRole("button", { name: "Run, timed out" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Timeline, timed out" }),
+    ).toBeTruthy();
   });
 
   test("omits the dot while the run is still in flight", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Running }] });
     renderAt();
-    expect(tab(/^Run/).querySelector("span.absolute.right-1")).toBeNull();
+    expect(tab(/^Timeline/).querySelector("span.absolute.right-1")).toBeNull();
   });
 });
 
@@ -201,7 +204,7 @@ describe("StudioSpine keyboard navigation", () => {
     ).toEqual([0, -1, -1]);
   });
 
-  test("ArrowDown moves focus and wraps past the disabled Run tab", () => {
+  test("ArrowDown moves focus and wraps past the disabled Timeline tab", () => {
     renderAt();
     tab(/^Copilot/).focus();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowDown" });
@@ -217,8 +220,8 @@ describe("StudioSpine keyboard navigation", () => {
     renderAt();
     tab(/^Copilot/).focus();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowUp" });
-    expect(document.activeElement).toBe(tab(/^Run/));
-    fireEvent.keyDown(tab(/^Run/), { key: "Home" });
+    expect(document.activeElement).toBe(tab(/^Timeline/));
+    fireEvent.keyDown(tab(/^Timeline/), { key: "Home" });
     expect(document.activeElement).toBe(tab(/^Copilot/));
   });
 

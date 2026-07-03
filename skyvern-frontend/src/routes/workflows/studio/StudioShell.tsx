@@ -139,7 +139,7 @@ function StudioPane({
 
 /**
  * Spine + panes shell: one vertical spine whose tabs (Copilot, Editor, Browser,
- * Run) each toggle a pane; open panes share the stage side by side in click
+ * Timeline) each toggle a pane; open panes share the stage side by side in click
  * order (?panes=). The Copilot chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
@@ -186,15 +186,15 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   const browserOpen = panes.includes("browser");
   const editorOpen = panes.includes("editor");
-  const runOpen = panes.includes("run");
+  const timelineOpen = panes.includes("timeline");
 
   // Move the persistent stream node into the highest-priority open surface:
-  // Browser pane > Run pane with a live block run (runStreamSlot registers only
-  // then) > Editor PiP > offscreen park, which keeps the socket warm.
+  // Browser pane > Timeline pane with a live block run (runStreamSlot registers
+  // only then) > Editor PiP > offscreen park, which keeps the socket warm.
   useLayoutEffect(() => {
     const activeSlot = browserOpen
       ? browserStreamSlot
-      : runOpen && runStreamSlot
+      : timelineOpen && runStreamSlot
         ? runStreamSlot
         : editorOpen && !pipMinimized
           ? editorStreamSlot
@@ -208,7 +208,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   }, [
     browserOpen,
     editorOpen,
-    runOpen,
+    timelineOpen,
     pipMinimized,
     editorStreamSlot,
     browserStreamSlot,
@@ -317,7 +317,7 @@ function StudioStage(props: StudioWorkspaceProps) {
               <BrowserTab />
             </StudioPane>
             <StudioPane
-              {...paneProps("run")}
+              {...paneProps("timeline")}
               headerExtras={<RunPaneStatusBadge />}
               headerActions={<RunPaneActions />}
             >

@@ -15,7 +15,7 @@ import { useStudioPaneCompact } from "../StudioShellContext";
 import { useStudioInspectedRun } from "../useStudioInspectedRun";
 
 /**
- * Left header cluster of the Run pane: the inspected run's status pill.
+ * Left header cluster of the Timeline pane: the inspected run's status pill.
  * Queries dedupe with the pane body via react-query.
  */
 export function RunPaneStatusBadge() {
@@ -30,7 +30,7 @@ export function RunPaneStatusBadge() {
 }
 
 /**
- * Right header cluster of the Run pane: the API & Webhooks menu for the
+ * Right header cluster of the Timeline pane: the API & Webhooks menu for the
  * inspected run, relocated from the retired run-hero header.
  */
 export function RunPaneActions() {

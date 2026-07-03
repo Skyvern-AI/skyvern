@@ -1,19 +1,20 @@
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
+import { STUDIO_PANES_PARAM } from "./panes";
 import { RunView } from "./runview/RunView";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
 
 /**
- * Run pane of the studio shell — the run timeline + run-data view (the Browser
- * pane owns the visuals). Shows the run in the URL when present, otherwise the
- * workflow's most recent run.
+ * Timeline pane of the studio shell — the run timeline + run-data view (the
+ * Browser pane owns the visuals). Shows the run in the URL when present,
+ * otherwise the workflow's most recent run.
  */
 export function RunTab() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
-  const { openPane } = useStudioPanes();
+  const { openPane, resolveLivePanes } = useStudioPanes();
   const { runId, pending } = useStudioInspectedRun();
   // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
   // so suppress that CTA for block runs (the block is rerun from the editor).
@@ -34,7 +35,12 @@ export function RunTab() {
       onRetry={
         isBlockRun
           ? undefined
-          : () => navigate(`/agents/${workflowPermanentId}/run`)
+          : () =>
+              // ?panes= rides through the run form so the post-start navigate
+              // restores this exact layout (plus the run surfaces appended).
+              navigate(
+                `/agents/${workflowPermanentId}/run?${STUDIO_PANES_PARAM}=${resolveLivePanes().join(",")}`,
+              )
       }
     />
   );

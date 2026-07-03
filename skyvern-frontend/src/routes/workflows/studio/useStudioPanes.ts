@@ -44,13 +44,22 @@ export function useStudioPanes() {
     [location.search, defaultPanes, present],
   );
 
+  // The open list as the live URL resolves it right now — what cross-route
+  // writers (block ▶, the Run form round-trip) must build on, per the
+  // continuity rule: in-app actions append, never rearrange or close.
+  const resolveLivePanes = useCallback(
+    (): StudioPaneId[] =>
+      present(resolveOpenPanes(liveSearch(location.search), defaultPanes)),
+    [location.search, defaultPanes, present],
+  );
+
   const applyPanes = useCallback(
     (
       compute: (current: StudioPaneId[]) => StudioPaneId[],
       options?: Pick<NavigateOptions, "state">,
     ) => {
       const search = liveSearch(location.search);
-      const current = present(resolveOpenPanes(search, defaultPanes));
+      const current = resolveLivePanes();
       const next = compute(current);
       notePaneWrite({ previous: current, next });
       navigate(
@@ -58,7 +67,7 @@ export function useStudioPanes() {
         { replace: true, ...options },
       );
     },
-    [navigate, location.search, defaultPanes, present, notePaneWrite],
+    [navigate, location.search, resolveLivePanes, notePaneWrite],
   );
 
   const togglePane = useCallback(
@@ -77,5 +86,5 @@ export function useStudioPanes() {
     [applyPanes],
   );
 
-  return { panes, togglePane, openPane, closePane };
+  return { panes, resolveLivePanes, togglePane, openPane, closePane };
 }

@@ -33,8 +33,8 @@ function runStatusLabel(status: Status): string {
 }
 
 /**
- * The studio's single vertical tab spine: Copilot, Editor, Browser and Run are
- * peer tabs, each toggling its pane open or closed on the stage.
+ * The studio's single vertical tab spine: Copilot, Editor, Browser and
+ * Timeline are peer tabs, each toggling its pane open or closed on the stage.
  */
 export function StudioSpine() {
   const { panes, togglePane } = useStudioPanes();
@@ -55,7 +55,9 @@ export function StudioSpine() {
   // Roving tabindex (WAI-ARIA toolbar): the rail is one tab stop; arrow keys
   // move focus across the enabled tabs, Enter/Space toggles.
   const [focusedId, setFocusedId] = useState<StudioPaneId>(STUDIO_PANE_IDS[0]!);
-  const enabledIds = STUDIO_PANE_IDS.filter((id) => !(id === "run" && !hasRun));
+  const enabledIds = STUDIO_PANE_IDS.filter(
+    (id) => !(id === "timeline" && !hasRun),
+  );
   const tabStopId = enabledIds.includes(focusedId) ? focusedId : enabledIds[0];
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
@@ -89,14 +91,14 @@ export function StudioSpine() {
       {STUDIO_PANE_IDS.map((id) => {
         const { label, icon: Icon } = STUDIO_PANE_META[id];
         const open = panes.includes(id);
-        const disabled = id === "run" && !hasRun;
+        const disabled = id === "timeline" && !hasRun;
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && !open;
-        const showRunStatusDot = id === "run" && Boolean(runStatus);
+        const showRunStatusDot = id === "timeline" && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
-          : id === "run" && runStatus
-            ? `Run, ${runStatusLabel(runStatus)}`
+          : id === "timeline" && runStatus
+            ? `Timeline, ${runStatusLabel(runStatus)}`
             : undefined;
         return (
           <button
@@ -111,9 +113,9 @@ export function StudioSpine() {
             onFocus={() => setFocusedId(id)}
             title={
               disabled
-                ? "Run: no runs yet"
-                : runStatus && id === "run"
-                  ? `Run: ${runStatusLabel(runStatus)}`
+                ? "Timeline: no runs yet"
+                : runStatus && id === "timeline"
+                  ? `Timeline: ${runStatusLabel(runStatus)}`
                   : `${open ? "Close" : "Open"} ${label}`
             }
             onClick={() => onToggle(id)}

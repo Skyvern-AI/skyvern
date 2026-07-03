@@ -17,13 +17,13 @@ import {
   type PaneClamp,
   type PaneWrite,
 } from "./StudioPaneDefaultsContext";
-import { useStudioRunSignals } from "./useStudioRunSignals";
 
 /**
  * First-visit pane policy for one studio mount. The state-aware default and
  * the narrow-viewport clamp are both latched exactly once (the shell remounts
- * per workflow via its key), so panes never reshuffle after first paint: a
- * runs signal that arrives later changes nothing until the next visit.
+ * per workflow via its key), so panes never reshuffle after first paint. The
+ * blocks signal is synchronous — the shell only mounts with the workflow
+ * loaded — so the latch decides from real data, never a placeholder.
  */
 export function StudioPaneDefaultsProvider({
   hasBlocks,
@@ -33,12 +33,9 @@ export function StudioPaneDefaultsProvider({
   children: ReactNode;
 }) {
   const location = useLocation();
-  const { knownHasRuns } = useStudioRunSignals();
 
-  // Latched: cached runs data decides; on a cold cache an agent with blocks
-  // keeps today's watch default while an empty agent starts on the editor.
   const [defaultPanes] = useState<readonly StudioPaneId[]>(() =>
-    defaultPanesForWorkflowState({ hasRuns: knownHasRuns, hasBlocks }),
+    defaultPanesForWorkflowState({ hasBlocks }),
   );
 
   const [initialPanes] = useState<readonly StudioPaneId[]>(() =>

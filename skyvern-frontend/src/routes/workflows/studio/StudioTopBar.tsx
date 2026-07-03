@@ -36,7 +36,9 @@ import { MakeACopyButton } from "../editor/MakeACopyButton";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
+import { STUDIO_PANES_PARAM } from "./panes";
 import { runOutcomeFromStatus } from "./runProjections";
+import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 
 function TitleSection({ editable = true }: { editable?: boolean }) {
@@ -128,6 +130,7 @@ export function RunStopButton() {
   );
   const activeRunId = workflowRun?.workflow_run_id;
   const running = runOutcomeFromStatus(workflowRun?.status) === "running";
+  const { resolveLivePanes } = useStudioPanes();
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
@@ -160,7 +163,12 @@ export function RunStopButton() {
     },
   });
 
-  const startFullRun = () => navigate(`/agents/${workflowPermanentId}/run`);
+  // ?panes= rides through the run form so the post-start navigate restores
+  // this exact layout (plus the run surfaces appended) instead of remapping.
+  const startFullRun = () =>
+    navigate(
+      `/agents/${workflowPermanentId}/run?${STUDIO_PANES_PARAM}=${resolveLivePanes().join(",")}`,
+    );
 
   if (running && activeRunId) {
     const stopDialog = (
@@ -217,8 +225,8 @@ export function RunStopButton() {
               <DialogTitle>Start a full run?</DialogTitle>
               <DialogDescription>
                 A block run is still executing. It will keep running — you can
-                watch it in the Browser pane while the Run pane switches to the
-                new full run.
+                watch it in the Browser pane while the Timeline pane switches to
+                the new full run.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

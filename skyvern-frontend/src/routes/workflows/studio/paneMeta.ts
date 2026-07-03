@@ -2,7 +2,7 @@ import { type ComponentType } from "react";
 import {
   ChatBubbleIcon,
   GlobeIcon,
-  PlayIcon,
+  ListBulletIcon,
   Share1Icon,
 } from "@radix-ui/react-icons";
 
@@ -15,5 +15,5 @@ export const STUDIO_PANE_META: Record<
   copilot: { label: "Copilot", icon: ChatBubbleIcon },
   editor: { label: "Editor", icon: Share1Icon },
   browser: { label: "Browser", icon: GlobeIcon },
-  run: { label: "Run", icon: PlayIcon },
+  timeline: { label: "Timeline", icon: ListBulletIcon },
 };
