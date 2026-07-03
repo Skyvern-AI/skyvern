@@ -146,6 +146,9 @@ type Props = {
   exfiltrate?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
+  // Whether unmounting clears the recording store. The studio passes false: it
+  // remounts this component across CDP<->VNC swaps without the session ending.
+  resetRecordingOnUnmount?: boolean;
   task?: {
     run: TaskApiResponse;
   };
@@ -250,6 +253,7 @@ function BrowserStream({
   exfiltrate = false,
   interactive = true,
   showControlButtons = undefined,
+  resetRecordingOnUnmount = true,
   task = undefined,
   workflow = undefined,
   resizeTrigger,
@@ -933,15 +937,20 @@ function BrowserStream({
     };
   }, [canvasContainer]);
 
-  // Reset the recording store when the stream unmounts — including mid-recording.
-  // The stream never unmounts during a live recording flow (the studio keeps it
-  // in a detached host across pane changes; the editor keeps it mounted while
-  // recording), so an unmount means the user abandoned the session (navigated
-  // away / switched workflows) and stale isRecording state would otherwise leak
-  // into the next mounted workflow as a stuck recording panel.
+  // Read the flag through a ref so the unmount cleanup stays mount-scoped: a
+  // StrictMode double-mount or transport swap must not cancel a live recording.
+  const resetRecordingOnUnmountRef = useRef(resetRecordingOnUnmount);
+  resetRecordingOnUnmountRef.current = resetRecordingOnUnmount;
+  // By default an unmount means the user abandoned the session, and the reset
+  // keeps stale isRecording from leaking into the next mounted workflow as a
+  // stuck recording panel. Surfaces that remount the stream while the session
+  // lives on (transport swaps, per-run streams) opt out and reset at the
+  // session level instead.
   useEffect(() => {
     return () => {
-      useRecordingStore.getState().reset();
+      if (resetRecordingOnUnmountRef.current) {
+        useRecordingStore.getState().reset();
+      }
     };
   }, []);
 

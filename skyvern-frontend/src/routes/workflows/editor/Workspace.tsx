@@ -725,6 +725,17 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
+  // Recording is session-scoped: the stream opts out of reset-on-unmount (it
+  // remounts across the CDP<->VNC recording swap mid-session), so the debug
+  // session owns the reset here — embedded, StudioBrowserStream owns it. The id
+  // guard keeps the null -> first-id transition from clearing a recording that
+  // started before the session resolved.
+  useEffect(() => {
+    if (embedded || !liveBrowserSessionId) {
+      return;
+    }
+    return () => useRecordingStore.getState().reset();
+  }, [embedded, liveBrowserSessionId]);
   // Embedded: the shell owns the stream, so bind the copilot once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
   const copilotRequiresLiveBrowser =
@@ -2419,6 +2430,9 @@ function Workspace({
                           // The recording panel overlays the canvas whenever a
                           // recording is live here, so the REC pill is redundant.
                           hideRecordingIndicator={true}
+                          // Remounts across the CDP<->VNC recording swap; the
+                          // debug session owns the recording reset.
+                          resetRecordingOnUnmount={false}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={!!workflowRun && !isFinalized}
                           onReadyChange={handleLiveBrowserReadyChange}

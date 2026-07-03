@@ -16,6 +16,7 @@ export function StudioBrowserStream() {
   const { panes } = useStudioPanes();
   const browserPaneOpen = panes.includes("browser");
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const resetRecording = useRecordingStore((s) => s.reset);
   const reloadNonce = useStudioBrowserStore((s) => s.reloadNonce);
   const setStreamUrl = useStudioBrowserStore((s) => s.setStreamUrl);
   const markActivity = useStudioBrowserStore((s) => s.markActivity);
@@ -37,6 +38,13 @@ export function StudioBrowserStream() {
     reset();
     return () => reset();
   }, [browserSessionId, reset]);
+
+  // Recording is session-scoped: clear it when the studio's browser session ends
+  // or changes. The transport stream no longer resets on unmount (it remounts
+  // across CDP<->VNC swaps without the session ending), so this owns that.
+  useEffect(() => {
+    return () => resetRecording();
+  }, [browserSessionId, resetRecording]);
 
   useEffect(() => {
     if (browserPaneOpen) {
