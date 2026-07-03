@@ -3700,6 +3700,16 @@ class CodeBlock(Block):
             "globals",
             "eval",
             "vars",
+            # Playwright Page escape hatches — the page object is injected into safe_vars and
+            # these methods allow arbitrary JS execution, Python callback injection into the
+            # browser JS context, and full network interception. None of them are dunders so
+            # they pass the AST dunder check; they must be blocked explicitly here.
+            "evaluate",           # executes arbitrary JS in the browser process
+            "evaluate_handle",    # returns live JS object handles into Python
+            "add_init_script",    # injects JS on every new document load
+            "expose_function",    # bridges a Python callable into browser JS — capability leak
+            "expose_binding",     # same as expose_function with frame/source metadata
+            "route",              # intercepts and rewrites all page network requests
         }
     )
 
