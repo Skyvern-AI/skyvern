@@ -555,7 +555,7 @@ class TestPDFParserSchemaValidation:
         )
         mp.setattr(PDFParserBlock, "record_output_parameter_value", record_output_parameter_value)
         mp.setattr(PDFParserBlock, "build_block_result", fake_build_block_result)
-        mp.setattr("skyvern.forge.sdk.workflow.models.block.download_file", AsyncMock(return_value="/tmp/test.pdf"))
+        mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value="/tmp/test.pdf"))
         mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", MagicMock(return_value="name\nAlice"))
         mp.setattr(
             "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
