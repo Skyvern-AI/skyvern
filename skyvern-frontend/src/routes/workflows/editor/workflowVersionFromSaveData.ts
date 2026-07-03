@@ -62,6 +62,7 @@ export function workflowVersionFromSaveData(
     run_with: settings.runWith,
     cache_key: settings.scriptCacheKey,
     ai_fallback: settings.aiFallback,
+    enable_self_healing: settings.enableSelfHealing ?? false,
     adaptive_caching: workflow.adaptive_caching ?? false,
     code_version:
       settings.runWith === "code" ? (settings.codeVersion ?? 2) : null,

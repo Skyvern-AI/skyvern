@@ -118,6 +118,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
+    enableSelfHealing: version.enable_self_healing ?? false,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,

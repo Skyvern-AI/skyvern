@@ -989,7 +989,7 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          AI Fallback (self-healing)
+                          AI Fallback (cached scripts)
                         </div>
                         <h2 className="text-sm text-slate-400">
                           If the run fails when running with code, keep this on

@@ -25,6 +25,7 @@ export type WorkflowCreateYAMLRequest = {
   run_with?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
+  enable_self_healing?: boolean;
   adaptive_caching?: boolean;
   code_version?: number | null;
   run_sequentially?: boolean;

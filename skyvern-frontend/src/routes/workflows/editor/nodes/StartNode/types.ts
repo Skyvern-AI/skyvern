@@ -20,6 +20,7 @@ export type WorkflowStartNodeData = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;
+  enableSelfHealing: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
