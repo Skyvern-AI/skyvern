@@ -90,14 +90,30 @@ class TestRequestPolicyPromptStructure:
         assert (
             "{outcome, contingent_on, contingent_antecedent_output_path, "
             "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
-            "expected_output_shape, kind, terminal_action_family, classification_output_key, expected_classification}"
+            "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
+            "classification_output_key, expected_classification}"
         ) in rendered
         assert "never hide it in outcome prose" in rendered
         assert "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label" in rendered
         assert "kind=outcome|terminal_action|validation_classification" in rendered
         assert "terminal_action_family=request|application|form|order|null" in rendered
+        assert (
+            "requested_output_evidence_source: "
+            "runtime_output|independent_run_evidence|registered_output_parameter|registered_artifact_content"
+        ) in rendered
         assert "classification_output_key=login_only and expected_classification=true" in rendered
         assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_priority_requested_output_evidence_source_guidance_is_present(self) -> None:
+        rendered = _render()
+        assert (
+            "selection, priority, ranking, or superlative criterion governs a returned requested-output field"
+            in rendered
+        )
+        assert "selected or highest-priority document name" in rendered
+        assert "output_path=output.document_name" in rendered
+        assert "requested_output_evidence_source=independent_run_evidence" in rendered
+        assert "the selected value cannot prove its own correctness" in rendered
 
     def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
         active = _render_active_criteria_for_prompt(
