@@ -323,21 +323,21 @@ def validate_local_file_path(candidate_path: str, run_id: str | None) -> str:
         LOG.warning("Empty path provided for file access validation", run_id=run_id)
         raise PermissionError(f"File access denied: path must not be empty for run {run_id}")
 
-    allowed_dir = Path(settings.DOWNLOAD_PATH, str(run_id)).resolve()
-    resolved = Path(candidate_path).resolve()
+    allowed_dir = os.path.realpath(os.path.join(settings.DOWNLOAD_PATH, str(run_id)))
+    resolved = os.path.realpath(candidate_path)
 
     # The resolved path must be the allowed dir itself or a child of it
-    if resolved != allowed_dir and not resolved.is_relative_to(allowed_dir):
+    if os.path.commonpath([allowed_dir, resolved]) != allowed_dir:
         LOG.warning(
             "Path traversal attempt blocked",
             candidate_path=candidate_path,
-            resolved_path=str(resolved),
-            allowed_dir=str(allowed_dir),
+            resolved_path=resolved,
+            allowed_dir=allowed_dir,
             run_id=run_id,
         )
         raise PermissionError(f"File access denied: path is outside the allowed download directory for run {run_id}")
 
-    return str(resolved)
+    return resolved
 
 
 def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
