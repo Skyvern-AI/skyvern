@@ -21,6 +21,8 @@ type Props = {
   page: number;
   pageSize?: number;
   search?: string;
+  // ANDed with the internal gating (workflow id + globalWorkflows loaded).
+  enabled?: boolean;
 } & UseQueryOptions;
 
 function useWorkflowRunsQuery({
@@ -29,6 +31,7 @@ function useWorkflowRunsQuery({
   page,
   pageSize,
   search,
+  enabled,
   ...queryOptions
 }: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
@@ -77,7 +80,7 @@ function useWorkflowRunsQuery({
         })
         .then((response) => response.data);
     },
-    enabled: !!workflowPermanentId && !!globalWorkflows,
+    enabled: !!workflowPermanentId && !!globalWorkflows && (enabled ?? true),
     ...queryOptions,
   });
 }

@@ -13,6 +13,7 @@ import { type ReactNode } from "react";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import { useRunViewStore } from "@/store/RunViewStore";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
@@ -203,7 +204,15 @@ afterEach(() => {
   mocks.debugSession = undefined;
   mocks.runHeroProps = [];
 });
-beforeEach(() => useRunViewStore.getState().reset());
+const initialStudioBrowserState = useStudioBrowserStore.getState();
+
+// jsdom doesn't implement scrollIntoView; focusBrowserPane calls it via rAF.
+Element.prototype.scrollIntoView = vi.fn();
+
+beforeEach(() => {
+  useRunViewStore.getState().reset();
+  useStudioBrowserStore.setState(initialStudioBrowserState, true);
+});
 
 describe("getSelectedRunFrameId", () => {
   test("defaults to live stream while a run is running", () => {
@@ -324,6 +333,25 @@ describe("RunView block run and the Browser pane", () => {
       kind: "action",
       artifactId: "art_1",
     });
+  });
+
+  test("focusBrowserPane pins the Browser pane's Live view", () => {
+    seedLiveBlockRun();
+    useStudioBrowserStore.setState({ view: "screenshots" });
+    render(
+      <MemoryRouter
+        initialEntries={["/?wr=wr_1&bl=Block%201&panes=run,browser"]}
+      >
+        <RunView workflowRunId="wr_1" />
+      </MemoryRouter>,
+    );
+
+    const props = mocks.runHeroProps[mocks.runHeroProps.length - 1];
+    act(() => {
+      (props?.onFocusBrowserPane as () => void)();
+    });
+    // The CTA promises live; a pinned replay pill must not swallow it.
+    expect(useStudioBrowserStore.getState().view).toBe("live");
   });
 
   test("Browser pane closed, Run pane open: the hero stays self-sufficient", () => {

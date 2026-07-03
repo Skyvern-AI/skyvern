@@ -14,6 +14,7 @@ import {
   isWorkflowRunBlock,
 } from "@/routes/workflows/types/workflowRunTypes";
 import { useRunViewStore } from "@/store/RunViewStore";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
 import { cn, isRecord } from "@/util/utils";
@@ -249,6 +250,8 @@ export function RunView({
   // node (StudioShell priority); the hero then points at it instead.
   const debugStreamInBrowserPane = showDebugStream && browserPaneOpen;
   const focusBrowserPane = useCallback(() => {
+    // The pane may sit on a pinned replay view; this CTA promises live.
+    useStudioBrowserStore.getState().setView("live");
     openPane("browser");
     // Defer past the pane-open commit so the scroll sees the visible panel.
     requestAnimationFrame(() => {

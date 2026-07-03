@@ -23,3 +23,11 @@ export const StudioShellContext = createContext<StudioShellContextValue>({
 export function useStudioShellContext(): StudioShellContextValue {
   return useContext(StudioShellContext);
 }
+
+// True when the hosting pane header is too narrow for labels; header chrome
+// (view pills, badges) collapses to icons. Provided by StudioPane.
+export const StudioPaneCompactContext = createContext(false);
+
+export function useStudioPaneCompact(): boolean {
+  return useContext(StudioPaneCompactContext);
+}
