@@ -44,7 +44,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome, RecordedOutcomeGroundingRequirement
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
@@ -781,6 +781,55 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
+    grounding = getattr(ctx, "recorded_outcome_grounding_requirement", None)
+    if isinstance(grounding, RecordedOutcomeGroundingRequirement) and grounding.payload is not None:
+        payload = grounding.payload
+        LOG.info(
+            "copilot recorded outcome grounding rendered",
+            repeated_structural_key=payload.repeated_structural_key,
+            workflow_run_id=payload.workflow_run_id,
+            observed_after_workflow_run=payload.observed_after_workflow_run,
+        )
+        lines.extend(
+            [
+                "RECORDED OUTCOME GROUNDING EVIDENCE:",
+                f"repeated_structural_key: {_clean_authoring_repair_prompt_atom(payload.repeated_structural_key)}",
+                f"source_tool: {payload.source_tool}",
+                f"observed_after_workflow_run: {str(payload.observed_after_workflow_run).lower()}",
+                f"observed_empty_page: {str(payload.observed_empty_page).lower()}",
+                f"challenge_gated: {str(payload.challenge_gated).lower()}",
+                f"capture_degraded: {str(payload.capture_degraded).lower()}",
+                f"diagnostic_reason: {_clean_authoring_repair_prompt_atom(payload.diagnostic_reason)}",
+                f"current_url_present: {str(payload.current_url_present).lower()}",
+                f"current_title_present: {str(payload.current_title_present).lower()}",
+            ]
+        )
+        if payload.target_url:
+            lines.append(f"target_url: {_clean_authoring_repair_prompt_atom(payload.target_url)}")
+        if payload.source_url:
+            lines.append(f"source_url: {_clean_authoring_repair_prompt_atom(payload.source_url)}")
+        if payload.requirement_workflow_run_id:
+            lines.append(f"requirement_workflow_run_id: {payload.requirement_workflow_run_id}")
+        if payload.payload_workflow_run_id:
+            lines.append(f"payload_workflow_run_id: {payload.payload_workflow_run_id}")
+        if payload.workflow_run_id:
+            lines.append(f"grounding_workflow_run_id: {payload.workflow_run_id}")
+        if payload.current_origin:
+            lines.append(f"current_origin: {_clean_authoring_repair_prompt_atom(payload.current_origin)}")
+        if payload.form_summaries:
+            lines.append(f"forms: {_render_authoring_repair_prompt_list(payload.form_summaries)}")
+        if payload.result_container_summaries:
+            lines.append(
+                f"result_containers: {_render_authoring_repair_prompt_list(payload.result_container_summaries)}"
+            )
+        if payload.navigation_action_summaries:
+            lines.append(
+                f"navigation_actions: {_render_authoring_repair_prompt_list(payload.navigation_action_summaries)}"
+            )
+        if payload.challenge_control_summaries:
+            lines.append(
+                f"challenge_controls: {_render_authoring_repair_prompt_list(payload.challenge_control_summaries)}"
+            )
     lines.append(
         "Before saving or rerunning, change the next authored step, selector, extraction, or binding based on this "
         "recorded structure. Do not re-emit the same plan against the same structural key."
@@ -2871,11 +2920,12 @@ async def _translate_to_agent_result(
                 workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml
             )
             try:
-                last_workflow = _process_workflow_yaml(
+                last_workflow = await _process_workflow_yaml(
                     workflow_id=chat_request.workflow_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     organization_id=organization_id,
                     workflow_yaml=workflow_yaml,
+                    settings_fallback_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml,
                 )
                 last_workflow_yaml = workflow_yaml
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:

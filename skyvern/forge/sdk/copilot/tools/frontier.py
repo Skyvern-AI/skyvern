@@ -9,14 +9,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 import structlog
-import yaml
 
 try:
     from bs4 import BeautifulSoup  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
     BeautifulSoup = None  # type: ignore[assignment, misc]
 from jinja2.sandbox import SandboxedEnvironment
-from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
@@ -31,7 +29,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
-from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
@@ -555,14 +552,15 @@ async def _get_prior_workflow_definition(ctx: AgentContext) -> object | None:
     last_yaml = getattr(ctx, "last_workflow_yaml", None)
     if last_yaml:
         try:
-            workflow = _process_workflow_yaml(
+            workflow = await _process_workflow_yaml(
                 workflow_id=ctx.workflow_id,
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 organization_id=ctx.organization_id,
                 workflow_yaml=last_yaml,
             )
             return workflow.workflow_definition
-        except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException):
+        except Exception:
+            # Prior-parse is best-effort; a settings-inherit lookup failure must not break diffs.
             pass
     try:
         fetched = await app.DATABASE.workflows.get_workflow_by_permanent_id(
@@ -584,13 +582,14 @@ async def _get_prior_workflow(ctx: AgentContext) -> Workflow | None:
     last_yaml = ctx.last_workflow_yaml
     if last_yaml:
         try:
-            return _process_workflow_yaml(
+            return await _process_workflow_yaml(
                 workflow_id=ctx.workflow_id,
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 organization_id=ctx.organization_id,
                 workflow_yaml=last_yaml,
             )
-        except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException):
+        except Exception:
+            # Prior-parse is best-effort; a settings-inherit lookup failure must not break diffs.
             pass
     try:
         return await app.DATABASE.workflows.get_workflow_by_permanent_id(
@@ -625,6 +624,7 @@ _CANONICAL_WORKFLOW_SETTING_FIELDS: tuple[str, ...] = (
     "ai_fallback",
     "cache_key",
     "adaptive_caching",
+    "enable_self_healing",
     "code_version",
     "run_sequentially",
     "sequential_key",

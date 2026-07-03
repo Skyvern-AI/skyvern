@@ -4378,11 +4378,20 @@ async def get_workflow(
         if workflow_permanent_id not in await app.STORAGE.retrieve_global_workflows():
             raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_permanent_id)
 
-    return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=None if template else current_org.organization_id,
         version=version,
     )
+    if not template:
+        workflow.copilot_authored = "copilot" in (
+            workflow.created_by,
+            workflow.edited_by,
+        ) or await app.DATABASE.workflows.is_workflow_copilot_authored(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+        )
+    return workflow
 
 
 @legacy_base_router.get(

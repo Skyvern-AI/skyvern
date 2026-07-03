@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.forge.sdk.copilot.build_test_outcome import maybe_satisfy_recorded_outcome_grounding_requirement
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     RunEvidenceSnapshot,
@@ -863,6 +864,7 @@ async def _inspect_page_for_composition_impl(
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     finalize_runtime_authoring_repair_context_from_page_observation(copilot_ctx)
+    maybe_satisfy_recorded_outcome_grounding_requirement(copilot_ctx)
     if (
         isinstance(run_id, str)
         and run_id

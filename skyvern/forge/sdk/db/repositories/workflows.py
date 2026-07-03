@@ -113,6 +113,7 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
+        enable_self_healing: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
         run_sequentially: bool = False,
@@ -145,6 +146,7 @@ class WorkflowsRepository(BaseRepository):
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
                 run_sequentially=run_sequentially,
@@ -192,6 +194,20 @@ class WorkflowsRepository(BaseRepository):
             )
             await session.execute(update_deleted_at_query)
             await session.commit()
+
+    @db_operation("is_workflow_copilot_authored")
+    async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
+        """Any version ever stamped by copilot marks the lineage. The latest row alone is not a
+        durable signal: user saves re-stamp created_by/edited_by, while copilot back-stamps v1 on
+        copilot-born workflows. Deleted versions still count — provenance is historical."""
+        copilot_version_exists = (
+            select(WorkflowModel.workflow_id)
+            .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
+            .filter(or_(WorkflowModel.created_by == "copilot", WorkflowModel.edited_by == "copilot"))
+            .limit(1)
+        )
+        async with self.Session() as session:
+            return (await session.scalar(copilot_version_exists)) is not None
 
     @db_operation("get_workflow")
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow | None:
@@ -663,6 +679,7 @@ class WorkflowsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -721,6 +738,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.ai_fallback = ai_fallback
                 if adaptive_caching is not _UNSET:
                     workflow.adaptive_caching = cast(bool, adaptive_caching)
+                if enable_self_healing is not _UNSET:
+                    workflow.enable_self_healing = cast(bool, enable_self_healing)
                 if run_sequentially is not None:
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
@@ -976,6 +995,7 @@ class WorkflowsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -1070,6 +1090,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.ai_fallback = ai_fallback
             if adaptive_caching is not _UNSET:
                 workflow.adaptive_caching = cast(bool, adaptive_caching)
+            if enable_self_healing is not _UNSET:
+                workflow.enable_self_healing = cast(bool, enable_self_healing)
             if run_sequentially is not None:
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:

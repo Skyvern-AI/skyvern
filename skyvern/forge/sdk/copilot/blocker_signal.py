@@ -277,6 +277,7 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
+_RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
 
 
 def _should_stash_over_existing(
@@ -293,6 +294,18 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code == "tool_error_post_budget_challenge_blocker"
         and existing.internal_reason_code in _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES
+    ):
+        return True
+    if (
+        incoming.internal_reason_code == _RECORDED_OUTCOME_GROUNDING_REASON_CODE
+        and existing.blocker_kind == "tool_error"
+        and not existing.renders_final_reply
+    ):
+        return True
+    if (
+        existing.internal_reason_code == _RECORDED_OUTCOME_GROUNDING_REASON_CODE
+        and not existing.renders_final_reply
+        and incoming.renders_final_reply
     ):
         return True
     if (

@@ -1319,6 +1319,10 @@ class WorkflowCreateYAMLRequest(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
+    # None = inherit from the existing workflow on update (mirrors code_version);
+    # treated as False on first create. Prevents older clients that omit the field
+    # from silently disabling self-healing on save.
+    enable_self_healing: bool | None = None
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
     run_sequentially: bool = Field(default=False, title="Prevent Overlapping Runs")

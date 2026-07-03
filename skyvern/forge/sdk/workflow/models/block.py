@@ -96,7 +96,6 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
-from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -277,8 +276,6 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
-
-ENABLE_CODE_BLOCK_SELF_HEALING_FLAG = "ENABLE_CODE_BLOCK_SELF_HEALING"
 
 TASK_TO_BLOCK_STATUS: dict[TaskStatus, BlockStatus] = {
     TaskStatus.completed: BlockStatus.completed,
@@ -4006,27 +4003,33 @@ async def wrapper({default_args}):
                 best_start = step.line_start
         return best
 
-    async def _self_heal_enabled(self, organization_id: str | None) -> bool:
-        # Per-org PostHog dial over the env default, mirroring the master copilot flags: the env
-        # default is the OSS/standalone fallback and a resolution failure degrades to it, never raising.
-        env_enabled = settings.ENABLE_CODE_BLOCK_SELF_HEALING
-        provider = app.EXPERIMENTATION_PROVIDER
-        if not organization_id or isinstance(provider, NoOpExperimentationProvider):
-            return env_enabled
+    async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
+        # User-facing per-workflow setting, restricted to copilot-authored workflows —
+        # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
+        # The env default stays as the OSS/standalone and local-dev override.
+        if settings.ENABLE_CODE_BLOCK_SELF_HEALING:
+            return True
+        workflow = workflow_run_context.workflow
+        if workflow is None or not workflow.enable_self_healing:
+            return False
+        if "copilot" in (workflow.created_by, workflow.edited_by):
+            return True
+        # User saves re-stamp both fields with the user id, so the current version alone is
+        # not durable; fall back to lineage (copilot stamps every version it writes and
+        # back-stamps v1 on copilot-born workflows). This runs inside the block's exception
+        # handler — a lookup failure must fail closed, never mask the original block failure.
         try:
-            flag_enabled = await provider.is_feature_enabled_cached(
-                ENABLE_CODE_BLOCK_SELF_HEALING_FLAG,
-                organization_id,
-                properties={"organization_id": organization_id},
+            return await app.DATABASE.workflows.is_workflow_copilot_authored(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
             )
-            return bool(flag_enabled) or env_enabled
         except Exception:
             LOG.warning(
-                "Failed to resolve code-block self-heal flag; falling back to env default",
-                organization_id=organization_id,
+                "Self-heal copilot-lineage lookup failed; failing closed (no heal)",
+                workflow_permanent_id=workflow.workflow_permanent_id,
                 exc_info=True,
             )
-            return env_enabled
+            return False
 
     def _is_healable_page_failure(self, exception: Exception, recording_page: RecordingPage) -> bool:
         """Heal genuine page failures only: a recorded page call raised, or an (unmapped) Playwright
@@ -4107,7 +4110,7 @@ async def wrapper({default_args}):
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
-        if not await self._self_heal_enabled(organization_id):
+        if not await self._self_heal_enabled(workflow_run_context):
             return None
         if not self._is_healable_page_failure(exception, recording_page):
             return None
