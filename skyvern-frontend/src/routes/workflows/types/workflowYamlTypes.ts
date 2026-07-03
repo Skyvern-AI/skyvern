@@ -1,6 +1,7 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   CodeBlockStep,
+  CredentialSelectionStrategy,
   WorkflowBlockType,
   WorkflowModel,
 } from "./workflowTypes";
@@ -129,6 +130,8 @@ export type OutputParameterYAML = ParameterYAMLBase & {
 export type CredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "credential";
   credential_id: string;
+  credential_ids?: Array<string> | null;
+  selection_strategy?: CredentialSelectionStrategy | null;
 };
 
 export type BlockYAML =
@@ -372,7 +375,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema?: Record<string, unknown> | null;
 };
 

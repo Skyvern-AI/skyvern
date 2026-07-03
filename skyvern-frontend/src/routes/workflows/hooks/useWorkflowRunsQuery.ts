@@ -23,6 +23,8 @@ type Props = {
   search?: string;
   // ANDed with the internal gating (workflow id + globalWorkflows loaded).
   enabled?: boolean;
+  createdAtStart?: string;
+  createdAtEnd?: string;
 } & UseQueryOptions;
 
 function useWorkflowRunsQuery({
@@ -32,6 +34,8 @@ function useWorkflowRunsQuery({
   pageSize,
   search,
   enabled,
+  createdAtStart,
+  createdAtEnd,
   ...queryOptions
 }: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
@@ -48,6 +52,8 @@ function useWorkflowRunsQuery({
         page,
         pageSize,
         search,
+        createdAtStart,
+        createdAtEnd,
       ],
       activeOrgQueryKeyScope,
     ),
@@ -71,6 +77,12 @@ function useWorkflowRunsQuery({
       }
       if (search) {
         params.append("search_key", search);
+      }
+      if (createdAtStart) {
+        params.append("created_at_start", createdAtStart);
+      }
+      if (createdAtEnd) {
+        params.append("created_at_end", createdAtEnd);
       }
 
       return client

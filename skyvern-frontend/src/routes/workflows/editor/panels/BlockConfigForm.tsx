@@ -6,6 +6,7 @@ import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 import { AppNode, type WorkflowBlockNode } from "../nodes";
 import { ActionBlockForm } from "./BlockConfigForm/ActionBlockForm";
 import { CodeBlockBlockForm } from "./BlockConfigForm/CodeBlockBlockForm";
+import { ConditionalBlockForm } from "./BlockConfigForm/ConditionalBlockForm";
 import { DownloadBlockForm } from "./BlockConfigForm/DownloadBlockForm";
 import { ExtractionBlockForm } from "./BlockConfigForm/ExtractionBlockForm";
 import { FileDownloadBlockForm } from "./BlockConfigForm/FileDownloadBlockForm";
@@ -36,20 +37,6 @@ type WorkflowBlockNodeType = WorkflowBlockNode["type"];
 
 type BlockFormComponent = ComponentType<{ blockId: string }>;
 
-// BranchesEditor runs auto-default-branch + auto-activeBranchId repair
-// effects; mounting it in the sidebar would fire the same repairs from
-// two concurrent instances. The canvas tile is the authoritative mount.
-function ConditionalSidebarPlaceholder() {
-  return (
-    <div
-      data-testid="block-config-form-conditional-placeholder"
-      className="px-4 py-4 text-sm text-slate-400"
-    >
-      Edit conditional branches on the canvas tile.
-    </div>
-  );
-}
-
 const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   task: TaskBlockForm,
   taskv2: Taskv2BlockForm,
@@ -59,7 +46,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   login: LoginBlockForm,
   wait: WaitBlockForm,
   loop: LoopBlockForm,
-  conditional: ConditionalSidebarPlaceholder,
+  conditional: ConditionalBlockForm,
   textPrompt: TextPromptBlockForm,
   sendEmail: SendEmailBlockForm,
   codeBlock: CodeBlockBlockForm,
