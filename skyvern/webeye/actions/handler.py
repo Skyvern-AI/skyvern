@@ -28,6 +28,7 @@ from skyvern.constants import (
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
+from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     EmptySelect,
@@ -158,6 +159,7 @@ UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the uplo
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
+COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
@@ -354,6 +356,164 @@ class SelectShadowAgreement(BaseModel):
             return int(str(value).strip())
         except ValueError:
             return None
+
+
+def _autocomplete_candidates_from_elements(elements: list[dict]) -> list[dict[str, str | None]]:
+    candidates: list[dict[str, str | None]] = []
+    seen: set[tuple[str | None, str]] = set()
+    for candidate in _select_shadow_candidates_from_elements(elements):
+        element_id = candidate.get("element_id")
+        label = candidate.get("label") or candidate.get("value")
+        if not element_id or not label:
+            continue
+        dedupe_key = (element_id, _normalize_select_shadow_text(label))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        candidates.append({"element_id": element_id, "label": label, "value": candidate.get("value")})
+    return candidates
+
+
+def _resolve_autocomplete_candidate(
+    target_value: str,
+    elements: list[dict],
+) -> tuple[int, dict[str, str | None]] | None:
+    candidates = _autocomplete_candidates_from_elements(elements)
+    matched_index = match_option_exact_or_stem(target_value, [candidate.get("label") or "" for candidate in candidates])
+    if matched_index is None:
+        return None
+    return matched_index, candidates[matched_index]
+
+
+async def _read_autocomplete_option_identity(
+    *,
+    skyvern_frame: SkyvernFrame,
+    locator: Locator,
+) -> dict[str, Any] | None:
+    try:
+        element_handle = await locator.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        if element_handle is None:
+            return None
+        return await skyvern_frame.read_autocomplete_option_identity(element_handle)
+    except Exception:
+        LOG.info("Failed to read autocomplete option identity", exc_info=True)
+        return None
+
+
+async def _verify_autocomplete_option_identity(
+    *,
+    skyvern_frame: SkyvernFrame,
+    locator: Locator,
+    matched_index: int,
+    matched_label: str,
+) -> bool:
+    identity = await _read_autocomplete_option_identity(skyvern_frame=skyvern_frame, locator=locator)
+    if identity is None:
+        return False
+
+    actual_index = identity.get("index")
+    actual_label = identity.get("label")
+    label_matches = _normalize_select_shadow_text(actual_label) == _normalize_select_shadow_text(matched_label)
+    # Advisory only: typeahead DOMs can detach or rerender options, so label
+    # identity is required and index is retained only for diagnostics.
+    if label_matches:
+        if actual_index not in (matched_index, None, -1):
+            LOG.info(
+                "Autocomplete option index differed from deterministic candidate; accepting label match",
+                expected_index=matched_index,
+                expected_label=matched_label,
+                actual_index=actual_index,
+                actual_label=actual_label,
+            )
+        return True
+
+    LOG.info(
+        "Autocomplete option identity did not match deterministic candidate",
+        expected_index=matched_index,
+        expected_label=matched_label,
+        actual_index=actual_index,
+        actual_label=actual_label,
+    )
+    return False
+
+
+async def _verify_autocomplete_input_readback(
+    *,
+    skyvern_element: SkyvernElement,
+    matched_index: int,
+    matched_label: str,
+) -> bool:
+    actual_value = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
+    if _normalize_select_shadow_text(actual_value) == _normalize_select_shadow_text(matched_label):
+        return True
+
+    LOG.info(
+        "Autocomplete read-back did not match deterministic option",
+        expected_index=matched_index,
+        expected_label=matched_label,
+        actual_value=actual_value,
+    )
+    return False
+
+
+async def _reset_autocomplete_for_llm_fallback(
+    *,
+    current_incremental_scraped: IncrementalScrapePage,
+    skyvern_frame: SkyvernFrame,
+    skyvern_element: SkyvernElement,
+    page: Page,
+    scraped_page: ScrapedPage,
+    dom: DomUtil,
+    text: str,
+    task: Task,
+    step: Step,
+) -> tuple[IncrementalScrapePage, list[dict], list[dict], str, list[str]]:
+    await current_incremental_scraped.stop_listen_dom_increment()
+    await skyvern_element.input_clear()
+
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+    await skyvern_element.press_fill(text)
+    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fallback_refill")
+    incremental_element = await incremental_scraped.get_incremental_element_tree(
+        clean_and_remove_element_tree_factory(
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+        ),
+    )
+
+    if len(incremental_element) > 0:
+        cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+        html = incremental_scraped.build_html_tree(cleaned_incremental_element)
+        return incremental_scraped, incremental_element, cleaned_incremental_element, html, []
+
+    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+
+    dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
+    new_interactable_element_ids = [
+        element_id
+        for element_id in new_element_ids
+        if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+    ]
+    if len(new_interactable_element_ids) == 0:
+        raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+
+    LOG.info(
+        "New elements detected after resetting autocomplete fallback input",
+        new_elements_ids=new_interactable_element_ids,
+    )
+    fallback_elements = [
+        scraped_page_after_open.id_to_element_dict[element_id] for element_id in new_interactable_element_ids
+    ]
+    return (
+        incremental_scraped,
+        fallback_elements,
+        fallback_elements,
+        scraped_page_after_open.build_element_tree(),
+        new_interactable_element_ids,
+    )
 
 
 def _select_shadow_agrees_with_native_choice(
@@ -952,6 +1112,30 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
     except Exception:
         LOG.warning(
             "Failed to evaluate collapse-select-fanout flag; defaulting to disabled",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
+    organization_id = task.organization_id
+    if not organization_id:
+        return False
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+    try:
+        return bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate collapse-autocomplete-fanout flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
@@ -2898,7 +3082,9 @@ async def handle_input_text_action(
         if not await skyvern_element.is_raw_input():
             is_location_input = input_or_select_context.is_location_input if input_or_select_context else False
             if input_or_select_context and (await skyvern_element.is_auto_completion_input() or is_location_input):
-                action.set_has_mini_agent()
+                collapse_autocomplete_fanout_enabled = await _is_collapse_autocomplete_fanout_enabled(task)
+                if not collapse_autocomplete_fanout_enabled:
+                    action.set_has_mini_agent()
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
                     scraped_page=scraped_page,
@@ -2908,6 +3094,8 @@ async def handle_input_text_action(
                     skyvern_element=skyvern_element,
                     step=step,
                     task=task,
+                    action=action,
+                    collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
                 ):
                     auto_complete_hacky_flag = False
                     return [result]
@@ -4596,6 +4784,8 @@ async def choose_auto_completion_dropdown(
     preserved_elements: list[dict] | None = None,
     relevance_threshold: float = 0.8,
     is_location_input: bool = False,
+    collapse_autocomplete_fanout_enabled: bool = False,
+    action: InputTextAction | None = None,
 ) -> AutoCompletionResult:
     preserved_elements = preserved_elements or []
     clear_input = True
@@ -4648,15 +4838,139 @@ async def choose_auto_completion_dropdown(
 
         result.incremental_elements = copy.deepcopy(incremental_element)
         html = ""
-        new_interactable_element_ids = []
+        new_interactable_element_ids: list[str] = []
         shadow_candidate_elements: list[dict] = []
         if len(incremental_element) > 0:
             cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
             shadow_candidate_elements = cleaned_incremental_element
 
+            if collapse_autocomplete_fanout_enabled and not context.is_search_bar:
+                # Resolve against the raw elements so duplicate labels under distinct
+                # element IDs remain ambiguous instead of being collapsed away.
+                deterministic_match = _resolve_autocomplete_candidate(text, incremental_element)
+                if deterministic_match is not None:
+                    matched_index, matched_candidate = deterministic_match
+                    matched_element_id = matched_candidate.get("element_id") or ""
+                    matched_label = matched_candidate.get("label") or ""
+                    matched_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{matched_element_id}"]')
+                    if matched_element_id and matched_label and await matched_locator.count() > 0:
+                        option_identity_matches = await _verify_autocomplete_option_identity(
+                            skyvern_frame=skyvern_frame,
+                            locator=matched_locator,
+                            matched_index=matched_index,
+                            matched_label=matched_label,
+                        )
+                        if not option_identity_matches:
+                            LOG.info(
+                                "Autocomplete deterministic option identity failed, resetting input before LLM fallback",
+                                element_id=matched_element_id,
+                                matched_index=matched_index,
+                                matched_label=matched_label,
+                            )
+                            (
+                                incremental_scraped,
+                                fallback_incremental_elements,
+                                shadow_candidate_elements,
+                                html,
+                                new_interactable_element_ids,
+                            ) = await _reset_autocomplete_for_llm_fallback(
+                                current_incremental_scraped=incremental_scraped,
+                                skyvern_frame=skyvern_frame,
+                                skyvern_element=skyvern_element,
+                                page=page,
+                                scraped_page=scraped_page,
+                                dom=dom,
+                                text=text,
+                                task=task,
+                                step=step,
+                            )
+                            result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
+                            cleaned_incremental_element = shadow_candidate_elements
+                        else:
+                            LOG.info(
+                                "Autocomplete deterministic fast path: exact/stem option found, skipping LLM",
+                                element_id=matched_element_id,
+                                input_value=text,
+                                matched_index=matched_index,
+                                matched_label=matched_label,
+                            )
+                            try:
+                                await matched_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                                if await _verify_autocomplete_input_readback(
+                                    skyvern_element=skyvern_element,
+                                    matched_index=matched_index,
+                                    matched_label=matched_label,
+                                ):
+                                    clear_input = False
+                                    result.action_result = ActionSuccess()
+                                    return result
+                                LOG.info(
+                                    "Autocomplete deterministic read-back failed, resetting input before LLM fallback",
+                                    element_id=matched_element_id,
+                                    matched_index=matched_index,
+                                    matched_label=matched_label,
+                                )
+                            except Exception:
+                                LOG.info(
+                                    "Autocomplete deterministic fast-path click/read-back failed, falling through to LLM",
+                                    element_id=matched_element_id,
+                                    matched_index=matched_index,
+                                    matched_label=matched_label,
+                                    exc_info=True,
+                                )
+                            (
+                                incremental_scraped,
+                                fallback_incremental_elements,
+                                shadow_candidate_elements,
+                                html,
+                                new_interactable_element_ids,
+                            ) = await _reset_autocomplete_for_llm_fallback(
+                                current_incremental_scraped=incremental_scraped,
+                                skyvern_frame=skyvern_frame,
+                                skyvern_element=skyvern_element,
+                                page=page,
+                                scraped_page=scraped_page,
+                                dom=dom,
+                                text=text,
+                                task=task,
+                                step=step,
+                            )
+                            result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
+                            cleaned_incremental_element = shadow_candidate_elements
+                    else:
+                        # The deterministic candidate detached before it could be clicked;
+                        # re-open the dropdown so the LLM fallback sees the live options
+                        # instead of the stale captured scrape that still lists it.
+                        LOG.info(
+                            "Autocomplete deterministic option detached before click, resetting input before LLM fallback",
+                            element_id=matched_element_id,
+                            matched_index=matched_index,
+                            matched_label=matched_label,
+                        )
+                        (
+                            incremental_scraped,
+                            fallback_incremental_elements,
+                            shadow_candidate_elements,
+                            html,
+                            new_interactable_element_ids,
+                        ) = await _reset_autocomplete_for_llm_fallback(
+                            current_incremental_scraped=incremental_scraped,
+                            skyvern_frame=skyvern_frame,
+                            skyvern_element=skyvern_element,
+                            page=page,
+                            scraped_page=scraped_page,
+                            dom=dom,
+                            text=text,
+                            task=task,
+                            step=step,
+                        )
+                        result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
+                        cleaned_incremental_element = shadow_candidate_elements
+
             # Fast path for location inputs: if exactly one option appeared and it contains
-            # what the user typed, click it directly without an LLM call.
-            if is_location_input and len(cleaned_incremental_element) == 1:
+            # what the user typed, click it directly without an LLM call. Preserve the legacy
+            # location behavior when the broader collapse flag is disabled.
+            if not collapse_autocomplete_fanout_enabled and is_location_input and len(cleaned_incremental_element) == 1:
                 only_element = cleaned_incremental_element[0]
                 fast_path_element_id = only_element.get("id", "")
                 # Normalize whitespace for comparison (handles double spaces, etc.)
@@ -4681,7 +4995,8 @@ async def choose_auto_completion_dropdown(
                                 element_id=fast_path_element_id,
                             )
 
-            html = incremental_scraped.build_html_tree(cleaned_incremental_element)
+            if not html:
+                html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         else:
             scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
             new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(
@@ -4705,6 +5020,9 @@ async def choose_auto_completion_dropdown(
             )
             shadow_candidate_elements = result.incremental_elements
             html = scraped_page_after_open.build_element_tree()
+
+        if collapse_autocomplete_fanout_enabled and action is not None:
+            action.set_has_mini_agent()
 
         slim_output = await get_slim_output_template_value("auto-completion-choose-option")
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
@@ -4822,6 +5140,8 @@ async def input_or_auto_complete_input(
     skyvern_element: SkyvernElement,
     step: Step,
     task: Task,
+    action: InputTextAction | None = None,
+    collapse_autocomplete_fanout_enabled: bool = False,
 ) -> ActionResult | None:
     LOG.info(
         "Trigger auto completion",
@@ -4861,6 +5181,8 @@ async def input_or_auto_complete_input(
             step=step,
             task=task,
             is_location_input=is_location,
+            collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
+            action=action,
         )
         if isinstance(result.action_result, ActionSuccess):
             return ActionSuccess()
@@ -4896,6 +5218,8 @@ async def input_or_auto_complete_input(
             current_value=current_value,
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
         )
+        if collapse_autocomplete_fanout_enabled and action is not None:
+            action.set_has_mini_agent()
         json_respone = await app.SECONDARY_LLM_API_HANDLER(
             prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
         )
@@ -4925,6 +5249,8 @@ async def input_or_auto_complete_input(
                 step=step,
                 task=task,
                 is_location_input=is_location,
+                collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
+                action=action,
             )
             if isinstance(result.action_result, ActionSuccess):
                 return ActionSuccess()
