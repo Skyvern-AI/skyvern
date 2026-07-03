@@ -4616,11 +4616,35 @@ async def chain_click(
         if blocking_element is None:
             if blocked:
                 LOG.info(
-                    "Chain click: element is blocked by a non-interactable element, try to click by the coordinates",
+                    "Chain click: element is blocked by a non-interactable element, evaluating fallback",
                     action=action,
                     element=str(skyvern_element),
                     locator=locator,
                 )
+                # An untracked overlay is intercepting an anchor: dispatching a
+                # coordinate click can trigger overlay JS that navigates away.
+                # Follow the anchor's ``href`` directly when it is a plain http
+                # link; skip uploads, explicit coordinate clicks, and downloads
+                # (JS-driven downloads may build a blob/POST on click and would
+                # fetch the wrong static resource via ``frame.goto(href)``).
+                if (
+                    isinstance(action, ClickAction)
+                    and not action.file_url
+                    and not action.download
+                    and action.x is None
+                    and action.y is None
+                    and skyvern_element.get_tag_name() == InteractiveElement.A
+                ):
+                    navigated_href = await skyvern_element.try_navigate_via_href(page=page)
+                    if navigated_href:
+                        LOG.info(
+                            "Chain click: bypassed coordinate fallback via direct href navigation",
+                            action=action,
+                            element=str(skyvern_element),
+                            href=navigated_href,
+                        )
+                        action_results.append(ActionSuccess())
+                        return action_results
             else:
                 # Element is visible and elementFromPoint returns the target itself,
                 # but Playwright's click still failed (e.g. element transiently
