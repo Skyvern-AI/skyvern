@@ -14,13 +14,16 @@ import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import {
+  commitYamlDraft,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -119,7 +122,6 @@ import {
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
-  convertToNode,
   createNode,
   descendants,
   generateNodeLabel,
@@ -715,16 +717,6 @@ function FlowRenderer({
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
-  const recordedBlocks = useRecordedBlocksStore((state) => state.blocks);
-  const recordedParameters = useRecordedBlocksStore(
-    (state) => state.parameters,
-  );
-  const recordedInsertionPoint = useRecordedBlocksStore(
-    (state) => state.insertionPoint,
-  );
-  const clearRecordedBlocks = useRecordedBlocksStore(
-    (state) => state.clearRecordedBlocks,
-  );
   useShouldNotifyWhenClosingTab(!readOnly && workflowChangesStore.hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return (
@@ -768,7 +760,6 @@ function FlowRenderer({
 
   useEffect(() => {
     if (nodesInitialized && !hasCompletedInitialLoad.current) {
-      hasCompletedInitialLoad.current = true;
       doLayout(nodes, edges);
       // After Dagre computes positions, wait one frame for the DOM to update
       // with new positions, then fade in the nodes/edges at their final positions.
@@ -777,6 +768,11 @@ function FlowRenderer({
         // After the fade-in animation completes, enable normal transform transitions
         fadeTimerRef.current = setTimeout(() => {
           setLayoutPhase("ready");
+          // Mark complete only at the terminal phase. Setting it earlier would
+          // strand layoutPhase at "pre-layout" (stuck logo loader) if this async
+          // advance is cancelled by a nodesInitialized re-flip — e.g. the
+          // recording flow toggling editor visibility or injecting fresh nodes.
+          hasCompletedInitialLoad.current = true;
         }, 350);
       });
       return () => {
@@ -973,6 +969,11 @@ function FlowRenderer({
   }, [constructSaveData, readOnly]);
 
   async function handleSave(): Promise<boolean> {
+    // With the YAML editor open (e.g. the nav-blocker "Save changes" dialog),
+    // persist the parsed draft directly instead of the stale pre-edit canvas.
+    if (useWorkflowYamlEditorStore.getState().active) {
+      return commitYamlDraft(true);
+    }
     // Validate before saving; block if any workflow errors exist
     const errors = getWorkflowErrors(nodes);
     if (errors.length > 0) {
@@ -989,7 +990,7 @@ function FlowRenderer({
       });
       return false;
     }
-    await saveWorkflow.mutateAsync();
+    await saveWorkflow.mutateAsync(undefined);
     return true;
   }
 
@@ -1204,118 +1205,6 @@ function FlowRenderer({
 
     doLayout(nodes, edges);
   }
-
-  // effect to add new blocks that were generated from a browser recording,
-  // along with any new parameters
-  useEffect(() => {
-    if (readOnly) {
-      return;
-    }
-    if (!recordedBlocks || !recordedInsertionPoint) {
-      return;
-    }
-
-    const { previous, next, parent, connectingEdgeType } =
-      recordedInsertionPoint;
-
-    const newNodes: Array<AppNode> = [];
-    const newEdges: Array<Edge> = [];
-
-    let existingLabels = nodes
-      .filter(isWorkflowBlockNode)
-      .map((node) => node.data.label);
-
-    let prevNodeId = previous;
-
-    // convert each WorkflowBlock to an AppNode
-    recordedBlocks.forEach((block, index) => {
-      const id = nanoid();
-      const label = generateNodeLabel(existingLabels);
-      existingLabels = [...existingLabels, label];
-      const blockWithLabel = { ...block, label: block.label || label };
-
-      const node = convertToNode(
-        { id, parentId: parent },
-        blockWithLabel,
-        true,
-      );
-      newNodes.push(node);
-
-      // create edge from previous node to this one
-      if (prevNodeId) {
-        newEdges.push({
-          id: nanoid(),
-          type: "edgeWithAddButton",
-          source: prevNodeId,
-          target: id,
-          style: { strokeWidth: 2 },
-        });
-      }
-
-      // if this is the last block, connect to next
-      if (index === recordedBlocks.length - 1 && next) {
-        newEdges.push({
-          id: nanoid(),
-          type: connectingEdgeType,
-          source: id,
-          target: next,
-          style: { strokeWidth: 2 },
-        });
-      }
-
-      prevNodeId = id;
-    });
-
-    const editedEdges = previous
-      ? edges.filter((edge) => edge.source !== previous)
-      : edges;
-
-    const previousNode = nodes.find((node) => node.id === previous);
-    const previousNodeIndex = previousNode
-      ? nodes.indexOf(previousNode)
-      : nodes.length - 1;
-
-    const newNodesAfter = [
-      ...nodes.slice(0, previousNodeIndex + 1),
-      ...newNodes,
-      ...nodes.slice(previousNodeIndex + 1),
-    ];
-
-    workflowChangesStore.setHasChanges(true);
-    doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
-
-    const newParameters = Array<ParametersState[number]>();
-
-    for (const newParameter of recordedParameters ?? []) {
-      const exists = parameters.some((param) => param.key === newParameter.key);
-
-      if (!exists) {
-        newParameters.push({
-          key: newParameter.key,
-          parameterType: "workflow",
-          dataType: newParameter.workflow_parameter_type,
-          description: newParameter.description ?? null,
-          defaultValue: newParameter.default_value ?? "",
-        });
-      }
-    }
-
-    if (newParameters.length > 0) {
-      const workflowParametersStore = useWorkflowParametersStore.getState();
-      workflowParametersStore.setParameters([
-        ...workflowParametersStore.parameters,
-        ...newParameters,
-      ]);
-    }
-
-    clearRecordedBlocks();
-    // Effect runs strictly when the recording store flips a new
-    // (blocks, insertionPoint) pair into place. nodes/edges/parameters etc.
-    // are read from the latest closure inside the effect body; including
-    // them in deps would re-fire on every editor edit and re-apply the
-    // recorded blocks.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recordedBlocks, recordedInsertionPoint]);
 
   const editorElementRef = useRef<HTMLDivElement>(null);
 

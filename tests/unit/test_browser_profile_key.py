@@ -6,6 +6,7 @@ import pytest
 from jinja2 import TemplateSyntaxError
 
 from skyvern.forge.sdk.workflow.browser_profile_key import (
+    build_browser_profile_key_digest,
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
     validate_browser_profile_key,
@@ -40,7 +41,9 @@ def test_validate_browser_profile_key_rejects_invalid_jinja() -> None:
 def test_segmented_storage_key_uses_stable_hashed_suffix() -> None:
     digest = sha256(b"cred_123").hexdigest()[:24]
     assert build_workflow_browser_session_storage_key("wpid_test", "cred_123") == f"wpid_test/profile_segments/{digest}"
+    assert build_browser_profile_key_digest("cred_123") == digest
 
 
 def test_empty_storage_key_keeps_legacy_workflow_key() -> None:
     assert build_workflow_browser_session_storage_key("wpid_test", None) == "wpid_test"
+    assert build_browser_profile_key_digest(None) == ""

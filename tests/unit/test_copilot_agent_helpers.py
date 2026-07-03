@@ -910,6 +910,33 @@ workflow_definition:
         assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
         assert "Do not re-emit the same plan against the same structural key" in prompt
 
+    def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                structural_failure_identity="completion:unsatisfied-output",
+                missing_requested_output_facts=[
+                    {
+                        "output_path": "output.confirmation_number",
+                        "output_root": "output",
+                        "value_status": "no_typed_value",
+                        "reason_code": "no_evidence",
+                    }
+                ],
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "output_path=output.confirmation_number" in prompt
+        assert "output_root=output" in prompt
+        assert "Use the exact output_path values in goal_value_paths and returned output" in prompt
+        assert "output_root is diagnostic grouping only" in prompt
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""

@@ -2952,7 +2952,7 @@ class RawSkyvern:
             Number of items per page
 
         vault_type : typing.Optional[CredentialVaultType]
-            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
+            Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6804,7 +6804,7 @@ class AsyncRawSkyvern:
             Number of items per page
 
         vault_type : typing.Optional[CredentialVaultType]
-            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
+            Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.

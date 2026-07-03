@@ -1477,11 +1477,122 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         assert ctx.has_staged_proposal is False
         assert ctx.latest_recorded_build_test_outcome is not None
         assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
         assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_accepts_canonical_output_path_candidate_with_sibling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "submit_form_and_extract_confirmation"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["output.confirmation_number"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["output.confirmation_number"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {
+                    "output_path": "output.confirmation_number",
+                    "output_root": "output",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Form submission
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"output": {{"confirmation_number": "ABC-123", "account_number": "100245"}}}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == candidate_yaml
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "outcome_not_demonstrated"
+
+    @pytest.mark.asyncio
+    async def test_authoritative_outcome_not_demonstrated_rejects_flat_candidate_for_canonical_output_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        label = "submit_form_and_extract_confirmation"
+        ctx.code_artifact_metadata = {
+            label: {
+                "block_label": label,
+                "claimed_outcomes": [{"goal_value_paths": ["confirmation_number"]}],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["confirmation_number"]}],
+            }
+        }
+        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            authored_structure_signature="authored:previous-failed-candidate",
+            missing_requested_output_facts=[
+                {
+                    "output_path": "output.confirmation_number",
+                    "output_root": "output",
+                    "value_status": "no_typed_value",
+                },
+            ],
+        )
+        candidate_yaml = _yaml(
+            f"""
+            title: Form submission
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {label}
+                code: |
+                  return {{"confirmation_number": "ABC-123"}}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is False
+        assert "output.confirmation_number" in result["error"]
+        assert "Declare those exact output_path values" in result["error"]
+        assert "output_root is diagnostic only" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "metadata_reject"
+        assert outcome.missing_requested_output_facts == [
+            {
+                "output_path": "output.confirmation_number",
+                "output_root": "output",
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+        ]
+        rendered = agent_module._recorded_build_test_outcome_prompt(ctx)
+        assert "output_path=output.confirmation_number" in rendered
 
     def test_required_output_roots_ignore_nested_debug_output_root_without_declared_root(self) -> None:
         label = "extract_provider_profile"
@@ -1498,10 +1609,10 @@ class TestCodeRepairProgressClassification:
             """
         )
 
-        assert workflow_update_module._candidate_missing_required_output_roots(
+        assert workflow_update_module._candidate_missing_required_output_paths(
             candidate_yaml,
             metadata,
-            required_roots={"npi"},
+            required_paths={"npi"},
         ) == ["npi"]
 
     def test_required_output_roots_ignore_same_label_undeclared_static_root(self) -> None:
@@ -1519,10 +1630,10 @@ class TestCodeRepairProgressClassification:
             """
         )
 
-        assert workflow_update_module._candidate_missing_required_output_roots(
+        assert workflow_update_module._candidate_missing_required_output_paths(
             candidate_yaml,
             metadata,
-            required_roots={"npi"},
+            required_paths={"npi"},
         ) == ["npi"]
 
     def test_required_output_roots_ignore_static_root_without_label_metadata(self) -> None:
@@ -1539,10 +1650,10 @@ class TestCodeRepairProgressClassification:
             """
         )
 
-        assert workflow_update_module._candidate_missing_required_output_roots(
+        assert workflow_update_module._candidate_missing_required_output_paths(
             candidate_yaml,
             {},
-            required_roots={"npi"},
+            required_paths={"npi"},
         ) == ["npi"]
 
     def test_required_output_roots_accept_same_label_declared_static_root(self) -> None:
@@ -1561,10 +1672,10 @@ class TestCodeRepairProgressClassification:
         )
 
         assert (
-            workflow_update_module._candidate_missing_required_output_roots(
+            workflow_update_module._candidate_missing_required_output_paths(
                 candidate_yaml,
                 metadata,
-                required_roots={"npi"},
+                required_paths={"npi"},
             )
             == []
         )
@@ -1938,7 +2049,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         outcome = ctx.latest_recorded_build_test_outcome
         assert outcome is not None
         assert outcome.reason_code == "metadata_reject"
@@ -2000,7 +2111,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         outcome = ctx.latest_recorded_build_test_outcome
         assert outcome is not None
         assert outcome.reason_code == "metadata_reject"
@@ -2058,7 +2169,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         outcome = ctx.latest_recorded_build_test_outcome
         assert outcome is not None
         assert outcome.reason_code == "metadata_reject"
@@ -2112,7 +2223,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         outcome = ctx.latest_recorded_build_test_outcome
         assert outcome is not None
         assert outcome.reason_code == "metadata_reject"
@@ -2222,7 +2333,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         outcome = ctx.latest_recorded_build_test_outcome
         assert outcome is not None
         assert outcome.reason_code == "metadata_reject"
@@ -2385,7 +2496,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "does not cover the missing requested output roots" in result["error"]
+        assert "does not cover the missing requested output paths" in result["error"]
         outcome = ctx.latest_recorded_build_test_outcome
         assert outcome is not None
         assert outcome.reason_code == "metadata_reject"

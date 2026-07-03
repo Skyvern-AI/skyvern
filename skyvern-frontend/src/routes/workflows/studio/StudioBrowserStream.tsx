@@ -70,6 +70,10 @@ export function StudioBrowserStream() {
         interactive={false}
         showControlButtons={browserPaneOpen && !controlLocked}
         isRecording={isRecording}
+        // While recording, the Copilot pane hosts the live-drafts panel, whose
+        // header already shows the timer + step count — the REC pill would
+        // duplicate it. Closing that pane brings the pill back as the indicator.
+        hideRecordingIndicator={panes.includes("copilot")}
         onUrlChange={handleUrlChange}
         onActivity={handleActivity}
       />

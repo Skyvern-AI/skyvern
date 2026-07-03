@@ -1211,7 +1211,24 @@ class BrowserProfileModel(Base):
     __table_args__ = (
         Index("idx_browser_profiles_org", "organization_id"),
         Index("idx_browser_profiles_org_name", "organization_id", "name"),
-        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+        Index(
+            "uq_browser_profiles_org_name_user",
+            "organization_id",
+            "name",
+            unique=True,
+            postgresql_where=text("is_managed = false"),
+            sqlite_where=text("is_managed = false"),
+        ),
+        Index(
+            "uq_browser_profiles_managed_segment",
+            "organization_id",
+            "workflow_permanent_id",
+            "browser_profile_key_digest",
+            unique=True,
+            postgresql_where=text("is_managed = true AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = true AND deleted_at IS NULL"),
+        ),
+        Index("idx_browser_profiles_wpid", "workflow_permanent_id"),
     )
 
     browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
@@ -1221,6 +1238,9 @@ class BrowserProfileModel(Base):
     source_browser_type = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
+    is_managed = Column(Boolean, nullable=False, server_default=sqlalchemy.false(), default=False)
+    workflow_permanent_id = Column(String, nullable=True)
+    browser_profile_key_digest = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

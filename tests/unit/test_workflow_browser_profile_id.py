@@ -233,6 +233,7 @@ def _make_workflow_stub(
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_profile_id=browser_profile_id,
+        persist_browser_session=False,
         max_elapsed_time_minutes=max_elapsed_time_minutes,
         run_with="agent",
         code_version=None,
