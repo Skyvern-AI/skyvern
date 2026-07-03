@@ -97,7 +97,8 @@ function EdgeWithAddButton({
   // Derive upload state directly from mutation to avoid race conditions
   const isUploadingSOP = sopToBlocksMutation.isPending;
 
-  const isProcessing = processRecordingMutation.isPending;
+  const isProcessing =
+    processRecordingMutation.isPending || recordingStore.isCommitting;
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
@@ -151,6 +152,13 @@ function EdgeWithAddButton({
   };
 
   const onEndRecord = () => {
+    // With live interpretation, the recording panel owns the commit so user
+    // edits/deletes to draft steps are honored.
+    if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {
+      recordingStore.requestFinish();
+      return;
+    }
+
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     }
