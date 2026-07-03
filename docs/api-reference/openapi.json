@@ -5810,6 +5810,44 @@
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
           },
           {
+            "name": "created_at_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created at or after this UTC timestamp (ISO 8601).",
+              "title": "Created At Start"
+            },
+            "description": "Only include runs created at or after this UTC timestamp (ISO 8601)."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this UTC timestamp (ISO 8601).",
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
