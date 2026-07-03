@@ -3720,6 +3720,8 @@ class CodeBlock(Block):
             "globals",
             "eval",
             "vars",
+            "format",
+            "format_map",
         }
     )
 
