@@ -2585,6 +2585,12 @@ def _record_adjudicated_build_test_outcome(
     completion_verification: CompletionVerificationResult | None,
     recorded_run_outcome: RecordedRunOutcome | None,
 ) -> None:
+    result_data = result.get("data")
+    registered_output_parameter_payloads = (
+        result_data.get("registered_output_parameter_values")
+        if isinstance(result_data, dict) and isinstance(result_data.get("registered_output_parameter_values"), list)
+        else None
+    )
     record_build_test_outcome(
         copilot_ctx,
         recorded_outcome_from_run_blocks_result(
@@ -2596,6 +2602,7 @@ def _record_adjudicated_build_test_outcome(
                 getattr(copilot_ctx, "workflow_yaml", None),
                 getattr(copilot_ctx, "code_artifact_metadata", None),
             ),
+            registered_output_parameter_payloads=registered_output_parameter_payloads,
         ),
     )
 

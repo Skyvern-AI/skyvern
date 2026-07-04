@@ -679,6 +679,40 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             lines.append(
                 f"page_challenges: {_render_authoring_repair_prompt_list(repair_context.page_challenge_summaries)}"
             )
+    if repair_context.reason_code == "metadata_reject":
+        if repair_context.runtime_failure_reason:
+            lines.append(
+                f"runtime_failure_reason: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_reason)}"
+            )
+        if repair_context.runtime_failure_class:
+            lines.append(
+                f"runtime_failure_class: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_class)}"
+            )
+        if repair_context.metadata_contract_source:
+            lines.append(
+                "metadata_contract_source: "
+                f"{_clean_authoring_repair_prompt_atom(repair_context.metadata_contract_source)}"
+            )
+        if repair_context.metadata_contract_reason_code:
+            lines.append(
+                "metadata_contract_reason_code: "
+                f"{_clean_authoring_repair_prompt_atom(repair_context.metadata_contract_reason_code)}"
+            )
+        if repair_context.required_goal_value_paths:
+            lines.append(
+                "required_goal_value_paths: "
+                f"{_render_authoring_repair_prompt_list(repair_context.required_goal_value_paths)}"
+            )
+        if repair_context.required_extraction_schema_paths:
+            lines.append(
+                "required_extraction_schema_paths: "
+                f"{_render_authoring_repair_prompt_list(repair_context.required_extraction_schema_paths)}"
+            )
+        if repair_context.required_code_return_paths:
+            lines.append(
+                "required_code_return_paths: "
+                f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
+            )
     selector_alternative_lines = _render_selector_repair_alternatives(repair_context.selector_alternatives)
     if selector_alternative_lines:
         lines.append("same_page_selector_alternatives:")
@@ -729,6 +763,11 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
         lines.append(
             "For missing prior block outputs, bind to an actual available_output_key or repair the producing/current "
             "code block so the output exists; do not create a workflow parameter for missing_output_key."
+        )
+    if repair_context.reason_code == "metadata_reject":
+        lines.append(
+            "For metadata rejects, author code_artifact_metadata with goal_value_paths, valid extraction_schema, "
+            "and code return paths matching required requested output child paths; rerun update_and_run_blocks."
         )
     lines.append(_clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=260))
     return "\n\n" + "\n".join(line for line in lines if line)
@@ -1403,6 +1442,15 @@ def _make_agent_result(
         result.apply_without_review = _should_apply_code_only_success_without_review(ctx, result.proposal_disposition)
     if ctx is not None and result.completion_criteria_turn_state is None:
         result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    if ctx is not None and result.code_artifact_metadata is None:
+        evidence_metadata = getattr(
+            getattr(ctx, "workflow_verification_evidence", None), "code_artifact_metadata", None
+        )
+        ctx_metadata = getattr(ctx, "code_artifact_metadata", None)
+        if isinstance(evidence_metadata, dict) and evidence_metadata:
+            result.code_artifact_metadata = evidence_metadata
+        elif isinstance(ctx_metadata, dict) and ctx_metadata:
+            result.code_artifact_metadata = ctx_metadata
     return result
 
 

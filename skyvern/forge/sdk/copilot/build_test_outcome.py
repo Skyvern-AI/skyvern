@@ -83,13 +83,19 @@ class RecordedBuildTestOutcome(BaseModel):
     page_evidence_refs: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
+    runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
     authored_structure_signature: str | None = None
     display_text: str = ""
     key_provenance: dict[str, str] = Field(default_factory=dict)
 
     @property
     def structural_key_payload(self) -> dict[str, object] | None:
-        if not (self.structural_failure_identity or self.verified_progress_marker or self.page_evidence_refs):
+        if not (
+            self.structural_failure_identity
+            or self.verified_progress_marker
+            or self.page_evidence_refs
+            or self.runtime_output_repair_facts
+        ):
             return None
         return {
             "version": _STRUCTURAL_KEY_VERSION,
@@ -103,6 +109,7 @@ class RecordedBuildTestOutcome(BaseModel):
             "page_evidence_refs": sorted(self.page_evidence_refs),
             "evidence_refs": sorted(self.evidence_refs),
             "missing_requested_output_facts": self.missing_requested_output_facts,
+            "runtime_output_repair_facts": self.runtime_output_repair_facts,
         }
 
     @property
@@ -635,6 +642,7 @@ def recorded_outcome_from_run_blocks_result(
     recorded_run_outcome: RecordedRunOutcome | None = None,
     completion_verification: CompletionVerificationResult | None = None,
     authored_structure_signature: str | None = None,
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
@@ -645,6 +653,15 @@ def recorded_outcome_from_run_blocks_result(
     output_refs = _output_evidence_refs(blocks)
     verification_identity = _completion_verification_identity(completion_verification)
     missing_output_facts = _missing_requested_output_facts(completion_verification, blocks)
+    authoritative_workflow_run_id = (
+        recorded_run_outcome.workflow_run_id if recorded_run_outcome is not None else None
+    ) or workflow_run_id
+    runtime_output_facts = _runtime_output_repair_facts(
+        completion_verification,
+        blocks,
+        registered_output_parameter_payloads or _mapping_list(data.get("registered_output_parameter_values")),
+        authoritative_workflow_run_id,
+    )
     if recorded_run_outcome is not None:
         reason_code = _run_outcome_reason_code(recorded_run_outcome)
         if reason_code == "terminal_challenge_blocker":
@@ -713,6 +730,7 @@ def recorded_outcome_from_run_blocks_result(
             page_evidence_refs=page_refs,
             evidence_refs=evidence_refs,
             missing_requested_output_facts=missing_output_facts,
+            runtime_output_repair_facts=runtime_output_facts,
             authored_structure_signature=authored_structure_signature,
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
@@ -720,6 +738,7 @@ def recorded_outcome_from_run_blocks_result(
                 "page_evidence_refs": "bounded post-run page evidence",
                 "evidence_refs": "run output structure",
                 "missing_requested_output_facts": "CompletionVerificationResult unsatisfied output paths and run output shape",
+                "runtime_output_repair_facts": "same-run registered output parameters and completion verdicts",
             },
         )
     run_status = _safe_str(data.get("overall_status"))
@@ -1170,6 +1189,51 @@ def _missing_requested_output_facts(
     return sorted(facts, key=lambda item: str(item.get("output_path") or ""))
 
 
+def _runtime_output_repair_facts(
+    completion_verification: CompletionVerificationResult | None,
+    blocks: Sequence[Mapping[str, object]],
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]],
+    workflow_run_id: str,
+) -> list[dict[str, object]]:
+    if completion_verification is None or completion_verification.status != "evaluated" or not workflow_run_id:
+        return []
+    facts: list[dict[str, object]] = []
+    for verdict in completion_verification.verdicts:
+        if verdict.satisfied or not verdict.output_path:
+            continue
+        output_path = _bounded_ref(verdict.output_path)
+        if not _output_path_has_child(output_path):
+            continue
+        output_root = _output_path_root(output_path)
+        if not output_root:
+            continue
+        values, evidence_refs, block_labels = _runtime_output_values_for_path(
+            blocks,
+            registered_output_parameter_payloads,
+            workflow_run_id,
+            output_path,
+        )
+        value_status = _runtime_output_value_status(values, verdict)
+        fact: dict[str, object] = {
+            "workflow_run_id": _bounded_ref(workflow_run_id),
+            "output_path": output_path,
+            "output_root": output_root,
+            "criterion_id": _bounded_ref(verdict.criterion_id),
+            "reason_code": _bounded_ref(verdict.reason_code),
+            "value_status": value_status,
+        }
+        if len(block_labels) == 1:
+            fact["block_label"] = block_labels[0]
+        if verdict.grounding_mode:
+            fact["grounding_mode"] = verdict.grounding_mode
+        if verdict.expected_output_shape:
+            fact["expected_output_shape"] = _bounded_ref(verdict.expected_output_shape)
+        if evidence_refs:
+            fact["evidence_refs"] = evidence_refs
+        facts.append(fact)
+    return sorted(facts, key=lambda item: str(item.get("output_path") or ""))
+
+
 def _has_presence_only_output_evidence(verdict: CriterionVerdict) -> bool:
     return (
         verdict.reason_code == "structurally_abstained"
@@ -1181,6 +1245,10 @@ def _has_presence_only_output_evidence(verdict: CriterionVerdict) -> bool:
 
 def _output_path_root(output_path: str) -> str:
     return _bounded_ref(output_path.split(".", 1)[0].split("[", 1)[0])
+
+
+def _output_path_has_child(output_path: str) -> bool:
+    return "." in output_path or "[]" in output_path
 
 
 def _output_path_value_status(
@@ -1205,6 +1273,73 @@ def _output_path_value_status(
     if grounding_mode == "shape" and not has_exact_value:
         return "presence_only_evidence"
     return "typed_value_unverified"
+
+
+def _runtime_output_values_for_path(
+    blocks: Sequence[Mapping[str, object]],
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]],
+    workflow_run_id: str,
+    output_path: str,
+) -> tuple[list[object], list[str], list[str]]:
+    values: list[object] = []
+    evidence_refs: list[str] = []
+    block_labels: list[str] = []
+    for item in registered_output_parameter_payloads:
+        item_run_id = _safe_str(item.get("workflow_run_id"))
+        if item_run_id != workflow_run_id:
+            continue
+        value, present = _registered_output_value_for_path(item, output_path)
+        if not present:
+            continue
+        values.append(value)
+        label = _bounded_ref(item.get("block_label"))
+        key = _bounded_ref(item.get("output_parameter_key"))
+        if label:
+            block_labels.append(label)
+        if label or key:
+            evidence_refs.append(f"registered_output:{label or 'unknown'}:{key or output_path}")
+    for block in blocks:
+        extracted = block.get("extracted_data")
+        if extracted is None:
+            continue
+        value, present = _value_at_output_path(extracted, output_path)
+        if not present:
+            continue
+        values.append(value)
+        label = _bounded_ref(block.get("label"))
+        if label:
+            block_labels.append(label)
+            evidence_refs.append(f"output:{label}")
+    return values, list(dict.fromkeys(evidence_refs)), sorted(dict.fromkeys(block_labels))
+
+
+def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:
+    value = item.get("value")
+    key = _safe_str(item.get("output_parameter_key"))
+    if key == output_path:
+        return value, True
+    if output_path.startswith("output.") and key == output_path.split(".", 1)[1]:
+        return value, True
+    if isinstance(value, Mapping):
+        return _value_at_output_path(value, output_path)
+    return None, False
+
+
+def _runtime_output_value_status(values: Sequence[object], verdict: CriterionVerdict) -> str:
+    if values:
+        if any(value is None for value in values):
+            return "null"
+        expected_shape = (verdict.expected_output_shape or "").casefold()
+        if expected_shape in {"string", "str"} and any(not isinstance(value, str) for value in values):
+            return "type_mismatch"
+        if expected_shape in {"array", "list"} and any(not isinstance(value, list) for value in values):
+            return "shape_mismatch"
+        if expected_shape in {"object", "dict"} and any(not isinstance(value, Mapping) for value in values):
+            return "shape_mismatch"
+        return "no_typed_value" if not verdict.has_exact_value else "type_mismatch"
+    if verdict.reason_code == "structurally_abstained":
+        return "structural_abstained"
+    return "no_typed_value"
 
 
 def _value_at_output_path(value: object, output_path: str) -> tuple[object | None, bool]:
