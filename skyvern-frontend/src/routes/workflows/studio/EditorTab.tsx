@@ -13,8 +13,8 @@ export type StudioWorkspaceProps = Omit<
   "showBrowser" | "embedded"
 >;
 
-// Editor tab: the real Workspace canvas in embedded mode (the shell owns the top
-// bar + Copilot spine, so Workspace's floating header is suppressed).
+// Editor tab: the real Workspace canvas in embedded mode (the shell owns the
+// top bar and pane chrome, so Workspace's floating header is suppressed).
 export function EditorTab(props: StudioWorkspaceProps) {
   // Show the overlay only while a commit is genuinely in flight or its blocks
   // are landing. Both signals clear on *every* terminal outcome (success, empty,

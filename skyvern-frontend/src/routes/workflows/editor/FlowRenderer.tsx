@@ -433,7 +433,8 @@ type Props = {
   // Embedded in the studio shell: aligns the block-config sidebar's top/bottom
   // edges with the Copilot column instead of the legacy header offsets.
   embedded?: boolean;
-  // Studio open-pane key; a change recenters the canvas once the layout settles.
+  // Studio pane-layout key (open set + committed divider widths); a change
+  // recenters the canvas once the layout settles.
   paneLayoutKey?: string;
 };
 
@@ -1733,9 +1734,11 @@ function FlowRenderer({
     runStartAnchoredFit({ width: rect.width, height: rect.height });
   }, [embedded, layoutPhase, nodesInitialized, runStartAnchoredFit]);
 
-  // Pane-set/order changes are explicit recenter triggers: a sibling pane
-  // toggling shifts the canvas without tripping the stranded threshold, but
-  // the flow should read as centered again once the layout settles.
+  // Pane-set/order changes and committed divider resizes (drag release,
+  // double-click reset, keyboard step) are explicit recenter triggers: they
+  // shift the canvas without tripping the stranded threshold, but the flow
+  // should read as centered again once the layout settles. Live drags never
+  // re-fit per frame — widths only commit to the store on release.
   const prevPaneLayoutKeyRef = useRef(paneLayoutKey);
   useEffect(() => {
     if (!embedded || paneLayoutKey === undefined) {

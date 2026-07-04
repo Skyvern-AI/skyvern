@@ -110,10 +110,16 @@ export function BrowserTab() {
             />
           )
         ) : view === "recording" ? (
-          <HeroRecording
-            recordingUrls={recordingUrls}
-            onPlay={onRecordingPlay}
-          />
+          recordingUrls.length > 0 ? (
+            <HeroRecording
+              recordingUrls={recordingUrls}
+              onPlay={onRecordingPlay}
+            />
+          ) : (
+            <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
+              No recording for this run
+            </div>
+          )
         ) : heroSelection ? (
           <>
             <HeroScreenshot selection={heroSelection} running={running} />
@@ -128,7 +134,9 @@ export function BrowserTab() {
           </>
         ) : (
           <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
-            Waiting for the first action…
+            {visuals.finalized
+              ? "No screenshots for this run"
+              : "Waiting for the first action…"}
           </div>
         )}
       </div>
