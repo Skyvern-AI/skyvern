@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
+import { toReadableSearch } from "@/routes/workflows/studio/panes";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { type AppNode, isWorkflowBlockNode } from "../nodes";
@@ -76,11 +77,14 @@ export function useSelectedBlockUrlSync({
   nodes,
   getNodes,
 }: UseSelectedBlockUrlSyncOptions): void {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const selectedBlockId = useWorkflowPanelStore((s) => s.selectedBlockId);
   const setSelectedBlockId = useWorkflowPanelStore((s) => s.setSelectedBlockId);
   const suppressNextSelectionMirrorRef = useRef(false);
   const selectedBlockLabelParam = searchParams.get(SELECTED_BLOCK_SEARCH_PARAM);
+  const searchParamsRef = useRef(searchParams);
+  searchParamsRef.current = searchParams;
 
   const getCurrentNodes = useCallback(() => {
     const latestNodes = getNodes?.();
@@ -89,14 +93,14 @@ export function useSelectedBlockUrlSync({
 
   // Merge writes against the live URL, not this render's closure: pushState is
   // synchronous, so a concurrent navigate (pane toggles writing ?panes=) is
-  // already visible there while the closure params can be one commit stale and
+  // already visible there while the closure params can be one render stale and
   // would clobber it. window.location is blank under a memory router (tests);
   // fall back to the closure, where no such race exists.
   const liveParams = useCallback(
-    (closure: URLSearchParams) =>
+    () =>
       window.location.search !== ""
         ? new URLSearchParams(window.location.search)
-        : new URLSearchParams(closure),
+        : new URLSearchParams(searchParamsRef.current),
     [],
   );
 
@@ -111,14 +115,9 @@ export function useSelectedBlockUrlSync({
       selectedBlockLabelParam,
     );
     if (!matchedNodeId) {
-      setSearchParams(
-        (prev) => {
-          const next = liveParams(prev);
-          next.delete(SELECTED_BLOCK_SEARCH_PARAM);
-          return next;
-        },
-        { replace: true },
-      );
+      const next = liveParams();
+      next.delete(SELECTED_BLOCK_SEARCH_PARAM);
+      navigate({ search: toReadableSearch(next) }, { replace: true });
     }
 
     // Must actually move selectedBlockId off the stale block, not just skip
@@ -136,8 +135,8 @@ export function useSelectedBlockUrlSync({
     enabled,
     getCurrentNodes,
     liveParams,
+    navigate,
     selectedBlockLabelParam,
-    setSearchParams,
     setSelectedBlockId,
   ]);
 
@@ -163,24 +162,19 @@ export function useSelectedBlockUrlSync({
       return;
     }
 
-    setSearchParams(
-      (prev) => {
-        const next = liveParams(prev);
-        if (selectedBlockLabel) {
-          next.set(SELECTED_BLOCK_SEARCH_PARAM, selectedBlockLabel);
-        } else {
-          next.delete(SELECTED_BLOCK_SEARCH_PARAM);
-        }
-        return next;
-      },
-      { replace: true },
-    );
+    const next = liveParams();
+    if (selectedBlockLabel) {
+      next.set(SELECTED_BLOCK_SEARCH_PARAM, selectedBlockLabel);
+    } else {
+      next.delete(SELECTED_BLOCK_SEARCH_PARAM);
+    }
+    navigate({ search: toReadableSearch(next) }, { replace: true });
   }, [
     enabled,
     getCurrentNodes,
     liveParams,
+    navigate,
     searchParams,
     selectedBlockId,
-    setSearchParams,
   ]);
 }

@@ -1,8 +1,15 @@
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 
 /**
- * Segmented-control button shared by the studio's view toggles (run hero,
- * browser pane header). Collapses to its icon when the host header is compact.
+ * Segmented-control button shared by the studio's view toggles (pane headers).
+ * Collapses to its icon when the host header is compact. Labelled states carry
+ * no tooltip (only icon-only controls tooltip); compact moves the label into
+ * one, and an explicit `title` (status info) always shows.
  */
 export function ViewToggle({
   active,
@@ -19,23 +26,32 @@ export function ViewToggle({
   compact: boolean;
   title?: string;
 }) {
-  return (
+  const tip = title ?? (compact ? label : undefined);
+  const button = (
     <button
       type="button"
       onClick={onClick}
-      title={title ?? (compact ? label : undefined)}
       aria-label={label}
       aria-pressed={active}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium",
+        "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium",
         "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
         active
-          ? "bg-studio-accent/15 text-foreground"
-          : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+          ? "bg-accent text-foreground"
+          : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
       )}
     >
       {icon}
       {compact ? null : label}
     </button>
+  );
+  if (!tip) {
+    return button;
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent side="bottom">{tip}</TooltipContent>
+    </Tooltip>
   );
 }

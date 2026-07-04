@@ -77,6 +77,11 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
+from skyvern.forge.sdk.workflow.credential_selection import (
+    VALID_SELECTION_STRATEGIES,
+    normalize_selection_strategy,
+    select_credential_for_run,
+)
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     WorkflowVersionConflict,
@@ -982,6 +987,38 @@ class WorkflowService:
         missing = [credential_id for credential_id in unique_ids if credential_id not in found]
         if missing:
             raise InvalidCredentialId(", ".join(missing))
+
+    async def _validate_and_normalize_credential_rotation_parameters(
+        self,
+        parameters: list[Any],
+        organization: Organization,
+    ) -> None:
+        credential_ids_to_validate: list[str] = []
+        for parameter in parameters:
+            credential_ids = getattr(parameter, "credential_ids", None)
+            if credential_ids is None:
+                continue
+            key = getattr(parameter, "key", None) or "<unknown>"
+            if not credential_ids:
+                raise SkyvernHTTPException(
+                    message=f"credential_ids for credential parameter {key} must be non-empty.",
+                    status_code=400,
+                )
+            credential_ids = list(dict.fromkeys(credential_ids))
+            parameter.credential_ids = credential_ids
+            selection_strategy = getattr(parameter, "selection_strategy", None)
+            if normalize_selection_strategy(selection_strategy) not in VALID_SELECTION_STRATEGIES:
+                raise SkyvernHTTPException(
+                    message=(
+                        f"selection_strategy for credential parameter {key} must be one of: "
+                        f"{', '.join(sorted(VALID_SELECTION_STRATEGIES))}."
+                    ),
+                    status_code=400,
+                )
+            parameter.credential_id = credential_ids[0]
+            credential_ids_to_validate.extend(credential_ids)
+
+        await self._validate_credential_ids(credential_ids_to_validate, organization)
 
     async def validate_schedule_parameters(
         self,
@@ -3055,6 +3092,7 @@ class WorkflowService:
                     block=block,
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
                 )
                 # Save the original navigation goal before any mutation so
                 # retries don't stack the browser-session prefix repeatedly.
@@ -3726,6 +3764,7 @@ class WorkflowService:
             block=block,
             workflow_run_id=None,
             organization_id=organization_id,
+            workflow_permanent_id=None,
         )
 
     async def _resolve_login_block_browser_profile_id(
@@ -3733,6 +3772,7 @@ class WorkflowService:
         block: Block,
         workflow_run_id: str | None,
         organization_id: str | None,
+        workflow_permanent_id: str | None,
     ) -> str | None:
         """Inspect the block-level parameters and return the browser_profile_id
         from the credential parameter bound to this specific block."""
@@ -3743,6 +3783,8 @@ class WorkflowService:
         credential_ids = await self._resolve_login_block_credential_ids(
             block=block,
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
         )
 
         for credential_id in credential_ids:
@@ -3787,6 +3829,8 @@ class WorkflowService:
         self,
         block: Block,
         workflow_run_id: str | None,
+        organization_id: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> list[str]:
         """Return credential ids bound to this block, preserving parameter order."""
         params = block.parameters
@@ -3800,7 +3844,12 @@ class WorkflowService:
 
             # Style 1: CredentialParameter (has credential_id directly)
             if isinstance(param, CredentialParameter):
-                credential_id = param.credential_id
+                credential_id = await self._resolve_credential_parameter_id(
+                    parameter=param,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
 
             # Style 2: WorkflowParameter with type CREDENTIAL_ID
             elif (
@@ -3842,6 +3891,30 @@ class WorkflowService:
 
         return credential_ids
 
+    async def _resolve_credential_parameter_id(
+        self,
+        *,
+        parameter: CredentialParameter,
+        workflow_run_id: str | None,
+        organization_id: str | None,
+        workflow_permanent_id: str | None,
+    ) -> str:
+        if not parameter.credential_ids or not workflow_run_id or not organization_id or not workflow_permanent_id:
+            return parameter.credential_id
+
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
+        if workflow_run_context:
+            return await workflow_run_context.resolve_credential_parameter_id(parameter, organization_id)
+
+        return await select_credential_for_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            parameter_key=parameter.key,
+            credential_ids=parameter.credential_ids,
+            selection_strategy=parameter.selection_strategy,
+        )
+
     async def _apply_login_block_credential_proxy_pin(
         self,
         *,
@@ -3859,6 +3932,8 @@ class WorkflowService:
         credential_ids = await self._resolve_login_block_credential_ids(
             block=block,
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=getattr(workflow_run, "workflow_permanent_id", None),
         )
         for credential_id in credential_ids:
             if not organization_id:
@@ -4786,6 +4861,13 @@ class WorkflowService:
         edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         if workflow_definition is not None:
+            if organization_id is not None:
+                organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+                if organization is not None:
+                    await self._validate_and_normalize_credential_rotation_parameters(
+                        workflow_definition.parameters,
+                        organization,
+                    )
             updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
                 workflow_id=workflow_id,
                 title=title,
@@ -6945,6 +7027,10 @@ class WorkflowService:
             "Creating workflow from request",
             organization_id=organization_id,
             title=title,
+        )
+        await self._validate_and_normalize_credential_rotation_parameters(
+            request.workflow_definition.parameters,
+            organization,
         )
         new_workflow_id: str | None = None
         refresh_schedule_runtime_limits = False

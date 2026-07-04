@@ -177,6 +177,8 @@ describe("useSelectedBlockUrlSync", () => {
       const params = new URLSearchParams(result.current.search);
       expect(params.get("panes")).toBe("copilot,editor");
       expect(params.get("wr")).toBe("run_1");
+      // The mirror write must not re-encode the panes commas to %2C.
+      expect(result.current.search).toContain("panes=copilot,editor");
     } finally {
       window.history.replaceState(null, "", "/");
     }

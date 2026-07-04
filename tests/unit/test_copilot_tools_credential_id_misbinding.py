@@ -85,6 +85,61 @@ def test_credential_id_bound_through_block_credential_parameter_is_allowed() -> 
     assert _credential_id_misbinding_findings(yaml) == []
 
 
+def test_credential_ids_bound_through_credential_parameter_are_allowed() -> None:
+    yaml = _yaml(
+        """
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: login_credentials
+            parameter_type: credential
+            credential_id: cred_527971855302737592
+            credential_ids:
+            - cred_527971855302737592
+            - cred_827971855302737593
+          blocks:
+          - block_type: login
+            label: login_to_portal
+            url: https://authenticationtest.com/loginUserAndPassword/
+            parameter_keys: [login_credentials]
+        """
+    )
+
+    assert _credential_id_misbinding_findings(yaml) == []
+
+
+def test_credential_parameter_unrelated_field_with_credential_id_is_still_flagged() -> None:
+    yaml = _yaml(
+        """
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: login_credentials
+            parameter_type: credential
+            credential_id: cred_527971855302737592
+            credential_ids:
+            - cred_527971855302737592
+            - cred_827971855302737593
+            description: Use cred_927971855302737594 for this login.
+          blocks:
+          - block_type: login
+            label: login_to_portal
+            url: https://authenticationtest.com/loginUserAndPassword/
+            parameter_keys: [login_credentials]
+        """
+    )
+
+    findings = _credential_id_misbinding_findings(yaml)
+
+    assert findings == [
+        {
+            "location": "workflow",
+            "field": "description",
+            "credential_id": "cred_927971855302737594",
+        }
+    ]
+
+
 def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
     yaml = _yaml(
         """
