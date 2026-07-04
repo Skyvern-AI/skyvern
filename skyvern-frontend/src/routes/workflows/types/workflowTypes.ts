@@ -587,6 +587,7 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   download_filename: string | null;
   save_response_as_file: boolean;
+  secret_response_paths: Array<string> | null;
 };
 
 export type PrintPageBlock = WorkflowBlockBase & {

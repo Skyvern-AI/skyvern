@@ -588,6 +588,16 @@ class WorkflowRunContext:
     def generate_random_secret_id() -> str:
         return f"{RANDOM_SECRET_ID_PREFIX}{generate_random_string(length=4)}"
 
+    def register_secret_value(self, secret_value: str, suffix: str | None = None) -> str:
+        while True:
+            secret_id = self.generate_random_secret_id()
+            if suffix:
+                secret_id = f"{secret_id}_{suffix}"
+            if secret_id not in self.secrets:
+                break
+        self.secrets[secret_id] = secret_value
+        return secret_id
+
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
         Extract vault_id and item_id from the credential_id.

@@ -436,6 +436,7 @@ export type HttpRequestBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   download_filename?: string | null;
   save_response_as_file?: boolean;
+  secret_response_paths?: Array<string> | null;
 };
 
 export type PrintPageBlockYAML = BlockYAMLBase & {

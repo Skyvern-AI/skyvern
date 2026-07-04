@@ -232,6 +232,15 @@ function serializeLoopNodeWhileBranchToYAML(
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
+function serializeSecretResponsePaths(
+  secretResponsePaths: Array<string>,
+): Array<string> | null {
+  const normalized = secretResponsePaths
+    .map((path) => path.trim())
+    .filter(Boolean);
+  return normalized.length > 0 ? normalized : null;
+}
+
 type ConditionalEdgeData = {
   conditionalNodeId?: string;
   conditionalBranchId?: string;
@@ -1096,6 +1105,7 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           downloadFilename: block.download_filename ?? "",
           saveResponseAsFile: block.save_response_as_file ?? false,
+          secretResponsePaths: block.secret_response_paths ?? [],
         },
       };
     }
@@ -3104,6 +3114,9 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         download_filename: node.data.downloadFilename || null,
         save_response_as_file: node.data.saveResponseAsFile,
+        secret_response_paths: serializeSecretResponsePaths(
+          node.data.secretResponsePaths ?? [],
+        ),
       };
     }
     case "printPage": {
@@ -4441,6 +4454,9 @@ function convertBlocksToBlockYAML(
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),
           download_filename: block.download_filename,
+          secret_response_paths: serializeSecretResponsePaths(
+            block.secret_response_paths ?? [],
+          ),
         };
         return blockYaml;
       }

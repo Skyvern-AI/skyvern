@@ -11,6 +11,7 @@ import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from dataclasses import replace
 from typing import Annotated, Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 
@@ -90,6 +91,10 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     ReachedDownloadTarget,
     code_is_download_intent,
+)
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestedOutputEvidenceSource,
+    _coerce_requested_output_evidence_source,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
@@ -220,6 +225,8 @@ class CodeArtifactCompletionCriterion(BaseModel):
     level: Literal["terminal", "outcome", "prefix", "method"] = "terminal"
     outcome: str | None = None
     terminal: bool | None = None
+    output_path: str | None = None
+    requested_output_evidence_source: RequestedOutputEvidenceSource | None = None
 
 
 class CodeArtifactScopedRef(BaseModel):
@@ -576,6 +583,61 @@ def _artifact_label_fragment(label: str) -> str:
 
 def _artifact_mutable_rows(value: Any) -> list[dict[str, Any]]:
     return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _requested_output_path_key(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if not path or path == "$":
+        return None
+    if path.startswith("$."):
+        path = path[2:]
+    elif path.startswith("$["):
+        path = path[1:]
+    if not path.startswith("output."):
+        path = f"output.{path}"
+    return path
+
+
+def _metadata_requested_output_evidence_sources(
+    code_artifact_metadata: object,
+) -> dict[str, RequestedOutputEvidenceSource]:
+    metadata = code_artifact_metadata if isinstance(code_artifact_metadata, Mapping) else {}
+    sources: dict[str, RequestedOutputEvidenceSource] = {}
+    for artifact in metadata.values():
+        if not isinstance(artifact, Mapping):
+            continue
+        for criterion in _artifact_rows(artifact.get("completion_criteria")):
+            if "requested_output_evidence_source" not in criterion:
+                continue
+            source = _coerce_requested_output_evidence_source(criterion.get("requested_output_evidence_source"))
+            if source == "runtime_output":
+                continue
+            output_path = _requested_output_path_key(criterion.get("output_path"))
+            if output_path:
+                sources.setdefault(output_path, source)
+    return sources
+
+
+def _apply_code_artifact_requested_output_evidence_sources(ctx: AgentContext, code_artifact_metadata: object) -> None:
+    sources = _metadata_requested_output_evidence_sources(code_artifact_metadata)
+    if not sources:
+        return
+    policy = getattr(ctx, "request_policy", None)
+    if policy is None:
+        return
+    criteria = getattr(policy, "completion_criteria", None)
+    if not isinstance(criteria, list):
+        return
+    updated_criteria = []
+    for criterion in criteria:
+        output_path = _requested_output_path_key(getattr(criterion, "output_path", None))
+        if output_path in sources:
+            updated_criteria.append(replace(criterion, requested_output_evidence_source=sources[output_path]))
+        else:
+            updated_criteria.append(criterion)
+    policy.completion_criteria = updated_criteria
 
 
 def _drop_contradictory_checkpoint_mode(ref: dict[str, Any]) -> None:
@@ -5093,6 +5155,7 @@ async def _update_workflow(
         merged_metadata = {block: row for block, row in merged_metadata.items() if block in retained_labels}
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
+        _apply_code_artifact_requested_output_evidence_sources(ctx, merged_metadata)
         params["code_artifact_metadata"] = merged_metadata
     if (
         credential_scout_errors

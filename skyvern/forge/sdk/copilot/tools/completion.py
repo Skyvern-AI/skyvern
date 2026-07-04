@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     _STRUCTURED_RECORD_CRITERION_IDS,
     CompletionVerificationResult,
     CriterionVerdict,
+    EvidenceSourceKind,
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
@@ -243,13 +244,17 @@ def _build_page_observation_evidence_snapshot(
 ) -> RunEvidenceSnapshot:
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     block_outputs: dict[str, Any] = {}
+    block_output_sources: dict[str, EvidenceSourceKind] = {}
     if isinstance(observed_data, dict) and observed_data:
         block_outputs["current_page_observation"] = observed_data
+        block_output_sources["current_page_observation"] = "independent_page_evidence"
     elif observed_data is not None:
         block_outputs["current_page_observation"] = str(observed_data)
+        block_output_sources["current_page_observation"] = "independent_page_evidence"
     return RunEvidenceSnapshot(
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         block_outputs=block_outputs,
+        block_output_sources=block_output_sources,
         current_url=_valid_runtime_anchor_url(url),
         page_title=title if isinstance(title, str) and title.strip() else None,
     )
@@ -625,6 +630,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     # run satisfy a criterion the current run never re-produced.
     blocks = data.get("blocks")
     block_outputs: dict[str, Any] = {}
+    block_output_sources: dict[str, EvidenceSourceKind] = {}
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
@@ -634,16 +640,20 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             evidence_output = _completion_evidence_payload(output)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
+                block_output_sources[label] = "runtime_output"
             for output_key, output_value in _workflow_output_parameter_payloads(output).items():
                 block_outputs[output_key] = output_value
+                block_output_sources[output_key] = "registered_output_parameter"
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
         block_outputs[output_key] = output_value
+        block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
         registered_output_value = _completion_evidence_payload(registered.get("value"))
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
+            block_output_sources[registered_output_key] = "registered_output_parameter"
         if isinstance(registered_block_label, str) and registered_block_label in current_labels:
             if isinstance(registered_output_key, str) and registered_output_key:
                 existing = block_outputs.get(registered_block_label)
@@ -651,8 +661,10 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
                     existing.setdefault(registered_output_key, registered_output_value)
                 else:
                     block_outputs[registered_block_label] = {registered_output_key: registered_output_value}
+                block_output_sources.setdefault(registered_block_label, "registered_output_parameter")
             else:
                 block_outputs[registered_block_label] = registered_output_value
+                block_output_sources[registered_block_label] = "registered_output_parameter"
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
@@ -667,6 +679,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     return RunEvidenceSnapshot(
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         block_outputs=block_outputs,
+        block_output_sources=block_output_sources,
         current_url=_valid_runtime_anchor_url(data.get("current_url")),
         page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
         run_terminal_status=run_terminal_status

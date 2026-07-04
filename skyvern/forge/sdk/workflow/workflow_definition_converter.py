@@ -844,6 +844,7 @@ def block_yaml_to_block(
             follow_redirects=block_yaml.follow_redirects,
             download_filename=block_yaml.download_filename,
             save_response_as_file=block_yaml.save_response_as_file,
+            secret_response_paths=block_yaml.secret_response_paths,
             parameters=http_request_block_parameters,
         )
     elif block_yaml.block_type == BlockType.GOTO_URL:

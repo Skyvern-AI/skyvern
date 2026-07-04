@@ -2337,6 +2337,18 @@ def _build_http_request_statement(block: dict[str, Any]) -> cst.SimpleStatementL
             )
         )
 
+    if block.get("secret_response_paths") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("secret_response_paths"),
+                value=_value(block.get("secret_response_paths")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("timeout") is not None:
         args.append(
             cst.Arg(
