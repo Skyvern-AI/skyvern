@@ -17,7 +17,11 @@ import pytest
 from agents import RunConfig
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    author_time_reject_missing_output_paths,
+    recorded_outcome_from_author_time_reject,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
@@ -26,18 +30,33 @@ from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotGoalSatisfied,
+    _canonical_output_path,
     _check_enforcement,
     _maybe_synthesized_block_offer_msg,
     _needs_suspicious_success_nudge,
     _prune_input_list,
+    _should_block_mutating_tool_after_synthesized_offer,
     _should_force_synthesized_block_persistence,
     _summarize_tool_output,
+    _uncovered_output_reject_admits_evaluate,
+    consume_uncovered_output_reopen_event,
+    record_scouted_output_coverage,
     run_with_enforcement,
     synthesized_block_persistence_signal,
+    synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
+    uncovered_output_reject_scout_steer_signal,
+    uncovered_requested_output_paths,
+)
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    _POST_HOOK_CONTEXT_ROLLBACK_FIELDS,
+    _restore_post_hook_context,
+    _snapshot_post_hook_context,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
 from skyvern.forge.sdk.copilot.tools import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _analyze_run_blocks,
@@ -82,7 +101,16 @@ class _Ctx:
         self.completion_verification_result = None
         self.last_artifact_health_blocker_reason = None
         self.latest_diagnosis_repair_contract = None
+        self.last_code_authoring_repair_context = None
         self.synthesized_block_reopened_after_failed_run = False
+        self.synthesized_block_reopened_for_output_coverage = False
+        self.scouted_output_covered_paths: set[str] = set()
+        self.uncovered_output_rescout_context_key = None
+        self.uncovered_output_rescout_steer_key = None
+        self.latest_recorded_build_test_outcome = None
+        self.last_run_blocks_workflow_run_id = None
+        self.completion_criteria_turn_state = None
+        self.reached_download_target: ReachedDownloadTarget | None = None
 
 
 class TestSynthesizedOfferPersistenceGate:
@@ -1956,3 +1984,357 @@ class TestGoalLikelyNeedsMoreBlocks:
     def test_non_string_returns_false(self) -> None:
         assert self._check(None, 1) is False  # type: ignore[arg-type]
         assert self._check(123, 1) is False  # type: ignore[arg-type]
+
+
+def _criterion(output_path: str, outcome: str) -> CompletionCriterion:
+    return CompletionCriterion(id=output_path, outcome=outcome, output_path=output_path)
+
+
+def _turn_state(*criteria: CompletionCriterion) -> SimpleNamespace:
+    return SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+
+
+def _download_target() -> ReachedDownloadTarget:
+    return ReachedDownloadTarget(
+        selector="a.download",
+        affordance_text="Download",
+        download_kind="registered",
+        source_step="trajectory_recency",
+        already_registered=True,
+    )
+
+
+def _entry_commit_trajectory() -> list[dict[str, object]]:
+    return [
+        {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Order number"},
+        {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+    ]
+
+
+def _author_time_reject_outcome(*output_paths: str) -> RecordedBuildTestOutcome:
+    paths = sorted(output_paths)
+    return recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        block_labels=["extract_order"],
+        structural_payload={
+            "reason_code": "recorded_outcome_missing_output_coverage",
+            "missing_output_paths": paths,
+            "block_labels": ["extract_order"],
+            "recorded_reason_code": "outcome_not_demonstrated",
+        },
+        observed_evidence_summary="missing requested output coverage",
+        missing_requested_output_facts=[
+            {
+                "output_path": path,
+                "output_root": path.split(".", 1)[0],
+                "reason_code": "recorded_outcome_missing_output_coverage",
+                "value_status": "no_typed_value",
+            }
+            for path in paths
+        ],
+    )
+
+
+class TestScoutOutputCoverageGate:
+    def _authoring_ctx(self, *criteria: CompletionCriterion) -> _Ctx:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.scout_trajectory = _entry_commit_trajectory()
+        ctx.reached_download_target = None
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(ctx.scout_trajectory)
+        ctx.completion_criteria_turn_state = _turn_state(*criteria)
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        return ctx
+
+    def test_empty_output_set_falls_through_to_shape_heuristic(self) -> None:
+        ctx = self._authoring_ctx()
+        assert uncovered_requested_output_paths(ctx) == set()
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_run_only_evidence_source_is_exempt_from_pre_run_gate(self) -> None:
+        registered = CompletionCriterion(
+            id="output.confirmation_number",
+            outcome="the confirmation number is registered as a workflow output parameter",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source="registered_output_parameter",
+        )
+        ctx = self._authoring_ctx(registered)
+        assert uncovered_requested_output_paths(ctx) == set()
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_runtime_output_stays_gated_alongside_exempt_source(self) -> None:
+        registered = CompletionCriterion(
+            id="output.confirmation_number",
+            outcome="the confirmation number is registered as a workflow output parameter",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source="registered_artifact_content",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(registered, runtime)
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_uncovered_output_keeps_gate_open_and_admits_scout_tools(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_value_bearing_container_covers_path_and_force_fires(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        page_evidence = {
+            "result_containers": [
+                {"text_excerpt": "Document Name  Resale Certificate 2024 for order 5591"},
+            ]
+        }
+        record_scouted_output_coverage(ctx, page_evidence)
+        assert ctx.scouted_output_covered_paths == {"output.document_name"}
+        assert uncovered_requested_output_paths(ctx) == set()
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+
+    def test_empty_shell_selector_tokens_do_not_credit(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        page_evidence = {
+            "result_containers": [
+                {
+                    "selector": "#document-name-table",
+                    "row_selector": "tr.document",
+                    "text_excerpt": "Search results loaded for widgets",
+                }
+            ]
+        }
+        record_scouted_output_coverage(ctx, page_evidence)
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    def test_registered_download_covered_by_reached_download_target(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.downloaded_files", "the downloaded files are captured"))
+        ctx.reached_download_target = _download_target()
+        assert uncovered_requested_output_paths(ctx) == set()
+
+    def test_download_target_covers_only_registered_download_paths(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.downloaded_files", "the downloaded files are captured"),
+            _criterion("output.document_name", "the order status document name is captured"),
+        )
+        ctx.reached_download_target = _download_target()
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    def test_unreachable_output_never_completes_on_long_trajectory(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.scout_trajectory = _entry_commit_trajectory() * 12
+        ctx.synthesized_block_offered_trajectory_len = len(ctx.scout_trajectory)
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_none_criteria_source_shapes_are_byte_identical(self) -> None:
+        ctx = self._authoring_ctx()
+        ctx.completion_criteria_turn_state = None
+        assert uncovered_requested_output_paths(ctx) == set()
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=None)
+        assert uncovered_requested_output_paths(ctx) == set()
+
+    def test_all_generic_token_path_is_exempt_and_falls_through_to_shape(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.data", "the data is captured"))
+        assert uncovered_requested_output_paths(ctx) == set()
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+
+    def test_generic_path_exemption_keeps_specific_path_gating(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.data", "the data is captured"),
+            _criterion("output.document_name", "the order status document name is captured"),
+        )
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    def test_repair_context_required_goal_value_paths_join_requested_set(self) -> None:
+        ctx = self._authoring_ctx()
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["document_name"],
+        )
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        record_scouted_output_coverage(
+            ctx, {"result_containers": [{"text_excerpt": "Document Name  Resale Certificate 2024"}]}
+        )
+        assert uncovered_requested_output_paths(ctx) == set()
+
+    def test_reopen_fires_after_prior_run_then_author_reject(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.last_run_blocks_workflow_run_id = "wr_prior_run"
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is True
+        assert consume_uncovered_output_reopen_event(ctx) is True
+        assert ctx.synthesized_block_reopened_for_output_coverage is True
+
+    def test_stream_recorded_authoring_success_clears_latch_and_steer_key(self) -> None:
+        ctx = _Ctx()
+        ctx.synthesized_block_reopened_for_output_coverage = True
+        ctx.uncovered_output_rescout_steer_key = "steer-key"
+        ctx.uncovered_output_rescout_context_key = "context-key"
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 1}})
+        assert ctx.synthesized_block_reopened_for_output_coverage is False
+        assert ctx.uncovered_output_rescout_steer_key is None
+        assert ctx.uncovered_output_rescout_context_key == "context-key"
+
+    def test_recorded_workflow_update_clears_latch_and_steer_key(self) -> None:
+        ctx = make_copilot_context("title: Updated")
+        ctx.synthesized_block_reopened_for_output_coverage = True
+        ctx.uncovered_output_rescout_steer_key = "steer-key"
+        ctx.uncovered_output_rescout_context_key = "context-key"
+        _record_workflow_update_result(
+            ctx,
+            {
+                "ok": True,
+                "data": {"block_count": 1},
+                "_workflow": SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            },
+        )
+        assert ctx.synthesized_block_reopened_for_output_coverage is False
+        assert ctx.uncovered_output_rescout_steer_key is None
+        assert ctx.uncovered_output_rescout_context_key == "context-key"
+
+    def test_accessor_empty_when_no_recorded_outcome(self) -> None:
+        assert author_time_reject_missing_output_paths(None) == set()
+
+    def test_fact_paths_canonicalize_into_uncovered_set(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        outcome = _author_time_reject_outcome("output.document_name")
+        canonical = {_canonical_output_path(path) for path in author_time_reject_missing_output_paths(outcome)}
+        assert canonical & uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    def test_admission_allows_evaluate_while_uncovered_output_reject_active(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is True
+        assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_consume_reopen_event_arms_latch_fire_once(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        assert consume_uncovered_output_reopen_event(ctx) is True
+        assert ctx.synthesized_block_reopened_for_output_coverage is True
+        assert synthesized_persistence_reopened(ctx) is True
+        assert consume_uncovered_output_reopen_event(ctx) is False
+
+    def test_steer_redirects_reauthor_to_scout_once_then_lets_through(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        consume_uncovered_output_reopen_event(ctx)
+        steer = uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks")
+        assert isinstance(steer, CopilotToolBlockerSignal)
+        assert steer.cleared_by_tools == frozenset({"evaluate"})
+        assert steer.renders_final_reply is False
+        assert "output.document_name" in steer.agent_steering_text
+        assert steer.extra["uncovered_output_paths"] == ["output.document_name"]
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is None
+
+    def test_steer_redirects_update_workflow_reauthor_before_clear_consumes_reopen(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        consume_uncovered_output_reopen_event(ctx)
+        steer = uncovered_output_reject_scout_steer_signal(ctx, "update_workflow")
+        assert isinstance(steer, CopilotToolBlockerSignal)
+        assert steer.cleared_by_tools == frozenset({"evaluate"})
+        assert steer.blocked_tool == "update_workflow"
+
+    def test_steer_inert_without_reopen_latch(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is None
+
+    def test_no_contradictory_blockers_steer_and_force_persist_disjoint(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        consume_uncovered_output_reopen_event(ctx)
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is not None
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        ctx.scouted_output_covered_paths = {"output.document_name"}
+        ctx.uncovered_output_rescout_steer_key = None
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is None
+
+    def test_persisted_run_outcome_does_not_trigger_author_reopen(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.completion_verification_result = TestSynthesizedOfferPersistenceGate._unsatisfied_verification()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:unsatisfied-output",
+            missing_requested_output_facts=[
+                {
+                    "output_path": "output.document_name",
+                    "output_root": "output",
+                    "reason_code": "outcome_not_demonstrated",
+                    "value_status": "no_typed_value",
+                }
+            ],
+        )
+        assert author_time_reject_missing_output_paths(ctx.latest_recorded_build_test_outcome) == set()
+        assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is False
+        assert consume_uncovered_output_reopen_event(ctx) is False
+        assert ctx.synthesized_block_reopened_for_output_coverage is False
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is None
+        assert isinstance(synthesized_block_persistence_signal(ctx, "click"), CopilotToolBlockerSignal)
+
+    def test_author_reject_inert_when_no_missing_output_facts(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = recorded_outcome_from_author_time_reject(
+            reason_code="metadata_reject",
+            block_labels=["extract_order"],
+            structural_payload={"reason_code": "recorded_outcome_missing_output_coverage"},
+        )
+        assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is False
+        assert consume_uncovered_output_reopen_event(ctx) is False
+        assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+    def test_author_reject_inert_when_paths_already_covered(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.scouted_output_covered_paths = {"output.document_name"}
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is False
+        assert consume_uncovered_output_reopen_event(ctx) is False
+
+    def test_coverage_reopen_refreshes_synthesized_offer_after_authoring(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        assert _maybe_synthesized_block_offer_msg(ctx) is None
+        ctx.synthesized_block_reopened_for_output_coverage = True
+        assert _maybe_synthesized_block_offer_msg(ctx) is not None
+
+    def test_post_hook_failure_rolls_back_coverage_credit(self) -> None:
+        assert "scouted_output_covered_paths" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        assert "synthesized_block_reopened_for_output_coverage" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        ctx = _Ctx()
+        ctx.scouted_output_covered_paths = {"output.document_name"}
+        ctx.synthesized_block_reopened_for_output_coverage = False
+        snapshot = _snapshot_post_hook_context(ctx)
+        ctx.scouted_output_covered_paths.add("output.leaked")
+        ctx.synthesized_block_reopened_for_output_coverage = True
+        _restore_post_hook_context(ctx, snapshot)
+        assert ctx.scouted_output_covered_paths == {"output.document_name"}
+        assert ctx.synthesized_block_reopened_for_output_coverage is False
