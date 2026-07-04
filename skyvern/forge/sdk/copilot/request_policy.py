@@ -187,9 +187,16 @@ ExpectedOutputShape = Literal[
     "money_amount",
     "owner_label",
 ]
+RequestedOutputEvidenceSource = Literal[
+    "runtime_output",
+    "independent_run_evidence",
+    "registered_output_parameter",
+    "registered_artifact_content",
+]
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
+_REQUESTED_OUTPUT_EVIDENCE_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputEvidenceSource))
 
 _OUTPUT_INTENT_RE = re.compile(
     r"\b(?:read|capture|extract|output|return|returns|returned|include|includes|including|"
@@ -252,6 +259,7 @@ class CompletionCriterion:
     output_path: str | None = None
     expected_output_value: str | None = None
     expected_output_shape: ExpectedOutputShape | None = None
+    requested_output_evidence_source: RequestedOutputEvidenceSource = "runtime_output"
     kind: CriterionKind = "outcome"
     terminal_action_family: TerminalActionFamily | None = None
     classification_output_key: str | None = None
@@ -288,6 +296,7 @@ class RequestPolicy:
     classifier_status: str = "not_run"
     classifier_failure_kind: str = "none"
     classifier_retry_count: int = 0
+    classifier_non_runtime_requested_output_evidence_sources: list[str] = field(default_factory=list)
     completion_contract_status: str = "absent"
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
@@ -316,6 +325,12 @@ class RequestPolicy:
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
             "classifier_retry_count": self.classifier_retry_count,
+            "classifier_non_runtime_requested_output_evidence_source_count": len(
+                self.classifier_non_runtime_requested_output_evidence_sources
+            ),
+            "classifier_non_runtime_requested_output_evidence_sources": list(
+                self.classifier_non_runtime_requested_output_evidence_sources
+            ),
             "completion_contract_status": self.completion_contract_status,
             "existing_workflow_credential_id_count": len(self.existing_workflow_credential_ids),
             "existing_workflow_credential_origin_count": sum(
@@ -332,6 +347,7 @@ class RequestPolicy:
             data[f"{prefix}_output_path"] = criterion.output_path
             data[f"{prefix}_grounding_mode"] = _criterion_grounding_mode(criterion)
             data[f"{prefix}_has_exact_value"] = criterion.expected_output_value is not None
+            data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
         return data
@@ -599,6 +615,12 @@ def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
     return None
 
 
+def _coerce_requested_output_evidence_source(value: Any) -> RequestedOutputEvidenceSource:
+    if isinstance(value, str) and value in _REQUESTED_OUTPUT_EVIDENCE_SOURCES:
+        return cast(RequestedOutputEvidenceSource, value)
+    return "runtime_output"
+
+
 def _coerce_classification_output_key(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -708,6 +730,9 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
         )
         expected_output_value = expected_output_value or None
         expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        requested_output_evidence_source = _coerce_requested_output_evidence_source(
+            item.get("requested_output_evidence_source")
+        )
         contingent_on_raw = item.get("contingent_on")
         contingent_on = (
             " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
@@ -734,6 +759,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             output_path = None
             expected_output_value = None
             expected_output_shape = None
+            requested_output_evidence_source = "runtime_output"
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
@@ -761,6 +787,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 output_path=output_path,
                 expected_output_value=expected_output_value,
                 expected_output_shape=expected_output_shape,
+                requested_output_evidence_source=requested_output_evidence_source,
                 kind=kind,
                 terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
                 classification_output_key=classification_output_key,
@@ -1079,6 +1106,31 @@ def _requested_output_shapes_from_criteria(
     return shapes
 
 
+def _requested_output_evidence_sources_from_criteria(
+    criteria: list[CompletionCriterion],
+    requested_specs: list[tuple[str, str, str]],
+) -> dict[str, RequestedOutputEvidenceSource]:
+    sources: dict[str, RequestedOutputEvidenceSource] = {}
+    eligible_source_criteria: list[CompletionCriterion] = []
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated:
+            continue
+        if criterion.requested_output_evidence_source == "runtime_output":
+            continue
+        if criterion.kind == "outcome" and not _validation_classification_output_path(criterion.output_path):
+            eligible_source_criteria.append(criterion)
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path != output_path and not _criterion_text_covers_requested_output(
+                criterion, field_name
+            ):
+                continue
+            sources.setdefault(output_path, criterion.requested_output_evidence_source)
+    if len(requested_specs) == 1 and len(eligible_source_criteria) == 1:
+        _field_name, output_path, _field_label = requested_specs[0]
+        sources.setdefault(output_path, eligible_source_criteria[0].requested_output_evidence_source)
+    return sources
+
+
 def _requested_output_criterion_id(output_path: str) -> str:
     slug = "_".join(_word_tokens(output_path)) or "field"
     return f"{_REQUESTED_OUTPUT_CRITERION_ID_PREFIX}{slug}"
@@ -1294,6 +1346,9 @@ def _apply_requested_output_completion_criteria(
 
     value_by_output_path = _requested_output_expected_values_from_criteria(policy.completion_criteria, requested_specs)
     shape_by_output_path = _requested_output_shapes_from_criteria(policy.completion_criteria, requested_specs)
+    source_by_output_path = _requested_output_evidence_sources_from_criteria(
+        policy.completion_criteria, requested_specs
+    )
 
     metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
     for criterion in policy.completion_criteria:
@@ -1338,6 +1393,7 @@ def _apply_requested_output_completion_criteria(
             output_path=output_path,
             expected_output_value=value_by_output_path.get(output_path),
             expected_output_shape=shape_by_output_path.get(output_path),
+            requested_output_evidence_source=source_by_output_path.get(output_path, "runtime_output"),
             contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
             contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
             deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
@@ -1432,6 +1488,8 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["expected_output_value"] = criterion.expected_output_value
         if criterion.expected_output_shape:
             item["expected_output_shape"] = criterion.expected_output_shape
+        if criterion.requested_output_evidence_source != "runtime_output":
+            item["requested_output_evidence_source"] = criterion.requested_output_evidence_source
         if criterion.classification_output_key:
             item["classification_output_key"] = criterion.classification_output_key
         if criterion.expected_classification is not None:
@@ -1710,6 +1768,13 @@ async def _classify_request(
 
     policy = _classification_from_raw(raw_payload)
     policy.classifier_retry_count = retry_count
+    policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
+        {
+            criterion.requested_output_evidence_source
+            for criterion in policy.completion_criteria
+            if criterion.requested_output_evidence_source != "runtime_output"
+        }
+    )
     policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.completion_criteria else "absent"

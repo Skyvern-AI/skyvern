@@ -8,11 +8,12 @@ import { type StudioPaneId } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 
 function OrderProbe({ order }: { order: StudioPaneId[] }) {
-  const { panes, setPanesOrder } = useStudioPanes();
+  const { panes, setPanesOrder, setOpenPanes } = useStudioPanes();
   return (
     <div>
       <output data-testid="panes">{panes.join(",")}</output>
       <button onClick={() => setPanesOrder(order)}>set-order</button>
+      <button onClick={() => setOpenPanes(order)}>set-open</button>
     </div>
   );
 }
@@ -24,6 +25,14 @@ function renderWithPanes(search: string, order: StudioPaneId[]) {
     </MemoryRouter>,
   );
 }
+
+describe("useStudioPanes setOpenPanes", () => {
+  test("replaces the open set outright (layout override)", () => {
+    renderWithPanes("?panes=copilot,browser,overview", ["editor"]);
+    fireEvent.click(screen.getByText("set-open"));
+    expect(screen.getByTestId("panes").textContent).toBe("editor");
+  });
+});
 
 describe("useStudioPanes setPanesOrder", () => {
   test("commits a reordered list to the URL", () => {
@@ -41,10 +50,10 @@ describe("useStudioPanes setPanesOrder", () => {
   });
 
   test("keeps the open set from the URL: closed panes in the order are dropped, missing ones appended", () => {
-    // "timeline" is not open, so it must not open; "browser" is open but
+    // "overview" is not open, so it must not open; "browser" is open but
     // absent from the requested order, so it keeps a slot at the end.
     renderWithPanes("?panes=copilot,editor,browser", [
-      "timeline",
+      "overview",
       "editor",
       "copilot",
     ]);

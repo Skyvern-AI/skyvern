@@ -1,18 +1,19 @@
-export type StudioPaneId = "copilot" | "editor" | "browser" | "timeline";
+export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
 
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "copilot",
   "editor",
   "browser",
-  "timeline",
+  "overview",
 ];
 
 export const STUDIO_PANES_PARAM = "panes";
 
 // Accepted forever on parse so pre-rename ?panes= links keep working; the
-// canonical id ("timeline") is what serializes back out.
+// canonical id ("overview") is what serializes back out.
 const STUDIO_PANE_ID_ALIASES: Record<string, StudioPaneId> = {
-  run: "timeline",
+  run: "overview",
+  timeline: "overview",
 };
 
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
@@ -24,10 +25,23 @@ export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
 // is already open — they never rearrange or close panes.
 export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
   "browser",
-  "timeline",
+  "overview",
 ];
 
-// Copilot / Editor / Timeline share one narrow floor; the browser viewport
+// Panes that mutate the workflow (Copilot builds, Editor saves) are blocked
+// while the shell shows a run of a deleted agent; run viewing stays.
+export const DELETED_WORKFLOW_BLOCKED_PANES: readonly StudioPaneId[] = [
+  "copilot",
+  "editor",
+];
+
+export function panesWithoutDeletedBlocked(
+  panes: readonly StudioPaneId[],
+): StudioPaneId[] {
+  return panes.filter((id) => !DELETED_WORKFLOW_BLOCKED_PANES.includes(id));
+}
+
+// Copilot / Editor / Overview share one narrow floor; the browser viewport
 // keeps a little more room. The stage clamps shared links and nudges on
 // over-tight opens against these numbers (fitPanesToWidth below), and divider
 // resizes clamp against them too.
@@ -35,7 +49,7 @@ export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
   copilot: 260,
   editor: 260,
   browser: 300,
-  timeline: 260,
+  overview: 260,
 };
 
 // Stage chrome for the fit math; must match the stage p-3 and the divider
@@ -127,10 +141,10 @@ export function panesFromDeepLink(
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
 ): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
-    return ["editor", "browser", "timeline"];
+    return ["editor", "browser", "overview"];
   }
   if (params.runId || params.active) {
-    return ["copilot", "browser", "timeline"];
+    return ["copilot", "browser", "overview"];
   }
   return [...defaultPanes];
 }
@@ -188,6 +202,13 @@ export function withPaneClosed(
   return panes.filter((p) => p !== id);
 }
 
+// Commas are legal unencoded in query values and parse back identically; keep
+// ?panes=copilot,browser readable no matter which writer serialized last.
+export function toReadableSearch(params: URLSearchParams): string {
+  const raw = params.toString().replace(/%2C/g, ",");
+  return raw ? `?${raw}` : "";
+}
+
 // Serialize the open list into a search string, preserving unrelated params.
 export function searchWithPanes(
   search: string,
@@ -195,7 +216,5 @@ export function searchWithPanes(
 ): string {
   const params = new URLSearchParams(search);
   params.set(STUDIO_PANES_PARAM, panes.join(","));
-  // Commas are legal unencoded in query values and parse back identically;
-  // keep them readable (?panes=copilot,browser).
-  return `?${params.toString().replace(/%2C/g, ",")}`;
+  return toReadableSearch(params);
 }

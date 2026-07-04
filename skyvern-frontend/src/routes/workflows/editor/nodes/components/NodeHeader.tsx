@@ -35,6 +35,7 @@ import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserS
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useBlockRunTarget } from "@/routes/workflows/editor/hooks/useBlockRunTarget";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { DebugSessionProfileIncompatibleDialog } from "@/routes/workflows/debugger/DebugSessionProfileIncompatibleDialog";
 import {
@@ -251,11 +252,9 @@ function NodeHeader({
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
-  const {
-    blockLabel: urlBlockLabel,
-    workflowPermanentId,
-    workflowRunId,
-  } = useParams();
+  const { workflowPermanentId } = useParams();
+  const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
+    useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
@@ -281,7 +280,9 @@ function NodeHeader({
   const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflowRun } = useWorkflowRunQuery({
+    workflowRunId: activeWorkflowRunId,
+  });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
@@ -297,11 +298,11 @@ function NodeHeader({
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
-    urlBlockLabel !== undefined &&
-    urlBlockLabel === blockLabel;
+    targetBlockLabel !== undefined &&
+    targetBlockLabel === blockLabel;
 
   const thisBlockIsTargetted =
-    urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+    targetBlockLabel !== undefined && targetBlockLabel === blockLabel;
 
   const isRecording = recordingStore.isRecording;
 
@@ -367,36 +368,41 @@ function NodeHeader({
   });
 
   useEffect(() => {
-    if (!workflowRun || !workflowPermanentId || !workflowRunId) {
+    if (
+      !workflowRun ||
+      !workflowPermanentId ||
+      !activeWorkflowRunId ||
+      // Only block-scoped runs toast per block; full runs report via the run
+      // surfaces (?wr= without ?bl=).
+      targetBlockLabel === undefined
+    ) {
       return;
     }
 
     if (
-      workflowRunId === workflowRun?.workflow_run_id &&
+      activeWorkflowRunId === workflowRun?.workflow_run_id &&
       statusIsFinalized(workflowRun)
     ) {
-      // navigate(`/workflows/${workflowPermanentId}/build`);
-
       if (statusIsAFailureType(workflowRun)) {
         toast({
           variant: "destructive",
-          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
           description: `Reason: ${workflowRun.failure_reason}`,
         });
       } else if (statusIsFinalized(workflowRun)) {
         toast({
           variant: "success",
-          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
         });
       }
     }
   }, [
     queryClient,
-    urlBlockLabel,
+    targetBlockLabel,
     navigate,
     workflowPermanentId,
     workflowRun,
-    workflowRunId,
+    activeWorkflowRunId,
   ]);
 
   const runBlock = useMutation({
@@ -622,7 +628,9 @@ function NodeHeader({
       const browserSessionId = debugSession.browser_session_id;
       const client = await getClient(credentialGetter);
       return client
-        .post(`/runs/${browserSessionId}/workflow_run/${workflowRunId}/cancel/`)
+        .post(
+          `/runs/${browserSessionId}/workflow_run/${activeWorkflowRunId}/cancel/`,
+        )
         .then((response) => response.data);
     },
     onSuccess: () => {

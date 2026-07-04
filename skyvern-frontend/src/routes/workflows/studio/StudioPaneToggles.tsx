@@ -1,14 +1,20 @@
-import { useState, type KeyboardEvent } from "react";
+import { useEffect, useState, type KeyboardEvent } from "react";
 
 import { Status } from "@/api/types";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
+import { ControlTooltip } from "./ControlTooltip";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META } from "./paneMeta";
-import { STUDIO_PANE_IDS, type StudioPaneId } from "./panes";
+import {
+  DELETED_WORKFLOW_BLOCKED_PANES,
+  STUDIO_PANE_IDS,
+  type StudioPaneId,
+} from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunSignals } from "./useStudioRunSignals";
+import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 // Terminal-only (finalizedRunStatus never returns a live status); mirrors the
 // StatusBadge variant buckets so the dot reads the same as the run chip.
@@ -32,18 +38,40 @@ function runStatusLabel(status: Status): string {
   return status === Status.TimedOut ? "timed out" : status;
 }
 
+// Mirrors the labels' `hidden xl:inline`: below Tailwind's xl the toggles are
+// icon-only and the tooltip carries the label; with labels visible, enabled
+// toggles have no tooltip (only icon-only controls tooltip).
+function useLabelsCollapsed(): boolean {
+  const [collapsed, setCollapsed] = useState(false);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return;
+    }
+    const query = window.matchMedia("(min-width: 1280px)");
+    const update = () => setCollapsed(!query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return collapsed;
+}
+
 /**
- * The studio's single vertical tab spine: Copilot, Editor, Browser and
- * Timeline are peer tabs, each toggling its pane open or closed on the stage.
+ * The studio's pane toggles, top-center in the top bar: Copilot, Editor,
+ * Browser and Overview are peer TOGGLES (multi-active, not exclusive tabs) —
+ * each opens or closes its pane on the stage. Labels collapse to icons below
+ * xl so the cluster never crowds the title or the run actions.
  */
-export function StudioSpine() {
+export function StudioPaneToggles() {
   const { panes, togglePane } = useStudioPanes();
+  const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   const hasUnseenBrowserActivity = useStudioBrowserStore(
     (s) => s.hasUnseenActivity,
   );
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
 
   const { hasRun, runStatus } = useStudioRunSignals();
+  const labelsCollapsed = useLabelsCollapsed();
 
   const onToggle = (id: StudioPaneId) => {
     if (id === "browser" && !panes.includes("browser")) {
@@ -52,15 +80,18 @@ export function StudioSpine() {
     togglePane(id);
   };
 
-  // Roving tabindex (WAI-ARIA toolbar): the rail is one tab stop; arrow keys
-  // move focus across the enabled tabs, Enter/Space toggles.
+  const paneBlockedByDeletion = (id: StudioPaneId) =>
+    workflowDeleted && DELETED_WORKFLOW_BLOCKED_PANES.includes(id);
+
+  // Roving tabindex (WAI-ARIA toolbar): the cluster is one tab stop; arrow
+  // keys move focus across the enabled toggles, Enter/Space toggles.
   const [focusedId, setFocusedId] = useState<StudioPaneId>(STUDIO_PANE_IDS[0]!);
   const enabledIds = STUDIO_PANE_IDS.filter(
-    (id) => !(id === "timeline" && !hasRun),
+    (id) => !(id === "overview" && !hasRun) && !paneBlockedByDeletion(id),
   );
   const tabStopId = enabledIds.includes(focusedId) ? focusedId : enabledIds[0];
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+    const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
     if (!keys.includes(event.key) || enabledIds.length === 0) {
       return;
     }
@@ -70,9 +101,9 @@ export function StudioSpine() {
       enabledIds.indexOf(tabStopId ?? enabledIds[0]!),
     );
     const nextIndex =
-      event.key === "ArrowDown"
+      event.key === "ArrowRight"
         ? (current + 1) % enabledIds.length
-        : event.key === "ArrowUp"
+        : event.key === "ArrowLeft"
           ? (current - 1 + enabledIds.length) % enabledIds.length
           : event.key === "Home"
             ? 0
@@ -85,80 +116,82 @@ export function StudioSpine() {
   return (
     <nav
       aria-label="Studio panes"
-      className="flex h-full w-16 shrink-0 flex-col items-center gap-1 border-r border-border bg-slate-elevation1 px-1.5 py-3"
+      className="flex shrink-0 items-center gap-1.5"
       onKeyDown={onKeyDown}
     >
       {STUDIO_PANE_IDS.map((id) => {
         const { label, icon: Icon } = STUDIO_PANE_META[id];
         const open = panes.includes(id);
-        const disabled = id === "timeline" && !hasRun;
+        const blockedByDeletion = paneBlockedByDeletion(id);
+        const disabled = (id === "overview" && !hasRun) || blockedByDeletion;
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && !open;
-        const showRunStatusDot = id === "timeline" && Boolean(runStatus);
+        const showRunStatusDot = id === "overview" && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
-          : id === "timeline" && runStatus
-            ? `Timeline, ${runStatusLabel(runStatus)}`
-            : undefined;
-        return (
+          : id === "overview" && runStatus
+            ? `Overview, ${runStatusLabel(runStatus)}`
+            : label;
+        const tip = blockedByDeletion
+          ? "Source agent deleted"
+          : disabled
+            ? "Overview: no runs yet"
+            : runStatus && id === "overview"
+              ? `Overview: ${runStatusLabel(runStatus)}`
+              : `${open ? "Close" : "Open"} ${label}`;
+        const button = (
           <button
             key={id}
             id={studioTabId(id)}
             type="button"
+            aria-pressed={open}
             aria-expanded={open}
             aria-controls={studioPanelId(id)}
             aria-label={ariaLabel}
             disabled={disabled}
             tabIndex={id === tabStopId ? 0 : -1}
             onFocus={() => setFocusedId(id)}
-            title={
-              disabled
-                ? "Timeline: no runs yet"
-                : runStatus && id === "timeline"
-                  ? `Timeline: ${runStatusLabel(runStatus)}`
-                  : `${open ? "Close" : "Open"} ${label}`
-            }
             onClick={() => onToggle(id)}
             className={cn(
-              "relative flex w-full flex-col items-center gap-1 rounded-md px-1 py-2 text-[10px] font-medium leading-none transition-colors",
+              "relative inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium transition-colors",
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
               open
-                ? "bg-studio-accent/15 text-foreground"
-                : "text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground",
-              disabled &&
-                "cursor-default opacity-50 hover:bg-transparent hover:text-muted-foreground",
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+              disabled && "pointer-events-none opacity-50",
             )}
           >
-            {open ? (
-              <span
-                aria-hidden
-                className="absolute -left-1.5 bottom-2 top-2 w-[3px] rounded-r-full bg-studio-accent"
-              />
-            ) : null}
-            <Icon
-              className={cn("size-5", open && "text-studio-accent")}
-              aria-hidden
-            />
-            {label}
+            <Icon className="size-3.5" aria-hidden />
+            <span className="hidden xl:inline">{label}</span>
             {showActivityDot ? (
               <span
                 aria-hidden
                 title="New browser activity"
-                className="absolute right-1 top-1 flex size-2"
+                className="absolute -right-0.5 -top-0.5 flex size-2"
               >
-                <span className="absolute inline-flex h-full w-full rounded-full bg-studio-accent opacity-75 motion-safe:animate-ping" />
-                <span className="relative inline-flex size-2 rounded-full bg-studio-accent shadow-[0_0_0_3px_rgba(109,108,246,0.20)]" />
+                <span className="absolute inline-flex h-full w-full rounded-full bg-primary opacity-75 motion-safe:animate-ping" />
+                <span className="relative inline-flex size-2 rounded-full bg-primary" />
               </span>
             ) : showRunStatusDot && runStatus ? (
               <span
                 aria-hidden
                 className={cn(
-                  "absolute right-1 top-1 size-2 rounded-full",
+                  "absolute -right-0.5 -top-0.5 size-2 rounded-full",
                   runStatusDotClass(runStatus),
                 )}
               />
             ) : null}
           </button>
+        );
+        // Disabled toggles always voice their reason; enabled ones tooltip
+        // only while icon-collapsed.
+        if (!disabled && !labelsCollapsed) {
+          return button;
+        }
+        return (
+          <ControlTooltip key={id} content={tip} blocked={disabled}>
+            {button}
+          </ControlTooltip>
         );
       })}
       <span

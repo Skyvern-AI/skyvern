@@ -64,11 +64,14 @@ function WorkflowYamlEditor({ variant = "fullscreen" }: Props) {
             </span>
           ) : null}
         </div>
-        <YamlModeToggle
-          mode="code"
-          onVisual={switchToVisual}
-          disabled={committing}
-        />
+        {/* The studio's pane variant hosts this toggle in the pane header. */}
+        {fullscreen ? (
+          <YamlModeToggle
+            mode="code"
+            onVisual={switchToVisual}
+            disabled={committing}
+          />
+        ) : null}
       </div>
       {error ? (
         <div

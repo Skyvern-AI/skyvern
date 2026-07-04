@@ -67,6 +67,7 @@ def _criterion(
     deliverable_kind: str | None = None,
     expected_output_value: str | None = None,
     expected_output_shape: str | None = None,
+    requested_output_evidence_source: str = "runtime_output",
     kind: str = "outcome",
     classification_output_key: str | None = None,
     expected_classification: str | bool | None = None,
@@ -82,6 +83,7 @@ def _criterion(
         deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
         expected_output_value=expected_output_value,
         expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
+        requested_output_evidence_source=requested_output_evidence_source,  # type: ignore[arg-type]
         kind=kind,  # type: ignore[arg-type]
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
@@ -141,6 +143,150 @@ def test_present_completion_contract_helper_rejects_absent_policy() -> None:
     policy = RequestPolicy(completion_contract_status="absent", completion_criteria=[])
 
     assert request_policy_has_present_completion_contract(policy) is False
+
+
+def test_completion_criteria_preserve_requested_output_evidence_source() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record selects the best option.",
+                "output_path": "output.best_option_selected",
+                "expected_output_value": "true",
+                "requested_output_evidence_source": "independent_run_evidence",
+            },
+            {
+                "outcome": "The returned record includes status.",
+                "output_path": "output.status",
+                "expected_output_value": "Active",
+            },
+            {
+                "outcome": "The registered output parameter includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_value": "WTR-1842-DEMO",
+                "requested_output_evidence_source": "registered_output_parameter",
+            },
+            {
+                "outcome": "The registered artifact content includes the statement total.",
+                "output_path": "output.statement_total",
+                "expected_output_value": "$41.00",
+                "requested_output_evidence_source": "registered_artifact_content",
+            },
+            {
+                "outcome": "The classifier drifted.",
+                "output_path": "output.drifted",
+                "requested_output_evidence_source": "output_path_name_heuristic",
+            },
+        ]
+    )
+
+    assert [criterion.requested_output_evidence_source for criterion in criteria] == [
+        "independent_run_evidence",
+        "runtime_output",
+        "registered_output_parameter",
+        "registered_artifact_content",
+        "runtime_output",
+    ]
+
+    round_tripped = criteria_from_json(criteria_to_json(criteria))
+    assert [criterion.requested_output_evidence_source for criterion in round_tripped] == [
+        "independent_run_evidence",
+        "runtime_output",
+        "registered_output_parameter",
+        "registered_artifact_content",
+        "runtime_output",
+    ]
+
+    policy = RequestPolicy(completion_criteria=list(round_tripped))
+    trace = policy.to_trace_data()
+    assert trace["requested_output_criterion_0_evidence_source"] == "independent_run_evidence"
+    assert trace["requested_output_criterion_1_evidence_source"] == "runtime_output"
+    assert trace["requested_output_criterion_2_evidence_source"] == "registered_output_parameter"
+    assert trace["requested_output_criterion_3_evidence_source"] == "registered_artifact_content"
+
+
+def test_requested_output_canonicalization_preserves_independent_evidence_source() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record selects the best option.",
+                output_path="output.best_option",
+                expected_output_value="true",
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with best option.")
+
+    requested = _criteria_for_path(policy, "output.best_option")
+    assert requested
+    assert requested[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+def test_requested_output_canonicalization_inherits_single_independent_selection_source() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The highest-priority returned record is selected.",
+                expected_output_value="true",
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with document name.")
+
+    requested = _criteria_for_path(policy, "output.document_name")
+    assert requested
+    assert requested[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+@pytest.mark.asyncio
+async def test_classifier_requested_output_selection_source_survives_canonicalization() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with document name.",
+        [
+            {
+                "outcome": "The highest-priority returned document is selected.",
+                "expected_output_value": "true",
+                "requested_output_evidence_source": "independent_run_evidence",
+            }
+        ],
+    )
+
+    requested = _criteria_for_path(policy, "output.document_name")
+    trace = policy.to_trace_data()
+
+    assert requested
+    assert requested[0].requested_output_evidence_source == "independent_run_evidence"
+    assert trace["classifier_non_runtime_requested_output_evidence_source_count"] == 1
+    assert trace["classifier_non_runtime_requested_output_evidence_sources"] == ["independent_run_evidence"]
+
+
+def test_request_policy_trace_exposes_classifier_fallback_status() -> None:
+    policy = RequestPolicy(
+        classifier_status="fallback",
+        classifier_failure_kind="timeout",
+        classifier_retry_count=2,
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record includes status.",
+                output_path="output.status",
+            )
+        ],
+    )
+
+    trace = policy.to_trace_data()
+
+    assert trace["classifier_status"] == "fallback"
+    assert trace["classifier_failure_kind"] == "timeout"
+    assert trace["classifier_retry_count"] == 2
+    assert trace["classifier_non_runtime_requested_output_evidence_source_count"] == 0
+    assert trace["classifier_non_runtime_requested_output_evidence_sources"] == []
+    assert trace["requested_output_criterion_0_evidence_source"] == "runtime_output"
 
 
 @pytest.mark.asyncio

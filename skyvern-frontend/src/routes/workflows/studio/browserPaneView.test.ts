@@ -9,9 +9,7 @@ const base = {
   inspectingRun: false,
   blockRunInDebugSession: false,
   running: false,
-  debugSessionUp: false,
   hasRecording: false,
-  hasScreenshots: false,
   failed: false,
 };
 
@@ -23,12 +21,11 @@ describe("resolveBrowserPaneView", () => {
         intent: "live",
         inspectingRun: true,
         hasRecording: true,
-        hasScreenshots: true,
       }),
     ).toBe("live");
   });
 
-  it("pins Recording only when a recording exists", () => {
+  it("pins Recording even before its data arrives (empty state)", () => {
     expect(
       resolveBrowserPaneView({
         ...base,
@@ -36,30 +33,22 @@ describe("resolveBrowserPaneView", () => {
         hasRecording: true,
       }),
     ).toBe("recording");
-    expect(
-      resolveBrowserPaneView({
-        ...base,
-        intent: "recording",
-        debugSessionUp: true,
-      }),
-    ).toBe("live");
+    expect(resolveBrowserPaneView({ ...base, intent: "recording" })).toBe(
+      "recording",
+    );
   });
 
-  it("pins Screenshots only when screenshots exist", () => {
+  it("pins Screenshots even before its data arrives (empty state)", () => {
+    expect(resolveBrowserPaneView({ ...base, intent: "screenshots" })).toBe(
+      "screenshots",
+    );
     expect(
       resolveBrowserPaneView({
         ...base,
         intent: "screenshots",
-        hasScreenshots: true,
+        hasRecording: true,
       }),
     ).toBe("screenshots");
-    expect(
-      resolveBrowserPaneView({
-        ...base,
-        intent: "screenshots",
-        debugSessionUp: true,
-      }),
-    ).toBe("live");
   });
 
   it("overrides a stored replay intent when a recording starts", () => {
@@ -70,8 +59,6 @@ describe("resolveBrowserPaneView", () => {
           intent,
           recording: true,
           hasRecording: true,
-          hasScreenshots: true,
-          debugSessionUp: true,
         }),
       ).toBe("live");
     }
@@ -85,7 +72,6 @@ describe("resolveBrowserPaneView", () => {
         scrubbing: true,
         inspectingRun: true,
         hasRecording: true,
-        hasScreenshots: true,
       }),
     ).toBe("live");
   });
@@ -96,7 +82,6 @@ describe("resolveBrowserPaneView", () => {
         ...base,
         scrubbing: true,
         running: true,
-        debugSessionUp: true,
       }),
     ).toBe("screenshots");
   });
@@ -107,9 +92,7 @@ describe("resolveBrowserPaneView", () => {
         ...base,
         blockRunInDebugSession: true,
         inspectingRun: true,
-        debugSessionUp: true,
         hasRecording: true,
-        hasScreenshots: true,
       }),
     ).toBe("live");
   });
@@ -125,9 +108,7 @@ describe("resolveBrowserPaneView", () => {
       resolveBrowserPaneView({
         ...base,
         inspectingRun: true,
-        debugSessionUp: true,
         hasRecording: true,
-        hasScreenshots: true,
       }),
     ).toBe("recording");
   });
@@ -139,33 +120,25 @@ describe("resolveBrowserPaneView", () => {
         inspectingRun: true,
         failed: true,
         hasRecording: true,
-        hasScreenshots: true,
       }),
     ).toBe("screenshots");
   });
 
   it("defaults to the live debug browser when no run is inspected", () => {
-    expect(
-      resolveBrowserPaneView({
-        ...base,
-        debugSessionUp: true,
-        hasRecording: true,
-        hasScreenshots: true,
-      }),
-    ).toBe("live");
+    expect(resolveBrowserPaneView({ ...base, hasRecording: true })).toBe(
+      "live",
+    );
   });
 
-  it("defaults to the last run's replay when idle with history and no session", () => {
-    expect(
-      resolveBrowserPaneView({
-        ...base,
-        hasRecording: true,
-        hasScreenshots: true,
-      }),
-    ).toBe("recording");
-    expect(resolveBrowserPaneView({ ...base, hasScreenshots: true })).toBe(
-      "screenshots",
+  it("edit entry stays live while the debug session boots, never the latest run's recording", () => {
+    // No ?wr= in the URL; the inspected latest run carries a recording and the
+    // debug session hasn't booted yet — the pane must be live (connecting).
+    expect(resolveBrowserPaneView({ ...base, hasRecording: true })).toBe(
+      "live",
     );
+    expect(
+      resolveBrowserPaneView({ ...base, hasRecording: true, failed: true }),
+    ).toBe("live");
   });
 
   it("falls back to live (warming up) with nothing to show", () => {
