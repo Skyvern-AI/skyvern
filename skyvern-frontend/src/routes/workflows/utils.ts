@@ -169,10 +169,9 @@ export interface Duration {
 
 export const toDuration = (seconds: number): Duration => {
   let minutes = Math.floor(seconds / 60);
-  let hours = Math.floor(minutes / 60);
+  const hours = Math.floor(minutes / 60);
   seconds = seconds % 60;
   minutes = minutes % 60;
-  hours = hours % 24;
 
   return {
     hour: Math.floor(hours),
