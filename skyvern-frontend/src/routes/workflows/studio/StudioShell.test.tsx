@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { fireEvent, render, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { StudioPane } from "./StudioShell";
@@ -22,16 +23,18 @@ describe("StudioPane header drag", () => {
       onMove: vi.fn(),
     };
     render(
-      <StudioPane
-        id="copilot"
-        open
-        order={0}
-        flex={undefined}
-        reorder={reorder}
-        onClose={vi.fn()}
-      >
-        <div>content</div>
-      </StudioPane>,
+      <TooltipProvider delayDuration={0}>
+        <StudioPane
+          id="copilot"
+          open
+          order={0}
+          flex={undefined}
+          reorder={reorder}
+          onClose={vi.fn()}
+        >
+          <div>content</div>
+        </StudioPane>
+      </TooltipProvider>,
     );
     return {
       reorder,

@@ -68,7 +68,7 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
   const [searchParams] = useSearchParams();
   const activeParam = searchParams.get("active");
-  // The Timeline pane's loop-iteration selection isn't in the URL; read it from the
+  // The Overview pane's loop-iteration selection isn't in the URL; read it from the
   // shared store so a selected iteration's screenshot resolves here too.
   const activeIteration = useRunViewStore((s) => s.activeIteration);
 

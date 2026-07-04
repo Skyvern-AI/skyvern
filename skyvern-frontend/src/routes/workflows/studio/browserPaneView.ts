@@ -15,17 +15,16 @@ type ResolveBrowserPaneViewArgs = {
   // stays the surface even after it finalizes (the block-iterate loop).
   blockRunInDebugSession: boolean;
   running: boolean;
-  debugSessionUp: boolean;
   hasRecording: boolean;
-  hasScreenshots: boolean;
   failed: boolean;
 };
 
 /**
  * The Browser pane's view machine, ported from RunHero's resolveRunHeroCenterView:
  * live while running, replay (recording/screenshots) on step-select or once the
- * inspected run finishes, and an idle workflow with history but no live session
- * defaults to the last run's replay instead of an empty stream.
+ * inspected run finishes. Without a run named in the URL (edit context) the
+ * pane is live from the first frame — a booting debug session shows its
+ * connecting state, never a flash of the latest run's replay.
  */
 export function resolveBrowserPaneView({
   intent,
@@ -34,9 +33,7 @@ export function resolveBrowserPaneView({
   inspectingRun,
   blockRunInDebugSession,
   running,
-  debugSessionUp,
   hasRecording,
-  hasScreenshots,
   failed,
 }: ResolveBrowserPaneViewArgs): BrowserPaneView {
   // An active recording outranks everything, stored replay intents included:
@@ -47,12 +44,12 @@ export function resolveBrowserPaneView({
   if (intent === "live") {
     return "live";
   }
-  // A pinned replay intent can outlive its data (reload, run swap); fall back
-  // to the machine until there is something to render.
-  if (intent === "recording" && hasRecording) {
+  // A pinned replay intent always presents its surface; when the run has no
+  // recording/screenshots (yet), the pane body renders the empty state.
+  if (intent === "recording") {
     return "recording";
   }
-  if (intent === "screenshots" && hasScreenshots) {
+  if (intent === "screenshots") {
     return "screenshots";
   }
   if (scrubbing) {
@@ -67,11 +64,7 @@ export function resolveBrowserPaneView({
   if (inspectingRun) {
     return hasRecording && !failed ? "recording" : "screenshots";
   }
-  if (debugSessionUp) {
-    return "live";
-  }
-  if (hasRecording && !failed) {
-    return "recording";
-  }
-  return hasScreenshots ? "screenshots" : "live";
+  // Edit context: the live debug surface immediately (its boot shows the
+  // connecting state); the latest run's replays stay one pill-click away.
+  return "live";
 }

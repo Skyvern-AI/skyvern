@@ -10,20 +10,29 @@ import { createPortal } from "react-dom";
 import { useParams } from "react-router-dom";
 import { Cross2Icon } from "@radix-ui/react-icons";
 
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { cn } from "@/util/utils";
 
 import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
+import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
+import { EditorPaneModeToggle } from "./EditorPaneHeader";
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
-import { RunPaneActions, RunPaneStatusBadge } from "./runview/RunPaneHeader";
+import { RunPaneActions, RunPaneViewToggles } from "./runview/RunPaneHeader";
 import { StudioBrowserStream } from "./StudioBrowserStream";
 import { StudioCoachMark } from "./StudioCoachMark";
 import { studioPanelId, studioTabId } from "./constants";
@@ -47,8 +56,8 @@ import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import {
   StudioPaneCompactContext,
   StudioShellContext,
+  StudioWorkflowDeletedContext,
 } from "./StudioShellContext";
-import { StudioSpine } from "./StudioSpine";
 import { StudioStageLauncher } from "./StudioStageLauncher";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
@@ -83,6 +92,7 @@ export function StudioPane({
   onClose,
   headerExtras,
   headerActions,
+  iconBadge,
   children,
 }: {
   id: StudioPaneId;
@@ -95,6 +105,8 @@ export function StudioPane({
   headerExtras?: ReactNode;
   // Rendered right-aligned, before the close button.
   headerActions?: ReactNode;
+  // Presence-badge overlay on the pane icon (e.g. the Copilot active dot).
+  iconBadge?: ReactNode;
   children: ReactNode;
 }) {
   const { label, icon: Icon } = STUDIO_PANE_META[id];
@@ -169,7 +181,6 @@ export function StudioPane({
         draggable
         aria-label={`${label} pane header`}
         aria-keyshortcuts="Control+Shift+ArrowLeft Control+Shift+ArrowRight"
-        title={`Drag to reorder the ${label} pane (or Ctrl/Cmd+Shift+←/→)`}
         onPointerDownCapture={(event) => {
           pointerOnControl.current =
             event.target instanceof Element &&
@@ -210,8 +221,19 @@ export function StudioPane({
         }}
         className="flex h-9 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing"
       >
-        <Icon className="size-3.5 shrink-0 text-studio-accent" aria-hidden />
-        <span className="min-w-0 truncate text-xs font-medium text-foreground">
+        {/* The drag hint lives on the grip (icon + label) only, so the header's
+            buttons keep their own tooltips instead of inheriting this one. */}
+        <span
+          className="relative shrink-0"
+          title={`Drag to reorder the ${label} pane (or Ctrl/Cmd+Shift+←/→)`}
+        >
+          <Icon className="size-3.5 text-muted-foreground" aria-hidden />
+          {iconBadge}
+        </span>
+        <span
+          className="min-w-0 truncate text-xs font-medium text-foreground"
+          title={`Drag to reorder the ${label} pane (or Ctrl/Cmd+Shift+←/→)`}
+        >
           {label}
         </span>
         <StudioPaneCompactContext.Provider value={compact}>
@@ -219,15 +241,19 @@ export function StudioPane({
           <span className="min-w-0 flex-1" />
           {headerActions}
         </StudioPaneCompactContext.Provider>
-        <button
-          type="button"
-          onClick={onClose}
-          title={`Close ${label}`}
-          aria-label={`Close ${label} pane`}
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        >
-          <Cross2Icon className="size-3.5" />
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label={`Close ${label} pane`}
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <Cross2Icon className="size-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Close {label}</TooltipContent>
+        </Tooltip>
       </div>
       <div className="min-h-0 min-w-0 flex-1">{children}</div>
       {/* Full-pane drop surface while a header drag is live; sits over iframe /
@@ -479,17 +505,36 @@ function StudioPaneDivider({
 }
 
 /**
- * Spine + panes shell: one vertical spine whose tabs (Copilot, Editor, Browser,
- * Timeline) each toggle a pane; open panes share the stage side by side in click
- * order (?panes=). The Copilot chat is portaled into its pane from Workspace.
+ * Panes shell: the top bar's pane toggles (Copilot, Editor, Browser, Overview)
+ * each toggle a pane; open panes share the stage side by side in click order
+ * (?panes=). The Copilot chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
   return (
-    <StudioPaneDefaultsProvider
-      hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
+    <StudioWorkflowDeletedContext.Provider
+      value={props.workflow.deleted_at ?? null}
     >
-      <StudioStage {...props} />
-    </StudioPaneDefaultsProvider>
+      <StudioPaneDefaultsProvider
+        hasBlocks={props.workflow.workflow_definition.blocks.length > 0}
+      >
+        <StudioStage {...props} />
+      </StudioPaneDefaultsProvider>
+    </StudioWorkflowDeletedContext.Provider>
+  );
+}
+
+/**
+ * Pane body while the source agent is deleted: the pane's normal content would
+ * operate on the missing workflow (Copilot chats, editor saves, debug
+ * browsers), so it never mounts — runs stay viewable from the run panes.
+ */
+function WorkflowDeletedPaneNotice() {
+  return (
+    <div className="flex h-full items-center justify-center p-4">
+      <p className="max-w-xs text-center text-sm text-muted-foreground">
+        Source agent deleted — this run is view-only.
+      </p>
+    </div>
   );
 }
 
@@ -497,7 +542,17 @@ function StudioStage(props: StudioWorkspaceProps) {
   const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
   const { registerStageElement } = useStudioPaneDefaults();
   const { workflowPermanentId } = useParams();
+  const workflowDeleted = Boolean(props.workflow.deleted_at);
   const isRecording = useRecordingStore((s) => s.isRecording);
+  // The title store is normally seeded by the embedded Workspace's canvas,
+  // which never mounts for a deleted agent — seed it here instead.
+  const initializeTitle = useWorkflowTitleStore((s) => s.initializeTitle);
+  const initialTitle = props.initialTitle;
+  useEffect(() => {
+    if (workflowDeleted) {
+      initializeTitle(initialTitle);
+    }
+  }, [workflowDeleted, initialTitle, initializeTitle]);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
     enabled: false,
@@ -513,6 +568,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
   );
+  const [panelPortalEl, setPanelPortalEl] = useState<HTMLElement | null>(null);
 
   // The live browser stream is mounted once into this detached host and
   // re-parented into the owning pane, so it never remounts on pane changes.
@@ -533,15 +589,15 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   const browserOpen = panes.includes("browser");
   const editorOpen = panes.includes("editor");
-  const timelineOpen = panes.includes("timeline");
+  const overviewOpen = panes.includes("overview");
 
   // Move the persistent stream node into the highest-priority open surface:
-  // Browser pane > Timeline pane with a live block run (runStreamSlot registers
+  // Browser pane > Overview pane with a live block run (runStreamSlot registers
   // only then) > Editor PiP > offscreen park, which keeps the socket warm.
   useLayoutEffect(() => {
     const activeSlot = browserOpen
       ? browserStreamSlot
-      : timelineOpen && runStreamSlot
+      : overviewOpen && runStreamSlot
         ? runStreamSlot
         : editorOpen && !pipMinimized
           ? editorStreamSlot
@@ -555,7 +611,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   }, [
     browserOpen,
     editorOpen,
-    timelineOpen,
+    overviewOpen,
     pipMinimized,
     editorStreamSlot,
     browserStreamSlot,
@@ -567,14 +623,15 @@ function StudioStage(props: StudioWorkspaceProps) {
   const shellContextValue = useMemo(
     () => ({
       copilotPortalEl,
+      panelPortalEl,
       setEditorStreamSlot,
       setBrowserStreamSlot,
       setRunStreamSlot,
     }),
-    [copilotPortalEl],
+    [copilotPortalEl, panelPortalEl],
   );
 
-  // The ✕ unmounts with its pane, so hand focus back to the pane's spine tab.
+  // The ✕ unmounts with its pane, so hand focus back to the pane's toggle.
   const closeWithFocus = (id: StudioPaneId) => {
     closePane(id);
     document.getElementById(studioTabId(id))?.focus();
@@ -659,90 +716,117 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   return (
     <StudioShellContext.Provider value={shellContextValue}>
-      <div className="flex h-full w-full flex-col">
-        <StudioTopBar />
-        <div className="flex min-h-0 min-w-0 flex-1">
-          <StudioSpine />
-          {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
+      {/* Studio-scoped tooltip timing: the app has no global provider, so this
+          only affects Radix tooltips inside the shell. */}
+      <TooltipProvider delayDuration={200} skipDelayDuration={300}>
+        <div className="flex h-full w-full flex-col">
+          <StudioTopBar />
+          <div className="flex min-h-0 min-w-0 flex-1">
+            {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
               stream slots); the CSS order carries the layout order instead, so
               screen-reader/Tab order stays the fixed order, not the visual one.
               Reordering (drag or keyboard) only rewrites CSS order — panes and
               the stream singleton never remount. */}
-          <div
-            ref={registerStageElement}
-            className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden p-3"
-          >
-            <StudioPane {...paneProps("copilot")}>
-              <div className="relative h-full w-full">
-                {/* Copilot portal target. Kept mounted while the pane is closed
+            <div
+              ref={registerStageElement}
+              className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden p-3"
+            >
+              <StudioPane
+                {...paneProps("copilot")}
+                headerActions={<CopilotPaneControls />}
+                iconBadge={<CopilotActiveDot />}
+              >
+                {workflowDeleted ? (
+                  <WorkflowDeletedPaneNotice />
+                ) : (
+                  <div className="relative h-full w-full">
+                    {/* Copilot portal target. Kept mounted while the pane is closed
                     — or while recording, when the live-drafts panel covers it —
                     so an in-flight Copilot turn isn't torn down. */}
-                <div
-                  ref={setCopilotPortalEl}
-                  className={cn(
-                    "h-full w-full",
-                    isRecording && "pointer-events-none",
-                  )}
-                />
-                {isRecording && browserSessionId ? (
-                  <div className="absolute inset-0 duration-150 animate-in fade-in slide-in-from-left-2">
-                    <RecordingPanel browserSessionId={browserSessionId} />
+                    <div
+                      ref={setCopilotPortalEl}
+                      className={cn(
+                        "h-full w-full",
+                        isRecording && "pointer-events-none",
+                      )}
+                    />
+                    {isRecording && browserSessionId ? (
+                      <div className="absolute inset-0 duration-150 animate-in fade-in slide-in-from-left-2">
+                        <RecordingPanel browserSessionId={browserSessionId} />
+                      </div>
+                    ) : null}
                   </div>
-                ) : null}
-              </div>
-            </StudioPane>
-            <StudioPane {...paneProps("editor")}>
-              <EditorTab {...props} />
-            </StudioPane>
-            {/* Kept mounted (CSS-hidden) so its stream slot stays registered;
+                )}
+              </StudioPane>
+              <StudioPane
+                {...paneProps("editor")}
+                headerExtras={<EditorPaneModeToggle />}
+              >
+                {/* The embedded Workspace boots debug sessions, copilot chats
+                    and block-script queries against the workflow — none of
+                    which exist once the agent is deleted, so it never mounts. */}
+                {workflowDeleted ? (
+                  <WorkflowDeletedPaneNotice />
+                ) : (
+                  <EditorTab {...props} />
+                )}
+              </StudioPane>
+              {/* Kept mounted (CSS-hidden) so its stream slot stays registered;
                 the persistent stream node is re-parented in, not remounted. */}
-            <StudioPane
-              {...paneProps("browser")}
-              headerExtras={<BrowserPaneViewPills />}
-              headerActions={<BrowserPaneActions />}
-            >
-              <BrowserTab />
-            </StudioPane>
-            <StudioPane
-              {...paneProps("timeline")}
-              headerExtras={<RunPaneStatusBadge />}
-              headerActions={<RunPaneActions />}
-            >
-              <RunTab />
-            </StudioPane>
-            {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
+              <StudioPane
+                {...paneProps("browser")}
+                headerExtras={<BrowserPaneViewPills />}
+                headerActions={<BrowserPaneActions />}
+              >
+                <BrowserTab />
+              </StudioPane>
+              <StudioPane
+                {...paneProps("overview")}
+                headerExtras={<RunPaneViewToggles />}
+                headerActions={<RunPaneActions />}
+              >
+                <RunTab />
+              </StudioPane>
+              {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
-            {panes.slice(1).map((rightId, index) => (
-              <StudioPaneDivider
-                key={`${panes[index]}:${rightId}`}
-                leftId={panes[index]!}
-                rightId={rightId}
-                order={index * 2 + 1}
-                panes={panes}
-                onCommit={setPaneWidths}
-                onReset={resetPaneWidths}
+              {panes.slice(1).map((rightId, index) => (
+                <StudioPaneDivider
+                  key={`${panes[index]}:${rightId}`}
+                  leftId={panes[index]!}
+                  rightId={rightId}
+                  order={index * 2 + 1}
+                  panes={panes}
+                  onCommit={setPaneWidths}
+                  onReset={resetPaneWidths}
+                />
+              ))}
+              {panes.length === 0 ? <StudioStageLauncher /> : null}
+              <StudioCoachMark />
+              <StudioWorkflowPanels />
+              {/* Overlay target for Workspace-wired panels (pointer-events off
+                  while empty so the stage stays clickable). */}
+              <div
+                ref={setPanelPortalEl}
+                className="pointer-events-none absolute inset-0 z-40"
               />
-            ))}
-            {panes.length === 0 ? <StudioStageLauncher /> : null}
-            <StudioCoachMark />
-            <StudioWorkflowPanels />
-            <span
-              role="status"
-              aria-live="polite"
-              aria-atomic="true"
-              className="sr-only"
-            >
-              {reorderAnnouncement}
-            </span>
+              <span
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                className="sr-only"
+              >
+                {reorderAnnouncement}
+              </span>
+            </div>
           </div>
+          <div
+            ref={setStreamHolderEl}
+            aria-hidden
+            className="h-0 w-0 overflow-hidden"
+          />
+          {createPortal(<StudioBrowserStream />, streamHostEl)}
         </div>
-        <div
-          ref={setStreamHolderEl}
-          aria-hidden
-          className="h-0 w-0 overflow-hidden"
-        />
-        {createPortal(<StudioBrowserStream />, streamHostEl)}
-      </div>
+      </TooltipProvider>
     </StudioShellContext.Provider>
   );
 }
