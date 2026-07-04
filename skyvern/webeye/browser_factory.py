@@ -97,7 +97,7 @@ def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrow
             if key_lower == FRESH_CONTEXT_HEADER.lower():
                 use_fresh_context = value.lower() == "true"
             elif key_lower == "enable_download":
-                enable_download = bool(value)
+                enable_download = value.lower() == "true"
             else:
                 headers[key] = value
 
