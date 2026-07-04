@@ -9077,185 +9077,108 @@ class TestWholeTrajectoryImposition:
         assert any("unscouted browser action" in violation for violation in result.violations)
         assert result.substitutions is None
 
-    def test_rejects_unknown_page_receiver_call(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+    @pytest.mark.parametrize(
+        "sibling_code",
+        [
+            pytest.param(
+                """
             await page.evaluate("window.localStorage.clear()")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_unknown_direct_locator_receiver_call(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_unknown_page_receiver_call",
+            ),
+            pytest.param(
+                """
             await page.locator("#electricDate").evaluate("node => node.remove()")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_unknown_locator_alias_receiver_call(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_unknown_direct_locator_receiver_call",
+            ),
+            pytest.param(
+                """
             target = page.locator("#electricDate")
             await target.evaluate("node => node.remove()")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_page_alias_mutation(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_unknown_locator_alias_receiver_call",
+            ),
+            pytest.param(
+                """
             p = page
             await p.goto("https://example.com/other")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_transitive_page_alias_mutation(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_page_alias_mutation",
+            ),
+            pytest.param(
+                """
             p = page
             q = p
             await q.goto("https://example.com/other")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_transitive_locator_alias_mutation(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_transitive_page_alias_mutation",
+            ),
+            pytest.param(
+                """
             target = page.locator("#electricDate")
             other = target
             await other.fill("2026-07-01")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_bound_method_alias_mutation(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_transitive_locator_alias_mutation",
+            ),
+            pytest.param(
+                """
             fill_electric = page.locator("#electricDate").fill
             await fill_electric("2026-07-01")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_transitive_bound_method_alias_mutation(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_bound_method_alias_mutation",
+            ),
+            pytest.param(
+                """
             fill_electric = page.locator("#electricDate").fill
             other = fill_electric
             await other("2026-07-01")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_dynamic_dispatch_on_page(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_transitive_bound_method_alias_mutation",
+            ),
+            pytest.param(
+                """
             await getattr(page, "goto")("https://example.com/other")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_dynamic_dispatch_on_locator_alias(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_dynamic_dispatch_on_page",
+            ),
+            pytest.param(
+                """
             target = page.locator("#electricDate")
             await getattr(target, "fill")("2026-07-01")
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_helper_receiving_browser_object(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_dynamic_dispatch_on_locator_alias",
+            ),
+            pytest.param(
+                """
             async def clear(target):
                 await target.evaluate("node => node.remove()")
             await clear(page.locator("#electricDate"))
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_helper_receiving_browser_keyword_object(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_helper_receiving_browser_object",
+            ),
+            pytest.param(
+                """
             async def clear(target):
                 await target.evaluate("node => node.remove()")
             await clear(target=page.locator("#electricDate"))
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
-
-    def test_rejects_helper_receiving_page_keyword_object(self) -> None:
-        ctx = _quote_ctx()
-        submitted = _submitted_with_sibling_code(
-            """
+            """,
+                id="test_rejects_helper_receiving_browser_keyword_object",
+            ),
+            pytest.param(
+                """
             async def navigate(page_arg):
                 await page_arg.goto("https://example.com/other")
             await navigate(page_arg=page)
-            """
-        )
+            """,
+                id="test_rejects_helper_receiving_page_keyword_object",
+            ),
+        ],
+    )
+    def test_rejects_ambiguous_browser_mutation(self, sibling_code: str) -> None:
+        ctx = _quote_ctx()
+        submitted = _submitted_with_sibling_code(sibling_code)
 
         result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
 

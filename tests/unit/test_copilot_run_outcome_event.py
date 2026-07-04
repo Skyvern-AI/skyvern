@@ -419,20 +419,14 @@ async def test_evaluating_hold_gets_final_frame_when_recording_raises(monkeypatc
     assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
 
 
-def test_recorder_returns_none_for_failed_run() -> None:
-    result = _run_result([], ok=False)
-    ctx = _ctx()
-    assert _record_run_blocks_result(ctx, result, completion_verification=None) is None
-    assert ctx.last_run_outcome is None
-
-
 def test_failed_rerun_clears_prior_recorded_outcome() -> None:
     ctx = _ctx()
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_demonstrated", reason_code="blocker_reported")
     ctx.last_run_outcome_block_labels = ["search_registry_person"]
 
-    _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
+    outcome = _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
 
+    assert outcome is None
     assert ctx.last_run_outcome is None
     assert ctx.last_run_outcome_block_labels == []
 

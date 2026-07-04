@@ -101,44 +101,7 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _apply_code_artifact_requested_output_evidence_sources,
     _normalize_code_artifact_metadata,
 )
-
-
-def _criterion(
-    cid: str,
-    outcome: str,
-    *,
-    method_mandated: bool = False,
-    output_path: str | None = None,
-    contingent_on: str | None = None,
-    contingent_antecedent_output_path: str | None = None,
-    kind: str = "outcome",
-    terminal_action_family: str | None = None,
-    deliverable_kind: str | None = None,
-    expected_output_value: str | None = None,
-    expected_output_shape: str | None = None,
-    requested_output_evidence_source: str = "runtime_output",
-    classification_output_key: str | None = None,
-    expected_classification: str | bool | None = None,
-    requested_output_corroborator: bool = False,
-) -> CompletionCriterion:
-    return CompletionCriterion(
-        id=cid,
-        outcome=outcome,
-        method_mandated=method_mandated,
-        output_path=output_path,
-        contingent_on=contingent_on,
-        contingent_antecedent_output_path=contingent_antecedent_output_path,
-        kind=kind,
-        terminal_action_family=terminal_action_family,
-        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
-        expected_output_value=expected_output_value,
-        expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
-        requested_output_evidence_source=requested_output_evidence_source,  # type: ignore[arg-type]
-        classification_output_key=classification_output_key,
-        expected_classification=expected_classification,
-        requested_output_corroborator=requested_output_corroborator,
-    )
-
+from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
 
 _STRUCTURED_RECORD_CRITERIA = (
     ("fallback_record_identity", "The returned record identifies the target record."),
@@ -2022,28 +1985,6 @@ def test_fallback_floor_rejects_boolean_only_validation_review_evidence() -> Non
     assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
 
 
-def test_fallback_floor_rejects_validation_review_submitted_request() -> None:
-    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload(submitted_request=True)})
-
-    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
-
-
-def test_fallback_floor_rejects_validation_review_confirmation_page_visible() -> None:
-    snapshot = RunEvidenceSnapshot(
-        block_outputs={"submit_request": _validation_review_payload(confirmation_page_visible=True)}
-    )
-
-    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
-
-
-def test_fallback_floor_rejects_validation_review_submit_or_finalize_click() -> None:
-    snapshot = RunEvidenceSnapshot(
-        block_outputs={"submit_request": _validation_review_payload(submit_or_finalize_clicked=True)}
-    )
-
-    assert grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot) == []
-
-
 def test_fallback_floor_rejects_review_text_without_structured_review_page() -> None:
     snapshot = RunEvidenceSnapshot(
         block_outputs={
@@ -2107,6 +2048,9 @@ def test_fallback_floor_rejects_validation_review_values_contradicting_requested
         {"failure_reason": "submit disabled"},
         {"status": "failed"},
         {"all_checks_passed": False},
+        {"submitted_request": True},
+        {"confirmation_page_visible": True},
+        {"submit_or_finalize_clicked": True},
     ],
 )
 def test_fallback_floor_rejects_validation_review_negative_guards(overrides: dict[str, Any]) -> None:

@@ -18,7 +18,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -27,13 +27,10 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _maybe_run_completion_verification_from_page_observation,
     _outcome_unverified_reason,
 )
+from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
 
 _NO_GRADEABLE_PROSE = "could not be independently verified"
 _ADD_OR_FIX_PROSE = "Add or fix the block"
-
-
-def _criterion(cid: str, outcome: str, *, level: str = "run", method_mandated: bool = False) -> CompletionCriterion:
-    return CompletionCriterion(id=cid, outcome=outcome, level=level, method_mandated=method_mandated)  # type: ignore[arg-type]
 
 
 def _ctx() -> CopilotContext:

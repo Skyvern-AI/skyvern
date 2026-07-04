@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.workflow_change_summary import (
@@ -46,25 +47,28 @@ def _with_blocks(extra_blocks: list[dict[str, Any]]) -> dict[str, Any]:
     return workflow
 
 
-def test_first_turn_when_prior_yaml_missing() -> None:
-    summary = summarize_user_workflow_change(prior_yaml=None, current_yaml=_dump(_baseline_dict()))
+@pytest.mark.parametrize(
+    "prior_yaml",
+    [
+        pytest.param(None, id="prior_yaml_missing"),
+        pytest.param("   \n", id="prior_yaml_blank"),
+    ],
+)
+def test_first_turn_when_no_prior_state(prior_yaml: str | None) -> None:
+    summary = summarize_user_workflow_change(prior_yaml=prior_yaml, current_yaml=_dump(_baseline_dict()))
     assert summary.kind is WorkflowChangeKind.FIRST_TURN_NO_PRIOR_STATE
 
 
-def test_first_turn_when_prior_yaml_blank() -> None:
-    summary = summarize_user_workflow_change(prior_yaml="   \n", current_yaml=_dump(_baseline_dict()))
-    assert summary.kind is WorkflowChangeKind.FIRST_TURN_NO_PRIOR_STATE
-
-
-def test_unchanged_when_strings_match() -> None:
+@pytest.mark.parametrize(
+    "trailing",
+    [
+        pytest.param("", id="strings_match"),
+        pytest.param("\n\n", id="only_whitespace_differs"),
+    ],
+)
+def test_unchanged_since_last_turn(trailing: str) -> None:
     baseline = _dump(_baseline_dict())
-    summary = summarize_user_workflow_change(prior_yaml=baseline, current_yaml=baseline)
-    assert summary.kind is WorkflowChangeKind.UNCHANGED_SINCE_LAST_TURN
-
-
-def test_unchanged_when_only_whitespace_differs() -> None:
-    baseline = _dump(_baseline_dict())
-    summary = summarize_user_workflow_change(prior_yaml=baseline, current_yaml=baseline + "\n\n")
+    summary = summarize_user_workflow_change(prior_yaml=baseline, current_yaml=baseline + trailing)
     assert summary.kind is WorkflowChangeKind.UNCHANGED_SINCE_LAST_TURN
 
 

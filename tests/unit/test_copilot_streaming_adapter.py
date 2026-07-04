@@ -1017,3 +1017,71 @@ class TestCodeRepairProgressStreaming:
         assert tool_results[0].success is False
         narrations = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
         assert narrations == []
+
+
+async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) -> Any:
+    """Drive `stream_to_sse` over a single tool round-trip and return the
+    emitted ``WorkflowCopilotToolResultUpdate``."""
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": tool_name, "arguments": "{}"}
+    tool_call = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": tool_name}
+    out_item.output = [{"type": "text", "text": json.dumps(parsed_output)}]
+    tool_output = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    async def _events() -> Any:
+        yield tool_call
+        yield tool_output
+
+    result = MagicMock()
+    result.stream_events = lambda: _events()
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(
+        result,
+        stream,
+        SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None),
+    )
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    return tool_results[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_detail_for_failure() -> None:
+    long_error = "Workflow validation failed: " + (
+        "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
+    )
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": False, "error": long_error},
+    )
+    assert payload.success is False
+    assert payload.detail is not None
+    assert len(payload.detail) > 120
+    # `summary` is the visible bullet, capped tighter than `detail` (the
+    # tooltip-grade text) — strictly longer detail is the contract.
+    assert len(payload.detail) > len(payload.summary)
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_no_detail_for_success() -> None:
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": True, "data": {"block_count": 3}},
+    )
+    assert payload.success is True
+    assert payload.detail is None

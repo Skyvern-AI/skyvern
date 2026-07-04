@@ -398,36 +398,31 @@ def test_composition_parse_html_adds_challenge_state_for_anti_bot_dom() -> None:
     assert parsed["challenge_state"]["gated_submit_controls"] == []
 
 
-def test_composition_parse_html_reports_schema_empty_without_semantic_terminal_inference() -> None:
-    parsed = parse_composition_html(
-        """
+@pytest.mark.parametrize(
+    ("body_html", "page_url"),
+    [
+        pytest.param(
+            """
         <html><head><title>Done</title></head><body>
           <main>Confirmation complete.</main>
         </body></html>
         """,
-        inspected_url="https://example.com/confirmation",
-        current_url="https://example.com/confirmation",
-    )
-
-    assert parsed["forms"] == []
-    assert parsed["navigation_targets"] == []
-    assert parsed["result_containers"] == []
-    assert parsed["schema_empty_page"] is True
-    assert parsed["observed_empty_page"] is False
-    assert parsed["empty_page_visual_state"] is None
-    assert "empty_page_state" not in parsed
-
-
-def test_composition_parse_html_keeps_loading_shell_unobserved_without_visual_confirmation() -> None:
-    parsed = parse_composition_html(
-        """
+            "https://example.com/confirmation",
+            id="terminal_text",
+        ),
+        pytest.param(
+            """
         <html><head><title>Loading</title></head><body>
           <main>Loading...</main>
         </body></html>
         """,
-        inspected_url="https://example.com/results",
-        current_url="https://example.com/results",
-    )
+            "https://example.com/results",
+            id="loading_shell",
+        ),
+    ],
+)
+def test_composition_parse_html_reports_schema_empty_without_visual_confirmation(body_html: str, page_url: str) -> None:
+    parsed = parse_composition_html(body_html, inspected_url=page_url, current_url=page_url)
 
     assert parsed["forms"] == []
     assert parsed["navigation_targets"] == []
@@ -654,7 +649,14 @@ def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> Non
     assert "extract_results (extraction)" in error
 
 
-def test_composition_gate_rejects_stale_page_evidence_from_another_origin() -> None:
+@pytest.mark.parametrize(
+    "stale_url",
+    [
+        pytest.param("https://other.example/lookup", id="another_origin"),
+        pytest.param("https://example.com/login", id="same_origin_different_path"),
+    ],
+)
+def test_composition_gate_rejects_stale_page_evidence(stale_url: str) -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
         {
@@ -665,29 +667,8 @@ def test_composition_gate_rejects_stale_page_evidence_from_another_origin() -> N
     )
     evidence = {
         **_first_last_evidence(),
-        "inspected_url": "https://other.example/lookup",
-        "current_url": "https://other.example/lookup",
-    }
-
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
-
-    assert error is not None
-    assert "page-dependent build blocks need observed page evidence" in error
-
-
-def test_composition_gate_rejects_stale_page_evidence_from_same_origin_different_path() -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
-        {
-            "block_type": "navigation",
-            "label": "search_lookup",
-            "navigation_goal": "Enter {{ parameters.person_name }} into the name search field and submit.",
-        },
-    )
-    evidence = {
-        **_first_last_evidence(),
-        "inspected_url": "https://example.com/login",
-        "current_url": "https://example.com/login",
+        "inspected_url": stale_url,
+        "current_url": stale_url,
     }
 
     error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
@@ -2349,29 +2330,34 @@ def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@_skip_no_browser
-@pytest.mark.asyncio
-async def test_structured_extractor_matches_html_parser_on_live_dom() -> None:
+async def _capture_live_dom(url: str, html: str, wait_selector: str) -> tuple[str, str]:
     from playwright.async_api import async_playwright
+
+    async def _handle(route: Any) -> None:
+        if route.request.url == url:
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        else:
+            await route.abort()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
-
-        async def _handle(route: Any) -> None:
-            if route.request.url == _FIDELITY_URL:
-                await route.fulfill(status=200, content_type="text/html", body=_FIDELITY_HTML)
-            else:
-                await route.abort()
-
         await context.route("**/*", _handle)
         page = await context.new_page()
-        await page.goto(_FIDELITY_URL, wait_until="domcontentloaded")
-        await page.wait_for_selector("#searchForm")
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_selector(wait_selector)
         raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
         content = await page.content()
         await context.close()
         await browser.close()
+
+    return raw, content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_matches_html_parser_on_live_dom() -> None:
+    raw, content = await _capture_live_dom(_FIDELITY_URL, _FIDELITY_HTML, "#searchForm")
 
     structured = parse_composition_structured(json.loads(raw), inspected_url=_FIDELITY_URL, current_url=_FIDELITY_URL)
     html_parsed = parse_composition_html(content, inspected_url=_FIDELITY_URL, current_url=_FIDELITY_URL)
@@ -2427,27 +2413,7 @@ def _heavy_results_cart_html() -> str:
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_structured_extractor_matches_html_parser_on_heavy_results_cart_dom() -> None:
-    from playwright.async_api import async_playwright
-
-    html = _heavy_results_cart_html()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-
-        async def _handle(route: Any) -> None:
-            if route.request.url == _HEAVY_URL:
-                await route.fulfill(status=200, content_type="text/html", body=html)
-            else:
-                await route.abort()
-
-        await context.route("**/*", _handle)
-        page = await context.new_page()
-        await page.goto(_HEAVY_URL, wait_until="domcontentloaded")
-        await page.wait_for_selector("#products")
-        raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
-        content = await page.content()
-        await context.close()
-        await browser.close()
+    raw, content = await _capture_live_dom(_HEAVY_URL, _heavy_results_cart_html(), "#products")
 
     structured = parse_composition_structured(json.loads(raw), inspected_url=_HEAVY_URL, current_url=_HEAVY_URL)
     html_parsed = parse_composition_html(content, inspected_url=_HEAVY_URL, current_url=_HEAVY_URL)
@@ -2465,25 +2431,7 @@ _STANDALONE_CONTROLS_LIVE_URL = "https://app.example.com/account-info"
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_structured_extractor_matches_html_parser_on_standalone_controls_dom() -> None:
-    from playwright.async_api import async_playwright
-
-    async def _handle(route: Any) -> None:
-        if route.request.url == _STANDALONE_CONTROLS_LIVE_URL:
-            await route.fulfill(status=200, content_type="text/html", body=_STANDALONE_CONTROLS_HTML)
-        else:
-            await route.abort()
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        await context.route("**/*", _handle)
-        page = await context.new_page()
-        await page.goto(_STANDALONE_CONTROLS_LIVE_URL, wait_until="domcontentloaded")
-        await page.wait_for_selector("#biz-tile")
-        raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
-        content = await page.content()
-        await context.close()
-        await browser.close()
+    raw, content = await _capture_live_dom(_STANDALONE_CONTROLS_LIVE_URL, _STANDALONE_CONTROLS_HTML, "#biz-tile")
 
     structured = parse_composition_structured(
         json.loads(raw), inspected_url=_STANDALONE_CONTROLS_LIVE_URL, current_url=_STANDALONE_CONTROLS_LIVE_URL
