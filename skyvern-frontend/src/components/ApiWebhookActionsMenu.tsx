@@ -1,4 +1,4 @@
-import { type ReactElement } from "react";
+import { type ReactElement, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -9,6 +9,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import { copyText } from "@/util/copyText";
 import {
@@ -25,6 +30,8 @@ type ApiWebhookActionsMenuProps = {
   // Single element forwarded to the trigger via Radix `asChild`; when set,
   // `size` is unused. Defaults to the solid secondary button (legacy pages).
   trigger?: ReactElement;
+  // Radix tooltip on the trigger; the host must provide a TooltipProvider.
+  triggerTooltip?: ReactNode;
 };
 
 export function ApiWebhookActionsMenu({
@@ -33,16 +40,27 @@ export function ApiWebhookActionsMenu({
   onTestWebhook,
   size = "default",
   trigger,
+  triggerTooltip,
 }: ApiWebhookActionsMenuProps) {
+  const menuTrigger = (
+    <DropdownMenuTrigger asChild>
+      {trigger ?? (
+        <Button type="button" variant="secondary" size={size}>
+          API & Webhooks
+        </Button>
+      )}
+    </DropdownMenuTrigger>
+  );
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        {trigger ?? (
-          <Button type="button" variant="secondary" size={size}>
-            API & Webhooks
-          </Button>
-        )}
-      </DropdownMenuTrigger>
+      {triggerTooltip ? (
+        <Tooltip>
+          <TooltipTrigger asChild>{menuTrigger}</TooltipTrigger>
+          <TooltipContent side="bottom">{triggerTooltip}</TooltipContent>
+        </Tooltip>
+      ) : (
+        menuTrigger
+      )}
       <DropdownMenuContent>
         <DropdownMenuLabel className="py-2 text-base">
           Re-run via API

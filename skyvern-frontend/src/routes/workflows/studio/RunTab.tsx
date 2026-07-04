@@ -1,28 +1,24 @@
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
-import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { RunView } from "./runview/RunView";
+import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
-import { useStudioRunId } from "./useStudioRunId";
+import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 /**
- * Run pane of the studio shell — the fused hero + filmstrip RunView. Shows the
- * run in the URL when present, otherwise the workflow's most recent run.
+ * Overview pane of the studio shell — the run timeline + run-data view (the
+ * Browser pane owns the visuals). Shows the run in the URL when present,
+ * otherwise the workflow's most recent run.
  */
 export function RunTab() {
   const navigate = useNavigate();
-  const urlRunId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const { workflowPermanentId } = useParams();
   const { openPane } = useStudioPanes();
-  // isPending (not isLoading) stays true while the query is disabled waiting for
-  // globalWorkflows, so the empty state can't flash before the run lookup settles.
-  const { data: runs, isPending: runsPending } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    page: 1,
-    pageSize: 1,
-  });
-  const runId = urlRunId ?? runs?.[0]?.workflow_run_id;
+  const { runId, pending } = useStudioInspectedRun();
+  // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
+  // source agent, so the CTAs go too (the run stays viewable).
+  const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
   // so suppress that CTA for block runs (the block is rerun from the editor).
   const isBlockRun = searchParams.has("bl");
@@ -30,19 +26,26 @@ export function RunTab() {
   return (
     <RunView
       workflowRunId={runId}
-      runIdPending={!urlRunId && runsPending}
-      onFix={(seedMessage) => {
-        // One replace-navigation opens the Copilot pane and seeds the message via
-        // location.state (Workspace reads it as the copilot's initialMessage), so
-        // the pane write can't race a separate state-only navigation.
-        openPane("copilot", {
-          state: { copilotMessage: seedMessage, copilotFixOrigin: true },
-        });
-      }}
-      onRetry={
-        isBlockRun
+      runIdPending={pending}
+      onFix={
+        workflowDeleted
           ? undefined
-          : () => navigate(`/agents/${workflowPermanentId}/run`)
+          : (seedMessage) => {
+              // One replace-navigation opens the Copilot pane and seeds the message
+              // via location.state (Workspace reads it as the copilot's
+              // initialMessage), so the pane write can't race a separate
+              // state-only navigation.
+              openPane("copilot", {
+                state: { copilotMessage: seedMessage, copilotFixOrigin: true },
+              });
+            }
+      }
+      onRetry={
+        isBlockRun || workflowDeleted
+          ? undefined
+          : // The post-start navigate resets the layout to the run mapping,
+            // so the form round-trip carries nothing.
+            () => navigate(`/agents/${workflowPermanentId}/run`)
       }
     />
   );

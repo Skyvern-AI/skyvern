@@ -2229,8 +2229,8 @@ def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> s
     return "allow"
 
 
-def _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
-    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
+def _should_block_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS and tool_name != "update_workflow":
         return False
     if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
         return False
@@ -2247,18 +2247,13 @@ def _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx: Any, tool
 
 
 def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
-    if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
-        return None
-    ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
-    if ambiguous_selector_rescout_state == "allow":
-        return None
-    if _should_block_mutating_tool_after_unresolved_recorded_outcome(ctx, tool_name):
+    if _should_block_tool_after_unresolved_recorded_outcome(ctx, tool_name):
         return CopilotToolBlockerSignal(
             blocker_kind="tool_error",
             agent_steering_text=(
                 "The last recorded test outcome is authoritative and still has unsatisfied completion criteria. "
                 f"Call {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} with a materially changed authored workflow now; "
-                "do not spend the repair attempt on browser interaction."
+                "do not spend the repair attempt on another standalone tool call."
             ),
             user_facing_reason="I need to revise and test the workflow code instead of interacting with the page.",
             recovery_hint="retry_with_different_tool",
@@ -2269,6 +2264,11 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
             blocked_tool=tool_name,
             extra={"recorded_outcome_reason_code": "outcome_not_demonstrated"},
         )
+    if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
+        return None
+    ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
+    if ambiguous_selector_rescout_state == "allow":
+        return None
     if (
         ambiguous_selector_rescout_state != "block"
         and not _should_force_synthesized_block_persistence(ctx)

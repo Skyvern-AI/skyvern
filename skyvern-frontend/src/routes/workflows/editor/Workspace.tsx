@@ -64,6 +64,7 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
@@ -164,6 +165,7 @@ import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { WorkflowDefinition, WorkflowSettings } from "../types/workflowTypes";
+import { useAgentsPathMatch } from "../useAgentsPathMatch";
 import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
@@ -171,7 +173,9 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import { useStudioShellContext } from "../studio/StudioShellContext";
+import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
@@ -347,7 +351,14 @@ function Workspace({
   const { blockLabel, workflowPermanentId } = useParams();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
+  const studioPaneWidths = useStudioShellStore((s) => s.paneWidths);
   const studioCopilotOpen = studioPanes.includes("copilot");
+  // Armed iff the workflow has no blocks at mount — the studio shell remounts
+  // Workspace per workflow, so `workflow` is always populated here. The first
+  // copilot build that lands blocks auto-opens the Editor pane, exactly once.
+  const editorAutoOpenArmedRef = useRef(
+    workflow.workflow_definition.blocks.length === 0,
+  );
   const location = useLocation();
   const navigate = useNavigate();
   const locationState = location.state as {
@@ -392,6 +403,7 @@ function Workspace({
     selectedBlockId,
     isNodeLibraryOpen,
   );
+  const isEditRoute = useAgentsPathMatch("/:workflowPermanentId/edit") !== null;
   // While collapsed, the pill is offscreen but its WorkflowHeaderCollapseTab
   // (chevron) sits at the bottom edge, centered on the pill. If we let the
   // pill's right inset track blockSidebarOpen while collapsed, the tab snaps
@@ -719,6 +731,17 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
+  // Recording is session-scoped: the stream opts out of reset-on-unmount (it
+  // remounts across the CDP<->VNC recording swap mid-session), so the debug
+  // session owns the reset here — embedded, StudioBrowserStream owns it. The id
+  // guard keeps the null -> first-id transition from clearing a recording that
+  // started before the session resolved.
+  useEffect(() => {
+    if (embedded || !liveBrowserSessionId) {
+      return;
+    }
+    return () => useRecordingStore.getState().reset();
+  }, [embedded, liveBrowserSessionId]);
   // Embedded: the shell owns the stream, so bind the copilot once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
   const copilotRequiresLiveBrowser =
@@ -1602,6 +1625,20 @@ function Workspace({
     useWorkflowYamlEditorStore.getState().open(yaml);
   };
 
+  // Expose Code-mode entry to the studio's Editor pane header via the store.
+  // A stable wrapper over a ref keeps the registration from churning while
+  // still calling the latest closure.
+  const enterYamlModeRef = useRef(enterYamlMode);
+  enterYamlModeRef.current = enterYamlMode;
+  useEffect(() => {
+    if (!embedded || isGlobalWorkflow) {
+      return;
+    }
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => enterYamlModeRef.current());
+    return () => store.registerEnterYamlMode(null);
+  }, [embedded, isGlobalWorkflow]);
+
   // Commit-on-switch: reparse the edited YAML into the graph via the Copilot's
   // non-persisting convert endpoint. Returns false on invalid YAML (stays open).
   const commitYaml = async (persist: boolean = false): Promise<boolean> => {
@@ -1772,6 +1809,20 @@ function Workspace({
         .setHasChanges(yamlEntryHadChangesRef.current || yamlEditorDirty);
     }
   }, [yamlEditorActive, yamlEditorDirty]);
+
+  // Studio exit from version history/comparison: keep the current version,
+  // clear the comparison, close the panel. Panes stay editor-only.
+  const exitVersionHistory = () => {
+    setWorkflowPanelState({
+      active: false,
+      content: "history",
+      data: {
+        showComparison: false,
+        version1: undefined,
+        version2: undefined,
+      },
+    });
+  };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     // Close panels
@@ -1964,6 +2015,7 @@ function Workspace({
               onCopilotReviewClose={
                 workflowPanelState.data.onCopilotReviewClose
               }
+              onExit={embedded ? exitVersionHistory : undefined}
             />
           </div>
           {workflowPanelState.active &&
@@ -1972,6 +2024,7 @@ function Workspace({
                 <WorkflowHistoryPanel
                   workflowPermanentId={workflowPermanentId!}
                   onCompare={handleCompareVersions}
+                  onClose={embedded ? exitVersionHistory : undefined}
                 />
               </div>
             )}
@@ -1999,6 +2052,7 @@ function Workspace({
               onCopilotReviewClose={
                 workflowPanelState.data.onCopilotReviewClose
               }
+              onExit={embedded ? exitVersionHistory : undefined}
             />
           </div>
 
@@ -2026,7 +2080,7 @@ function Workspace({
                 opacity: !embedded && headerCollapsed ? 0 : 1,
               }}
             >
-              {workflowPanelState.content === "cacheKeyValues" && (
+              {!embedded && workflowPanelState.content === "cacheKeyValues" && (
                 <WorkflowCacheKeyValuesPanel
                   cacheKeyValues={cacheKeyValues}
                   pending={cacheKeyValuesLoading}
@@ -2064,6 +2118,7 @@ function Workspace({
                   <WorkflowHistoryPanel
                     workflowPermanentId={workflowPermanentId!}
                     onCompare={handleCompareVersions}
+                    onClose={embedded ? exitVersionHistory : undefined}
                   />
                 </div>
               )}
@@ -2091,11 +2146,41 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 embedded={embedded}
+                paneLayoutKey={
+                  embedded
+                    ? `${studioPanes.join(",")}|${paneWidthsKey(studioPaneWidths)}`
+                    : undefined
+                }
                 onRequestDeleteNode={handleRequestDeleteNode}
                 captureHistoryImmediately={captureWorkflowEditImmediately}
                 onAddNode={addNode}
                 historyApplyTrigger={historyApplyTrigger}
               />
+
+              {/* Studio hosts the toggle in the Editor pane header; legacy
+                  anchors it under the header on /edit only (the debugger
+                  mounts this Workspace too). */}
+              {!yamlEditorActive &&
+              !isGlobalWorkflow &&
+              !embedded &&
+              isEditRoute ? (
+                <div
+                  className={cn(
+                    "absolute top-[8.5rem] z-30 transition-all duration-300 ease-out",
+                    blockSidebarOpen
+                      ? HEADER_RIGHT_INSET_OPEN
+                      : HEADER_RIGHT_INSET_CLOSED,
+                  )}
+                  style={{
+                    transform: headerCollapsed
+                      ? "translateY(calc(-100% - 8.5rem))"
+                      : "translateY(0)",
+                    opacity: headerCollapsed ? 0 : 1,
+                  }}
+                >
+                  <YamlModeToggle mode="visual" onCode={enterYamlMode} />
+                </div>
+              ) : null}
 
               {/* sub panels */}
               {workflowPanelState.active && (
@@ -2128,29 +2213,30 @@ function Workspace({
                       opacity: !embedded && headerCollapsed ? 0 : 1,
                     }}
                   >
-                    {workflowPanelState.content === "cacheKeyValues" && (
-                      <WorkflowCacheKeyValuesPanel
-                        cacheKeyValues={cacheKeyValues}
-                        pending={cacheKeyValuesLoading}
-                        scriptKey={workflow.cache_key ?? "default"}
-                        filter={cacheKeyValueFilter ?? undefined}
-                        onFilterChange={setCacheKeyValueFilter}
-                        onDelete={(cacheKeyValue) => {
-                          deleteCacheKeyValue.mutate({
-                            workflowPermanentId: workflowPermanentId!,
-                            cacheKeyValue,
-                          });
-                        }}
-                        onPaginate={(page) => {
-                          setPage(page);
-                        }}
-                        onSelect={(cacheKeyValue) => {
-                          setExplicitCacheKeyValue(cacheKeyValue);
-                          setCacheKeyValueFilter("");
-                          closeWorkflowPanel();
-                        }}
-                      />
-                    )}
+                    {!embedded &&
+                      workflowPanelState.content === "cacheKeyValues" && (
+                        <WorkflowCacheKeyValuesPanel
+                          cacheKeyValues={cacheKeyValues}
+                          pending={cacheKeyValuesLoading}
+                          scriptKey={workflow.cache_key ?? "default"}
+                          filter={cacheKeyValueFilter ?? undefined}
+                          onFilterChange={setCacheKeyValueFilter}
+                          onDelete={(cacheKeyValue) => {
+                            deleteCacheKeyValue.mutate({
+                              workflowPermanentId: workflowPermanentId!,
+                              cacheKeyValue,
+                            });
+                          }}
+                          onPaginate={(page) => {
+                            setPage(page);
+                          }}
+                          onSelect={(cacheKeyValue) => {
+                            setExplicitCacheKeyValue(cacheKeyValue);
+                            setCacheKeyValueFilter("");
+                            closeWorkflowPanel();
+                          }}
+                        />
+                      )}
                     {!embedded &&
                       workflowPanelState.content === "parameters" && (
                         <div className="z-30">
@@ -2168,6 +2254,7 @@ function Workspace({
                         <WorkflowHistoryPanel
                           workflowPermanentId={workflowPermanentId!}
                           onCompare={handleCompareVersions}
+                          onClose={embedded ? exitVersionHistory : undefined}
                         />
                       </div>
                     )}
@@ -2200,7 +2287,7 @@ function Workspace({
                 opacity: headerCollapsed ? 0 : 1,
               }}
             >
-              {workflowPanelState.content === "cacheKeyValues" && (
+              {!embedded && workflowPanelState.content === "cacheKeyValues" && (
                 <WorkflowCacheKeyValuesPanel
                   cacheKeyValues={cacheKeyValues}
                   pending={cacheKeyValuesLoading}
@@ -2234,6 +2321,7 @@ function Workspace({
                   <WorkflowHistoryPanel
                     workflowPermanentId={workflowPermanentId!}
                     onCompare={handleCompareVersions}
+                    onClose={embedded ? exitVersionHistory : undefined}
                   />
                 </div>
               )}
@@ -2412,6 +2500,9 @@ function Workspace({
                           // The recording panel overlays the canvas whenever a
                           // recording is live here, so the REC pill is redundant.
                           hideRecordingIndicator={true}
+                          // Remounts across the CDP<->VNC recording swap; the
+                          // debug session owns the recording reset.
+                          resetRecordingOnUnmount={false}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={!!workflowRun && !isFinalized}
                           onReadyChange={handleLiveBrowserReadyChange}
@@ -2639,7 +2730,7 @@ function Workspace({
                     {/* timeline narrow */}
                     <div
                       className={cn(
-                        "delay-[300ms] pointer-events-none absolute left-0 top-0 h-full w-[6rem] rounded-l-lg opacity-0 transition-all duration-1000",
+                        "pointer-events-none absolute left-0 top-0 h-full w-[6rem] rounded-l-lg opacity-0 transition-all duration-1000 [transition-delay:300ms]",
                         {
                           "pointer-events-auto opacity-100":
                             timelineMode === "narrow",
@@ -2873,6 +2964,15 @@ function Workspace({
         onWorkflowUpdate={(workflowData, options) => {
           try {
             applyWorkflowUpdate(workflowData, options);
+            if (
+              embedded &&
+              options?.applied &&
+              editorAutoOpenArmedRef.current &&
+              workflowData.workflow_definition.blocks.length > 0
+            ) {
+              editorAutoOpenArmedRef.current = false;
+              openStudioPane("editor");
+            }
           } catch (error) {
             console.error(
               "Failed to parse and apply agent",
@@ -2915,10 +3015,40 @@ function Workspace({
         }}
       />
 
-      {!yamlEditorActive && !isGlobalWorkflow ? (
-        <div className="absolute right-4 top-3 z-30">
-          <YamlModeToggle mode="visual" onCode={enterYamlMode} />
-        </div>
+      {/* Studio: the cache key/value panel escapes the Editor pane via the
+          shell-level portal, so the Overview pane's Code view can open it (and
+          close it) even with the Editor pane hidden. */}
+      {embedded ? (
+        <StudioShellPanelPortal
+          open={
+            workflowPanelState.active &&
+            workflowPanelState.content === "cacheKeyValues"
+          }
+          onDismiss={closeWorkflowPanel}
+        >
+          <WorkflowCacheKeyValuesPanel
+            cacheKeyValues={cacheKeyValues}
+            pending={cacheKeyValuesLoading}
+            scriptKey={workflow.cache_key ?? "default"}
+            filter={cacheKeyValueFilter ?? undefined}
+            onFilterChange={setCacheKeyValueFilter}
+            onClose={closeWorkflowPanel}
+            onDelete={(cacheKeyValue) => {
+              deleteCacheKeyValue.mutate({
+                workflowPermanentId: workflowPermanentId!,
+                cacheKeyValue,
+              });
+            }}
+            onPaginate={(page) => {
+              setPage(page);
+            }}
+            onSelect={(cacheKeyValue) => {
+              setExplicitCacheKeyValue(cacheKeyValue);
+              setCacheKeyValueFilter("");
+              closeWorkflowPanel();
+            }}
+          />
+        </StudioShellPanelPortal>
       ) : null}
       {/* Studio: Code mode swaps the Editor pane's content (sibling panes stay
           usable); legacy keeps the original full-screen modal overlay. */}

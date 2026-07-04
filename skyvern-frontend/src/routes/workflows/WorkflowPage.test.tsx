@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 import CloudContext from "@/store/CloudContext";
+import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { WorkflowPage } from "./WorkflowPage";
 
 const { mockFeatureFlagEnabled } = vi.hoisted(() => ({
@@ -114,24 +115,28 @@ afterEach(() => {
 type RenderOptions = {
   isCloud?: boolean;
   analyticsFlagEnabled?: boolean;
+  pageSlots?: PageSlots;
 };
 
 function renderWorkflowPage({
   isCloud = true,
   analyticsFlagEnabled = true,
+  pageSlots = {},
 }: RenderOptions = {}) {
   mockFeatureFlagEnabled.mockReturnValue(analyticsFlagEnabled);
 
   return render(
     <CloudContext.Provider value={isCloud}>
-      <MemoryRouter initialEntries={["/workflows/wpid_abc123"]}>
-        <Routes>
-          <Route
-            path="/workflows/:workflowPermanentId"
-            element={<WorkflowPage />}
-          />
-        </Routes>
-      </MemoryRouter>
+      <PageSlotsProvider value={pageSlots}>
+        <MemoryRouter initialEntries={["/workflows/wpid_abc123"]}>
+          <Routes>
+            <Route
+              path="/workflows/:workflowPermanentId"
+              element={<WorkflowPage />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </PageSlotsProvider>
     </CloudContext.Provider>,
   );
 }
@@ -157,5 +162,16 @@ describe("WorkflowPage analytics button", () => {
     renderWorkflowPage({ isCloud: false });
 
     expect(screen.queryByRole("link", { name: /analytics/i })).toBeNull();
+  });
+
+  it("renders the injected workflow analytics panel above Past Runs", () => {
+    const PanelStub = () => <div data-testid="analytics-panel-stub" />;
+    const { container } = renderWorkflowPage({
+      pageSlots: { workflowAnalyticsPanel: PanelStub },
+    });
+
+    expect(
+      container.querySelector('[data-testid="analytics-panel-stub"]'),
+    ).not.toBeNull();
   });
 });

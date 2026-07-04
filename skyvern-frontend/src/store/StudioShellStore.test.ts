@@ -17,12 +17,15 @@ describe("StudioShellStore", () => {
     expect(useStudioShellStore.getState().pipMinimized).toBe(false);
   });
 
-  test("persists only PiP shell state", () => {
+  test("persists only PiP and pane-width shell state", () => {
     useStudioShellStore.getState().setPipMinimized(true);
 
     const raw = localStorage.getItem(STUDIO_SHELL_STORAGE_KEY);
     expect(raw).not.toBeNull();
-    expect(JSON.parse(raw!).state).toEqual({ pipMinimized: true });
+    expect(JSON.parse(raw!).state).toEqual({
+      pipMinimized: true,
+      paneWidths: {},
+    });
   });
 
   test("migrates stale v0 Copilot collapse without restoring it", async () => {
@@ -41,5 +44,42 @@ describe("StudioShellStore", () => {
     expect(
       "copilotCollapsed" in (state as unknown as Record<string, unknown>),
     ).toBe(false);
+  });
+
+  test("merges and persists pane widths; reset clears them", () => {
+    useStudioShellStore.getState().setPaneWidths({ copilot: 412 });
+    useStudioShellStore.getState().setPaneWidths({ editor: 350.4 });
+
+    expect(useStudioShellStore.getState().paneWidths).toEqual({
+      copilot: 412,
+      editor: 350,
+    });
+    const raw = localStorage.getItem(STUDIO_SHELL_STORAGE_KEY);
+    expect(JSON.parse(raw!).state.paneWidths).toEqual({
+      copilot: 412,
+      editor: 350,
+    });
+
+    useStudioShellStore.getState().resetPaneWidths();
+    expect(useStudioShellStore.getState().paneWidths).toEqual({});
+  });
+
+  test("drops non-numeric persisted pane widths on rehydrate", async () => {
+    localStorage.setItem(
+      STUDIO_SHELL_STORAGE_KEY,
+      JSON.stringify({
+        state: {
+          pipMinimized: false,
+          paneWidths: { copilot: 320, editor: "wide", browser: -10 },
+        },
+        version: 0,
+      }),
+    );
+
+    await useStudioShellStore.persist.rehydrate();
+
+    expect(useStudioShellStore.getState().paneWidths).toEqual({
+      copilot: 320,
+    });
   });
 });

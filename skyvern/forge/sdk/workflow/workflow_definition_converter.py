@@ -168,6 +168,8 @@ def convert_workflow_definition(
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 created_at=now,
                 modified_at=now,
             )
@@ -842,6 +844,7 @@ def block_yaml_to_block(
             follow_redirects=block_yaml.follow_redirects,
             download_filename=block_yaml.download_filename,
             save_response_as_file=block_yaml.save_response_as_file,
+            secret_response_paths=block_yaml.secret_response_paths,
             parameters=http_request_block_parameters,
         )
     elif block_yaml.block_type == BlockType.GOTO_URL:

@@ -491,6 +491,7 @@ class FileType(StrEnum):
     PDF = "pdf"
     IMAGE = "image"
     DOCX = "docx"
+    ZIP = "zip"
 
 
 class PDFFormat(StrEnum):
@@ -595,6 +596,8 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
 class CredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
     credential_id: str
+    credential_ids: list[str] | None = None
+    selection_strategy: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -1105,9 +1108,16 @@ class HttpRequestBlockYAML(BlockYAML):
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
+    secret_response_paths: list[str] | None = None
 
     # Parameter keys for templating
     parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_secret_response_paths_file_conflict(self) -> "HttpRequestBlockYAML":
+        if self.save_response_as_file and self.secret_response_paths:
+            raise ValueError("secret_response_paths cannot be combined with save_response_as_file")
+        return self
 
 
 class PrintPageBlockYAML(BlockYAML):

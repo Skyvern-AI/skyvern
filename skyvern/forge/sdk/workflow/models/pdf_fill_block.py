@@ -23,7 +23,11 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILE
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import download_file, get_path_for_workflow_download_directory
+from skyvern.forge.sdk.api.files import (
+    download_file,
+    get_path_for_workflow_download_directory,
+    validate_local_file_path,
+)
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -179,13 +183,18 @@ class PdfFillBlock(Block):
             organization_id=organization_id,
         )
 
-    async def _resolve_source_pdf(self, organization_id: str | None) -> tuple[str, bool]:
-        # Bare local paths bypass download_file's gating, so only honor them in local dev;
-        # in deployed environments they could read other runs' files off a shared worker.
+    async def _resolve_source_pdf(self, workflow_run_id: str, organization_id: str | None) -> tuple[str, bool]:
         # Returns (path, is_temp): is_temp marks a download_file temp the caller must clean up;
         # a user-supplied local path is never deleted.
         if settings.ENV == "local" and os.path.exists(self.file_url):
             return self.file_url, False
+        if self.file_url.startswith("/"):
+            context = skyvern_context.current()
+            run_id = context.run_id if context and context.run_id else workflow_run_id
+            resolved = validate_local_file_path(self.file_url, run_id)
+            if not os.path.isfile(resolved):
+                raise FileNotFoundError(f"Local file not found: {self.file_url}")
+            return resolved, False
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
@@ -854,7 +863,7 @@ class PdfFillBlock(Block):
             )
 
         try:
-            source_pdf_path, source_is_temp = await self._resolve_source_pdf(organization_id)
+            source_pdf_path, source_is_temp = await self._resolve_source_pdf(workflow_run_id, organization_id)
         except Exception as e:
             return await self._record_failure(
                 workflow_run_context,

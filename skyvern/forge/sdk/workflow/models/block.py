@@ -15,10 +15,11 @@ import shutil
 import smtplib
 import textwrap
 import uuid
+import zipfile
 from collections import defaultdict, deque
 from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
@@ -80,6 +81,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     is_remote_url,
     parse_uri_to_path,
+    resolve_local_or_download_file,
     resolve_run_download_id,
     validate_local_file_path,
 )
@@ -3884,6 +3886,20 @@ async def wrapper({default_args}):
             uri = value.get("s3uri")
         if not uri or not str(uri).strip():
             return value
+        if str(uri).startswith("/"):
+            try:
+                local_path = validate_local_file_path(str(uri), workflow_run_id)
+                if not os.path.isfile(local_path):
+                    raise FileNotFoundError(f"Local file not found: {uri}")
+                return local_path
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                LOG.warning(
+                    "CodeBlock file parameter path is outside the run's download directory; leaving the original value",
+                    workflow_run_id=workflow_run_id,
+                )
+                return value
         try:
             output_dir = get_download_dir(workflow_run_id)
             local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
@@ -5015,13 +5031,14 @@ class DownloadToS3Block(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
 
-    async def _upload_file_to_s3(self, uri: str, file_path: str) -> None:
+    async def _upload_file_to_s3(self, uri: str, file_path: str, cleanup_file: bool = True) -> None:
         try:
             client = self.get_async_aws_client()
             await client.upload_file_from_path(uri=uri, file_path=file_path)
         finally:
             # Clean up the temporary file since it's created with delete=False
-            os.unlink(file_path)
+            if cleanup_file:
+                os.unlink(file_path)
 
     async def execute(
         self,
@@ -5057,7 +5074,11 @@ class DownloadToS3Block(Block):
             )
 
         try:
-            file_path = await download_file(self.url, max_size_mb=10, organization_id=organization_id)
+            context = skyvern_context.current()
+            run_id = context.run_id if context and context.run_id else workflow_run_id
+            file_path = await resolve_local_or_download_file(
+                self.url, run_id, organization_id=organization_id, max_size_mb=10
+            )
         except Exception as e:
             LOG.error("DownloadToS3Block Failed to download file", url=self.url, error=str(e))
             raise e
@@ -5065,7 +5086,7 @@ class DownloadToS3Block(Block):
         uri = None
         try:
             uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}"
-            await self._upload_file_to_s3(uri, file_path)
+            await self._upload_file_to_s3(uri, file_path, cleanup_file=not self.url.startswith("/"))
         except Exception as e:
             LOG.error("DownloadToS3Block Failed to upload file to S3", uri=uri, error=str(e))
             raise e
@@ -6171,6 +6192,16 @@ class FileParserBlock(Block):
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
     # Bounded cap for legitimate wide cells (JSON blobs, long descriptions); applied only while parsing.
     _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
+    # ZIP extraction guards (zip-bomb protection; sizes from central-directory metadata).
+    # ClassVar keeps these plain class attributes — without it pydantic wraps underscore
+    # names in ModelPrivateAttr and class-level access breaks.
+    _MAX_ZIP_ARCHIVE_BYTES: ClassVar[int] = 512 * 1024 * 1024
+    _MAX_ZIP_ENTRIES: ClassVar[int] = 1000
+    _MAX_ZIP_UNCOMPRESSED_BYTES: ClassVar[int] = 1024**3
+    _ZIP_JUNK_DIRS: ClassVar[tuple[str, ...]] = ("__MACOSX",)
+    _ZIP_JUNK_FILES: ClassVar[tuple[str, ...]] = (".DS_Store", "Thumbs.db")
+    # Classic EOCD + max comment + ZIP64 locator + ZIP64 EOCD fixed part.
+    _ZIP_EOCD_TAIL_BYTES: ClassVar[int] = 65_557 + 20 + 56
 
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
@@ -6249,6 +6280,8 @@ class FileParserBlock(Block):
                 file_type=FileType.DOCX,
                 error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
             )
+        elif suffix == ".zip":
+            return FileType.ZIP
         elif suffix == ".csv":
             return FileType.CSV
 
@@ -6281,6 +6314,9 @@ class FileParserBlock(Block):
             return FileType.EXCEL
         elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             return FileType.DOCX
+        elif mime == "application/zip":
+            # OOXML files are ZIP containers matched before this generic branch, so only plain archives reach it.
+            return FileType.ZIP
         elif mime.startswith("image/"):
             return FileType.IMAGE
         return None
@@ -6378,6 +6414,11 @@ class FileParserBlock(Block):
             except Exception as e:
                 raise InvalidFileType(
                     file_url=file_url_used, file_type=self.file_type, error=f"Invalid DOCX file format: {str(e)}"
+                )
+        elif self.file_type == FileType.ZIP:
+            if not zipfile.is_zipfile(file_path):
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error="File is not a valid ZIP archive"
                 )
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
@@ -6755,6 +6796,242 @@ class FileParserBlock(Block):
                 file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse DOCX file: {str(e)}"
             )
 
+    @classmethod
+    def _is_zip_junk_member(cls, member_name: str) -> bool:
+        parts = PurePosixPath(member_name).parts
+        if not parts:
+            return True
+        if any(part in cls._ZIP_JUNK_DIRS for part in parts):
+            return True
+        return parts[-1] in cls._ZIP_JUNK_FILES or parts[-1].startswith("._")
+
+    @classmethod
+    def _read_zip_total_entry_count(cls, file_path: str) -> int | None:
+        try:
+            file_size = os.path.getsize(file_path)
+            tail_size = min(file_size, cls._ZIP_EOCD_TAIL_BYTES)
+            with open(file_path, "rb") as file:
+                file.seek(file_size - tail_size)
+                tail = file.read(tail_size)
+
+            eocd_index = tail.rfind(b"PK\x05\x06")
+            if eocd_index < 0 or eocd_index + 22 > len(tail):
+                return None
+
+            count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
+            if count != 0xFFFF:
+                return count
+
+            zip64_eocd_index = tail.rfind(b"PK\x06\x06")
+            if zip64_eocd_index < 0 or zip64_eocd_index + 40 > len(tail):
+                return None
+            return int.from_bytes(tail[zip64_eocd_index + 32 : zip64_eocd_index + 40], "little")
+        except Exception:
+            return None
+
+    def _check_extracted_size_within_limit(self, total_bytes: int) -> None:
+        if total_bytes > self._MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise InvalidFileType(
+                file_url=self.file_url,
+                file_type=self.file_type,
+                error=f"ZIP archive uncompressed content exceeds the limit of {self._MAX_ZIP_UNCOMPRESSED_BYTES} bytes",
+            )
+
+    def _extract_zip_file(
+        self, file_path: str, workflow_run_id: str, workflow_run_block_id: str
+    ) -> list[dict[str, Any]]:
+        """Extract a ZIP archive into the run's download directory.
+
+        Returns the extracted files as {"file_name", "file_path", "file_size"} dicts sorted by
+        file_name, so downstream blocks can consume the files from the local filesystem.
+        """
+        context = skyvern_context.current()
+        run_id = context.run_id if context and context.run_id else workflow_run_id
+        zip_stem = sanitize_filename(Path(file_path).stem, default="archive")
+        extract_dir = (
+            get_path_for_workflow_download_directory(run_id) / "unzipped" / f"{zip_stem}_{workflow_run_block_id}"
+        )
+
+        archive_size = os.path.getsize(file_path)
+        if archive_size > self._MAX_ZIP_ARCHIVE_BYTES:
+            raise InvalidFileType(
+                file_url=self.file_url,
+                file_type=self.file_type,
+                error=f"ZIP archive size ({archive_size} bytes) exceeds the limit of {self._MAX_ZIP_ARCHIVE_BYTES} bytes",
+            )
+
+        declared_entry_count = self._read_zip_total_entry_count(file_path)
+        if declared_entry_count is not None and declared_entry_count > self._MAX_ZIP_ENTRIES:
+            raise InvalidFileType(
+                file_url=self.file_url,
+                file_type=self.file_type,
+                error=f"ZIP archive declares {declared_entry_count} entries, exceeding the limit of {self._MAX_ZIP_ENTRIES}",
+            )
+
+        with zipfile.ZipFile(file_path) as zip_file:
+            members = [
+                member
+                for member in zip_file.infolist()
+                if not member.is_dir() and not self._is_zip_junk_member(member.filename)
+            ]
+            if len(members) > self._MAX_ZIP_ENTRIES:
+                raise InvalidFileType(
+                    file_url=self.file_url,
+                    file_type=self.file_type,
+                    error=f"ZIP archive contains {len(members)} files, exceeding the limit of {self._MAX_ZIP_ENTRIES}",
+                )
+            total_uncompressed_bytes = sum(member.file_size for member in members)
+            # The declared-size check is advisory; measured bytes after extraction are authoritative.
+            if total_uncompressed_bytes > self._MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise InvalidFileType(
+                    file_url=self.file_url,
+                    file_type=self.file_type,
+                    error=f"ZIP archive uncompressed size ({total_uncompressed_bytes} bytes) exceeds the limit of {self._MAX_ZIP_UNCOMPRESSED_BYTES} bytes",
+                )
+            if any(member.flag_bits & 0x1 for member in members):
+                raise InvalidFileType(
+                    file_url=self.file_url,
+                    file_type=self.file_type,
+                    error="Password-protected ZIP archives are not supported",
+                )
+
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            # Keyed by destination path: member names that sanitize to the same destination
+            # (e.g. "a.csv", "/a.csv", "../a.csv") overwrite on disk, and per ZIP semantics the
+            # last entry wins — keep one list entry per file instead of duplicates.
+            # measured_total_bytes intentionally counts every member's written bytes (including
+            # overwritten collisions) because it guards total write I/O, not final disk usage.
+            files_by_path: dict[str, dict[str, Any]] = {}
+            measured_total_bytes = 0
+            for member in members:
+                if member.file_size > self._MAX_ZIP_UNCOMPRESSED_BYTES - measured_total_bytes:
+                    raise InvalidFileType(
+                        file_url=self.file_url,
+                        file_type=self.file_type,
+                        error=f"ZIP archive uncompressed content exceeds the limit of {self._MAX_ZIP_UNCOMPRESSED_BYTES} bytes",
+                    )
+                # ZipFile.extract sanitizes absolute paths and ".." components, so members cannot
+                # escape extract_dir.
+                extracted_path = zip_file.extract(member, path=extract_dir)
+                extracted_size = Path(extracted_path).stat().st_size
+                measured_total_bytes += extracted_size
+                self._check_extracted_size_within_limit(measured_total_bytes)
+                if extracted_path in files_by_path:
+                    LOG.warning(
+                        "FileParserBlock ZIP members collide after path sanitization, keeping the last one",
+                        file_url=self.file_url,
+                        member_name=member.filename,
+                    )
+                files_by_path[extracted_path] = {
+                    "file_name": str(Path(extracted_path).relative_to(extract_dir)),
+                    "file_path": extracted_path,
+                    "file_size": extracted_size,
+                }
+
+        extracted_files = sorted(files_by_path.values(), key=lambda file_info: file_info["file_name"])
+        LOG.info(
+            "FileParserBlock Extracted ZIP archive",
+            file_url=self.file_url,
+            extract_dir=str(extract_dir),
+            file_count=len(extracted_files),
+        )
+        return extracted_files
+
+    async def _parse_file_of_type(
+        self,
+        file_type: FileType,
+        file_path: str,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str | list[dict[str, Any]] | None:
+        """Parse a file with the parser for its type; returns None for unsupported types."""
+        if file_type == FileType.CSV:
+            return await self._parse_csv_file(file_path)
+        if file_type == FileType.EXCEL:
+            return await self._parse_excel_file(file_path)
+        if file_type == FileType.PDF:
+            return await self._parse_pdf_file(
+                file_path, workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
+            )
+        if file_type == FileType.IMAGE:
+            return await self._parse_image_file(
+                file_path, workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
+            )
+        if file_type == FileType.DOCX:
+            return await self._parse_docx_file(file_path)
+        return None
+
+    async def _parse_zip_contents(
+        self,
+        extracted_files: list[dict[str, Any]],
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Parse every supported file extracted from a ZIP for combined AI extraction.
+
+        Returns [{"file_name", "content"}, ...]. Unsupported or unparseable files are skipped;
+        total content is truncated at a file boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
+        """
+        content_entries: list[dict[str, Any]] = []
+        current_tokens = 0
+        for file_info in extracted_files:
+            inner_path: str = file_info["file_path"]
+            file_name: str = file_info["file_name"]
+            try:
+                inner_file_type = self._detect_file_type_from_url(inner_path, file_path=inner_path)
+            except InvalidFileType as e:
+                LOG.warning("FileParserBlock Skipping unsupported file in ZIP", file_name=file_name, error=str(e))
+                continue
+            if inner_file_type == FileType.ZIP:
+                LOG.warning("FileParserBlock Skipping nested ZIP archive", file_name=file_name)
+                continue
+            try:
+                content = await self._parse_file_of_type(
+                    inner_file_type,
+                    inner_path,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            except Exception as e:
+                LOG.warning(
+                    "FileParserBlock Failed to parse file in ZIP, skipping it", file_name=file_name, error=str(e)
+                )
+                continue
+            if content is None:
+                LOG.warning(
+                    "FileParserBlock Skipping file with unsupported type in ZIP",
+                    file_name=file_name,
+                    detected_file_type=inner_file_type,
+                )
+                continue
+            entry = {"file_name": file_name, "content": content}
+            entry_tokens = count_tokens(json.dumps(entry, separators=(",", ":"), default=str))
+            if current_tokens + entry_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
+                if not content_entries:
+                    raise InvalidFileType(
+                        file_url=self.file_url,
+                        file_type=self.file_type,
+                        error=f"File '{file_name}' in the ZIP archive alone exceeds the maximum extraction input size",
+                    )
+                LOG.warning(
+                    "FileParserBlock ZIP content exceeds token limit, truncating at file boundary",
+                    file_url=self.file_url,
+                    files_included=len(content_entries),
+                    total_files=len(extracted_files),
+                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                )
+                break
+            current_tokens += entry_tokens
+            content_entries.append(entry)
+
+        if not content_entries:
+            raise InvalidFileType(
+                file_url=self.file_url,
+                file_type=self.file_type,
+                error="ZIP archive contains no parseable files (supported: CSV, Excel, PDF, image, DOCX)",
+            )
+        return content_entries
+
     async def _extract_with_ai(
         self,
         content: str | list[dict[str, Any]],
@@ -6939,12 +7216,13 @@ class FileParserBlock(Block):
             self.file_url = extracted_url
 
         try:
-            # Download the file.
-            file_path = await download_file(self.file_url, organization_id=organization_id)
+            context = skyvern_context.current()
+            run_id = context.run_id if context and context.run_id else workflow_run_id
+            file_path = await resolve_local_or_download_file(self.file_url, run_id, organization_id=organization_id)
 
             # Resolve AUTO_DETECT (and legacy CSV-as-default) via URL/magic-byte detection;
-            # IMAGE/EXCEL/PDF/DOCX are honored as user overrides.
-            if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
+            # IMAGE/EXCEL/PDF/DOCX/ZIP are honored as user overrides.
+            if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX, FileType.ZIP):
                 self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
             # Validate the file type
@@ -6968,32 +7246,34 @@ class FileParserBlock(Block):
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
         try:
-            if self.file_type == FileType.CSV:
-                parsed_data = await self._parse_csv_file(file_path)
-            elif self.file_type == FileType.EXCEL:
-                parsed_data = await self._parse_excel_file(file_path)
-            elif self.file_type == FileType.PDF:
-                parsed_data = await self._parse_pdf_file(
-                    file_path,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
+            if self.file_type == FileType.ZIP:
+                extracted_zip_files = await asyncio.to_thread(
+                    self._extract_zip_file, file_path, workflow_run_id, workflow_run_block_id
                 )
-            elif self.file_type == FileType.IMAGE:
-                parsed_data = await self._parse_image_file(
-                    file_path,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-            elif self.file_type == FileType.DOCX:
-                parsed_data = await self._parse_docx_file(file_path)
+                if self.json_schema:
+                    parsed_data = await self._parse_zip_contents(
+                        extracted_zip_files,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                else:
+                    parsed_data = extracted_zip_files
             else:
-                return await self._record_failure(
-                    workflow_run_context,
-                    workflow_run_id,
-                    workflow_run_block_id,
-                    organization_id,
-                    f"Unsupported file type: {self.file_type}",
+                maybe_parsed = await self._parse_file_of_type(
+                    self.file_type,
+                    file_path,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
+                if maybe_parsed is None:
+                    return await self._record_failure(
+                        workflow_run_context,
+                        workflow_run_id,
+                        workflow_run_block_id,
+                        organization_id,
+                        f"Unsupported file type: {self.file_type}",
+                    )
+                parsed_data = maybe_parsed
         except Exception as e:
             return await self._record_failure(
                 workflow_run_context,
@@ -7110,8 +7390,19 @@ class PDFParserBlock(Block):
                 organization_id=organization_id,
             )
 
-        # Download the file.
-        file_path = await download_file(self.file_url, organization_id=organization_id)
+        try:
+            context = skyvern_context.current()
+            run_id = context.run_id if context and context.run_id else workflow_run_id
+            file_path = await resolve_local_or_download_file(self.file_url, run_id, organization_id=organization_id)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to download or validate file: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
         try:
             extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
@@ -7833,6 +8124,73 @@ class TaskV2Block(Block):
         )
 
 
+def _is_secret_scalar(value: Any) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _secret_path_suffix(path: str) -> str | None:
+    # The last non-numeric segment names the placeholder (placeholder_XXXX_ssn) so the
+    # LLM gets the same field-matching signal credential stubs carry (_username, _password).
+    for segment in reversed(path.split(".")):
+        cleaned = re.sub(r"[^A-Za-z0-9_]", "_", segment).strip("_")
+        if cleaned and not cleaned.isdigit():
+            return cleaned[:32]
+    return None
+
+
+def _register_and_replace_secret_response_path(
+    response_body: Any,
+    path: str,
+    workflow_run_context: WorkflowRunContext,
+) -> bool:
+    suffix = _secret_path_suffix(path)
+    current = response_body
+    segments = path.split(".")
+    for index, segment in enumerate(segments):
+        is_last = index == len(segments) - 1
+        if isinstance(current, dict):
+            if segment not in current:
+                return False
+            if is_last:
+                value = current[segment]
+                if not _is_secret_scalar(value):
+                    return False
+                current[segment] = workflow_run_context.register_secret_value(str(value), suffix=suffix)
+                return True
+            current = current[segment]
+        elif isinstance(current, list):
+            if not segment.isdigit():
+                return False
+            list_index = int(segment)
+            if list_index >= len(current):
+                return False
+            if is_last:
+                value = current[list_index]
+                if not _is_secret_scalar(value):
+                    return False
+                current[list_index] = workflow_run_context.register_secret_value(str(value), suffix=suffix)
+                return True
+            current = current[list_index]
+        else:
+            return False
+    return False
+
+
+def _apply_secret_response_paths(
+    response_body: Any,
+    secret_response_paths: list[str],
+    workflow_run_context: WorkflowRunContext,
+) -> list[str]:
+    invalid_paths: list[str] = []
+    for path in dict.fromkeys(p.strip() for p in secret_response_paths if p.strip()):
+        if not _register_and_replace_secret_response_path(response_body, path, workflow_run_context):
+            invalid_paths.append(path)
+    return invalid_paths
+
+
+SECRET_RESPONSE_BODY_REDACTED = "<response body redacted: secret_response_paths did not fully resolve>"
+
+
 class HttpRequestBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -7848,6 +8206,7 @@ class HttpRequestBlock(Block):
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
+    secret_response_paths: list[str] | None = None
 
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
@@ -7894,9 +8253,18 @@ class HttpRequestBlock(Block):
         template_kwargs = {"force_include_secrets": True}
 
         def _render_string(value: str) -> str:
-            return self.format_block_parameter_template_from_workflow_run_context(
+            rendered = self.format_block_parameter_template_from_workflow_run_context(
                 value, workflow_run_context, **template_kwargs
             )
+            # Boundary check so a longer id sharing a registered token's prefix is not partially replaced.
+            for token in dict.fromkeys(workflow_run_context.find_embedded_placeholder_tokens(rendered)):
+                secret_value = str(workflow_run_context.secrets[token])
+                rendered = re.sub(
+                    re.escape(token) + r"(?![A-Za-z0-9_])",
+                    secret_value.replace("\\", "\\\\"),
+                    rendered,
+                )
+            return rendered
 
         if self.url:
             self.url = _render_string(self.url)
@@ -7911,9 +8279,7 @@ class HttpRequestBlock(Block):
             self.headers = cast(dict[str, str], render_templates_in_json_value(self.headers, _render_string))
 
         if self.download_filename:
-            self.download_filename = self.format_block_parameter_template_from_workflow_run_context(
-                self.download_filename, workflow_run_context, **template_kwargs
-            )
+            self.download_filename = _render_string(self.download_filename)
 
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
@@ -7993,17 +8359,18 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
         except Exception as e:
-            error_data = {"error": str(e), "error_type": "unknown"}
+            masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
+            error_data = {"error": masked_error, "error_type": "unknown"}
             LOG.warning(
                 "File download failed",
-                error=str(e),
-                url=self.url,
+                error=masked_error,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
                 workflow_run_id=workflow_run_id,
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"File download failed: {str(e)}",
+                failure_reason=f"File download failed: {masked_error}",
                 output_parameter_value=error_data,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8034,6 +8401,16 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
 
+        if self.save_response_as_file and self.secret_response_paths:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="secret_response_paths cannot be combined with save_response_as_file",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         # Validate URL
         if not self.url:
             return await self.build_block_result(
@@ -8048,7 +8425,7 @@ class HttpRequestBlock(Block):
         if not self.validate_url(self.url):
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Invalid URL format: {self.url}",
+                failure_reason=f"Invalid URL format: {workflow_run_context.mask_secrets_in_data(self.url)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8062,7 +8439,10 @@ class HttpRequestBlock(Block):
         # If files are provided, don't set default Content-Type (aiohttp will set multipart/form-data)
         if not self.files:
             if not self.headers.get("Content-Type") and not self.headers.get("content-type"):
-                LOG.info("Adding default content-type as application/json", headers=self.headers)
+                LOG.info(
+                    "Adding default content-type as application/json",
+                    headers=workflow_run_context.mask_secrets_in_data(self.headers),
+                )
                 self.headers["Content-Type"] = "application/json"
 
         # Download files from HTTP URLs or S3 URIs if needed
@@ -8070,6 +8450,7 @@ class HttpRequestBlock(Block):
         if self.files:
             downloaded_files: dict[str, str] = {}
             for field_name, file_path in self.files.items():
+                masked_file_path = str(workflow_run_context.mask_secrets_in_data(file_path))
                 # Parse file path (handle file:// URI format)
                 actual_file_path: str | None = None
                 is_file_uri = file_path.startswith("file://")
@@ -8078,9 +8459,10 @@ class HttpRequestBlock(Block):
                     try:
                         actual_file_path = parse_uri_to_path(file_path)
                     except ValueError as e:
+                        masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
                         return await self.build_block_result(
                             success=False,
-                            failure_reason=f"Invalid file URI format: {file_path}. Error: {str(e)}",
+                            failure_reason=(f"Invalid file URI format: {masked_file_path}. Error: {masked_error}"),
                             output_parameter_value=None,
                             status=BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
@@ -8123,7 +8505,11 @@ class HttpRequestBlock(Block):
                 if not (is_url or is_managed_storage_uri or is_allowed_local_file):
                     return await self.build_block_result(
                         success=False,
-                        failure_reason=f"No permission to access local file: {file_path}. Only HTTP/HTTPS URLs, managed storage URIs, or files in allowed directories are allowed.",
+                        failure_reason=(
+                            "No permission to access local file: "
+                            f"{masked_file_path}. Only HTTP/HTTPS URLs, "
+                            "managed storage URIs, or files in allowed directories are allowed."
+                        ),
                         output_parameter_value=None,
                         status=BlockStatus.failed,
                         workflow_run_block_id=workflow_run_block_id,
@@ -8134,10 +8520,11 @@ class HttpRequestBlock(Block):
                 if is_allowed_local_file:
                     # Use local file directly
                     local_file_path_str: str = cast(str, actual_file_path)
+                    masked_local_file_path = str(workflow_run_context.mask_secrets_in_data(local_file_path_str))
                     if not os.path.exists(local_file_path_str):
                         return await self.build_block_result(
                             success=False,
-                            failure_reason=f"File not found: {local_file_path_str}",
+                            failure_reason=f"File not found: {masked_local_file_path}",
                             output_parameter_value=None,
                             status=BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
@@ -8147,7 +8534,7 @@ class HttpRequestBlock(Block):
                     LOG.info(
                         "HttpRequestBlock Using allowed local file",
                         field_name=field_name,
-                        file_path=local_file_path_str,
+                        file_path=masked_local_file_path,
                     )
                 else:
                     # Download from remote source
@@ -8155,7 +8542,7 @@ class HttpRequestBlock(Block):
                         LOG.info(
                             "HttpRequestBlock Downloading file from remote source",
                             field_name=field_name,
-                            file_path=file_path,
+                            file_path=masked_file_path,
                             is_url=is_url,
                             is_managed_storage_uri=is_managed_storage_uri,
                         )
@@ -8164,13 +8551,14 @@ class HttpRequestBlock(Block):
                         LOG.info(
                             "HttpRequestBlock File downloaded successfully",
                             field_name=field_name,
-                            original_path=file_path,
+                            original_path=masked_file_path,
                             local_path=local_file_path,
                         )
                     except Exception as e:
+                        masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
                         return await self.build_block_result(
                             success=False,
-                            failure_reason=f"Failed to download file {file_path}: {str(e)}",
+                            failure_reason=(f"Failed to download file {masked_file_path}: {masked_error}"),
                             output_parameter_value=None,
                             status=BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
@@ -8192,11 +8580,11 @@ class HttpRequestBlock(Block):
             LOG.info(
                 "Executing HTTP request",
                 method=self.method,
-                url=self.url,
-                headers=self.headers,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
+                headers=workflow_run_context.mask_secrets_in_data(self.headers),
                 workflow_run_id=workflow_run_id,
-                body=self.body,
-                files=self.files,
+                body=workflow_run_context.mask_secrets_in_data(self.body),
+                files=workflow_run_context.mask_secrets_in_data(self.files),
             )
 
             status_code, response_headers, response_body = await aiohttp_request(
@@ -8208,6 +8596,23 @@ class HttpRequestBlock(Block):
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
             )
+
+            success = 200 <= status_code < 300
+            failure_reason = None
+            invalid_secret_response_paths: list[str] = []
+            if self.secret_response_paths:
+                # Extract on every status so a secret echoed in an error body never reaches outputs or logs.
+                invalid_secret_response_paths = _apply_secret_response_paths(
+                    response_body,
+                    self.secret_response_paths,
+                    workflow_run_context,
+                )
+                if success and invalid_secret_response_paths:
+                    success = False
+                    failure_reason = (
+                        "secret_response_paths did not resolve to a non-empty string: "
+                        f"{', '.join(invalid_secret_response_paths)}"
+                    )
 
             response_data = {
                 "status_code": status_code,
@@ -8222,19 +8627,23 @@ class HttpRequestBlock(Block):
                 "url": self.url,
             }
 
+            if invalid_secret_response_paths:
+                response_data["response_body"] = SECRET_RESPONSE_BODY_REDACTED
+                response_data["body"] = SECRET_RESPONSE_BODY_REDACTED
+
             response_data = workflow_run_context.mask_secrets_in_data(response_data)
 
             LOG.info(
                 "HTTP request completed",
                 status_code=status_code,
-                url=self.url,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
                 method=self.method,
                 workflow_run_id=workflow_run_id,
                 response_data=response_data,
             )
 
-            success = 200 <= status_code < 300
-            failure_reason = None if success else f"HTTP {status_code}: {response_data.get('response_body', '')}"
+            if failure_reason is None and not success:
+                failure_reason = f"HTTP {status_code}: {response_data.get('response_body', '')}"
 
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
 
@@ -8259,18 +8668,19 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
         except Exception as e:
-            error_data = {"error": str(e), "error_type": "unknown"}
+            masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
+            error_data = {"error": masked_error, "error_type": "unknown"}
             LOG.warning(
                 "HTTP request failed with unexpected error",
-                error=str(e),
-                url=self.url,
+                error=masked_error,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
                 method=self.method,
                 workflow_run_id=workflow_run_id,
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"HTTP request failed: {str(e)}",
+                failure_reason=f"HTTP request failed: {masked_error}",
                 output_parameter_value=error_data,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,

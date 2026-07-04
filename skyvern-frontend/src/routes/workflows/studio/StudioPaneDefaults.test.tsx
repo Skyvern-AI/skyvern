@@ -11,13 +11,8 @@ import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioPanes } from "./useStudioPanes";
 
-const { runSignalsMock, toastMock } = vi.hoisted(() => ({
-  runSignalsMock: vi.fn(),
+const { toastMock } = vi.hoisted(() => ({
   toastMock: vi.fn(),
-}));
-
-vi.mock("./useStudioRunSignals", () => ({
-  useStudioRunSignals: () => runSignalsMock(),
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({
@@ -29,7 +24,7 @@ function PanesProbe() {
   return (
     <div>
       <output data-testid="panes">{panes.join(",")}</output>
-      <button onClick={() => togglePane("run")}>toggle-run</button>
+      <button onClick={() => togglePane("overview")}>toggle-overview</button>
       <button onClick={() => openPane("editor")}>open-editor</button>
       <button onClick={() => openPane("browser")}>open-browser</button>
     </div>
@@ -81,92 +76,63 @@ beforeEach(() => {
     coachMarkSeen: false,
     narrowNudgeSeen: false,
   });
-  runSignalsMock.mockReturnValue({
-    hasRun: false,
-    runStatus: undefined,
-    knownHasRuns: undefined,
-  });
   toastMock.mockReset();
 });
 
-describe("state-aware default panes", () => {
-  test("an agent with cached runs starts on Copilot + Browser", () => {
-    runSignalsMock.mockReturnValue({
-      hasRun: true,
-      runStatus: undefined,
-      knownHasRuns: true,
-    });
-    renderStudio();
-    expect(panesText()).toBe("copilot,browser");
-  });
-
-  test("a never-run agent starts on Copilot + Editor", () => {
-    runSignalsMock.mockReturnValue({
-      hasRun: false,
-      runStatus: undefined,
-      knownHasRuns: false,
-    });
-    renderStudio();
-    expect(panesText()).toBe("copilot,editor");
-  });
-
-  test("an empty agent starts on Copilot + Editor even before runs load", () => {
+describe("cold-entry default panes (the four contexts)", () => {
+  test("an empty agent starts on Copilot + Browser", () => {
     renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("copilot,editor");
+    expect(panesText()).toBe("copilot,browser");
   });
 
-  test("an agent with blocks keeps the legacy default while runs are unknown", () => {
+  test("a built agent starts on Copilot + Browser + Editor", () => {
     renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("copilot,browser");
+    expect(panesText()).toBe("copilot,browser,editor");
   });
 
-  test("a runs signal that arrives after mount does not reshuffle the panes", () => {
-    const { rerender, tree } = renderStudio({ hasBlocks: true });
+  test("a run in the URL lands on Copilot + Browser + Overview", () => {
+    renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
+    expect(panesText()).toBe("copilot,browser,overview");
+  });
+
+  test("a block-run deep link lands on Editor + Browser + Overview", () => {
+    renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1&bl=block_1" });
+    expect(panesText()).toBe("editor,browser,overview");
+  });
+
+  test("a blocks signal that changes after mount does not reshuffle the panes", () => {
+    const { rerender } = renderStudio({ hasBlocks: false });
     expect(panesText()).toBe("copilot,browser");
-    runSignalsMock.mockReturnValue({
-      hasRun: false,
-      runStatus: undefined,
-      knownHasRuns: false,
-    });
-    rerender(tree);
+    rerender(
+      <MemoryRouter initialEntries={["/workflows/wpid_1/studio"]}>
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <PanesProbe />
+        </StudioPaneDefaultsProvider>
+      </MemoryRouter>,
+    );
     expect(panesText()).toBe("copilot,browser");
   });
 
   test("an explicit ?panes= is never overridden by the state default", () => {
-    runSignalsMock.mockReturnValue({
-      hasRun: false,
-      runStatus: undefined,
-      knownHasRuns: false,
-    });
     renderStudio({ path: "/workflows/wpid_1/studio?panes=browser" });
     expect(panesText()).toBe("browser");
   });
 
-  test("deep links keep their mapping regardless of the state default", () => {
-    runSignalsMock.mockReturnValue({
-      hasRun: true,
-      runStatus: undefined,
-      knownHasRuns: false,
-    });
-    renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
-    expect(panesText()).toBe("run");
+  test("the pre-rename ?panes=run alias presents the Overview pane", () => {
+    renderStudio({ path: "/workflows/wpid_1/studio?panes=copilot,run" });
+    expect(panesText()).toBe("copilot,overview");
   });
 
   test("toggling from the state default writes the default plus the change", () => {
-    runSignalsMock.mockReturnValue({
-      hasRun: true,
-      runStatus: undefined,
-      knownHasRuns: false,
-    });
-    renderStudio();
-    fireEvent.click(screen.getByText("open-browser"));
-    expect(panesText()).toBe("copilot,editor,browser");
+    renderStudio({ hasBlocks: false });
+    fireEvent.click(screen.getByText("open-editor"));
+    expect(panesText()).toBe("copilot,browser,editor");
   });
 });
 
 describe("narrow-viewport clamp of shared links", () => {
   const FOUR_PANES =
-    "/workflows/wpid_1/studio?panes=copilot,editor,browser,run";
+    "/workflows/wpid_1/studio?panes=copilot,editor,browser,overview";
 
   test("an over-wide shared link degrades to its fitting prefix", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 600 });
@@ -175,18 +141,18 @@ describe("narrow-viewport clamp of shared links", () => {
 
   test("a wide viewport presents the shared link untouched", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 2000 });
-    expect(panesText()).toBe("copilot,editor,browser,run");
+    expect(panesText()).toBe("copilot,editor,browser,overview");
   });
 
   test("without a measurable stage the list is presented as-is", () => {
     renderStudio({ path: FOUR_PANES });
-    expect(panesText()).toBe("copilot,editor,browser,run");
+    expect(panesText()).toBe("copilot,editor,browser,overview");
   });
 
   test("the first pane write clears the clamp and builds on what is shown", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 600 });
-    fireEvent.click(screen.getByText("toggle-run"));
-    expect(panesText()).toBe("copilot,editor,run");
+    fireEvent.click(screen.getByText("toggle-overview"));
+    expect(panesText()).toBe("copilot,editor,overview");
   });
 });
 
@@ -196,9 +162,9 @@ describe("narrow-viewport nudge", () => {
       path: "/workflows/wpid_1/studio?panes=copilot,editor",
       stageWidth: 600,
     });
-    fireEvent.click(screen.getByText("toggle-run"));
+    fireEvent.click(screen.getByText("toggle-overview"));
     expect(toastMock).toHaveBeenCalledTimes(1);
-    expect(panesText()).toBe("copilot,editor,run");
+    expect(panesText()).toBe("copilot,editor,overview");
     fireEvent.click(screen.getByText("open-browser"));
     expect(toastMock).toHaveBeenCalledTimes(1);
     expect(useStudioFirstRunStore.getState().narrowNudgeSeen).toBe(true);
@@ -215,10 +181,10 @@ describe("narrow-viewport nudge", () => {
 
   test("closing a pane never nudges", () => {
     renderStudio({
-      path: "/workflows/wpid_1/studio?panes=copilot,run",
+      path: "/workflows/wpid_1/studio?panes=copilot,overview",
       stageWidth: 600,
     });
-    fireEvent.click(screen.getByText("toggle-run"));
+    fireEvent.click(screen.getByText("toggle-overview"));
     expect(panesText()).toBe("copilot");
     expect(toastMock).not.toHaveBeenCalled();
   });

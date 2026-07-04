@@ -15,6 +15,7 @@ from structlog.testing import capture_logs
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
     _build_built_unverified_exit_result,
@@ -71,7 +72,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
-from skyvern.forge.sdk.copilot.tools.completion import _completion_verification_criteria
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.completion import (
+    _authored_output_contract_criteria,
+    _completion_verification_criteria,
+    _maybe_run_completion_verification,
+)
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -885,6 +891,53 @@ workflow_definition:
         assert "page_actions: Search button.search disabled" in prompt
         assert "adapt the next code block to the observed page state" in prompt
         assert "do not re-emit the same failing selector or name path" in prompt
+
+    def test_metadata_repair_context_prompt_includes_failure_and_contract_guidance(self) -> None:
+        long_reason = "missing requested output child paths " + ("x" * 220)
+        repair_context = CodeAuthoringRepairContext(
+            block_label="lookup_status",
+            reason_code="metadata_reject",
+            runtime_failure_reason=long_reason,
+            runtime_failure_class="requested_output_contract_missing_output_coverage",
+            required_goal_value_paths=["output.record_id", "output.flags"],
+            required_extraction_schema_paths=["output.record_id", "output.flags"],
+            required_code_return_paths=["output.record_id", "output.flags"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+            repair_instruction=(
+                "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths."
+            ),
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        standard_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert agent_module._code_authoring_repair_context_prompt(standard_ctx) == ""
+        assert "reason_code: metadata_reject" in prompt
+        assert "block_label: lookup_status" in prompt
+        assert "runtime_failure_reason: missing requested output child paths " in prompt
+        assert "x" * 180 not in prompt
+        assert "runtime_failure_class: requested_output_contract_missing_output_coverage" in prompt
+        assert "metadata_contract_source: requested_output_contract" in prompt
+        assert "metadata_contract_reason_code: requested_output_contract_missing_output_coverage" in prompt
+        assert "required_goal_value_paths: output.record_id, output.flags" in prompt
+        assert "required_extraction_schema_paths: output.record_id, output.flags" in prompt
+        assert "required_code_return_paths: output.record_id, output.flags" in prompt
+        assert "code_artifact_metadata" in prompt
+        assert "goal_value_paths" in prompt
+        assert "valid extraction_schema" in prompt
+        assert "code return paths" in prompt
+        assert "required requested output child paths" in prompt
+        assert "rerun update_and_run_blocks" in prompt
+        assert "Declare code_artifact_metadata goal_value_paths" in prompt
+        assert "Coastal" not in prompt
 
     def test_recorded_build_test_outcome_prompt_renders_structural_grounding(self) -> None:
         ctx = _ctx(
@@ -1892,8 +1945,218 @@ class TestBlockGoalMainGoal:
 
 class TestRuntimeBlockGoalPersistenceBoundary:
     @pytest.mark.asyncio
+    async def test_update_and_run_blocks_metadata_repair_context_preflight_blocks_before_update(
+        self, monkeypatch
+    ) -> None:
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: extract_entry_output
+      code: |
+        return {"output": {"summary": "found"}}
+"""
+        repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id", "output.flags"],
+            required_extraction_schema_paths=["output.record_id", "output.flags"],
+            required_code_return_paths=["output.record_id", "output.flags"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            tools_module,
+            "_tool_loop_error",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("loop check should not run")),
+        )
+        monkeypatch.setattr(
+            tools_module,
+            "_update_workflow",
+            AsyncMock(side_effect=AssertionError("_update_workflow should not run")),
+        )
+        record_calls: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            tools_module,
+            "record_tool_step_result_for_ctx",
+            lambda _ctx, tool, _args, result: record_calls.append((tool, result)),
+        )
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert "cannot attempt a run" in parsed["error"]
+        assert parsed["data"]["reason_code"] == "metadata_contract_required_before_run"
+        assert parsed["data"]["authoring_repair_context"]["required_goal_value_paths"] == [
+            "output.flags",
+            "output.record_id",
+        ]
+        assert parsed["data"]["metadata_repair_contract"]["block_label"] == "extract_entry_output"
+        assert record_calls
+        assert record_calls[0][0] == "update_and_run_blocks"
+        assert record_calls[0][1]["data"]["reason_code"] == "metadata_contract_required_before_run"
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_metadata_contract_scaffold_reaches_update_workflow(self, monkeypatch) -> None:
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: extract_entry_output
+      code: |
+        return {"output": {"record_id": "ABC123", "flags": ["enabled"]}}
+"""
+        repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id", "output.flags"],
+            required_extraction_schema_paths=["output.record_id", "output.flags"],
+            required_code_return_paths=["output.record_id", "output.flags"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        captured_metadata: list[dict[str, object]] = []
+
+        async def fake_update_workflow(payload, _ctx, **_kwargs):
+            captured_metadata.extend(payload["code_artifact_metadata"])
+            return {"ok": False, "error": "sentinel update reached", "data": {"from_update": True}}
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed["error"] == "sentinel update reached"
+        assert captured_metadata
+        assert captured_metadata[0]["block_label"] == "extract_entry_output"
+        assert captured_metadata[0]["artifact_id"] == "code_artifact:extract_entry_output"
+        assert captured_metadata[0]["claimed_outcomes"][0]["goal_value_paths"] == [
+            "output.flags",
+            "output.record_id",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_post_steering_static_return_gap_reaches_run(self, monkeypatch) -> None:
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: extract_entry_output
+      code: |
+        return "not a structured output"
+"""
+        required_paths = {"output.record_id"}
+        schema = workflow_update_module._schema_template_text_for_required_paths(required_paths)
+        repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id"],
+            required_extraction_schema_paths=["output.record_id"],
+            required_code_return_paths=["output.record_id"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        ctx.turn_id = "metadata-contract-run-preflight"
+        signature = workflow_update_module._output_contract_signature(
+            ctx=ctx,
+            workflow_yaml=workflow_yaml,
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            required_paths=required_paths,
+        )
+        ctx.output_contract_reject_count_by_signature = {signature: 2}
+        captured: dict[str, object] = {}
+
+        async def fake_update_workflow(payload, update_ctx, **_kwargs):
+            captured["update_called"] = True
+            captured["metadata"] = payload["code_artifact_metadata"]
+            update_ctx.workflow_yaml = payload["workflow_yaml"]
+            update_ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+            return {"ok": True, "data": {"block_count": 1}}
+
+        async def fake_run_blocks(params, _ctx, **_kwargs):
+            captured["run_called"] = True
+            captured["run_params"] = params
+            return {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr-1",
+                    "overall_status": "completed",
+                    "blocks": [{"label": "extract_entry_output", "status": "completed"}],
+                },
+            }
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(
+            tools_module, "_plan_frontier", lambda *args: (["extract_entry_output"], {}, "extract_entry_output")
+        )
+        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps(
+                {
+                    "workflow_yaml": workflow_yaml,
+                    "block_labels": ["extract_entry_output"],
+                }
+            ),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is True
+        assert captured["update_called"] is True
+        assert captured["run_called"] is True
+        update_metadata = captured["metadata"]
+        assert isinstance(update_metadata, list)
+        assert update_metadata[0]["block_label"] == "extract_entry_output"
+        assert update_metadata[0]["claimed_outcomes"][0]["goal_value_paths"] == ["output.record_id"]
+        assert update_metadata[0]["claimed_outcomes"][0]["extraction_schema"] == schema
+
+    @pytest.mark.asyncio
     async def test_update_and_run_blocks_persists_clean_yaml(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import tools as tools_module
         from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 
         clean_yaml = """
@@ -1907,7 +2170,9 @@ workflow_definition:
 """
         captured: dict[str, str | bool] = {}
 
-        async def fake_update_workflow(payload, ctx, allow_missing_credentials=False):
+        async def fake_update_workflow(
+            payload, ctx, allow_missing_credentials=False, allow_static_output_uncertainty=False
+        ):
             captured["workflow_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]
             workflow = await _process_workflow_yaml(
@@ -5190,7 +5455,6 @@ class TestRunBlocksCredentialApproval:
 
     @pytest.mark.asyncio
     async def test_update_and_run_blocks_rejects_unapproved_credential_at_shared_run_seam(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import tools as tools_module
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 
         workflow = self._workflow("cred_unapproved")
@@ -6172,3 +6436,331 @@ class TestDeclaredEqualsGradedCompletionCriteria:
         graded = policy.graded_completion_criteria()
         assert all(not criterion.method_mandated for criterion in graded)
         assert {criterion.id for criterion in graded} == {"c2", "c3", "c4", "c5"}
+
+    @pytest.mark.asyncio
+    async def test_fallback_floor_uses_authored_output_contract_paths_for_completion(self) -> None:
+        label = "validate_public_path"
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            code_artifact_metadata={
+                label: {
+                    "claimed_outcomes": [
+                        {
+                            "goal_value_paths": [
+                                "output.public_form_exists",
+                                "output.visible_page_path_label",
+                                "output.recommended_next_action",
+                            ]
+                        }
+                    ],
+                    "terminal_verifier_expectations": [
+                        {
+                            "goal_value_paths": [
+                                "output.public_form_exists",
+                                "output.visible_page_path_label",
+                                "output.recommended_next_action",
+                            ]
+                        }
+                    ],
+                }
+            },
+            workflow_yaml=(
+                "title: Utility path\n"
+                "workflow_definition:\n"
+                "  blocks:\n"
+                "    - block_type: code\n"
+                f"      label: {label}\n"
+                "      code: |\n"
+                "        return {}\n"
+            ),
+            last_workflow_yaml=None,
+            completion_verification_result=None,
+            copilot_total_timeout_exceeded=False,
+            reached_download_target=None,
+            workflow_verification_evidence=SimpleNamespace(block_verified=[]),
+            verified_prefix_labels=[],
+            verified_block_outputs={},
+            post_run_page_observation_after_failed_test=False,
+            completion_criteria_turn_state=None,
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_public_path",
+                    "overall_status": "completed",
+                    "blocks": [
+                        {
+                            "label": label,
+                            "status": "completed",
+                            "extracted_data": {
+                                "public_form_exists": True,
+                                "visible_page_path_label": "sign in",
+                                "recommended_next_action": "authenticate",
+                                "evidence_text": "diagnostic only",
+                            },
+                        }
+                    ],
+                    "executed_block_labels": [label],
+                },
+            },
+            0,
+        )
+
+        assert verification is not None
+        assert "__copilot_fallback_floor__run" not in verification.criterion_ids
+        assert {verdict.output_path for verdict in verification.verdicts} == {
+            "output.public_form_exists",
+            "output.visible_page_path_label",
+            "output.recommended_next_action",
+        }
+        assert not any(verdict.satisfied for verdict in verification.verdicts)
+        assert all(verdict.reason_code != "evidence_confirms" for verdict in verification.verdicts)
+
+    def test_fallback_floor_uses_repair_context_output_contract_paths_when_metadata_missing(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            code_artifact_metadata={},
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=[
+                    "output.public_form_exists",
+                    "output.visible_page_path_label",
+                    "output.recommended_next_action",
+                ],
+            ),
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_fallback_floor_prefers_repair_context_paths_over_stale_metadata(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            code_artifact_metadata={
+                "stale_output": {
+                    "claimed_outcomes": [{"goal_value_paths": ["output.old_path"]}],
+                }
+            },
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=[
+                    "output.public_form_exists",
+                    "output.visible_page_path_label",
+                    "output.recommended_next_action",
+                ],
+            ),
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert "output.old_path" not in {criterion.output_path for criterion in criteria}
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_staged_contract_uses_durable_metadata_before_repair_context(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            code_artifact_metadata={
+                "stale_output": {
+                    "claimed_outcomes": [{"goal_value_paths": ["output.old_path"]}],
+                }
+            },
+            workflow_verification_evidence=SimpleNamespace(
+                code_artifact_metadata={
+                    "validate_public_path": {
+                        "claimed_outcomes": [
+                            {
+                                "goal_value_paths": [
+                                    "output.public_form_exists",
+                                    "output.visible_page_path_label",
+                                    "output.recommended_next_action",
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=["output.repair_context_only"],
+            ),
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert "output.old_path" not in {criterion.output_path for criterion in criteria}
+        assert "output.repair_context_only" not in {criterion.output_path for criterion in criteria}
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_staged_contract_uses_ctx_metadata_when_evidence_metadata_empty(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            code_artifact_metadata={
+                "validate_public_path": {
+                    "claimed_outcomes": [{"goal_value_paths": ["output.public_form_exists"]}],
+                }
+            },
+            last_code_authoring_repair_context=None,
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [(criterion.id, criterion.output_path) for criterion in criteria] == [
+            ("__copilot_authored_output__output_public_form_exists", "output.public_form_exists")
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_staged_contract_canonicalizes_block_local_metadata_paths(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            workflow_verification_evidence=SimpleNamespace(
+                code_artifact_metadata={
+                    "validate_public_path": {
+                        "claimed_outcomes": [
+                            {
+                                "goal_value_paths": [
+                                    "public_form_exists",
+                                    "visible_page_path_label",
+                                    "recommended_next_action",
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            code_artifact_metadata={},
+            last_code_authoring_repair_context=None,
+        )
+
+        criteria = _authored_output_contract_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_staged_contract_missing_durable_metadata_fails_closed_without_fallback_floor(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            code_artifact_metadata={},
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=[
+                    "output.public_form_exists",
+                    "output.visible_page_path_label",
+                    "output.recommended_next_action",
+                ],
+            ),
+            workflow_yaml="title: Utility path\nworkflow_definition:\n  blocks: []\n",
+            last_workflow_yaml=None,
+            completion_verification_result=None,
+            copilot_total_timeout_exceeded=False,
+            reached_download_target=None,
+            verified_prefix_labels=[],
+            verified_block_outputs={},
+            post_run_page_observation_after_failed_test=False,
+            completion_criteria_turn_state=None,
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.id for criterion in criteria] == ["__copilot_authored_output_contract_missing"]
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.__copilot_missing_authored_output_contract__"
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_missing_contract",
+                    "overall_status": "completed",
+                    "blocks": [
+                        {
+                            "label": "validate_public_path",
+                            "status": "completed",
+                            "extracted_data": {
+                                "public_form_exists": True,
+                                "visible_page_path_label": "sign in",
+                                "recommended_next_action": "authenticate",
+                                "evidence_text": "diagnostic only",
+                            },
+                        }
+                    ],
+                    "executed_block_labels": ["validate_public_path"],
+                },
+            },
+            0,
+        )
+
+        assert verification is not None
+        assert "__copilot_fallback_floor__run" not in verification.criterion_ids
+        assert verification.criterion_ids == ["__copilot_authored_output_contract_missing"]
+        assert not verification.is_fully_satisfied()
