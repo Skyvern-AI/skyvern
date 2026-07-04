@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
+
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _reconcile_completion_criteria_on_context,
@@ -54,7 +56,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
     _parse_completion_criteria,
-    _render_active_criteria_for_prompt,
     normalized_criterion_outcome_key,
 )
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -62,23 +63,7 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _outcome_failure_warrants_repair,
     _split_criteria_by_plane,
 )
-
-
-def _criterion(
-    cid: str,
-    outcome: str,
-    *,
-    level: str = "run",
-    output_path: str | None = None,
-    deliverable_kind: str | None = None,
-) -> CompletionCriterion:
-    return CompletionCriterion(
-        id=cid,
-        outcome=outcome,
-        level=level,  # type: ignore[arg-type]
-        output_path=output_path,
-        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
-    )
+from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
 
 
 def _stored(
@@ -262,42 +247,46 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
     assert plan_persistence(build_turn_state(StoredCriteriaSnapshot(), decision)) is None
 
 
-def test_criteria_json_round_trip_preserves_level_and_flags() -> None:
-    criteria = (
-        CompletionCriterion(
-            id="c0",
-            outcome="the returned record includes ID",
-            implicit=True,
-            output_path="output.id",
+@pytest.mark.parametrize(
+    "criteria",
+    [
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="c0",
+                    outcome="the returned record includes ID",
+                    implicit=True,
+                    output_path="output.id",
+                ),
+                CompletionCriterion(id="c1", outcome="inputs are reusable", method_mandated=True, level="definition"),
+            ),
+            id="level-and-flags",
         ),
-        CompletionCriterion(id="c1", outcome="inputs are reusable", method_mandated=True, level="definition"),
-    )
-    assert criteria_from_json(criteria_to_json(criteria)) == criteria
-
-
-def test_criteria_json_round_trip_preserves_terminal_action_fields() -> None:
-    criteria = (
-        CompletionCriterion(
-            id="c0",
-            outcome="a commercial water service request is started",
-            kind="terminal_action",
-            terminal_action_family="request",
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="c0",
+                    outcome="a commercial water service request is started",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                ),
+            ),
+            id="terminal-action-fields",
         ),
-    )
-
-    assert criteria_from_json(criteria_to_json(criteria)) == criteria
-
-
-def test_criteria_json_round_trip_preserves_deliverable_kind() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The requested download is returned.",
-            output_path="output.output_id",
-            deliverable_kind="registered_download",
+        pytest.param(
+            (
+                _criterion(
+                    "c0",
+                    "The requested download is returned.",
+                    output_path="output.output_id",
+                    deliverable_kind="registered_download",
+                ),
+            ),
+            id="deliverable-kind",
         ),
-    )
-
+    ],
+)
+def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
 
 
@@ -448,21 +437,6 @@ def test_completion_verifier_render_includes_required_output_path() -> None:
     rendered = _render_criteria([_criterion("c0", "The returned record includes ID.", output_path="output.id")])
 
     assert "required_output_path=output.id" in rendered
-
-
-def test_active_criteria_rendering_includes_deliverable_kind() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The requested download is returned.",
-                output_path="output.output_id",
-                deliverable_kind="registered_download",
-            )
-        ]
-    )
-
-    assert "registered_download" in rendered
 
 
 def test_completion_verifier_render_includes_deliverable_kind() -> None:
@@ -818,35 +792,41 @@ def test_present_value_credits_quoted_currency_literal_verbatim() -> None:
     assert verdict.evidence_ref == "block_outputs:read_statement"
 
 
-def test_present_value_abstains_when_literal_absent_from_outputs() -> None:
-    criteria = [_criterion("c0", "the May 2026 statement total reads $4,210.55")]
-    snapshot = _snapshot({"read_statement": {"total": "$1,000.00"}})
-    assert grade_present_value_criteria(criteria, snapshot) == []
-
-
-def test_present_value_abstains_on_empty_block_outputs() -> None:
-    criteria = [_criterion("c0", "the May 2026 statement total reads $4,210.55")]
-    assert grade_present_value_criteria(criteria, _snapshot({})) == []
-
-
-def test_present_value_abstains_on_blocked_run_without_target_literal() -> None:
-    criteria = [_criterion("c0", "the statement total reads $4,210.55")]
-    snapshot = _snapshot({"download": {"blocker": "verify you are human to continue"}})
-    assert grade_present_value_criteria(criteria, snapshot) == []
-
-
-def test_present_value_abstains_when_no_high_specificity_literal() -> None:
-    criteria = [_criterion("c0", "the invoice was downloaded successfully")]
-    snapshot = _snapshot({"download": {"file": "invoice downloaded successfully"}})
-    assert grade_present_value_criteria(criteria, snapshot) == []
-
-
-def test_present_value_does_not_credit_on_bare_year_token() -> None:
-    # A 4-digit year is too low-specificity: a coincidental output mention of the
-    # year must not credit the criterion.
-    criteria = [_criterion("c0", "the 2026 billing summary is shown")]
-    snapshot = _snapshot({"footer": {"copyright": "© 2026 Example Corp"}})
-    assert grade_present_value_criteria(criteria, snapshot) == []
+@pytest.mark.parametrize(
+    ("outcome", "block_outputs"),
+    [
+        pytest.param(
+            "the May 2026 statement total reads $4,210.55",
+            {"read_statement": {"total": "$1,000.00"}},
+            id="literal-absent",
+        ),
+        pytest.param(
+            "the May 2026 statement total reads $4,210.55",
+            {},
+            id="empty-block-outputs",
+        ),
+        pytest.param(
+            "the statement total reads $4,210.55",
+            {"download": {"blocker": "verify you are human to continue"}},
+            id="blocked-run",
+        ),
+        pytest.param(
+            "the invoice was downloaded successfully",
+            {"download": {"file": "invoice downloaded successfully"}},
+            id="no-high-specificity-literal",
+        ),
+        # A 4-digit year is too low-specificity: a coincidental output mention of the
+        # year must not credit the criterion.
+        pytest.param(
+            "the 2026 billing summary is shown",
+            {"footer": {"copyright": "© 2026 Example Corp"}},
+            id="bare-year-token",
+        ),
+    ],
+)
+def test_present_value_abstains(outcome: str, block_outputs: dict) -> None:
+    criteria = [_criterion("c0", outcome)]
+    assert grade_present_value_criteria(criteria, _snapshot(block_outputs)) == []
 
 
 def test_present_value_credits_multi_digit_account_identifier() -> None:

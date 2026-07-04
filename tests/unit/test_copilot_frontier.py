@@ -1422,38 +1422,6 @@ def test_run_blocks_outcome_rolls_forward_after_failed_preview() -> None:
     assert ctx.last_test_failure_reason is None
 
 
-def test_yaml_diff_invalidation_drops_edited_label_and_downstream() -> None:
-    """When the YAML changes between runs, verified-state invalidation based
-    on the diff should drop edited labels and anything downstream so the
-    next frontier planner doesn't seed stale values.
-    """
-    ctx = _make_ctx()
-    ctx.verified_prefix_labels = ["a", "b", "c"]
-    ctx.verified_block_outputs = {"a": "nav", "b": {"v": 1}, "c": "x"}
-
-    old = _FakeDefinition(
-        [
-            _FakeBlock("a", "navigation"),
-            _FakeBlock("b", "extraction", {"prompt": "p"}),
-            _FakeBlock("c", "extraction", {"prompt": "kept"}),
-        ]
-    )
-    new = _FakeDefinition(
-        [
-            _FakeBlock("a", "navigation"),
-            _FakeBlock("b", "extraction", {"prompt": "CHANGED"}),
-            _FakeBlock("c", "extraction", {"prompt": "kept"}),
-        ]
-    )
-    invalidated = _find_invalidated_labels(old, new, list(ctx.verified_prefix_labels))
-    assert invalidated == {"b", "c"}
-    for label in invalidated:
-        ctx.verified_block_outputs.pop(label, None)
-    ctx.verified_prefix_labels = [label for label in ctx.verified_prefix_labels if label not in invalidated]
-    assert ctx.verified_prefix_labels == ["a"]
-    assert ctx.verified_block_outputs == {"a": "nav"}
-
-
 # --------------------------------------------------------------------------- #
 # Edit-time verified-state invalidation                                        #
 # --------------------------------------------------------------------------- #
@@ -1593,21 +1561,48 @@ def test_no_op_resave_preserves_block_verified_only_end_to_end_claim() -> None:
     assert ctx.last_full_workflow_test_ok is True
 
 
-def test_missing_new_definition_with_trust_fails_closed() -> None:
-    specs = (
-        ("a", "goto_url", {"url": "https://example.com"}),
-        ("b", "navigation", {"prompt": "b"}),
-    )
+@pytest.mark.parametrize(
+    ("prior", "new", "seed_labels", "seed_url"),
+    [
+        pytest.param(
+            _wf_def(
+                ("a", "goto_url", {"url": "https://example.com"}),
+                ("b", "navigation", {"prompt": "b"}),
+            ),
+            None,
+            ["a", "b"],
+            "https://example.com/b",
+            id="missing-new",
+        ),
+        pytest.param(
+            None,
+            _wf_def(
+                ("open", "goto_url", {"url": "https://example.com"}),
+                ("extract", "extraction", {"prompt": "extract"}),
+            ),
+            ["open", "extract"],
+            "https://example.com/x",
+            id="unavailable-prior",
+        ),
+    ],
+)
+def test_absent_definition_side_with_trust_fails_closed(
+    prior: _FakeDefinition | None,
+    new: _FakeDefinition | None,
+    seed_labels: list[str],
+    seed_url: str,
+) -> None:
     ctx = _make_ctx()
-    _seed_verified(ctx, ["a", "b"], current_url="https://example.com/b", full=True)
+    _seed_verified(ctx, seed_labels, current_url=seed_url, full=True)
 
-    _invalidate_verified_state_on_edit(ctx, _wf_def(*specs), None)
+    _invalidate_verified_state_on_edit(ctx, prior, new)
 
     assert ctx.verified_prefix_labels == []
     assert ctx.verified_block_outputs == {}
     assert ctx.workflow_verification_evidence.block_verified == []
-    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.verified_prefix_current_url is None
     assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
 
 
 def test_edit_unverified_upstream_invalidates_downstream_verified() -> None:
@@ -1691,24 +1686,6 @@ def test_workflow_update_clears_terminal_run_evidence() -> None:
     assert ctx.outcome_verification_trace_snapshot == {}
 
 
-def test_unavailable_prior_with_trust_fails_closed() -> None:
-    new = _wf_def(
-        ("open", "goto_url", {"url": "https://example.com"}),
-        ("extract", "extraction", {"prompt": "extract"}),
-    )
-    ctx = _make_ctx()
-    _seed_verified(ctx, ["open", "extract"], current_url="https://example.com/x", full=True)
-
-    _invalidate_verified_state_on_edit(ctx, None, new)
-
-    assert ctx.verified_prefix_labels == []
-    assert ctx.verified_block_outputs == {}
-    assert ctx.workflow_verification_evidence.block_verified == []
-    assert ctx.verified_prefix_current_url is None
-    assert ctx.workflow_verification_evidence.full_workflow_verified is False
-    assert ctx.last_full_workflow_test_ok is False
-
-
 def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     prior = _wf_def(("a", "goto_url", {"url": "https://example.com"}))
     new = _wf_def(("a", "goto_url", {"url": "https://example.com/2"}))
@@ -1768,62 +1745,42 @@ def test_fused_and_split_leave_identical_verified_state() -> None:
     assert "extract" in fused_labels
 
 
-def test_parameter_value_change_resets_verified_trust() -> None:
-    prior = _wf_def(
-        ("search", "navigation", {"prompt": "search {{ term }}"}),
-        ("extract", "extraction", {"prompt": "grab"}),
-        params=[_FakeParameter("term", "cats")],
-    )
-    new = _wf_def(
-        ("search", "navigation", {"prompt": "search {{ term }}"}),
-        ("extract", "extraction", {"prompt": "grab"}),
-        params=[_FakeParameter("term", "dogs")],
-    )
-    ctx = _make_ctx()
-    _seed_verified(ctx, ["search", "extract"], current_url="https://example.com/r", full=True)
-
-    _invalidate_verified_state_on_edit(ctx, prior, new)
-
-    assert ctx.verified_prefix_labels == []
-    assert ctx.verified_block_outputs == {}
-    assert ctx.workflow_verification_evidence.block_verified == []
-    assert ctx.workflow_verification_evidence.full_workflow_verified is False
-    assert ctx.last_full_workflow_test_ok is False
-
-
-def test_parameter_addition_resets_verified_trust() -> None:
+@pytest.mark.parametrize(
+    ("prior_params", "new_params"),
+    [
+        pytest.param(
+            [_FakeParameter("term", "cats")],
+            [_FakeParameter("term", "dogs")],
+            id="value-change",
+        ),
+        pytest.param(
+            [_FakeParameter("term", "cats")],
+            [_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
+            id="addition",
+        ),
+        pytest.param(
+            [_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
+            [_FakeParameter("term", "cats")],
+            id="removal",
+        ),
+    ],
+)
+def test_parameter_definition_change_resets_verified_trust(
+    prior_params: list[_FakeParameter], new_params: list[_FakeParameter]
+) -> None:
     # A block can reference a parameter by template without a config edit, so an
     # added key may alter behavior the block-diff alone won't catch — fail closed.
-    prior = _wf_def(
-        ("search", "navigation", {"prompt": "search"}),
-        params=[_FakeParameter("term", "cats")],
-    )
-    new = _wf_def(
-        ("search", "navigation", {"prompt": "search"}),
-        params=[_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
-    )
-    ctx = _make_ctx()
-    _seed_verified(ctx, ["search"], current_url="https://example.com/s", full=True)
-
-    _invalidate_verified_state_on_edit(ctx, prior, new)
-
-    assert ctx.verified_prefix_labels == []
-    assert ctx.verified_block_outputs == {}
-    assert ctx.workflow_verification_evidence.block_verified == []
-    assert ctx.workflow_verification_evidence.full_workflow_verified is False
-    assert ctx.last_full_workflow_test_ok is False
-
-
-def test_parameter_removal_resets_verified_trust() -> None:
+    # The shared fixture references {{ term }} but never `limit`, so the addition
+    # and removal cases exercise the unreferenced-key fail-closed path.
     prior = _wf_def(
         ("search", "navigation", {"prompt": "search {{ term }}"}),
         ("extract", "extraction", {"prompt": "grab"}),
-        params=[_FakeParameter("term", "cats"), _FakeParameter("limit", 10)],
+        params=prior_params,
     )
     new = _wf_def(
         ("search", "navigation", {"prompt": "search {{ term }}"}),
         ("extract", "extraction", {"prompt": "grab"}),
-        params=[_FakeParameter("term", "cats")],
+        params=new_params,
     )
     ctx = _make_ctx()
     _seed_verified(ctx, ["search", "extract"], current_url="https://example.com/r", full=True)

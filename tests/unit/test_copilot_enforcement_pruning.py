@@ -21,10 +21,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcom
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
-    POST_SUSPICIOUS_SUCCESS_NUDGE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotGoalSatisfied,
     _check_enforcement,
@@ -48,6 +47,7 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from tests.unit.conftest import make_copilot_context
 
 
 class _Ctx:
@@ -472,14 +472,7 @@ class TestSynthesizedOfferPersistenceGate:
         assert synthesized_block_persistence_signal(ctx, "evaluate") is None
 
     def test_recorded_workflow_update_clears_synthesized_persistence_gate(self) -> None:
-        ctx = CopilotContext(
-            organization_id="o",
-            workflow_id="w",
-            workflow_permanent_id="wp",
-            workflow_yaml="title: Updated",
-            browser_session_id=None,
-            stream=SimpleNamespace(),
-        )
+        ctx = make_copilot_context(workflow_yaml="title: Updated")
         ctx.turn_intent = TurnIntent(
             mode=TurnIntentMode.BUILD,
             authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
@@ -506,14 +499,7 @@ class TestSynthesizedOfferPersistenceGate:
         assert synthesized_block_persistence_signal(ctx, "evaluate") is None
 
     def test_recorded_workflow_update_clears_reopened_synthesized_persistence_latch(self) -> None:
-        ctx = CopilotContext(
-            organization_id="o",
-            workflow_id="w",
-            workflow_permanent_id="wp",
-            workflow_yaml="title: Updated",
-            browser_session_id=None,
-            stream=SimpleNamespace(),
-        )
+        ctx = make_copilot_context(workflow_yaml="title: Updated")
         ctx.synthesized_block_reopened_after_failed_run = True
 
         _record_workflow_update_result(
@@ -1469,13 +1455,6 @@ def test_suspicious_success_fires_when_flag_set() -> None:
     ctx = _Ctx()
     ctx.last_test_suspicious_success = True
     assert _needs_suspicious_success_nudge(ctx) is True
-
-
-def test_check_enforcement_returns_suspicious_nudge_when_flag_set() -> None:
-    ctx = _Ctx()
-    ctx.last_test_suspicious_success = True
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_SUSPICIOUS_SUCCESS_NUDGE
 
 
 # ---------------------------------------------------------------------------

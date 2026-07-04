@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -62,18 +61,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
-
-
-def _fresh_context() -> CopilotContext:
-    return CopilotContext(
-        organization_id="o",
-        workflow_id="w",
-        workflow_permanent_id="wp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
+from tests.unit.conftest import make_copilot_context as _fresh_context
 
 # ---------------------------------------------------------------------------
 # A — fresh CopilotContext

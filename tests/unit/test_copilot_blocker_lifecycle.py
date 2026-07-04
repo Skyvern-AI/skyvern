@@ -1,21 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from skyvern.forge.sdk.copilot.blocker_signal import BlockerKind, CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-
-
-def _ctx() -> CopilotContext:
-    return CopilotContext(
-        organization_id="org",
-        workflow_id="wf",
-        workflow_permanent_id="wfp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
+from tests.unit.conftest import make_copilot_context as _ctx
 
 
 def _signal(
@@ -40,14 +27,6 @@ def test_recoverable_blocker_clears_on_matching_tool_success() -> None:
     ctx.blocker_signal = _signal(cleared_by=frozenset({"update_workflow"}))
     record_tool_step_result_for_ctx(ctx, "update_workflow", {"workflow_yaml": "y"}, {"ok": True})
     assert ctx.blocker_signal is None
-
-
-def test_recoverable_blocker_does_not_clear_on_unrelated_tool_success() -> None:
-    ctx = _ctx()
-    signal = _signal(cleared_by=frozenset({"update_workflow"}))
-    ctx.blocker_signal = signal
-    record_tool_step_result_for_ctx(ctx, "list_credentials", None, {"ok": True})
-    assert ctx.blocker_signal is signal
 
 
 def test_loop_blocker_clears_on_progress_tool_success() -> None:

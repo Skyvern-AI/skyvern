@@ -256,11 +256,51 @@ def test_normalize_scaffolding_preserves_wrapped_ordinary_reply_sentence() -> No
 @pytest.mark.parametrize(
     "user_response",
     [
-        "Next step: call get_run_results with this workflow_run_id.",
-        'Call `get_run_results(workflow_run_id="wr_123")` first, then await user input.',
-        "Then call update_and_run_blocks with a smaller chain.",
-        "Do NOT retry this tool call; wait for the current run result.",
-        "Do NOT re-invoke the tool until the user responds.",
+        pytest.param(
+            "Next step: call get_run_results with this workflow_run_id.",
+            id="call-get-run-results-instruction",
+        ),
+        pytest.param(
+            'Call `get_run_results(workflow_run_id="wr_123")` first, then await user input.',
+            id="call-get-run-results-backtick-await",
+        ),
+        pytest.param(
+            "Then call update_and_run_blocks with a smaller chain.",
+            id="call-update-and-run-blocks-instruction",
+        ),
+        pytest.param(
+            "Do NOT retry this tool call; wait for the current run result.",
+            id="do-not-retry-tool-call",
+        ),
+        pytest.param(
+            "Do NOT re-invoke the tool until the user responds.",
+            id="do-not-reinvoke-tool",
+        ),
+        pytest.param(
+            'I\'ll call get_run_results(workflow_run_id="wr_123") and report back.',
+            id="call-get-run-results-report-back",
+        ),
+        pytest.param(
+            "Next I need to run_blocks_and_collect_debug[block_labels=['login']].",
+            id="run-blocks-and-collect-debug",
+        ),
+        pytest.param(
+            "Use `update_workflow` to apply that change.",
+            id="backtick-update-workflow-tool-name",
+        ),
+        pytest.param(
+            "Trace shows get_run_results was the last tool dispatched on this turn.",
+            id="trace-mentions-get-run-results",
+        ),
+        pytest.param(
+            "Falling back to list_credentials since the user did not specify one.",
+            id="list-credentials-fallback",
+        ),
+        pytest.param(
+            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+            "Do NOT retry block-running tools.",
+            id="late-block-running-timer-do-not-retry",
+        ),
     ],
 )
 def test_rejects_internal_tool_instruction_leak_in_user_response(user_response: str) -> None:
@@ -362,14 +402,6 @@ class TestSanctionedSecretReferenceIdiom:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
             tool_arguments={"workflow_yaml": "code: |\n  token = await login_credential.otp()"},
-        )
-
-        assert verdict.allowed
-
-    def test_allows_secret_keyword_match_when_full_line_is_sanctioned_otp_reference(self) -> None:
-        verdict = evaluate_output_policy(
-            request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  passcode = await login_credential.otp()"},
         )
 
         assert verdict.allowed
@@ -882,27 +914,6 @@ def test_rejects_internal_machinery_vocab_via_extended_taxonomy(user_response: s
     )
 
     assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
-
-
-@pytest.mark.parametrize(
-    "user_response",
-    [
-        'I\'ll call get_run_results(workflow_run_id="wr_123") and report back.',
-        "Next I need to run_blocks_and_collect_debug[block_labels=['login']].",
-        "Use `update_workflow` to apply that change.",
-        "Trace shows get_run_results was the last tool dispatched on this turn.",
-        "Falling back to list_credentials since the user did not specify one.",
-    ],
-)
-def test_rejects_internal_tool_name_leak_via_tool_instruction(user_response: str) -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response=user_response,
-    )
-
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in hard_block_output_policy_verdict(verdict).reason_codes
 
 
 @pytest.mark.parametrize(
@@ -1961,19 +1972,6 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
     assert agent_result.proposal_disposition == "no_proposal"
     assert "hunter2" not in agent_result.user_response
     assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in agent_result.user_response
-
-
-def test_output_policy_blocks_late_block_running_instruction_leak() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response=(
-            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
-            "Do NOT retry block-running tools."
-        ),
-    )
-
-    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
 
 
 def test_translate_scrubs_late_block_running_leak_and_preserves_draft() -> None:

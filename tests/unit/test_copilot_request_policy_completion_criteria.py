@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
 )
+from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
 
 
 async def _policy_for_message(
@@ -53,41 +54,6 @@ async def _policy_for_message(
 
 def _stored(*criteria: CompletionCriterion) -> StoredCriteriaSet:
     return StoredCriteriaSet(set_id="wccs_existing", goal_epoch=1, criteria=tuple(criteria))
-
-
-def _criterion(
-    cid: str,
-    outcome: str,
-    *,
-    level: str = "run",
-    output_path: str | None = None,
-    method_mandated: bool = False,
-    contingent_on: str | None = None,
-    contingent_antecedent_output_path: str | None = None,
-    deliverable_kind: str | None = None,
-    expected_output_value: str | None = None,
-    expected_output_shape: str | None = None,
-    requested_output_evidence_source: str = "runtime_output",
-    kind: str = "outcome",
-    classification_output_key: str | None = None,
-    expected_classification: str | bool | None = None,
-) -> CompletionCriterion:
-    return CompletionCriterion(
-        id=cid,
-        outcome=outcome,
-        level=level,  # type: ignore[arg-type]
-        output_path=output_path,
-        method_mandated=method_mandated,
-        contingent_on=contingent_on,
-        contingent_antecedent_output_path=contingent_antecedent_output_path,
-        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
-        expected_output_value=expected_output_value,
-        expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
-        requested_output_evidence_source=requested_output_evidence_source,  # type: ignore[arg-type]
-        kind=kind,  # type: ignore[arg-type]
-        classification_output_key=classification_output_key,
-        expected_classification=expected_classification,
-    )
 
 
 def _outcomes(policy: RequestPolicy) -> list[str]:
@@ -1317,215 +1283,173 @@ def test_requested_output_canonicalization_preserves_marker_for_approved_downloa
     assert criteria[0].deliverable_kind == "registered_download"
 
 
-def test_active_criteria_rendering_includes_contingent_on() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "A provider blocker is reported to the user.",
-                contingent_on="the provider site blocks online submission",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "A provider blocker is reported to the user.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "contingent_on": "the provider site blocks online submission",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_contingent_antecedent_output_path() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "A provider blocker is reported to the user.",
-                contingent_on="the provider site blocks online submission",
-                contingent_antecedent_output_path="output.blocker",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "A provider blocker is reported to the user.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "contingent_on": "the provider site blocks online submission",
-            "contingent_antecedent_output_path": "output.blocker",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_deliverable_kind() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The requested download is returned.",
-                output_path="output.output_id",
-                deliverable_kind="registered_download",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The requested download is returned.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "deliverable_kind": "registered_download",
-            "output_path": "output.output_id",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_expected_output_value_as_structured_data() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The returned record includes service address.",
-                output_path="output.service_address",
-                expected_output_value="1234 Sample Utility Way",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The returned record includes service address.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "output_path": "output.service_address",
-            "expected_output_value": "1234 Sample Utility Way",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_expected_output_shape_as_structured_data() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The returned record includes confirmation number.",
-                output_path="output.confirmation_number",
-                expected_output_shape="reference_code",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The returned record includes confirmation number.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "output_path": "output.confirmation_number",
-            "expected_output_shape": "reference_code",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_validation_classification_contract() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The run classifies whether the path is login gated.",
-                kind="validation_classification",
-                classification_output_key="login_gated",
-                expected_classification=True,
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The run classifies whether the path is login gated.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "validation_classification",
-            "terminal_action_family": None,
-            "classification_output_key": "login_gated",
-            "expected_classification": True,
-        }
-    ]
-
-
-def test_criteria_json_round_trips_contingent_on() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
+@pytest.mark.parametrize(
+    ("criterion_kwargs", "expected"),
+    [
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+            },
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "contingent_on": "the provider site blocks online submission",
+            },
+            id="contingent_on",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_criteria_json_round_trips_expected_output_value() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The returned record includes service address.",
-            output_path="output.service_address",
-            expected_output_value="1234 Sample Utility Way",
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            id="contingent_antecedent_output_path",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_criteria_json_round_trips_expected_output_shape() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The returned record includes confirmation number.",
-            output_path="output.confirmation_number",
-            expected_output_shape="reference_code",
+        pytest.param(
+            {
+                "outcome": "The requested download is returned.",
+                "output_path": "output.output_id",
+                "deliverable_kind": "registered_download",
+            },
+            {
+                "outcome": "The requested download is returned.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "deliverable_kind": "registered_download",
+                "output_path": "output.output_id",
+            },
+            id="deliverable_kind",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_criteria_json_round_trips_validation_classification_contract() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The run classifies whether the path is login gated.",
-            kind="validation_classification",
-            classification_output_key="path_classification",
-            expected_classification="login_gated",
+        pytest.param(
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            },
+            {
+                "outcome": "The returned record includes service address.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            },
+            id="expected_output_value",
         ),
-    )
+        pytest.param(
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            id="expected_output_shape",
+        ),
+        pytest.param(
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "validation_classification",
+                "terminal_action_family": None,
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+            id="validation_classification_contract",
+        ),
+    ],
+)
+def test_active_criteria_rendering_includes_optional_fields(
+    criterion_kwargs: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    rendered = _render_active_criteria_for_prompt([_criterion("c0", **criterion_kwargs)])
+
+    assert json.loads(rendered) == [expected]
+
+
+@pytest.mark.parametrize(
+    "criterion_kwargs",
+    [
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+            },
+            id="contingent_on",
+        ),
+        pytest.param(
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            },
+            id="expected_output_value",
+        ),
+        pytest.param(
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            id="expected_output_shape",
+        ),
+        pytest.param(
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "login_gated",
+            },
+            id="validation_classification_contract",
+        ),
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            id="contingent_antecedent_output_path",
+        ),
+    ],
+)
+def test_criteria_json_round_trips(criterion_kwargs: dict[str, Any]) -> None:
+    criteria = (_criterion("c0", **criterion_kwargs),)
 
     restored = criteria_from_json(criteria_to_json(criteria))
 
@@ -1592,137 +1516,82 @@ def test_request_policy_trace_exposes_requested_output_grounding_contract_withou
     assert "1234 Sample Utility Way" not in repr(trace)
 
 
-def test_reconcile_supersedes_same_output_path_with_different_expected_output_value() -> None:
-    stored = _stored(
-        _criterion(
-            "s0",
-            "The returned record includes service address.",
-            output_path="output.service_address",
-            expected_output_value="1234 Sample Utility Way",
-        )
-    )
-    fresh = [
-        _criterion(
-            "c0",
-            "The returned record includes service address.",
-            output_path="output.service_address",
-            expected_output_value="7890 Changed Ave",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_reconcile_supersedes_same_output_path_with_different_expected_output_shape() -> None:
-    stored = _stored(
-        _criterion(
-            "s0",
-            "The returned record includes confirmation number.",
-            output_path="output.confirmation_number",
-            expected_output_shape="reference_code",
-        )
-    )
-    fresh = [
-        _criterion(
-            "c0",
-            "The returned record includes confirmation number.",
-            output_path="output.confirmation_number",
-            expected_output_shape="numeric_identifier",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_reconcile_supersedes_validation_classification_with_different_target() -> None:
-    stored = _stored(
-        _criterion(
-            "s0",
-            "The run classifies whether the path is login gated.",
-            kind="validation_classification",
-            classification_output_key="path_classification",
-            expected_classification="login_gated",
-        )
-    )
-    fresh = [
-        _criterion(
-            "c0",
-            "The run classifies whether the path is public.",
-            kind="validation_classification",
-            classification_output_key="path_classification",
-            expected_classification="public",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_criteria_json_round_trips_contingent_antecedent_output_path() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
-            contingent_antecedent_output_path="output.blocker",
+@pytest.mark.parametrize(
+    ("stored_criterion", "fresh_criterion"),
+    [
+        pytest.param(
+            _criterion(
+                "s0",
+                "The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="1234 Sample Utility Way",
+            ),
+            _criterion(
+                "c0",
+                "The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="7890 Changed Ave",
+            ),
+            id="changed-expected-output-value",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_reconcile_keeps_conditional_and_unconditional_same_outcome_distinct() -> None:
-    stored = _stored(_criterion("s0", "A provider blocker is reported to the user."))
-    fresh = [
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_reconcile_keeps_structural_conditional_and_unconditional_same_outcome_distinct() -> None:
-    stored = _stored(_criterion("s0", "A provider blocker is reported to the user."))
-    fresh = [
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
-            contingent_antecedent_output_path="output.blocker",
-        )
-    ]
+        pytest.param(
+            _criterion(
+                "s0",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c0",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            id="changed-expected-output-shape",
+        ),
+        pytest.param(
+            _criterion(
+                "s0",
+                "The run classifies whether the path is login gated.",
+                kind="validation_classification",
+                classification_output_key="path_classification",
+                expected_classification="login_gated",
+            ),
+            _criterion(
+                "c0",
+                "The run classifies whether the path is public.",
+                kind="validation_classification",
+                classification_output_key="path_classification",
+                expected_classification="public",
+            ),
+            id="changed-classification-target",
+        ),
+        pytest.param(
+            _criterion("s0", "A provider blocker is reported to the user."),
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+            ),
+            id="added-contingent-on",
+        ),
+        pytest.param(
+            _criterion("s0", "A provider blocker is reported to the user."),
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            id="added-structural-contingent-on",
+        ),
+    ],
+)
+def test_reconcile_supersedes_or_keeps_distinct(
+    stored_criterion: CompletionCriterion, fresh_criterion: CompletionCriterion
+) -> None:
+    stored = _stored(stored_criterion)
+    fresh = [fresh_criterion]
 
     decision = reconcile_completion_criteria(
         StoredCriteriaSnapshot(active=stored, next_epoch=2),

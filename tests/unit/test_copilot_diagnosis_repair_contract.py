@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -572,105 +573,52 @@ def test_runtime_key_error_for_missing_prior_output_records_typed_authoring_cont
     assert result["data"]["authoring_repair_context"] == repair_context.model_dump(mode="json")
 
 
-def test_runtime_key_error_for_available_prior_output_keeps_generic_runtime_repair() -> None:
+@pytest.mark.parametrize(
+    ("yaml_builder", "run_id", "keyerror_name"),
+    [
+        pytest.param(
+            lambda: _runtime_output_dependency_yaml(available=True),
+            "wr_available_output",
+            "create_or_verify_resource_output",
+            id="available_prior_output",
+        ),
+        pytest.param(
+            _runtime_declared_output_named_input_yaml,
+            "wr_declared_input",
+            "create_or_verify_resource_output",
+            id="declared_workflow_input",
+        ),
+        pytest.param(
+            _runtime_declared_non_string_output_named_input_yaml,
+            "wr_declared_number_input",
+            "create_or_verify_resource_output",
+            id="declared_non_string_workflow_input",
+        ),
+        pytest.param(
+            _runtime_output_substring_only_yaml,
+            "wr_substring_only",
+            "foo_output",
+            id="code_substring_only",
+        ),
+    ],
+)
+def test_runtime_key_error_boundary_keeps_generic_runtime_repair(
+    yaml_builder: Callable[[], str], run_id: str, keyerror_name: str
+) -> None:
     ctx = _ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.workflow_yaml = _runtime_output_dependency_yaml(available=True)
+    ctx.workflow_yaml = yaml_builder()
     result = {
         "ok": False,
         "error": "Run failed.",
         "data": {
-            "workflow_run_id": "wr_available_output",
+            "workflow_run_id": run_id,
             "overall_status": "failed",
             "blocks": [
                 {
                     "label": "read_resource_table",
                     "status": "failed",
-                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
-                }
-            ],
-        },
-    }
-
-    record_pending_runtime_authoring_repair_context(ctx, result)
-
-    pending_context = ctx.pending_code_authoring_runtime_repair_context
-    assert isinstance(pending_context, CodeAuthoringRepairContext)
-    assert pending_context.reason_code == "runtime_block_failure"
-    assert pending_context.missing_output_key is None
-
-
-def test_runtime_key_error_for_declared_workflow_input_keeps_generic_runtime_repair() -> None:
-    ctx = _ctx()
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.workflow_yaml = _runtime_declared_output_named_input_yaml()
-    result = {
-        "ok": False,
-        "error": "Run failed.",
-        "data": {
-            "workflow_run_id": "wr_declared_input",
-            "overall_status": "failed",
-            "blocks": [
-                {
-                    "label": "read_resource_table",
-                    "status": "failed",
-                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
-                }
-            ],
-        },
-    }
-
-    record_pending_runtime_authoring_repair_context(ctx, result)
-
-    pending_context = ctx.pending_code_authoring_runtime_repair_context
-    assert isinstance(pending_context, CodeAuthoringRepairContext)
-    assert pending_context.reason_code == "runtime_block_failure"
-    assert pending_context.missing_output_key is None
-
-
-def test_runtime_key_error_for_declared_non_string_workflow_input_keeps_generic_runtime_repair() -> None:
-    ctx = _ctx()
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.workflow_yaml = _runtime_declared_non_string_output_named_input_yaml()
-    result = {
-        "ok": False,
-        "error": "Run failed.",
-        "data": {
-            "workflow_run_id": "wr_declared_number_input",
-            "overall_status": "failed",
-            "blocks": [
-                {
-                    "label": "read_resource_table",
-                    "status": "failed",
-                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
-                }
-            ],
-        },
-    }
-
-    record_pending_runtime_authoring_repair_context(ctx, result)
-
-    pending_context = ctx.pending_code_authoring_runtime_repair_context
-    assert isinstance(pending_context, CodeAuthoringRepairContext)
-    assert pending_context.reason_code == "runtime_block_failure"
-    assert pending_context.missing_output_key is None
-
-
-def test_runtime_key_error_for_code_substring_only_keeps_generic_runtime_repair() -> None:
-    ctx = _ctx()
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.workflow_yaml = _runtime_output_substring_only_yaml()
-    result = {
-        "ok": False,
-        "error": "Run failed.",
-        "data": {
-            "workflow_run_id": "wr_substring_only",
-            "overall_status": "failed",
-            "blocks": [
-                {
-                    "label": "read_resource_table",
-                    "status": "failed",
-                    "failure_reason": "KeyError: 'foo_output'",
+                    "failure_reason": f"KeyError: '{keyerror_name}'",
                 }
             ],
         },
@@ -1301,47 +1249,6 @@ def test_first_pass_contradiction_does_not_satisfy_latest_diagnosis_contract() -
     assert latest_diagnosis_contract_satisfies_goal(ctx) is False
 
 
-def test_no_change_contracts_do_not_carry_remaining_blocker() -> None:
-    satisfied_ctx = _ctx()
-    satisfied_ctx.completion_verification_result = _satisfied_completion_verification()
-    partial_ctx = _ctx()
-    partial_ctx.completion_verification_result = _satisfied_completion_verification()
-
-    contracts = [
-        build_diagnosis_repair_contract(
-            source_tool="update_and_run_blocks",
-            result=_clean_completed_result(),
-            ctx=satisfied_ctx,
-            workflow_updated=True,
-        ),
-        build_diagnosis_repair_contract(
-            source_tool="run_blocks_and_collect_debug",
-            result={"ok": True, "data": {"workflow_run_id": "wr_4", "overall_status": "completed", "blocks": []}},
-            ctx=_ctx(),
-        ),
-        build_diagnosis_repair_contract(
-            source_tool="update_and_run_blocks",
-            result={
-                "ok": False,
-                "error": "Completion verification confirmed the requested outcome despite partial run status.",
-                "data": {
-                    "workflow_run_id": "wr_partial_verified",
-                    "overall_status": "failed",
-                    "frontier_start_label": "extract",
-                    "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
-                    "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "failed"}],
-                },
-            },
-            ctx=partial_ctx,
-            workflow_updated=True,
-        ),
-    ]
-
-    for contract in contracts:
-        assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
-        assert contract.verification_result.remaining_blocker is None
-
-
 def test_failed_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
     ctx = _ctx()
     ctx.completion_verification_result = _satisfied_completion_verification()
@@ -1810,21 +1717,56 @@ def test_active_run_terminal_evidence_contract_stops_without_marking_workflow_su
     assert "not verified end-to-end" in contract.repair_decision.proposed_change_summary
 
 
-def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> None:
+@pytest.mark.parametrize(
+    ("suspicious", "completion_verification", "anti_bot", "failure_reason", "run_id"),
+    [
+        pytest.param(
+            True,
+            _satisfied_completion_verification(),
+            "Extracted data reported anti-bot blocker: Verify you are human",
+            "Run completed, but extracted data reported a blocker: Verify you are human",
+            "wr_blocked",
+            id="suspicious_success_flag_with_satisfied_verification",
+        ),
+        pytest.param(
+            False,
+            _satisfied_completion_verification(),
+            "Extracted data reported anti-bot blocker: Verify you are human",
+            "Run completed, but extracted data reported a blocker: Verify you are human",
+            "wr_blocked_clean",
+            id="satisfied_completion_verification_only",
+        ),
+        pytest.param(
+            False,
+            None,
+            "Typed run analysis reported an anti-bot challenge.",
+            "Run output reported a blocker: Verify you are human.",
+            "wr_blocked",
+            id="bare_challenge_category",
+        ),
+    ],
+)
+def test_terminal_challenge_preempts_clean_run_ok_contract_stops(
+    suspicious: bool,
+    completion_verification: CompletionVerificationResult | None,
+    anti_bot: str,
+    failure_reason: str,
+    run_id: str,
+) -> None:
     ctx = _ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
-    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
-    ctx.completion_verification_result = _satisfied_completion_verification()
+    ctx.last_test_suspicious_success = suspicious
+    ctx.last_test_anti_bot = anti_bot
+    ctx.last_test_failure_reason = failure_reason
+    ctx.completion_verification_result = completion_verification
 
     contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
         result={
             "ok": True,
             "data": {
-                "workflow_run_id": "wr_blocked",
+                "workflow_run_id": run_id,
                 "overall_status": "completed",
-                "failure_reason": ctx.last_test_failure_reason,
+                "failure_reason": failure_reason,
                 "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
                 "blocks": [
                     {
@@ -1874,67 +1816,6 @@ def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_v
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.completion_contract_satisfied is False
     assert contract.verification_result.remaining_blocker is not None
-
-
-def test_terminal_challenge_preempts_clean_run_even_with_satisfied_completion_verification() -> None:
-    ctx = _ctx()
-    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
-    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
-    ctx.completion_verification_result = _satisfied_completion_verification()
-
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr_blocked_clean",
-                "overall_status": "completed",
-                "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
-                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
-            },
-        },
-        ctx=ctx,
-        workflow_updated=True,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
-    assert contract.repair_decision.next_action == RepairNextAction.STOP
-    assert contract.verification_result.user_goal_satisfied is False
-    assert contract.verification_result.completion_contract_satisfied is False
-    assert contract.verification_result.remaining_blocker is not None
-
-
-def test_challenge_category_preempts_clean_run_ok_contract() -> None:
-    ctx = _ctx()
-    ctx.last_test_anti_bot = "Typed run analysis reported an anti-bot challenge."
-    ctx.last_test_failure_reason = "Run output reported a blocker: Verify you are human."
-
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr_blocked",
-                "overall_status": "completed",
-                "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
-                "blocks": [
-                    {
-                        "label": "extract",
-                        "block_type": "EXTRACTION",
-                        "status": "completed",
-                    }
-                ],
-            },
-        },
-        ctx=ctx,
-        workflow_updated=True,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
-    assert contract.repair_decision.next_action == RepairNextAction.STOP
-    assert contract.verification_result.user_goal_satisfied is False
 
 
 def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contract() -> None:

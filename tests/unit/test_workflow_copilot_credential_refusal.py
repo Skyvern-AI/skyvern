@@ -8,22 +8,11 @@ agents SDK via FunctionTool.description). Both must state the same policy,
 or the agent follows whichever it weights higher.
 """
 
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.tools import (
     run_blocks_tool,
     update_and_run_blocks_tool,
 )
-
-_AGENT_TEMPLATE_DEFAULTS = dict(
-    workflow_knowledge_base="test kb",
-    current_datetime="2026-01-01T00:00:00Z",
-    tool_usage_guide="",
-    security_rules="",
-)
-
-
-def _render_agent_prompt() -> str:
-    return prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+from tests.unit.conftest import render_agent_prompt as _render_agent_prompt
 
 
 class TestAgentPromptRefusalClause:

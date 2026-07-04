@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from skyvern.forge.sdk.copilot.context import (
     LoadedResultTargetContext,
@@ -19,33 +22,34 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     loaded_result_composition_evidence_from_page,
     loaded_result_target_structure_signature,
 )
+from tests.unit.copilot_test_helpers import make_raw_loaded_result_context
 
 
-def test_merge_turn_summary_caps_urls_visited() -> None:
+@pytest.mark.parametrize(
+    ("tool", "summary_template", "list_attr", "last_value_attr", "expected_last_value"),
+    [
+        ("navigate_browser", "Navigated to https://site{i}.test", "urls_visited", "url", "https://site59.test"),
+        ("type_text", "Typed into '#field{i}'", "fields_filled", "selector", "#field59"),
+        ("list_credentials", "Found 1 for site {i}", "credentials_checked", None, None),
+    ],
+    ids=["urls_visited", "fields_filled", "credentials_checked"],
+)
+def test_merge_turn_summary_caps_activity(
+    tool: str,
+    summary_template: str,
+    list_attr: str,
+    last_value_attr: str | None,
+    expected_last_value: str | None,
+) -> None:
     ctx = StructuredContext()
-    activity = [{"tool": "navigate_browser", "summary": f"Navigated to https://site{i}.test"} for i in range(60)]
+    activity = [{"tool": tool, "summary": summary_template.format(i=i)} for i in range(60)]
     ctx.merge_turn_summary(activity)
 
-    assert len(ctx.urls_visited) == 40
+    capped = getattr(ctx, list_attr)
+    assert len(capped) == 40
     # Oldest entries trimmed; most recent survive.
-    assert ctx.urls_visited[-1].url == "https://site59.test"
-
-
-def test_merge_turn_summary_caps_fields_filled() -> None:
-    ctx = StructuredContext()
-    activity = [{"tool": "type_text", "summary": f"Typed into '#field{i}'"} for i in range(60)]
-    ctx.merge_turn_summary(activity)
-
-    assert len(ctx.fields_filled) == 40
-    assert ctx.fields_filled[-1].selector == "#field59"
-
-
-def test_merge_turn_summary_caps_credentials_checked() -> None:
-    ctx = StructuredContext()
-    activity = [{"tool": "list_credentials", "summary": f"Found 1 for site {i}"} for i in range(60)]
-    ctx.merge_turn_summary(activity)
-
-    assert len(ctx.credentials_checked) == 40
+    if last_value_attr is not None:
+        assert getattr(capped[-1], last_value_attr) == expected_last_value
 
 
 def test_merge_turn_summary_records_resolved_credential_ids() -> None:
@@ -116,21 +120,7 @@ def test_loaded_result_targets_roundtrip_without_selector_fields_or_legacy_signa
 
 def test_sanitize_global_llm_context_strips_loaded_result_selectors_and_recomputes_legacy_signature() -> None:
     expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-    raw = json.dumps(
-        {
-            "user_goal": "extract loaded results",
-            "loaded_result_targets": [
-                {
-                    "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
-                    "is_table": True,
-                    "row_selector": 'tr[data-account="987654321"]',
-                    "row_count": 2,
-                    "sample_rows": ["Jane Customer account 123456"],
-                    "structure_signature": "legacy-selector-derived-sig",
-                }
-            ],
-        }
-    )
+    raw = make_raw_loaded_result_context(include_user_goal=True, include_sample_rows=True)
 
     sanitized = sanitize_global_llm_context_for_prompt(raw)
 
@@ -312,6 +302,78 @@ def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
     by_url = {page.url: page for page in pages}
     assert by_url["https://example.com/cart"].had_bounded_schema is True
     assert by_url["https://example.com/cart"].reached_via == "interaction"
+
+
+@dataclass
+class _Ctx:
+    prior_discovery_calls_made: int = 0
+    discovery_calls_this_turn: int = 0
+
+
+def test_structured_context_default_discovery_calls_made_is_zero() -> None:
+    assert StructuredContext().discovery_calls_made == 0
+
+
+def test_structured_context_round_trip_preserves_discovery_calls_made() -> None:
+    sc = StructuredContext(user_goal="x", discovery_calls_made=2)
+    raw = sc.to_json_str()
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.discovery_calls_made == 2
+
+
+def test_finalize_writes_summed_counter_into_outgoing_context() -> None:
+    inbound = StructuredContext(user_goal="x", discovery_calls_made=1).to_json_str()
+    ctx = _Ctx(prior_discovery_calls_made=1, discovery_calls_this_turn=1)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 2
+    assert sc.user_goal == "x"
+
+
+def test_finalize_writes_zero_when_no_calls_made_and_no_prior() -> None:
+    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=0)
+    # No prior context + no this-turn activity -> no need to invent a context.
+    assert finalize_discovery_counter_in_global_llm_context(ctx, None) is None
+
+
+def test_finalize_writes_prior_when_this_turn_is_zero_and_prior_context_exists() -> None:
+    inbound = StructuredContext(user_goal="g", discovery_calls_made=2).to_json_str()
+    ctx = _Ctx(prior_discovery_calls_made=2, discovery_calls_this_turn=0)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 2
+
+
+def test_finalize_handles_string_only_inbound_context() -> None:
+    """Legacy `global_llm_context` was a plain string. The migration path in
+    `StructuredContext.from_json_str` should preserve the string in
+    user_goal and zero the counter."""
+    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=1)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, "legacy string context")
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 1
+    assert sc.user_goal == "legacy string context"
+
+
+def test_finalize_handles_invalid_json_inbound() -> None:
+    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=1)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, "{not valid json")
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 1
+
+
+def test_finalize_treats_none_ctx_as_passthrough_in_factory() -> None:
+    """The factory in agent.py passes ctx=None for very-early errors (before
+    CopilotContext is constructed). The finalizer itself isn't called in that
+    branch — _make_agent_result skips it — but verify that the StructuredContext
+    round-trip itself still preserves a counter set by an earlier turn."""
+    inbound = StructuredContext(discovery_calls_made=2).to_json_str()
+    parsed = json.loads(inbound)
+    assert parsed["discovery_calls_made"] == 2
 
 
 class TestCopilotContext:

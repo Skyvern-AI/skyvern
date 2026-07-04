@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     to_trace_data,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from tests.unit.conftest import make_copilot_context as _copilot_ctx
 
 
 def _make(
@@ -372,9 +373,7 @@ def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> No
     (child) per the field-shadowing convention. Default values must stay in
     sync so callers reading via the AgentContext annotation see the same
     initial state as callers reading via CopilotContext."""
-    from types import SimpleNamespace
 
-    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.copilot.runtime import AgentContext
 
     agent_ctx = AgentContext(
@@ -401,17 +400,6 @@ def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> No
     assert agent_ctx.latest_tool_blocker_signal == copilot_ctx.latest_tool_blocker_signal
     assert agent_ctx.tool_blocker_signals == []
     assert copilot_ctx.tool_blocker_signals == []
-
-
-def _copilot_ctx() -> CopilotContext:
-    return CopilotContext(
-        organization_id="org",
-        workflow_id="wf",
-        workflow_permanent_id="wfp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
 
 
 _CONSECUTIVE_LOOP_MESSAGE = "LOOP DETECTED: 'evaluate' has been called 3 times consecutively."

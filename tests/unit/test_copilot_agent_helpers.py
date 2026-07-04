@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_built_unverified_exit_result,
     _build_goal_satisfied_exit_result,
     _resolve_wrapped_exception_exit_result,
+    _verified_workflow_or_none,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
@@ -97,6 +98,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
+from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 
 _HISTORY_SENTINEL_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -110,33 +113,6 @@ def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]
         )
         for sender, content in pairs
     ]
-
-
-def _ctx(**overrides):
-    from skyvern.forge.sdk.copilot.context import CopilotContext
-
-    defaults = dict(
-        organization_id="org-1",
-        workflow_id="wf-1",
-        workflow_permanent_id="wfp-1",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=MagicMock(),
-    )
-    defaults.update(overrides)
-    return CopilotContext(**defaults)
-
-
-def _verified_goal_contract(*, next_action: RepairNextAction = RepairNextAction.NO_CHANGE) -> DiagnosisRepairContract:
-    return DiagnosisRepairContract(
-        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
-        diagnosis_result=DiagnosisResult(),
-        repair_decision=RepairDecision(next_action=next_action),
-        verification_result=VerificationResult(
-            user_goal_satisfied=True,
-            completion_contract_satisfied=True,
-        ),
-    )
 
 
 def _unverified_no_repair_contract() -> DiagnosisRepairContract:
@@ -998,8 +974,6 @@ class TestVerifiedWorkflowOrNone:
         return object()
 
     def test_passes_workflow_when_tested_successfully(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
         wf = self._wf()
         ctx = _ctx(
             last_workflow=wf,
@@ -1009,50 +983,47 @@ class TestVerifiedWorkflowOrNone:
         )
         assert _verified_workflow_or_none(ctx) == (wf, "foo: bar")
 
-    def test_zeros_when_only_frontier_tested_successfully(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(
-            last_workflow=self._wf(),
-            last_workflow_yaml="foo: bar",
-            last_test_ok=True,
-            last_full_workflow_test_ok=False,
-        )
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_when_test_failed(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(last_workflow=self._wf(), last_workflow_yaml="foo: bar", last_test_ok=False)
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_when_untested_update(self) -> None:
-        # Exactly the scenario where _record_workflow_update_result reset
-        # last_test_ok to None after a standalone update_workflow or after
-        # the agent edited post-failure without re-testing.
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(last_workflow=self._wf(), last_workflow_yaml="foo: bar", last_test_ok=None)
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_when_no_last_workflow(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(last_workflow=None, last_test_ok=True)
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_on_suspicious_success(self) -> None:
-        # _record_run_blocks_result sets last_test_ok=None when blocks ran ok
-        # but produced no meaningful extraction data. Still an unverified
-        # outcome; must not surface a proposal.
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(
-            last_workflow=self._wf(),
-            last_workflow_yaml="foo: bar",
-            last_test_ok=None,
-            last_test_suspicious_success=True,
-        )
+    @pytest.mark.parametrize(
+        "ctx_overrides",
+        [
+            pytest.param(
+                {
+                    "last_workflow": object(),
+                    "last_workflow_yaml": "foo: bar",
+                    "last_test_ok": True,
+                    "last_full_workflow_test_ok": False,
+                },
+                id="only_frontier_tested_successfully",
+            ),
+            pytest.param(
+                {"last_workflow": object(), "last_workflow_yaml": "foo: bar", "last_test_ok": False},
+                id="test_failed",
+            ),
+            # _record_workflow_update_result resets last_test_ok to None after a standalone
+            # update_workflow or after the agent edited post-failure without re-testing.
+            pytest.param(
+                {"last_workflow": object(), "last_workflow_yaml": "foo: bar", "last_test_ok": None},
+                id="untested_update",
+            ),
+            pytest.param(
+                {"last_workflow": None, "last_test_ok": True},
+                id="no_last_workflow",
+            ),
+            # _record_run_blocks_result sets last_test_ok=None when blocks ran ok but produced no
+            # meaningful extraction data. Still an unverified outcome; must not surface a proposal.
+            pytest.param(
+                {
+                    "last_workflow": object(),
+                    "last_workflow_yaml": "foo: bar",
+                    "last_test_ok": None,
+                    "last_test_suspicious_success": True,
+                },
+                id="suspicious_success",
+            ),
+        ],
+    )
+    def test_zeros_on_unverified_outcome(self, ctx_overrides: dict) -> None:
+        ctx = _ctx(**ctx_overrides)
         assert _verified_workflow_or_none(ctx) == (None, None)
 
 
@@ -3052,9 +3023,16 @@ workflow_definition:
         assert "output judge unavailable" in agent_result.user_response.lower()
         assert "untested" not in agent_result.user_response.lower()
 
-    def test_goal_reached_default_true_keeps_verified_path(self) -> None:
-        # Backwards-compat: stale prompts that omit goal_reached must continue
-        # to surface a tested workflow as validated.
+    @pytest.mark.parametrize(
+        "payload_extras",
+        [
+            # Backwards-compat: stale prompts that omit goal_reached must continue
+            # to surface a tested workflow as validated.
+            pytest.param({}, id="default_absent"),
+            pytest.param({"goal_reached": True}, id="explicit_true"),
+        ],
+    )
+    def test_goal_reached_true_keeps_verified_path(self, payload_extras: dict) -> None:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
             last_workflow=wf,
@@ -3063,7 +3041,7 @@ workflow_definition:
             last_full_workflow_test_ok=True,
             last_update_block_count=3,
         )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", **payload_extras})
         agent_result = asyncio.run(
             agent_module._translate_to_agent_result(
                 result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
@@ -3103,25 +3081,6 @@ workflow_definition:
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "auto_applicable"
         assert agent_result.apply_without_review is True
-
-    def test_goal_reached_true_explicit_keeps_verified_path(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_update_block_count=3,
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_goal_reached_string_false_is_coerced(self) -> None:
         # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
@@ -6264,28 +6223,36 @@ class TestStructuralInfeasibilityQuestion:
         )
         assert agent_module._structural_infeasibility_question(intent) == "Which source has the filings?"
 
-    def test_returns_none_when_reason_code_absent(self) -> None:
-        intent = self._intent(
-            mode=TurnIntentMode.CLARIFY,
-            reason_codes=[TurnIntentReasonCode.LOW_CONFIDENCE_CLARIFICATION],
-            question="What workflow should I build or change?",
-        )
-        assert agent_module._structural_infeasibility_question(intent) is None
-
-    def test_returns_none_when_mode_not_clarify(self) -> None:
-        intent = self._intent(
-            mode=TurnIntentMode.BUILD,
-            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
-            question="Which source has the filings?",
-        )
-        assert agent_module._structural_infeasibility_question(intent) is None
-
-    def test_returns_none_for_blank_question(self) -> None:
-        intent = self._intent(
-            mode=TurnIntentMode.CLARIFY,
-            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
-            question="   ",
-        )
+    @pytest.mark.parametrize(
+        "mode, reason_codes, question",
+        [
+            pytest.param(
+                TurnIntentMode.CLARIFY,
+                [TurnIntentReasonCode.LOW_CONFIDENCE_CLARIFICATION],
+                "What workflow should I build or change?",
+                id="reason_code_absent",
+            ),
+            pytest.param(
+                TurnIntentMode.BUILD,
+                [TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+                "Which source has the filings?",
+                id="mode_not_clarify",
+            ),
+            pytest.param(
+                TurnIntentMode.CLARIFY,
+                [TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+                "   ",
+                id="blank_question",
+            ),
+        ],
+    )
+    def test_returns_none_for_non_infeasible_intent(
+        self,
+        mode: TurnIntentMode,
+        reason_codes: list[TurnIntentReasonCode],
+        question: str | None,
+    ) -> None:
+        intent = self._intent(mode=mode, reason_codes=reason_codes, question=question)
         assert agent_module._structural_infeasibility_question(intent) is None
 
     def test_returns_none_for_non_turn_intent(self) -> None:

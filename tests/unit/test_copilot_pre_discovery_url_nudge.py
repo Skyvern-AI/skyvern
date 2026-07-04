@@ -138,27 +138,30 @@ def test_no_nudge_for_non_ask_question() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_credential_clarification_passes_through() -> None:
+@pytest.mark.parametrize(
+    ("clarification_reason", "ask_text"),
+    [
+        pytest.param(
+            "credential_name_unresolved",
+            "Which saved credential should I use for the login page?",
+            id="credential",
+        ),
+        pytest.param(
+            "ambiguous_loop_edit",
+            "Which loop block on the page should I edit?",
+            id="loop",
+        ),
+        pytest.param(
+            "missing_conditional_condition",
+            "What condition should gate this site visit?",
+            id="conditional",
+        ),
+    ],
+)
+def test_non_default_clarification_reason_passes_through(clarification_reason: str, ask_text: str) -> None:
     ctx = _Ctx()
-    ctx.request_policy = SimpleNamespace(clarification_reason="credential_name_unresolved")
-    ask = {
-        "type": "ASK_QUESTION",
-        "user_response": "Which saved credential should I use for the login page?",
-    }
-    assert _pre_discovery_url_question_nudge(ctx, ask) is None
-
-
-def test_loop_clarification_passes_through() -> None:
-    ctx = _Ctx()
-    ctx.request_policy = SimpleNamespace(clarification_reason="ambiguous_loop_edit")
-    ask = {"type": "ASK_QUESTION", "user_response": "Which loop block on the page should I edit?"}
-    assert _pre_discovery_url_question_nudge(ctx, ask) is None
-
-
-def test_conditional_clarification_passes_through() -> None:
-    ctx = _Ctx()
-    ctx.request_policy = SimpleNamespace(clarification_reason="missing_conditional_condition")
-    ask = {"type": "ASK_QUESTION", "user_response": "What condition should gate this site visit?"}
+    ctx.request_policy = SimpleNamespace(clarification_reason=clarification_reason)
+    ask = {"type": "ASK_QUESTION", "user_response": ask_text}
     assert _pre_discovery_url_question_nudge(ctx, ask) is None
 
 
@@ -208,39 +211,40 @@ def test_present_completion_contract_ask_has_no_per_rule_cap() -> None:
     assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
 
 
-def test_present_completion_contract_ask_allows_request_policy_clarification() -> None:
-    ctx = _present_contract_ctx(
-        request_policy=_present_contract_policy(
-            user_response_policy="ask_clarification",
-            clarification_reason="credential_name_unresolved",
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {
+                "request_policy": _present_contract_policy(
+                    user_response_policy="ask_clarification",
+                    clarification_reason="credential_name_unresolved",
+                ),
+                "turn_intent": _authoring_intent(mode=TurnIntentMode.CLARIFY, requires_user_input=True),
+            },
+            id="request_policy_clarification",
         ),
-        turn_intent=_authoring_intent(mode=TurnIntentMode.CLARIFY, requires_user_input=True),
-    )
-
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
-
-
-def test_present_completion_contract_ask_allows_non_none_clarification_reason() -> None:
-    ctx = _present_contract_ctx(
-        request_policy=_present_contract_policy(clarification_reason="credential_name_unresolved"),
-    )
-
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
-
-
-def test_present_completion_contract_ask_allows_clarify_turn_intent() -> None:
-    ctx = _present_contract_ctx(
-        turn_intent=TurnIntent(
-            mode=TurnIntentMode.CLARIFY,
-            authority=TurnIntentAuthority(requires_user_input=True),
+        pytest.param(
+            {"request_policy": _present_contract_policy(clarification_reason="credential_name_unresolved")},
+            id="non_none_clarification_reason",
         ),
-    )
-
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
-
-
-def test_present_completion_contract_ask_allows_turn_intent_requiring_user_input() -> None:
-    ctx = _present_contract_ctx(turn_intent=_authoring_intent(requires_user_input=True))
+        pytest.param(
+            {
+                "turn_intent": TurnIntent(
+                    mode=TurnIntentMode.CLARIFY,
+                    authority=TurnIntentAuthority(requires_user_input=True),
+                ),
+            },
+            id="clarify_turn_intent",
+        ),
+        pytest.param(
+            {"turn_intent": _authoring_intent(requires_user_input=True)},
+            id="turn_intent_requiring_user_input",
+        ),
+    ],
+)
+def test_present_completion_contract_ask_allows_clarification(overrides: dict[str, object]) -> None:
+    ctx = _present_contract_ctx(**overrides)
 
     assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
 
