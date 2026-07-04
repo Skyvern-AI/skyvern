@@ -12770,7 +12770,8 @@
           "excel",
           "pdf",
           "image",
-          "docx"
+          "docx",
+          "zip"
         ],
         "title": "FileType"
       },
