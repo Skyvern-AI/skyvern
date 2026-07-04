@@ -3002,6 +3002,7 @@ async def http_request(
     follow_redirects: bool = True,
     label: str | None = None,
     parameters: list[str] | None = None,
+    secret_response_paths: list[str] | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     method = _render_template_with_label(method, label)
@@ -3013,6 +3014,7 @@ async def http_request(
         body=body,
         timeout=timeout,
         follow_redirects=follow_redirects,
+        secret_response_paths=secret_response_paths,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,

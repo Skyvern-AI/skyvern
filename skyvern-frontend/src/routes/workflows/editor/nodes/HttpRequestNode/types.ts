@@ -13,6 +13,7 @@ export type HttpRequestNodeData = NodeBaseData & {
   parameterKeys: Array<string>;
   downloadFilename: string;
   saveResponseAsFile: boolean;
+  secretResponsePaths: string[];
 };
 
 export type HttpRequestNode = Node<HttpRequestNodeData, "http_request">;
@@ -33,6 +34,7 @@ export const httpRequestNodeDefaultData: HttpRequestNodeData = {
   model: null,
   downloadFilename: "",
   saveResponseAsFile: false,
+  secretResponsePaths: [],
 };
 
 export function isHttpRequestNode(node: Node): node is HttpRequestNode {

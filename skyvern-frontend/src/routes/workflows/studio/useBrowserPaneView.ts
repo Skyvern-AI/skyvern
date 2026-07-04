@@ -83,9 +83,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     inspectingRun: explicit,
     blockRunInDebugSession,
     running: visuals.running,
-    debugSessionUp: debugBrowserSessionId != null,
     hasRecording: visuals.recordingUrls.length > 0,
-    hasScreenshots: visuals.hasScreenshots,
     failed: visuals.failed,
   });
 

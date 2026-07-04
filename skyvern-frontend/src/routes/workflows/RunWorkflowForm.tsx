@@ -6,7 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 
@@ -47,13 +47,6 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { liveSearch } from "@/routes/workflows/studio/liveSearch";
-import {
-  RUN_APPEND_PANES,
-  STUDIO_PANES_PARAM,
-  parsePanesParam,
-  withPanesOpen,
-} from "@/routes/workflows/studio/panes";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
@@ -331,7 +324,6 @@ function RunWorkflowForm({
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
-  const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
@@ -410,23 +402,11 @@ function RunWorkflowForm({
       queryClient.invalidateQueries({
         queryKey: ["runs"],
       });
-      // Only studio-originated launches (Run button, Timeline retry) carry
-      // ?panes=; its presence — even explicitly empty (all panes closed) —
-      // marks the origin and holds the layout to return to, so the round-trip
-      // appends the run surfaces instead of remapping. liveSearch guards this
-      // mutation callback against a stale ?panes= closure.
-      const carriedPanes = parsePanesParam(
-        new URLSearchParams(liveSearch(location.search)).get(
-          STUDIO_PANES_PARAM,
-        ),
-      );
-      if (studioEnabled && carriedPanes !== null) {
-        const panes = withPanesOpen(carriedPanes, RUN_APPEND_PANES);
-        navigate(
-          `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}&${STUDIO_PANES_PARAM}=${panes.join(",")}`,
-        );
-      } else if (studioEnabled) {
-        // Land in the studio shell; the ?wr= deep link maps the panes.
+      if (studioEnabled) {
+        // A full-run start RESETS the layout: land on the bare ?wr= deep link
+        // so the run mapping (copilot, browser, overview) applies exactly as
+        // it does when cold-entering a run — the editor doesn't ride along
+        // into run-watching. Block runs keep their own append path.
         navigate(
           `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
         );

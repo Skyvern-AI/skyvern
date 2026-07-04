@@ -8208,6 +8208,73 @@ class TaskV2Block(Block):
         )
 
 
+def _is_secret_scalar(value: Any) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _secret_path_suffix(path: str) -> str | None:
+    # The last non-numeric segment names the placeholder (placeholder_XXXX_ssn) so the
+    # LLM gets the same field-matching signal credential stubs carry (_username, _password).
+    for segment in reversed(path.split(".")):
+        cleaned = re.sub(r"[^A-Za-z0-9_]", "_", segment).strip("_")
+        if cleaned and not cleaned.isdigit():
+            return cleaned[:32]
+    return None
+
+
+def _register_and_replace_secret_response_path(
+    response_body: Any,
+    path: str,
+    workflow_run_context: WorkflowRunContext,
+) -> bool:
+    suffix = _secret_path_suffix(path)
+    current = response_body
+    segments = path.split(".")
+    for index, segment in enumerate(segments):
+        is_last = index == len(segments) - 1
+        if isinstance(current, dict):
+            if segment not in current:
+                return False
+            if is_last:
+                value = current[segment]
+                if not _is_secret_scalar(value):
+                    return False
+                current[segment] = workflow_run_context.register_secret_value(str(value), suffix=suffix)
+                return True
+            current = current[segment]
+        elif isinstance(current, list):
+            if not segment.isdigit():
+                return False
+            list_index = int(segment)
+            if list_index >= len(current):
+                return False
+            if is_last:
+                value = current[list_index]
+                if not _is_secret_scalar(value):
+                    return False
+                current[list_index] = workflow_run_context.register_secret_value(str(value), suffix=suffix)
+                return True
+            current = current[list_index]
+        else:
+            return False
+    return False
+
+
+def _apply_secret_response_paths(
+    response_body: Any,
+    secret_response_paths: list[str],
+    workflow_run_context: WorkflowRunContext,
+) -> list[str]:
+    invalid_paths: list[str] = []
+    for path in dict.fromkeys(p.strip() for p in secret_response_paths if p.strip()):
+        if not _register_and_replace_secret_response_path(response_body, path, workflow_run_context):
+            invalid_paths.append(path)
+    return invalid_paths
+
+
+SECRET_RESPONSE_BODY_REDACTED = "<response body redacted: secret_response_paths did not fully resolve>"
+
+
 class HttpRequestBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -8223,6 +8290,7 @@ class HttpRequestBlock(Block):
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
+    secret_response_paths: list[str] | None = None
 
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
@@ -8269,9 +8337,18 @@ class HttpRequestBlock(Block):
         template_kwargs = {"force_include_secrets": True}
 
         def _render_string(value: str) -> str:
-            return self.format_block_parameter_template_from_workflow_run_context(
+            rendered = self.format_block_parameter_template_from_workflow_run_context(
                 value, workflow_run_context, **template_kwargs
             )
+            # Boundary check so a longer id sharing a registered token's prefix is not partially replaced.
+            for token in dict.fromkeys(workflow_run_context.find_embedded_placeholder_tokens(rendered)):
+                secret_value = str(workflow_run_context.secrets[token])
+                rendered = re.sub(
+                    re.escape(token) + r"(?![A-Za-z0-9_])",
+                    secret_value.replace("\\", "\\\\"),
+                    rendered,
+                )
+            return rendered
 
         if self.url:
             self.url = _render_string(self.url)
@@ -8286,9 +8363,7 @@ class HttpRequestBlock(Block):
             self.headers = cast(dict[str, str], render_templates_in_json_value(self.headers, _render_string))
 
         if self.download_filename:
-            self.download_filename = self.format_block_parameter_template_from_workflow_run_context(
-                self.download_filename, workflow_run_context, **template_kwargs
-            )
+            self.download_filename = _render_string(self.download_filename)
 
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
@@ -8368,17 +8443,18 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
         except Exception as e:
-            error_data = {"error": str(e), "error_type": "unknown"}
+            masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
+            error_data = {"error": masked_error, "error_type": "unknown"}
             LOG.warning(
                 "File download failed",
-                error=str(e),
-                url=self.url,
+                error=masked_error,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
                 workflow_run_id=workflow_run_id,
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"File download failed: {str(e)}",
+                failure_reason=f"File download failed: {masked_error}",
                 output_parameter_value=error_data,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8409,6 +8485,16 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
 
+        if self.save_response_as_file and self.secret_response_paths:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="secret_response_paths cannot be combined with save_response_as_file",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         # Validate URL
         if not self.url:
             return await self.build_block_result(
@@ -8423,7 +8509,7 @@ class HttpRequestBlock(Block):
         if not self.validate_url(self.url):
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Invalid URL format: {self.url}",
+                failure_reason=f"Invalid URL format: {workflow_run_context.mask_secrets_in_data(self.url)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8437,7 +8523,10 @@ class HttpRequestBlock(Block):
         # If files are provided, don't set default Content-Type (aiohttp will set multipart/form-data)
         if not self.files:
             if not self.headers.get("Content-Type") and not self.headers.get("content-type"):
-                LOG.info("Adding default content-type as application/json", headers=self.headers)
+                LOG.info(
+                    "Adding default content-type as application/json",
+                    headers=workflow_run_context.mask_secrets_in_data(self.headers),
+                )
                 self.headers["Content-Type"] = "application/json"
 
         # Download files from HTTP URLs or S3 URIs if needed
@@ -8445,6 +8534,7 @@ class HttpRequestBlock(Block):
         if self.files:
             downloaded_files: dict[str, str] = {}
             for field_name, file_path in self.files.items():
+                masked_file_path = str(workflow_run_context.mask_secrets_in_data(file_path))
                 # Parse file path (handle file:// URI format)
                 actual_file_path: str | None = None
                 is_file_uri = file_path.startswith("file://")
@@ -8453,9 +8543,10 @@ class HttpRequestBlock(Block):
                     try:
                         actual_file_path = parse_uri_to_path(file_path)
                     except ValueError as e:
+                        masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
                         return await self.build_block_result(
                             success=False,
-                            failure_reason=f"Invalid file URI format: {file_path}. Error: {str(e)}",
+                            failure_reason=(f"Invalid file URI format: {masked_file_path}. Error: {masked_error}"),
                             output_parameter_value=None,
                             status=BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
@@ -8498,7 +8589,11 @@ class HttpRequestBlock(Block):
                 if not (is_url or is_managed_storage_uri or is_allowed_local_file):
                     return await self.build_block_result(
                         success=False,
-                        failure_reason=f"No permission to access local file: {file_path}. Only HTTP/HTTPS URLs, managed storage URIs, or files in allowed directories are allowed.",
+                        failure_reason=(
+                            "No permission to access local file: "
+                            f"{masked_file_path}. Only HTTP/HTTPS URLs, "
+                            "managed storage URIs, or files in allowed directories are allowed."
+                        ),
                         output_parameter_value=None,
                         status=BlockStatus.failed,
                         workflow_run_block_id=workflow_run_block_id,
@@ -8509,10 +8604,11 @@ class HttpRequestBlock(Block):
                 if is_allowed_local_file:
                     # Use local file directly
                     local_file_path_str: str = cast(str, actual_file_path)
+                    masked_local_file_path = str(workflow_run_context.mask_secrets_in_data(local_file_path_str))
                     if not os.path.exists(local_file_path_str):
                         return await self.build_block_result(
                             success=False,
-                            failure_reason=f"File not found: {local_file_path_str}",
+                            failure_reason=f"File not found: {masked_local_file_path}",
                             output_parameter_value=None,
                             status=BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
@@ -8522,7 +8618,7 @@ class HttpRequestBlock(Block):
                     LOG.info(
                         "HttpRequestBlock Using allowed local file",
                         field_name=field_name,
-                        file_path=local_file_path_str,
+                        file_path=masked_local_file_path,
                     )
                 else:
                     # Download from remote source
@@ -8530,7 +8626,7 @@ class HttpRequestBlock(Block):
                         LOG.info(
                             "HttpRequestBlock Downloading file from remote source",
                             field_name=field_name,
-                            file_path=file_path,
+                            file_path=masked_file_path,
                             is_url=is_url,
                             is_managed_storage_uri=is_managed_storage_uri,
                         )
@@ -8539,13 +8635,14 @@ class HttpRequestBlock(Block):
                         LOG.info(
                             "HttpRequestBlock File downloaded successfully",
                             field_name=field_name,
-                            original_path=file_path,
+                            original_path=masked_file_path,
                             local_path=local_file_path,
                         )
                     except Exception as e:
+                        masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
                         return await self.build_block_result(
                             success=False,
-                            failure_reason=f"Failed to download file {file_path}: {str(e)}",
+                            failure_reason=(f"Failed to download file {masked_file_path}: {masked_error}"),
                             output_parameter_value=None,
                             status=BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
@@ -8567,11 +8664,11 @@ class HttpRequestBlock(Block):
             LOG.info(
                 "Executing HTTP request",
                 method=self.method,
-                url=self.url,
-                headers=self.headers,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
+                headers=workflow_run_context.mask_secrets_in_data(self.headers),
                 workflow_run_id=workflow_run_id,
-                body=self.body,
-                files=self.files,
+                body=workflow_run_context.mask_secrets_in_data(self.body),
+                files=workflow_run_context.mask_secrets_in_data(self.files),
             )
 
             status_code, response_headers, response_body = await aiohttp_request(
@@ -8583,6 +8680,23 @@ class HttpRequestBlock(Block):
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
             )
+
+            success = 200 <= status_code < 300
+            failure_reason = None
+            invalid_secret_response_paths: list[str] = []
+            if self.secret_response_paths:
+                # Extract on every status so a secret echoed in an error body never reaches outputs or logs.
+                invalid_secret_response_paths = _apply_secret_response_paths(
+                    response_body,
+                    self.secret_response_paths,
+                    workflow_run_context,
+                )
+                if success and invalid_secret_response_paths:
+                    success = False
+                    failure_reason = (
+                        "secret_response_paths did not resolve to a non-empty string: "
+                        f"{', '.join(invalid_secret_response_paths)}"
+                    )
 
             response_data = {
                 "status_code": status_code,
@@ -8597,19 +8711,23 @@ class HttpRequestBlock(Block):
                 "url": self.url,
             }
 
+            if invalid_secret_response_paths:
+                response_data["response_body"] = SECRET_RESPONSE_BODY_REDACTED
+                response_data["body"] = SECRET_RESPONSE_BODY_REDACTED
+
             response_data = workflow_run_context.mask_secrets_in_data(response_data)
 
             LOG.info(
                 "HTTP request completed",
                 status_code=status_code,
-                url=self.url,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
                 method=self.method,
                 workflow_run_id=workflow_run_id,
                 response_data=response_data,
             )
 
-            success = 200 <= status_code < 300
-            failure_reason = None if success else f"HTTP {status_code}: {response_data.get('response_body', '')}"
+            if failure_reason is None and not success:
+                failure_reason = f"HTTP {status_code}: {response_data.get('response_body', '')}"
 
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
 
@@ -8634,18 +8752,19 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
         except Exception as e:
-            error_data = {"error": str(e), "error_type": "unknown"}
+            masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
+            error_data = {"error": masked_error, "error_type": "unknown"}
             LOG.warning(
                 "HTTP request failed with unexpected error",
-                error=str(e),
-                url=self.url,
+                error=masked_error,
+                url=workflow_run_context.mask_secrets_in_data(self.url),
                 method=self.method,
                 workflow_run_id=workflow_run_id,
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"HTTP request failed: {str(e)}",
+                failure_reason=f"HTTP request failed: {masked_error}",
                 output_parameter_value=error_data,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,

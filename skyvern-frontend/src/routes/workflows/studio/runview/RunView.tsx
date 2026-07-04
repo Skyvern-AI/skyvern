@@ -1,26 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActivityLogIcon,
   ClockIcon,
-  CodeIcon,
   Cross2Icon,
   ExclamationTriangleIcon,
-  FileTextIcon,
-  ListBulletIcon,
-  ReaderIcon,
-  ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { statusIsFinalized } from "@/routes/tasks/types";
+import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { isRecord } from "@/util/utils";
 
-import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
-import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
@@ -35,9 +28,8 @@ import {
   formatElapsed,
   runOutcomeFromStatus,
 } from "../runProjections";
-import { studioPanelId } from "../constants";
+import { toReadableSearch } from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
-import { ViewToggle } from "../ViewToggle";
 import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
@@ -46,8 +38,8 @@ import {
   type RunOutputError,
   type RunOutputFile,
 } from "./RunOutputsSection";
-import { RunOverviewSection } from "./RunOverviewSection";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { RunSummaryStrip } from "./RunSummaryStrip";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -57,12 +49,6 @@ type RunViewProps = {
   onFix?: (seedMessage?: string) => void;
   onRetry?: () => void;
 };
-
-type RunPaneView = "timeline" | "overview" | "inputs" | "outputs" | "code";
-
-// Below this row width the view-toggle labels collapse to icons — the pane,
-// not the viewport, decides (studio panes share the stage side by side).
-const TOGGLE_ROW_COMPACT_BELOW_PX = 440;
 
 function isRunOutputError(value: unknown): value is RunOutputError {
   return isRecord(value);
@@ -76,10 +62,11 @@ function normalizeRunOutputErrors(value: unknown): RunOutputError[] {
 }
 
 /**
- * Timeline pane body: the run timeline + step detail, with Overview / Inputs /
- * Outputs / Code as sibling views. Visuals (live stream, screenshots,
- * recordings) live in the Browser pane, which follows this pane's selection
- * via RunViewStore and ?active=.
+ * Overview pane body: the run timeline + step detail (under the summary strip),
+ * with Inputs / Outputs / Code as sibling views. The view toggles live in the
+ * pane header (RunPaneViewToggles) and share useRunPaneViewStore. Visuals
+ * (live stream, screenshots, recordings) live in the Browser pane, which
+ * follows this pane's selection via RunViewStore and ?active=.
  */
 export function RunView({
   workflowRunId,
@@ -93,30 +80,18 @@ export function RunView({
   const { data: workflowRun, isLoading } =
     useWorkflowRunWithWorkflowQuery(queryOptions);
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
-  const { workflowPermanentId } = useParams();
-  const cacheKey = workflowRun?.workflow?.cache_key ?? "";
-  const codeGenerating = useIsGeneratingCode({
-    cacheKey,
-    cacheKeyValue: constructCacheKeyValue({
-      codeKey: cacheKey,
-      workflow: workflowRun?.workflow,
-      workflowRun,
-    }),
-    workflowPermanentId,
-    workflowRunId,
-  });
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
-  const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const resetRunView = useRunViewStore((s) => s.reset);
-  const setBrowserPaneView = useStudioBrowserStore((s) => s.setView);
-  const { panes: studioPanes, openPane } = useStudioPanes();
-  const runPaneOpen = studioPanes.includes("timeline");
-  const [searchParams, setSearchParams] = useSearchParams();
+  const { panes: studioPanes } = useStudioPanes();
+  const runPaneOpen = studioPanes.includes("overview");
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
-  const [view, setView] = useState<RunPaneView>("timeline");
+  const view = useRunPaneViewStore((s) => s.view);
+  const resetPaneView = useRunPaneViewStore((s) => s.reset);
   const [failureDismissed, setFailureDismissed] = useState(false);
   const [outputSummary, setOutputSummary] = useState<string | null>(null);
 
@@ -125,13 +100,13 @@ export function RunView({
   useEffect(() => {
     resetRunView();
     setOutputSummary(null);
-    setView("timeline");
+    resetPaneView();
     setFailureDismissed(false);
     const active = searchParamsRef.current.get("active");
     if (active) {
       pinFrame(active);
     }
-  }, [workflowRunId, resetRunView, pinFrame]);
+  }, [workflowRunId, resetRunView, resetPaneView, pinFrame]);
 
   // Mirror the pinned item to ?active= so selection survives reload. Skip the first
   // pass after a run change so the seed above doesn't fight the URL.
@@ -141,30 +116,26 @@ export function RunView({
       lastMirroredRunRef.current = workflowRunId;
       return;
     }
-    setSearchParams(
-      (prev) => {
-        // Build on the LIVE URL (prev is this render's closure): a concurrent
-        // navigation (block-run launch, pane toggle) is already visible there.
-        const base = window.location.search || `?${prev.toString()}`;
-        const next = new URLSearchParams(base);
-        const desired =
-          pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
-        if ((next.get("active") ?? null) === desired) {
-          return next;
-        }
-        if (desired) {
-          next.set("active", desired);
-        } else {
-          next.delete("active");
-        }
-        return next;
-      },
-      { replace: true },
+    // Build on the LIVE URL (the ref can be one render stale): a concurrent
+    // navigation (block-run launch, pane toggle) is already visible there.
+    const next = new URLSearchParams(
+      window.location.search || searchParamsRef.current.toString(),
     );
-  }, [pinnedFrameId, workflowRunId, setSearchParams]);
+    const desired =
+      pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
+    if ((next.get("active") ?? null) === desired) {
+      return;
+    }
+    if (desired) {
+      next.set("active", desired);
+    } else {
+      next.delete("active");
+    }
+    navigate({ search: toReadableSearch(next) }, { replace: true });
+  }, [pinnedFrameId, workflowRunId, navigate]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
-  // the Timeline pane being open: RunView stays mounted while its pane is closed.
+  // the Overview pane being open: RunView stays mounted while its pane is closed.
   //
   // The guard reads the LIVE URL, not this render's searchParams: a block-run launch
   // navigates to ?wr=&bl= via a separate router update, and this effect can fire from
@@ -181,25 +152,69 @@ export function RunView({
     if (new URLSearchParams(window.location.search).get("wr")) {
       return;
     }
-    setSearchParams(
-      (prev) => {
-        const base = window.location.search || `?${prev.toString()}`;
-        const next = new URLSearchParams(base);
-        if (next.get("wr")) {
-          return next;
-        }
-        next.set("wr", workflowRunId);
-        return next;
-      },
-      { replace: true },
+    const next = new URLSearchParams(
+      window.location.search || searchParamsRef.current.toString(),
     );
-  }, [runPaneOpen, workflowRunId, setSearchParams]);
+    if (next.get("wr")) {
+      return;
+    }
+    next.set("wr", workflowRunId);
+    navigate({ search: toReadableSearch(next) }, { replace: true });
+  }, [runPaneOpen, workflowRunId, navigate]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
+  // Landing the selection on the LAST timeline item — so the Browser pane
+  // shows the final screenshot instead of an idle replay — happens on two
+  // paths sharing this one-shot: cold-opening a deep link to an already-
+  // finished run (?wr= with no ?active=), and a run watched live to its
+  // running→terminal transition. Explicit choices always win (?active=, a
+  // user's timeline pin, or — for the live-watch path — a pinned view pill),
+  // and ?bl= block-iterate links keep their live debug surface.
+  const autoPinDecidedForRunRef = useRef<string | undefined>(undefined);
+  const watchedLiveRunRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!workflowRunId || autoPinDecidedForRunRef.current === workflowRunId) {
+      return;
+    }
+    if (!workflowRun || !timeline) {
+      return;
+    }
+    if (!statusIsFinalized(workflowRun)) {
+      // Still running: leave the one-shot open so the terminal transition of
+      // a watched run lands the same last-item pin as a cold open.
+      watchedLiveRunRef.current = workflowRunId;
+      return;
+    }
+    autoPinDecidedForRunRef.current = workflowRunId;
+    const watchedLive = watchedLiveRunRef.current === workflowRunId;
+    const params = new URLSearchParams(
+      window.location.search || searchParamsRef.current.toString(),
+    );
+    if (params.get("wr") !== workflowRunId || params.get("active")) {
+      return;
+    }
+    if (params.has("bl")) {
+      return;
+    }
+    if (useRunViewStore.getState().pinnedFrameId) {
+      return;
+    }
+    // A view pill pinned mid-watch is an explicit choice; the ?active= write
+    // that follows a pin would hand the pane back to the machine and override
+    // it. (Cold opens skip this guard: a run swap resets the pill to auto in
+    // useBrowserPaneView, possibly in this same effect flush.)
+    if (watchedLive && useStudioBrowserStore.getState().view !== "auto") {
+      return;
+    }
+    const last = frames.length > 0 ? frames[frames.length - 1] : null;
+    if (last) {
+      pinFrame(last.id);
+    }
+  }, [workflowRunId, workflowRun, timeline, frames, pinFrame]);
+
   const outcome = runOutcomeFromStatus(workflowRun?.status);
-  const running = outcome === "running";
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
@@ -222,24 +237,6 @@ export function RunView({
     [timeline, selectedId, finalized, finallyBlockLabel],
   );
 
-  const focusBrowserPane = useCallback(() => {
-    // An explicit "watch live": unpin back to the live edge and hand the
-    // Browser pane a live intent (it may be sitting on a replay view).
-    jumpToLive();
-    setBrowserPaneView("live");
-    openPane("browser");
-    // Defer past the pane-open commit so the scroll sees the visible panel.
-    requestAnimationFrame(() => {
-      const reduceMotion =
-        typeof window.matchMedia === "function" &&
-        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      document.getElementById(studioPanelId("browser"))?.scrollIntoView({
-        behavior: reduceMotion ? "auto" : "smooth",
-        block: "nearest",
-        inline: "nearest",
-      });
-    });
-  }, [jumpToLive, setBrowserPaneView, openPane]);
   const fixSeedMessage = useMemo(
     () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
     [workflowRun?.failure_reason],
@@ -329,26 +326,6 @@ export function RunView({
     observerOutput != null ||
     webhookFailureReason != null;
 
-  // Collapse toggle labels to icons by the row's own width.
-  const hasRun = workflowRun != null;
-  const toggleRowRef = useRef<HTMLDivElement>(null);
-  const [toggleCompact, setToggleCompact] = useState(false);
-  useEffect(() => {
-    const el = toggleRowRef.current;
-    if (!hasRun || !el || typeof ResizeObserver === "undefined") {
-      return;
-    }
-    const observer = new ResizeObserver((entries) => {
-      const width = entries[0]?.contentRect.width ?? 0;
-      // A closed pane measures 0 (display:none); keep its last real state.
-      if (width > 0) {
-        setToggleCompact(width < TOGGLE_ROW_COMPACT_BELOW_PX);
-      }
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [hasRun]);
-
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
   }
@@ -358,90 +335,8 @@ export function RunView({
     finalized ? (workflowRun.finished_at ?? null) : null,
   );
 
-  // A selected view whose data vanished (run change settles late) falls back
-  // to the timeline instead of rendering an empty body.
-  const resolvedView =
-    (view === "inputs" && !hasInputs) || (view === "outputs" && !hasOutputs)
-      ? "timeline"
-      : view;
-
   return (
     <div className="flex h-full min-h-0 w-full flex-col">
-      <div
-        ref={toggleRowRef}
-        className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2"
-      >
-        <div
-          role="group"
-          aria-label="Run view"
-          className="flex min-w-0 shrink items-center gap-0.5 overflow-hidden rounded-md border border-slate-700 bg-slate-elevation2 p-0.5"
-        >
-          <ViewToggle
-            active={resolvedView === "timeline"}
-            onClick={() => setView("timeline")}
-            compact={toggleCompact}
-            label="Timeline"
-            icon={<ActivityLogIcon className="h-3 w-3" />}
-          />
-          <ViewToggle
-            active={resolvedView === "overview"}
-            onClick={() => setView("overview")}
-            compact={toggleCompact}
-            label="Overview"
-            icon={<ReaderIcon className="h-3 w-3" />}
-          />
-          {hasInputs ? (
-            <ViewToggle
-              active={resolvedView === "inputs"}
-              onClick={() => setView("inputs")}
-              compact={toggleCompact}
-              label="Inputs"
-              icon={<ListBulletIcon className="h-3 w-3" />}
-            />
-          ) : null}
-          {hasOutputs ? (
-            <ViewToggle
-              active={resolvedView === "outputs"}
-              onClick={() => setView("outputs")}
-              compact={toggleCompact}
-              label="Outputs"
-              icon={<FileTextIcon className="h-3 w-3" />}
-            />
-          ) : null}
-          <ViewToggle
-            active={resolvedView === "code"}
-            onClick={() => setView("code")}
-            compact={toggleCompact}
-            label="Code"
-            title={
-              codeGenerating ? "Generating cached code for this run" : undefined
-            }
-            icon={
-              codeGenerating ? (
-                <ReloadIcon
-                  data-testid="code-generating-spinner"
-                  className="h-3 w-3 animate-spin"
-                />
-              ) : (
-                <CodeIcon className="h-3 w-3" />
-              )
-            }
-          />
-        </div>
-        <span className="min-w-0 flex-1" />
-        {running && !provisioning ? (
-          <button
-            type="button"
-            onClick={focusBrowserPane}
-            title="Watch live in the Browser pane"
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-          >
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
-            Live
-          </button>
-        ) : null}
-      </div>
-
       <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden p-3">
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
@@ -484,11 +379,7 @@ export function RunView({
             {onFix || onRetry ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 {onFix ? (
-                  <Button
-                    size="sm"
-                    className="bg-studio-accent text-foreground hover:bg-studio-accent/90"
-                    onClick={() => onFix(fixSeedMessage)}
-                  >
+                  <Button size="sm" onClick={() => onFix(fixSeedMessage)}>
                     Fix with Copilot
                   </Button>
                 ) : null}
@@ -502,71 +393,78 @@ export function RunView({
           </div>
         ) : null}
 
-        {resolvedView === "timeline" ? (
-          <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
-            <div className="min-h-0 overflow-hidden">
-              <WorkflowRunTimeline
-                workflowRunId={workflowRunId}
-                hideLiveBadge
-                activeItem={activeItem}
-                activeIteration={activeIteration}
-                onActionItemSelected={(item) => {
-                  pinFrame(item.action.action_id);
-                }}
-                onBlockItemSelected={(block) => {
-                  pinFrame(block.workflow_run_block_id);
-                }}
-                onThoughtItemSelected={(thought) => {
-                  pinFrame(thought.thought_id);
-                }}
-                onLiveStreamSelected={() => {
-                  pinFrame("stream");
-                }}
-                onIterationSelected={(loopBlock, iterationIndex) => {
-                  pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
-                }}
-              />
+        {view === "timeline" ? (
+          <div className="flex min-h-0 flex-1 flex-col gap-3">
+            <RunSummaryStrip workflowRun={workflowRun} elapsed={elapsed} />
+            <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
+              <div className="min-h-0 overflow-hidden">
+                <WorkflowRunTimeline
+                  workflowRunId={workflowRunId}
+                  hideLiveBadge
+                  activeItem={activeItem}
+                  activeIteration={activeIteration}
+                  onActionItemSelected={(item) => {
+                    pinFrame(item.action.action_id);
+                  }}
+                  onBlockItemSelected={(block) => {
+                    pinFrame(block.workflow_run_block_id);
+                  }}
+                  onThoughtItemSelected={(thought) => {
+                    pinFrame(thought.thought_id);
+                  }}
+                  onLiveStreamSelected={() => {
+                    pinFrame("stream");
+                  }}
+                  onIterationSelected={(loopBlock, iterationIndex) => {
+                    pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
+                  }}
+                />
+              </div>
+              <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
+                <WorkflowRunBlockDetail
+                  activeItem={activeItem}
+                  activeIteration={activeIteration}
+                  timeline={timeline ?? []}
+                  timelineReady={Boolean(timeline)}
+                  showDownloadedFiles
+                  workflowRunId={workflowRunId}
+                  onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
+                />
+              </div>
             </div>
-            <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
-              <WorkflowRunBlockDetail
-                activeItem={activeItem}
-                activeIteration={activeIteration}
-                timeline={timeline ?? []}
-                timelineReady={Boolean(timeline)}
-                showDownloadedFiles
-                workflowRunId={workflowRunId}
-                onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
+          </div>
+        ) : view === "inputs" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
+            {hasInputs ? (
+              <RunInputsSection
+                parameters={runInputs.parameters}
+                meta={runInputs.meta}
               />
-            </div>
+            ) : (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                No inputs for this run
+              </div>
+            )}
           </div>
-        ) : resolvedView === "overview" ? (
+        ) : view === "outputs" ? (
           <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
-            <RunOverviewSection
-              workflowRun={workflowRun}
-              actionCount={frames.length}
-              elapsed={elapsed}
-            />
-          </div>
-        ) : resolvedView === "inputs" ? (
-          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
-            <RunInputsSection
-              parameters={runInputs.parameters}
-              meta={runInputs.meta}
-            />
-          </div>
-        ) : resolvedView === "outputs" ? (
-          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
-            <RunOutputsSection
-              workflowRunId={workflowRun.workflow_run_id}
-              workflowTitle={workflowRun.workflow?.title}
-              extractedInformation={extractedInformation}
-              files={downloadedFiles}
-              errors={runErrors}
-              observerOutput={observerOutput}
-              webhookFailureReason={webhookFailureReason}
-              summary={outputSummary}
-              onSummary={setOutputSummary}
-            />
+            {hasOutputs ? (
+              <RunOutputsSection
+                workflowRunId={workflowRun.workflow_run_id}
+                workflowTitle={workflowRun.workflow?.title}
+                extractedInformation={extractedInformation}
+                files={downloadedFiles}
+                errors={runErrors}
+                observerOutput={observerOutput}
+                webhookFailureReason={webhookFailureReason}
+                summary={outputSummary}
+                onSummary={setOutputSummary}
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                No outputs for this run
+              </div>
+            )}
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1 p-2">

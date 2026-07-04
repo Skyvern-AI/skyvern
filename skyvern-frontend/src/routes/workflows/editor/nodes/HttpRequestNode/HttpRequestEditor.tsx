@@ -69,6 +69,8 @@ const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
 const downloadFilenameTooltip =
   "The complete filename (without extension) for downloaded files. Extension is automatically determined from the response Content-Type.";
+const secretResponsePathsTooltip =
+  "One dot-path per line into the JSON response body (e.g. data.ssn). Matched values are stored as secrets: hidden from outputs, logs, and the AI, and usable in later blocks like credentials.";
 
 function HttpRequestEditor({ blockId }: { blockId: string }) {
   // Subscribe to the node's data slice. The sidebar mount lives outside the
@@ -101,6 +103,7 @@ function HttpRequestEditorBody({
     parameterKeys,
     downloadFilename,
     saveResponseAsFile,
+    secretResponsePaths = [],
     continueOnFailure,
   } = data;
 
@@ -440,6 +443,27 @@ function HttpRequestEditorBody({
                     />
                   </div>
                 )}
+              </div>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Secret Response Paths
+                  </Label>
+                  <HelpTooltip content={secretResponsePathsTooltip} />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={blockId}
+                  onChange={(next) =>
+                    update({
+                      secretResponsePaths: next ? next.split("\n") : [],
+                    })
+                  }
+                  value={secretResponsePaths.join("\n")}
+                  placeholder="data.ssn"
+                  className="nopan text-xs"
+                  disabled={!editable}
+                  hideActions
+                />
               </div>
             </div>
           </AccordionContent>

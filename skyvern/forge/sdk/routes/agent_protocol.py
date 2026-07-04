@@ -3866,6 +3866,8 @@ async def _get_workflow_runs_by_id(
     search_key: str | None,
     error_code: str | None,
     exclude_child_runs: bool,
+    created_at_start: datetime | None = None,
+    created_at_end: datetime | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -3877,6 +3879,8 @@ async def _get_workflow_runs_by_id(
         search_key=search_key,
         error_code=error_code,
         exclude_child_runs=exclude_child_runs,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
     )
 
 
@@ -3921,6 +3925,14 @@ async def get_workflow_runs_by_id(
         ),
         examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
+    created_at_start: Annotated[
+        datetime | None,
+        Query(description="Only include runs created at or after this UTC timestamp (ISO 8601)."),
+    ] = None,
+    created_at_end: Annotated[
+        datetime | None,
+        Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
@@ -3937,6 +3949,8 @@ async def get_workflow_runs_by_id(
         status=status,
         search_key=search_key,
         error_code=error_code,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
         exclude_child_runs=True,
     )
 
@@ -3982,6 +3996,14 @@ async def get_workflow_runs_by_id_legacy(
         ),
         examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
+    created_at_start: Annotated[
+        datetime | None,
+        Query(description="Only include runs created at or after this UTC timestamp (ISO 8601)."),
+    ] = None,
+    created_at_end: Annotated[
+        datetime | None,
+        Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
@@ -3997,6 +4019,8 @@ async def get_workflow_runs_by_id_legacy(
         status=status,
         search_key=search_key,
         error_code=error_code,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
         exclude_child_runs=False,
     )
 

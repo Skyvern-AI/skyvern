@@ -87,9 +87,10 @@ function WorkflowCacheKeyValuesPanel({
           {onClose && (
             <Button
               size="icon"
-              variant="ghost"
+              variant="outline"
               aria-label="Close"
-              className="size-7 shrink-0"
+              title="Close"
+              className="h-7 w-7 shrink-0 border-border bg-transparent shadow-none"
               onClick={onClose}
             >
               <Cross2Icon className="size-4" />
