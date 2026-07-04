@@ -548,6 +548,19 @@ def recorded_outcome_from_author_time_reject(
     )
 
 
+def author_time_reject_missing_output_paths(latest: RecordedBuildTestOutcome | None) -> set[str]:
+    if latest is None or latest.phase != "author_time_reject":
+        return set()
+    paths: set[str] = set()
+    for fact in latest.missing_requested_output_facts:
+        if not isinstance(fact, Mapping):
+            continue
+        output_path = fact.get("output_path")
+        if isinstance(output_path, str) and output_path:
+            paths.add(output_path)
+    return paths
+
+
 def recorded_outcome_from_loaded_result_evidence(
     evidence: LoadedResultCompositionEvidence,
 ) -> RecordedBuildTestOutcome:

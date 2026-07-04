@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    record_scouted_output_coverage,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
 )
@@ -998,6 +999,7 @@ async def _maybe_steer_evaluate_to_action(
         if parsed is None or not has_actionable_steer_content(parsed):
             _reset_evaluate_tracker(ctx)
             return False
+        record_scouted_output_coverage(ctx, parsed)
         loaded_results = loaded_result_composition_evidence_from_page(parsed)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)

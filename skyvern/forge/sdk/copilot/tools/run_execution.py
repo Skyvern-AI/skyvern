@@ -54,7 +54,11 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal, reset_no_progress_interaction_count
+from skyvern.forge.sdk.copilot.enforcement import (
+    consume_uncovered_output_reopen_event,
+    repair_ceiling_stop_signal,
+    reset_no_progress_interaction_count,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -2776,7 +2780,7 @@ def _should_arm_recorded_outcome_grounding(copilot_ctx: Any) -> bool:
     return bool(latest.workflow_run_id or getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
 
 
-def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContract) -> None:
+def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRepairContract) -> None:
     """Count consecutive REPAIR verdicts that made no newly-verified forward progress.
 
     Progress is growth in the turn-scoped set of judge-confirmed completion criteria, or a
@@ -2785,17 +2789,15 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     current run's confirmations are folded in, else this run's own wins would already be
     banked and never read as new.
     """
-    current = satisfied_criterion_ids(getattr(copilot_ctx, "completion_verification_result", None))
-    high_water_raw: Any = getattr(copilot_ctx, "verified_criteria_high_water", frozenset())
-    high_water = high_water_raw if isinstance(high_water_raw, frozenset) else frozenset(high_water_raw or [])
-    prefix_len = len(getattr(copilot_ctx, "verified_prefix_labels", []) or [])
-    prefix_high_raw = getattr(copilot_ctx, "verified_prefix_high_water_len", 0)
-    prefix_high = prefix_high_raw if isinstance(prefix_high_raw, int) else 0
+    current = satisfied_criterion_ids(copilot_ctx.completion_verification_result)
+    high_water = copilot_ctx.verified_criteria_high_water
+    prefix_len = len(copilot_ctx.verified_prefix_labels)
+    prefix_high = copilot_ctx.verified_prefix_high_water_len
     # A run-tied REPAIR verdict always sees this False (the failing run cleared it in
     # _record_run_blocks_result); a True here is a stale carry-over from a prior clean
     # pass on a non-run path, so latch it consumed and count it as progress only once.
-    full_pass = getattr(copilot_ctx, "last_full_workflow_test_ok", False) is True
-    consumed = getattr(copilot_ctx, "verified_full_pass_consumed", False) is True
+    full_pass = copilot_ctx.last_full_workflow_test_ok
+    consumed = copilot_ctx.verified_full_pass_consumed
     progressed = made_newly_verified_progress(
         current_satisfied=current,
         high_water=high_water,
@@ -2808,6 +2810,14 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
     if progressed:
         reset_no_progress_interaction_count(copilot_ctx)
 
+    if not progressed and consume_uncovered_output_reopen_event(copilot_ctx):
+        contract.repair_loop_state = RepairLoopState(
+            streak_token=copilot_ctx.last_repair_non_convergence_signature,
+            consecutive_identical_repair_count=copilot_ctx.consecutive_non_converging_repair_count,
+            ceiling_reached=False,
+        )
+        return
+
     signature = _repair_non_convergence_signature(copilot_ctx, contract)
     if signature is None or progressed:
         copilot_ctx.consecutive_non_converging_repair_count = 0
@@ -2819,14 +2829,13 @@ def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContrac
             ceiling_reached=False,
         )
         return
-    prior_signature = getattr(copilot_ctx, "last_repair_non_convergence_signature", None)
-    prior_count = getattr(copilot_ctx, "consecutive_non_converging_repair_count", 0)
-    prior_count = prior_count if isinstance(prior_count, int) else 0
+    prior_signature = copilot_ctx.last_repair_non_convergence_signature
+    prior_count = copilot_ctx.consecutive_non_converging_repair_count
     count = prior_count + 1 if signature == prior_signature else 1
-    requirement = getattr(copilot_ctx, "recorded_outcome_grounding_requirement", None)
-    if isinstance(
-        getattr(copilot_ctx, "latest_recorded_build_test_outcome", None), RecordedBuildTestOutcome
-    ) and not signature.endswith(getattr(requirement, "structural_key", "")):
+    requirement = copilot_ctx.recorded_outcome_grounding_requirement
+    if isinstance(copilot_ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome) and not signature.endswith(
+        requirement.structural_key if requirement is not None else ""
+    ):
         clear_recorded_outcome_grounding_requirement(copilot_ctx)
     copilot_ctx.consecutive_non_converging_repair_count = count
     copilot_ctx.last_repair_non_convergence_signature = signature

@@ -7712,6 +7712,8 @@ def _record_workflow_update_result(
             copilot_ctx.last_update_block_count = block_count
     copilot_ctx.update_workflow_called = True
     copilot_ctx.synthesized_block_reopened_after_failed_run = False
+    copilot_ctx.synthesized_block_reopened_for_output_coverage = False
+    copilot_ctx.uncovered_output_rescout_steer_key = None
     copilot_ctx.test_after_update_done = False
     copilot_ctx.post_update_nudge_count = 0
     copilot_ctx.last_test_ok = None
