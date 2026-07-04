@@ -186,6 +186,8 @@ class PdfFillBlock(Block):
     async def _resolve_source_pdf(self, workflow_run_id: str, organization_id: str | None) -> tuple[str, bool]:
         # Returns (path, is_temp): is_temp marks a download_file temp the caller must clean up;
         # a user-supplied local path is never deleted.
+        if settings.ENV == "local" and os.path.exists(self.file_url):
+            return self.file_url, False
         if self.file_url.startswith("/"):
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
@@ -193,8 +195,6 @@ class PdfFillBlock(Block):
             if not os.path.isfile(resolved):
                 raise FileNotFoundError(f"Local file not found: {self.file_url}")
             return resolved, False
-        if settings.ENV == "local" and os.path.exists(self.file_url):
-            return self.file_url, False
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
