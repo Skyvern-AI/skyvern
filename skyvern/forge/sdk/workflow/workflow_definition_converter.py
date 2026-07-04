@@ -168,6 +168,8 @@ def convert_workflow_definition(
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 created_at=now,
                 modified_at=now,
             )

@@ -1,6 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
-import { ArrowTopRightIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ArrowTopRightIcon,
+  ExclamationTriangleIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -18,12 +22,14 @@ import { Switch } from "@/components/ui/switch";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { type AppNode } from "..";
+import { parameterIsSkyvernCredential } from "../../types";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
@@ -74,9 +80,28 @@ function LoginEditorBody({
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
+  const workflowParameters = useWorkflowParametersStore(
+    (state) => state.parameters,
+  );
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
   );
+  const credentialParameterKey =
+    data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined;
+  const credentialIsRotating = useMemo(() => {
+    if (!credentialParameterKey) return false;
+
+    const parameter = workflowParameters.find(
+      (workflowParameter) => workflowParameter.key === credentialParameterKey,
+    );
+
+    if (!parameter || parameter.parameterType !== "credential") return false;
+
+    return (
+      parameterIsSkyvernCredential(parameter) &&
+      (parameter.credentialIds?.length ?? 0) >= 2
+    );
+  }, [credentialParameterKey, workflowParameters]);
   const hasTotpValues = Boolean(
     data.totpIdentifier?.trim() || data.totpVerificationUrl?.trim(),
   );
@@ -133,6 +158,7 @@ function LoginEditorBody({
           </p>
           <LoginBlockCredentialSelector
             nodeId={blockId}
+            editable={editable}
             value={
               data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined
             }
@@ -154,6 +180,16 @@ function LoginEditorBody({
         </div>
         {showTwoFactorFields ? (
           <div className="space-y-3">
+            {credentialIsRotating && hasTotpValues ? (
+              <p className="flex items-start gap-1.5 text-xs text-amber-400">
+                <ExclamationTriangleIcon className="mt-0.5 size-3 shrink-0" />
+                <span>
+                  Block-level 2FA overrides every rotated account with a single
+                  destination. Remove it unless all accounts share one 2FA
+                  inbox.
+                </span>
+              </p>
+            ) : null}
             <div className="space-y-2">
               <div className="flex gap-2">
                 <Label className="text-xs text-slate-300">2FA Identifier</Label>
@@ -205,6 +241,11 @@ function LoginEditorBody({
               </button>
             ) : null}
           </div>
+        ) : credentialIsRotating ? (
+          <p className="text-xs text-slate-400">
+            2FA is handled per account — each rotated credential uses its own
+            verification settings.
+          </p>
         ) : showCredentialTotpSummary ? (
           <div className="flex items-center justify-between gap-2">
             <a

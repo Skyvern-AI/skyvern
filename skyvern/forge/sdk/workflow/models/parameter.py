@@ -125,6 +125,8 @@ class CredentialParameter(Parameter):
     workflow_id: str
 
     credential_id: str
+    credential_ids: list[str] | None = None
+    selection_strategy: str | None = None
 
     created_at: datetime
     modified_at: datetime

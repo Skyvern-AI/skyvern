@@ -85,11 +85,15 @@ export type AzureVaultCredentialParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type CredentialSelectionStrategy = "round_robin" | "random";
+
 export type CredentialParameter = WorkflowParameterBase & {
   parameter_type: "credential";
   workflow_id: string;
   credential_parameter_id: string;
   credential_id: string;
+  credential_ids?: Array<string> | null;
+  selection_strategy?: CredentialSelectionStrategy | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;

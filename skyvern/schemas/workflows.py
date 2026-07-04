@@ -596,6 +596,8 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
 class CredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
     credential_id: str
+    credential_ids: list[str] | None = None
+    selection_strategy: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):

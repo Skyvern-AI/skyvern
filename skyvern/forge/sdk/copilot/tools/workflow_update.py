@@ -105,7 +105,11 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    credential_param_ids,
+    parse_workflow_yaml,
+    workflow_blocks,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -3564,7 +3568,7 @@ def _reconcile_synthesized_parameters(
     existing_by_key = {
         str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
     }
-    existing_credentials = credential_params(parameters)
+    existing_credentials = credential_param_ids(parameters)
     parameter_keys: list[str] = []
     violations: list[str] = []
     aliases: dict[str, str] = {}
@@ -3614,7 +3618,7 @@ def _reconcile_synthesized_parameters(
         typed_length = typed_length or scout_typed_length
         if credential_id:
             if existing is not None:
-                if existing_credentials.get(key) != credential_id:
+                if credential_id not in existing_credentials.get(key, set()):
                     violations.append(
                         f"Unable to bind synthesized credential parameter `{key}`: submitted credential binding does not match scout metadata."
                     )
@@ -4794,7 +4798,7 @@ def _credentialed_code_block_scout_gate_errors(
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return []
-    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return []
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
@@ -4808,25 +4812,28 @@ def _credentialed_code_block_scout_gate_errors(
         code = str(block.get("code") or "")
         if not code.strip():
             continue
-        required_fields_by_credential: dict[str, set[str]] = {}
+        required_fields_by_parameter: dict[str, tuple[set[str], set[str]]] = {}
         for access in _credential_field_accesses(code):
             if not access.requires_live_scout:
                 continue
-            credential_id = credential_params_by_key.get(access.parameter_key)
-            if credential_id:
-                required_fields_by_credential.setdefault(credential_id, set()).add(access.field)
-        if not required_fields_by_credential:
+            credential_ids = credential_params_by_key.get(access.parameter_key)
+            if credential_ids:
+                allowed_credential_ids, required_fields = required_fields_by_parameter.setdefault(
+                    access.parameter_key, (credential_ids, set())
+                )
+                required_fields.add(access.field)
+        if not required_fields_by_parameter:
             continue
 
         matched_fill_indexes: list[int] = []
         matched_source_urls: set[str] = set()
         missing_fields: list[str] = []
-        for credential_id, required_fields in required_fields_by_credential.items():
+        for allowed_credential_ids, required_fields in required_fields_by_parameter.values():
             matched_fields: set[str] = set()
             for index, interaction in enumerate(scout_trajectory):
                 if str(interaction.get("tool_name") or "").strip() != "fill_credential_field":
                     continue
-                if str(interaction.get("credential_id") or "").strip() != credential_id:
+                if str(interaction.get("credential_id") or "").strip() not in allowed_credential_ids:
                     continue
                 field = str(interaction.get("credential_field") or "").strip()
                 if field not in required_fields:

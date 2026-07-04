@@ -4055,6 +4055,8 @@ function convertParametersToParameterYAML(
             ...base,
             parameter_type: WorkflowParameterTypes.Credential,
             credential_id: parameter.credential_id,
+            credential_ids: parameter.credential_ids ?? null,
+            selection_strategy: parameter.selection_strategy ?? null,
           };
         }
         case WorkflowParameterTypes.OnePassword: {
