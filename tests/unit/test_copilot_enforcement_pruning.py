@@ -435,6 +435,11 @@ class TestSynthesizedOfferPersistenceGate:
         assert signal.blocked_tool == "click"
         assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
         assert "last recorded test outcome" in signal.agent_steering_text
+        update_signal = synthesized_block_persistence_signal(ctx, "update_workflow")
+        assert isinstance(update_signal, CopilotToolBlockerSignal)
+        assert update_signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert update_signal.blocked_tool == "update_workflow"
+        assert update_signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
         assert synthesized_block_persistence_signal(ctx, "update_and_run_blocks") is None
         assert synthesized_block_persistence_signal(ctx, "evaluate") is None
 
