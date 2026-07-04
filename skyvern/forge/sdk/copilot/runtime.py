@@ -298,6 +298,10 @@ class AgentContext:
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
+    # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
+    output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
+    output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
+    runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False

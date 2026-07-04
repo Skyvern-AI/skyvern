@@ -646,6 +646,9 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
         proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+    code_artifact_metadata = getattr(agent_result, "code_artifact_metadata", None)
+    if code_artifact_metadata:
+        proposed_data["_copilot_code_artifact_metadata"] = code_artifact_metadata
     if _proposal_disposition(agent_result) == "review_untested":
         proposed_data["_copilot_unvalidated"] = True
     return proposed_data

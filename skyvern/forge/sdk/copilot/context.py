@@ -171,6 +171,11 @@ class CodeAuthoringRepairContext(BaseModel):
     missing_output_key: str | None = None
     available_output_keys: list[str] = Field(default_factory=list)
     current_block_parameter_keys: list[str] = Field(default_factory=list)
+    required_goal_value_paths: list[str] = Field(default_factory=list)
+    required_extraction_schema_paths: list[str] = Field(default_factory=list)
+    required_code_return_paths: list[str] = Field(default_factory=list)
+    metadata_contract_source: str = ""
+    metadata_contract_reason_code: str = ""
     failed_block_status: str | None = None
     workflow_run_id: str | None = None
     current_origin: str | None = None
@@ -462,6 +467,7 @@ class AgentResult:
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
     # settings changes); terminal handlers roll back on non-auto-accept.
     canonical_was_persisted_due_to_param_change: bool = False
