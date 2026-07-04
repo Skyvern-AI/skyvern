@@ -3876,7 +3876,7 @@ function getUniqueLabelForExistingNode(
   if (!existingLabels.includes(label)) {
     return label;
   }
-  for (let i = 2; i < existingLabels.length + 1; i++) {
+  for (let i = 2; i < existingLabels.length + 2; i++) {
     const candidate = `${label}_${i}`;
     if (!existingLabels.includes(candidate)) {
       return candidate;
