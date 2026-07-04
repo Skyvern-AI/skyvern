@@ -165,6 +165,7 @@ import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { WorkflowDefinition, WorkflowSettings } from "../types/workflowTypes";
+import { useAgentsPathMatch } from "../useAgentsPathMatch";
 import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
@@ -402,6 +403,7 @@ function Workspace({
     selectedBlockId,
     isNodeLibraryOpen,
   );
+  const isEditRoute = useAgentsPathMatch("/:workflowPermanentId/edit") !== null;
   // While collapsed, the pill is offscreen but its WorkflowHeaderCollapseTab
   // (chevron) sits at the bottom edge, centered on the pill. If we let the
   // pill's right inset track blockSidebarOpen while collapsed, the tab snaps
@@ -2155,6 +2157,31 @@ function Workspace({
                 historyApplyTrigger={historyApplyTrigger}
               />
 
+              {/* Studio hosts the toggle in the Editor pane header; legacy
+                  anchors it under the header on /edit only (the debugger
+                  mounts this Workspace too). */}
+              {!yamlEditorActive &&
+              !isGlobalWorkflow &&
+              !embedded &&
+              isEditRoute ? (
+                <div
+                  className={cn(
+                    "absolute top-[8.5rem] z-30 transition-all duration-300 ease-out",
+                    blockSidebarOpen
+                      ? HEADER_RIGHT_INSET_OPEN
+                      : HEADER_RIGHT_INSET_CLOSED,
+                  )}
+                  style={{
+                    transform: headerCollapsed
+                      ? "translateY(calc(-100% - 8.5rem))"
+                      : "translateY(0)",
+                    opacity: headerCollapsed ? 0 : 1,
+                  }}
+                >
+                  <YamlModeToggle mode="visual" onCode={enterYamlMode} />
+                </div>
+              ) : null}
+
               {/* sub panels */}
               {workflowPanelState.active && (
                 <>
@@ -2988,12 +3015,6 @@ function Workspace({
         }}
       />
 
-      {/* Studio hosts the toggle in the Editor pane header instead. */}
-      {!yamlEditorActive && !isGlobalWorkflow && !embedded ? (
-        <div className="absolute right-4 top-3 z-30">
-          <YamlModeToggle mode="visual" onCode={enterYamlMode} />
-        </div>
-      ) : null}
       {/* Studio: the cache key/value panel escapes the Editor pane via the
           shell-level portal, so the Overview pane's Code view can open it (and
           close it) even with the Editor pane hidden. */}
