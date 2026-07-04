@@ -290,7 +290,7 @@ def _requested_output_tokens(criteria: tuple[CompletionCriterion, ...] | list[Co
     return tokens
 
 
-def _requested_output_paths(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
+def requested_output_paths(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
     return {
         criterion.output_path
         for criterion in criteria
@@ -333,7 +333,7 @@ def _fresh_generic_rephrase_lacks_stored_requested_outputs(
         output_path for criterion in stored_requested_criteria if (output_path := criterion.output_path) is not None
     }
     if stored_requested_paths:
-        fresh_requested_paths = _requested_output_paths(fresh)
+        fresh_requested_paths = requested_output_paths(fresh)
         missing_paths = stored_requested_paths - fresh_requested_paths
         if not missing_paths:
             return False

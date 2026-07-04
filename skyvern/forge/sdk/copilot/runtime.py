@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         RecordedBuildTestOutcome,
         RecordedOutcomeGroundingRequirement,
     )
+    from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -252,6 +253,7 @@ class AgentContext:
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     completion_verification_result: CompletionVerificationResult | None = None
+    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
@@ -306,6 +308,10 @@ class AgentContext:
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
     synthesized_block_reopened_after_failed_run: bool = False
+    synthesized_block_reopened_for_output_coverage: bool = False
+    scouted_output_covered_paths: set[str] = field(default_factory=set)
+    uncovered_output_rescout_context_key: str | None = None
+    uncovered_output_rescout_steer_key: str | None = None
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0

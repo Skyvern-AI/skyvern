@@ -84,6 +84,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
     artifact_health_blocked,
     outcome_fully_verified,
+    synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
     verified_goal_claim_authorized,
@@ -888,7 +889,8 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="policy_not_code_only_browser")
         return ""
     reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
-    if ctx.update_workflow_called and not reopened_after_failed_run:
+    reopened = synthesized_persistence_reopened(ctx)
+    if ctx.update_workflow_called and not reopened:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
         return ""
     if not ctx.scout_trajectory:
@@ -901,7 +903,7 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         ctx.synthesized_block_offered
         and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
         and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
-        and not reopened_after_failed_run
+        and not reopened
     ):
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",

@@ -10,8 +10,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
 class _RaisingClient:
@@ -19,18 +20,24 @@ class _RaisingClient:
         raise RuntimeError("Timeout 5000ms exceeded")
 
 
-def _agent_ctx() -> AgentContext:
-    return AgentContext(
+def _agent_ctx() -> CopilotContext:
+    return CopilotContext(
         organization_id="o_1",
         workflow_id="w_1",
         workflow_permanent_id="wpid_1",
         workflow_yaml="",
         browser_session_id="pbs_1",
         stream=MagicMock(),
+        user_message="scout",
+        turn_intent=TurnIntent(
+            mode=TurnIntentMode.EDIT,
+            user_goal="scout",
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        ),
     )
 
 
-def _make_server(ctx: AgentContext, tool_name: str) -> SkyvernOverlayMCPServer:
+def _make_server(ctx: CopilotContext, tool_name: str) -> SkyvernOverlayMCPServer:
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
         overlays={tool_name: SchemaOverlay()},

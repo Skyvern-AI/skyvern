@@ -277,6 +277,7 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
+UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
 _RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
 
 

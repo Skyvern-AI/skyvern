@@ -9,17 +9,24 @@ from unittest.mock import AsyncMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    recorded_outcome_from_author_time_reject,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
+    RepairLoopState,
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -427,6 +434,71 @@ def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes
     assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 1
     assert sandbox_contract.repair_loop_state.ceiling_reached is False
     assert getattr(ctx, "blocker_signal", None) is None
+
+
+def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
+    criterion = CompletionCriterion(id=output_path, outcome="the value is captured", output_path=output_path)
+    return SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+
+
+def _uncovered_output_author_reject(output_path: str) -> RecordedBuildTestOutcome:
+    return recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        block_labels=["extract_order"],
+        structural_payload={
+            "reason_code": "recorded_outcome_missing_output_coverage",
+            "missing_output_paths": [output_path],
+        },
+        missing_requested_output_facts=[{"output_path": output_path, "output_root": output_path.split(".", 1)[0]}],
+    )
+
+
+def _run_repair_loop_state(ctx: CopilotContext) -> RepairLoopState:
+    repair_context = CodeAuthoringRepairContext(
+        block_label="extract_order",
+        reason_code="runtime_block_failure",
+        runtime_failure_reason="output missing",
+    )
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(repair_context),
+        ctx=ctx,
+    )
+    run_execution_module._update_repair_loop_state(ctx, contract)
+    return contract.repair_loop_state
+
+
+def test_uncovered_output_author_reject_reopens_once_then_counts_to_ceiling() -> None:
+    ctx = _ctx()
+    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
+    ctx.latest_recorded_build_test_outcome = _uncovered_output_author_reject("output.document_name")
+
+    first = _run_repair_loop_state(ctx)
+    assert first.consecutive_identical_repair_count == 0
+    assert first.ceiling_reached is False
+    assert ctx.synthesized_block_reopened_for_output_coverage is True
+    assert ctx.consecutive_non_converging_repair_count == 0
+
+    counts = [_run_repair_loop_state(ctx).consecutive_identical_repair_count for _ in range(3)]
+    assert counts == [1, 2, 3]
+    assert counts[-1] == settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL
+    assert isinstance(getattr(ctx, "blocker_signal", None), CopilotToolBlockerSignal)
+
+
+def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
+    ctx = _ctx()
+    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
+    ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="outcome_not_demonstrated",
+        structural_failure_identity="completion:unsatisfied-output",
+        missing_requested_output_facts=[{"output_path": "output.document_name", "output_root": "output"}],
+    )
+    state = _run_repair_loop_state(ctx)
+    assert state.consecutive_identical_repair_count == 1
+    assert ctx.synthesized_block_reopened_for_output_coverage is False
 
 
 def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:

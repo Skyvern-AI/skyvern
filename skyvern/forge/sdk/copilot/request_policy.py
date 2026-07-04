@@ -58,7 +58,7 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "raw_secret_handling",
     "clarification_reason",
 }
-_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
+REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
     {
         "output.downloaded_files",
         "output.downloaded_file_urls",
@@ -1363,7 +1363,7 @@ def _apply_requested_output_completion_criteria(
         for field_name, output_path, _field_label in requested_specs:
             if criterion.output_path == output_path or _criterion_text_covers_requested_output(criterion, field_name):
                 deliverable_kind = (
-                    criterion.deliverable_kind if output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
+                    criterion.deliverable_kind if output_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
                 )
                 metadata_by_output_path.setdefault(
                     output_path,

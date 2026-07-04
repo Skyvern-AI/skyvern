@@ -464,6 +464,7 @@ def test_reconciliation_guard_message_does_not_say_timed_out() -> None:
         repeated_action_fingerprint_streak_count=0,
         last_test_non_retriable_nav_error=None,
         pending_reconciliation_run_id="wr_guarded",
+        synthesized_block_reopened_for_output_coverage=False,
     )
     msg = _tool_loop_error(ctx, "update_and_run_blocks")
     assert isinstance(msg, str)

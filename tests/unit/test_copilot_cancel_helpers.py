@@ -248,6 +248,7 @@ def _guard_ctx(pending_run_id: str | None = None) -> _NS:
         repeated_action_fingerprint_streak_count=0,
         last_test_non_retriable_nav_error=None,
         pending_reconciliation_run_id=pending_run_id,
+        synthesized_block_reopened_for_output_coverage=False,
     )
 
 

@@ -42,6 +42,7 @@ def _ctx(**overrides: Any) -> Any:
         "staged_workflow": None,
         "staged_workflow_yaml": None,
         "has_staged_proposal": False,
+        "synthesized_block_reopened_for_output_coverage": False,
     }
     base.update(overrides)
     return SimpleNamespace(**base)

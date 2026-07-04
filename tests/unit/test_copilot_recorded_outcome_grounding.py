@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     maybe_satisfy_recorded_outcome_grounding_requirement,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDE
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.run_execution import _update_repair_loop_state
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
 def _outcome(**updates: object) -> RecordedBuildTestOutcome:
@@ -43,14 +45,26 @@ def _outcome(**updates: object) -> RecordedBuildTestOutcome:
     return RecordedBuildTestOutcome(**base)  # type: ignore[arg-type]
 
 
-def _ctx(outcome: RecordedBuildTestOutcome | None = None) -> SimpleNamespace:
+def _ctx(outcome: RecordedBuildTestOutcome | None = None) -> CopilotContext:
     history = []
     if outcome is not None:
         history = [
             {"structural_key": outcome.structural_key, "is_authoritative": True},
             {"structural_key": outcome.structural_key, "is_authoritative": True},
         ]
-    return SimpleNamespace(
+    return CopilotContext(
+        organization_id="o",
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=SimpleNamespace(),  # type: ignore[arg-type]
+        user_message="Fix the workflow",
+        turn_intent=TurnIntent(
+            mode=TurnIntentMode.EDIT,
+            user_goal="Fix the workflow",
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        ),
         latest_recorded_build_test_outcome=outcome,
         recorded_build_test_outcome_history=history,
         recorded_outcome_grounding_requirement=None,
@@ -66,12 +80,10 @@ def _ctx(outcome: RecordedBuildTestOutcome | None = None) -> SimpleNamespace:
         turn_halt=None,
         observed_browser_urls=["https://example.com/results"],
         consecutive_tool_tracker=[],
-        tool_failure_history=[],
         tool_activity=[],
         pending_reconciliation_run_id=None,
         pending_reconciliation_requires_user_input=False,
         post_budget_page_inspection_required=False,
-        workflow_verification_evidence=SimpleNamespace(active_run_terminal_evidence_detected=False),
         last_failure_category_top=None,
         repeated_action_fingerprint_streak_count=0,
         last_test_non_retriable_nav_error=None,
