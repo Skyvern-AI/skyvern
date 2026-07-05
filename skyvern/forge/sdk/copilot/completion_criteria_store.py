@@ -8,9 +8,11 @@ stays at the route/repository seam; everything here is side-effect free.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
+from skyvern.forge.sdk.copilot.completion_output_grounding import split_requested_output_criteria
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     run_plane_all_no_evidence,
@@ -361,6 +363,34 @@ def _fresh_generic_rephrase_lacks_stored_requested_outputs(
         return False
     fresh_tokens = set().union(*(_word_tokens(criterion.outcome) for criterion in fresh))
     return bool(stored_requested_tokens - fresh_tokens)
+
+
+def apply_requested_output_producer_floor(
+    criteria: Iterable[CompletionCriterion],
+) -> tuple[tuple[CompletionCriterion, ...], tuple[str, ...]]:
+    """Re-key presence-only requested-output criteria (no expected value, shape, or deliverable) to a
+    run-plane outcome so the observed-end-state judge grades them instead of failing closed. Typed
+    value/shape criteria, judgment booleans, and typed deliverables are untouched; the transform is idempotent."""
+    criteria = tuple(criteria)
+    requested, _remaining = split_requested_output_criteria(list(criteria))
+    presence_only_ids = {
+        criterion.id
+        for criterion in requested
+        if criterion.expected_output_value is None
+        and criterion.expected_output_shape is None
+        and criterion.deliverable_kind is None
+    }
+    if not presence_only_ids:
+        return criteria, ()
+    floored: list[CompletionCriterion] = []
+    rekeyed_paths: list[str] = []
+    for criterion in criteria:
+        if criterion.id in presence_only_ids:
+            rekeyed_paths.append(criterion.output_path or "")
+            floored.append(replace(criterion, output_path=None, level="run", kind="outcome"))
+        else:
+            floored.append(criterion)
+    return tuple(floored), tuple(rekeyed_paths)
 
 
 def reconcile_completion_criteria(
