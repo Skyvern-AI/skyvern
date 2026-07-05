@@ -94,7 +94,11 @@ class TestRequestPolicyPromptStructure:
             "classification_output_key, expected_classification}"
         ) in rendered
         assert "never hide it in outcome prose" in rendered
-        assert "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label" in rendered
+        assert (
+            "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, "
+            "goal_judgment_boolean" in rendered
+        )
+        assert "goal_judgment_boolean declares that the field is an artifact-computed true/false judgment" in rendered
         assert "kind=outcome|terminal_action|validation_classification" in rendered
         assert "terminal_action_family=request|application|form|order|null" in rendered
         assert (
