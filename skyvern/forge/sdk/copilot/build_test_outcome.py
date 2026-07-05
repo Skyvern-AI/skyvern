@@ -1283,7 +1283,7 @@ def _output_path_value_status(
         return "empty_typed_value"
     grounding_mode = getattr(verdict, "grounding_mode", None)
     has_exact_value = getattr(verdict, "has_exact_value", False)
-    if grounding_mode == "shape" and not has_exact_value:
+    if grounding_mode in {"shape", "judgment_boolean"} and not has_exact_value:
         return "presence_only_evidence"
     return "typed_value_unverified"
 

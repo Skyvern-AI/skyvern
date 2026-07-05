@@ -12,6 +12,9 @@ import yaml
 from skyvern.forge.sdk.copilot.completion_verification import CriterionVerdict, EvidenceSourceKind, RunEvidenceSnapshot
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    ExpectedOutputValue,
+    RequestedOutputEvidenceSource,
+    _is_judgment_boolean_criterion,
     lookup_requested_output_path_alias,
     schema_output_path_aliases_from_criteria,
 )
@@ -22,6 +25,9 @@ _REQUESTED_OUTPUT_PREFIX = "output."
 _STRUCTURAL_ABSTENTION_REASON_CODE = "structurally_abstained"
 # Ignored at any requested-output traversal depth, including schema-declared nested fields.
 _IGNORED_RUNTIME_FIELD_NAMES = frozenset({"evidence_text"})
+_INDEPENDENT_EVIDENCE_SOURCES: frozenset[EvidenceSourceKind] = frozenset(
+    {"independent_page_evidence", "registered_output_parameter", "registered_artifact_content"}
+)
 
 
 class _GroundingCtx(Protocol):
@@ -57,6 +63,7 @@ def grade_requested_output_criteria(
     requested_path_aliases = schema_output_path_aliases_from_criteria(criteria)
     raw_authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx)
     authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, requested_path_aliases)
+    declared_judgment_output_paths = _producer_declared_judgment_output_paths(copilot_ctx.code_artifact_metadata)
     verdicts: list[CriterionVerdict] = []
     for criterion in criteria:
         path = _normalize_output_path(criterion.output_path)
@@ -73,7 +80,12 @@ def grade_requested_output_criteria(
                 )
             )
             continue
-        accepted_runtime_outputs = dict(_accepted_runtime_outputs(snapshot.block_outputs, accepted_labels))
+        independent_labels = {
+            label for label, source in snapshot.block_output_sources.items() if source in _INDEPENDENT_EVIDENCE_SOURCES
+        }
+        accepted_runtime_outputs = dict(
+            _accepted_runtime_outputs(snapshot.block_outputs, accepted_labels, independent_labels)
+        )
         accepted_output_sources = {
             label: source
             for label, source in snapshot.block_output_sources.items()
@@ -87,7 +99,16 @@ def grade_requested_output_criteria(
         expected_value = criterion.expected_output_value
         expected_shape = criterion.expected_output_shape
         grounding_mode = _criterion_grounding_mode(criterion)
-        trace_fields = _criterion_trace_fields(criterion, grounding_mode)
+        requires_declared_independent_evidence = bool(path) and path in declared_judgment_output_paths
+        effective_evidence_source: RequestedOutputEvidenceSource = (
+            "independent_run_evidence"
+            if requires_declared_independent_evidence
+            else criterion.requested_output_evidence_source
+        )
+        judgment_grounding_bars_self_emission = (
+            _is_judgment_boolean_criterion(criterion) or requires_declared_independent_evidence
+        )
+        trace_fields = _criterion_trace_fields(criterion, grounding_mode, effective_evidence_source)
         if expected_value is not None:
             refutation = _independent_evidence_text_refutation(
                 accepted_runtime_outputs,
@@ -118,6 +139,7 @@ def grade_requested_output_criteria(
         else:
             match_state, evidence_ref = _runtime_output_path_presence(accepted_runtime_outputs, path, projection_roots)
             if match_state == "present" and evidence_ref is not None:
+                present_source = _evidence_source_for_ref(accepted_output_sources, evidence_ref)
                 verdicts.append(
                     CriterionVerdict(
                         criterion_id=criterion.id,
@@ -128,7 +150,11 @@ def grade_requested_output_criteria(
                             "requested-output field is present, but the criterion lacks typed expected_output_value "
                             "or expected_output_shape to prove the value"
                         ),
-                        evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
+                        evidence_source=present_source,
+                        self_emitted_judgment_not_independent=(
+                            judgment_grounding_bars_self_emission
+                            and present_source not in _INDEPENDENT_EVIDENCE_SOURCES
+                        ),
                         **trace_fields,
                     )
                 )
@@ -147,6 +173,7 @@ def grade_requested_output_criteria(
             )
             continue
         if match_state == "present" and evidence_ref is not None:
+            present_source = _evidence_source_for_ref(accepted_output_sources, evidence_ref)
             verdicts.append(
                 CriterionVerdict(
                     criterion_id=criterion.id,
@@ -157,13 +184,20 @@ def grade_requested_output_criteria(
                         "requested-output field is present with a typed expected_output_shape, but no exact "
                         "expected_output_value can prove or refute the value"
                     ),
-                    evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
+                    evidence_source=present_source,
+                    self_emitted_judgment_not_independent=(
+                        judgment_grounding_bars_self_emission and present_source not in _INDEPENDENT_EVIDENCE_SOURCES
+                    ),
                     **trace_fields,
                 )
             )
             continue
         if match_state == "satisfied" and evidence_ref is not None:
-            if criterion.requested_output_evidence_source == "independent_run_evidence":
+            satisfied_source = _evidence_source_for_ref(accepted_output_sources, evidence_ref)
+            requires_independent_evidence = (
+                effective_evidence_source == "independent_run_evidence" or _is_judgment_boolean_criterion(criterion)
+            )
+            if requires_independent_evidence and satisfied_source not in _INDEPENDENT_EVIDENCE_SOURCES:
                 verdicts.append(
                     CriterionVerdict(
                         criterion_id=criterion.id,
@@ -173,7 +207,7 @@ def grade_requested_output_criteria(
                         missing_evidence=(
                             "self-emitted requested output is not independent evidence for this criterion"
                         ),
-                        evidence_source=_evidence_source_for_ref(accepted_output_sources, evidence_ref),
+                        evidence_source=satisfied_source,
                         self_emitted_judgment_not_independent=True,
                         **trace_fields,
                     )
@@ -237,13 +271,23 @@ def _independent_evidence_text_refutation(
     block_outputs: Mapping[str, Any],
     output_sources: Mapping[str, EvidenceSourceKind],
     path: str,
-    expected_value: str,
+    expected_value: ExpectedOutputValue,
     projection_roots: set[str],
 ) -> tuple[str, EvidenceSourceKind] | None:
     parts = _path_parts(path)
     for label, payload in block_outputs.items():
         source = output_sources.get(label)
         if source != "independent_page_evidence" or not isinstance(payload, Mapping):
+            continue
+        if isinstance(expected_value, bool):
+            values, source_path = _runtime_path_values(payload, parts, path, projection_roots)
+            grounded_booleans = [_bool_canonical(value) for value in values]
+            if (
+                grounded_booleans
+                and all(value is not None for value in grounded_booleans)
+                and expected_value not in grounded_booleans
+            ):
+                return f"block_outputs:{label}.{source_path}", source
             continue
         evidence_text = payload.get("evidence_text")
         if not isinstance(evidence_text, str) or not _expected_value_in_text(evidence_text, expected_value):
@@ -260,7 +304,11 @@ def _expected_value_in_text(text: str, expected: str) -> bool:
     return bool(target) and (target in observed or _compact_expected_text(target) in _compact_expected_text(observed))
 
 
-def _criterion_grounding_mode(criterion: CompletionCriterion) -> Literal["exact_value", "shape", "missing"]:
+def _criterion_grounding_mode(
+    criterion: CompletionCriterion,
+) -> Literal["exact_value", "shape", "missing", "judgment_boolean"]:
+    if _is_judgment_boolean_criterion(criterion):
+        return "judgment_boolean"
     if criterion.expected_output_value is not None:
         return "exact_value"
     if criterion.expected_output_shape is not None:
@@ -268,14 +316,66 @@ def _criterion_grounding_mode(criterion: CompletionCriterion) -> Literal["exact_
     return "missing"
 
 
-def _criterion_trace_fields(criterion: CompletionCriterion, grounding_mode: str) -> dict[str, Any]:
+def _criterion_trace_fields(
+    criterion: CompletionCriterion,
+    grounding_mode: str,
+    evidence_source: RequestedOutputEvidenceSource | None = None,
+) -> dict[str, Any]:
     return {
         "output_path": criterion.output_path,
         "grounding_mode": grounding_mode,
         "expected_output_shape": criterion.expected_output_shape,
         "has_exact_value": criterion.expected_output_value is not None,
-        "requested_output_evidence_source": criterion.requested_output_evidence_source,
+        "requested_output_evidence_source": evidence_source or criterion.requested_output_evidence_source,
     }
+
+
+def _producer_declared_judgment_output_paths(metadata: object) -> set[str]:
+    if not isinstance(metadata, Mapping):
+        return set()
+    paths: set[str] = set()
+    for artifact in metadata.values():
+        if not isinstance(artifact, Mapping):
+            continue
+        declared_criteria = artifact.get("completion_criteria")
+        if isinstance(declared_criteria, list):
+            for declared in declared_criteria:
+                if not isinstance(declared, Mapping):
+                    continue
+                if declared.get("requested_output_evidence_source") != "independent_run_evidence":
+                    continue
+                normalized = _normalize_output_path(declared.get("output_path"))
+                if normalized:
+                    paths.add(normalized)
+        for row_group in (artifact.get("claimed_outcomes"), artifact.get("terminal_verifier_expectations")):
+            rows = [row for row in row_group if isinstance(row, Mapping)] if isinstance(row_group, list) else []
+            for row in rows:
+                paths.update(_schema_boolean_output_paths(_parse_extraction_schema(row.get("extraction_schema"))))
+    return paths
+
+
+def _schema_boolean_output_paths(schema: Mapping[str, Any] | None, prefix: str = "") -> set[str]:
+    if not isinstance(schema, Mapping):
+        return set()
+    if schema.get("type") == "array":
+        items = schema.get("items")
+        array_prefix = f"{prefix}[]" if prefix else ""
+        return _schema_boolean_output_paths(items, array_prefix) if isinstance(items, Mapping) else set()
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        if schema.get("type") == "boolean" and prefix:
+            return {_normalize_output_path(prefix)}
+        return set()
+    paths: set[str] = set()
+    for raw_name, child_schema in properties.items():
+        name = str(raw_name).strip()
+        if not name or not isinstance(child_schema, Mapping):
+            continue
+        child_prefix = f"{prefix}.{name}" if prefix else name
+        if child_schema.get("type") == "boolean":
+            paths.add(_normalize_output_path(child_prefix))
+        paths.update(_schema_boolean_output_paths(child_schema, child_prefix))
+    return paths
 
 
 def _authored_output_contract_paths_by_label(
@@ -415,14 +515,16 @@ def _runtime_projection_roots(authored_paths: set[str]) -> set[str]:
     return {parts[0] for path in authored_paths if len(parts := _path_parts(path)) > 1}
 
 
-def _accepted_runtime_outputs(block_outputs: Mapping[str, Any], accepted_labels: set[str]) -> list[tuple[str, Any]]:
-    if not accepted_labels:
+def _accepted_runtime_outputs(
+    block_outputs: Mapping[str, Any], accepted_labels: set[str], independent_labels: set[str]
+) -> list[tuple[str, Any]]:
+    if not accepted_labels and not independent_labels:
         return []
     accepted_output_keys = {f"{label}_output" for label in accepted_labels}
     return [
         (label, payload)
         for label, payload in block_outputs.items()
-        if label in accepted_labels or label in accepted_output_keys
+        if label in accepted_labels or label in accepted_output_keys or label in independent_labels
     ]
 
 
@@ -457,7 +559,10 @@ def _dict_keys(node: ast.Dict) -> set[str]:
 
 
 def _runtime_output_path_match(
-    block_outputs: Mapping[str, Any], path: str, expected_value: str | None, projection_roots: set[str] | None = None
+    block_outputs: Mapping[str, Any],
+    path: str,
+    expected_value: ExpectedOutputValue | None,
+    projection_roots: set[str] | None = None,
 ) -> tuple[str, str | None]:
     parts = _path_parts(path)
     if not parts or expected_value is None:
@@ -580,7 +685,22 @@ def _is_meaningful_requested_value(value: Any) -> bool:
     return True
 
 
-def _value_matches_expected(value: Any, expected: str) -> bool:
+def _bool_canonical(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        collapsed = value.strip().casefold()
+        if collapsed == "true":
+            return True
+        if collapsed == "false":
+            return False
+    return None
+
+
+def _value_matches_expected(value: Any, expected: ExpectedOutputValue) -> bool:
+    if isinstance(expected, bool):
+        canonical = _bool_canonical(value)
+        return canonical is not None and canonical == expected
     if isinstance(value, Mapping):
         return any(_value_matches_expected(item, expected) for item in value.values())
     if isinstance(value, list):
