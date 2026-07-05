@@ -232,6 +232,17 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
     return None
 
 
+def run_backed_repair_evidence_exists(ctx: object) -> bool:
+    fallback_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if isinstance(latest, RecordedBuildTestOutcome):
+        # An author-time reject is never run-backed even if a stale run id lingers on ctx; only a persisted run counts.
+        if latest.phase != "persisted_block_run":
+            return False
+        return bool(latest.workflow_run_id or fallback_run_id)
+    return bool(fallback_run_id)
+
+
 def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGroundingRequirement | None:
     outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
     if not isinstance(outcome, RecordedBuildTestOutcome) or not outcome.is_authoritative:
