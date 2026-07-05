@@ -167,10 +167,46 @@ class RecordedOutcomeGroundingRequirement(BaseModel):
     payload: RecordedOutcomeGroundingPayload | None = None
 
 
+BindingFrontierFacet = Literal[
+    "unexecuted_submit",
+    "value_shape",
+    "amend_in_place",
+    "selector_frontier",
+]
+_UNCROSSABLE_DIAGNOSTIC_REASONS = frozenset({"empty_page", "challenge_gated", "capture_degraded"})
+
+
+class RecordedOutcomeBindingConstraint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repeated_structural_key: str
+    phase: BuildTestOutcomePhase
+    reason_code: BuildTestOutcomeReasonCode
+    frontier_facet: BindingFrontierFacet
+    owning_block_labels: list[str] = Field(default_factory=list)
+    diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = "none"
+    workflow_run_id: str | None = None
+    recorded_block_signatures: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def frontier_uncrossable(self) -> bool:
+        return self.diagnostic_reason in _UNCROSSABLE_DIAGNOSTIC_REASONS
+
+    def owning_block_frontier_moved(self, candidate_block_signatures: Mapping[str, str]) -> bool:
+        if not self.owning_block_labels:
+            return True
+        for label in self.owning_block_labels:
+            recorded = self.recorded_block_signatures.get(label)
+            if recorded is None or candidate_block_signatures.get(label) != recorded:
+                return True
+        return False
+
+
 class _RecordedBuildTestOutcomeContext(Protocol):
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
     recorded_build_test_outcome_history: list[dict[str, object]]
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None
+    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None
 
 
 def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome | None) -> None:
@@ -214,6 +250,83 @@ def authored_structure_signature_from_workflow(
     if payload is None:
         return None
     return _stable_hash(payload)
+
+
+def authored_block_signatures_from_workflow(
+    workflow_yaml: str | None,
+    code_artifact_metadata: object = None,
+) -> dict[str, str]:
+    payload = _authored_structure_payload_from_workflow(workflow_yaml, code_artifact_metadata)
+    if payload is None:
+        return {}
+    signatures: dict[str, str] = {}
+    code_blocks = payload.get("code_blocks")
+    if not isinstance(code_blocks, list):
+        return signatures
+    for block in code_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        label = _safe_str(block.get("label"))
+        if not label:
+            continue
+        signatures[label] = _stable_hash(
+            {
+                "code_hash": block.get("code_hash"),
+                "parameter_keys": block.get("parameter_keys"),
+                "output_metadata": block.get("output_metadata"),
+            }
+        )
+    return signatures
+
+
+def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontierFacet:
+    if outcome.reason_code == "scout_act_observe_hollow_after_interaction":
+        return "unexecuted_submit"
+    if outcome.runtime_output_repair_facts:
+        return "amend_in_place"
+    if outcome.missing_requested_output_facts:
+        return "value_shape"
+    if outcome.reason_code in {"sandbox_unresolved_name", "synthesized_parameter_binding_ambiguous"}:
+        return "amend_in_place"
+    if outcome.reason_code in {"outcome_not_demonstrated", "no_meaningful_output", "runtime_missing_output_dependency"}:
+        return "value_shape"
+    return "selector_frontier"
+
+
+def _bind_recorded_outcome_constraint(ctx: object, requirement: RecordedOutcomeGroundingRequirement) -> None:
+    outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    payload = requirement.payload
+    if not isinstance(outcome, RecordedBuildTestOutcome) or payload is None:
+        return
+    owning_labels = _clean_list(
+        outcome.block_labels or ([outcome.attempted_block_label] if outcome.attempted_block_label else [])
+    )
+    recorded_signatures = authored_block_signatures_from_workflow(
+        getattr(ctx, "workflow_yaml", None),
+        getattr(ctx, "code_artifact_metadata", None),
+    )
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=requirement.structural_key,
+        phase=outcome.phase,
+        reason_code=outcome.reason_code,
+        frontier_facet=_binding_frontier_facet(outcome),
+        owning_block_labels=owning_labels,
+        diagnostic_reason=payload.diagnostic_reason,
+        workflow_run_id=requirement.workflow_run_id,
+        recorded_block_signatures={
+            label: recorded_signatures[label] for label in owning_labels if label in recorded_signatures
+        },
+    )
+    ctx.recorded_outcome_binding_constraint = constraint  # type: ignore[attr-defined]
+    LOG.info(
+        "copilot recorded outcome binding bound",
+        repeated_structural_key=constraint.repeated_structural_key,
+        frontier_facet=constraint.frontier_facet,
+        owning_block_labels=constraint.owning_block_labels,
+        diagnostic_reason=constraint.diagnostic_reason,
+        frontier_uncrossable=constraint.frontier_uncrossable,
+        workflow_run_id=constraint.workflow_run_id,
+    )
 
 
 def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
@@ -290,6 +403,7 @@ def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGr
 
 def clear_recorded_outcome_grounding_requirement(ctx: object) -> None:
     ctx.recorded_outcome_grounding_requirement = None  # type: ignore[attr-defined]
+    ctx.recorded_outcome_binding_constraint = None  # type: ignore[attr-defined]
 
 
 def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
@@ -314,9 +428,8 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     if payload is None:
         _log_grounding_rejection(requirement, evidence)
         return False
-    ctx.recorded_outcome_grounding_requirement = requirement.model_copy(  # type: ignore[attr-defined]
-        update={"satisfied": True, "payload": payload}
-    )
+    satisfied_requirement = requirement.model_copy(update={"satisfied": True, "payload": payload})
+    ctx.recorded_outcome_grounding_requirement = satisfied_requirement  # type: ignore[attr-defined]
     LOG.info(
         "copilot recorded outcome grounding satisfied",
         structural_key=requirement.structural_key,
@@ -325,6 +438,7 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
         observed_after_workflow_run=payload.observed_after_workflow_run,
         source_tool=payload.source_tool,
     )
+    _bind_recorded_outcome_constraint(ctx, satisfied_requirement)
     return True
 
 

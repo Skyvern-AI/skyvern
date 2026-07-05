@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
+        RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
@@ -252,6 +253,8 @@ class AgentContext:
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
+    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
+    consecutive_non_converging_repair_count: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     verified_terminal_proposal_ready: bool = False
