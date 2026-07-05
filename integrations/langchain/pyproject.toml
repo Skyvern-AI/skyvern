@@ -32,7 +32,7 @@ override-dependencies = [
     "cryptography>=46.0.7",
     "pygments>=2.20.0",
     # Dependabot high security upgrades (transitive)
-    "litellm>=1.83.10",
+    "litellm>=1.84.0",
     "langsmith>=0.8.0",
 ]
 
