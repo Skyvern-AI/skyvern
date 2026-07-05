@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     author_time_reject_missing_output_paths,
+    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_durable_fallback_entry_target,
@@ -340,7 +341,7 @@ def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
 
 def _needs_repair_ceiling_halt(ctx: Any) -> bool:
     state = _repair_loop_state(ctx)
-    return state is not None and state.ceiling_reached is True
+    return state is not None and state.ceiling_reached is True and run_backed_repair_evidence_exists(ctx)
 
 
 def repair_ceiling_stop_signal(
@@ -1443,7 +1444,7 @@ def _check_enforcement(
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
         state = _repair_loop_state(ctx)
-        # Backstop: the detection-time latch normally raises this above; this catches any increment path that bypassed the latch.
+        # Backstop: detection-time latch normally raises this above; catches a run-backed increment that bypassed it.
         signal = repair_ceiling_stop_signal(ctx, contract, config)
         stash_blocker_signal(ctx, signal)
         stash_repair_ceiling_turn_halt(

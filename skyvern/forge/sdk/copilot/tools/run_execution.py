@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
+    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_security import (
     COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
@@ -2846,7 +2847,7 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
     )
     if _should_arm_recorded_outcome_grounding(copilot_ctx):
         arm_recorded_outcome_grounding_requirement(copilot_ctx)
-    if contract.repair_loop_state.ceiling_reached:
+    if contract.repair_loop_state.ceiling_reached and run_backed_repair_evidence_exists(copilot_ctx):
         signal = repair_ceiling_stop_signal(copilot_ctx, contract)
         stash_blocker_signal(copilot_ctx, signal)
         stash_repair_ceiling_turn_halt(copilot_ctx, signal, consecutive_identical_repair_count=count)

@@ -56,6 +56,7 @@ _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
 _TEXT_MAX = 180
 _REF_TEXT_MAX = 96
+_VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _PLAYWRIGHT_LOCATOR_WAIT_RE = re.compile(
@@ -86,6 +87,7 @@ class RecordedBuildTestOutcome(BaseModel):
     runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
     authored_structure_signature: str | None = None
     display_text: str = ""
+    observed_page_value_excerpt: str = ""
     key_provenance: dict[str, str] = Field(default_factory=dict)
 
     @property
@@ -230,6 +232,17 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
         if isinstance(previous_key, str):
             return previous_key == latest["structural_key"]
     return None
+
+
+def run_backed_repair_evidence_exists(ctx: object) -> bool:
+    fallback_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if isinstance(latest, RecordedBuildTestOutcome):
+        # An author-time reject is never run-backed even if a stale run id lingers on ctx; only a persisted run counts.
+        if latest.phase != "persisted_block_run":
+            return False
+        return bool(latest.workflow_run_id or fallback_run_id)
+    return bool(fallback_run_id)
 
 
 def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGroundingRequirement | None:
@@ -524,6 +537,7 @@ def recorded_outcome_from_author_time_reject(
     structural_payload: Mapping[str, object] | None = None,
     authored_structure_signature: str | None = None,
     observed_evidence_summary: str = "",
+    observed_page_value_excerpt: str = "",
     page_evidence_refs: Sequence[str] = (),
     missing_requested_output_facts: Sequence[Mapping[str, object]] = (),
 ) -> RecordedBuildTestOutcome:
@@ -540,6 +554,7 @@ def recorded_outcome_from_author_time_reject(
         authored_structure_signature=authored_structure_signature,
         missing_requested_output_facts=[dict(fact) for fact in missing_requested_output_facts],
         observed_evidence_summary=_bounded_text(observed_evidence_summary),
+        observed_page_value_excerpt=" ".join(observed_page_value_excerpt.split())[:_VALUE_EXCERPT_MAX],
         page_evidence_refs=_clean_list(page_evidence_refs),
         key_provenance={
             "structural_failure_identity": "author-time validator structural reason",
@@ -612,6 +627,14 @@ def recorded_outcome_from_scout_act_observe_hollow(
     source_origin = _origin_ref(source_url)
     current_origin = _origin_ref(current_url)
     bounded_recapture_result = _bounded_ref(recapture_result)
+    value_excerpt = _observed_page_value_excerpt(page_evidence)
+    LOG.info(
+        "copilot_hollow_value_carry",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        value_excerpt_len=len(value_excerpt),
+        value_excerpt_sha8=hashlib.sha256(value_excerpt.encode()).hexdigest()[:8] if value_excerpt else "",
+        current_origin=current_origin,
+    )
     structural_payload = {
         "interaction_tool": _bounded_ref(interaction_tool),
         "selector": _bounded_ref(selector),
@@ -641,6 +664,7 @@ def recorded_outcome_from_scout_act_observe_hollow(
         structural_failure_identity="scout_act_observe:" + _stable_hash(structural_payload),
         page_evidence_refs=page_refs,
         observed_evidence_summary="Scout interaction reached the page, but bounded page evidence stayed hollow.",
+        observed_page_value_excerpt=value_excerpt,
         key_provenance={
             "structural_failure_identity": "scout interaction identity and bounded hollow page shape",
             "page_evidence_refs": "scout interaction source/current URL origins and structural counts",
@@ -1034,6 +1058,32 @@ def _origin_ref(value: object) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
     return f"origin:{parsed.scheme}://{parsed.netloc}"
+
+
+def _observed_page_value_excerpt(page_evidence: Mapping[str, object] | None) -> str:
+    evidence = page_evidence or {}
+    for key in ("visible_text_excerpt", "visible_text", "bodyText"):
+        text = _safe_str(evidence.get(key))
+        if text.strip():
+            return " ".join(text.split())[:_VALUE_EXCERPT_MAX]
+    return ""
+
+
+def observed_value_extraction_scaffold_lines(observed_values: str, output_paths: Sequence[str]) -> list[str]:
+    observed_values = " ".join(observed_values.split())[:_VALUE_EXCERPT_MAX]
+    if not observed_values:
+        return []
+    paths = [path for path in dict.fromkeys(str(p).strip() for p in output_paths) if path]
+    if not paths:
+        return [f"observed_page_values: {observed_values}"]
+    lines = [
+        "OBSERVED PAGE VALUES CONTRACT: author a keyed extraction over the on-screen values below and bind "
+        "each required output_path to its observed value.",
+        f"observed_values: {observed_values}",
+        "bind_output_paths:",
+    ]
+    lines.extend(f"- {path}: <observed value>" for path in paths[:8])
+    return lines
 
 
 def _hollow_page_shape(page_evidence: Mapping[str, object] | None) -> dict[str, object]:
