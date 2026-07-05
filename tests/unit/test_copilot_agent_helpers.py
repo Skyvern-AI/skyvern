@@ -966,6 +966,53 @@ workflow_definition:
         assert "Use the exact output_path values in goal_value_paths and returned output" in prompt
         assert "output_root is diagnostic grouping only" in prompt
 
+    def test_recorded_build_test_outcome_prompt_surfaces_observed_page_values(self) -> None:
+        long_value = "Request WTR-1842-DEMO for account 100245 confirmed. " + "detail " * 40
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="scout_evaluate",
+                attempted_tool="scout_interaction",
+                attempted_target="#submit",
+                verdict="repairable_failure",
+                reason_code="scout_act_observe_hollow_after_interaction",
+                structural_failure_identity="scout_act_observe:hollow",
+                page_evidence_refs=["origin:https://example.com"],
+                observed_page_value_excerpt=long_value.strip(),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        value_line = next(line for line in prompt.splitlines() if line.startswith("observed_page_values:"))
+        assert "WTR-1842-DEMO" in value_line
+        assert "100245" in value_line
+        assert len(value_line) > 200
+
+    def test_recorded_build_test_outcome_prompt_binds_observed_values_on_metadata_reject(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="author_time_reject",
+                attempted_tool="update_workflow",
+                verdict="authoring_rejected",
+                reason_code="metadata_reject",
+                structural_failure_identity="author_time:metadata_reject",
+                observed_page_value_excerpt="Request WTR-1842-DEMO for account 100245 confirmed.",
+                missing_requested_output_facts=[
+                    {"output_root": "output", "output_path": "output.confirmation_number"},
+                    {"output_root": "output", "output_path": "output.account_number"},
+                ],
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "OBSERVED PAGE VALUES CONTRACT" in prompt
+        assert "observed_values: Request WTR-1842-DEMO for account 100245 confirmed." in prompt
+        assert "- output.confirmation_number: <observed value>" in prompt
+        assert "- output.account_number: <observed value>" in prompt
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""

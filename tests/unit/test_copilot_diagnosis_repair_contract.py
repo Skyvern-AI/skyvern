@@ -479,10 +479,12 @@ def test_uncovered_output_author_reject_reopens_once_then_counts_to_ceiling() ->
     assert ctx.synthesized_block_reopened_for_output_coverage is True
     assert ctx.consecutive_non_converging_repair_count == 0
 
-    counts = [_run_repair_loop_state(ctx).consecutive_identical_repair_count for _ in range(3)]
+    states = [_run_repair_loop_state(ctx) for _ in range(3)]
+    counts = [state.consecutive_identical_repair_count for state in states]
     assert counts == [1, 2, 3]
     assert counts[-1] == settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL
-    assert isinstance(getattr(ctx, "blocker_signal", None), CopilotToolBlockerSignal)
+    assert states[-1].ceiling_reached is True
+    assert ctx.blocker_signal is None
 
 
 def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
