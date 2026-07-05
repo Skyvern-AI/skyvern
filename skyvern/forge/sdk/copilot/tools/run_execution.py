@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
+    RecordedOutcomeGroundingRequirement,
     arm_recorded_outcome_grounding_requirement,
     authored_structure_signature_from_workflow,
     clear_recorded_outcome_grounding_requirement,
@@ -2834,10 +2835,15 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
     prior_count = copilot_ctx.consecutive_non_converging_repair_count
     count = prior_count + 1 if signature == prior_signature else 1
     requirement = copilot_ctx.recorded_outcome_grounding_requirement
-    if isinstance(copilot_ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome) and not signature.endswith(
-        requirement.structural_key if requirement is not None else ""
-    ):
-        clear_recorded_outcome_grounding_requirement(copilot_ctx)
+    if isinstance(requirement, RecordedOutcomeGroundingRequirement):
+        latest = copilot_ctx.latest_recorded_build_test_outcome
+        current_key = latest.structural_key if isinstance(latest, RecordedBuildTestOutcome) else None
+        if (
+            current_key is None
+            or signature != f"recorded_build_test_outcome:{current_key}"
+            or requirement.structural_key != current_key
+        ):
+            clear_recorded_outcome_grounding_requirement(copilot_ctx)
     copilot_ctx.consecutive_non_converging_repair_count = count
     copilot_ctx.last_repair_non_convergence_signature = signature
     contract.repair_loop_state = RepairLoopState(
