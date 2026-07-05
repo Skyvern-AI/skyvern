@@ -18,6 +18,8 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criteria_to_json
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    _schema_boolean_output_paths,
+    _value_matches_expected,
     grade_requested_output_criteria,
     split_requested_output_criteria,
 )
@@ -5021,6 +5023,297 @@ def test_requested_output_independent_evidence_source_does_not_self_attest() -> 
     assert trace.to_trace_data()["verdict_0_self_emitted_judgment_not_independent"] is True
 
 
+def test_shape_judgment_self_emitted_from_runtime_engages_veto_without_exact_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("selected_highest_priority")
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The highest-priority document was correctly selected.",
+            output_path="output.selected_highest_priority",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"selected_highest_priority": True}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].grounding_mode == "judgment_boolean"
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+
+
+def test_presence_only_extraction_typed_independent_by_classifier_stays_veto_exempt() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("document_name")
+    criteria = [
+        _criterion(
+            "c_document_name",
+            "The highest-priority document name is returned.",
+            output_path="output.document_name",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"document_name": "Selected Document.pdf"}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].grounding_mode == "missing"
+    assert verdicts[0].self_emitted_judgment_not_independent is False
+
+
+def _metadata_with_declared_independent_criterion(label: str, output_path: str) -> dict[str, Any]:
+    normalized = output_path.removeprefix("output.")
+    return {
+        label: {
+            "claimed_outcomes": [{"goal_value_paths": [normalized]}],
+            "completion_criteria": [
+                {"output_path": output_path, "requested_output_evidence_source": "independent_run_evidence"}
+            ],
+        }
+    }
+
+
+def test_producer_declared_independent_source_engages_veto_despite_classifier_string_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_with_declared_independent_criterion(
+        "select_document", "output.selected_highest_priority"
+    )
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The highest-priority document was correctly selected.",
+            output_path="output.selected_highest_priority",
+            expected_output_value="true",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"select_document": {"selected_highest_priority": True}},
+            block_output_sources={"select_document": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+    assert verdicts[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+def test_presence_only_producer_declared_independent_path_engages_veto() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_with_declared_independent_criterion(
+        "select_document", "output.selected_highest_priority"
+    )
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The highest-priority document was correctly selected.",
+            output_path="output.selected_highest_priority",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"select_document": {"selected_highest_priority": True}},
+            block_output_sources={"select_document": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].grounding_mode == "missing"
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+
+
+def test_producer_declared_boolean_schema_engages_veto_despite_classifier_string_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {
+        "select_document": {
+            "claimed_outcomes": [
+                {
+                    "goal_value_paths": ["selected_highest_priority"],
+                    "extraction_schema": {
+                        "type": "object",
+                        "properties": {"selected_highest_priority": {"type": "boolean"}},
+                    },
+                }
+            ],
+        }
+    }
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The highest-priority document was correctly selected.",
+            output_path="output.selected_highest_priority",
+            expected_output_value="true",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"select_document": {"selected_highest_priority": True}},
+            block_output_sources={"select_document": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+
+
+def test_schema_boolean_output_paths_captures_array_of_boolean_leaf() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"judgments": {"type": "array", "items": {"type": "boolean"}}},
+    }
+    assert _schema_boolean_output_paths(schema) == {"judgments[]"}
+
+
+def test_array_of_boolean_judgment_path_self_emitted_from_runtime_abstains() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {
+        "select_document": {
+            "claimed_outcomes": [
+                {
+                    "goal_value_paths": ["judgments[]"],
+                    "extraction_schema": {
+                        "type": "object",
+                        "properties": {"judgments": {"type": "array", "items": {"type": "boolean"}}},
+                    },
+                }
+            ],
+        }
+    }
+    criteria = [
+        _criterion(
+            "c_selected",
+            "Each candidate was judged against the highest-priority rule.",
+            output_path="output.judgments[]",
+            expected_output_value="true",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"select_document": {"judgments": [True]}},
+            block_output_sources={"select_document": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+
+
+def test_producer_declared_independent_criterion_stays_in_requested_output_grader_split() -> None:
+    criterion = _criterion(
+        "c_selected",
+        "The highest-priority document was correctly selected.",
+        output_path="output.selected_highest_priority",
+        expected_output_value="true",
+        requested_output_evidence_source="runtime_output",
+    )
+    requested, remaining = split_requested_output_criteria([criterion])
+    assert requested == [criterion]
+    assert remaining == []
+
+
+def test_producer_declared_independent_source_still_satisfies_with_independent_corroboration() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_with_declared_independent_criterion(
+        "select_document", "output.selected_highest_priority"
+    )
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The highest-priority document was correctly selected.",
+            output_path="output.selected_highest_priority",
+            expected_output_value="true",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"page_probe": {"selected_highest_priority": True}},
+            block_output_sources={"page_probe": "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def test_runtime_site_datum_still_self_confirms_when_other_path_declared_independent() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["status", "selected_highest_priority"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.selected_highest_priority",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                }
+            ],
+        }
+    }
+    criteria = [
+        _criterion(
+            "c_status",
+            "The returned record includes status.",
+            output_path="output.status",
+            expected_output_value="Active",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"status": "Active"}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].requested_output_evidence_source == "runtime_output"
+
+
 @pytest.mark.asyncio
 async def test_admitted_code_artifact_metadata_propagates_requested_output_evidence_source() -> None:
     ctx = _run_ctx()
@@ -5522,6 +5815,72 @@ def test_requested_output_ignores_unrelated_block_outputs_when_matching_values(
     assert verdicts[0].state == "unsatisfied"
     assert verdicts[0].reason_code == expected_reason
     assert verdicts[0].evidence_ref == expected_ref
+
+
+def test_requested_output_string_distinct_independent_page_evidence_refutes_matching_self_emission() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        _criterion(
+            "c_confirmation_number",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "extract_profile": {"confirmation_number": "WTR-1842-DEMO"},
+                "current_page_observation": {"confirmation_number": "WTR-9999-WRONG"},
+            },
+            block_output_sources={
+                "extract_profile": "runtime_output",
+                "current_page_observation": "independent_page_evidence",
+            },
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:current_page_observation.confirmation_number"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def test_requested_output_string_distinct_independent_corroborator_mismatch_contradicts() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        _criterion(
+            "c_confirmation_number",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-0000-BAD",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "utility_citrus_turn_on": {"confirmation_number": "WTR-0000-BAD"},
+                "current_page_observation": {"confirmation_number": "WTR-1842-DEMO"},
+            },
+            block_output_sources={
+                "utility_citrus_turn_on": "runtime_output",
+                "current_page_observation": "independent_page_evidence",
+            },
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:current_page_observation.confirmation_number"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
 
 
 def test_requested_output_exact_value_unrelated_sibling_does_not_refute_matching_target() -> None:
@@ -8724,3 +9083,387 @@ def test_completion_contract_not_violated_unavailable_blocks_surfacing() -> None
     # An unavailable verdict means the outcome could not be verified: do not surface
     # the workflow as verified on run status alone.
     assert _completion_contract_not_violated(ctx) is False  # type: ignore[arg-type]
+
+
+def test_judgment_boolean_self_emitted_from_runtime_source_abstains() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("selected_highest_priority")
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The returned record reports the highest-priority selection judgment.",
+            output_path="output.selected_highest_priority",
+            expected_output_value=True,
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"selected_highest_priority": True}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+    assert verdicts[0].grounding_mode == "judgment_boolean"
+
+
+def test_judgment_boolean_confirmed_by_independent_page_evidence() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("selected_highest_priority")
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The returned record reports the highest-priority selection judgment.",
+            output_path="output.selected_highest_priority",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"current_page_observation": {"selected_highest_priority": True}},
+            block_output_sources={"current_page_observation": "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def test_judgment_boolean_refuted_by_independent_page_evidence_at_structured_path() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("selected_highest_priority")
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The returned record reports the highest-priority selection judgment.",
+            output_path="output.selected_highest_priority",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"current_page_observation": {"selected_highest_priority": False}},
+            block_output_sources={"current_page_observation": "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:current_page_observation.selected_highest_priority"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def test_bool_expected_never_matches_container_with_unrelated_nested_boolean() -> None:
+    assert _value_matches_expected({"answer": False, "reviewed": True}, True) is False
+    assert _value_matches_expected([{"answer": False}, {"other": True}], True) is False
+    assert _value_matches_expected(True, True) is True
+    assert _value_matches_expected("true", True) is True
+    assert _value_matches_expected(False, True) is False
+
+
+def test_judgment_boolean_refuted_when_independent_evidence_resolves_false_leaf() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("answer")
+    criteria = [
+        _criterion(
+            "c_answer",
+            "The returned record reports the affirmative judgment.",
+            output_path="output.answer",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"current_page_observation": {"answer": False, "reviewed": True}},
+            block_output_sources={"current_page_observation": "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == "block_outputs:current_page_observation.answer"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def _judgment_shape_abstention() -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id="c_judgment",
+        state="unsatisfied",
+        reason_code="structurally_abstained",
+        evidence_ref="block_outputs:extract_profile.selected_highest_priority",
+        output_path="output.selected_highest_priority",
+        grounding_mode="judgment_boolean",
+        has_exact_value=False,
+        requested_output_evidence_source="independent_run_evidence",
+    )
+
+
+def test_judgment_abstention_gets_no_floor_credit_from_generic_corroboration() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_judgment"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_reach",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="observed_end_state_url",
+            ),
+            _judgment_shape_abstention(),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_value_less_judgment_abstention_never_certifies_via_independent_corroborator() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_judgment"],
+        verdicts=[
+            _judgment_shape_abstention(),
+            CriterionVerdict(
+                criterion_id="c_judgment__requested_output_corroborator",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_source="independent_page_evidence",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_judgment_abstention_rejects_non_independent_corroborator() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_judgment"],
+        verdicts=[
+            _judgment_shape_abstention(),
+            CriterionVerdict(
+                criterion_id="c_judgment__requested_output_corroborator",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_source="runtime_output",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_coerce_result_stamps_evidence_source_from_snapshot_sources() -> None:
+    raw = {
+        "verdicts": [
+            {
+                "criterion_id": "c_corroborator",
+                "satisfied": True,
+                "reason_code": "evidence_confirms",
+                "evidence_ref": "block_outputs:current_page_observation.selected_highest_priority",
+            }
+        ]
+    }
+
+    result = _coerce_result(
+        raw,
+        ["c_corroborator"],
+        block_output_sources={"current_page_observation": "independent_page_evidence"},
+    )
+
+    assert result.verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def _verdict_for(result: CompletionVerificationResult, criterion_id: str) -> CriterionVerdict:
+    return next(verdict for verdict in result.verdicts if verdict.criterion_id == criterion_id)
+
+
+def test_requested_output_corroborator_same_record_self_confirmation_fails_closed() -> None:
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0", "c1", "c1__requested_output_corroborator"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="block_outputs:submit_turn_on_request",
+                grounding_mode="terminal_record",
+                evidence_source="terminal_record",
+            ),
+            CriterionVerdict(
+                criterion_id="c1",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:submit_turn_on_request.confirmation_number",
+                output_path="output.confirmation_number",
+                grounding_mode="shape",
+                requested_output_evidence_source="runtime_output",
+                evidence_source="runtime_output",
+            ),
+            CriterionVerdict(
+                criterion_id="c1__requested_output_corroborator",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="submit_turn_on_request_output",
+            ),
+        ],
+    )
+
+    result = combine_verification_results(["c0", "c1", "c1__requested_output_corroborator"], run_result, [])
+
+    corroborator = _verdict_for(result, "c1__requested_output_corroborator")
+    assert corroborator.state == "unsatisfied"
+    assert corroborator.reason_code == "evidence_contradicts"
+    assert result.is_fully_satisfied() is False
+
+
+def test_requested_output_corroborator_distinct_record_still_satisfies() -> None:
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c1", "c1__requested_output_corroborator"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c1",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:submit_turn_on_request.confirmation_number",
+                output_path="output.confirmation_number",
+                grounding_mode="shape",
+                requested_output_evidence_source="runtime_output",
+                evidence_source="runtime_output",
+            ),
+            CriterionVerdict(
+                criterion_id="c1__requested_output_corroborator",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="observed_end_state_url",
+                evidence_source="independent_page_evidence",
+            ),
+        ],
+    )
+
+    result = combine_verification_results(["c1", "c1__requested_output_corroborator"], run_result, [])
+
+    corroborator = _verdict_for(result, "c1__requested_output_corroborator")
+    assert corroborator.state == "satisfied"
+    assert corroborator.reason_code == "evidence_confirms"
+
+
+def test_coerce_result_stamps_evidence_source_from_bare_label_ref() -> None:
+    raw = {
+        "verdicts": [
+            {
+                "criterion_id": "c_corroborator",
+                "satisfied": True,
+                "reason_code": "evidence_confirms",
+                "evidence_ref": "current_page_observation",
+            }
+        ]
+    }
+
+    result = _coerce_result(
+        raw,
+        ["c_corroborator"],
+        block_output_sources={"current_page_observation": "independent_page_evidence"},
+    )
+
+    assert result.verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def test_bare_label_corroborator_certifies_self_emitted_judgment() -> None:
+    coerced_corroborator = _coerce_result(
+        {
+            "verdicts": [
+                {
+                    "criterion_id": "c_judgment__requested_output_corroborator",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation",
+                }
+            ]
+        },
+        ["c_judgment__requested_output_corroborator"],
+        block_output_sources={"current_page_observation": "independent_page_evidence"},
+    ).verdicts[0]
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_reach", "c_judgment", "c_judgment__requested_output_corroborator"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_reach",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="observed_end_state_url",
+            ),
+            CriterionVerdict(
+                criterion_id="c_judgment",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:select_document.selected_highest_priority",
+                output_path="output.selected_highest_priority",
+                grounding_mode="judgment_boolean",
+                requested_output_evidence_source="independent_run_evidence",
+                evidence_source="runtime_output",
+                self_emitted_judgment_not_independent=True,
+            ),
+            coerced_corroborator,
+        ],
+    )
+
+    result = combine_verification_results(
+        ["c_reach", "c_judgment", "c_judgment__requested_output_corroborator"], run_result, []
+    )
+
+    assert coerced_corroborator.evidence_source == "independent_page_evidence"
+    assert result.is_fully_satisfied() is True
+
+
+def test_requested_output_corroborator_same_record_not_flipped_when_source_is_independent() -> None:
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c1", "c1__requested_output_corroborator"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c1",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="block_outputs:submit_turn_on_request.confirmation_number",
+                output_path="output.confirmation_number",
+                grounding_mode="shape",
+                requested_output_evidence_source="independent_run_evidence",
+                evidence_source="independent_page_evidence",
+            ),
+            CriterionVerdict(
+                criterion_id="c1__requested_output_corroborator",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="submit_turn_on_request_output",
+                evidence_source="independent_page_evidence",
+            ),
+        ],
+    )
+
+    result = combine_verification_results(["c1", "c1__requested_output_corroborator"], run_result, [])
+
+    corroborator = _verdict_for(result, "c1__requested_output_corroborator")
+    assert corroborator.state == "satisfied"
+    assert corroborator.reason_code == "evidence_confirms"
