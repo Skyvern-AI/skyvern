@@ -1212,6 +1212,10 @@ def _record_author_time_reject_outcome(
     block_labels: list[str] | None = None,
     missing_requested_output_facts: list[dict[str, object]] | None = None,
 ) -> None:
+    prior_outcome = ctx.latest_recorded_build_test_outcome
+    observed_page_value_excerpt = (
+        prior_outcome.observed_page_value_excerpt if isinstance(prior_outcome, RecordedBuildTestOutcome) else ""
+    )
     record_build_test_outcome(
         ctx,
         recorded_outcome_from_author_time_reject(
@@ -1220,6 +1224,7 @@ def _record_author_time_reject_outcome(
             structural_payload=structural_payload,
             authored_structure_signature=authored_structure_signature,
             observed_evidence_summary=summary,
+            observed_page_value_excerpt=observed_page_value_excerpt,
             missing_requested_output_facts=missing_requested_output_facts or [],
         ),
     )

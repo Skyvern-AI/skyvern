@@ -6,6 +6,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
+    observed_value_extraction_scaffold_lines,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
@@ -133,7 +134,6 @@ def test_scout_act_observe_hollow_outcome_is_structural_and_privacy_bounded() ->
         recapture_result="timeout",
     )
 
-    dumped = outcome.model_dump(mode="json")
     key_payload = outcome.structural_key_payload
 
     assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
@@ -142,8 +142,122 @@ def test_scout_act_observe_hollow_outcome_is_structural_and_privacy_bounded() ->
     assert "recapture_attempted:true" in outcome.page_evidence_refs
     assert "recapture_result:timeout" in outcome.page_evidence_refs
     for sensitive in ("token=secret", "name=customer", "acme-inc", "claim-123", "Customer name", "Private Account"):
-        assert sensitive not in str(dumped)
         assert sensitive not in str(key_payload)
+
+
+def test_hollow_outcome_carries_observed_value_excerpt_off_the_structural_key() -> None:
+    def _outcome(visible_text: str) -> RecordedBuildTestOutcome:
+        return recorded_outcome_from_scout_act_observe_hollow(
+            interaction_tool="click",
+            selector="#submit",
+            current_url="https://example.com/confirmation",
+            source_url="https://example.com/form",
+            page_evidence={
+                "page_title": "Confirmation",
+                "forms": [],
+                "visible_text_excerpt": visible_text,
+            },
+            recapture_attempted=True,
+            recapture_result="hollow",
+        )
+
+    confirmation = _outcome("Request WTR-1842-DEMO for account 100245 confirmed")
+    other = _outcome("A completely different confirmation body")
+
+    assert "WTR-1842-DEMO" in confirmation.observed_page_value_excerpt
+    assert "100245" in confirmation.observed_page_value_excerpt
+    assert confirmation.structural_key == other.structural_key
+    assert "WTR-1842-DEMO" not in str(confirmation.structural_key_payload)
+
+
+def test_hollow_outcome_value_excerpt_falls_back_to_legacy_text_keys() -> None:
+    from_visible_text = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"visible_text": "Legacy visible text body"},
+        recapture_attempted=False,
+        recapture_result="not_attempted_no_budget",
+    )
+    from_body_text = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"bodyText": "Legacy body text body"},
+        recapture_attempted=False,
+        recapture_result="not_attempted_no_budget",
+    )
+
+    assert from_visible_text.observed_page_value_excerpt == "Legacy visible text body"
+    assert from_body_text.observed_page_value_excerpt == "Legacy body text body"
+
+
+def test_hollow_outcome_value_excerpt_is_bounded_and_key_independent() -> None:
+    long_text = "X" * 5000
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"visible_text_excerpt": long_text},
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+    baseline = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"visible_text_excerpt": ""},
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+
+    assert 0 < len(outcome.observed_page_value_excerpt) <= 700
+    assert baseline.observed_page_value_excerpt == ""
+    assert outcome.structural_key == baseline.structural_key
+
+
+def test_author_time_reject_carries_value_excerpt_off_the_convergence_key() -> None:
+    carried = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={"version": "metadata_reject_output_contract:v1", "signature": "abc"},
+        observed_page_value_excerpt="  Request WTR-1842-DEMO for account 100245  " + "detail " * 400,
+        missing_requested_output_facts=[{"output_path": "output.confirmation_number"}],
+    )
+    baseline = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={"version": "metadata_reject_output_contract:v1", "signature": "abc"},
+        missing_requested_output_facts=[{"output_path": "output.confirmation_number"}],
+    )
+
+    assert "WTR-1842-DEMO" in carried.observed_page_value_excerpt
+    assert 0 < len(carried.observed_page_value_excerpt) <= 700
+    assert "WTR-1842-DEMO" not in str(carried.structural_key_payload)
+    assert carried.structural_key == baseline.structural_key
+
+
+def test_observed_value_extraction_scaffold_binds_output_paths() -> None:
+    scaffold = observed_value_extraction_scaffold_lines(
+        "Request WTR-1842-DEMO for account 100245",
+        ["output.confirmation_number", "output.account_number", "output.confirmation_number"],
+    )
+
+    assert scaffold[0].startswith("OBSERVED PAGE VALUES CONTRACT")
+    assert "observed_values: Request WTR-1842-DEMO for account 100245" in scaffold
+    assert "bind_output_paths:" in scaffold
+    assert "- output.confirmation_number: <observed value>" in scaffold
+    assert "- output.account_number: <observed value>" in scaffold
+    assert sum(1 for line in scaffold if line.startswith("- output.confirmation_number")) == 1
+
+
+def test_observed_value_extraction_scaffold_without_paths_surfaces_values_only() -> None:
+    assert observed_value_extraction_scaffold_lines("Confirmed WTR-1842-DEMO", []) == [
+        "observed_page_values: Confirmed WTR-1842-DEMO"
+    ]
+    assert observed_value_extraction_scaffold_lines("   ", ["output.x"]) == []
 
 
 def test_prose_or_label_only_typed_outcome_is_not_authoritative() -> None:

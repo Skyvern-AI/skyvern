@@ -44,7 +44,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome, RecordedOutcomeGroundingRequirement
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    _VALUE_EXCERPT_MAX,
+    RecordedBuildTestOutcome,
+    RecordedOutcomeGroundingRequirement,
+    observed_value_extraction_scaffold_lines,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
@@ -821,6 +826,23 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
+    if outcome.observed_page_value_excerpt:
+        rendered_values = _clean_authoring_repair_prompt_atom(
+            outcome.observed_page_value_excerpt, max_chars=_VALUE_EXCERPT_MAX
+        )
+        output_paths = [
+            _clean_authoring_repair_prompt_atom(str(fact.get("output_path")))
+            for fact in outcome.missing_requested_output_facts
+            if isinstance(fact, dict) and isinstance(fact.get("output_path"), str) and fact.get("output_path")
+        ]
+        scaffold_lines = observed_value_extraction_scaffold_lines(rendered_values, output_paths)
+        lines.extend(scaffold_lines)
+        LOG.info(
+            "copilot_observed_value_scaffold_surfaced",
+            excerpt_len=len(rendered_values),
+            output_path_count=len(output_paths),
+            scaffold_line_count=len(scaffold_lines),
+        )
     grounding = getattr(ctx, "recorded_outcome_grounding_requirement", None)
     if isinstance(grounding, RecordedOutcomeGroundingRequirement) and grounding.payload is not None:
         payload = grounding.payload
