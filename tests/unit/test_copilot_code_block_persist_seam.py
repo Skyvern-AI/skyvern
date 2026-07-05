@@ -1155,7 +1155,7 @@ class TestCodeRepairProgressClassification:
         result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
 
         assert result["ok"] is False
-        assert "unchanged after the last recorded test outcome" in result["error"]
+        assert "left the frontier the last recorded test outcome named unchanged" in result["error"]
         assert ctx.workflow_yaml == _code_yaml('await page.goto("https://example.com/old")')
         assert ctx.has_staged_proposal is False
         assert ctx.latest_recorded_build_test_outcome is not None

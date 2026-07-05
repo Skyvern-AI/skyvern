@@ -937,7 +937,7 @@ workflow_definition:
         assert "phase: persisted_block_run" in prompt
         assert "reason_code: runtime_block_failure" in prompt
         assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
-        assert "Do not re-emit the same plan against the same structural key" in prompt
+        assert "change the next authored step, selector, extraction, or binding based on" in prompt
 
     def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
         ctx = _ctx(
@@ -6498,6 +6498,7 @@ class TestDeclaredEqualsGradedCompletionCriteria:
             verified_prefix_labels=[],
             verified_block_outputs={},
             post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
             completion_criteria_turn_state=None,
         )
 
@@ -6738,6 +6739,7 @@ class TestDeclaredEqualsGradedCompletionCriteria:
             verified_prefix_labels=[],
             verified_block_outputs={},
             post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
             completion_criteria_turn_state=None,
         )
 

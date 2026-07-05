@@ -1593,6 +1593,15 @@ def _is_hidden_modal_candidate(node: Any) -> bool:
     return False
 
 
+def _is_css_hidden_node(node: Any) -> bool:
+    if not hasattr(node, "has_attr"):
+        return False
+    if node.has_attr("hidden"):
+        return True
+    style = _attr_value(node, "style").replace(" ", "").lower()
+    return "display:none" in style or "visibility:hidden" in style
+
+
 def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     seen_selectors: set[str] = set()
@@ -1714,6 +1723,11 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
 
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
+    for node in soup.find_all(True):
+        if node.decomposed:
+            continue
+        if _is_css_hidden_node(node):
+            node.decompose()
 
     visible_text = _node_text(soup.body if getattr(soup, "body", None) is not None else soup)
     all_nodes = soup.find_all(True)

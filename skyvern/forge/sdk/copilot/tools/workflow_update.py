@@ -32,6 +32,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
+    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
@@ -111,6 +113,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, may
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
+    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
@@ -1174,10 +1177,14 @@ def _is_unresolved_symbol_repair_context(repair_context: CodeAuthoringRepairCont
 _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
 
 
-def _record_code_authoring_guardrail_reject(ctx: AgentContext, *, defer_churn_stop: bool = False) -> None:
+def _record_code_authoring_guardrail_reject(
+    ctx: AgentContext, *, defer_churn_stop: bool = False, frontier_unchanged: bool = False
+) -> None:
     # Callers record the current build-test outcome first so repeat detection compares that key to history.
     repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    if repeated_outcome is False:
+    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
+    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
+    if repeated_outcome is False and not frontier_unchanged:
         ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
@@ -1513,19 +1520,63 @@ def _metadata_violation_categories(violations: list[str]) -> list[str]:
     return categories
 
 
-def _unchanged_after_recorded_outcome_signature(
+class _ConvergenceReject(NamedTuple):
+    authored_structure_signature: str
+    reason: Literal["identical_authored_structure", "frontier_unchanged"]
+    commit_early_terminal: bool
+
+
+def _recorded_outcome_convergence_reject(
     ctx: AgentContext,
     *,
     workflow_yaml: str,
     code_artifact_metadata: object,
-) -> str | None:
+) -> _ConvergenceReject | None:
     latest = ctx.latest_recorded_build_test_outcome
     if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
         return None
     candidate_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
-    if candidate_signature is None or candidate_signature != latest.authored_structure_signature:
+    if candidate_signature is None:
         return None
-    return candidate_signature
+    if candidate_signature == latest.authored_structure_signature:
+        return _ConvergenceReject(candidate_signature, "identical_authored_structure", False)
+    constraint = ctx.recorded_outcome_binding_constraint
+    if not isinstance(constraint, RecordedOutcomeBindingConstraint):
+        return None
+    # An author-time reject re-keys `latest` without an executed run, so keep the binding
+    # anchored to its run-outcome key across consecutive frontier-unchanged rejects until a
+    # real run legitimately re-keys it.
+    if latest.phase != "author_time_reject" and constraint.repeated_structural_key != latest.structural_key:
+        return None
+    candidate_block_signatures = authored_block_signatures_from_workflow(workflow_yaml, code_artifact_metadata)
+    if constraint.owning_block_frontier_moved(candidate_block_signatures):
+        return None
+    return _ConvergenceReject(candidate_signature, "frontier_unchanged", constraint.frontier_uncrossable)
+
+
+def _commit_recorded_outcome_early_terminal(ctx: AgentContext) -> None:
+    constraint = ctx.recorded_outcome_binding_constraint
+    diagnostic_reason = (
+        constraint.diagnostic_reason if isinstance(constraint, RecordedOutcomeBindingConstraint) else "none"
+    )
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=(
+            f"The recorded build-test outcome names an uncrossable page frontier ({diagnostic_reason}) and the "
+            "frontier block is unchanged; stop retrying and report the recorded blocker from the preserved draft."
+        ),
+        user_facing_reason="I can't get past this page, so I'll stop here and report what I found.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="repair_ceiling_reached",
+        blocked_tool="update_workflow",
+    )
+    stash_blocker_signal(ctx, signal)
+    stash_repair_ceiling_turn_halt(
+        ctx, signal, consecutive_identical_repair_count=ctx.consecutive_non_converging_repair_count
+    )
 
 
 def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
@@ -7408,12 +7459,12 @@ async def _update_workflow(
     # New data-write blocks default to surfacing failures rather than swallowing them.
     workflow_yaml = default_data_write_continue_on_failure(workflow_yaml, ctx.workflow_yaml)
 
-    authored_structure_signature = _unchanged_after_recorded_outcome_signature(
+    convergence_reject = _recorded_outcome_convergence_reject(
         ctx,
         workflow_yaml=workflow_yaml,
         code_artifact_metadata=getattr(ctx, "code_artifact_metadata", None),
     )
-    if authored_structure_signature is not None:
+    if convergence_reject is not None:
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
         _record_author_time_reject_outcome(
             ctx,
@@ -7421,17 +7472,27 @@ async def _update_workflow(
             summary="The authored code and output structure are unchanged after the last recorded test outcome.",
             structural_payload={
                 "reason_code": "unchanged_after_recorded_outcome",
-                "authored_structure_signature": authored_structure_signature,
+                "authored_structure_signature": convergence_reject.authored_structure_signature,
                 "block_labels": block_labels,
             },
-            authored_structure_signature=authored_structure_signature,
+            authored_structure_signature=convergence_reject.authored_structure_signature,
             block_labels=block_labels,
         )
-        _record_code_authoring_guardrail_reject(ctx)
+        _record_code_authoring_guardrail_reject(
+            ctx, frontier_unchanged=convergence_reject.reason == "frontier_unchanged"
+        )
+        LOG.info(
+            "copilot recorded outcome convergence behavior",
+            convergence_reason=convergence_reject.reason,
+            commit_early_terminal=convergence_reject.commit_early_terminal,
+            block_labels=block_labels,
+        )
+        if convergence_reject.commit_early_terminal:
+            _commit_recorded_outcome_early_terminal(ctx)
         return reject(
             error=(
-                "Submitted workflow is unchanged after the last recorded test outcome. "
-                "Revise the code block or output metadata before testing again."
+                "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
+                "Revise the code block or output metadata that owns that frontier before testing again."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),

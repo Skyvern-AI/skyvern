@@ -47,6 +47,7 @@ from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
     RecordedOutcomeGroundingRequirement,
     observed_value_extraction_scaffold_lines,
 )
@@ -58,6 +59,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSnapshot,
+    apply_requested_output_producer_floor,
     build_turn_state,
     reconcile_completion_criteria,
 )
@@ -410,28 +412,45 @@ def _stored_active_completion_criteria(
     return list(snapshot.active.criteria)
 
 
+def _log_requested_output_producer_floor(rekeyed_paths: tuple[str, ...]) -> None:
+    if not rekeyed_paths:
+        return
+    LOG.info(
+        "copilot requested-output producer floor",
+        requested_output_floor_rekeyed_paths=list(rekeyed_paths),
+        requested_output_floor_rekeyed_count=len(rekeyed_paths),
+    )
+
+
 def _reconcile_completion_criteria_on_context(
     ctx: CopilotContext,
     policy: RequestPolicy,
     policy_inputs: RequestPolicyGuardrailInputs,
 ) -> None:
+    fresh_criteria = list(policy.completion_criteria)
+    floored_fresh, fresh_floor_rekeyed_paths = apply_requested_output_producer_floor(fresh_criteria)
+    if fresh_floor_rekeyed_paths:
+        policy.completion_criteria = list(floored_fresh)
     snapshot = policy_inputs.stored_completion_criteria
     if snapshot is None:
+        _log_requested_output_producer_floor(fresh_floor_rekeyed_paths)
         return
     requested_output_path_aliases = (
         ctx.copilot_config.requested_output_path_aliases if ctx.copilot_config is not None else None
     )
     decision = reconcile_completion_criteria(
         snapshot,
-        list(policy.completion_criteria),
+        fresh_criteria,
         actionable=policy.user_response_policy != "ask_clarification",
         requested_output_path_aliases=requested_output_path_aliases,
     )
-    if decision.action == "adopt_stored":
-        policy.completion_criteria = list(decision.criteria)
     ctx.completion_criteria_turn_state = build_turn_state(snapshot, decision)
     record_criteria_lifecycle(ctx, decision.to_trace_data())
     LOG.info("copilot completion criteria reconciled", **decision.to_trace_data())
+    floored_criteria, floor_rekeyed_paths = apply_requested_output_producer_floor(decision.criteria)
+    if decision.action == "adopt_stored" or floor_rekeyed_paths:
+        policy.completion_criteria = list(floored_criteria)
+    _log_requested_output_producer_floor(floor_rekeyed_paths)
 
 
 def _store_request_policy_on_context(
@@ -892,10 +911,23 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
             lines.append(
                 f"challenge_controls: {_render_authoring_repair_prompt_list(payload.challenge_control_summaries)}"
             )
-    lines.append(
-        "Before saving or rerunning, change the next authored step, selector, extraction, or binding based on this "
-        "recorded structure. Do not re-emit the same plan against the same structural key."
-    )
+    binding = ctx.recorded_outcome_binding_constraint
+    if isinstance(binding, RecordedOutcomeBindingConstraint):
+        lines.extend(
+            [
+                "RECORDED OUTCOME BINDING CONSTRAINT:",
+                f"frontier_facet: {_clean_authoring_repair_prompt_atom(binding.frontier_facet)}",
+                f"owning_block_labels: {_render_authoring_repair_prompt_list(binding.owning_block_labels)}",
+                f"diagnostic_reason: {_clean_authoring_repair_prompt_atom(binding.diagnostic_reason)}",
+                "The next authored change must move the named frontier facet on the owning block(s); an unchanged "
+                "frontier is rejected before rerun.",
+            ]
+        )
+    else:
+        lines.append(
+            "Before saving or rerunning, change the next authored step, selector, extraction, or binding based on "
+            "this recorded structure."
+        )
     return "\n\n" + "\n".join(line for line in lines if line)
 
 

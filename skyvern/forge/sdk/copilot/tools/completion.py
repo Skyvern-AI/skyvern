@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 
@@ -73,6 +73,10 @@ from .blockers import (
 LOG = structlog.get_logger()
 
 _TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+_POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
+# Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
+# and observation flag cannot be traversed as observed page content.
+_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
 _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
@@ -729,6 +733,44 @@ def _artifact_health_blocker_from_result(
     return reason, failed_labels, failure_classes
 
 
+class _PostRunPageEvidenceCtx(Protocol):
+    composition_page_evidence: Mapping[str, Any] | None
+
+
+def _same_run_post_run_page_evidence(
+    copilot_ctx: _PostRunPageEvidenceCtx, run_id: str | None
+) -> Mapping[str, Any] | None:
+    """Post-run page evidence stamped for the graded run, admitted only when its own
+    ``workflow_run_id`` matches and it was observed after the run, so a stale pre-run page cannot certify."""
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    evidence = copilot_ctx.composition_page_evidence
+    if not isinstance(evidence, Mapping):
+        return None
+    if evidence.get("observed_after_workflow_run") is not True:
+        return None
+    if evidence.get("workflow_run_id") != run_id:
+        return None
+    return evidence
+
+
+def _bind_independent_post_run_page_evidence(
+    copilot_ctx: _PostRunPageEvidenceCtx,
+    run_id: str | None,
+    block_outputs: dict[str, Any],
+    block_output_sources: dict[str, EvidenceSourceKind],
+) -> None:
+    if _POST_RUN_PAGE_OBSERVATION_LABEL in block_outputs:
+        return
+    evidence = _same_run_post_run_page_evidence(copilot_ctx, run_id)
+    if evidence is None:
+        return
+    block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL] = {
+        key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS
+    }
+    block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
+
+
 def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> RunEvidenceSnapshot:
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
@@ -774,10 +816,13 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             else:
                 block_outputs[registered_block_label] = registered_output_value
                 block_output_sources[registered_block_label] = "registered_output_parameter"
+    run_id = data.get("workflow_run_id")
+    _bind_independent_post_run_page_evidence(
+        copilot_ctx, run_id if isinstance(run_id, str) else None, block_outputs, block_output_sources
+    )
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
-    run_id = data.get("workflow_run_id")
     run_terminal_status = data.get("overall_status")
     failure_reasons = [" ".join(reason.split()) for reason in iter_failure_reasons(result)]
     _artifact_reason, artifact_failed_labels, artifact_failure_classes = _artifact_health_blocker_from_result(
