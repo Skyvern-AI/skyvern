@@ -6491,10 +6491,15 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
             )
 
-        if not need_call_webhook:
-            return
-
-        await self.execute_workflow_webhook(workflow_run, api_key)
+        try:
+            if need_call_webhook:
+                await self.execute_workflow_webhook(workflow_run, api_key)
+        finally:
+            # Run contexts hold parameters/secrets/outputs and are keyed per
+            # run; without eviction they accumulate for the process lifetime.
+            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
+            for child_workflow_run_id in child_workflow_run_ids:
+                app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
 
     async def prepare_workflow_webhook(
         self,

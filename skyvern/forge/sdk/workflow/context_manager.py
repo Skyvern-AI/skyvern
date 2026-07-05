@@ -1684,6 +1684,9 @@ class WorkflowContextManager:
         self._validate_workflow_run_context(workflow_run_id)
         return self.workflow_run_contexts[workflow_run_id]
 
+    def remove_workflow_run_context(self, workflow_run_id: str) -> None:
+        self.workflow_run_contexts.pop(workflow_run_id, None)
+
     async def register_block_parameters_for_workflow_run(
         self,
         workflow_run_id: str,
