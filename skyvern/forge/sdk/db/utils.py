@@ -318,6 +318,11 @@ def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = 
 def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
     if debug_enabled:
         LOG.debug("Converting TaskModel to Task", task_id=task_obj.task_id)
+    extracted_information = task_obj.extracted_information
+    if extracted_information is not None and not isinstance(extracted_information, (dict, list, str)):
+        # LLM extraction can store a bare JSON scalar (bool/int/float); coerce to its JSON
+        # string form so one such row can't fail Task validation and break a whole listing.
+        extracted_information = json.dumps(extracted_information, default=str)
     task = Task(
         task_id=task_obj.task_id,
         status=TaskStatus(task_obj.status),
@@ -337,7 +342,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         navigation_goal=task_obj.navigation_goal,
         data_extraction_goal=task_obj.data_extraction_goal,
         navigation_payload=task_obj.navigation_payload,
-        extracted_information=task_obj.extracted_information,
+        extracted_information=extracted_information,
         failure_reason=task_obj.failure_reason,
         organization_id=task_obj.organization_id,
         proxy_location=deserialize_proxy_location(task_obj.proxy_location),
