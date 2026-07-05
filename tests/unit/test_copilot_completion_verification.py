@@ -16,7 +16,11 @@ from skyvern.forge.sdk.copilot.agent import (
     _rewrite_failed_test_response,
     _verified_workflow_or_none,
 )
-from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criteria_to_json
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    apply_requested_output_producer_floor,
+    criteria_from_json,
+    criteria_to_json,
+)
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
     _schema_boolean_output_paths,
     _value_matches_expected,
@@ -95,6 +99,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _watchdog_exit_allows_terminal_promotion,
 )
 from skyvern.forge.sdk.copilot.tools.completion import (
+    _POST_RUN_PAGE_OBSERVATION_LABEL,
     _artifact_health_blocker_from_result,
     _reconcile_download_completion_criterion,
 )
@@ -9467,3 +9472,481 @@ def test_requested_output_corroborator_same_record_not_flipped_when_source_is_in
     corroborator = _verdict_for(result, "c1__requested_output_corroborator")
     assert corroborator.state == "satisfied"
     assert corroborator.reason_code == "evidence_confirms"
+
+
+def _post_run_page_evidence(*, run_id: str, visible_text_excerpt: str, **structured: object) -> dict[str, Any]:
+    return {
+        "workflow_run_id": run_id,
+        "observed_after_workflow_run": True,
+        "current_url": "https://example.test/confirmation",
+        "visible_text_excerpt": visible_text_excerpt,
+        **structured,
+    }
+
+
+def test_same_run_post_run_page_evidence_binds_structured_under_reserved_independent_label() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="Confirmation Number WTR-1842-DEMO",
+        confirmation_number="WTR-1842-DEMO",
+    )
+
+    snapshot = _build_run_evidence_snapshot(ctx, _requested_output_result({"note": "ok"}))
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert snapshot.block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] == "independent_page_evidence"
+    assert bound["confirmation_number"] == "WTR-1842-DEMO"
+    assert bound["visible_text_excerpt"] == "Confirmation Number WTR-1842-DEMO"
+    assert "workflow_run_id" not in bound
+    assert "observed_after_workflow_run" not in bound
+    assert snapshot.block_output_sources["extract_profile"] == "runtime_output"
+
+
+def test_same_run_post_run_page_evidence_positive_arm_confirms_reached_value() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="Confirmation Number WTR-1842-DEMO",
+        confirmation_number="WTR-1842-DEMO",
+    )
+
+    snapshot = _build_run_evidence_snapshot(ctx, _requested_output_result({"note": "ok"}))
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        [
+            _criterion(
+                "c_confirmation_number",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_value="WTR-1842-DEMO",
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ],
+        snapshot,
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    result = CompletionVerificationResult(
+        status="evaluated", criterion_ids=["c_confirmation_number"], verdicts=verdicts
+    )
+    assert result.is_fully_satisfied() is True
+
+
+def test_post_run_page_evidence_from_a_different_run_is_not_bound() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_stale_prior_run",
+        visible_text_excerpt="Confirmation Number WTR-1842-DEMO",
+    )
+
+    snapshot = _build_run_evidence_snapshot(ctx, _requested_output_result({"note": "ok"}))
+
+    assert _POST_RUN_PAGE_OBSERVATION_LABEL not in snapshot.block_outputs
+    assert _POST_RUN_PAGE_OBSERVATION_LABEL not in snapshot.block_output_sources
+
+
+def test_pre_run_page_evidence_without_post_run_stamp_is_not_bound() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_requested_output",
+        "visible_text_excerpt": "Confirmation Number WTR-1842-DEMO",
+    }
+
+    snapshot = _build_run_evidence_snapshot(ctx, _requested_output_result({"note": "ok"}))
+
+    assert _POST_RUN_PAGE_OBSERVATION_LABEL not in snapshot.block_outputs
+
+
+def test_independent_page_text_substring_alone_never_confirms_reached_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        _criterion(
+            "c_confirmation_number",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "visible_text_excerpt": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+                }
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_source is None
+
+
+def test_generic_static_page_chrome_phrase_never_confirms_on_non_reached_goal() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        _criterion(
+            "c_status",
+            "The submission status is returned.",
+            output_path="output.status",
+            expected_output_value="Application submitted successfully",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "visible_text_excerpt": "Home  Application submitted successfully  Contact us",
+                }
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_source is None
+
+
+def test_independent_page_evidence_text_alone_still_does_not_confirm_authored_prose() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        _criterion(
+            "c_confirmation_number",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "evidence_text": "Water Service Request Submitted. Confirmation Number WTR-1842-DEMO.",
+                }
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+
+
+def test_independent_page_text_never_confirms_a_boolean_via_prose() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("passed_validation")
+    criteria = [
+        replace(
+            _criterion(
+                "c_passed_validation",
+                "Validation passed.",
+                output_path="output.passed_validation",
+                expected_output_shape="goal_judgment_boolean",
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            expected_output_value=True,
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {"visible_text_excerpt": "Status: true. Everything looks true."}
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code != "evidence_confirms"
+
+
+def test_structured_contradiction_masks_the_text_confirmation_door() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        _criterion(
+            "c_confirmation_number",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "confirmation_number": "WTR-9999-OTHER",
+                    "visible_text_excerpt": "Confirmation Number WTR-1842-DEMO",
+                }
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+def test_registered_artifact_content_confirms_structured_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("confirmation_number")
+    criteria = [
+        _criterion(
+            "c_confirmation_number",
+            "The returned record includes confirmation number.",
+            output_path="output.confirmation_number",
+            expected_output_value="WTR-1842-DEMO",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"artifact_content": {"confirmation_number": "WTR-1842-DEMO"}},
+            block_output_sources={"artifact_content": "registered_artifact_content"},
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_source == "registered_artifact_content"
+
+
+def test_self_emitted_judgment_without_independent_corroborator_still_vetoes() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("selected_highest_priority")
+    criteria = [
+        _criterion(
+            "c_selected",
+            "The highest-priority document was correctly selected.",
+            output_path="output.selected_highest_priority",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"selected_highest_priority": True}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].self_emitted_judgment_not_independent is True
+    result = CompletionVerificationResult(status="evaluated", criterion_ids=["c_selected"], verdicts=verdicts)
+    assert result.is_fully_satisfied() is False
+
+
+def test_producer_floor_rekeys_presence_only_requested_output_to_run_outcome() -> None:
+    criteria = [
+        _criterion(
+            "c_presence_only",
+            "The confirmation number is returned.",
+            output_path="output.confirmation_number",
+        )
+    ]
+
+    floored, rekeyed_paths = apply_requested_output_producer_floor(criteria)
+
+    assert rekeyed_paths == ("output.confirmation_number",)
+    assert floored[0].output_path is None
+    assert floored[0].level == "run"
+    assert floored[0].kind == "outcome"
+    assert floored[0].outcome == "The confirmation number is returned."
+    requested, _remaining = split_requested_output_criteria(list(floored))
+    assert requested == []
+
+
+def test_producer_floor_leaves_typed_value_shape_and_judgment_booleans_untouched() -> None:
+    criteria = [
+        _criterion(
+            "c_value",
+            "The NPI is returned.",
+            output_path="output.npi",
+            expected_output_value="1234567890",
+        ),
+        _criterion(
+            "c_shape",
+            "The confirmation number is returned.",
+            output_path="output.confirmation_number",
+            expected_output_shape="reference_code",
+        ),
+        _criterion(
+            "c_bool",
+            "Validation passed.",
+            output_path="output.passed_validation",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        ),
+    ]
+
+    floored, rekeyed_paths = apply_requested_output_producer_floor(criteria)
+
+    assert rekeyed_paths == ()
+    assert floored == tuple(criteria)
+
+
+def test_producer_floor_is_idempotent() -> None:
+    criteria = [
+        _criterion(
+            "c_presence_only",
+            "The confirmation number is returned.",
+            output_path="output.confirmation_number",
+        )
+    ]
+
+    once, _rekeyed = apply_requested_output_producer_floor(criteria)
+    twice, rekeyed_twice = apply_requested_output_producer_floor(once)
+
+    assert rekeyed_twice == ()
+    assert twice == once
+
+
+@pytest.mark.parametrize("generic_expected", ["Yes", "Submitted", "Approved", "7", "in progress", "not found"])
+def test_short_generic_expected_value_does_not_confirm_via_page_chrome(generic_expected: str) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("status")
+    criteria = [
+        _criterion(
+            "c_status",
+            "The returned record includes status.",
+            output_path="output.status",
+            expected_output_value=generic_expected,
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "visible_text_excerpt": f"Home Submitted Approved Yes No 7 items {generic_expected}",
+                }
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code != "evidence_confirms"
+
+
+@pytest.mark.parametrize(
+    "distinctive_expected, page_text",
+    [
+        ("Order 84213 confirmed", "Your Order 84213 confirmed. Thank you for your purchase."),
+        ("INV-2024-001", "Invoice INV-2024-001 has been generated and emailed."),
+    ],
+)
+def test_distinctive_expected_value_in_page_text_alone_no_longer_confirms(
+    distinctive_expected: str, page_text: str
+) -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("reference")
+    criteria = [
+        _criterion(
+            "c_reference",
+            "The returned record includes reference.",
+            output_path="output.reference",
+            expected_output_value=distinctive_expected,
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={_POST_RUN_PAGE_OBSERVATION_LABEL: {"visible_text_excerpt": page_text}},
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "missing_exact_field"
+    assert verdicts[0].evidence_source is None
+
+
+def test_judgment_declared_string_value_does_not_confirm_via_page_text_door() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_with_declared_independent_criterion("select_plan", "output.selected_plan")
+    criteria = [
+        _criterion(
+            "c_selected_plan",
+            "The cheapest plan was selected.",
+            output_path="output.selected_plan",
+            expected_output_value="Plan-Gold-4000",
+            requested_output_evidence_source="runtime_output",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "visible_text_excerpt": "Compare plans: Plan-Silver-2000, Plan-Gold-4000, Plan-Bronze-1000.",
+                }
+            },
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code != "evidence_confirms"
+
+
+def test_bound_post_run_page_evidence_drops_only_stamp_keys() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_requested_output",
+        "observed_after_workflow_run": True,
+        "current_url": "https://example.test/confirmation",
+        "visible_text_excerpt": "Confirmation Number WTR-1842-DEMO",
+        "status": "shipped",
+    }
+
+    snapshot = _build_run_evidence_snapshot(ctx, _requested_output_result({"note": "ok"}))
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert bound == {
+        "current_url": "https://example.test/confirmation",
+        "visible_text_excerpt": "Confirmation Number WTR-1842-DEMO",
+        "status": "shipped",
+    }
+    assert "workflow_run_id" not in bound
+    assert "observed_after_workflow_run" not in bound

@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
+    _binding_frontier_facet,
+    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
     observed_value_extraction_scaffold_lines,
@@ -397,6 +400,119 @@ def test_authored_structure_signature_is_stable_and_excludes_raw_code_or_prose()
     assert signature == same_structure
     assert "page.goto" not in str(dumped)
     assert "Find the exact provider" not in str(dumped)
+
+
+def test_binding_frontier_facet_derivation_per_reason_code() -> None:
+    def _outcome(**updates: object) -> RecordedBuildTestOutcome:
+        base: dict[str, object] = {
+            "phase": "persisted_block_run",
+            "verdict": "repairable_failure",
+            "reason_code": "runtime_block_failure",
+            "structural_failure_identity": "runtime:x",
+        }
+        base.update(updates)
+        return RecordedBuildTestOutcome(**base)  # type: ignore[arg-type]
+
+    assert _binding_frontier_facet(_outcome()) == "selector_frontier"
+    assert _binding_frontier_facet(_outcome(reason_code="sandbox_unresolved_name")) == "amend_in_place"
+    assert _binding_frontier_facet(_outcome(reason_code="synthesized_parameter_binding_ambiguous")) == "amend_in_place"
+    assert _binding_frontier_facet(_outcome(reason_code="outcome_not_demonstrated")) == "value_shape"
+    assert (
+        _binding_frontier_facet(_outcome(reason_code="scout_act_observe_hollow_after_interaction"))
+        == "unexecuted_submit"
+    )
+    assert (
+        _binding_frontier_facet(_outcome(missing_requested_output_facts=[{"output_path": "records[].npi"}]))
+        == "value_shape"
+    )
+    assert (
+        _binding_frontier_facet(_outcome(runtime_output_repair_facts=[{"output_path": "records[].npi"}]))
+        == "amend_in_place"
+    )
+
+
+def test_authored_block_signatures_track_only_owning_block_frontier_movement() -> None:
+    base = """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        parameter_keys:
+        - provider_query
+        code: |
+          return {"records": [{"npi": "123"}]}
+      - block_type: code
+        label: format_output
+        code: |
+          return {"formatted": True}
+    """
+    changed_owning = base.replace('"123"', '"456"')
+    changed_other = base.replace('"formatted": True', '"formatted": False')
+
+    baseline = authored_block_signatures_from_workflow(base, None)
+    assert set(baseline) == {"search_registry", "format_output"}
+
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key="k",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_registry"],
+        recorded_block_signatures={"search_registry": baseline["search_registry"]},
+    )
+
+    assert constraint.owning_block_frontier_moved(baseline) is False
+    assert constraint.owning_block_frontier_moved(authored_block_signatures_from_workflow(changed_other, None)) is False
+    assert constraint.owning_block_frontier_moved(authored_block_signatures_from_workflow(changed_owning, None)) is True
+    assert constraint.owning_block_frontier_moved({}) is True
+
+
+def test_authored_block_signatures_ignore_cosmetic_block_fields() -> None:
+    base = """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        parameter_keys:
+        - provider_query
+        code: |
+          return {"records": [{"npi": "123"}]}
+    """
+    described = base.replace(
+        "        label: search_registry\n",
+        "        label: search_registry\n        description: look up the provider by name\n",
+    )
+    continue_on_failure = base.replace(
+        "        label: search_registry\n",
+        "        label: search_registry\n        continue_on_failure: true\n",
+    )
+    renamed = base.replace("search_registry", "lookup_registry")
+
+    baseline = authored_block_signatures_from_workflow(base, None)
+    assert authored_block_signatures_from_workflow(described, None) == baseline
+    assert authored_block_signatures_from_workflow(continue_on_failure, None) == baseline
+
+    renamed_signatures = authored_block_signatures_from_workflow(renamed, None)
+    assert set(renamed_signatures) == {"lookup_registry"}
+    assert renamed_signatures["lookup_registry"] == baseline["search_registry"]
+
+
+def test_binding_constraint_uncrossable_reflects_diagnostic_reason() -> None:
+    def _constraint(reason: str) -> RecordedOutcomeBindingConstraint:
+        return RecordedOutcomeBindingConstraint(
+            repeated_structural_key="k",
+            phase="persisted_block_run",
+            reason_code="runtime_block_failure",
+            frontier_facet="selector_frontier",
+            diagnostic_reason=reason,  # type: ignore[arg-type]
+        )
+
+    assert _constraint("none").frontier_uncrossable is False
+    assert _constraint("empty_page").frontier_uncrossable is True
+    assert _constraint("challenge_gated").frontier_uncrossable is True
+    assert _constraint("capture_degraded").frontier_uncrossable is True
 
 
 def test_authored_structure_signature_changes_on_code_parameter_or_output_structure() -> None:
