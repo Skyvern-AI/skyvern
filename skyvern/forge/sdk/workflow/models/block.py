@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.ssrf import validate_public_http_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
@@ -9092,6 +9093,19 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
 
+        try:
+            validate_public_http_url(self.url)
+        except SkyvernException as e:
+            masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
+            return await self.build_block_result(
+                success=False,
+                failure_reason=masked_error,
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         # Add default content-type as application/json if not provided (unless files are being uploaded)
         if not self.headers:
             self.headers = {}
@@ -9255,6 +9269,7 @@ class HttpRequestBlock(Block):
                 files=self.files,
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
+                validate_public_network=True,
             )
 
             success = 200 <= status_code < 300

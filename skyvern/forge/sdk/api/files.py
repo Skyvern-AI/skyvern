@@ -32,11 +32,8 @@ from skyvern.forge.sdk.core.aiohttp_helper import (
     validate_and_pin_fetch_url,
     validate_and_pin_redirect_url,
 )
-from skyvern.utils.url_validators import (
-    MAX_SAFE_REDIRECTS,
-    SAFE_REDIRECT_STATUS_CODES,
-    encode_url,
-)
+from skyvern.forge.sdk.core.ssrf import create_public_network_trace_config
+from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, SAFE_REDIRECT_STATUS_CODES, encode_url
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -239,10 +236,14 @@ async def download_file(
                 LOG.info("Downloading file from local file system", url=url)
                 return local_path
 
-        resolver = SSRFGuardedResolver()
+        resolver = SSRFGuardedResolver(require_public_network=True)
         current_url = await validate_and_pin_fetch_url(url, resolver)
         request_headers = dict(headers or {})
-        async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
+        async with aiohttp.ClientSession(
+            connector=ssrf_guarded_tcp_connector(resolver),
+            # Validate the exact URL aiohttp dispatches; numeric hosts can bypass resolver callbacks.
+            trace_configs=[create_public_network_trace_config()],
+        ) as session:
             LOG.info("Starting to download file", url=url)
             for _ in range(MAX_SAFE_REDIRECTS + 1):
                 encoded_url = encode_url(current_url)
