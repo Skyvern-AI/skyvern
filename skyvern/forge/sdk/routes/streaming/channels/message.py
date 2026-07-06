@@ -15,6 +15,7 @@ Channel data:
 import asyncio
 import dataclasses
 import enum
+import math
 import typing as t
 
 import structlog
@@ -38,7 +39,6 @@ from skyvern.forge.sdk.routes.streaming.verify import (
     verify_workflow_run,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
-from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
@@ -133,6 +133,12 @@ class MessageInBeginExfiltration(Message):
     kind: t.Literal[MessageKind.BEGIN_EXFILTRATION] = MessageKind.BEGIN_EXFILTRATION
     workflow_permanent_id: str | None = None
     live_interpretation_enabled: bool = False
+    # Client capability: true only when the frontend understands delta interpretation
+    # updates. Defaults false so older clients keep receiving full snapshots.
+    supports_interpretation_deltas: bool = False
+    # Per-recording id from the client. Distinguishes a reconnect (same id, reuse
+    # session) from a new recording (new id, fresh session). None on older clients.
+    recording_attempt_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -268,6 +274,8 @@ class MessageOutRecordingInterpretationUpdate(Message):
     interpretation_session_id: str = ""
     session_revision: int = 0
     steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
+    changed_steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
+    is_snapshot: bool = True
     pending: bool = False
     finalized: bool = False
 
@@ -311,10 +319,7 @@ MessageOut = (
 )
 
 
-ChannelMessage = MessageIn | MessageOut
-
-
-def reify_channel_message(data: dict) -> ChannelMessage:
+def reify_channel_message(data: dict) -> MessageIn:
     kind = data.get("kind", None)
 
     match kind:
@@ -323,9 +328,12 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInAskForClipboardResponse(text=text)
         case MessageKind.BEGIN_EXFILTRATION:
             workflow_permanent_id = data.get("workflow_permanent_id")
+            recording_attempt_id = data.get("recording_attempt_id")
             return MessageInBeginExfiltration(
                 workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
                 live_interpretation_enabled=bool(data.get("live_interpretation_enabled") or False),
+                supports_interpretation_deltas=bool(data.get("supports_interpretation_deltas") or False),
+                recording_attempt_id=recording_attempt_id if isinstance(recording_attempt_id, str) else None,
             )
         case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
@@ -377,14 +385,27 @@ def message_to_dict(message: MessageOut) -> dict:
         if isinstance(obj, enum.Enum):
             return obj.value
         if isinstance(obj, BaseModel):
-            return obj.model_dump(mode="json")
+            return _replace_non_finite(obj.model_dump(mode="json"))
         if isinstance(obj, list):
             return [convert_value(item) for item in obj]
         if isinstance(obj, dict):
             return {key: convert_value(value) for key, value in obj.items()}
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
         return obj
 
     return {key: convert_value(value) for key, value in dataclasses.asdict(message).items()}
+
+
+def _replace_non_finite(obj: t.Any) -> t.Any:
+    """NaN/Infinity are not valid JSON; JSON.parse rejects them and drops the whole frame."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, list):
+        return [_replace_non_finite(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _replace_non_finite(value) for key, value in obj.items()}
+    return obj
 
 
 @dataclasses.dataclass
@@ -397,7 +418,10 @@ class MessageChannel:
     organization_id: str
     websocket: WebSocket
     # --
-    out_queue: asyncio.Queue[MessageOut] = dataclasses.field(default_factory=asyncio.Queue)  # warn: unbounded
+    # Every outbound frame goes through here so backend_to_frontend is the single
+    # websocket writer. Carries MessageOut (serialized by the pump) or a pre-built
+    # dict for out-of-band frames (clipboard) that aren't modeled as MessageOut.
+    out_queue: asyncio.Queue[MessageOut | dict] = dataclasses.field(default_factory=asyncio.Queue)  # warn: unbounded
     browser_session: AddressablePersistentBrowserSession | None = None
     workflow_run: WorkflowRun | None = None
 
@@ -442,84 +466,6 @@ class MessageChannel:
 
         return True
 
-    async def drain(self) -> list[dict | MessageOut]:
-        datums: list[dict | MessageOut] = []
-
-        result = await asyncio.gather(
-            self.receive_from_out_queue(),
-            self.receive_from_user(),
-        )
-
-        # NOTE(jdo): mypy seems to be unable to infer this, whereas pylance has
-        # no issue; added explicit type hints here to help mypy out.
-        out_queue: list[MessageOut] = result[0]
-        in_queue: list[dict] = result[1]
-
-        for out_message in out_queue:
-            datums.append(out_message)
-
-        for in_message in in_queue:
-            if isinstance(in_message, dict):
-                datums.append(in_message)
-            else:
-                LOG.error(
-                    f"{self.class_name} drain dropping user message: unexpected result type: {type(in_message)}",
-                    message=in_message,
-                    **self.identity,
-                )
-
-        if datums:
-            LOG.debug(f"{self.class_name} Drained {len(datums)} messages from message channel.", **self.identity)
-
-        return datums
-
-    async def receive_from_user(self) -> list[dict]:
-        datums: list[dict] = []
-
-        while True:
-            try:
-                data = await asyncio.wait_for(self.websocket.receive_json(), timeout=0.001)
-                datums.append(data)
-            except asyncio.TimeoutError:
-                break
-            except RuntimeError as ex:
-                if "not connected" in str(ex).lower():
-                    break
-            except WebSocketDisconnect:
-                LOG.warning(f"{self.class_name} Disconnected while receiving message from channel", **self.identity)
-                break
-            except Exception:
-                LOG.exception(f"{self.class_name} Failed to receive message from message channel", **self.identity)
-                break
-
-        return datums
-
-    async def receive_from_out_queue(self) -> list[MessageOut]:
-        datums: list[MessageOut] = []
-
-        while True:
-            try:
-                data = await asyncio.wait_for(self.out_queue.get(), timeout=0.001)
-                datums.append(data)
-            except asyncio.TimeoutError:
-                break
-            except asyncio.QueueEmpty:
-                break
-
-        return datums
-
-    def receive_from_out_queue_nowait(self) -> list[MessageOut]:
-        datums: list[MessageOut] = []
-
-        while True:
-            try:
-                data = self.out_queue.get_nowait()
-                datums.append(data)
-            except asyncio.QueueEmpty:
-                break
-
-        return datums
-
     # async def send(self, *, messages: list[dict]) -> t.Self:
     async def send(self, *, messages: list[MessageOut]) -> t.Self:
         for message in messages:
@@ -535,28 +481,14 @@ class MessageChannel:
 
     async def ask_for_clipboard(self) -> None:
         LOG.info(f"{self.class_name} Sending ask-for-clipboard to message channel", **self.identity)
-
-        try:
-            await self.websocket.send_json(
-                {
-                    "kind": "ask-for-clipboard",
-                }
-            )
-        except Exception:
-            LOG.exception(f"{self.class_name} Failed to send ask-for-clipboard to message channel", **self.identity)
+        # Enqueue rather than write directly: backend_to_frontend is the sole
+        # websocket writer, so this can't race the pump mid-frame (this method is
+        # called from the VNC channel task, a different task than the pump).
+        self.out_queue.put_nowait({"kind": "ask-for-clipboard"})
 
     async def send_copied_text(self, copied_text: str) -> None:
         LOG.info(f"{self.class_name} Sending copied text to message channel", **self.identity)
-
-        try:
-            await self.websocket.send_json(
-                {
-                    "kind": "copied-text",
-                    "text": copied_text,
-                }
-            )
-        except Exception:
-            LOG.exception(f"{self.class_name} Failed to send copied text to message channel", **self.identity)
+        self.out_queue.put_nowait({"kind": "copied-text", "text": copied_text})
 
 
 async def loop_stream_messages(message_channel: MessageChannel) -> None:
@@ -571,27 +503,20 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     live_interpretation_browser_session_id: str | None = None
 
     async def send(message: MessageOut) -> None:
-        if message_channel.websocket.client_state != WebSocketState.CONNECTED:
-            return
+        # Single-writer: enqueue only; backend_to_frontend is the sole task that
+        # writes to the websocket, so responses and out-of-band messages (event
+        # echoes, interpretation updates) cannot interleave mid-frame.
+        message_channel.send_nowait(messages=[message])
 
-        data = message_to_dict(message)
-
-        try:
-            await message_channel.websocket.send_json(data)
-        except WebSocketDisconnect:
-            pass
-        except Exception:
-            LOG.exception("MessageChannel: failed to send data.")
-
-    async def handle_data(data: dict | MessageOut) -> None:
+    async def handle_data(data: object) -> None:
         nonlocal class_name
         nonlocal exfiltration_channel
         nonlocal live_interpretation_browser_session_id
-        message: ChannelMessage
+        message: MessageIn
 
-        if isinstance(data, MessageOut):
-            message = data
-        elif isinstance(data, dict):
+        # receive_json returns whatever the client's JSON parses to — a top-level
+        # array/string/number is possible, so the guard is load-bearing.
+        if isinstance(data, dict):
             try:
                 message = reify_channel_message(data)
             except ValueError:
@@ -599,7 +524,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 return
         else:
             LOG.error(
-                f"{class_name} cannot handle data: expected dict or MessageOut, got {type(data)}",
+                f"{class_name} cannot handle data: expected dict, got {type(data)}",
                 **message_channel.identity,
             )
             return
@@ -660,6 +585,8 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                                 interpretation_session_id=update.interpretation_session_id,
                                 session_revision=update.session_revision,
                                 steps=update.steps,
+                                changed_steps=update.changed_steps,
+                                is_snapshot=update.is_snapshot,
                                 pending=update.pending,
                                 finalized=update.finalized,
                             )
@@ -679,6 +606,8 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         organization_id=message_channel.organization_id,
                         workflow_permanent_id=message.workflow_permanent_id,
                         on_update=on_interpretation_update,
+                        deltas_enabled=message.supports_interpretation_deltas,
+                        recording_attempt_id=message.recording_attempt_id,
                     )
                     live_interpretation_browser_session_id = browser_session_id
 
@@ -708,12 +637,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     on_event=on_event,
                     vnc_channel=vnc_channel,
                 ).start()
-
-            case MessageKind.BROWSER_TABS:
-                await send(message)
-
-            case MessageKind.BROWSER_URL:
-                await send(message)
 
             case MessageKind.CEDE_CONTROL:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
@@ -824,15 +747,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 if exfiltration_channel is not None:
                     await exfiltration_channel.rearm_all_pages()
 
-            case MessageKind.ERROR:
-                await send(message)
-
-            case MessageKind.EXFILTRATED_EVENT:
-                await send(message)
-
-            case MessageKind.RECORDING_INTERPRETATION_UPDATE:
-                await send(message)
-
             case MessageKind.GET_BROWSER_URL:
                 try:
                     async with execution_for_message_channel(message_channel) as execute:
@@ -908,9 +822,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     )
                     await send_error(message.kind, "Failed to reload.")
 
-            case MessageKind.SCREENSHOT:
-                await send(message)
-
             case MessageKind.TAKE_CONTROL:
                 LOG.info(f"{class_name} processing take-control message.", **message_channel.identity)
                 vnc_channel = get_vnc_channel(message_channel.client_id)
@@ -946,37 +857,75 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
         while message_channel.is_open:
             try:
-                datums = await message_channel.drain()
-
-                for data in datums:
-                    if not isinstance(data, (dict, MessageOut)):
-                        LOG.error(
-                            f"{class_name} cannot handle message: expected dict or MessageOut, got {type(data)}",
-                            **message_channel.identity,
-                        )
-                        continue
-
-                    await handle_data(data)
-
+                data = await message_channel.websocket.receive_json()
+                await handle_data(data)
             except WebSocketDisconnect:
                 LOG.debug(f"{class_name} frontend disconnected.", **message_channel.identity)
                 raise
             except ConnectionClosedError:
                 LOG.debug(f"{class_name} frontend closed channel.", **message_channel.identity)
                 raise
+            except RuntimeError as ex:
+                # Starlette raises a bare RuntimeError when receive() races a close.
+                if "not connected" in str(ex).lower():
+                    LOG.debug(f"{class_name} frontend no longer connected.", **message_channel.identity)
+                    return
+                LOG.exception(f"{class_name} An unexpected exception occurred.", **message_channel.identity)
+                raise
             except Exception:
                 LOG.exception(f"{class_name} An unexpected exception occurred.", **message_channel.identity)
                 raise
 
+    async def backend_to_frontend() -> None:
+        LOG.debug(f"{class_name} starting backend-to-frontend loop.", **message_channel.identity)
+
+        # Sole websocket writer: wakes the moment a message is enqueued instead of
+        # polling, and keeps sending while frontend_to_backend awaits a slow
+        # command handler (no head-of-line blocking for interpretation updates).
+        while message_channel.is_open:
+            message = await message_channel.out_queue.get()
+
+            if message_channel.websocket.client_state != WebSocketState.CONNECTED:
+                return
+
+            # Clipboard frames are enqueued as pre-built dicts; everything else is
+            # a MessageOut that needs serializing (NaN-sanitized) first.
+            data = message if isinstance(message, dict) else message_to_dict(message)
+
+            try:
+                await message_channel.websocket.send_json(data)
+            except WebSocketDisconnect:
+                return
+            except Exception:
+                # The try only wraps the socket write, so a failure here means the
+                # connection is unhealthy (e.g. Starlette's RuntimeError after a
+                # close frame) — end the session instead of log-spinning per message.
+                LOG.exception("MessageChannel: failed to send data.")
+                return
+
     loops = [
         asyncio.create_task(frontend_to_backend()),
+        asyncio.create_task(backend_to_frontend()),
     ]
 
     try:
-        await collect(loops)
+        # FIRST_COMPLETED (not collect's FIRST_EXCEPTION): a clean return from
+        # either side must also tear down its sibling, which otherwise blocks
+        # forever on receive_json()/out_queue.get().
+        done, _ = await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task.exception() is not None:
+                raise t.cast(Exception, task.exception())
     except Exception:
         LOG.exception(f"{class_name} An exception occurred in loop message channel stream.", **message_channel.identity)
     finally:
+        # Cancel both loops on every exit path — including when loop_stream_messages
+        # is itself cancelled mid-wait (collect() cancels it when the sibling verify
+        # loop raises). asyncio.wait does NOT cancel the tasks it awaits, so without
+        # this backend_to_frontend would be stranded on out_queue.get() forever.
+        for task in loops:
+            task.cancel()
+        await asyncio.gather(*loops, return_exceptions=True)
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
         if exfiltration_channel is not None:
             await exfiltration_channel.stop()

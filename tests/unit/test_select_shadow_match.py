@@ -105,6 +105,83 @@ async def test_normal_select_logs_shadow_match_tier_and_llm_agreement(
 
 
 @pytest.mark.asyncio
+async def test_normal_select_shadow_disagreement_emits_rich_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = await _run_normal_select_with_shadow_log(
+        monkeypatch,
+        target_label="Years",
+        llm_response={"index": 1, "value": "months"},
+    )
+
+    assert len(logs) == 1
+    event = logs[0]
+    assert event["match_found"] is True
+    assert event["match_agrees_with_llm"] is False
+    assert event["target_value"] == "Years"
+    assert event["matched_index"] == 0
+    assert event["matched_label"] == "Years"
+    assert event["matched_value"] == "years"
+    assert event["llm_index"] == 1
+    assert event["llm_value"] == "months"
+    assert "matched_element_id" not in event
+    assert "llm_element_id" not in event
+
+
+@pytest.mark.asyncio
+async def test_normal_select_agreement_stays_lean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = await _run_normal_select_with_shadow_log(
+        monkeypatch,
+        target_label="Years",
+        llm_response={"index": 0, "value": "years"},
+    )
+
+    assert len(logs) == 1
+    event = logs[0]
+    assert event["match_found"] is True
+    assert event["match_agrees_with_llm"] is True
+    for lean_only in (
+        "target_value",
+        "matched_index",
+        "matched_label",
+        "matched_value",
+        "matched_element_id",
+        "llm_index",
+        "llm_value",
+        "llm_element_id",
+    ):
+        assert lean_only not in event
+
+
+@pytest.mark.asyncio
+async def test_normal_select_disagreement_truncates_free_text_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_target = "A" * 200
+    long_option = "B" * 200
+    long_llm_value = "C" * 200
+    logs = await _run_normal_select_with_shadow_log(
+        monkeypatch,
+        target_label=long_target,
+        llm_response={"index": 1, "value": long_llm_value},
+        options=[
+            {"optionIndex": 0, "text": long_target, "value": long_option},
+            {"optionIndex": 1, "text": "Other", "value": "other"},
+        ],
+    )
+
+    assert len(logs) == 1
+    event = logs[0]
+    bound = handler.SELECT_SHADOW_MATCH_FIELD_MAX_CHARS
+    assert event["match_agrees_with_llm"] is False
+    for field in ("target_value", "matched_label", "matched_value", "llm_value"):
+        assert len(event[field]) == bound + 1
+        assert event[field].endswith("…")
+
+
+@pytest.mark.asyncio
 async def test_normal_select_shadow_match_keeps_blank_placeholder_index_alignment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -157,6 +234,37 @@ def test_shadow_match_candidate_errors_do_not_escape_live_path(monkeypatch: pyte
 
     get_candidates.assert_called_once()
     agreement.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_non_string_llm_values_are_coerced_not_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = await _run_normal_select_with_shadow_log(
+        monkeypatch,
+        target_label="Years",
+        llm_response={"index": 1, "value": 2024},
+    )
+
+    assert len(logs) == 1
+    event = logs[0]
+    assert event["match_agrees_with_llm"] is False
+    assert event["llm_value"] == "2024"
+
+
+def test_select_shadow_agreement_coerces_malformed_llm_fields() -> None:
+    agreement = handler.SelectShadowAgreement(
+        agrees=None,
+        llm_index="2",
+        llm_value=2024,
+        llm_element_id=97,
+    )
+    assert agreement.llm_index == 2
+    assert agreement.llm_value == "2024"
+    assert agreement.llm_element_id == "97"
+
+    non_numeric_index = handler.SelectShadowAgreement(agrees=None, llm_index="not-a-number")
+    assert non_numeric_index.llm_index is None
 
 
 def test_select_shadow_match_normalizes_curly_apostrophes() -> None:

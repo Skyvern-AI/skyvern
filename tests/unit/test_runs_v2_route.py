@@ -131,6 +131,8 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         search_key="login",
         error_code="LOGIN_FAILED",
         exclude_child_runs=expected_exclude_child_runs,
+        created_at_start=None,
+        created_at_end=None,
     )
 
 

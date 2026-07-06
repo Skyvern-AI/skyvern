@@ -4,49 +4,20 @@ narrative payload: ``responseKind`` from ``TurnOutcome.response_kind`` and
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from skyvern.forge.sdk.copilot.agent import _make_agent_result
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
-    DiagnosisInput,
-    DiagnosisRepairContract,
-    DiagnosisResult,
-    RepairDecision,
-    RepairNextAction,
-    VerificationResult,
-)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
-
-
-def _ctx(**overrides: object) -> CopilotContext:
-    defaults: dict = dict(
-        organization_id="org-1",
-        workflow_id="wf-1",
-        workflow_permanent_id="wfp-1",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=MagicMock(),
-    )
-    defaults.update(overrides)
-    return CopilotContext(**defaults)
+from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
+from tests.unit.copilot_test_helpers import make_verified_goal_contract
 
 
 def _verified_goal_ctx() -> CopilotContext:
     return _ctx(
         last_test_ok=True,
         last_full_workflow_test_ok=True,
-        latest_diagnosis_repair_contract=DiagnosisRepairContract(
-            diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
-            diagnosis_result=DiagnosisResult(),
-            repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
-            verification_result=VerificationResult(
-                user_goal_satisfied=True,
-                completion_contract_satisfied=True,
-            ),
-        ),
+        latest_diagnosis_repair_contract=make_verified_goal_contract(),
     )
 
 

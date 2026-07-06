@@ -73,6 +73,8 @@ def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[st
         if slot_field is None:
             continue
         found.extend(_extract_credential_ids_from_tool_value(parameter.get(slot_field)))
+        if slot_field == "credential_id":
+            found.extend(_extract_credential_ids_from_tool_value(parameter.get("credential_ids")))
 
     return list(dict.fromkeys(found))
 
@@ -133,8 +135,11 @@ def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[s
         if not isinstance(parameter, dict):
             return
         legal_slot_field = _credential_parameter_slot_field(parameter)
+        legal_slot_fields = {legal_slot_field} if legal_slot_field else set()
+        if legal_slot_field == "credential_id":
+            legal_slot_fields.add("credential_ids")
         for field_name, field_value in parameter.items():
-            if field_name == legal_slot_field:
+            if field_name in legal_slot_fields:
                 continue
             _scan_value(field_value, location, str(field_name))
 

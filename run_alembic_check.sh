@@ -6,7 +6,10 @@
 export DATABASE_STRING
 
 # first apply migrations
-export PATH="${PATH}:.venv/bin"
+# Prepend the repo venv so its alembic wins over a global install (e.g. Homebrew's),
+# which lacks the `cloud` package and would flag cloud tables as drift.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="${SCRIPT_DIR}/.venv/bin:${PATH}"
 alembic upgrade head
 # then check if the database is up to date with the models
 if ! alembic check; then

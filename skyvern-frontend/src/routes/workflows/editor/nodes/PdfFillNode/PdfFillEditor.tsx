@@ -152,13 +152,6 @@ function PdfFillEditorBody({
         value={data.model}
         onChange={(value) => update({ model: value })}
       />
-      <IgnoreWorkflowSystemPrompt
-        ignoreWorkflowSystemPrompt={data.ignoreWorkflowSystemPrompt ?? false}
-        editable={editable}
-        onIgnoreWorkflowSystemPromptChange={(ignoreWorkflowSystemPrompt) => {
-          update({ ignoreWorkflowSystemPrompt });
-        }}
-      />
 
       <Accordion type="single" collapsible>
         <AccordionItem value="advanced" className="border-b-0">
@@ -172,6 +165,17 @@ function PdfFillEditorBody({
                 parameters={data.parameterKeys}
                 onParametersChange={(parameterKeys) => {
                   update({ parameterKeys });
+                }}
+              />
+              <IgnoreWorkflowSystemPrompt
+                ignoreWorkflowSystemPrompt={
+                  data.ignoreWorkflowSystemPrompt ?? false
+                }
+                editable={editable}
+                onIgnoreWorkflowSystemPromptChange={(
+                  ignoreWorkflowSystemPrompt,
+                ) => {
+                  update({ ignoreWorkflowSystemPrompt });
                 }}
               />
               <div className="space-y-2">

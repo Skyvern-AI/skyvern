@@ -115,7 +115,7 @@ function getRunNavigationPath(
       // With the studio on, workflow runs open in its Run tab; otherwise they
       // use the standalone run page (also the fallback when there is no wpid).
       return studioEnabled && run.workflow_permanent_id
-        ? `/workflows/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
+        ? `/agents/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
         : `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
@@ -399,11 +399,11 @@ function RunHistory() {
             description="Every time you run a workflow, the result shows up on this page. Create your first workflow to get started."
             primaryAction={{
               label: "Create your first workflow",
-              onClick: () => navigate("/workflows"),
+              onClick: () => navigate("/agents"),
             }}
             secondaryAction={{
               label: "Browse templates",
-              onClick: () => navigate("/workflows"),
+              onClick: () => navigate("/agents"),
             }}
           />
         </div>

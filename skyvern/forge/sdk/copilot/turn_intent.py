@@ -110,6 +110,7 @@ class TurnIntentReasonCode(StrEnum):
     RAW_SECRET_REFUSAL = "raw_secret_refusal"
     USER_NON_PROGRESS = "user_non_progress"
     RECOVERY_FROM_RUN_CONTEXT = "recovery_from_run_context"
+    FIX_ORIGIN_DIAGNOSE = "fix_origin_diagnose"
     LLM_CLASSIFIER = "llm_classifier"
     LOW_CONFIDENCE_CLARIFICATION = "low_confidence_clarification"
     TARGET_ENTITY_RESOLVED = "target_entity_resolved"
@@ -754,6 +755,7 @@ def build_turn_intent(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     classifier_result: TurnIntentClassifierResult | None = None,
+    fix_origin: bool = False,
 ) -> TurnIntent:
     has_workflow = bool((workflow_yaml or "").strip())
     has_prior_context = bool((global_llm_context or "").strip())
@@ -864,6 +866,14 @@ def build_turn_intent(
         )
         reason_codes.append(TurnIntentReasonCode.LLM_CLASSIFIER)
         reason_codes.extend(classification.reason_codes)
+
+    # Runs before the LOW_CONFIDENCE / MISSING_EDIT_TARGET downgrades: a CLARIFY here is only a request-policy
+    # clarification (already set) that, like REFUSE, still wins; a confident/would-be-downgraded edit becomes DIAGNOSE.
+    if fix_origin and has_prior_run_signal and mode not in (TurnIntentMode.REFUSE, TurnIntentMode.CLARIFY):
+        mode = TurnIntentMode.DIAGNOSE
+        expected_output = TurnIntentExpectedOutput.RUN_RESULT
+        target_entities.pop("workflow_change", None)
+        reason_codes.append(TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE)
 
     if (
         classification is not None

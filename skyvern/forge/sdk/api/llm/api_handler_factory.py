@@ -89,6 +89,16 @@ VISION_FALLBACK_PROMPT_NAMES = {
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
 
+# Gemini's default safety filters reject legitimate automation content, returning
+# finish_reason=content_filter with empty output that breaks downstream JSON parsing.
+# Disable them for agent LLM calls; drop_params=True strips this on non-Gemini providers.
+GEMINI_SAFETY_SETTINGS: list[dict[str, str]] = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
 
 def _set_llm_context_attrs(
     span: otel_trace.Span,
@@ -2205,7 +2215,7 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         params: dict[str, Any] = {}
-        if not llm_config.model_name.startswith("ollama/"):
+        if not llm_config.model_name.startswith(("ollama/", "ollama_chat/")):
             # OLLAMA does not support max_completion_tokens
             if llm_config.max_completion_tokens is not None:
                 params["max_completion_tokens"] = llm_config.max_completion_tokens
@@ -2217,6 +2227,12 @@ class LLMAPIHandlerFactory:
 
         if llm_config.reasoning_effort is not None:
             params["reasoning_effort"] = llm_config.reasoning_effort
+
+        is_gemini = "gemini" in llm_config.model_name.lower()
+        if isinstance(llm_config, LLMRouterConfig):
+            is_gemini = is_gemini or "gemini" in (llm_config.main_model_group or "").lower()
+        if is_gemini:
+            params["safety_settings"] = GEMINI_SAFETY_SETTINGS
 
         return params
 

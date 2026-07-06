@@ -316,7 +316,7 @@ function TaskDetails() {
                 to={
                   env.useNewRunsUrl
                     ? `/runs/${workflowRun.workflow_run_id}`
-                    : `/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
+                    : `/agents/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
                 }
               >
                 {workflow.title}

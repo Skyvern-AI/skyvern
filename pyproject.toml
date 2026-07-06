@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.43"
+version = "1.0.44"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -281,7 +281,7 @@ constraint-dependencies = [
     "cryptography>=48.0.1",
     "flask>=3.1.3",
     "idna>=3.15",
-    "joserfc>=1.6.3",
+    "joserfc>=1.6.8",
     "jupyter-server>=2.18.0",
     "mako>=1.3.12",
     "mistune>=3.2.1",

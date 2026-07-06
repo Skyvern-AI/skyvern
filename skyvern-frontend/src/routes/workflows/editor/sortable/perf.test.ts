@@ -60,10 +60,12 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
+  enableSelfHealing: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {

@@ -226,7 +226,8 @@ def test_fill_prompts_noop_without_sources():
     assert "prompt" not in out["workflow_definition"]["blocks"][0]
 
 
-def test_process_workflow_yaml_derives_code_block_steps_for_replace_path():
+@pytest.mark.asyncio
+async def test_process_workflow_yaml_derives_code_block_steps_for_replace_path():
     # Regression: the inline REPLACE_WORKFLOW path (v1 and v2) builds the
     # frontend-facing workflow via _process_workflow_yaml without first deriving
     # steps, so a generated code block surfaced as "No steps yet" in the plain
@@ -245,8 +246,9 @@ def test_process_workflow_yaml_derives_code_block_steps_for_replace_path():
         "      await page.goto('https://example.com/')\n"
         "      await page.get_by_role('link', name='login').click()\n"
     )
-    wf = _process_workflow_yaml(
+    wf = await _process_workflow_yaml(
         workflow_id="w_1",
+        settings_fallback_yaml="enable_self_healing: false",
         workflow_permanent_id="wpid_1",
         organization_id="o_1",
         workflow_yaml=yaml_str,
@@ -388,3 +390,77 @@ def test_skyvern_page_high_level_actions_surface_as_steps():
     assert [s["action_type"] for s in steps] == ["select_option", "upload_file", "complete"]
     assert steps[0]["description"] == "Choose the country"
     assert steps[2]["description"] == "Confirm the form was submitted"
+
+
+def test_raw_dom_reads_surface_as_an_extraction_step_not_just_navigation():
+    # The reported case: a block navigates then scrapes the DOM with raw Playwright
+    # reads (no page.extract()). It must read as "navigate, then extract", not as a
+    # lone "Goto URL" that hides everything the code does.
+    code = (
+        "async def run(page):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    rows = page.locator('tr.item')\n"
+        "    count = await rows.count()\n"
+        "    results = []\n"
+        "    for i in range(count):\n"
+        "        row = rows.nth(i)\n"
+        "        title = await row.locator('.title').text_content()\n"
+        "        href = await row.locator('a').get_attribute('href')\n"
+        "        results.append({'title': title, 'href': href})\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["goto_url", "extract"]
+    assert steps[1]["description"] == "Extract information from the page"
+
+
+def test_consecutive_dom_reads_collapse_into_one_extraction_step():
+    # A scrape reads many fields; surfacing one step per read is noise. Collapse a
+    # run of adjacent reads into a single step spanning their combined line range.
+    code = (
+        "async def run(page):\n"
+        "    a = await page.locator('#a').text_content()\n"
+        "    b = await page.locator('#b').inner_text()\n"
+        "    c = await page.locator('#c').get_attribute('value')\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["extract"]
+    assert steps[0]["line_start"] == 2
+    assert steps[0]["line_end"] == 4
+
+
+def test_dom_reads_separated_by_an_action_are_distinct_steps():
+    code = (
+        "async def run(page):\n"
+        "    name = await page.locator('#name').text_content()\n"
+        "    await page.get_by_role('button', name='Next').click()\n"
+        "    price = await page.locator('#price').text_content()\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["extract", "click", "extract"]
+
+
+def test_explicit_extract_prompt_is_preserved_alongside_raw_reads():
+    # page.extract() carries the author's reader-facing prompt; consolidating raw
+    # reads must never merge into it and clobber that copy.
+    code = (
+        "async def run(page):\n"
+        "    data = await page.extract(prompt='Extract the product names')\n"
+        "    extra = await page.locator('#x').text_content()\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["extract", "extract"]
+    assert steps[0]["description"] == "Extract the product names"
+    assert steps[1]["description"] == "Extract information from the page"
+
+
+def test_control_flow_reads_do_not_fabricate_an_extraction_step():
+    # Visibility checks and counts gate control flow; they are not data extraction
+    # and must not invent an extract step.
+    code = (
+        "async def run(page):\n"
+        "    await page.goto('https://example.com/')\n"
+        "    if await page.locator('#banner').is_visible():\n"
+        "        await page.get_by_role('button', name='Close').click()\n"
+    )
+    steps = derive_code_block_steps(code)
+    assert [s["action_type"] for s in steps] == ["goto_url", "click"]

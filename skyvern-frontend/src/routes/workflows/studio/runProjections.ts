@@ -73,11 +73,12 @@ export type FilmstripFrame = {
   label: string;
   status: Status;
   blockType: string | null;
+  screenshotArtifactId: string | null;
   stepId: string | null;
   actionOrder: number | null;
 };
 
-function actionLabel(action: ActionsApiResponse): string {
+export function actionLabel(action: ActionsApiResponse): string {
   const candidate =
     action.intention?.trim() ||
     action.description?.trim() ||
@@ -119,6 +120,7 @@ export function buildFilmstrip(
             label: actionLabel(action),
             status: action.status,
             blockType: block.block_type ?? null,
+            screenshotArtifactId: action.screenshot_artifact_id ?? null,
             stepId: action.step_id,
             actionOrder: action.action_order,
           });

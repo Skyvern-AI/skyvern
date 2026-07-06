@@ -68,6 +68,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
+    generate_workflow_run_credential_selection_id,
     generate_workflow_run_id,
     generate_workflow_schedule_id,
     generate_workflow_script_id,
@@ -522,6 +523,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    enable_self_healing = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     code_version = Column(Integer, nullable=True, server_default=sqlalchemy.text("2"))
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)
@@ -822,10 +824,35 @@ class CredentialParameterModel(Base):
     description = Column(String, nullable=True)
 
     credential_id = Column(String, nullable=False)
+    credential_ids = Column(JSON, nullable=True)
+    selection_strategy = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunCredentialSelectionModel(Base):
+    __tablename__ = "workflow_run_credential_selections"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "parameter_key", name="uq_wrcs_workflow_run_parameter_key"),
+        Index(
+            "idx_wrcs_lru_lookup",
+            "organization_id",
+            "workflow_permanent_id",
+            "parameter_key",
+            "credential_id",
+            "created_at",
+        ),
+    )
+
+    selection_id = Column(String, primary_key=True, default=generate_workflow_run_credential_selection_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    parameter_key = Column(String, nullable=False)
+    credential_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
 class OnePasswordCredentialParameterModel(Base):
@@ -1211,7 +1238,24 @@ class BrowserProfileModel(Base):
     __table_args__ = (
         Index("idx_browser_profiles_org", "organization_id"),
         Index("idx_browser_profiles_org_name", "organization_id", "name"),
-        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+        Index(
+            "uq_browser_profiles_org_name_user",
+            "organization_id",
+            "name",
+            unique=True,
+            postgresql_where=text("is_managed = false"),
+            sqlite_where=text("is_managed = false"),
+        ),
+        Index(
+            "uq_browser_profiles_managed_segment",
+            "organization_id",
+            "workflow_permanent_id",
+            "browser_profile_key_digest",
+            unique=True,
+            postgresql_where=text("is_managed = true AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = true AND deleted_at IS NULL"),
+        ),
+        Index("idx_browser_profiles_wpid", "workflow_permanent_id"),
     )
 
     browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
@@ -1221,6 +1265,9 @@ class BrowserProfileModel(Base):
     source_browser_type = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
+    is_managed = Column(Boolean, nullable=False, server_default=sqlalchemy.false(), default=False)
+    workflow_permanent_id = Column(String, nullable=True)
+    browser_profile_key_digest = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

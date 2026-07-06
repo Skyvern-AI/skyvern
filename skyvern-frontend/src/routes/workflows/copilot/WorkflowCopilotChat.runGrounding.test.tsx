@@ -16,6 +16,7 @@ import {
 type StreamBody = {
   message: string;
   workflow_run_id?: string | null;
+  fix_origin?: boolean;
 };
 type StreamCall = {
   body: StreamBody;
@@ -123,19 +124,33 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
-async function renderChat(props: { workflowRunId?: string | null } = {}) {
-  const booleanFlags: Record<string, boolean> = {
-    ENABLE_WORKFLOW_COPILOT_V2: true,
-    WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
-    CODE_BLOCK_ACCESS: false,
-  };
-  const view = render(
-    <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
+const BOOLEAN_FLAGS: Record<string, boolean> = {
+  ENABLE_WORKFLOW_COPILOT_V2: true,
+  WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
+  CODE_BLOCK_ACCESS: false,
+};
+
+type ChatProps = {
+  workflowRunId?: string | null;
+  initialMessage?: string;
+  initialMessageFixOrigin?: boolean;
+  requiresLiveBrowser?: boolean;
+  isLiveBrowserReady?: boolean;
+  liveBrowserSessionId?: string | null;
+};
+
+function chatUi(props: ChatProps) {
+  return (
+    <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
       <FeatureFlagValueContext.Provider value={() => undefined}>
         <WorkflowCopilotChat {...props} />
       </FeatureFlagValueContext.Provider>
-    </FeatureFlagContext.Provider>,
+    </FeatureFlagContext.Provider>
   );
+}
+
+async function renderChat(props: ChatProps = {}) {
+  const view = render(chatUi(props));
   await waitFor(() =>
     expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
   );
@@ -202,5 +217,140 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_route");
+  });
+});
+
+describe("WorkflowCopilotChat — fix-origin signal", () => {
+  it("auto-sends fix_origin:true when the seed originates from Fix with Copilot", async () => {
+    await renderChat({
+      workflowRunId: "wr_1",
+      initialMessage:
+        "Diagnose why this run failed, then fix the workflow so it succeeds.",
+      initialMessageFixOrigin: true,
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.fix_origin).toBe(true);
+    expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_1");
+  });
+
+  it("does not set fix_origin for a seed that is not a fix origin", async () => {
+    await renderChat({
+      workflowRunId: "wr_1",
+      initialMessage: "Build a workflow that scrapes prices.",
+      initialMessageFixOrigin: false,
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.fix_origin).toBe(false);
+  });
+
+  it("does not set fix_origin for a normal typed turn", async () => {
+    await renderChat({ workflowRunId: "wr_1" });
+    await submit("this run failed, fix it");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.fix_origin).toBe(false);
+  });
+
+  it("clears the fix-origin signal when a queued fix seed is cancelled (no leak to the next turn)", async () => {
+    const view = render(
+      chatUi({
+        workflowRunId: "wr_1",
+        requiresLiveBrowser: true,
+        isLiveBrowserReady: false,
+        initialMessage: "Diagnose why this run failed, then fix it.",
+        initialMessageFixOrigin: true,
+      }),
+    );
+    // Live browser not ready: the fix seed queues (a user bubble appears) instead of sending.
+    await waitFor(() =>
+      expect(screen.getByText(/Diagnose why this run failed/i)).toBeTruthy(),
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
+
+    // Cancel the queued prompt (Escape), then let the live browser become ready.
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    view.rerender(
+      chatUi({
+        workflowRunId: "wr_1",
+        requiresLiveBrowser: true,
+        isLiveBrowserReady: true,
+      }),
+    );
+
+    // A normal typed turn after the cancel must not inherit the cancelled fix-origin signal.
+    await submit("add a step that downloads the invoice");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.fix_origin).toBe(false);
+  });
+
+  it("clears the fix-origin signal when a queued fix seed is discarded by New chat (no leak to the next turn)", async () => {
+    const view = render(
+      chatUi({
+        workflowRunId: "wr_1",
+        requiresLiveBrowser: true,
+        isLiveBrowserReady: false,
+        initialMessage: "Diagnose why this run failed, then fix it.",
+        initialMessageFixOrigin: true,
+      }),
+    );
+    // Live browser not ready: the fix seed queues (a user bubble appears) instead of sending.
+    await waitFor(() =>
+      expect(screen.getByText(/Diagnose why this run failed/i)).toBeTruthy(),
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
+
+    // Discard the queued fix seed via "New chat", then let the live browser become ready.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /New chat/i }));
+    });
+    view.rerender(
+      chatUi({
+        workflowRunId: "wr_1",
+        requiresLiveBrowser: true,
+        isLiveBrowserReady: true,
+      }),
+    );
+
+    // A normal typed turn after New chat must not inherit the discarded fix-origin signal.
+    await submit("add a step that downloads the invoice");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.fix_origin).toBe(false);
+  });
+
+  it("preserves fix_origin when a queued fix seed drains after the live browser connects", async () => {
+    const view = render(
+      chatUi({
+        workflowRunId: "wr_1",
+        requiresLiveBrowser: true,
+        isLiveBrowserReady: false,
+        initialMessage: "Diagnose why this run failed, then fix it.",
+        initialMessageFixOrigin: true,
+      }),
+    );
+    // Live browser not ready: the fix seed queues instead of sending.
+    await waitFor(() =>
+      expect(screen.getByText(/Diagnose why this run failed/i)).toBeTruthy(),
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
+
+    // Browser connects (session id present): the queued fix seed drains and
+    // must still carry fix_origin. initialMessage is dropped so this is a pure
+    // drain of the already-queued prompt, not a fresh seed.
+    await act(async () => {
+      view.rerender(
+        chatUi({
+          workflowRunId: "wr_1",
+          requiresLiveBrowser: true,
+          isLiveBrowserReady: true,
+          liveBrowserSessionId: "bs_1",
+        }),
+      );
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.fix_origin).toBe(true);
   });
 });

@@ -13,7 +13,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge.sdk.artifact.manager import ArtifactManager, StepArchiveAccumulator
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.artifact.storage.test_helpers import create_fake_step
+from tests.unit.forge.sdk.artifact.storage.test_helpers import create_fake_step
 
 TEST_STEP_ID = "step_archive_test_001"
 TEST_STEP_ID_2 = "step_archive_test_002"

@@ -44,16 +44,120 @@ def test_credential_id_in_navigation_goal_is_flagged() -> None:
     ]
 
 
-def test_credential_id_bound_through_workflow_parameter_is_allowed() -> None:
+@pytest.mark.parametrize(
+    "yaml",
+    [
+        pytest.param(
+            _yaml(
+                """
+                title: Sign in
+                workflow_definition:
+                  parameters:
+                  - key: login_credentials
+                    parameter_type: workflow
+                    workflow_parameter_type: credential_id
+                    default_value: cred_527971855302737592
+                  blocks:
+                  - block_type: login
+                    label: login_to_portal
+                    url: https://authenticationtest.com/loginUserAndPassword/
+                    parameter_keys: [login_credentials]
+                """
+            ),
+            id="credential_id_bound_through_workflow_parameter_is_allowed",
+        ),
+        pytest.param(
+            _yaml(
+                """
+                title: Sign in
+                workflow_definition:
+                  parameters: []
+                  blocks:
+                  - block_type: login
+                    label: login_to_portal
+                    url: https://authenticationtest.com/loginUserAndPassword/
+                    parameters:
+                    - parameter_type: credential
+                      key: login_credentials
+                      credential_id: cred_527971855302737592
+                """
+            ),
+            id="credential_id_bound_through_block_credential_parameter_is_allowed",
+        ),
+        pytest.param(
+            _yaml(
+                """
+                title: Sign in
+                workflow_definition:
+                  parameters:
+                  - key: login_credentials
+                    parameter_type: credential
+                    credential_id: cred_527971855302737592
+                    credential_ids:
+                    - cred_527971855302737592
+                    - cred_827971855302737593
+                  blocks:
+                  - block_type: login
+                    label: login_to_portal
+                    url: https://authenticationtest.com/loginUserAndPassword/
+                    parameter_keys: [login_credentials]
+                """
+            ),
+            id="credential_ids_bound_through_credential_parameter_are_allowed",
+        ),
+        pytest.param(
+            _yaml(
+                """
+                title: Sign in
+                workflow_definition:
+                  parameters:
+                  - key: login_credentials
+                    parameter_type: workflow
+                    workflow_parameter_type: credential_id
+                    default_value: cred_527971855302737592
+                  blocks:
+                  - block_type: login
+                    label: login_to_portal
+                    navigation_goal: Sign in using {{ login_credentials }}.
+                    parameter_keys: [login_credentials]
+                """
+            ),
+            id="jinja_reference_to_credential_parameter_is_not_flagged",
+        ),
+        pytest.param(
+            _yaml(
+                """
+                title: Visit
+                workflow_definition:
+                  parameters: []
+                  blocks:
+                  - block_type: navigation
+                    label: visit
+                    url: https://example.com/
+                    navigation_goal: Open the homepage.
+                """
+            ),
+            id="workflow_without_credential_ids_is_inert",
+        ),
+    ],
+)
+def test_legal_credential_id_binding_shapes_are_allowed(yaml: str) -> None:
+    assert _credential_id_misbinding_findings(yaml) == []
+
+
+def test_credential_parameter_unrelated_field_with_credential_id_is_still_flagged() -> None:
     yaml = _yaml(
         """
         title: Sign in
         workflow_definition:
           parameters:
           - key: login_credentials
-            parameter_type: workflow
-            workflow_parameter_type: credential_id
-            default_value: cred_527971855302737592
+            parameter_type: credential
+            credential_id: cred_527971855302737592
+            credential_ids:
+            - cred_527971855302737592
+            - cred_827971855302737593
+            description: Use cred_927971855302737594 for this login.
           blocks:
           - block_type: login
             label: login_to_portal
@@ -62,27 +166,15 @@ def test_credential_id_bound_through_workflow_parameter_is_allowed() -> None:
         """
     )
 
-    assert _credential_id_misbinding_findings(yaml) == []
+    findings = _credential_id_misbinding_findings(yaml)
 
-
-def test_credential_id_bound_through_block_credential_parameter_is_allowed() -> None:
-    yaml = _yaml(
-        """
-        title: Sign in
-        workflow_definition:
-          parameters: []
-          blocks:
-          - block_type: login
-            label: login_to_portal
-            url: https://authenticationtest.com/loginUserAndPassword/
-            parameters:
-            - parameter_type: credential
-              key: login_credentials
-              credential_id: cred_527971855302737592
-        """
-    )
-
-    assert _credential_id_misbinding_findings(yaml) == []
+    assert findings == [
+        {
+            "location": "workflow",
+            "field": "description",
+            "credential_id": "cred_927971855302737594",
+        }
+    ]
 
 
 def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
@@ -215,23 +307,6 @@ def test_credential_id_used_both_legally_and_in_prose_reports_only_the_misbindin
     ]
 
 
-def test_workflow_without_credential_ids_is_inert() -> None:
-    yaml = _yaml(
-        """
-        title: Visit
-        workflow_definition:
-          parameters: []
-          blocks:
-          - block_type: navigation
-            label: visit
-            url: https://example.com/
-            navigation_goal: Open the homepage.
-        """
-    )
-
-    assert _credential_id_misbinding_findings(yaml) == []
-
-
 def test_parameter_without_parameter_type_field_is_scanned() -> None:
     yaml = _yaml(
         """
@@ -253,27 +328,6 @@ def test_parameter_without_parameter_type_field_is_scanned() -> None:
             "credential_id": "cred_527971855302737592",
         }
     ]
-
-
-def test_jinja_reference_to_credential_parameter_is_not_flagged() -> None:
-    yaml = _yaml(
-        """
-        title: Sign in
-        workflow_definition:
-          parameters:
-          - key: login_credentials
-            parameter_type: workflow
-            workflow_parameter_type: credential_id
-            default_value: cred_527971855302737592
-          blocks:
-          - block_type: login
-            label: login_to_portal
-            navigation_goal: Sign in using {{ login_credentials }}.
-            parameter_keys: [login_credentials]
-        """
-    )
-
-    assert _credential_id_misbinding_findings(yaml) == []
 
 
 def test_multiple_distinct_credential_ids_in_same_field_are_all_reported() -> None:
@@ -407,22 +461,24 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
         ),
         patch(
             "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
-            return_value=MagicMock(
-                title="Sign in",
-                description=None,
-                workflow_definition=MagicMock(),
-                proxy_location=None,
-                webhook_callback_url=None,
-                persist_browser_session=False,
-                browser_profile_id=None,
-                model=None,
-                max_screenshot_scrolls=None,
-                extra_http_headers=None,
-                run_with=None,
-                ai_fallback=None,
-                cache_key=None,
-                run_sequentially=None,
-                sequential_key=None,
+            new=AsyncMock(
+                return_value=MagicMock(
+                    title="Sign in",
+                    description=None,
+                    workflow_definition=MagicMock(),
+                    proxy_location=None,
+                    webhook_callback_url=None,
+                    persist_browser_session=False,
+                    browser_profile_id=None,
+                    model=None,
+                    max_screenshot_scrolls=None,
+                    extra_http_headers=None,
+                    run_with=None,
+                    ai_fallback=None,
+                    cache_key=None,
+                    run_sequentially=None,
+                    sequential_key=None,
+                ),
             ),
         ),
         patch(

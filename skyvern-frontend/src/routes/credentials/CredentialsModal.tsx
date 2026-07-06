@@ -52,6 +52,11 @@ import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
 import { getAuthenticatorKeyError } from "./credentialTotpValidation";
+import {
+  getAuthenticatorSaveError,
+  getCredentialErrorMessage,
+  type AuthenticatorSaveError,
+} from "./authenticatorSaveError";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -248,6 +253,45 @@ function CredentialsModal({
     name: false,
     values: false,
   });
+  // Inline authenticator setup error returned by the backend when it rejects a
+  // decoded QR value or pasted key. Cleared whenever the user edits the key.
+  const [authenticatorSaveError, setAuthenticatorSaveError] =
+    useState<AuthenticatorSaveError | null>(null);
+
+  const handlePasswordCredentialChange = useCallback(
+    (next: typeof PASSWORD_CREDENTIAL_INITIAL_VALUES) => {
+      setPasswordCredentialValues((prev) => {
+        if (next.totp !== prev.totp || next.totp_type !== prev.totp_type) {
+          setAuthenticatorSaveError(null);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const reportCredentialSaveError = useCallback(
+    (error: unknown, title = "Error"): string => {
+      const authError = getAuthenticatorSaveError(error);
+      if (authError && passwordCredentialValues.totp_type === "authenticator") {
+        setAuthenticatorSaveError(authError);
+      }
+      const description =
+        authError?.message ??
+        getCredentialErrorMessage(error) ??
+        (error instanceof Error
+          ? error.message
+          : "An unexpected error occurred");
+      const isEnterpriseUpgrade =
+        authError?.code === "enterprise_required" &&
+        passwordCredentialValues.totp_type === "authenticator";
+      if (!isEnterpriseUpgrade) {
+        toast({ title, description, variant: "destructive" });
+      }
+      return description;
+    },
+    [passwordCredentialValues.totp_type],
+  );
 
   const handleEnableEditName = useCallback(() => {
     setEditingGroups((prev) => ({ ...prev, name: true }));
@@ -461,6 +505,7 @@ function CredentialsModal({
     setCreditCardCredentialValues(createCreditCardCredentialInitialValues());
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
     setEditingGroups({ name: false, values: false });
+    setAuthenticatorSaveError(null);
     setTestAndSave(false);
     setTestUrl("");
     setTestStatus("idle");
@@ -618,6 +663,7 @@ function CredentialsModal({
   );
 
   const startTest = useCallback(async () => {
+    setAuthenticatorSaveError(null);
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const proxyPinPayload = getProxyPinPayload();
@@ -664,15 +710,11 @@ function CredentialsModal({
       }, 3000);
     } catch (error) {
       setTestStatus("failed");
-      const detail = (
-        (error as AxiosError)?.response?.data as { detail?: string }
-      )?.detail;
-      setTestFailureReason(detail ?? "Failed to start credential test");
-      toast({
-        title: "Failed to start credential test",
-        description: detail ?? "An unexpected error occurred",
-        variant: "destructive",
-      });
+      const description = reportCredentialSaveError(
+        error,
+        "Failed to start credential test",
+      );
+      setTestFailureReason(description);
     }
   }, [
     credentialGetter,
@@ -681,6 +723,7 @@ function CredentialsModal({
     userContext,
     pollTestStatus,
     getProxyPinPayload,
+    reportCredentialSaveError,
   ]);
 
   const createCredentialMutation = useMutation({
@@ -747,12 +790,7 @@ function CredentialsModal({
       }
     },
     onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
-      toast({
-        title: "Error",
-        description: detail ? detail : error.message,
-        variant: "destructive",
-      });
+      reportCredentialSaveError(error);
     },
   });
 
@@ -829,12 +867,7 @@ function CredentialsModal({
       }
     },
     onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
-      toast({
-        title: "Error",
-        description: detail ? detail : error.message,
-        variant: "destructive",
-      });
+      reportCredentialSaveError(error);
     },
   });
 
@@ -900,12 +933,7 @@ function CredentialsModal({
       });
     },
     onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
-      toast({
-        title: "Error",
-        description: detail ? detail : error.message,
-        variant: "destructive",
-      });
+      reportCredentialSaveError(error);
     },
   });
 
@@ -969,6 +997,7 @@ function CredentialsModal({
       if (authenticatorKeyError) {
         return;
       }
+      setAuthenticatorSaveError(null);
 
       // If test passed, rename the temp credential instead of creating a new one
       if (testAndSave && testStatus === "completed" && testCredentialId) {
@@ -1263,7 +1292,7 @@ function CredentialsModal({
       return (
         <PasswordCredentialContent
           values={passwordCredentialValues}
-          onChange={setPasswordCredentialValues}
+          onChange={handlePasswordCredentialChange}
           url={testUrl}
           onUrlChange={setTestUrl}
           urlRequired={testAndSave}
@@ -1273,6 +1302,7 @@ function CredentialsModal({
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
           totpError={authenticatorKeyError}
+          authenticatorSaveError={authenticatorSaveError}
           beforeCredentialFields={customVaultCheckbox}
           afterUrl={
             <div className="space-y-3">

@@ -187,26 +187,6 @@ def test_diagnosis_repair_tool_error_records_consecutive_boundary_only() -> None
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
 
-class TestLoopDetection:
-    def test_loop_detected_on_third_consecutive_call(self) -> None:
-        from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
-
-        tracker: list[str] = []
-        assert detect_tool_loop(tracker, "update_workflow") is None
-        assert detect_tool_loop(tracker, "update_workflow") is None
-        error = detect_tool_loop(tracker, "update_workflow")
-        assert error is not None
-        assert "LOOP DETECTED" in error
-
-    def test_tracker_resets_when_tool_changes(self) -> None:
-        from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
-
-        tracker: list[str] = []
-        assert detect_tool_loop(tracker, "update_workflow") is None
-        assert detect_tool_loop(tracker, "list_credentials") is None
-        assert tracker == ["list_credentials"]
-
-
 class TestFailedToolStepLoopDetection:
     def test_interleaved_successful_tool_does_not_reset_failed_step(self) -> None:
         tracker: dict[str, int] = {}

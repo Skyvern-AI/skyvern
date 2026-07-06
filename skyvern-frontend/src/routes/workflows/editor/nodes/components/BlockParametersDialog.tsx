@@ -14,6 +14,7 @@ import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { WorkflowParameterInput } from "@/routes/workflows/WorkflowParameterInput";
 import { getLabelForWorkflowParameterType } from "@/routes/workflows/editor/workflowEditorUtils";
 import type { WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
+import { getInvalidJsonMessage } from "@/util/jsonParseError";
 
 /**
  * Validates a parameter value based on its type.
@@ -34,8 +35,7 @@ function validateParameterValue(value: unknown, type: string): string | null {
           JSON.parse(trimmed);
           return null;
         } catch (e) {
-          const message = e instanceof SyntaxError ? e.message : "Parse error";
-          return `Invalid JSON: ${message}`;
+          return getInvalidJsonMessage(trimmed, e);
         }
       }
       return null;
