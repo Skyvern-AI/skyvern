@@ -968,7 +968,9 @@ function NodeHeader({
             ) : (
               gripHandle
             ))}
-          <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+          <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+            {/* Without shrink-0, a long label or subtitle in the sibling
+            column steals width from this box before its own min-content. */}
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
           <div className="flex min-w-0 flex-col gap-1">
@@ -977,7 +979,10 @@ function NodeHeader({
               editable={editable}
               onChange={setLabel}
               titleClassName="text-base"
-              inputClassName="text-base"
+              // A negative margin here would shrink this auto-width column's
+              // measured size and clip short values via max-w-full, so the
+              // padding is offset with relative/left (paint-only) instead.
+              inputClassName="relative -left-1 px-1 text-base"
             />
 
             <div className="flex items-center gap-2">
