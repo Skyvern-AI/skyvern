@@ -267,6 +267,7 @@ class CompletionCriterion:
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
+    mint_degrade: Literal["turn_unsatisfiable_fallback"] | None = None
 
 
 @dataclass
@@ -349,6 +350,8 @@ class RequestPolicy:
             data[f"{prefix}_output_path"] = criterion.output_path
             data[f"{prefix}_grounding_mode"] = _criterion_grounding_mode(criterion)
             data[f"{prefix}_has_exact_value"] = criterion.expected_output_value is not None
+            if criterion.mint_degrade is not None:
+                data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
@@ -1361,7 +1364,7 @@ def _apply_classifier_typed_requested_output_corroborators(policy: RequestPolicy
 
 
 def _apply_requested_output_completion_criteria(
-    policy: RequestPolicy, user_message: str, aliases: dict[str, str] | None = None
+    policy: RequestPolicy, user_message: str, aliases: dict[str, str] | None = None, *, extract_literals: bool = False
 ) -> None:
     schema_aliases = schema_output_path_aliases_from_criteria(policy.completion_criteria)
     config_aliases = _normalize_requested_output_aliases(aliases)
@@ -1391,6 +1394,9 @@ def _apply_requested_output_completion_criteria(
         return
 
     value_by_output_path = _requested_output_expected_values_from_criteria(policy.completion_criteria, requested_specs)
+    if extract_literals:
+        for output_path, literal in _fallback_literal_expected_values(user_message, requested_specs).items():
+            value_by_output_path.setdefault(output_path, literal)
     shape_by_output_path = _requested_output_shapes_from_criteria(policy.completion_criteria, requested_specs)
     source_by_output_path = _requested_output_evidence_sources_from_criteria(
         policy.completion_criteria, requested_specs
@@ -1555,6 +1561,88 @@ def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
     return criterion.id == _FALLBACK_FLOOR_BASE_ID
 
 
+def is_turn_unsatisfiable_fallback_degraded(criterion: CompletionCriterion) -> bool:
+    return criterion.mint_degrade == "turn_unsatisfiable_fallback"
+
+
+_FALLBACK_LITERAL_MIN_CHARS = 4
+_FALLBACK_LITERAL_BINDER_RE = r"(?:equal to|equals|should be|must be|is expected to be|expected to be|will be|is|:|=)"
+_FALLBACK_LITERAL_MAX_SCAN_CHARS = 4000
+
+
+def _fallback_literal_field_surface_forms(field_name: str, field_label: str) -> list[str]:
+    forms: set[str] = set()
+    for source in (field_name, field_label):
+        collapsed = " ".join(source.split()).strip()
+        if collapsed:
+            forms.add(collapsed)
+            forms.add(collapsed.replace(" ", "_"))
+    return [form for form in sorted(forms, key=len, reverse=True) if form]
+
+
+def _fallback_literal_excluded_forms(field_name: str, field_label: str, output_path: str) -> set[str]:
+    forms = {
+        " ".join(_word_tokens(field_name)),
+        " ".join(_word_tokens(field_label)),
+        " ".join(_word_tokens(output_path)),
+    }
+    return {form for form in forms if form}
+
+
+def _fallback_literal_candidates_for_field(user_message: str, field_name: str, field_label: str) -> list[str]:
+    bounded_message = user_message[:_FALLBACK_LITERAL_MAX_SCAN_CHARS]
+    candidates: list[str] = []
+    for surface in _fallback_literal_field_surface_forms(field_name, field_label):
+        pattern = re.compile(
+            r"\b"
+            + re.escape(surface)
+            + r"\b\s{0,8}+(?:"
+            + _FALLBACK_LITERAL_BINDER_RE
+            + r"\s{0,8}+)?(?P<quote>['\"`])(?P<quoted>[^'\"`]{1,80}+)(?P=quote)",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(bounded_message):
+            quoted = match.group("quoted")
+            if quoted is not None:
+                candidates.append(quoted)
+    return candidates
+
+
+def _fallback_literal_expected_values(
+    user_message: str, requested_specs: list[tuple[str, str, str]]
+) -> dict[str, ExpectedOutputValue]:
+    if not user_message.strip():
+        return {}
+    values: dict[str, ExpectedOutputValue] = {}
+    for field_name, output_path, field_label in requested_specs:
+        excluded = _fallback_literal_excluded_forms(field_name, field_label, output_path)
+        accepted: list[str] = []
+        for raw in _fallback_literal_candidates_for_field(user_message, field_name, field_label):
+            coerced = _coerce_expected_output_value(raw)
+            if not isinstance(coerced, str) or len(coerced) < _FALLBACK_LITERAL_MIN_CHARS:
+                continue
+            if " ".join(_word_tokens(coerced)) in excluded:
+                continue
+            accepted.append(coerced)
+        unique = list(dict.fromkeys(accepted))
+        if len(unique) == 1:
+            values[output_path] = unique[0]
+    return values
+
+
+def _mark_turn_unsatisfiable_fallback_criteria(policy: RequestPolicy) -> None:
+    marked: list[CompletionCriterion] = []
+    for criterion in policy.completion_criteria:
+        value_less = criterion.expected_output_value is None and criterion.expected_output_shape is None
+        is_floor_base = is_fallback_floor_base_criterion(criterion)
+        is_requested_output = criterion.id.startswith(_REQUESTED_OUTPUT_CRITERION_ID_PREFIX)
+        if value_less and (is_floor_base or is_requested_output):
+            marked.append(replace(criterion, mint_degrade="turn_unsatisfiable_fallback"))
+        else:
+            marked.append(criterion)
+    policy.completion_criteria = marked
+
+
 def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
     floor = [
         CompletionCriterion(
@@ -1617,8 +1705,11 @@ def _classifier_fallback_policy(
         classifier_retry_count=retry_count,
         completion_contract_status="present" if fallback_criteria else "unknown",
     )
-    _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
+    _apply_requested_output_completion_criteria(
+        policy, user_message, requested_output_path_aliases, extract_literals=True
+    )
     _apply_classifier_typed_requested_output_corroborators(policy)
+    _mark_turn_unsatisfiable_fallback_criteria(policy)
     if policy.graded_completion_criteria():
         policy.completion_contract_status = "present"
     return policy

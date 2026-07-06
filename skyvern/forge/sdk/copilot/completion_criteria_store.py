@@ -145,6 +145,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
         }
         if criterion.requested_output_corroborator:
             item["requested_output_corroborator"] = True
+        if criterion.mint_degrade is not None:
+            item["mint_degrade"] = criterion.mint_degrade
         items.append(item)
     return items
 
@@ -217,6 +219,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
                 requested_output_corroborator=bool(item.get("requested_output_corroborator")),
+                mint_degrade="turn_unsatisfiable_fallback"
+                if item.get("mint_degrade") == "turn_unsatisfiable_fallback"
+                else None,
             )
         )
     return tuple(criteria)
@@ -225,7 +230,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
-    deliverable_kind_key = criterion.deliverable_kind or ""
+    deliverable_kind_key = f"{criterion.deliverable_kind or ''}\x1fmint_degrade:{criterion.mint_degrade or ''}"
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
     expected_output_shape_key = criterion.expected_output_shape or ""
     requested_output_evidence_source_key = criterion.requested_output_evidence_source
@@ -379,6 +384,7 @@ def apply_requested_output_producer_floor(
         if criterion.expected_output_value is None
         and criterion.expected_output_shape is None
         and criterion.deliverable_kind is None
+        and criterion.mint_degrade is None
     }
     if not presence_only_ids:
         return criteria, ()

@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
+    carry_degraded_criterion_ids,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_validation_classification_criteria,
     is_fallback_floor_base_criterion,
     is_registered_download_completion_criterion,
+    only_degraded_blocking,
     registered_download_completion_criterion,
     structural_unfired_contingent_criterion_ids,
     summarize_unsatisfied_outcomes,
@@ -399,6 +401,7 @@ async def _maybe_run_completion_verification_from_page_observation(
     )
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
+        verification = carry_degraded_criterion_ids(verification, criteria)
         copilot_ctx.completion_verification_result = verification
         record_completion_verification(copilot_ctx, verification)
         _record_adjudication_on_turn_state(copilot_ctx, verification)
@@ -552,6 +555,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                 contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
             )
 
+    verification = carry_degraded_criterion_ids(verification, criteria)
     if (
         isinstance(existing, CompletionVerificationResult)
         and not verification.is_fully_satisfied()
@@ -1156,6 +1160,13 @@ async def _maybe_run_completion_verification(
         return None
     criteria = _completion_verification_criteria(copilot_ctx)
     criteria = _reconcile_download_completion_criterion(copilot_ctx, result, criteria)
+    verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
+    return carry_degraded_criterion_ids(verification, criteria) if verification is not None else None
+
+
+async def _completion_verification_from_run_result(
+    copilot_ctx: Any, result: dict[str, Any], handler_start: float, criteria: list[CompletionCriterion]
+) -> CompletionVerificationResult | None:
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     criterion_ids = [criterion.id for criterion in criteria]
     contingent_ids, contingent_on_by_id, contingent_path_by_id = _contingent_metadata_for_criteria(criteria)
@@ -1468,6 +1479,8 @@ def _outcome_failure_warrants_repair(
     verification result, so this only governs the repair directive, not the gate.
     """
     if completion_verification is None:
+        return False
+    if only_degraded_blocking(completion_verification):
         return False
     if any(verdict.reason_code == "evidence_contradicts" for verdict in completion_verification.verdicts):
         return True
