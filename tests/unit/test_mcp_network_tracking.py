@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,21 +25,8 @@ from skyvern.cli.mcp_tools.inspection import (
     skyvern_network_route,
     skyvern_network_unroute,
 )
-
-
-def _make_state() -> SessionState:
-    return SessionState(
-        console_messages=deque(maxlen=1000),
-        network_requests=deque(maxlen=1000),
-        dialog_events=deque(maxlen=1000),
-    )
-
-
-def _make_page(raw: MagicMock | None = None) -> SimpleNamespace:
-    if raw is None:
-        raw = MagicMock()
-        raw.on = MagicMock()
-    return SimpleNamespace(page=raw)
+from tests.unit._mcp_browser_fakes import make_page as _make_page
+from tests.unit._mcp_browser_fakes import make_session_state as _make_state
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, state: SessionState) -> None:
