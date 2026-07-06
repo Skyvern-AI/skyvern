@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from skyvern.core.script_generations.script_validators import validate_missing_selectors
 from skyvern.services.script_reviewer import ScriptReviewer
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "prompts" / "skyvern" / "script-reviewer.j2"
@@ -404,53 +405,7 @@ class TestValidateMissingSelectors:
     def setup_method(self) -> None:
         self.reviewer = ScriptReviewer()
 
-    def test_fallback_with_selector_is_fine(self) -> None:
-        code = """
-async def block_fn(page, context):
-    await page.click(selector='button:has-text("Submit")', ai='fallback', prompt='submit')
-"""
-        assert self.reviewer._validate_missing_selectors(code) is None
-
-    def test_fallback_without_selector_flagged(self) -> None:
-        """ai='fallback' with no selector= silently uses AI as primary path."""
-        code = """
-async def block_fn(page, context):
-    await page.click(ai='fallback', prompt='Click Billing & Payments')
-"""
-        error = self.reviewer._validate_missing_selectors(code)
-        assert error is not None
-        assert "page.click()" in error
-        assert "Missing selector" in error
-
-    def test_fill_without_selector_flagged(self) -> None:
-        code = """
-async def block_fn(page, context):
-    await page.fill(ai='fallback', prompt='Enter username', value='test')
-"""
-        error = self.reviewer._validate_missing_selectors(code)
-        assert error is not None
-        assert "page.fill()" in error
-
-    def test_no_ai_arg_without_selector_flagged(self) -> None:
-        """Bare calls with no ai= and no selector= silently burn LLM tokens."""
-        code = """
-async def block_fn(page, context):
-    await page.click(prompt='Click something')
-"""
-        error = self.reviewer._validate_missing_selectors(code)
-        assert error is not None
-        assert "page.click()" in error
-        assert "no ai= argument" in error
-
-    def test_proactive_without_selector_not_flagged(self) -> None:
-        """ai='proactive' without selector is intentional — AI always generates the value."""
-        code = """
-async def block_fn(page, context):
-    await page.click(ai='proactive', prompt='Click something')
-"""
-        assert self.reviewer._validate_missing_selectors(code) is None
-
-    def test_multiline_call_flagged(self) -> None:
+    def test_delegates_to_shared_validator(self) -> None:
         code = """
 async def block_fn(page, context):
     await page.click(
@@ -458,36 +413,9 @@ async def block_fn(page, context):
         prompt='Click Billing & Payments',
     )
 """
-        error = self.reviewer._validate_missing_selectors(code)
-        assert error is not None
-        assert "page.click()" in error
-
-    def test_multiline_with_selector_ok(self) -> None:
-        code = """
-async def block_fn(page, context):
-    await page.click(
-        selector='a:has-text("Billing")',
-        ai='fallback',
-        prompt='Click billing link',
-    )
-"""
-        assert self.reviewer._validate_missing_selectors(code) is None
-
-    def test_comments_ignored(self) -> None:
-        code = """
-async def block_fn(page, context):
-    # await page.click(ai='fallback', prompt='old code')
-    await page.click(selector='button', ai='fallback', prompt='submit')
-"""
-        assert self.reviewer._validate_missing_selectors(code) is None
-
-    def test_non_interaction_methods_ignored(self) -> None:
-        """Methods like page.wait, page.complete are not interaction methods."""
-        code = """
-async def block_fn(page, context):
-    await page.wait(ai='fallback', prompt='wait for page')
-"""
-        assert self.reviewer._validate_missing_selectors(code) is None
+        result = self.reviewer._validate_missing_selectors(code)
+        assert result is not None
+        assert result == validate_missing_selectors(code)
 
 
 class TestExtractCachedBlocks:

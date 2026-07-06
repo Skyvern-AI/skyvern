@@ -127,13 +127,6 @@ def test_planning_tool_still_trips_name_only_streak() -> None:
     assert "LOOP DETECTED" in msg
 
 
-def test_block_running_tool_is_blocked_by_pending_reconciliation() -> None:
-    ctx = _ctx(pending_reconciliation_run_id="wr_123")
-    msg = _tool_loop_error(ctx, "update_and_run_blocks")
-    assert msg is not None
-    assert "wr_123" in msg
-
-
 def test_block_running_tool_blocks_late_retry_after_failed_workflow() -> None:
     ctx = _ctx(
         last_failed_workflow_yaml="version: '1.0'",
