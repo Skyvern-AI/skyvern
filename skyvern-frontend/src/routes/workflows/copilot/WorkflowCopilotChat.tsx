@@ -2392,7 +2392,7 @@ export function WorkflowCopilotChat({
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
               minHeight: "40px",
               maxHeight: "150px",
