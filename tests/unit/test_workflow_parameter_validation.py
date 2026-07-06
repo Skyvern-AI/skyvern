@@ -4,6 +4,8 @@ These tests ensure that parameter keys and block labels are valid Python/Jinja2 
 preventing runtime errors like "'State_' is undefined" when using keys like "State_/_Province".
 """
 
+from collections.abc import Callable
+
 import pytest
 from pydantic import ValidationError
 
@@ -18,303 +20,119 @@ from skyvern.schemas.workflows import (
 from skyvern.utils.templating import replace_jinja_reference
 
 
-class TestParameterKeyValidation:
-    """Tests for parameter key validation."""
+class TestIdentifierValidation:
+    """Tests for parameter key and block label validation."""
 
-    def test_valid_parameter_key_simple(self) -> None:
-        """Test that simple valid keys are accepted."""
-        param = WorkflowParameterYAML(
-            key="my_parameter",
-            workflow_parameter_type=WorkflowParameterType.STRING,
-        )
-        assert param.key == "my_parameter"
-
-    def test_valid_parameter_key_with_numbers(self) -> None:
-        """Test that keys with numbers (not at start) are accepted."""
-        param = WorkflowParameterYAML(
-            key="param123",
-            workflow_parameter_type=WorkflowParameterType.STRING,
-        )
-        assert param.key == "param123"
-
-    def test_valid_parameter_key_underscore_prefix(self) -> None:
-        """Test that keys starting with underscore are accepted."""
-        param = WorkflowParameterYAML(
-            key="_private_param",
-            workflow_parameter_type=WorkflowParameterType.STRING,
-        )
-        assert param.key == "_private_param"
-
-    def test_valid_parameter_key_single_letter(self) -> None:
-        """Test that single letter keys are accepted."""
-        param = WorkflowParameterYAML(
-            key="x",
-            workflow_parameter_type=WorkflowParameterType.STRING,
-        )
-        assert param.key == "x"
-
-    def test_invalid_parameter_key_with_slash(self) -> None:
-        """Test that keys with '/' are rejected (the main bug case from SKY-7356)."""
-        with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="State_/_Province",
+    @pytest.mark.parametrize(
+        ("model_name", "value"),
+        [
+            pytest.param("parameter", "my_parameter", id="parameter-key"),
+            pytest.param("parameter", "param123", id="parameter-key-with-numbers"),
+            pytest.param("parameter", "_private_param", id="parameter-key-underscore-prefix"),
+            pytest.param("parameter", "x", id="parameter-key-single-letter"),
+            pytest.param("block", "my_task", id="block-label"),
+            pytest.param("block", "task123", id="block-label-with-numbers"),
+            pytest.param("block", "_private_task", id="block-label-underscore-prefix"),
+        ],
+    )
+    def test_valid_keys(self, model_name: str, value: str) -> None:
+        if model_name == "parameter":
+            param = WorkflowParameterYAML(
+                key=value,
                 workflow_parameter_type=WorkflowParameterType.STRING,
             )
-        error_msg = str(exc_info.value)
-        assert "not a valid parameter name" in error_msg
+            assert param.key == value
+        else:
+            block = TaskBlockYAML(label=value, url="https://example.com")
+            assert block.label == value
 
-    def test_invalid_parameter_key_with_hyphen(self) -> None:
-        """Test that keys with '-' are rejected."""
+    @pytest.mark.parametrize(
+        ("model_name", "value", "error_fragment"),
+        [
+            pytest.param("parameter", "State_/_Province", "not a valid parameter name", id="parameter-invalid-char"),
+            pytest.param("parameter", "state-or-province", "not a valid parameter name", id="parameter-hyphen"),
+            pytest.param("parameter", "some.property", "not a valid parameter name", id="parameter-dot"),
+            pytest.param("parameter", "123param", "not a valid parameter name", id="parameter-digit-prefix"),
+            pytest.param("parameter", "my parameter", "whitespace", id="parameter-whitespace"),
+            pytest.param("parameter", "my\tparameter", "whitespace", id="parameter-tab"),
+            pytest.param("parameter", "param*value", "not a valid parameter name", id="parameter-asterisk"),
+            pytest.param("block", "task/block", "not a valid label", id="block-invalid-char"),
+            pytest.param("block", "task-block", "not a valid label", id="block-hyphen"),
+            pytest.param("block", "123task", "not a valid label", id="block-digit-prefix"),
+            pytest.param("block", "", "empty", id="block-empty"),
+            pytest.param("block", "   ", "empty", id="block-whitespace-only"),
+            pytest.param("block", "my task", "not a valid label", id="block-space"),
+        ],
+    )
+    def test_invalid_keys(self, model_name: str, value: str, error_fragment: str) -> None:
         with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="state-or-province",
-                workflow_parameter_type=WorkflowParameterType.STRING,
-            )
-        error_msg = str(exc_info.value)
-        assert "not a valid parameter name" in error_msg
+            if model_name == "parameter":
+                WorkflowParameterYAML(
+                    key=value,
+                    workflow_parameter_type=WorkflowParameterType.STRING,
+                )
+            else:
+                TaskBlockYAML(label=value, url="https://example.com")
 
-    def test_invalid_parameter_key_with_dot(self) -> None:
-        """Test that keys with '.' are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="some.property",
-                workflow_parameter_type=WorkflowParameterType.STRING,
-            )
-        error_msg = str(exc_info.value)
-        assert "not a valid parameter name" in error_msg
-
-    def test_invalid_parameter_key_starts_with_digit(self) -> None:
-        """Test that keys starting with a digit are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="123param",
-                workflow_parameter_type=WorkflowParameterType.STRING,
-            )
-        error_msg = str(exc_info.value)
-        assert "not a valid parameter name" in error_msg
-
-    def test_invalid_parameter_key_with_space(self) -> None:
-        """Test that keys with spaces are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="my parameter",
-                workflow_parameter_type=WorkflowParameterType.STRING,
-            )
-        error_msg = str(exc_info.value)
-        assert "whitespace" in error_msg
-
-    def test_invalid_parameter_key_with_tab(self) -> None:
-        """Test that keys with tabs are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="my\tparameter",
-                workflow_parameter_type=WorkflowParameterType.STRING,
-            )
-        error_msg = str(exc_info.value)
-        assert "whitespace" in error_msg
-
-    def test_invalid_parameter_key_with_asterisk(self) -> None:
-        """Test that keys with '*' are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            WorkflowParameterYAML(
-                key="param*value",
-                workflow_parameter_type=WorkflowParameterType.STRING,
-            )
-        error_msg = str(exc_info.value)
-        assert "not a valid parameter name" in error_msg
+        assert error_fragment in str(exc_info.value).lower()
 
 
-class TestBlockLabelValidation:
-    """Tests for block label validation."""
+class TestSanitizers:
+    """Tests for identifier sanitizers."""
 
-    def test_valid_block_label_simple(self) -> None:
-        """Test that simple valid labels are accepted."""
-        block = TaskBlockYAML(label="my_task", url="https://example.com")
-        assert block.label == "my_task"
-
-    def test_valid_block_label_with_numbers(self) -> None:
-        """Test that labels with numbers (not at start) are accepted."""
-        block = TaskBlockYAML(label="task123", url="https://example.com")
-        assert block.label == "task123"
-
-    def test_valid_block_label_underscore_prefix(self) -> None:
-        """Test that labels starting with underscore are accepted."""
-        block = TaskBlockYAML(label="_private_task", url="https://example.com")
-        assert block.label == "_private_task"
-
-    def test_invalid_block_label_with_slash(self) -> None:
-        """Test that labels with '/' are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            TaskBlockYAML(label="task/block", url="https://example.com")
-        error_msg = str(exc_info.value)
-        assert "not a valid label" in error_msg
-
-    def test_invalid_block_label_with_hyphen(self) -> None:
-        """Test that labels with '-' are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            TaskBlockYAML(label="task-block", url="https://example.com")
-        error_msg = str(exc_info.value)
-        assert "not a valid label" in error_msg
-
-    def test_invalid_block_label_starts_with_digit(self) -> None:
-        """Test that labels starting with a digit are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            TaskBlockYAML(label="123task", url="https://example.com")
-        error_msg = str(exc_info.value)
-        assert "not a valid label" in error_msg
-
-    def test_invalid_block_label_empty(self) -> None:
-        """Test that empty labels are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            TaskBlockYAML(label="", url="https://example.com")
-        error_msg = str(exc_info.value)
-        assert "empty" in error_msg.lower()
-
-    def test_invalid_block_label_whitespace_only(self) -> None:
-        """Test that whitespace-only labels are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            TaskBlockYAML(label="   ", url="https://example.com")
-        error_msg = str(exc_info.value)
-        assert "empty" in error_msg.lower()
-
-    def test_invalid_block_label_with_space(self) -> None:
-        """Test that labels with spaces are rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            TaskBlockYAML(label="my task", url="https://example.com")
-        error_msg = str(exc_info.value)
-        assert "not a valid label" in error_msg
-
-
-class TestSanitizeBlockLabel:
-    """Tests for the sanitize_block_label function."""
-
-    def test_sanitize_slash(self) -> None:
-        """Test that slashes are replaced with underscores."""
-        assert sanitize_block_label("State/Province") == "State_Province"
-
-    def test_sanitize_hyphen(self) -> None:
-        """Test that hyphens are replaced with underscores."""
-        assert sanitize_block_label("my-block") == "my_block"
-
-    def test_sanitize_dot(self) -> None:
-        """Test that dots are replaced with underscores."""
-        assert sanitize_block_label("block.name") == "block_name"
-
-    def test_sanitize_multiple_special_chars(self) -> None:
-        """Test that multiple special characters are handled."""
-        assert sanitize_block_label("State_/_Province") == "State_Province"
-
-    def test_sanitize_consecutive_underscores(self) -> None:
-        """Test that consecutive underscores are collapsed."""
-        assert sanitize_block_label("a__b___c") == "a_b_c"
-
-    def test_sanitize_leading_trailing_underscores(self) -> None:
-        """Test that leading/trailing underscores are removed."""
-        assert sanitize_block_label("_my_block_") == "my_block"
-
-    def test_sanitize_digit_prefix(self) -> None:
-        """Test that labels starting with digits get underscore prefix."""
-        assert sanitize_block_label("123abc") == "_123abc"
-
-    def test_sanitize_digit_prefix_after_strip(self) -> None:
-        """Test that digit prefix is added after stripping underscores."""
-        assert sanitize_block_label("_123abc") == "_123abc"
-
-    def test_sanitize_all_invalid_chars(self) -> None:
-        """Test that if all chars are invalid, default is returned."""
-        assert sanitize_block_label("///") == "block"
-
-    def test_sanitize_empty_string(self) -> None:
-        """Test that empty string returns default."""
-        assert sanitize_block_label("") == "block"
-
-    def test_sanitize_valid_label_unchanged(self) -> None:
-        """Test that valid labels are unchanged."""
-        assert sanitize_block_label("my_valid_label") == "my_valid_label"
-
-    def test_sanitize_spaces(self) -> None:
-        """Test that spaces are replaced with underscores."""
-        assert sanitize_block_label("my block name") == "my_block_name"
-
-
-class TestSanitizeParameterKey:
-    """Tests for the sanitize_parameter_key function."""
-
-    def test_sanitize_slash(self) -> None:
-        """Test that slashes are replaced with underscores."""
-        assert sanitize_parameter_key("State/Province") == "State_Province"
-
-    def test_sanitize_hyphen(self) -> None:
-        """Test that hyphens are replaced with underscores."""
-        assert sanitize_parameter_key("my-param") == "my_param"
-
-    def test_sanitize_dot(self) -> None:
-        """Test that dots are replaced with underscores."""
-        assert sanitize_parameter_key("param.name") == "param_name"
-
-    def test_sanitize_all_invalid_chars(self) -> None:
-        """Test that if all chars are invalid, default is returned."""
-        assert sanitize_parameter_key("///") == "parameter"
-
-    def test_sanitize_empty_string(self) -> None:
-        """Test that empty string returns default."""
-        assert sanitize_parameter_key("") == "parameter"
-
-    def test_sanitize_valid_key_unchanged(self) -> None:
-        """Test that valid keys are unchanged."""
-        assert sanitize_parameter_key("my_valid_key") == "my_valid_key"
+    @pytest.mark.parametrize(
+        ("sanitizer", "raw_value", "expected"),
+        [
+            pytest.param(sanitize_block_label, "State/Province", "State_Province", id="block-label-slash"),
+            pytest.param(sanitize_block_label, "my-block", "my_block", id="block-label-hyphen"),
+            pytest.param(sanitize_block_label, "block.name", "block_name", id="block-label-dot"),
+            pytest.param(sanitize_block_label, "State_/_Province", "State_Province", id="block-label-mixed-specials"),
+            pytest.param(sanitize_block_label, "a__b___c", "a_b_c", id="block-label-collapse-underscores"),
+            pytest.param(sanitize_block_label, "_my_block_", "my_block", id="block-label-trim-underscores"),
+            pytest.param(sanitize_block_label, "123abc", "_123abc", id="block-label-digit-prefix"),
+            pytest.param(sanitize_block_label, "_123abc", "_123abc", id="block-label-digit-prefix-after-strip"),
+            pytest.param(sanitize_block_label, "///", "block", id="block-label-default"),
+            pytest.param(sanitize_block_label, "", "block", id="block-label-empty-default"),
+            pytest.param(sanitize_block_label, "my_valid_label", "my_valid_label", id="block-label-valid-unchanged"),
+            pytest.param(sanitize_block_label, "my block name", "my_block_name", id="block-label-spaces"),
+            pytest.param(sanitize_parameter_key, "State/Province", "State_Province", id="parameter-key-slash"),
+            pytest.param(sanitize_parameter_key, "my-param", "my_param", id="parameter-key-hyphen"),
+            pytest.param(sanitize_parameter_key, "param.name", "param_name", id="parameter-key-dot"),
+            pytest.param(sanitize_parameter_key, "///", "parameter", id="parameter-key-default"),
+            pytest.param(sanitize_parameter_key, "", "parameter", id="parameter-key-empty-default"),
+            pytest.param(sanitize_parameter_key, "my_valid_key", "my_valid_key", id="parameter-key-valid-unchanged"),
+        ],
+    )
+    def test_sanitizers(self, sanitizer: Callable[[str], str], raw_value: str, expected: str) -> None:
+        assert sanitizer(raw_value) == expected
 
 
 class TestReplaceJinjaReference:
     """Tests for the replace_jinja_reference function."""
 
-    def test_replace_simple_reference(self) -> None:
-        """Test replacing a simple Jinja reference."""
-        text = "Value is {{ old_key }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "Value is {{ new_key }}"
-
-    def test_replace_reference_no_spaces(self) -> None:
-        """Test replacing a reference without spaces."""
-        text = "Value is {{old_key}}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "Value is {{new_key}}"
-
-    def test_replace_reference_with_attribute(self) -> None:
-        """Test replacing a reference with attribute access."""
-        text = "Value is {{ old_key.field }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "Value is {{ new_key.field }}"
-
-    def test_replace_reference_with_filter(self) -> None:
-        """Test replacing a reference with filter."""
-        text = "Value is {{ old_key | default('') }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "Value is {{ new_key | default('') }}"
-
-    def test_replace_reference_with_index(self) -> None:
-        """Test replacing a reference with index access."""
-        text = "Value is {{ old_key[0] }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "Value is {{ new_key[0] }}"
-
-    def test_replace_multiple_references(self) -> None:
-        """Test replacing multiple occurrences."""
-        text = "{{ old_key }} and {{ old_key.field }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "{{ new_key }} and {{ new_key.field }}"
-
-    def test_no_replace_partial_match(self) -> None:
-        """Test that partial matches are not replaced."""
-        text = "{{ old_key_extended }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "{{ old_key_extended }}"
-
-    def test_no_replace_different_key(self) -> None:
-        """Test that different keys are not affected."""
-        text = "{{ other_key }}"
-        result = replace_jinja_reference(text, "old_key", "new_key")
-        assert result == "{{ other_key }}"
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            pytest.param("Value is {{ old_key }}", "Value is {{ new_key }}", id="simple-reference"),
+            pytest.param("Value is {{old_key}}", "Value is {{new_key}}", id="no-space-reference"),
+            pytest.param("Value is {{ old_key.field }}", "Value is {{ new_key.field }}", id="attribute-access"),
+            pytest.param(
+                "Value is {{ old_key | default('') }}",
+                "Value is {{ new_key | default('') }}",
+                id="filter-expression",
+            ),
+            pytest.param("Value is {{ old_key[0] }}", "Value is {{ new_key[0] }}", id="index-access"),
+            pytest.param(
+                "{{ old_key }} and {{ old_key.field }}",
+                "{{ new_key }} and {{ new_key.field }}",
+                id="multiple-occurrences",
+            ),
+            pytest.param("{{ old_key_extended }}", "{{ old_key_extended }}", id="partial-match-unchanged"),
+            pytest.param("{{ other_key }}", "{{ other_key }}", id="different-key-unchanged"),
+        ],
+    )
+    def test_replace_jinja_reference(self, text: str, expected: str) -> None:
+        assert replace_jinja_reference(text, "old_key", "new_key") == expected
 
 
 class TestSanitizeWorkflowYamlWithReferences:
