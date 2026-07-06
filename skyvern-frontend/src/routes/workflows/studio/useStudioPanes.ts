@@ -5,8 +5,11 @@ import {
   type NavigateOptions,
 } from "react-router-dom";
 
+import { useStudioShellStore } from "@/store/StudioShellStore";
+
 import { liveSearch } from "./liveSearch";
 import {
+  layoutClassForSearch,
   panesListEqual,
   panesWithoutDeletedBlocked,
   resolveOpenPanes,
@@ -19,6 +22,13 @@ import {
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
+type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
+  // When true the resulting pane list is stored as the learned default for this
+  // layout class (edit/run). System writes leave this unset so they never
+  // overwrite a user's last-chosen arrangement.
+  learn?: boolean;
+};
+
 /**
  * Pane state lives in the URL (?panes=), so the open set and its order are
  * shareable and can never drift from navigation. Writes merge against the live
@@ -30,6 +40,7 @@ export function useStudioPanes() {
   const navigate = useNavigate();
   const { defaultPanes, clamp, notePaneWrite } = useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
+  const setPaneLayout = useStudioShellStore((s) => s.setPaneLayout);
 
   // The mount-time viewport clamp only masks the exact pane list the URL
   // carried at mount; any other list means someone navigated, so present it
@@ -66,7 +77,7 @@ export function useStudioPanes() {
   const applyPanes = useCallback(
     (
       compute: (current: StudioPaneId[]) => StudioPaneId[],
-      options?: Pick<NavigateOptions, "state">,
+      options?: ApplyPanesOptions,
     ) => {
       const search = liveSearch(location.search);
       const current = resolveLivePanes();
@@ -77,8 +88,14 @@ export function useStudioPanes() {
       notePaneWrite({ previous: current, next });
       navigate(
         { search: searchWithPanes(search, next) },
-        { replace: true, ...options },
+        { replace: true, state: options?.state },
       );
+      if (options?.learn && next.length > 0 && !workflowDeleted) {
+        const cls = layoutClassForSearch(search);
+        if (cls !== null) {
+          setPaneLayout(cls, next);
+        }
+      }
     },
     [
       navigate,
@@ -86,22 +103,25 @@ export function useStudioPanes() {
       resolveLivePanes,
       notePaneWrite,
       workflowDeleted,
+      setPaneLayout,
     ],
   );
 
   const togglePane = useCallback(
-    (id: StudioPaneId) => applyPanes((current) => togglePaneIn(current, id)),
+    (id: StudioPaneId, opts?: Pick<ApplyPanesOptions, "learn">) =>
+      applyPanes((current) => togglePaneIn(current, id), opts),
     [applyPanes],
   );
 
   const openPane = useCallback(
-    (id: StudioPaneId, options?: Pick<NavigateOptions, "state">) =>
+    (id: StudioPaneId, options?: ApplyPanesOptions) =>
       applyPanes((current) => withPaneOpen(current, id), options),
     [applyPanes],
   );
 
   const closePane = useCallback(
-    (id: StudioPaneId) => applyPanes((current) => withPaneClosed(current, id)),
+    (id: StudioPaneId, opts?: Pick<ApplyPanesOptions, "learn">) =>
+      applyPanes((current) => withPaneClosed(current, id), opts),
     [applyPanes],
   );
 
@@ -115,7 +135,7 @@ export function useStudioPanes() {
   // Reorder-only write (drag-and-drop / keyboard move): the live URL keeps
   // deciding WHICH panes are open; `order` only decides where they sit.
   const setPanesOrder = useCallback(
-    (order: readonly StudioPaneId[]) =>
+    (order: readonly StudioPaneId[], opts?: Pick<ApplyPanesOptions, "learn">) =>
       applyPanes((current) => {
         const next = order.filter(
           (id, index) => current.includes(id) && order.indexOf(id) === index,
@@ -126,7 +146,7 @@ export function useStudioPanes() {
           }
         }
         return next;
-      }),
+      }, opts),
     [applyPanes],
   );
 

@@ -1,5 +1,18 @@
 export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
 
+// "edit" = no run in URL; "run" = run present, no block label; null = block-iterate (never learned).
+export type StudioLayoutClass = "edit" | "run";
+
+export function layoutClassForSearch(search: string): StudioLayoutClass | null {
+  const params = new URLSearchParams(search);
+  if (params.get("bl") !== null) return null;
+  // Same run test as panesFromDeepLink: ?active= is a run reference too.
+  if (params.get("wr") !== null || params.get("active") !== null) {
+    return "run";
+  }
+  return "edit";
+}
+
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "copilot",
   "editor",

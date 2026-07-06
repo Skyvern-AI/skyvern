@@ -9,6 +9,7 @@ import {
   STUDIO_PANE_MIN_WIDTH,
   defaultPanesForWorkflowState,
   fitPanesToWidth,
+  layoutClassForSearch,
   panesFitWidth,
   panesFromDeepLink,
   panesListEqual,
@@ -411,5 +412,39 @@ describe("panesWithoutDeletedBlocked", () => {
 
   test("blocks exactly the copilot and editor panes", () => {
     expect(DELETED_WORKFLOW_BLOCKED_PANES).toEqual(["copilot", "editor"]);
+  });
+});
+
+describe("layoutClassForSearch", () => {
+  test("no params → edit class", () => {
+    expect(layoutClassForSearch("")).toBe("edit");
+  });
+
+  test("?panes= only → edit class (URL params other than wr/bl don't matter)", () => {
+    expect(layoutClassForSearch("?panes=copilot,browser")).toBe("edit");
+  });
+
+  test("?wr= without ?bl= → run class", () => {
+    expect(layoutClassForSearch("?wr=wr_123")).toBe("run");
+  });
+
+  test("?wr= with ?bl= → null (block-iterate, never learned)", () => {
+    expect(layoutClassForSearch("?wr=wr_123&bl=block_1")).toBeNull();
+  });
+
+  test("?bl= alone (no wr) → null", () => {
+    expect(layoutClassForSearch("?bl=block_1")).toBeNull();
+  });
+
+  test("?wr= with unrelated params → run class", () => {
+    expect(layoutClassForSearch("?wr=wr_123&panes=copilot")).toBe("run");
+  });
+
+  test("?active= without ?wr= → run class (same run test as panesFromDeepLink)", () => {
+    expect(layoutClassForSearch("?active=act_1")).toBe("run");
+  });
+
+  test("?active= with ?bl= → null", () => {
+    expect(layoutClassForSearch("?active=act_1&bl=block_1")).toBeNull();
   });
 });
