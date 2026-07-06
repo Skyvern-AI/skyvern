@@ -26,7 +26,7 @@ export function StudioStageLauncher() {
     if (id === "browser") {
       clearBrowserActivity();
     }
-    openPane(id);
+    openPane(id, { learn: true });
   };
 
   return (

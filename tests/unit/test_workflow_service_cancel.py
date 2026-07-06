@@ -329,15 +329,15 @@ async def test_execute_workflow_webhook_tolerates_soft_deleted_workflow(
 async def test_build_status_response_uses_filter_deleted_false_when_allowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``allow_deleted=True`` goes through the raw repository lookup with
+    """``allow_deleted=True`` goes through the run-joined repository lookup with
     ``filter_deleted=False`` so soft-deleted workflows still resolve.
     """
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
     svc = WorkflowService()
 
-    by_wpid = AsyncMock(return_value=MagicMock())
-    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", by_wpid)
+    by_run = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_for_workflow_run", by_run)
 
     # Short-circuit the rest of build_workflow_run_status_response by making
     # subsequent DB calls raise the first caught thing — we only care about
@@ -355,8 +355,8 @@ async def test_build_status_response_uses_filter_deleted_false_when_allowed(
             allow_deleted=True,
         )
 
-    by_wpid.assert_awaited_once()
-    assert by_wpid.call_args.kwargs["filter_deleted"] is False
+    by_run.assert_awaited_once()
+    assert by_run.call_args.kwargs["filter_deleted"] is False
 
 
 @pytest.mark.asyncio

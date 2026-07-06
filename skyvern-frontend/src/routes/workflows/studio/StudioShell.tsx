@@ -28,7 +28,10 @@ import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
-import { EditorPaneModeToggle } from "./EditorPaneHeader";
+import {
+  EditorPaneBlockSearch,
+  EditorPaneModeToggle,
+} from "./EditorPaneHeader";
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
@@ -633,7 +636,7 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   // The ✕ unmounts with its pane, so hand focus back to the pane's toggle.
   const closeWithFocus = (id: StudioPaneId) => {
-    closePane(id);
+    closePane(id, { learn: true });
     document.getElementById(studioTabId(id))?.focus();
   };
 
@@ -644,7 +647,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     if (panesListEqual(next, panes)) {
       return;
     }
-    setPanesOrder(next);
+    setPanesOrder(next, { learn: true });
     setReorderAnnouncement(
       `${STUDIO_PANE_META[movedId].label} pane moved to position ${
         next.indexOf(movedId) + 1
@@ -761,6 +764,7 @@ function StudioStage(props: StudioWorkspaceProps) {
               <StudioPane
                 {...paneProps("editor")}
                 headerExtras={<EditorPaneModeToggle />}
+                headerActions={<EditorPaneBlockSearch />}
               >
                 {/* The embedded Workspace boots debug sessions, copilot chats
                     and block-script queries against the workflow — none of

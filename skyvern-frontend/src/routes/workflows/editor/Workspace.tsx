@@ -172,6 +172,10 @@ import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
+import {
+  initialEditorAutoOpenState,
+  shouldAutoOpenEditor,
+} from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -356,8 +360,8 @@ function Workspace({
   // Armed iff the workflow has no blocks at mount — the studio shell remounts
   // Workspace per workflow, so `workflow` is always populated here. The first
   // copilot build that lands blocks auto-opens the Editor pane, exactly once.
-  const editorAutoOpenArmedRef = useRef(
-    workflow.workflow_definition.blocks.length === 0,
+  const editorAutoOpenStateRef = useRef(
+    initialEditorAutoOpenState(workflow.workflow_definition.blocks.length),
   );
   const location = useLocation();
   const navigate = useNavigate();
@@ -2964,13 +2968,16 @@ function Workspace({
         onWorkflowUpdate={(workflowData, options) => {
           try {
             applyWorkflowUpdate(workflowData, options);
-            if (
-              embedded &&
-              options?.applied &&
-              editorAutoOpenArmedRef.current &&
-              workflowData.workflow_definition.blocks.length > 0
-            ) {
-              editorAutoOpenArmedRef.current = false;
+            const { fire, nextState } = shouldAutoOpenEditor(
+              editorAutoOpenStateRef.current,
+              {
+                embedded,
+                applied: options?.applied,
+                blockCount: workflowData.workflow_definition.blocks.length,
+              },
+            );
+            editorAutoOpenStateRef.current = nextState;
+            if (fire) {
               openStudioPane("editor");
             }
           } catch (error) {

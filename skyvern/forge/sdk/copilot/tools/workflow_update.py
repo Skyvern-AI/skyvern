@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
+    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
@@ -68,7 +69,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
+    CodeAuthoringRepairContext,
+    CopilotContext,
+)
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
@@ -1740,10 +1745,12 @@ def _metadata_output_repair_context(
 
 _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE = "metadata_contract_required_before_run"
 _SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE = "separated_spine_shape_required"
+_SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE = "separated_browser_spine_plus_extraction"
 _OUTPUT_CONTRACT_REJECT_REASON_CODE = "output_contract_required"
 _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE = "output_contract_reject_budget_exhausted"
 _MAX_OUTPUT_CONTRACT_STEERING_REJECTS = 2
 _MAX_OUTPUT_CONTRACT_REJECTS = 4
+_MAX_OUTPUT_CONTRACT_DEFERRALS = 3
 
 
 @dataclass(frozen=True)
@@ -2371,6 +2378,30 @@ def _evaluate_output_contract_for_code_block(
             reason_code=reason_code,
         ),
     }
+    if _SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE in shape_violations and block_label:
+        attempt_key = _output_contract_spine_directive_attempt_key(
+            signature=signature, block_label=block_label, workflow_yaml=workflow_yaml
+        )
+        if attempt_key in ctx.output_contract_spine_directive_blockers_by_attempt_key:
+            blockers = ctx.output_contract_spine_directive_blockers_by_attempt_key[attempt_key]
+            stage_count = ctx.output_contract_spine_directive_stage_count_by_attempt_key.get(attempt_key)
+            payload["spine_structure_directive"] = {
+                "required_block_structure": _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE,
+                "spine_stage_count": stage_count,
+                "spine_split_blockers": blockers,
+            }
+            if repair is not None:
+                repair.required_block_structure = _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE
+                repair.spine_stage_count = stage_count
+                repair.spine_split_blockers = list(blockers)
+    if not block_label and signature in ctx.output_contract_output_owner_directive_candidates_by_signature:
+        repair = _output_owner_ambiguity_repair_context(
+            required_paths=required_paths,
+            owner_labels=owner_labels,
+            source=source,
+            reason_code=reason_code,
+        )
+        payload["output_owner_directive"] = {"output_owner_candidate_labels": repair.output_owner_candidate_labels}
     progress_data = _code_repair_progress_data(
         repair,
         missing_requested_output_facts=payload["missing_requested_output_facts"],
@@ -2409,8 +2440,29 @@ def _record_output_contract_reject(
     payload["output_contract_reject_count"] = count
     payload["output_contract_reject_budget"] = _MAX_OUTPUT_CONTRACT_REJECTS
     if count >= _MAX_OUTPUT_CONTRACT_REJECTS:
-        payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-        payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+        if run_backed_repair_evidence_exists(ctx):
+            payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+            payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+        else:
+            deferral_count = _record_output_contract_deferral(ctx, evaluation.required_paths)
+            if deferral_count >= _MAX_OUTPUT_CONTRACT_DEFERRALS:
+                payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+                payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+                LOG.info(
+                    "copilot_output_contract_budget_deferral_cap_reached",
+                    block_label=evaluation.block_label,
+                    canonical_output_contract_signature=evaluation.canonical_signature,
+                    output_contract_reject_count=count,
+                    output_contract_deferral_count=deferral_count,
+                )
+            else:
+                LOG.info(
+                    "copilot_output_contract_budget_rewrite_deferred_no_run",
+                    block_label=evaluation.block_label,
+                    canonical_output_contract_signature=evaluation.canonical_signature,
+                    output_contract_reject_count=count,
+                    output_contract_deferral_count=deferral_count,
+                )
     structural_payload = _output_contract_author_time_structural_payload(
         ctx,
         evaluation.required_paths,
@@ -2462,6 +2514,17 @@ def _record_output_contract_family_reject(
         reject_family=reject_family,
         canonical_required_child_paths=sorted(required_paths),
     )
+    return count
+
+
+def _record_output_contract_deferral(ctx: AgentContext, required_paths: set[str]) -> int:
+    if not required_paths:
+        return 0
+    signature = _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+    if not signature:
+        return 0
+    count = int(ctx.output_contract_deferral_count_by_signature.get(signature, 0) or 0) + 1
+    ctx.output_contract_deferral_count_by_signature[signature] = count
     return count
 
 
@@ -2768,6 +2831,167 @@ def _record_runtime_output_repair_attempt(ctx: AgentContext, attempt_key: str) -
     ctx.runtime_output_repair_attempt_by_signature = attempts
 
 
+def _output_contract_spine_directive_attempt_key(*, signature: str, block_label: str, workflow_yaml: str) -> str:
+    payload = {
+        "signature": signature,
+        "block_label": block_label,
+        "workflow_yaml_hash": hashlib.sha256(workflow_yaml.encode("utf-8")).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _referenced_parameter_keys_in_code(code: str, parameter_keys: list[str]) -> list[str]:
+    protected = {key for key in parameter_keys if key}
+    if not protected:
+        return []
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return []
+    referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    return sorted(referenced & protected)
+
+
+class _SpineSplitOutcome(NamedTuple):
+    imposed_yaml: str | None
+    blockers: list[str]
+    stage_count: int | None
+
+
+def _attempt_separated_spine_split(
+    *,
+    ctx: AgentContext,
+    parsed: dict[str, Any],
+    label: str,
+    target_code: str,
+    synthesized: SynthesizedCodeBlock,
+    required_paths: set[str],
+) -> _SpineSplitOutcome:
+    code_block = next(
+        (block for block in _workflow_code_blocks(parsed) if str(block.get("label") or "").strip() == label),
+        None,
+    )
+    if code_block is None:
+        return _SpineSplitOutcome(None, ["target_block_not_resolved_in_parsed"], None)
+
+    reconciliation = _reconcile_synthesized_parameters(
+        ctx=ctx,
+        parsed=parsed,
+        code_block=code_block,
+        submitted_code=target_code,
+        synthesized_parameters=synthesized.parameters,
+        scout_trajectory=ctx.scout_trajectory,
+    )
+    if reconciliation.violations:
+        return _SpineSplitOutcome(None, ["parameter_reconciliation_failed"], None)
+
+    reconciled_submitted = _apply_parameter_reconciliation_to_code(textwrap.dedent(target_code), reconciliation)
+    reconciled_synthesized = _apply_parameter_reconciliation_to_code(textwrap.dedent(synthesized.code), reconciliation)
+    extraction_suffix = _submitted_suffix_after_synthesized_code(reconciled_submitted, reconciled_synthesized)
+    if not extraction_suffix:
+        return _SpineSplitOutcome(None, ["extraction_boundary_ambiguous"], None)
+    suffix_mutations, _, suffix_ambiguous = _browser_surface_for_code(extraction_suffix)
+    if suffix_mutations or suffix_ambiguous:
+        return _SpineSplitOutcome(None, ["extraction_suffix_contains_browser_actions"], None)
+
+    keyed_extraction, static_violations = _extraction_code_with_required_static_return(
+        extraction_suffix, required_paths=required_paths
+    )
+    if static_violations:
+        return _SpineSplitOutcome(None, ["static_return_envelope_unavailable"], None)
+    if _browser_surface_contains_full_action_spine(keyed_extraction, reconciled_synthesized):
+        return _SpineSplitOutcome(None, ["extraction_retains_full_spine"], None)
+
+    stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=reconciled_synthesized)
+    if len(stage_codes) < 2:
+        return _SpineSplitOutcome(None, ["insufficient_durable_stages"], len(stage_codes))
+
+    split_violations = _split_selected_output_owner_into_browser_stages(
+        parsed=parsed,
+        code_block=code_block,
+        synthesized=synthesized,
+        synthesized_code=reconciled_synthesized,
+        extraction_code=keyed_extraction,
+        parameter_keys=reconciliation.parameter_keys,
+    )
+    if split_violations:
+        return _SpineSplitOutcome(None, split_violations, len(stage_codes))
+
+    referenced_keys = _referenced_parameter_keys_in_code(keyed_extraction, reconciliation.parameter_keys)
+    if referenced_keys:
+        code_block["parameter_keys"] = referenced_keys
+
+    return _SpineSplitOutcome(yaml.safe_dump(parsed, sort_keys=False), [], len(stage_codes))
+
+
+def _arm_output_contract_spine_directive(
+    ctx: AgentContext,
+    *,
+    attempt_key: str,
+    blockers: list[str],
+    stage_count: int | None,
+    block_label: str,
+    signature: str,
+) -> None:
+    already_armed = attempt_key in ctx.output_contract_spine_directive_blockers_by_attempt_key
+    ctx.output_contract_spine_directive_blockers_by_attempt_key[attempt_key] = list(blockers)
+    if stage_count is not None:
+        ctx.output_contract_spine_directive_stage_count_by_attempt_key[attempt_key] = stage_count
+    if already_armed:
+        return
+    LOG.info(
+        "copilot_output_contract_spine_structure_directive_emitted",
+        block_label=block_label,
+        canonical_output_contract_signature=signature,
+        spine_split_blockers=blockers,
+        spine_stage_count=stage_count,
+    )
+
+
+def _arm_output_contract_output_owner_directive(
+    ctx: AgentContext,
+    *,
+    signature: str,
+    owner_labels: list[str],
+) -> None:
+    already_armed = signature in ctx.output_contract_output_owner_directive_candidates_by_signature
+    ctx.output_contract_output_owner_directive_candidates_by_signature[signature] = list(owner_labels)
+    if already_armed:
+        return
+    LOG.info(
+        "copilot_output_contract_output_owner_directive_emitted",
+        canonical_output_contract_signature=signature,
+        output_owner_candidate_labels=owner_labels,
+    )
+
+
+def _output_owner_ambiguity_repair_context(
+    *,
+    required_paths: set[str],
+    owner_labels: list[str],
+    source: str,
+    reason_code: str,
+) -> CodeAuthoringRepairContext:
+    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    candidates = sorted(dict.fromkeys(str(label).strip() for label in owner_labels if str(label).strip()))
+    path_text = ", ".join(paths)
+    return CodeAuthoringRepairContext(
+        block_label="",
+        reason_code=OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
+        runtime_failure_class=reason_code,
+        required_goal_value_paths=paths,
+        required_extraction_schema_paths=paths,
+        required_code_return_paths=paths,
+        metadata_contract_source=source,
+        metadata_contract_reason_code=reason_code,
+        output_owner_candidate_labels=candidates,
+        repair_instruction=(
+            "Designate exactly one code block as the sole output owner for required paths "
+            f"{path_text}; declare code_artifact_metadata on that single block and remove competing output owners."
+        ),
+    )
+
+
 def _impose_output_contract_envelope_after_steering(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -2795,11 +3019,7 @@ def _impose_output_contract_envelope_after_steering(
         required_paths,
     )
     if not label or owner_labels != [label]:
-        LOG.info(
-            "copilot_output_contract_envelope_scaffold_bailed",
-            reason="ambiguous_or_invalid_output_owner",
-            canonical_output_contract_signature=signature,
-        )
+        _arm_output_contract_output_owner_directive(ctx, signature=signature, owner_labels=owner_labels)
         return workflow_yaml, raw_code_artifact_metadata, False
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
@@ -2816,11 +3036,41 @@ def _impose_output_contract_envelope_after_steering(
             reached_download_target=getattr(ctx, "reached_download_target", None),
         )
         if synthesized is not None and _browser_surface_contains_full_action_spine(target_code, synthesized.code):
-            LOG.info(
-                "copilot_output_contract_envelope_scaffold_bailed",
-                reason="separated_spine_shape_violation",
+            split = _attempt_separated_spine_split(
+                ctx=ctx,
+                parsed=parse_workflow_yaml(workflow_yaml),
+                label=label,
+                target_code=target_code,
+                synthesized=synthesized,
+                required_paths=required_paths,
+            )
+            if split.imposed_yaml is not None:
+                scaffolded_metadata = _apply_metadata_contract_scaffold(
+                    ctx,
+                    split.imposed_yaml,
+                    raw_code_artifact_metadata,
+                    required_paths=required_paths,
+                    source=source,
+                    reason_code=reason_code,
+                )
+                _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
+                LOG.info(
+                    "copilot_output_contract_spine_split_imposed",
+                    block_label=label,
+                    stage_count=split.stage_count,
+                    canonical_output_contract_signature=signature,
+                )
+                return split.imposed_yaml, scaffolded_metadata, True
+            attempt_key = _output_contract_spine_directive_attempt_key(
+                signature=signature, block_label=label, workflow_yaml=workflow_yaml
+            )
+            _arm_output_contract_spine_directive(
+                ctx,
+                attempt_key=attempt_key,
+                blockers=split.blockers,
+                stage_count=split.stage_count,
                 block_label=label,
-                canonical_output_contract_signature=signature,
+                signature=signature,
             )
             return workflow_yaml, raw_code_artifact_metadata, False
     keyed_code, violations = _extraction_code_with_required_static_return(target_code, required_paths=required_paths)
@@ -2911,6 +3161,11 @@ def _metadata_contract_run_preflight_reject(
         evaluation,
         summary="Submitted workflow does not satisfy the requested output contract before run.",
     )
+    if evaluation.repair_context is not None and (
+        evaluation.repair_context.required_block_structure
+        or evaluation.repair_context.reason_code == OUTPUT_OWNER_AMBIGUITY_REASON_CODE
+    ):
+        ctx.last_code_authoring_repair_context = evaluation.repair_context
     payload = dict(payload)
     payload["output_contract_reason_code"] = payload.get("reason_code")
     payload["reason_code"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
@@ -4503,14 +4758,19 @@ def _whole_trajectory_browser_surface_violations(
     synthesized_code: str,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
+    scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
+    scouted_signatures = set(scouted_mutations)
     for block in code_blocks:
         if block is selected_code_block:
             continue
         label = _code_block_label(block)
         block_code = str(block.get("code") or "")
         block_mutations, _, block_ambiguous = _browser_surface_for_code(block_code)
-        if block_mutations:
-            action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(block_mutations))
+        unscouted_mutations = [mutation for mutation in block_mutations if mutation not in scouted_signatures]
+        if unscouted_mutations:
+            action_text = ", ".join(
+                f"{mutation.receiver}.{mutation.method}" for mutation in sorted(unscouted_mutations)
+            )
             violations.append(
                 f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): {action_text}."
             )
@@ -4521,6 +4781,26 @@ def _whole_trajectory_browser_surface_violations(
                 + "."
             )
     return _BrowserSurfaceValidation(violations)
+
+
+def _separated_spine_already_imposed(
+    code_blocks: list[dict[str, Any]],
+    selected_code_block: dict[str, Any],
+    synthesized_code: str,
+) -> bool:
+    scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
+    if not scouted_mutations:
+        return False
+    selected_mutations, _, _ = _browser_surface_for_code(str(selected_code_block.get("code") or ""))
+    if selected_mutations:
+        return False
+    sibling_signatures: set[_BrowserMutationSignature] = set()
+    for block in code_blocks:
+        if block is selected_code_block:
+            continue
+        block_mutations, _, _ = _browser_surface_for_code(str(block.get("code") or ""))
+        sibling_signatures.update(block_mutations)
+    return sibling_signatures == set(scouted_mutations)
 
 
 def _browser_surface_contains_full_action_spine(submitted_code: str, synthesized_code: str) -> bool:
@@ -5784,6 +6064,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
         )
+
+    if _separated_spine_already_imposed(code_blocks, code_block, synthesized.code):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
     diagnostics = synthesized.diagnostics
     violations: list[str] = []

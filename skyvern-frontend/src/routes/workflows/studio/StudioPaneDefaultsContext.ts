@@ -17,6 +17,7 @@ export type StudioPaneDefaultsValue = {
   clamp: PaneClamp | null;
   notePaneWrite: (change: PaneWrite) => void;
   registerStageElement: (el: HTMLElement | null) => void;
+  learnedRunPanes: readonly StudioPaneId[] | null;
 };
 
 const noop = () => undefined;
@@ -29,6 +30,7 @@ export const StudioPaneDefaultsContext = createContext<StudioPaneDefaultsValue>(
     clamp: null,
     notePaneWrite: noop,
     registerStageElement: noop,
+    learnedRunPanes: null,
   },
 );
 
