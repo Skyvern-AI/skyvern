@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     terminal_challenge_blocker_signal_from_page_evidence,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -450,3 +451,126 @@ def test_default_verified_argument_is_fail_safe_and_raises() -> None:
 
     with pytest.raises(CopilotTurnHalt):
         raise_if_turn_halt(ctx)
+
+
+def _output_contract_ctx(*, granted: bool) -> SimpleNamespace:
+    states = {"sig_a": OutputContractAdvisoryState.GRANTED} if granted else {}
+    return SimpleNamespace(
+        turn_halt=None,
+        output_contract_actuation_by_signature=states,
+        output_contract_actuation_count_by_signature={},
+    )
+
+
+def test_loop_detected_deferred_while_output_contract_ladder_unresolved() -> None:
+    ctx = _output_contract_ctx(granted=True)
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn")
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement_backstop")
+
+    assert halt is None
+    assert ctx.turn_halt is None
+
+
+def test_loop_detected_promotes_once_output_contract_ladder_resolves() -> None:
+    ctx = _output_contract_ctx(granted=False)
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn")
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement_backstop")
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.LOOP_DETECTED
+
+
+def test_output_source_unobservable_terminal_promotes_even_while_ladder_unresolved() -> None:
+    ctx = _output_contract_ctx(granted=True)
+    signal = _signal(blocker_kind="tool_error", internal_reason_code="output_source_unobservable")
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+
+
+def test_active_terminal_challenge_promotes_while_ladder_unresolved() -> None:
+    ctx = _output_contract_ctx(granted=True)
+    signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="run_execution")
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def _defer_ledger_ctx() -> SimpleNamespace:
+    return SimpleNamespace(
+        turn_halt=None,
+        blocker_signal=None,
+        latest_tool_blocker_signal=None,
+        tool_blocker_signals=[],
+        output_contract_actuation_by_signature={"sig_a": OutputContractAdvisoryState.GRANTED},
+        output_contract_actuation_count_by_signature={},
+        output_contract_run_output_observed_by_signature={},
+        output_contract_page_extraction_imposed_by_signature={},
+        output_contract_pending_run_evidence={"sig_a": ["output.confirmation_number"]},
+    )
+
+
+def _defer_count_ledger_ctx() -> SimpleNamespace:
+    return SimpleNamespace(
+        turn_halt=None,
+        blocker_signal=None,
+        latest_tool_blocker_signal=None,
+        tool_blocker_signals=[],
+        output_contract_actuation_by_signature={"sig_a": OutputContractAdvisoryState.UNUSED},
+        output_contract_actuation_count_by_signature={"sig_a": 1},
+        output_contract_run_output_observed_by_signature={},
+        output_contract_page_extraction_imposed_by_signature={},
+        output_contract_pending_run_evidence={"sig_a": ["output.confirmation_number"]},
+    )
+
+
+def _loop_signal() -> CopilotToolBlockerSignal:
+    return _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn")
+
+
+def test_defer_swallows_first_loop_signal_and_snapshots_progress() -> None:
+    ctx = _defer_ledger_ctx()
+    assert stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop") is None
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_defer_progress_token is not None
+
+
+def test_defer_never_expires_granted_grant_awaiting_forced_dispatch() -> None:
+    ctx = _defer_ledger_ctx()
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+
+
+def test_defer_expires_countonly_ladder_into_typed_terminal() -> None:
+    ctx = _defer_count_ledger_ctx()
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+
+
+def test_defer_re_arms_when_lifecycle_advances() -> None:
+    ctx = _defer_ledger_ctx()
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    ctx.output_contract_run_output_observed_by_signature["sig_a"] = True
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+
+
+def test_defer_countonly_ladder_reaches_a_terminal_within_two_stalled_signals() -> None:
+    ctx = _defer_count_ledger_ctx()
+    for _ in range(6):
+        stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+        if ctx.turn_halt is not None:
+            break
+    assert ctx.turn_halt is not None
