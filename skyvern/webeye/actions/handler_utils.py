@@ -120,7 +120,7 @@ async def keypress(page: Page, keys: list[str], hold: bool = False, duration: fl
 async def drag(
     page: Page, start_x: int | None = None, start_y: int | None = None, path: list[tuple[int, int]] | None = None
 ) -> None:
-    if start_x and start_y:
+    if start_x is not None and start_y is not None:
         await EventStrategyFactory.move_cursor(page, start_x, start_y)
     await page.mouse.down()
     path = path or []
@@ -137,7 +137,7 @@ async def drag(
 
 
 async def left_mouse(page: Page, x: int | None, y: int | None, direction: Literal["down", "up"]) -> None:
-    if x and y:
+    if x is not None and y is not None:
         await EventStrategyFactory.move_cursor(page, x, y)
     if direction == "down":
         await page.mouse.down()
