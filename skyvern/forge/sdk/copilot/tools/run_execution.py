@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import tempfile
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -15,7 +17,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_blocker_signal_for_reason_codes,
@@ -25,6 +27,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     RecordedOutcomeGroundingRequirement,
     arm_recorded_outcome_grounding_requirement,
+    authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
     clear_recorded_outcome_grounding_requirement,
     latest_recorded_build_test_outcome_repeated,
@@ -39,8 +42,10 @@ from skyvern.forge.sdk.copilot.code_block_security import (
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     code_contains_credential_fill,
+    synthesize_code_block,
     trajectory_has_credential_fill,
 )
+from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
@@ -96,6 +101,9 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -110,11 +118,14 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.typed_value_policy import should_reject_type_text_value
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -190,6 +201,11 @@ _RUN_ID_UNSET = _RunIdUnset()
 _ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_INTERVAL_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_MAX_SAMPLES = 8
+
+_MAX_REGISTERED_ARTIFACTS = 3
+_MAX_REGISTERED_ARTIFACT_BYTES = 5 * 1024 * 1024
+_MAX_REGISTERED_ARTIFACT_TEXT_CHARS = 20_000
+_REGISTERED_ARTIFACT_PARSE_EXTENSIONS = frozenset({".txt", ".csv", ".json"})
 
 _POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
 
@@ -1085,14 +1101,141 @@ async def _attach_registered_output_parameter_values(
     return values_by_label
 
 
-async def _capture_and_store_post_run_failure_page(
+def _pin_pre_run_page_reference(ctx: CopilotContext, run_id: str) -> None:
+    evidence = ctx.composition_page_evidence
+    if not isinstance(evidence, Mapping):
+        return
+    text = page_evidence_prose_text(evidence).strip()
+    if not text:
+        return
+    ctx.pre_run_page_reference = PreRunPageReference(text=text, workflow_run_id=run_id)
+
+
+def _artifact_file_name(artifact: Artifact) -> str:
+    uri = artifact.uri if isinstance(artifact.uri, str) else ""
+    return uri.rsplit("/", 1)[-1] if uri else artifact.artifact_id
+
+
+def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> str | None:
+    suffix = os.path.splitext(file_name)[1].lower()
+    if suffix == ".pdf":
+        temp_file_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file_path = temp_file.name
+                temp_file.write(artifact_bytes)
+            return extract_pdf_file(temp_file_path, file_identifier=file_name) or None
+        except Exception:
+            return None
+        finally:
+            if temp_file_path is not None:
+                try:
+                    os.unlink(temp_file_path)
+                except OSError:
+                    pass
+    if suffix in _REGISTERED_ARTIFACT_PARSE_EXTENSIONS:
+        try:
+            return artifact_bytes.decode("utf-8", errors="ignore") or None
+        except Exception:
+            return None
+    return None
+
+
+def _collect_downloaded_artifact_ids(block_outputs_by_label: Mapping[str, Any]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for output in block_outputs_by_label.values():
+        if not isinstance(output, dict):
+            continue
+        raw = output.get("downloaded_file_artifact_ids")
+        if not isinstance(raw, list):
+            continue
+        for artifact_id in raw:
+            if isinstance(artifact_id, str) and artifact_id and artifact_id not in seen:
+                seen.add(artifact_id)
+                ordered.append(artifact_id)
+    return ordered
+
+
+async def _fetch_registered_download_artifacts(
+    *, run_id: str, organization_id: str, downloaded_artifact_ids: Sequence[str] | None
+) -> list[Artifact]:
+    # The run's own download artifact ids are same-run by construction, so keying off them
+    # avoids depending on the DOWNLOAD row's workflow_run_id stamp across repair-iteration run ids.
+    if downloaded_artifact_ids:
+        artifacts = await app.DATABASE.artifacts.get_artifacts_by_ids(
+            list(dict.fromkeys(downloaded_artifact_ids)),
+            organization_id=organization_id,
+        )
+        by_id = {
+            artifact.artifact_id: artifact for artifact in artifacts if artifact.artifact_type == ArtifactType.DOWNLOAD
+        }
+        return [by_id[artifact_id] for artifact_id in dict.fromkeys(downloaded_artifact_ids) if artifact_id in by_id]
+    result = await app.DATABASE.artifacts.get_artifacts_for_run(
+        run_id,
+        organization_id=organization_id,
+        artifact_types=[ArtifactType.DOWNLOAD],
+    )
+    return result if isinstance(result, list) else []
+
+
+async def _capture_registered_artifact_evidence(
+    ctx: CopilotContext,
+    *,
+    run_id: str,
+    organization_id: str,
+    downloaded_artifact_ids: Sequence[str] | None = None,
+) -> None:
+    try:
+        artifacts = await _fetch_registered_download_artifacts(
+            run_id=run_id,
+            organization_id=organization_id,
+            downloaded_artifact_ids=downloaded_artifact_ids,
+        )
+    except Exception:
+        LOG.debug("Registered-artifact evidence fetch failed", run_id=run_id, exc_info=True)
+        return
+    entries: list[RegisteredArtifactEntry] = []
+    total_chars = 0
+    for artifact in artifacts[:_MAX_REGISTERED_ARTIFACTS]:
+        file_name = _artifact_file_name(artifact)
+        suffix = os.path.splitext(file_name)[1].lower()
+        if suffix != ".pdf" and suffix not in _REGISTERED_ARTIFACT_PARSE_EXTENSIONS:
+            continue
+        file_size = artifact.file_size
+        if isinstance(file_size, int) and file_size > _MAX_REGISTERED_ARTIFACT_BYTES:
+            LOG.debug("Skipping oversize registered artifact", artifact_id=artifact.artifact_id, file_size=file_size)
+            continue
+        try:
+            artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        except Exception:
+            LOG.debug("Registered-artifact retrieve failed", artifact_id=artifact.artifact_id, exc_info=True)
+            continue
+        if not artifact_bytes or len(artifact_bytes) > _MAX_REGISTERED_ARTIFACT_BYTES:
+            continue
+        parsed_text = _parse_registered_artifact_text(file_name, artifact_bytes)
+        if not parsed_text:
+            continue
+        remaining = _MAX_REGISTERED_ARTIFACT_TEXT_CHARS - total_chars
+        if remaining <= 0:
+            break
+        clipped = parsed_text[:remaining]
+        total_chars += len(clipped)
+        entries.append(
+            RegisteredArtifactEntry(artifact_id=artifact.artifact_id, file_name=file_name, parsed_text=clipped)
+        )
+    if entries:
+        ctx.registered_artifact_evidence = RegisteredArtifactEvidence(entries=tuple(entries), workflow_run_id=run_id)
+
+
+async def _capture_and_store_post_run_page(
     ctx: CopilotContext,
     *,
     run_session_id: str,
     run_id: str,
     current_url: str,
 ) -> None:
-    """Observe-only capture of the run-session failure page; the discovery extractor reads
+    """Observe-only capture of the run-session page; the discovery extractor reads
     ctx.browser_session_id per call, so the rebind targets the run session and is restored in a finally.
     A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
@@ -1114,6 +1257,96 @@ async def _capture_and_store_post_run_failure_page(
         return
     if not post_run_inspection_cleanly_matches(ctx.composition_page_evidence, run_id):
         ctx.composition_page_evidence = None
+
+
+def _scout_ephemeral_values(ctx: CopilotContext, workflow_param_keys: set[str]) -> dict[str, str]:
+    trajectory = list(ctx.scout_trajectory or [])
+    if not trajectory:
+        return {}
+    strict = synthesize_code_block(
+        trajectory,
+        strict_selectors=True,
+        reached_download_target=ctx.reached_download_target,
+    )
+    lenient = synthesize_code_block(
+        trajectory,
+        strict_selectors=False,
+        reached_download_target=ctx.reached_download_target,
+    )
+    if strict is None or lenient is None:
+        return {}
+    lenient_by_index = dict(lenient.diagnostics.typed_param_bindings)
+    agreed_bindings = [
+        (index, key) for index, key in strict.diagnostics.typed_param_bindings if lenient_by_index.get(index) == key
+    ]
+    raw_by_index: dict[int, str] = {}
+    for index, interaction in enumerate(trajectory):
+        raw = interaction.get("raw_typed_value")
+        if not isinstance(raw, str) or not raw:
+            continue
+        selector = interaction.get("selector")
+        intent = " ".join(
+            part for part in (interaction.get("role"), interaction.get("accessible_name")) if isinstance(part, str)
+        )
+        if should_reject_type_text_value(
+            value=raw,
+            selector=selector if isinstance(selector, str) else "",
+            intent=intent,
+        ):
+            continue
+        raw_by_index[index] = raw
+    key_to_values: dict[str, set[str]] = {}
+    value_to_keys: dict[str, set[str]] = {}
+    for index, key in agreed_bindings:
+        raw = raw_by_index.get(index)
+        if not raw or key not in workflow_param_keys:
+            continue
+        key_to_values.setdefault(key, set()).add(raw)
+        value_to_keys.setdefault(raw, set()).add(key)
+    resolved: dict[str, str] = {}
+    for key, values in key_to_values.items():
+        if len(values) != 1:
+            continue
+        raw = next(iter(values))
+        if len(value_to_keys.get(raw, set())) != 1:
+            continue
+        resolved[key] = raw
+    return resolved
+
+
+def _resolve_run_data_and_unbound_keys(
+    all_workflow_params: Sequence[WorkflowParameter],
+    user_params: Mapping[str, Any],
+    scout_ephemeral_values: Mapping[str, str],
+) -> tuple[dict[str, Any], list[str]]:
+    data: dict[str, Any] = {}
+    unbound: list[str] = []
+    for wp in all_workflow_params:
+        if wp.key in user_params:
+            data[wp.key] = user_params[wp.key]
+            continue
+        if wp.default_value is not None and wp.default_value != "":
+            data[wp.key] = wp.default_value
+            continue
+        scout_value = scout_ephemeral_values.get(wp.key)
+        if scout_value:
+            data[wp.key] = scout_value
+            LOG.info(
+                "Bound run-scoped scout value for copilot test run",
+                parameter_key=wp.key,
+                value_length=len(scout_value),
+            )
+            continue
+        placeholder = _placeholder_for_parameter_type(wp.workflow_parameter_type)
+        if placeholder is not None:
+            data[wp.key] = placeholder
+            LOG.info(
+                "Auto-filled missing workflow parameter for copilot test run",
+                parameter_key=wp.key,
+                parameter_type=str(wp.workflow_parameter_type),
+            )
+        unbound.append(wp.key)
+    return data, unbound
 
 
 async def _run_blocks_and_collect_debug(
@@ -1260,21 +1493,12 @@ async def _run_blocks_and_collect_debug(
             },
         }
 
-    data: dict[str, Any] = {}
-    for wp in all_workflow_params:
-        if wp.key in user_params:
-            data[wp.key] = user_params[wp.key]
-        elif wp.default_value is not None:
-            data[wp.key] = wp.default_value
-        else:
-            placeholder = _placeholder_for_parameter_type(wp.workflow_parameter_type)
-            if placeholder is not None:
-                data[wp.key] = placeholder
-                LOG.info(
-                    "Auto-filled missing workflow parameter for copilot test run",
-                    parameter_key=wp.key,
-                    parameter_type=str(wp.workflow_parameter_type),
-                )
+    # Multi-word/PII values the persist-time policy withholds from default_value are bound run-scoped
+    # here (WorkflowRequestBody.data, never default_value) so the test run uses the scout-proven value.
+    scout_ephemeral_values = _scout_ephemeral_values(ctx, {wp.key for wp in all_workflow_params})
+    data, ctx.unbound_required_parameter_keys = _resolve_run_data_and_unbound_keys(
+        all_workflow_params, user_params, scout_ephemeral_values
+    )
 
     use_fresh_session = _should_use_fresh_session_for_login_first_replay(ctx, labels_to_execute, workflow)
     # True when the run was threaded into a fresh session rather than the scout's debug session;
@@ -1794,17 +2018,25 @@ async def _run_blocks_and_collect_debug(
 
     if (
         not dispatch_to_worker
-        and not run_ok
         and run_session_id
         and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
         and not ctx.copilot_total_timeout_exceeded
     ):
         # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
-        await _capture_and_store_post_run_failure_page(
+        _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
+        await _capture_and_store_post_run_page(
             ctx,
             run_session_id=run_session_id,
             run_id=workflow_run.workflow_run_id,
             current_url=current_url,
+        )
+
+    if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
+        await _capture_registered_artifact_evidence(
+            ctx,
+            run_id=workflow_run.workflow_run_id,
+            organization_id=ctx.organization_id,
+            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label),
         )
 
     result_data: dict[str, Any] = {
@@ -2586,7 +2818,7 @@ def _record_run_blocks_result(
 
 
 def _record_adjudicated_build_test_outcome(
-    copilot_ctx: Any,
+    copilot_ctx: CopilotContext,
     result: dict[str, Any],
     completion_verification: CompletionVerificationResult | None,
     recorded_run_outcome: RecordedRunOutcome | None,
@@ -2597,18 +2829,25 @@ def _record_adjudicated_build_test_outcome(
         if isinstance(result_data, dict) and isinstance(result_data.get("registered_output_parameter_values"), list)
         else None
     )
+    workflow_yaml = copilot_ctx.workflow_yaml
+    code_artifact_metadata = copilot_ctx.code_artifact_metadata
     record_build_test_outcome(
         copilot_ctx,
         recorded_outcome_from_run_blocks_result(
             result,
-            page_evidence=getattr(copilot_ctx, "composition_page_evidence", None),
+            page_evidence=copilot_ctx.composition_page_evidence,
             recorded_run_outcome=recorded_run_outcome,
             completion_verification=completion_verification,
             authored_structure_signature=authored_structure_signature_from_workflow(
-                getattr(copilot_ctx, "workflow_yaml", None),
-                getattr(copilot_ctx, "code_artifact_metadata", None),
+                workflow_yaml,
+                code_artifact_metadata,
             ),
             registered_output_parameter_payloads=registered_output_parameter_payloads,
+            unbound_required_parameter_keys=list(copilot_ctx.unbound_required_parameter_keys),
+            block_parameter_keys=authored_block_parameter_keys_from_workflow(
+                workflow_yaml,
+                code_artifact_metadata,
+            ),
         ),
     )
 

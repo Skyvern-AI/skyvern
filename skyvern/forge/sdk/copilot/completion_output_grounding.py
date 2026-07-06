@@ -28,6 +28,11 @@ _IGNORED_RUNTIME_FIELD_NAMES = frozenset({"evidence_text"})
 _INDEPENDENT_EVIDENCE_SOURCES: frozenset[EvidenceSourceKind] = frozenset(
     {"independent_page_evidence", "registered_output_parameter", "registered_artifact_content"}
 )
+_POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
+_REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
+_MIN_CARRIER_VALUE_CHARS = 4
+_MAX_CARRIER_TEXT_CHARS = 20_000
+_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
 
 
 class _GroundingCtx(Protocol):
@@ -67,6 +72,13 @@ def grade_requested_output_criteria(
     verdicts: list[CriterionVerdict] = []
     for criterion in criteria:
         path = _normalize_output_path(criterion.output_path)
+        # A carrier verdict is already sourced from independent evidence and only returned on a
+        # positive confirmation, so the early return skips the self-emission veto path that no
+        # longer applies; abstentions fall through to normal authored-path grading.
+        carrier_verdict = _carrier_confirmation(criterion, path, snapshot)
+        if carrier_verdict is not None:
+            verdicts.append(carrier_verdict)
+            continue
         accepted_labels = (
             {label for label, paths in authored_paths_by_label.items() if path in paths} if path else set()
         )
@@ -251,6 +263,149 @@ def grade_requested_output_criteria(
             )
         )
     return verdicts
+
+
+def _carrier_confirmation(
+    criterion: CompletionCriterion, path: str, snapshot: RunEvidenceSnapshot
+) -> CriterionVerdict | None:
+    if _is_judgment_boolean_criterion(criterion):
+        return None
+    value_text = _carrier_scalar_text(criterion.expected_output_value)
+    if value_text is None or len(value_text) < _MIN_CARRIER_VALUE_CHARS:
+        return None
+    if _carrier_independent_refutation(snapshot, path, criterion.expected_output_value) is not None:
+        return None
+    trace_fields = _criterion_trace_fields(
+        criterion, _criterion_grounding_mode(criterion), criterion.requested_output_evidence_source
+    )
+    artifact_text = _carrier_surface_text(
+        snapshot, _REGISTERED_ARTIFACT_OBSERVATION_LABEL, "registered_artifact_content"
+    )
+    if artifact_text is not None and _boundary_delimited_present(value_text, artifact_text):
+        return CriterionVerdict(
+            criterion_id=criterion.id,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref=f"block_outputs:{_REGISTERED_ARTIFACT_OBSERVATION_LABEL}",
+            evidence_source="registered_artifact_content",
+            **trace_fields,
+        )
+    page_text = _carrier_surface_text(snapshot, _POST_RUN_PAGE_OBSERVATION_LABEL, "independent_page_evidence")
+    if page_text is not None and _boundary_delimited_present(value_text, page_text):
+        pre_run_text = snapshot.pre_run_page_reference_text
+        if pre_run_text is None:
+            return None
+        if not _boundary_delimited_present(value_text, _normalized_expected_text(pre_run_text)):
+            return CriterionVerdict(
+                criterion_id=criterion.id,
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref=f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}",
+                evidence_source="independent_page_evidence",
+                **trace_fields,
+            )
+    return None
+
+
+def _carrier_scalar_text(value: ExpectedOutputValue | None) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, str)):
+        return _normalized_expected_text(value) or None
+    return None
+
+
+def _carrier_surface_text(snapshot: RunEvidenceSnapshot, label: str, expected_source: EvidenceSourceKind) -> str | None:
+    if snapshot.block_output_sources.get(label) != expected_source:
+        return None
+    payload = snapshot.block_outputs.get(label)
+    if not isinstance(payload, Mapping):
+        return None
+    return _normalized_expected_text(page_evidence_prose_text(payload))
+
+
+def _carrier_independent_refutation(
+    snapshot: RunEvidenceSnapshot, path: str, expected_value: ExpectedOutputValue | None
+) -> tuple[str, EvidenceSourceKind] | None:
+    if not path or expected_value is None:
+        return None
+    independent_outputs = {
+        label: payload
+        for label, payload in snapshot.block_outputs.items()
+        if snapshot.block_output_sources.get(label) == "independent_page_evidence"
+    }
+    if not independent_outputs:
+        return None
+    delegated = _independent_evidence_text_refutation(
+        independent_outputs, snapshot.block_output_sources, path, expected_value, set()
+    )
+    if delegated is not None:
+        return delegated
+    # Refute when the page packet carries a value AT the requested path that mismatches the
+    # expected scalar. The shared refutation only reaches this comparison behind an
+    # ``evidence_text`` field the page packet never carries, so it is checked directly here
+    # (SKY-11868); a free-text-only contradiction remains unmaskable by design.
+    if isinstance(expected_value, bool):
+        return None
+    parts = _path_parts(path)
+    for label, payload in independent_outputs.items():
+        if not isinstance(payload, Mapping):
+            continue
+        values, source_path = _runtime_path_values(payload, parts, path, set())
+        if values and not any(_value_matches_expected(value, expected_value) for value in values):
+            return f"block_outputs:{label}.{source_path}", "independent_page_evidence"
+    return None
+
+
+def page_evidence_prose_text(evidence: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    total = 0
+    for key, value in evidence.items():
+        if key in _PAGE_EVIDENCE_STAMP_KEYS:
+            continue
+        for scalar in _iter_prose_scalars(value):
+            parts.append(scalar)
+            total += len(scalar) + 1
+            if total >= _MAX_CARRIER_TEXT_CHARS:
+                return " ".join(parts)[:_MAX_CARRIER_TEXT_CHARS]
+    return " ".join(parts)
+
+
+def _iter_prose_scalars(value: Any) -> list[str]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    if isinstance(value, Mapping):
+        collected: list[str] = []
+        for item in value.values():
+            collected.extend(_iter_prose_scalars(item))
+        return collected
+    if isinstance(value, list):
+        collected = []
+        for item in value:
+            collected.extend(_iter_prose_scalars(item))
+        return collected
+    return []
+
+
+def _boundary_delimited_present(needle: str, haystack: str) -> bool:
+    if not needle or not haystack:
+        return False
+    length = len(needle)
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return False
+        before_ok = idx == 0 or not haystack[idx - 1].isalnum()
+        after_index = idx + length
+        after_ok = after_index == len(haystack) or not haystack[after_index].isalnum()
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
 
 
 def _evidence_source_for_ref(

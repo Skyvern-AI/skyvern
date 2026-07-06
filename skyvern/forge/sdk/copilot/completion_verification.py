@@ -261,6 +261,7 @@ class RunEvidenceSnapshot:
     failure_classes: list[str] = field(default_factory=list)
     failure_reasons: list[str] = field(default_factory=list)
     page_evidence: dict[str, Any] = field(default_factory=dict)
+    pre_run_page_reference_text: str | None = None
 
     def has_evidence(self) -> bool:
         return bool(
@@ -1251,13 +1252,23 @@ def grade_terminal_goal_record_corroboration(snapshot: RunEvidenceSnapshot) -> l
     return []
 
 
+_FALLBACK_FLOOR_CARRIER_SOURCES: frozenset[EvidenceSourceKind] = frozenset(
+    {"independent_page_evidence", "registered_artifact_content"}
+)
+
+
 def grade_fallback_floor_reached_end_state_criteria(
-    criteria: list[CompletionCriterion], snapshot: RunEvidenceSnapshot
+    criteria: list[CompletionCriterion],
+    snapshot: RunEvidenceSnapshot,
+    *,
+    carrier_verdicts: tuple[CriterionVerdict, ...] = (),
 ) -> list[CriterionVerdict]:
     eligible_criteria = [criterion for criterion in criteria if is_fallback_floor_base_criterion(criterion)]
     if not eligible_criteria:
         return []
     evidence_ref = _fallback_floor_reached_end_state_evidence_ref(snapshot, criteria)
+    if evidence_ref is None:
+        evidence_ref = _fallback_floor_carrier_evidence_ref(snapshot, carrier_verdicts)
     if evidence_ref is None:
         return []
     return [
@@ -1294,6 +1305,21 @@ def _fallback_floor_parent_record_poisoned(payload: Any) -> bool:
     return isinstance(payload, dict) and (
         _terminal_goal_record_has_negative_guard(payload) or _structured_record_contradiction(payload) is not None
     )
+
+
+def _fallback_floor_carrier_evidence_ref(
+    snapshot: RunEvidenceSnapshot, carrier_verdicts: tuple[CriterionVerdict, ...]
+) -> str | None:
+    if any(_fallback_floor_parent_record_poisoned(payload) for payload in snapshot.block_outputs.values()):
+        return None
+    for verdict in carrier_verdicts:
+        if (
+            verdict.state == "satisfied"
+            and verdict.reason_code == "evidence_confirms"
+            and verdict.evidence_source in _FALLBACK_FLOOR_CARRIER_SOURCES
+        ):
+            return verdict.evidence_ref or f"carrier:{verdict.criterion_id}"
+    return None
 
 
 def _fallback_floor_record_candidates(payload: Any) -> Iterable[dict[str, Any]]:

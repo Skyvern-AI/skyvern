@@ -2366,7 +2366,7 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_failure_page(
+    await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
     )
 
@@ -2415,7 +2415,7 @@ async def test_failed_seam_capture_neutralizes_non_matching_evidence(
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_failure_page(
+    await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
     )
     assert ctx.composition_page_evidence is None
@@ -2437,7 +2437,7 @@ async def test_failed_seam_capture_preserves_clean_matching_evidence(
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_failure_page(
+    await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
     )
     assert ctx.composition_page_evidence is clean

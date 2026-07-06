@@ -6191,8 +6191,8 @@ class WorkflowService:
             workflow_parameter_tuples,
             block_errors,
         ) = await asyncio.gather(
-            app.DATABASE.workflows.get_workflow_by_permanent_id(
-                workflow_permanent_id,
+            app.DATABASE.workflows.get_workflow_for_workflow_run(
+                workflow_run_id,
                 organization_id=organization_id,
                 filter_deleted=not allow_deleted,
             ),

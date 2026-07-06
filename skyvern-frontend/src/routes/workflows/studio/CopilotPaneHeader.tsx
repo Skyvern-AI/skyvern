@@ -8,6 +8,7 @@ import {
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 
 import { WorkflowCopilotHistory } from "../copilot/WorkflowCopilotHistory";
+import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
 
 /**
  * Copilot pane header chrome: the History and New-chat controls the docked
@@ -36,7 +37,7 @@ export function CopilotPaneControls() {
             type="button"
             onClick={controls.onNewChat}
             aria-label="New chat"
-            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            className={PANE_HEADER_ICON_BUTTON_CLASS}
           >
             <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
