@@ -3,33 +3,14 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.cli.core.result import BrowserContext
-
-# ═══════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════
-
-
-def _make_mock_page(url: str = "https://example.com") -> MagicMock:
-    page = MagicMock()
-    page.url = url
-    page.page = page  # SkyvernBrowserPage wraps raw page
-    page.context = MagicMock()
-    page.context.grant_permissions = AsyncMock()
-    return page
-
-
-def _patch_get_page(monkeypatch: pytest.MonkeyPatch, page: MagicMock, ctx: BrowserContext) -> AsyncMock:
-    from skyvern.cli.mcp_tools import browser as mcp_browser
-
-    mock = AsyncMock(return_value=(page, ctx))
-    monkeypatch.setattr(mcp_browser, "get_page", mock)
-    return mock
-
+from skyvern.cli.mcp_tools import browser as mcp_browser
+from tests.unit._mcp_browser_fakes import make_mock_page as _make_mock_page
+from tests.unit._mcp_browser_fakes import patch_get_page
 
 # ═══════════════════════════════════════════════════
 # _ensure_clipboard_permissions
@@ -67,7 +48,7 @@ async def test_clipboard_read_happy_path(monkeypatch: pytest.MonkeyPatch) -> Non
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value="hello world")
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     result = await skyvern_clipboard_read()
 
@@ -82,7 +63,7 @@ async def test_clipboard_read_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value="")
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     result = await skyvern_clipboard_read()
 
@@ -109,7 +90,7 @@ async def test_clipboard_read_evaluate_error(monkeypatch: pytest.MonkeyPatch) ->
     page = _make_mock_page()
     page.evaluate = AsyncMock(side_effect=Exception("Clipboard API not available"))
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     result = await skyvern_clipboard_read()
 
@@ -129,7 +110,7 @@ async def test_clipboard_write_happy_path(monkeypatch: pytest.MonkeyPatch) -> No
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value=None)
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     result = await skyvern_clipboard_write(text="copied text")
 
@@ -145,7 +126,7 @@ async def test_clipboard_write_empty_string(monkeypatch: pytest.MonkeyPatch) -> 
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value=None)
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     result = await skyvern_clipboard_write(text="")
 
@@ -173,7 +154,7 @@ async def test_clipboard_write_evaluate_error(monkeypatch: pytest.MonkeyPatch) -
     page = _make_mock_page()
     page.evaluate = AsyncMock(side_effect=Exception("Permission denied"))
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     result = await skyvern_clipboard_write(text="hello")
 
@@ -205,7 +186,7 @@ async def test_clipboard_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
 
     page.evaluate = mock_evaluate
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
 
     # Write
     write_result = await skyvern_clipboard_write(text="roundtrip test")
