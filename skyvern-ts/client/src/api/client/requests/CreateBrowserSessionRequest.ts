@@ -7,6 +7,8 @@ import type * as Skyvern from "../../index.js";
  *     {}
  */
 export interface CreateBrowserSessionRequest {
+    /** Optional startup URL to open when the browser session starts. */
+    url?: string;
     /** Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60. */
     timeout?: number;
     /**

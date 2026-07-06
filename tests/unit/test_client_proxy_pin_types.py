@@ -102,3 +102,21 @@ def test_raw_client_update_credential_sends_rotate_proxy_session_id() -> None:
     )
 
     assert request.call_args.kwargs["json"]["rotate_proxy_session_id"] is True
+
+
+def test_raw_client_create_browser_session_sends_startup_url() -> None:
+    request = Mock(
+        return_value=_response(
+            {
+                "browser_session_id": "pbs_123",
+                "organization_id": "org_123",
+                "status": "created",
+                "created_at": "2026-01-01T00:00:00Z",
+                "modified_at": "2026-01-02T00:00:00Z",
+            }
+        )
+    )
+
+    _raw_client(request).create_browser_session(url="https://web.telegram.org")
+
+    assert request.call_args.kwargs["json"]["url"] == "https://web.telegram.org"

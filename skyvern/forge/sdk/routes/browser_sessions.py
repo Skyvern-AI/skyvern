@@ -132,6 +132,7 @@ async def create_browser_session(
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
+        url=browser_session_request.url,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 

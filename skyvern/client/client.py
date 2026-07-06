@@ -1825,6 +1825,7 @@ class Skyvern:
     def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -1838,6 +1839,9 @@ class Skyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional startup URL to open when the browser session starts.
+
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
@@ -1908,6 +1912,7 @@ class Skyvern:
         client.create_browser_session()
         """
         _response = self._raw_client.create_browser_session(
+            url=url,
             timeout=timeout,
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
@@ -4852,6 +4857,7 @@ class AsyncSkyvern:
     async def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -4865,6 +4871,9 @@ class AsyncSkyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional startup URL to open when the browser session starts.
+
         timeout : typing.Optional[int]
             Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
 
@@ -4943,6 +4952,7 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.create_browser_session(
+            url=url,
             timeout=timeout,
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
