@@ -27,6 +27,7 @@ import CloudContext from "@/store/CloudContext";
 import { useContext, useEffect, useMemo, useState } from "react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import {
   CheckIcon,
@@ -44,6 +45,7 @@ import {
 import { useNodes, useReactFlow } from "@xyflow/react";
 import { AppNode } from "..";
 import { isLoginNode } from "./types";
+import { useLoginGoalAutoFill } from "./useLoginGoalAutoFill";
 import {
   isStartNode,
   isWorkflowStartNodeData,
@@ -70,6 +72,9 @@ type Props = {
   onUrlAutoFill?: (url: string) => void;
   /** Current URL value of the login block — skip auto-fill if already set */
   currentUrl?: string;
+  onInstructionsAutoFill?: (instructions: string) => void;
+  /** Current login-goal value, checked against computeLoginGoalPrefill's guard */
+  currentInstructions?: string;
 };
 
 // Function to generate a unique credential parameter key
@@ -97,6 +102,8 @@ function LoginBlockCredentialSelector({
   editable = true,
   onUrlAutoFill,
   currentUrl,
+  onInstructionsAutoFill,
+  currentInstructions,
 }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
@@ -109,6 +116,7 @@ function LoginBlockCredentialSelector({
   const setHasChanges = useWorkflowHasChangesStore(
     (state) => state.setHasChanges,
   );
+  const readOnlyScope = useWorkflowScopeReadOnly();
   const credentialParameters = workflowParameters.filter(
     (parameter) =>
       parameter.parameterType === "credential" ||
@@ -167,6 +175,20 @@ function LoginBlockCredentialSelector({
 
     return undefined;
   }, [value, credentialParameters, workflowParameters]);
+
+  useLoginGoalAutoFill({
+    editable,
+    selectedCredentialId,
+    credentials,
+    currentGoal: currentInstructions ?? "",
+    // Marks unsaved so a prefill isn't silently lost on navigation; skipped in read-only scope.
+    onAutoFill: (goal) => {
+      onInstructionsAutoFill?.(goal);
+      if (!readOnlyScope) {
+        setHasChanges(true);
+      }
+    },
+  });
 
   const rotationCredentialIds = useMemo(() => {
     const sourceIds = selectedSkyvernCredentialParameter?.credentialIds?.length
