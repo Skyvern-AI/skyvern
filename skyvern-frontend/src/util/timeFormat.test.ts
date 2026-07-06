@@ -104,4 +104,20 @@ describe("basicTimeFormat", () => {
     const result = basicTimeFormat("2026-03-04T18:30:00Z");
     expect(result).toContain(" at ");
   });
+
+  test("renders the timestamp in UTC, not the viewer's local time", () => {
+    // The tooltip is labeled "UTC", so it must show the UTC time regardless of
+    // the machine's time zone. For an input carrying a Z the rendered time must
+    // equal the UTC time (18:30), never a local-zone conversion of it.
+    const result = basicTimeFormat("2026-03-04T18:30:00Z");
+    expect(result).toBe("Wed, Mar 4, 2026 at 6:30:00 PM UTC");
+  });
+
+  test("treats a no-suffix timestamp as UTC before rendering", () => {
+    // Backend returns naive UTC timestamps without 'Z'. normalizeUtcTimestamp
+    // must run first so the tooltip matches the Z-suffixed instant.
+    const withoutZ = "2026-03-04T18:30:00.000000";
+    const withZ = "2026-03-04T18:30:00.000000Z";
+    expect(basicTimeFormat(withoutZ)).toBe(basicTimeFormat(withZ));
+  });
 });
