@@ -6,6 +6,7 @@ export type WorkflowAnalyticsPanelProps = {
 
 export type PageSlots = {
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
+  workflowRunsFilterControls?: React.ComponentType;
 };
 
 const PageSlotsContext = createContext<PageSlots>({});
