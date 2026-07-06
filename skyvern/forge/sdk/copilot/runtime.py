@@ -124,6 +124,25 @@ class PendingBrowserInteractionObservation:
     url: str = ""
 
 
+@dataclass(frozen=True)
+class PreRunPageReference:
+    text: str
+    workflow_run_id: str
+
+
+@dataclass(frozen=True)
+class RegisteredArtifactEntry:
+    artifact_id: str
+    file_name: str
+    parsed_text: str
+
+
+@dataclass(frozen=True)
+class RegisteredArtifactEvidence:
+    entries: tuple[RegisteredArtifactEntry, ...]
+    workflow_run_id: str
+
+
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
@@ -260,6 +279,11 @@ class AgentContext:
     verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
+    # Pre-run page state pinned at the run seam before the post-run capture overwrites the slot;
+    # stamped with the graded run id so a stale prior-run pin cannot anchor the absence scan.
+    pre_run_page_reference: PreRunPageReference | None = None
+    # Parsed text of this run's registered download artifacts, stamped with the run id.
+    registered_artifact_evidence: RegisteredArtifactEvidence | None = None
     # Ordered, bounded list of typed page-evidence packets — one per page observed
     # while scouting the goal path, each tagged with how that state was reached.
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
@@ -306,7 +330,13 @@ class AgentContext:
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
+    output_contract_deferral_count_by_signature: dict[str, int] = field(default_factory=dict)
     runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Armed when a collapsed-spine violation cannot be split; carries split blockers and stage count to the
+    # next authoring prompt, keyed by a composite {signature, label, authored-YAML hash} so a new draft re-arms.
+    output_contract_spine_directive_blockers_by_attempt_key: dict[str, list[str]] = field(default_factory=dict)
+    output_contract_spine_directive_stage_count_by_attempt_key: dict[str, int] = field(default_factory=dict)
+    output_contract_output_owner_directive_candidates_by_signature: dict[str, list[str]] = field(default_factory=dict)
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
