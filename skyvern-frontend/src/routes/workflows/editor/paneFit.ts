@@ -124,6 +124,66 @@ export function startAnchoredViewport({
   };
 }
 
+export const END_ANCHOR_BOTTOM_PX = 24;
+
+/**
+ * Mirror of `startAnchoredViewport` for the flow's END: same zoom rule and
+ * horizontal centering, with the flow's bottom edge anchored just above the
+ * pane bottom. Jumping between the two anchors keeps the zoom stable.
+ */
+export function endAnchoredViewport({
+  pane,
+  bounds,
+}: {
+  pane: Size;
+  bounds: Rect;
+}): Viewport | null {
+  const start = startAnchoredViewport({ pane, bounds });
+  if (start === null) {
+    return null;
+  }
+  return {
+    x: start.x,
+    y:
+      pane.height -
+      END_ANCHOR_BOTTOM_PX -
+      (bounds.y + bounds.height) * start.zoom,
+    zoom: start.zoom,
+  };
+}
+
+/**
+ * Which flow-jump buttons should show for the current viewport. Both hide
+ * when the whole flow fits the pane at the current zoom (no dead chrome);
+ * otherwise each shows only while its end of the flow is scrolled out of
+ * view.
+ */
+export function flowJumpVisibility({
+  pane,
+  viewport,
+  bounds,
+}: {
+  pane: Size;
+  viewport: Viewport;
+  bounds: Rect;
+}): { showJumpToStart: boolean; showJumpToEnd: boolean } {
+  if (
+    pane.width <= 0 ||
+    pane.height <= 0 ||
+    bounds.width <= 0 ||
+    bounds.height <= 0
+  ) {
+    return { showJumpToStart: false, showJumpToEnd: false };
+  }
+  const screenTop = bounds.y * viewport.zoom + viewport.y;
+  const screenHeight = bounds.height * viewport.zoom;
+  const flowTallerThanPane = screenHeight > pane.height;
+  return {
+    showJumpToStart: flowTallerThanPane && screenTop < 0,
+    showJumpToEnd: flowTallerThanPane && screenTop + screenHeight > pane.height,
+  };
+}
+
 /**
  * Viewport for a pane-layout change (panes opened/closed/reordered):
  * re-fits horizontally at the start-anchor zoom while keeping the content

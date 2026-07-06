@@ -108,6 +108,7 @@ import {
 } from "./paneFit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
+import { FlowJumpControls } from "./controls/FlowJumpControls";
 import { RedoControl } from "./controls/RedoControl";
 import { ToggleInteractivityControl } from "./controls/ToggleInteractivityControl";
 import { UndoControl } from "./controls/UndoControl";
@@ -2315,6 +2316,18 @@ function FlowRenderer({
                     <GlobalCollapseControl />
                   </Controls>
                 )}
+                {/*
+                  Studio-only: the jumps land on the pane-fit anchor
+                  viewports, which are the embedded pane's policy; the legacy
+                  editors keep whole-graph fitView and the debugger pins the
+                  viewport (constrainPan), so both are excluded. Mounted only
+                  once the initial layout settled so pre-layout bounds can't
+                  flash the buttons.
+                */}
+                {embedded &&
+                  !readOnly &&
+                  !flowIsConstrained &&
+                  layoutPhase === "ready" && <FlowJumpControls nodes={nodes} />}
               </ReactFlow>
             </SortableBlockScope>
             {/*
