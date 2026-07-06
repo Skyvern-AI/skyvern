@@ -373,6 +373,41 @@ def list_files_in_directory(directory: Path, recursive: bool = False) -> list[st
     return listed_files
 
 
+PENDING_EXTENSION_RENAME_WAIT_SECONDS = 3.0
+PENDING_EXTENSION_RENAME_POLL_SECONDS = 0.1
+
+
+async def wait_for_pending_extension_rename(download_dir: str, filename: str) -> str:
+    """Return the file's final name, waiting out an in-flight extension-recovery rename.
+
+    The browser finalizes a download under an extensionless name moments before the
+    async download listener renames it in place (bare GUID -> GUID.pdf). Storage syncs
+    must never upload the intermediate name — the same bytes would get registered
+    under both names across two syncs. For an extensionless file, wait briefly for the
+    rename to land and return the renamed filename; on timeout return the original so
+    the file is still uploaded rather than dropped.
+    """
+    if Path(filename).suffix:
+        return filename
+    deadline = asyncio.get_event_loop().time() + PENDING_EXTENSION_RENAME_WAIT_SECONDS
+    while asyncio.get_event_loop().time() < deadline:
+        if not os.path.exists(os.path.join(download_dir, filename)):
+            return _resolve_extension_rename_twin(download_dir, filename)
+        await asyncio.sleep(PENDING_EXTENSION_RENAME_POLL_SECONDS)
+    if not os.path.exists(os.path.join(download_dir, filename)):
+        return _resolve_extension_rename_twin(download_dir, filename)
+    return filename
+
+
+def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:
+    renamed = [
+        candidate
+        for candidate in os.listdir(download_dir)
+        if candidate != filename and Path(candidate).stem == filename and Path(candidate).suffix
+    ]
+    return renamed[0] if renamed else filename
+
+
 def list_downloading_files_in_directory(
     directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
 ) -> list[str]:
