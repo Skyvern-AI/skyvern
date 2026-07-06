@@ -57,6 +57,7 @@ function BrowserProfileSelector({
     page_size: PAGE_SIZE,
     searchKey: debouncedSearch,
     enabled: open,
+    managed: false,
   });
 
   const profiles = useMemo(

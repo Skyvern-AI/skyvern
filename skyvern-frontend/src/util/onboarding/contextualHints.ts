@@ -21,7 +21,7 @@ export type ContextualHint = {
   };
 };
 
-const EDITOR_ROUTE = /^\/workflows\/[^/]+\/(?:build|edit|studio)$/;
+const EDITOR_ROUTE = /^\/(?:agents|workflows)\/[^/]+\/(?:build|edit|studio)$/;
 
 export const HINT_REGISTRY: readonly ContextualHint[] = [
   {
@@ -59,7 +59,9 @@ export const HINT_REGISTRY: readonly ContextualHint[] = [
     surface: "dashboard",
     seenKey: "seen_hint_template",
     anchor: "[data-hint='start-template']",
-    matchRoute: (pathname) => pathname === "/workflows",
+    // "/workflows" is the permanent legacy alias that redirects to /agents.
+    matchRoute: (pathname) =>
+      pathname === "/agents" || pathname === "/workflows",
     prerequisite: (state) => state.first_save_at === null,
     popover: {
       title: "Start from a template",

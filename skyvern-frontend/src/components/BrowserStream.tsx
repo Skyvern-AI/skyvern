@@ -5,8 +5,9 @@ import _RFB, { type RfbEvent } from "@novnc/novnc/lib/rfb.js";
 type RFB = _RFB;
 const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
 import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useShallow } from "zustand/react/shallow";
 
 import { getClient } from "@/api/AxiosClient";
 import {
@@ -16,29 +17,24 @@ import {
 } from "@/api/types";
 import { Tip } from "@/components/Tip";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useRecordingElapsedSeconds } from "@/hooks/useRecordingElapsedSeconds";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
+import { buildOptimisticStep } from "@/routes/workflows/editor/recording/optimisticSteps";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
   useRecordingStore,
+  countVisibleDraftSteps,
+  type ExfiltratedEventConsoleParams,
   type MessageInExfiltratedEvent,
+  type RecordingInterpretationUpdate,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { wssBaseUrl, newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { copyText } from "@/util/copyText";
+import { formatRecordingClock } from "@/util/recordingClock";
 import { cn } from "@/util/utils";
-import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import {
   StreamStatusPanel,
   type StreamDiagnostic,
@@ -66,6 +62,14 @@ interface BrowserSession {
 
 interface CommandBeginExfiltration {
   kind: "begin-exfiltration";
+  workflow_permanent_id?: string;
+  live_interpretation_enabled?: boolean;
+  // Declares that this client understands delta interpretation updates, so the
+  // backend may send changed_steps instead of full snapshots.
+  supports_interpretation_deltas?: boolean;
+  // Per-recording id: stable across reconnects, new per recording, so the
+  // backend reuses the session on reconnect but starts fresh on a new recording.
+  recording_attempt_id?: string;
 }
 
 interface CommandCedeControl {
@@ -80,17 +84,33 @@ interface CommandTakeControl {
   kind: "take-control";
 }
 
+interface CommandRecordingCapturePause {
+  kind: "recording-capture-pause";
+}
+
+interface CommandRecordingCaptureResume {
+  kind: "recording-capture-resume";
+}
+
+interface CommandRecordingRearmCapture {
+  kind: "recording-rearm-capture";
+}
+
 // a "Command" is an fire-n-forget out-message - it does not require a response
 type Command =
   | CommandBeginExfiltration
   | CommandCedeControl
   | CommandEndExfiltration
+  | CommandRecordingCapturePause
+  | CommandRecordingCaptureResume
+  | CommandRecordingRearmCapture
   | CommandTakeControl;
 
 const messageInKinds = [
   "ask-for-clipboard",
   "copied-text",
   "exfiltrated-event",
+  "recording-interpretation-update",
 ] as const;
 
 type MessageInKind = (typeof messageInKinds)[number];
@@ -104,10 +124,15 @@ interface MessageInCopiedText {
   text: string;
 }
 
+interface MessageInRecordingInterpretationUpdate extends RecordingInterpretationUpdate {
+  kind: "recording-interpretation-update";
+}
+
 type MessageIn =
   | MessageInCopiedText
   | MessageInAskForClipboard
-  | MessageInExfiltratedEvent;
+  | MessageInExfiltratedEvent
+  | MessageInRecordingInterpretationUpdate;
 
 interface MessageOutAskForClipboardResponse {
   kind: "ask-for-clipboard-response";
@@ -121,6 +146,9 @@ type Props = {
   exfiltrate?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
+  // Whether unmounting clears the recording store. The studio passes false: it
+  // remounts this component across CDP<->VNC swaps without the session ending.
+  resetRecordingOnUnmount?: boolean;
   task?: {
     run: TaskApiResponse;
   };
@@ -130,22 +158,110 @@ type Props = {
   resizeTrigger?: number;
   isVisible?: boolean;
   isExecuting?: boolean;
+  // Hide the REC pill overlay when the recording panel is visible beside the
+  // stream (its header already shows the timer + step count).
+  hideRecordingIndicator?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onActivity?: () => void;
   // --
   onClose?: () => void;
 };
+
+type RfbWithFrameUpdates = RFB & {
+  _framebufferUpdate?: () => boolean;
+};
+
+/** VNC encode settings: favor fast frames when the user is driving the browser. */
+function applyVncStreamProfile(
+  rfb: RFB,
+  profile: "interactive" | "passive",
+): void {
+  if (profile === "interactive") {
+    // Low CPU per frame beats max zlib compression for click/type latency.
+    rfb.compressionLevel = 1;
+    rfb.qualityLevel = 7;
+    return;
+  }
+  rfb.compressionLevel = 2;
+  rfb.qualityLevel = 6;
+}
+
+function RecordingPill() {
+  const {
+    finishRequested,
+    manualCapturePaused,
+    draftSteps,
+    deletedStepIds,
+    exposedEventCount,
+    optimisticStepCount,
+    interpretationEnabled,
+  } = useRecordingStore(
+    useShallow((state) => ({
+      finishRequested: state.finishRequested,
+      manualCapturePaused: state.manualCapturePaused,
+      draftSteps: state.draftSteps,
+      deletedStepIds: state.deletedStepIds,
+      exposedEventCount: state.exposedEventCount,
+      optimisticStepCount: state.optimisticSteps.length,
+      interpretationEnabled: state.workflowPermanentId !== null,
+    })),
+  );
+
+  const interpretedStepCount = useMemo(
+    () => countVisibleDraftSteps(draftSteps, deletedStepIds),
+    [draftSteps, deletedStepIds],
+  );
+  const elapsedSeconds = useRecordingElapsedSeconds();
+  // Show interpreted + optimistic steps whenever interpretation is enabled, not
+  // just after the first snapshot arrives — otherwise the first step waits a
+  // backend round-trip even though the optimistic placeholder is already local.
+  const count = interpretationEnabled
+    ? interpretedStepCount + optimisticStepCount
+    : exposedEventCount;
+
+  const paused = manualCapturePaused && !finishRequested;
+
+  return (
+    <div
+      className={cn(
+        "inline-flex h-6 items-center gap-2 rounded-full border px-3 text-xs font-semibold tabular-nums",
+        paused
+          ? "border-amber-500/50 bg-amber-950 text-amber-200"
+          : "border-red-500/50 bg-red-950 text-red-200",
+      )}
+    >
+      <span
+        className={cn("h-2 w-2 rounded-full", {
+          "bg-amber-500": paused,
+          "bg-red-500": !paused,
+          "animate-pulse": !finishRequested && !paused,
+          "opacity-50": finishRequested,
+        })}
+      />
+      {finishRequested ? "FINISHING" : paused ? "PAUSED" : "REC"}{" "}
+      {formatRecordingClock(elapsedSeconds)}
+      <span className={paused ? "text-amber-400/80" : "text-red-400/80"}>
+        ·
+      </span>
+      {count}
+    </div>
+  );
+}
 
 function BrowserStream({
   browserSessionId = undefined,
   exfiltrate = false,
   interactive = true,
   showControlButtons = undefined,
+  resetRecordingOnUnmount = true,
   task = undefined,
   workflow = undefined,
   resizeTrigger,
   isVisible = true,
   isExecuting = false,
+  hideRecordingIndicator = false,
   onReadyChange,
+  onActivity,
   // --
   onClose,
 }: Props) {
@@ -226,6 +342,7 @@ function BrowserStream({
     setCanvasContainer(node);
   }, []);
   const rfbRef = useRef<RFB | null>(null);
+  const onActivityRef = useRef(onActivity);
   const userCanSendVncInputRef = useRef(false);
   const observerRef = useRef<MutationObserver | null>(null);
   const messageReconnectAttemptsRef = useRef(0);
@@ -233,13 +350,17 @@ function BrowserStream({
     null,
   );
   const clientId = useClientIdStore((state) => state.clientId);
-  const recordingStore = useRecordingStore();
+  const isRecording = useRecordingStore((state) => state.isRecording);
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
   const isBrowserSessionAvailable =
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
     entity !== "browserSession" || isBrowserSessionStarted;
+
+  useEffect(() => {
+    onActivityRef.current = onActivity;
+  }, [onActivity]);
 
   useEffect(() => {
     setIsBrowserSessionStarted(false);
@@ -364,6 +485,11 @@ function BrowserStream({
     };
   }, []);
 
+  // The low-latency encode profile is scoped to recording: that's where frame
+  // lag directly delays draft feedback. Other interactive live-browser streams
+  // keep the default profile to avoid a broad bandwidth/CPU bump.
+  const vncInteractive = exfiltrate;
+
   // vnc socket
   useEffect(
     () => {
@@ -431,6 +557,23 @@ function BrowserStream({
         const rfb = new RFB(canvas, vncUrl);
 
         rfb.scaleViewport = true;
+        applyVncStreamProfile(rfb, vncInteractive ? "interactive" : "passive");
+
+        const frameUpdateRfb = rfb as RfbWithFrameUpdates;
+        // noVNC does not expose a public framebuffer-update event in 1.5.x.
+        // Hook the internal method defensively so activity tracking degrades
+        // to no-op if the private API changes.
+        const originalFrameUpdate =
+          frameUpdateRfb._framebufferUpdate?.bind(rfb);
+        if (originalFrameUpdate) {
+          frameUpdateRfb._framebufferUpdate = () => {
+            const didCompleteFrameUpdate = originalFrameUpdate();
+            if (didCompleteFrameUpdate) {
+              onActivityRef.current?.();
+            }
+            return didCompleteFrameUpdate;
+          };
+        }
 
         rfbRef.current = rfb;
 
@@ -499,6 +642,17 @@ function BrowserStream({
       vncDisconnectedTrigger, // will re-run on disconnects
     ],
   );
+
+  // Re-apply encode profile when recording starts without tearing down the socket.
+  useEffect(() => {
+    if (!rfbRef.current) {
+      return;
+    }
+    applyVncStreamProfile(
+      rfbRef.current,
+      vncInteractive ? "interactive" : "passive",
+    );
+  }, [vncInteractive]);
 
   useEffect(() => {
     if (!showStream || !canvasContainer || !runId) {
@@ -674,6 +828,13 @@ function BrowserStream({
     }
   }, [task, workflow]);
 
+  const { workflowPermanentId, recordingAttemptId } = useRecordingStore(
+    useShallow((state) => ({
+      workflowPermanentId: state.workflowPermanentId,
+      recordingAttemptId: state.recordingAttemptId,
+    })),
+  );
+
   // effect for exfiltration
   useEffect(() => {
     const sendCommand = (command: Command) => {
@@ -684,16 +845,71 @@ function BrowserStream({
       messageSocket.send(JSON.stringify(command));
     };
 
-    sendCommand({
-      kind: exfiltrate ? "begin-exfiltration" : "end-exfiltration",
-    });
-  }, [exfiltrate, messageSocket]);
+    if (exfiltrate) {
+      // Including a workflow id turns on backend live interpretation: the
+      // server streams recording-interpretation-update draft step snapshots
+      // back over this same socket while the user records.
+      sendCommand({
+        kind: "begin-exfiltration",
+        workflow_permanent_id: workflowPermanentId ?? undefined,
+        live_interpretation_enabled: Boolean(workflowPermanentId),
+        // Client capability: the backend only emits per-step delta updates
+        // (changed_steps upserted by step_id) to clients that declare support;
+        // otherwise it falls back to full snapshots.
+        supports_interpretation_deltas: true,
+        // Stable across reconnects of this recording; a new recording mints a
+        // new id so the backend starts a fresh interpretation session.
+        recording_attempt_id: recordingAttemptId ?? undefined,
+      });
+    } else {
+      sendCommand({ kind: "end-exfiltration" });
+    }
+  }, [exfiltrate, messageSocket, workflowPermanentId, recordingAttemptId]);
+
+  const manualCapturePaused = useRecordingStore(
+    (state) => state.manualCapturePaused,
+  );
+  const draftEditDepth = useRecordingStore((state) => state.draftEditDepth);
+  const capturePaused = manualCapturePaused || draftEditDepth > 0;
+  const previousCapturePausedRef = useRef(false);
+
+  // Pause exfiltration + live interpretation while the operator edits drafts
+  // or explicitly pauses capture.
+  useEffect(() => {
+    if (!exfiltrate || !messageSocket) {
+      // Backend pause state is per exfiltration session, so start the next
+      // session's edge detection from "not paused". A recording that ended
+      // while paused would otherwise fire a spurious resume on the next start;
+      // and if capture IS paused on a mid-recording reconnect, this re-sends
+      // the pause to the new socket (idempotent) instead of assuming it.
+      previousCapturePausedRef.current = false;
+      return;
+    }
+
+    const wasPaused = previousCapturePausedRef.current;
+    if (!wasPaused && capturePaused) {
+      messageSocket.send(JSON.stringify({ kind: "recording-capture-pause" }));
+    } else if (wasPaused && !capturePaused) {
+      messageSocket.send(JSON.stringify({ kind: "recording-capture-resume" }));
+    }
+
+    previousCapturePausedRef.current = capturePaused;
+  }, [capturePaused, exfiltrate, messageSocket]);
 
   useEffect(() => {
     if (!interactive) {
       setUserIsControlling(false);
     }
   }, [interactive]);
+
+  // When control can no longer be offered (buttons hidden and not inherently
+  // interactive), a prior grab must be released or its input keeps flowing.
+  // Recording is exempt: it holds take-control for exfiltration.
+  useEffect(() => {
+    if (!interactive && !showControlButtons && !isRecording) {
+      setUserIsControlling(false);
+    }
+  }, [interactive, showControlButtons, isRecording]);
 
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
@@ -721,18 +937,26 @@ function BrowserStream({
     };
   }, [canvasContainer]);
 
-  // effect to ensure the recordingStore is reset when the component unmounts
+  // Read the flag through a ref so the unmount cleanup stays mount-scoped: a
+  // StrictMode double-mount or transport swap must not cancel a live recording.
+  const resetRecordingOnUnmountRef = useRef(resetRecordingOnUnmount);
+  resetRecordingOnUnmountRef.current = resetRecordingOnUnmount;
+  // By default an unmount means the user abandoned the session, and the reset
+  // keeps stale isRecording from leaking into the next mounted workflow as a
+  // stuck recording panel. Surfaces that remount the stream while the session
+  // lives on (transport swaps, per-run streams) opt out and reset at the
+  // session level instead.
   useEffect(() => {
     return () => {
-      recordingStore.reset();
+      if (resetRecordingOnUnmountRef.current) {
+        useRecordingStore.getState().reset();
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // effect to ensure 'take-control' is sent on the rising edge of
-  // recordingStore.isRecording
+  // effect to ensure 'take-control' is sent on the rising edge of isRecording
   useEffect(() => {
-    if (!recordingStore.isRecording) {
+    if (!isRecording) {
       return;
     }
 
@@ -750,7 +974,7 @@ function BrowserStream({
 
     sendCommand({ kind: "take-control" });
     setUserIsControlling(true);
-  }, [recordingStore.isRecording, isMessageConnected, messageSocket]);
+  }, [isRecording, isMessageConnected, messageSocket]);
 
   /**
    * TODO(jdo): could use zod or smth similar
@@ -815,11 +1039,71 @@ function BrowserStream({
         }
         break;
       }
+      case "recording-interpretation-update": {
+        // steps is optional: a delta update carries changed_steps instead. Only
+        // session_revision is required to accept the message.
+        if (
+          "session_revision" in data &&
+          typeof data.session_revision === "number"
+        ) {
+          const update = data as MessageInRecordingInterpretationUpdate;
+          return {
+            kind: "recording-interpretation-update",
+            interpretation_session_id:
+              typeof update.interpretation_session_id === "string"
+                ? update.interpretation_session_id
+                : "",
+            session_revision: update.session_revision,
+            steps: Array.isArray(update.steps) ? update.steps : [],
+            changed_steps: Array.isArray(update.changed_steps)
+              ? update.changed_steps
+              : [],
+            // Absent/true => full snapshot (legacy). Only false triggers delta merge.
+            is_snapshot:
+              typeof update.is_snapshot === "boolean"
+                ? update.is_snapshot
+                : true,
+            pending:
+              typeof update.pending === "boolean" ? update.pending : false,
+            finalized:
+              typeof update.finalized === "boolean" ? update.finalized : false,
+          };
+        }
+        break;
+      }
       default: {
         const _exhaustive: never = kind;
         return _exhaustive;
       }
     }
+  };
+
+  // Best-effort frame grab from the VNC canvas at the moment of a recorded
+  // click, so the live feed can show a zoomed shot at the action point.
+  const captureRecordingScreenshot = (
+    params: ExfiltratedEventConsoleParams,
+  ) => {
+    const schedule =
+      typeof requestIdleCallback === "function"
+        ? (fn: () => void) => requestIdleCallback(fn, { timeout: 750 })
+        : (fn: () => void) => window.setTimeout(fn, 0);
+
+    schedule(() => {
+      try {
+        const canvas = canvasContainer?.querySelector("canvas");
+        if (!canvas) {
+          return;
+        }
+        useRecordingStore.getState().addScreenshot({
+          timestampMs: params.timestamp,
+          dataUrl: canvas.toDataURL("image/jpeg", 0.5),
+          xp: params.mousePosition.xp,
+          yp: params.mousePosition.yp,
+        });
+      } catch {
+        // toDataURL can throw on a tainted/headless canvas; shots are optional
+      }
+    });
   };
 
   const handleMessage = (data: unknown, ws: WebSocket | null) => {
@@ -902,7 +1186,52 @@ function BrowserStream({
         break;
       }
       case "exfiltrated-event": {
-        recordingStore.add(message);
+        // Read store state fresh: this handler is attached once per socket
+        // and would otherwise see a stale isRecording.
+        const store = useRecordingStore.getState();
+        if (!store.isRecording && !store.finishRequested) {
+          break;
+        }
+        if (store.isCapturePaused()) {
+          break;
+        }
+        if (
+          store.isRecording &&
+          message.source === "console" &&
+          message.params.type === "click"
+        ) {
+          captureRecordingScreenshot(message.params);
+        }
+        if (
+          store.isRecording &&
+          !store.finishRequested &&
+          message.source === "cdp" &&
+          (message.event_name === "nav:frame_navigated" ||
+            message.event_name === "nav:navigated_within_document")
+        ) {
+          if (ws) {
+            ws.send(JSON.stringify({ kind: "recording-rearm-capture" }));
+          }
+        }
+        if (store.isRecording && !store.finishRequested) {
+          const optimistic = buildOptimisticStep(message);
+          if (optimistic) {
+            store.addOptimisticStep(optimistic);
+          }
+        }
+        store.add(message);
+        break;
+      }
+      case "recording-interpretation-update": {
+        useRecordingStore.getState().applyInterpretationUpdate({
+          interpretation_session_id: message.interpretation_session_id,
+          session_revision: message.session_revision,
+          steps: message.steps,
+          changed_steps: message.changed_steps,
+          is_snapshot: message.is_snapshot,
+          pending: message.pending,
+          finalized: message.finalized,
+        });
         break;
       }
       default: {
@@ -998,84 +1327,25 @@ function BrowserStream({
             )}
           </div>
         )}
-        {recordingStore.isRecording && (
-          <>
-            <div className="pointer-events-none absolute flex aspect-video w-full items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-red-500 animate-in fade-in">
+        {isRecording && (
+          <div className="pointer-events-none absolute flex aspect-video w-full items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-red-500 animate-in fade-in">
+            {/* The pill duplicates the recording panel's header (timer + step
+                count), so it's hidden while the panel is visible alongside. */}
+            {!hideRecordingIndicator && (
               <div className="relative h-full w-full">
-                <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-red-500">
-                  <div className="truncate">Browser is recording</div>
-                  <Tip content="To finish and turn your actions into blocks, click the stop icon.">
-                    <div className="cursor-pointer">
+                <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2">
+                  <RecordingPill />
+                  <Tip content="Your actions appear as blocks in the recording panel. Finish with Done, or use the trash icon to discard.">
+                    <div className="cursor-pointer text-red-500">
                       <InfoCircledIcon />
                     </div>
                   </Tip>
-                  <Dialog>
-                    <DialogTrigger asChild>
-                      <Button
-                        className="ml-auto cursor-pointer"
-                        size="sm"
-                        variant="destructive"
-                        style={{
-                          marginTop: "-0.5rem",
-                        }}
-                        onClick={(e) => {
-                          const hasEvents =
-                            recordingStore.pendingEvents.length > 0 ||
-                            recordingStore.compressedChunks.length > 0;
-                          if (!hasEvents) {
-                            e.preventDefault();
-                            captureRecordBrowser("record_browser.cancelled", {
-                              event_count_at_cancel:
-                                recordingStore.getEventCount(),
-                              seconds_recording:
-                                recordingStore.getSecondsRecording(),
-                            });
-                            recordingStore.setIsRecording(false);
-                            recordingStore.reset();
-                          }
-                        }}
-                      >
-                        cancel
-                      </Button>
-                    </DialogTrigger>
-                    <DialogContent>
-                      <DialogHeader>
-                        <DialogTitle>Cancel recording?</DialogTitle>
-                        <DialogDescription>
-                          You have recorded events that will be lost if you
-                          cancel. Are you sure you want to cancel the recording?
-                        </DialogDescription>
-                      </DialogHeader>
-                      <DialogFooter>
-                        <DialogClose asChild>
-                          <Button variant="outline">Keep recording</Button>
-                        </DialogClose>
-                        <DialogClose asChild>
-                          <Button
-                            variant="destructive"
-                            onClick={() => {
-                              captureRecordBrowser("record_browser.cancelled", {
-                                event_count_at_cancel:
-                                  recordingStore.getEventCount(),
-                                seconds_recording:
-                                  recordingStore.getSecondsRecording(),
-                              });
-                              recordingStore.setIsRecording(false);
-                              recordingStore.reset();
-                            }}
-                          >
-                            Cancel recording
-                          </Button>
-                        </DialogClose>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
                 </div>
               </div>
-            </div>
-          </>
+            )}
+          </div>
         )}
-        {isExecuting && !recordingStore.isRecording && (
+        {isExecuting && !isRecording && (
           <div className="pointer-events-none absolute flex aspect-video w-full animate-glow items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-yellow-500">
             <div className="relative h-full w-full">
               <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-yellow-500">

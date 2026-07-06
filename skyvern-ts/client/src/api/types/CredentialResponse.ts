@@ -14,7 +14,7 @@ export interface CredentialResponse {
     credential_type: Skyvern.CredentialTypeOutput;
     /** Name of the credential */
     name: string;
-    /** Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom') */
+    /** Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom') */
     vault_type?: Skyvern.CredentialVaultType;
     /** Browser profile ID linked to this credential */
     browser_profile_id?: string;

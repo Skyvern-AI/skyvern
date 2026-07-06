@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.config import settings
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import UpdateBrowserProfileRequest
 from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
@@ -68,6 +69,18 @@ def test_build_browser_args_uses_configured_recording_size(monkeypatch: pytest.M
     args = BrowserContextFactory.build_browser_args()
 
     assert args["record_video_size"] == {"width": 1280, "height": 720}
+
+
+@pytest.mark.asyncio
+async def test_resolve_recording_video_size_is_noop_in_oss() -> None:
+    agent_function = AgentFunction()
+
+    assert await agent_function.resolve_recording_video_size(None, distinct_id="wr_1", organization_id="o_1") is None
+    existing = {"width": 1280, "height": 720}
+    assert (
+        await agent_function.resolve_recording_video_size(existing, distinct_id="wr_1", organization_id="o_1")
+        == existing
+    )
 
 
 def test_deserialize_proxy_location_custom_url_returns_dict() -> None:

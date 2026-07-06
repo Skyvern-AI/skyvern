@@ -17,6 +17,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     loop_blocker_evidence_from_ctx,
     refresh_held_loop_blocker_evidence,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    maybe_satisfy_recorded_outcome_grounding_requirement,
+    recorded_outcome_grounding_requires_current_page,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
     structured_record_has_goal_content as _structured_record_candidate_has_goal_content,
 )
@@ -25,6 +29,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
     synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
+    uncovered_output_reject_scout_steer_signal,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
@@ -66,6 +71,18 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
     BLOCK_RUNNING_TOOLS
     | PAGE_INSPECTION_TOOLS
     | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
+)
+_RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
+    {
+        "update_workflow",
+        "click",
+        "fill_credential_field",
+        "navigate_browser",
+        "press_key",
+        "scroll",
+        "select_option",
+        "type_text",
+    }
 )
 
 
@@ -1465,8 +1482,19 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         if current_page_challenge_signal is not None:
             return _emit_tool_blocker_signal(ctx, current_page_challenge_signal)
 
+    uncovered_output_steer = uncovered_output_reject_scout_steer_signal(ctx, tool_name)
+    if uncovered_output_steer is not None:
+        return _emit_tool_blocker_signal(ctx, uncovered_output_steer)
+
     persistence_signal = synthesized_block_persistence_signal(ctx, tool_name)
     if persistence_signal is not None:
+        grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
+        if grounding_signal is not None:
+            LOG.info(
+                "copilot recorded outcome grounding enforced over persistence force",
+                tool_name=tool_name,
+            )
+            return _emit_tool_blocker_signal(ctx, grounding_signal)
         return _emit_tool_blocker_signal(ctx, persistence_signal)
 
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
@@ -1606,10 +1634,36 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         late_signal = _late_block_running_call_signal(ctx, tool_name)
         if late_signal is not None:
             return _emit_tool_blocker_signal(ctx, late_signal)
+    grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
+    if grounding_signal is not None:
+        return _emit_tool_blocker_signal(ctx, grounding_signal)
     return None
 
 
 _build_loop_blocker_signal = build_loop_blocker_signal
+
+
+def _recorded_outcome_grounding_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
+    if tool_name not in _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS:
+        return None
+    if maybe_satisfy_recorded_outcome_grounding_requirement(ctx):
+        return None
+    if not recorded_outcome_grounding_requires_current_page(ctx):
+        return None
+    return CopilotToolBlockerSignal(
+        blocker_kind="missing_required_context",
+        agent_steering_text=(
+            "The repeated recorded build-test outcome is still ungrounded. Call "
+            'inspect_page_for_composition(target_url="current_page") and use that bounded page '
+            "evidence before the next workflow mutation or browser mutation."
+        ),
+        user_facing_reason="I need to inspect the current page before changing the workflow again.",
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=frozenset({"inspect_page_for_composition"}),
+        renders_final_reply=False,
+        internal_reason_code="recorded_outcome_grounding_required",
+        blocked_tool=tool_name,
+    )
 
 
 def _analyze_run_blocks(

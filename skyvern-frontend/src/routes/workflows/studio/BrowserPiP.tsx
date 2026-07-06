@@ -11,6 +11,7 @@ import { cn } from "@/util/utils";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useStudioShellContext } from "./StudioShellContext";
 import { usePresence } from "./usePresence";
+import { useStudioPanes } from "./useStudioPanes";
 
 /**
  * Picture-in-picture preview of the persistent debug browser. The stream node
@@ -19,7 +20,7 @@ import { usePresence } from "./usePresence";
 export function BrowserPiP() {
   const minimized = useStudioShellStore((s) => s.pipMinimized);
   const setMinimized = useStudioShellStore((s) => s.setPipMinimized);
-  const setTab = useStudioShellStore((s) => s.setTab);
+  const { openPane } = useStudioPanes();
   const { setEditorStreamSlot } = useStudioShellContext();
 
   const { workflowPermanentId } = useParams();
@@ -65,7 +66,7 @@ export function BrowserPiP() {
         <div
           className={cn(
             "absolute bottom-4 right-4 z-30 flex w-[22rem] flex-col overflow-hidden rounded-lg border bg-slate-elevation1 shadow-lg duration-150",
-            live ? "border-studio-accent/50" : "border-border",
+            live ? "border-success/50" : "border-border",
             minimized
               ? "animate-out fade-out zoom-out-95"
               : "animate-in fade-in zoom-in-95",
@@ -87,9 +88,9 @@ export function BrowserPiP() {
             <div className="flex-1" />
             <button
               type="button"
-              onClick={() => setTab("browser")}
-              aria-label="Expand to Browser tab"
-              title="Expand to Browser tab"
+              onClick={() => openPane("browser")}
+              aria-label="Expand to Browser pane"
+              title="Expand to Browser pane"
               className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             >
               <EnterFullScreenIcon className="h-3.5 w-3.5" />
@@ -106,9 +107,9 @@ export function BrowserPiP() {
           </div>
           <button
             type="button"
-            onClick={() => setTab("browser")}
-            title="Expand to Browser tab"
-            aria-label="Expand to Browser tab"
+            onClick={() => openPane("browser")}
+            title="Expand to Browser pane"
+            aria-label="Expand to Browser pane"
             className="relative block h-[12rem] w-full bg-slate-elevation2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
           >
             {sessionId ? (

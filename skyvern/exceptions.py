@@ -789,9 +789,19 @@ class UnsupportedActionType(SkyvernException):
         super().__init__(f"Unsupport action type: {action_type}")
 
 
+_INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT = (
+    " The element appears to be a non-input segment of a custom date widget. "
+    "Look for a calendar icon, date picker trigger, or stepper button near this "
+    "element and click that instead of typing into the segment."
+)
+
+
 class InvalidElementForTextInput(SkyvernException):
-    def __init__(self, element_id: str, tag_name: str):
-        super().__init__(f"The {tag_name} element with id={element_id} doesn't support text input.")
+    def __init__(self, element_id: str, tag_name: str, *, is_date_related: bool = False):
+        message = f"The {tag_name} element with id={element_id} doesn't support text input."
+        if is_date_related:
+            message += _INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT
+        super().__init__(message)
 
 
 class ElementIsNotLabel(SkyvernException):

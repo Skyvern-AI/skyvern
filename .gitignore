@@ -162,6 +162,7 @@ ig_*
 
 # Skyvern ignores
 browser_sessions/
+credential_vault/
 videos/
 skyvern/artifacts/
 artifacts/

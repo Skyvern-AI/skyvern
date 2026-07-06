@@ -30,6 +30,7 @@ from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -239,6 +240,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
             await forge_app.api_app_startup_event(fastapi_app)
         except Exception:
             LOG.exception("Failed to execute api app startup event")
+
+    try:
+        await load_custom_llm_configs_from_database(forge_app.DATABASE)
+    except Exception:
+        LOG.exception("Failed to load custom LLM configs")
 
     # Close browser sessions left active by a previous process
     try:

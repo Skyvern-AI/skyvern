@@ -31,9 +31,13 @@ async def prepare_workflow(
     workflow_run_id: str | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     copilot_session_id: str | None = None,
+    resolved_workflow_id: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
+
+    ``resolved_workflow_id`` pins the exact workflow version row; when None, resolve by
+    permanent id + version.
     """
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
@@ -55,13 +59,20 @@ async def prepare_workflow(
         workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         copilot_session_id=copilot_session_id,
+        resolved_workflow_id=resolved_workflow_id,
     )
 
-    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-        workflow_permanent_id=workflow_id,
-        organization_id=None if template else organization.organization_id,
-        version=version,
-    )
+    if resolved_workflow_id is not None:
+        workflow = await app.WORKFLOW_SERVICE.get_workflow(
+            workflow_id=resolved_workflow_id,
+            organization_id=None if template else organization.organization_id,
+        )
+    else:
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_id,
+            organization_id=None if template else organization.organization_id,
+            version=version,
+        )
 
     await app.DATABASE.tasks.create_task_run(
         task_run_type=RunType.workflow_run,

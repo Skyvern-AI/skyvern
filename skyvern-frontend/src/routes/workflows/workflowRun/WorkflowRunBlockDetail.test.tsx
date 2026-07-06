@@ -72,6 +72,54 @@ function buildBlockItem(block: WorkflowRunBlock): WorkflowRunTimelineBlockItem {
   };
 }
 
+function buildAction(
+  overrides: Partial<ActionsApiResponse> = {},
+): ActionsApiResponse {
+  return {
+    action_id: "act_default",
+    action_type: ActionTypes.NullAction,
+    status: Status.Completed,
+    task_id: "tsk_code",
+    step_id: null,
+    step_order: 0,
+    action_order: 0,
+    reasoning: "Recorded code step",
+    description: null,
+    intention: null,
+    response: null,
+    text: null,
+    created_by: null,
+    confidence_float: null,
+    ...overrides,
+  };
+}
+
+function renderActionDiagnosticsHref(
+  activeAction: ActionsApiResponse,
+  actions: Array<ActionsApiResponse>,
+): string | null {
+  const block = buildBlock({
+    block_type: "code",
+    task_id: "tsk_code",
+    actions,
+  });
+
+  render(
+    <MemoryRouter>
+      <WorkflowRunBlockDetail
+        activeItem={activeAction}
+        timeline={[buildBlockItem(block)]}
+      />
+    </MemoryRouter>,
+  );
+
+  return screen
+    .getByRole("link", {
+      name: /diagnostics/i,
+    })
+    .getAttribute("href");
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -217,7 +265,152 @@ describe("WorkflowRunBlockDetail router", () => {
     );
   });
 
-  it("renders actions for a file_download block", () => {
+  it("opens diagnostics on the selected action step when the detail panel is focused on an action", () => {
+    const action = buildAction({
+      action_id: "act_code_step",
+      step_id: "stp_code_2",
+      step_order: 2,
+    });
+
+    expect(renderActionDiagnosticsHref(action, [action])).toBe(
+      "/tasks/tsk_code/diagnostics?step_id=stp_code_2&step=2",
+    );
+  });
+
+  it("falls back to a step query when the selected action has no step id", () => {
+    const action = buildAction({
+      action_id: "act_legacy_step",
+      step_order: 2,
+    });
+
+    expect(renderActionDiagnosticsHref(action, [action])).toBe(
+      "/tasks/tsk_code/diagnostics?step=2",
+    );
+  });
+
+  it("uses the selected retry's step index as the diagnostics fallback", () => {
+    const originalAttempt = buildAction({
+      action_id: "act_retry_original",
+      status: Status.Failed,
+      step_id: "stp_code_order_1_original",
+      step_order: 1,
+    });
+    const selectedRetry = buildAction({
+      action_id: "act_retry_selected",
+      step_id: "stp_code_order_1_stale",
+      step_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedRetry, [
+        {
+          ...originalAttempt,
+          action_id: "act_order_0",
+          step_id: "stp_code_order_0",
+          step_order: 0,
+          status: Status.Completed,
+        },
+        originalAttempt,
+        selectedRetry,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step_id=stp_code_order_1_stale&step=2");
+  });
+
+  it("does not count non-contiguous actions from the same step as retries", () => {
+    const stepZeroStart = buildAction({
+      action_id: "act_order_0_start",
+      step_id: "stp_code_order_0",
+      step_order: 0,
+      action_order: 0,
+    });
+    const stepOneStart = buildAction({
+      action_id: "act_order_1_start",
+      step_id: "stp_code_order_1",
+      step_order: 1,
+      action_order: 0,
+    });
+    const stepZeroFollowUp = buildAction({
+      action_id: "act_order_0_follow_up",
+      step_id: "stp_code_order_0",
+      step_order: 0,
+      action_order: 1,
+    });
+    const selectedAction = buildAction({
+      action_id: "act_order_1_selected",
+      step_id: "stp_code_order_1",
+      step_order: 1,
+      action_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedAction, [
+        stepZeroStart,
+        stepOneStart,
+        stepZeroFollowUp,
+        selectedAction,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step_id=stp_code_order_1&step=1");
+  });
+
+  it("ignores later step actions when computing the diagnostics fallback", () => {
+    const stepStart = buildAction({
+      action_id: "act_step_start",
+      step_order: 1,
+      action_order: 0,
+    });
+    const laterStepAction = buildAction({
+      action_id: "act_later_step",
+      step_order: 2,
+      action_order: 0,
+    });
+    const selectedAction = buildAction({
+      action_id: "act_step_selected",
+      step_order: 1,
+      action_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedAction, [
+        buildAction({
+          action_id: "act_order_0",
+          step_order: 0,
+          action_order: 0,
+        }),
+        stepStart,
+        laterStepAction,
+        selectedAction,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step=1");
+  });
+
+  it("uses action ordering for fallback when only one same-step action has a step id", () => {
+    const stepStart = buildAction({
+      action_id: "act_modern_step_start",
+      step_id: "stp_code_order_1",
+      step_order: 1,
+      action_order: 0,
+    });
+    const selectedAction = buildAction({
+      action_id: "act_legacy_step_selected",
+      step_id: null,
+      step_order: 1,
+      action_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedAction, [
+        buildAction({
+          action_id: "act_order_0",
+          step_order: 0,
+          action_order: 0,
+        }),
+        stepStart,
+        selectedAction,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step=1");
+  });
+
+  it("does not duplicate the timeline with an Actions (N) section", () => {
     const action: ActionsApiResponse = {
       action_id: "act_download",
       action_type: ActionTypes.Click,
@@ -242,8 +435,10 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
 
-    expect(screen.getByText("Actions (1)")).toBeDefined();
-    expect(screen.getByText("Click the invoice download link")).toBeDefined();
+    // The bottom timeline already lists every action; the detail panel must
+    // not re-list them under an "Actions (N)" section.
+    expect(screen.queryByText(/^Actions \(\d+\)$/)).toBeNull();
+    expect(screen.queryByText("Click the invoice download link")).toBeNull();
   });
 
   it("renders the conditional detail (branch evaluation) for a conditional block", () => {
@@ -332,7 +527,7 @@ describe("WorkflowRunBlockDetail router", () => {
     expect(screen.getByText("Running")).toBeDefined();
   });
 
-  it("surfaces the selected action directly under the block header", () => {
+  it("does not show a redundant Selected action section when a child action is selected", () => {
     const action: ActionsApiResponse = {
       action_id: "act_extract",
       action_type: ActionTypes.extract,
@@ -363,11 +558,51 @@ describe("WorkflowRunBlockDetail router", () => {
       />,
     );
 
+    // The block header still identifies the resolved block...
     expect(screen.getByText("calendar_lookup")).toBeDefined();
-    expect(screen.getByText("Selected action")).toBeDefined();
+    // ...but the redundant "Selected action" card is gone.
+    expect(screen.queryByText("Selected action")).toBeNull();
+  });
+
+  it("reflects the selected child action's data in the inspector tabs, not the parent block", () => {
+    const action: ActionsApiResponse = {
+      action_id: "act_input",
+      action_type: ActionTypes.InputText,
+      status: Status.Completed,
+      task_id: null,
+      step_id: null,
+      step_order: null,
+      action_order: null,
+      reasoning: "Input the last name into the search field",
+      description: null,
+      intention: null,
+      response: null,
+      text: "McTesterson",
+      created_by: null,
+      confidence_float: 1,
+    };
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_task",
+      block_type: "task_v2",
+      label: "registry_search",
+      actions: [action],
+    });
+
+    render(
+      <WorkflowRunBlockDetail
+        activeItem={action}
+        timeline={[buildBlockItem(block)]}
+      />,
+    );
+
+    // The action's reasoning is surfaced in the inspector (Summary by default).
     expect(
-      screen.getAllByText("Extract the event date from the page")[0],
+      screen.getByText("Input the last name into the search field"),
     ).toBeDefined();
+    // Its input value shows under Inputs — the child action, not the block.
+    // Radix Tabs activates on mousedown, not a bare click event.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Inputs" }));
+    expect(screen.getByText("McTesterson")).toBeDefined();
   });
 
   it("ignores a stale activeIteration when falling back via 'stream'", () => {

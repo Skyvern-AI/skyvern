@@ -26,6 +26,7 @@ from skyvern.forge.sdk.db.utils import convert_to_step, convert_to_task, hydrate
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
 from skyvern.schemas.steps import AgentStepOutput
@@ -457,6 +458,7 @@ class TasksRepository(BaseRepository):
                 )
                 return None
 
+    @traced(name="skyvern.db.update_step")
     @db_operation("update_step")
     async def update_step(
         self,
@@ -533,6 +535,7 @@ class TasksRepository(BaseRepository):
             else:
                 raise NotFoundError("Task not found")
 
+    @traced(name="skyvern.db.update_task")
     @db_operation("update_task")
     async def update_task(
         self,

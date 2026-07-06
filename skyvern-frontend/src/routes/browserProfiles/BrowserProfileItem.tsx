@@ -3,7 +3,9 @@ import { Pencil1Icon } from "@radix-ui/react-icons";
 import { useNavigate } from "react-router-dom";
 
 import { BrowserProfileApiResponse } from "@/api/types";
+import { CopyButton } from "@/components/CopyButton";
 import { SelectionCheckboxCell } from "@/components/SelectionCheckbox";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { TableCell, TableRow } from "@/components/ui/table";
 import {
@@ -67,7 +69,37 @@ function BrowserProfileItem({
         />
       )}
       <TableCell className="truncate">
-        <span title={profile.name}>{profile.name}</span>
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate" title={profile.name}>
+              {profile.name}
+            </span>
+            {profile.is_managed ? (
+              <Badge
+                variant="secondary"
+                className="shrink-0"
+                title="Auto-saved from a Save & Reuse Session workflow. Recreated automatically on the next run."
+              >
+                Auto-managed
+              </Badge>
+            ) : null}
+          </div>
+          <div
+            className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground"
+            onClick={stopRowClick}
+          >
+            <span
+              className="truncate font-mono"
+              title={profile.browser_profile_id}
+            >
+              {profile.browser_profile_id}
+            </span>
+            <CopyButton
+              value={profile.browser_profile_id}
+              className="size-5 shrink-0"
+            />
+          </div>
+        </div>
       </TableCell>
       <TableCell className="truncate text-muted-foreground">
         {profile.description ? (

@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { CredentialAuthenticatorSupportProvider } from "./CredentialAuthenticatorSupportContext";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
 
 type Values = {
@@ -39,6 +40,36 @@ const SAVED_VALUES: Values = {
   totp: "",
   totp_type: "email",
   totp_identifier: "saved-totp-id@example.com",
+};
+
+const ENTERPRISE_APPS = {
+  label: "Enterprise QR support",
+  apps: ["Enterprise Authenticator A", "Enterprise Authenticator B"],
+  contactUrl: "https://www.skyvern.com/contact",
+  qrCodeTypes: [
+    {
+      id: "example",
+      label: "Enterprise Authenticator A",
+    },
+    {
+      id: "opaque",
+      label: "Enterprise Authenticator B",
+    },
+  ],
+  inferQrCodeType: (value: string) => {
+    if (value.startsWith("example-authenticator://")) {
+      return "example";
+    }
+    if (value.startsWith("opaque-authenticator://")) {
+      return "opaque";
+    }
+    return null;
+  },
+  vendorLabels: {
+    opaque: "Enterprise Authenticator B",
+  },
+  description:
+    "Scan the QR as usual - Skyvern detects these setup codes automatically.",
 };
 
 // Mirrors CredentialsModal: starts the form at INITIAL_VALUES, then after mount
@@ -267,6 +298,14 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       });
       expect(qrCall).toBeTruthy();
     });
+    expect(
+      screen
+        .getByRole("button", { name: /Google Authenticator/ })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("authenticator-qr-type-detection").textContent,
+    ).toBe("Detected from QR");
     expect(imageBitmap.close).toHaveBeenCalled();
   });
 
@@ -318,6 +357,12 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       });
       expect(qrCall).toBeTruthy();
     });
+    expect(
+      screen
+        .getByRole("button", { name: /Google Authenticator/ })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(screen.queryByText("Detected from QR")).toBeNull();
     expect(imageBitmap.close).toHaveBeenCalled();
   });
 
@@ -559,5 +604,323 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       ),
     );
     expect(close).toHaveBeenCalled();
+  });
+});
+
+describe("PasswordCredentialContent — supported authenticator copy", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const NEW_VALUES: Values = {
+    name: "New cred",
+    username: "new-user@example.com",
+    password: "password",
+    totp: "",
+    totp_type: "none",
+    totp_identifier: "",
+  };
+
+  function stubQrCodeScan(rawValue: string) {
+    const imageBitmap = { close: vi.fn() } as unknown as ImageBitmap;
+    class MockBarcodeDetector {
+      detect = vi.fn().mockResolvedValue([{ rawValue }]);
+    }
+    vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue(imageBitmap));
+    vi.stubGlobal("BarcodeDetector", MockBarcodeDetector);
+    return imageBitmap;
+  }
+
+  async function uploadQrCodeImage() {
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Upload QR code image"), {
+        target: {
+          files: [new File(["qr"], "totp.png", { type: "image/png" })],
+        },
+      });
+    });
+  }
+
+  async function openAuthenticatorSection(
+    enterpriseApps?: typeof ENTERPRISE_APPS,
+    onChangeSpy = vi.fn(),
+  ) {
+    const content = (
+      <MemoryRouter>
+        <PasswordCredentialContent values={NEW_VALUES} onChange={onChangeSpy} />
+      </MemoryRouter>
+    );
+    render(
+      enterpriseApps ? (
+        <CredentialAuthenticatorSupportProvider value={{ enterpriseApps }}>
+          {content}
+        </CredentialAuthenticatorSupportProvider>
+      ) : (
+        content
+      ),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    return onChangeSpy;
+  }
+
+  it("always lists generic TOTP apps", async () => {
+    await openAuthenticatorSection();
+    expect(
+      screen.getByText(/Google Authenticator, Authy, 1Password/),
+    ).toBeTruthy();
+  });
+
+  it("omits enterprise QR type options in the default/OSS context", async () => {
+    await openAuthenticatorSection();
+    expect(
+      screen.getByRole("button", { name: /Google Authenticator/ }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Enterprise Authenticator A")).toBeNull();
+    expect(screen.queryByText("Enterprise Authenticator B")).toBeNull();
+    expect(
+      screen.queryByText(/detects these setup codes automatically/),
+    ).toBeNull();
+  });
+
+  it("renders Cloud provider QR type options when the context provides apps", async () => {
+    await openAuthenticatorSection(ENTERPRISE_APPS);
+    const selector = screen.getByTestId("authenticator-qr-type-selector");
+    expect(selector).toBeTruthy();
+    const keyInput = screen.getByPlaceholderText("e.g. JBSWY3DPEHPK3PXP");
+    expect(
+      selector.compareDocumentPosition(keyInput) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /Google Authenticator/ }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Enterprise Authenticator A" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Enterprise Authenticator B" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/detects these setup codes automatically/),
+    ).toBeTruthy();
+    expect(
+      selector.querySelectorAll('[data-testid="authenticator-type-logo"]'),
+    ).toHaveLength(3);
+  });
+
+  it("highlights the Cloud provider QR type inferred from an uploaded QR code", async () => {
+    const imageBitmap = stubQrCodeScan(
+      "example-authenticator://activate?payload=opaque",
+    );
+    const onChangeSpy = await openAuthenticatorSection(ENTERPRISE_APPS);
+    await uploadQrCodeImage();
+
+    await waitFor(() => {
+      const qrCall = onChangeSpy.mock.calls.find((call) => {
+        const next = call[0] as Values;
+        return (
+          next.totp_type === "authenticator" &&
+          next.totp === "example-authenticator://activate?payload=opaque"
+        );
+      });
+      expect(qrCall).toBeTruthy();
+    });
+    expect(
+      screen
+        .getByRole("button", { name: /Enterprise Authenticator A/ })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("authenticator-qr-type-detection").textContent,
+    ).toBe("Detected from QR");
+    expect(imageBitmap.close).toHaveBeenCalled();
+  });
+
+  it("announces the inferred type via a polite live region naming the detected app", async () => {
+    stubQrCodeScan("example-authenticator://activate?payload=opaque");
+    await openAuthenticatorSection(ENTERPRISE_APPS);
+    await uploadQrCodeImage();
+
+    const liveRegion = await waitFor(() => {
+      const region = screen
+        .getByTestId("authenticator-qr-type-detection")
+        .closest('[role="status"]');
+      expect(region).toBeTruthy();
+      return region as HTMLElement;
+    });
+    expect(liveRegion.getAttribute("aria-live")).toBe("polite");
+    expect(liveRegion.textContent).toContain("Detected from QR");
+    expect(liveRegion.textContent).toContain("Enterprise Authenticator A");
+    expect(
+      screen.getByTestId("authenticator-qr-type-detection").textContent,
+    ).toBe("Detected from QR");
+  });
+
+  it("visually marks only the inferred chip as detected, and clears that marker when the user picks another type", async () => {
+    stubQrCodeScan("example-authenticator://activate?payload=opaque");
+    await openAuthenticatorSection(ENTERPRISE_APPS);
+    await uploadQrCodeImage();
+
+    const inferredButton = await waitFor(() => {
+      const button = screen.getByRole("button", {
+        name: /Enterprise Authenticator A/,
+      });
+      expect(button.getAttribute("data-inferred")).toBe("true");
+      return button;
+    });
+    expect(
+      screen
+        .getByRole("button", { name: /Google Authenticator/ })
+        .getAttribute("data-inferred"),
+    ).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /Google Authenticator/ }),
+      );
+    });
+
+    expect(inferredButton.getAttribute("data-inferred")).toBeNull();
+    expect(screen.queryByText("Detected from QR")).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: /Google Authenticator/ })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("does not falsely highlight a Cloud enterprise type for an unknown uploaded QR code", async () => {
+    const imageBitmap = stubQrCodeScan(
+      "unknown-authenticator://activate?payload=opaque",
+    );
+    const onChangeSpy = await openAuthenticatorSection(ENTERPRISE_APPS);
+    await uploadQrCodeImage();
+
+    await waitFor(() => {
+      const qrCall = onChangeSpy.mock.calls.find((call) => {
+        const next = call[0] as Values;
+        return (
+          next.totp_type === "authenticator" &&
+          next.totp === "unknown-authenticator://activate?payload=opaque"
+        );
+      });
+      expect(qrCall).toBeTruthy();
+    });
+    expect(
+      screen
+        .getByRole("button", { name: /Google Authenticator/ })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(
+      screen
+        .getByRole("button", { name: "Enterprise Authenticator A" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(
+      screen
+        .getByRole("button", { name: "Enterprise Authenticator B" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(screen.queryByText("Detected from QR")).toBeNull();
+    expect(imageBitmap.close).toHaveBeenCalled();
+  });
+});
+
+describe("PasswordCredentialContent — inline authenticator save error", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  const AUTH_VALUES: Values = {
+    name: "New cred",
+    username: "new-user@example.com",
+    password: "password",
+    totp: "otpauth://totp/user@example.com?secret=BAD",
+    totp_type: "authenticator",
+    totp_identifier: "",
+  };
+
+  it("shows enterprise copy with a contact link for an enterprise-required error", () => {
+    render(
+      <MemoryRouter>
+        <CredentialAuthenticatorSupportProvider
+          value={{ enterpriseApps: ENTERPRISE_APPS }}
+        >
+          <PasswordCredentialContent
+            values={AUTH_VALUES}
+            onChange={vi.fn()}
+            authenticatorSaveError={{
+              code: "enterprise_required",
+              message: "This authenticator requires a Skyvern enterprise plan.",
+              vendor: "opaque",
+            }}
+          />
+        </CredentialAuthenticatorSupportProvider>
+      </MemoryRouter>,
+    );
+
+    const enterpriseMessage = screen.getByText(
+      "Enterprise Authenticator B requires a Skyvern enterprise plan.",
+    );
+    expect(enterpriseMessage.closest(".text-destructive")).toBeNull();
+    expect(screen.getByTestId("enterprise-authenticator-upgrade")).toBeTruthy();
+    const contactLink = screen.getByRole("link", { name: "Contact us" });
+    expect(contactLink.getAttribute("href")).toBe(
+      "https://www.skyvern.com/contact",
+    );
+    const input = screen.getByPlaceholderText("e.g. JBSWY3DPEHPK3PXP");
+    expect(input.getAttribute("aria-invalid")).toBe("false");
+    expect(input.className).not.toContain("border-destructive");
+    expect(input.getAttribute("aria-describedby")).toBeTruthy();
+  });
+
+  it("shows actionable no-code-secret copy without a contact link", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={AUTH_VALUES}
+          onChange={vi.fn()}
+          authenticatorSaveError={{
+            code: "no_code_secret",
+            message:
+              "This QR code doesn't contain a code-based setup key. It may enroll a push-approval app or device-bound authenticator. Set up an authenticator app or one-time code instead.",
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/push-approval app/)).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Contact us" })).toBeNull();
+    const input = screen.getByPlaceholderText("e.g. JBSWY3DPEHPK3PXP");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(input.className).toContain("border-destructive");
+    const describedBy = input.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toContain(
+      "push-approval app",
+    );
+  });
+
+  it("keeps the decoded QR value in the field after a save failure", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={AUTH_VALUES}
+          onChange={vi.fn()}
+          authenticatorSaveError={{
+            code: "invalid_authenticator_key",
+            message: "Invalid authenticator key.",
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    const input = screen.getByPlaceholderText(
+      "e.g. JBSWY3DPEHPK3PXP",
+    ) as HTMLInputElement;
+    expect(input.value).toBe("otpauth://totp/user@example.com?secret=BAD");
   });
 });

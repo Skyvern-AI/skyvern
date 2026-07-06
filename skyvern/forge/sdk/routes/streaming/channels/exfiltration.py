@@ -184,11 +184,32 @@ class ExfiltrationChannel(CdpChannel):
         for fingerprint in expired:
             self._recent_console_event_fingerprints.pop(fingerprint, None)
 
-    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+    # Excluded from the fingerprint: advances by ms when one interaction is re-captured across a reconnect.
+    _CONSOLE_FINGERPRINT_VOLATILE_KEYS: t.ClassVar[frozenset[str]] = frozenset({"timestamp"})
+
+    def _console_fingerprint(self, event_data: dict[str, t.Any]) -> str:
+        # Drop None values (recursively) as well as volatile keys: the binding,
+        # Playwright-console, and raw-CDP transports materialize the same event
+        # with None-vs-absent differences (JSON.stringify drops undefined keys;
+        # the binding serializes them to null), which otherwise defeats dedup.
+        stable = self._strip_none(
+            {k: v for k, v in event_data.items() if k not in self._CONSOLE_FINGERPRINT_VOLATILE_KEYS}
+        )
         try:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"))
         except TypeError:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"), default=str)
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+
+    @classmethod
+    def _strip_none(cls, value: t.Any) -> t.Any:
+        if isinstance(value, dict):
+            return {k: cls._strip_none(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [cls._strip_none(item) for item in value]
+        return value
+
+    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+        fingerprint = self._console_fingerprint(event_data)
 
         now = time.monotonic()
         self._prune_console_dedup_cache(now)

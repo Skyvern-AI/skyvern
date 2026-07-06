@@ -7,6 +7,7 @@ interface UseInfiniteBrowserProfilesQueryParams {
   page_size?: number;
   searchKey?: string;
   enabled?: boolean;
+  managed?: boolean;
 }
 
 // Dedupe by id so concurrent-insert page-boundary repeats don't duplicate rows;
@@ -35,9 +36,10 @@ function useInfiniteBrowserProfilesQuery(
   const credentialGetter = useCredentialGetter();
   const pageSize = params?.page_size ?? 20;
   const searchKey = params?.searchKey ?? "";
+  const managed = params?.managed;
 
   return useInfiniteQuery<Array<BrowserProfileApiResponse>>({
-    queryKey: ["browserProfiles-infinite", searchKey, pageSize],
+    queryKey: ["browserProfiles-infinite", searchKey, pageSize, managed],
     queryFn: async ({ pageParam = 1 }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const searchParams = new URLSearchParams();
@@ -45,6 +47,9 @@ function useInfiniteBrowserProfilesQuery(
       searchParams.append("page_size", String(pageSize));
       if (searchKey) {
         searchParams.append("search_key", searchKey);
+      }
+      if (managed !== undefined) {
+        searchParams.append("managed", String(managed));
       }
       return client
         .get<Array<BrowserProfileApiResponse>>("/browser_profiles", {

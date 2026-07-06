@@ -3,6 +3,7 @@ import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 
 import {
   WorkflowBlockType,
@@ -230,6 +231,15 @@ function serializeLoopNodeWhileBranchToYAML(
 }
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
+
+function serializeSecretResponsePaths(
+  secretResponsePaths: Array<string>,
+): Array<string> | null {
+  const normalized = secretResponsePaths
+    .map((path) => path.trim())
+    .filter(Boolean);
+  return normalized.length > 0 ? normalized : null;
+}
 
 type ConditionalEdgeData = {
   conditionalNodeId?: string;
@@ -1095,6 +1105,7 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           downloadFilename: block.download_filename ?? "",
           saveResponseAsFile: block.save_response_as_file ?? false,
+          secretResponsePaths: block.secret_response_paths ?? [],
         },
       };
     }
@@ -1997,12 +2008,14 @@ function getElements(
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
+      enableSelfHealing: settings.enableSelfHealing ?? false,
       label: "__start_block__",
       showCode: false,
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
       workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
+      errorCodeMapping: settings.errorCodeMapping ?? null,
     }),
   );
 
@@ -3101,6 +3114,9 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         download_filename: node.data.downloadFilename || null,
         save_response_as_file: node.data.saveResponseAsFile,
+        secret_response_paths: serializeSecretResponsePaths(
+          node.data.secretResponsePaths ?? [],
+        ),
       };
     }
     case "printPage": {
@@ -3413,10 +3429,12 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
+    enableSelfHealing: false,
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
     workflowSystemPrompt: null,
+    errorCodeMapping: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -3448,10 +3466,12 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
+      enableSelfHealing: data.enableSelfHealing,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
       workflowSystemPrompt: data.workflowSystemPrompt ?? null,
+      errorCodeMapping: data.errorCodeMapping ?? null,
     };
   }
   return defaultSettings;
@@ -4048,6 +4068,8 @@ function convertParametersToParameterYAML(
             ...base,
             parameter_type: WorkflowParameterTypes.Credential,
             credential_id: parameter.credential_id,
+            credential_ids: parameter.credential_ids ?? null,
+            selection_strategy: parameter.selection_strategy ?? null,
           };
         }
         case WorkflowParameterTypes.OnePassword: {
@@ -4432,6 +4454,9 @@ function convertBlocksToBlockYAML(
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),
           download_filename: block.download_filename,
+          secret_response_paths: serializeSecretResponsePaths(
+            block.secret_response_paths ?? [],
+          ),
         };
         return blockYaml;
       }
@@ -4539,6 +4564,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
+    enable_self_healing: workflow.enable_self_healing ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
     sequential_key: workflow.sequential_key ?? undefined,
   };
@@ -4603,7 +4629,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
       if (!result.success) {
         errors.push(
-          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+          `${node.data.label}: Data schema has invalid templated JSON: ${getJsonParseErrorDetail(
+            node.data.dataSchema,
+            result.error ?? "Parse error",
+          )}`,
         );
       }
     }
@@ -4689,7 +4718,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
       if (!result.success) {
         errors.push(
-          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+          `${node.data.label}: Data schema has invalid templated JSON: ${getJsonParseErrorDetail(
+            node.data.dataSchema,
+            result.error ?? "Parse error",
+          )}`,
         );
       }
     }
@@ -4699,8 +4731,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   textPromptNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.jsonSchema,
+          error,
+        )}`,
+      );
     }
   });
 
@@ -4708,8 +4745,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   pdfParserNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.jsonSchema,
+          error,
+        )}`,
+      );
     }
   });
 
@@ -4717,8 +4759,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   fileParserNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.jsonSchema,
+          error,
+        )}`,
+      );
     }
   });
 

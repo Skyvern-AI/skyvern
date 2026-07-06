@@ -64,6 +64,16 @@ codex mcp get skyvern
 
 If you previously configured Skyvern with an `x-api-key` header, run `codex mcp remove skyvern` first so Codex does not skip the OAuth handshake. You do not need to run `codex mcp login skyvern` after `add` — the OAuth flow runs inline. Use `codex mcp login skyvern` only to re-authenticate after a token expires or to request custom `--scopes`.
 
+<Note>
+If `codex mcp add` fails with `resource is not allowed for this authorization server`, your Codex version derived a trailing-slash `resource` from the URL. Pass the slashless resource explicitly:
+
+```bash
+codex mcp add skyvern --url https://api.skyvern.com/mcp/ --oauth-resource https://api.skyvern.com/mcp
+```
+
+Skyvern Cloud accepts both forms, so the flag is only needed on older self-hosted deployments.
+</Note>
+
 </Tab>
 <Tab title="Cursor">
 

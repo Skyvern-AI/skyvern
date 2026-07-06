@@ -18,11 +18,15 @@ from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    _adjudicated_run_outcome,
     _record_run_blocks_result,
+    _stash_recorded_run_outcome,
     _verify_and_record_run_blocks_result,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate
@@ -134,6 +138,48 @@ def _evaluated(satisfied: bool) -> CompletionVerificationResult:
         reason_code="evidence_confirms" if satisfied else "no_evidence",
     )
     return CompletionVerificationResult(status="evaluated", criterion_ids=["c0"], verdicts=[verdict])
+
+
+def _mixed_observed_reach_state_with_reperception_contradiction() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_reach", "c_reperception"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_reach",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="observed_end_state_url",
+            ),
+            CriterionVerdict(
+                criterion_id="c_reperception",
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                evidence_ref="scout_synthesized_browser_steps_output",
+            ),
+        ],
+    )
+
+
+def _mixed_observed_reach_state_with_requested_output_contradiction() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_reach", "c_requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_reach",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="observed_end_state_url",
+            ),
+            CriterionVerdict(
+                criterion_id="c_requested_output",
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                evidence_ref="block_outputs:search_registry_person.confirmation_number",
+            ),
+        ],
+    )
 
 
 def _run_outcome_frames(stream: _FakeStream) -> list[WorkflowCopilotRunOutcomeUpdate]:
@@ -374,20 +420,14 @@ async def test_evaluating_hold_gets_final_frame_when_recording_raises(monkeypatc
     assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
 
 
-def test_recorder_returns_none_for_failed_run() -> None:
-    result = _run_result([], ok=False)
-    ctx = _ctx()
-    assert _record_run_blocks_result(ctx, result, completion_verification=None) is None
-    assert ctx.last_run_outcome is None
-
-
 def test_failed_rerun_clears_prior_recorded_outcome() -> None:
     ctx = _ctx()
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_demonstrated", reason_code="blocker_reported")
     ctx.last_run_outcome_block_labels = ["search_registry_person"]
 
-    _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
+    outcome = _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
 
+    assert outcome is None
     assert ctx.last_run_outcome is None
     assert ctx.last_run_outcome_block_labels == []
 
@@ -404,6 +444,94 @@ def test_recorded_run_outcome_carries_producing_workflow_run_id() -> None:
     assert outcome.workflow_run_id == "wr_test"
     assert ctx.last_run_outcome is not None
     assert ctx.last_run_outcome.workflow_run_id == "wr_test"
+
+
+def test_recorded_run_outcome_commits_same_adjudication_reach_state_over_reperception_contradiction() -> None:
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+
+    outcome = _record_run_blocks_result(
+        ctx,
+        _run_result([_code_block("search_registry_person", {"records": []})]),
+        completion_verification=_mixed_observed_reach_state_with_reperception_contradiction(),
+    )
+
+    assert outcome == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+    assert ctx.last_run_outcome == outcome
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+    assert outcome_fully_verified(ctx) is True
+
+
+def test_recorded_run_outcome_does_not_commit_requested_output_contradiction() -> None:
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+
+    outcome = _record_run_blocks_result(
+        ctx,
+        _run_result([_code_block("search_registry_person", {"records": []})]),
+        completion_verification=_mixed_observed_reach_state_with_requested_output_contradiction(),
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "not_demonstrated"
+    assert ctx.last_run_outcome == outcome
+    assert outcome_fully_verified(ctx) is False
+
+
+def test_adjudication_keeps_committed_same_run_demonstrated_outcome() -> None:
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+    ctx.last_run_blocks_workflow_run_id = "wr_test"
+    committed = _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="demonstrated"))
+
+    assert committed == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+
+    adjudicated = _adjudicated_run_outcome(ctx, _evaluated(satisfied=False))
+    stashed = _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_test",
+        ),
+    )
+
+    assert adjudicated == committed
+    assert stashed == committed
+    assert ctx.last_run_outcome == committed
+
+
+def test_adjudication_does_not_keep_committed_outcome_for_new_run() -> None:
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_prior")
+    ctx.last_run_blocks_workflow_run_id = "wr_test"
+
+    adjudicated = _adjudicated_run_outcome(ctx, _evaluated(satisfied=False))
+
+    assert adjudicated.verdict == "not_demonstrated"
+
+
+@pytest.mark.asyncio
+async def test_missing_run_id_does_not_emit_committed_demonstrated_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _clean_run_result()
+    result["data"].pop("workflow_run_id")
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+    ctx.last_run_blocks_workflow_run_id = "wr_test"
+
+    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
+        return _evaluated(satisfied=False)
+
+    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
+    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
+    assert frames[-1].workflow_run_id != "wr_test"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.verdict == "not_demonstrated"
 
 
 def test_both_consumers_route_through_single_producer() -> None:
@@ -480,3 +608,28 @@ def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> Non
     for block in payload["blocks"]:
         assert "outcome" not in block
         assert "outcomeReason" not in block
+
+
+class TestGenuineAttemptRunStamp:
+    def test_ok_run_counts_as_genuine_attempt(self) -> None:
+        ctx = _ctx([_code_block("b0", {"records": [{"id": 1}]})])
+        _record_run_blocks_result(ctx, _run_result([_code_block("b0", {"records": [{"id": 1}]})]))
+        assert ctx.last_test_ok is True
+        assert ctx.last_run_blocks_workflow_run_id == "wr_test"
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_failed_run_counts_as_genuine_attempt(self) -> None:
+        ctx = _ctx([_code_block("b0", {})])
+        _record_run_blocks_result(ctx, _run_result([_code_block("b0", {})], ok=False))
+        assert ctx.last_test_ok is False
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_watchdog_softened_run_counts_as_genuine_attempt(self) -> None:
+        ctx = _ctx([_code_block("b0", {})])
+        ctx.copilot_total_timeout_exceeded = True
+        result = _run_result([_code_block("b0", {})], ok=False)
+        result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
+        _record_run_blocks_result(ctx, result)
+        assert ctx.last_test_ok is None
+        assert ctx.last_run_blocks_workflow_run_id == "wr_test"
+        assert ctx.has_genuine_workflow_attempt() is True

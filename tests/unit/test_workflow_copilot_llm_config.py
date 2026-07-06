@@ -65,42 +65,26 @@ def test_narrator_handler_prefers_dedicated_when_set(monkeypatch: pytest.MonkeyP
     assert narration._get_narrator_handler() is dedicated
 
 
-def test_narrator_handler_falls_back_to_secondary_on_attribute_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A plain object lacking the dedicated attribute raises ``AttributeError``;
-    the fallback must catch that branch as well as the holder's ``RuntimeError``."""
-    secondary = object()
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(SECONDARY_LLM_API_HANDLER=secondary),
-    )
-    assert narration._get_narrator_handler() is secondary
-
-
-def test_narrator_handler_falls_back_to_secondary_on_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``AppHolder.__getattr__`` raises bare ``RuntimeError`` pre-startup,
-    not ``AttributeError`` — the fallback must catch both."""
-    secondary = object()
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        _AppHolderStub(SECONDARY_LLM_API_HANDLER=secondary),
-    )
-    assert narration._get_narrator_handler() is secondary
-
-
-def test_narrator_handler_falls_back_to_secondary_when_dedicated_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Defensive: a custom forge-app initializer that sets the new attribute
-    to ``None`` must not silently disable narration when SECONDARY is wired."""
-    secondary = object()
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(
-            WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=None,
-            SECONDARY_LLM_API_HANDLER=secondary,
+@pytest.mark.parametrize(
+    "make_app",
+    [
+        # A plain object lacking the dedicated attribute raises AttributeError.
+        pytest.param(lambda secondary: SimpleNamespace(SECONDARY_LLM_API_HANDLER=secondary), id="attribute_error"),
+        # AppHolder.__getattr__ raises bare RuntimeError pre-startup, not AttributeError.
+        pytest.param(lambda secondary: _AppHolderStub(SECONDARY_LLM_API_HANDLER=secondary), id="runtime_error"),
+        # A custom forge-app initializer that sets the new attribute to None must not disable narration.
+        pytest.param(
+            lambda secondary: SimpleNamespace(
+                WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=None,
+                SECONDARY_LLM_API_HANDLER=secondary,
+            ),
+            id="dedicated_is_none",
         ),
-    )
+    ],
+)
+def test_narrator_handler_falls_back_to_secondary(monkeypatch: pytest.MonkeyPatch, make_app: Any) -> None:
+    secondary = object()
+    monkeypatch.setattr(copilot_llm_config, "app", make_app(secondary))
     assert narration._get_narrator_handler() is secondary
 
 
@@ -178,62 +162,33 @@ async def test_resolve_main_copilot_handler_falls_back_to_dedicated(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_resolve_main_copilot_handler_falls_back_to_primary_on_attribute_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A plain object lacking the dedicated attribute raises ``AttributeError``."""
-    primary = object()
-
-    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(LLM_API_HANDLER=primary),
-    )
-
-    handler = await copilot_llm_config.resolve_main_copilot_handler("wpid_1", "org_1")
-    assert handler is primary
-
-
-@pytest.mark.asyncio
-async def test_resolve_main_copilot_handler_falls_back_to_primary_on_runtime_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``AppHolder.__getattr__`` raises bare ``RuntimeError`` pre-startup, not
-    ``AttributeError`` — the helper must catch both."""
-    primary = object()
-
-    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
-    monkeypatch.setattr(copilot_llm_config, "app", _AppHolderStub(LLM_API_HANDLER=primary))
-
-    handler = await copilot_llm_config.resolve_main_copilot_handler("wpid_1", "org_1")
-    assert handler is primary
-
-
-@pytest.mark.asyncio
-async def test_resolve_main_copilot_handler_falls_back_when_dedicated_is_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    primary = object()
-
-    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
-            LLM_API_HANDLER=primary,
+@pytest.mark.parametrize(
+    "make_app",
+    [
+        # A plain object lacking the dedicated attribute raises AttributeError.
+        pytest.param(lambda primary: SimpleNamespace(LLM_API_HANDLER=primary), id="attribute_error"),
+        # AppHolder.__getattr__ raises bare RuntimeError pre-startup, not AttributeError.
+        pytest.param(lambda primary: _AppHolderStub(LLM_API_HANDLER=primary), id="runtime_error"),
+        # A custom forge-app initializer that sets the new attribute to None must fall through.
+        pytest.param(
+            lambda primary: SimpleNamespace(
+                WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
+                LLM_API_HANDLER=primary,
+            ),
+            id="dedicated_is_none",
         ),
-    )
+    ],
+)
+async def test_resolve_main_copilot_handler_falls_back_to_primary(
+    monkeypatch: pytest.MonkeyPatch, make_app: Any
+) -> None:
+    primary = object()
+
+    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
+    monkeypatch.setattr(copilot_llm_config, "app", make_app(primary))
 
     handler = await copilot_llm_config.resolve_main_copilot_handler("wpid_1", "org_1")
     assert handler is primary

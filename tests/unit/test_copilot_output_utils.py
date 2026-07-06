@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    _sanitize_failure_text,
+    build_run_blocks_response,
     format_tool_result_for_user,
     looks_like_workflow_yaml_in_chat,
     parse_final_response,
@@ -689,19 +693,49 @@ class TestFormatToolResultForUser:
         assert summary.startswith("Failed:")
         assert "ERR_NAME_NOT_RESOLVED" in summary
 
-    def test_click_success_returns_empty_summary(self) -> None:
-        summary = self._format(
-            "click",
-            {"ok": True, "data": {"selector": "input[name='ackStatus']"}},
-        )
-        assert summary == ""
-
-    def test_type_text_success_returns_empty_summary(self) -> None:
-        summary = self._format(
-            "type_text",
-            {"ok": True, "data": {"selector": "#last_name", "typed_length": 5}},
-        )
-        assert summary == ""
+    @pytest.mark.parametrize(
+        ("tool_name", "result", "expected"),
+        [
+            pytest.param(
+                "click",
+                {"ok": True, "data": {"selector": "input[name='ackStatus']"}},
+                "",
+                id="click-suppressed",
+            ),
+            pytest.param(
+                "type_text",
+                {"ok": True, "data": {"selector": "#last_name", "typed_length": 5}},
+                "",
+                id="type_text-suppressed",
+            ),
+            pytest.param(
+                "select_option",
+                {"ok": True, "data": {"value": "option-1"}},
+                "",
+                id="select_option-suppressed",
+            ),
+            pytest.param(
+                "navigate_browser",
+                {"ok": True, "url": "https://example.com"},
+                "Navigated to https://example.com",
+                id="navigate_browser-fallthrough",
+            ),
+            pytest.param(
+                "update_workflow",
+                {"ok": True, "data": {"block_count": 3}},
+                "Workflow updated (3 blocks)",
+                id="update_workflow-fallthrough",
+            ),
+            pytest.param(
+                "press_key",
+                {"ok": True, "data": {"key": "Enter"}},
+                "Pressed 'Enter'",
+                id="press_key-fallthrough",
+            ),
+        ],
+    )
+    def test_success_summary_routing(self, tool_name: str, result: dict, expected: str) -> None:
+        assert self._format(tool_name, result) == expected
 
     def test_evaluate_success_returns_empty_summary_dropping_shape_suffix(self) -> None:
         summary = self._format(
@@ -721,34 +755,6 @@ class TestFormatToolResultForUser:
         )
         assert summary == ""
         assert "object with keys" not in summary
-
-    def test_select_option_success_returns_empty_summary(self) -> None:
-        summary = self._format(
-            "select_option",
-            {"ok": True, "data": {"value": "option-1"}},
-        )
-        assert summary == ""
-
-    def test_navigate_browser_success_falls_through_to_summarize(self) -> None:
-        summary = self._format(
-            "navigate_browser",
-            {"ok": True, "url": "https://example.com"},
-        )
-        assert summary == "Navigated to https://example.com"
-
-    def test_update_workflow_success_falls_through_to_summarize(self) -> None:
-        summary = self._format(
-            "update_workflow",
-            {"ok": True, "data": {"block_count": 3}},
-        )
-        assert "3" in summary
-
-    def test_press_key_success_falls_through_to_summarize(self) -> None:
-        summary = self._format(
-            "press_key",
-            {"ok": True, "data": {"key": "Enter"}},
-        )
-        assert summary == "Pressed 'Enter'"
 
     def test_summarize_tool_result_unchanged_for_click_success(self) -> None:
         agent_summary = summarize_tool_result(
@@ -811,17 +817,48 @@ class TestParseFinalResponse:
         parsed = parse_final_response("[1, 2, 3]")
         assert parsed == {"type": "REPLY", "user_response": "[1, 2, 3]"}
 
-    def test_strips_leading_reply_label_before_parse(self) -> None:
-        envelope = 'REPLY\n{"type": "REPLY", "user_response": "ok"}'
+    @pytest.mark.parametrize(
+        ("envelope", "expected_type", "expected_fields"),
+        [
+            pytest.param(
+                'REPLY\n{"type": "REPLY", "user_response": "ok"}',
+                "REPLY",
+                {"user_response": "ok"},
+                id="plain-label",
+            ),
+            pytest.param(
+                'ASK_QUESTION:\n{"type": "ASK_QUESTION", "user_response": "what date?"}',
+                "ASK_QUESTION",
+                {"user_response": "what date?"},
+                id="colon-suffixed-label",
+            ),
+            pytest.param(
+                'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}',
+                "REPLACE_WORKFLOW",
+                {"workflow_yaml": "title: x"},
+                id="replace-workflow-label",
+            ),
+            pytest.param(
+                'ask_question {"type": "ASK_QUESTION", "user_response": "which account?"}',
+                "ASK_QUESTION",
+                {"user_response": "which account?"},
+                id="mixed-case-label",
+            ),
+            pytest.param(
+                "REPLACE_WORKFLOW\n```json\n"
+                '{"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}\n'
+                "```",
+                "REPLACE_WORKFLOW",
+                {"workflow_yaml": "title: x"},
+                id="label-before-json-fence",
+            ),
+        ],
+    )
+    def test_strips_leading_response_type_label(self, envelope: str, expected_type: str, expected_fields: dict) -> None:
         parsed = parse_final_response(envelope)
-        assert parsed["type"] == "REPLY"
-        assert parsed["user_response"] == "ok"
-
-    def test_strips_leading_ask_question_label_with_colon(self) -> None:
-        envelope = 'ASK_QUESTION:\n{"type": "ASK_QUESTION", "user_response": "what date?"}'
-        parsed = parse_final_response(envelope)
-        assert parsed["type"] == "ASK_QUESTION"
-        assert parsed["user_response"] == "what date?"
+        assert parsed["type"] == expected_type
+        for key, value in expected_fields.items():
+            assert parsed[key] == value
 
     def test_plain_leading_label_falls_through_for_output_policy(self) -> None:
         text = "ASK_QUESTION\nWhich account should I use?"
@@ -832,30 +869,6 @@ class TestParseFinalResponse:
         text = "Reply with the invoice number from the page."
         parsed = parse_final_response(text)
         assert parsed == {"type": "REPLY", "user_response": text}
-
-    def test_strips_leading_replace_workflow_label(self) -> None:
-        envelope = (
-            'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}'
-        )
-        parsed = parse_final_response(envelope)
-        assert parsed["type"] == "REPLACE_WORKFLOW"
-        assert parsed["workflow_yaml"] == "title: x"
-
-    def test_strips_mixed_case_leading_structured_label(self) -> None:
-        envelope = 'ask_question {"type": "ASK_QUESTION", "user_response": "which account?"}'
-        parsed = parse_final_response(envelope)
-        assert parsed["type"] == "ASK_QUESTION"
-        assert parsed["user_response"] == "which account?"
-
-    def test_strips_leading_label_before_json_code_fence(self) -> None:
-        envelope = (
-            "REPLACE_WORKFLOW\n```json\n"
-            '{"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}\n'
-            "```"
-        )
-        parsed = parse_final_response(envelope)
-        assert parsed["type"] == "REPLACE_WORKFLOW"
-        assert parsed["workflow_yaml"] == "title: x"
 
     def test_extracts_json_after_prose_preamble(self) -> None:
         envelope = 'Here\'s my response: {"type": "REPLY", "user_response": "ok"}'
@@ -1006,3 +1019,73 @@ class TestLooksLikeWorkflowYamlInChat:
             "will fail validation — those fields need to come from the user."
         )
         assert looks_like_workflow_yaml_in_chat(text) is False
+
+
+def test_summarize_tool_result_detail_returns_none_on_success() -> None:
+    assert summarize_tool_result_detail({"ok": True, "data": {"block_count": 2}}) is None
+
+
+def test_summarize_tool_result_detail_caps_at_max_chars() -> None:
+    long_error = "Workflow validation failed: " + ("missing field 'foo'; " * 200)
+    detail = summarize_tool_result_detail({"ok": False, "error": long_error}, max_chars=400)
+    assert detail is not None
+    assert len(detail) <= 400
+    assert detail.endswith("...")
+
+
+def test_summarize_tool_result_detail_preserves_short_full_message() -> None:
+    detail = summarize_tool_result_detail(
+        {"ok": False, "error": "Workflow validation failed: title field required"},
+    )
+    assert detail == "Workflow validation failed: title field required"
+
+
+def test_summarize_tool_result_detail_strips_header_blobs() -> None:
+    text = "Failure with headers: {'host': 'x', 'authorization': 'Bearer abc'} please retry"
+    detail = summarize_tool_result_detail({"ok": False, "error": text})
+    assert detail is not None
+    assert "authorization" not in detail
+    assert "Bearer" not in detail
+
+
+def test_sanitize_failure_text_default_cap_unchanged() -> None:
+    sanitized = _sanitize_failure_text("x" * 200)
+    assert len(sanitized) == 120
+    assert sanitized.endswith("...")
+
+
+def test_sanitize_failure_text_respects_max_chars() -> None:
+    sanitized = _sanitize_failure_text("x" * 1000, max_chars=500)
+    assert len(sanitized) == 500
+    assert sanitized.endswith("...")
+
+
+def test_sanitize_tool_result_for_llm_passes_through_failure_dict() -> None:
+    failure = {"ok": False, "error": "Workflow validation failed: title required"}
+    sanitized = sanitize_tool_result_for_llm("update_workflow", failure)
+    assert sanitized["ok"] is False
+    assert sanitized["error"] == "Workflow validation failed: title required"
+
+
+def test_build_run_blocks_response_success_passes_through() -> None:
+    response = build_run_blocks_response(True, {"workflow_run_id": "wr_test", "blocks": []})
+    assert response == {"ok": True, "data": {"workflow_run_id": "wr_test", "blocks": []}}
+
+
+def test_build_run_blocks_response_promotes_run_level_failure_reason() -> None:
+    response = build_run_blocks_response(
+        False,
+        {
+            "workflow_run_id": "wr_test",
+            "overall_status": "failed",
+            "failure_reason": "Navigation timed out after 60s",
+            "blocks": [],
+        },
+    )
+    assert response["ok"] is False
+    assert response["error"] == "Navigation timed out after 60s"
+
+
+def test_build_run_blocks_response_falls_back_when_no_failure_reason() -> None:
+    response = build_run_blocks_response(False, {"workflow_run_id": "wr_test"})
+    assert response["error"] == "Unknown error (no failure reason provided)"

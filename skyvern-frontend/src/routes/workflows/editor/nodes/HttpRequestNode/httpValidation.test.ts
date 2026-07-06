@@ -61,6 +61,19 @@ describe("validateJson", () => {
     expect(result.valid).toBe(false);
   });
 
+  test("non-breaking spaces outside strings explain the hidden character", () => {
+    const result = validateJson(`{
+  "personalInfo": {
+    "firstName": "Luis",
+    "lastName": "Ortiz"\u00a0
+  }
+}`);
+    expect(result.valid).toBe(false);
+    expect(result.message).toContain(
+      "JSON contains a non-breaking space (U+00A0) at line 4, column 24; replace it with a regular space.",
+    );
+  });
+
   test("completely malformed JSON is invalid", () => {
     const result = validateJson("{key: value}");
     expect(result.valid).toBe(false);

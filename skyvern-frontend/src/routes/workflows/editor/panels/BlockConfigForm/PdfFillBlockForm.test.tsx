@@ -217,6 +217,13 @@ describe("PdfFillBlockForm", () => {
     expect(screen.getByText("Prompt")).toBeDefined();
     expect(screen.getByText("Payload")).toBeDefined();
     expect(screen.queryByText("API Key")).toBeNull();
+    expect(
+      screen
+        .getByText("Advanced Settings")
+        .compareDocumentPosition(
+          screen.getByTestId("ignore-workflow-system-prompt"),
+        ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   test("editing file URL, prompt, and payload propagates", () => {

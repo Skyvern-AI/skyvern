@@ -16,6 +16,9 @@ class BrowserProfile(BaseModel):
     source_browser_type: str | None = None
     proxy_location: ProxyLocationInput = None
     proxy_session_id: str | None = None
+    is_managed: bool = False
+    workflow_permanent_id: str | None = None
+    browser_profile_key_digest: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

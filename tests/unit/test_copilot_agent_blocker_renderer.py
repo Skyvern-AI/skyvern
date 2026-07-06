@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPol
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
+from tests.unit.conftest import make_copilot_context as _ctx
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
 # (instead of hand-copying) guarantees the test stays in sync if a new token
@@ -41,17 +42,6 @@ _LEAK_TOKENS_FULL = _LEAK_DENY_TOKENS
 # automatically rather than silently passing with stale values.
 _ALL_BLOCKER_KINDS: tuple[BlockerKind, ...] = get_args(BlockerKind)
 _ALL_RECOVERY_HINTS: tuple[RecoveryHint, ...] = get_args(RecoveryHint)
-
-
-def _ctx() -> CopilotContext:
-    return CopilotContext(
-        organization_id="org",
-        workflow_id="wf",
-        workflow_permanent_id="wfp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
 
 
 def _signal(

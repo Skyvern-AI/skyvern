@@ -12,10 +12,14 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    grade_fallback_floor_reached_end_state_criteria,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy, build_classifier_fallback_floor
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tools import (
     _analyze_run_blocks,
@@ -24,6 +28,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_unfinished_run_verification_candidate,
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
+    run_execution,
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
 from skyvern.forge.sdk.copilot.tools.blockers import _code_output_has_goal_content
@@ -88,6 +93,27 @@ def _structured_record_payload(**overrides: Any) -> dict[str, Any]:
         ],
         "overall_status": "Active",
         "evidence_text": "Opened Details page",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "validation_only": True,
+        "submit_or_finalize_clicked": False,
+        "pre_submit_review_reached": True,
+        "final_controls_visible": ["Submit Request", "Back"],
+        "review_values": {
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Requested Start Date": "2026-06-22",
+        },
+        "evidence_text": (
+            "Start Service - Review\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Submit Request\nBack"
+        ),
     }
     payload.update(overrides)
     return payload
@@ -702,8 +728,6 @@ def test_structured_record_top_level_output_record_is_meaningful() -> None:
 async def test_registered_output_adapter_fetches_db_values_and_synthesizes_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.copilot.tools import run_execution
-
     async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
         assert workflow_run_id == "wr_test"
         return [
@@ -759,6 +783,60 @@ async def test_registered_output_adapter_fetches_db_values_and_synthesizes_block
     assert data["blocks"][0]["extracted_data"]["extract_record_status_details_output"]["record_number"] == "1234567890"
 
 
+@pytest.mark.asyncio
+async def test_registered_validation_review_output_from_dict_workflow_merges_into_block_and_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_payload = _validation_review_payload()
+
+    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
+        assert workflow_run_id == "wr_test"
+        return [
+            SimpleNamespace(
+                workflow_run_id="wr_test",
+                output_parameter_id="op_review",
+                value=review_payload,
+            )
+        ]
+
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
+    )
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "blocks": [
+                {
+                    "label": "validate_business_start_service_review",
+                    "block_type": "CODE",
+                    "output_parameter": {
+                        "output_parameter_id": "op_review",
+                        "key": "validate_business_start_service_review_output",
+                    },
+                }
+            ]
+        }
+    )
+    data: dict[str, Any] = {"workflow_run_id": "wr_test", "blocks": []}
+
+    by_label = await _attach_registered_output_parameter_values(
+        workflow_run_id="wr_test",
+        workflow=workflow,  # type: ignore[arg-type]
+        data=data,
+    )
+    ctx = _ctx([{"label": "validate_business_start_service_review"}])
+    snapshot = _build_run_evidence_snapshot(ctx, {"ok": True, "data": data})
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert by_label == {
+        "validate_business_start_service_review": {"validate_business_start_service_review_output": review_payload}
+    }
+    assert data["registered_output_parameter_values"][0]["block_label"] == "validate_business_start_service_review"
+    assert data["blocks"][0]["extracted_data"]["validate_business_start_service_review_output"] == review_payload
+    assert verdicts[0].evidence_ref == "block_outputs:validate_business_start_service_review"
+
+
 def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None:
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -772,6 +850,56 @@ def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_failure_reason is None
     assert verified_goal_satisfied_context(ctx) is True
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.verdict == "progress_observed"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "verified_success"
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+
+
+def test_unverified_success_records_goal_relative_build_test_outcome() -> None:
+    result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
+    ctx = _ctx(result["data"]["blocks"])
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_demonstrated"
+    assert recorded.reason_code == "outcome_not_demonstrated"
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.phase == "persisted_block_run"
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.structural_key is not None
+
+
+def test_changed_output_structure_changes_unverified_success_structural_key() -> None:
+    first_result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
+    second_result = _run_result(
+        [_code_block("search_registry_person", {"records": [{"status_present": True}], "result_count": 1})]
+    )
+    ctx = _ctx(first_result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, first_result, completion_verification=_no_evidence("c0"))
+    first_key = ctx.latest_recorded_build_test_outcome.structural_key
+    _record_run_blocks_result(ctx, second_result, completion_verification=_no_evidence("c0"))
+
+    assert first_key is not None
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+    assert ctx.latest_recorded_build_test_outcome.structural_key != first_key
+
+
+def test_terminal_blocker_does_not_leave_authoritative_prompt_outcome() -> None:
+    result = _blocked_flag_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.blocker_signal is not None
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.reason_code == "terminal_challenge_blocker"
+    assert outcome.is_authoritative is False
 
 
 def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:

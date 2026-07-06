@@ -2,30 +2,41 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    recorded_outcome_from_author_time_reject,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
+    RepairLoopState,
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
+from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+    RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
+    record_pending_runtime_authoring_repair_context,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
@@ -49,11 +60,93 @@ def _ctx() -> CopilotContext:
     )
 
 
+def _runtime_output_dependency_yaml(*, available: bool = False) -> str:
+    producer_label = "create_or_verify_resource" if available else "create_resource"
+    return f"""
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: {producer_label}
+    code: |
+      return {{"ok": True}}
+  - block_type: code
+    label: read_resource_table
+    parameter_keys: [create_or_verify_resource_output]
+    code: |
+      resource = create_or_verify_resource_output["id"]
+      return {{"resource": resource}}
+"""
+
+
+def _runtime_declared_output_named_input_yaml() -> str:
+    return """
+workflow_definition:
+  parameters:
+  - key: create_or_verify_resource_output
+    parameter_type: workflow
+    workflow_parameter_type: string
+  blocks:
+  - block_type: code
+    label: read_resource_table
+    parameter_keys: [create_or_verify_resource_output]
+    code: |
+      resource = create_or_verify_resource_output["id"]
+      return {"resource": resource}
+"""
+
+
+def _runtime_declared_non_string_output_named_input_yaml() -> str:
+    return """
+workflow_definition:
+  parameters:
+  - key: create_or_verify_resource_output
+    parameter_type: workflow
+    workflow_parameter_type: number
+  blocks:
+  - block_type: code
+    label: read_resource_table
+    parameter_keys: [create_or_verify_resource_output]
+    code: |
+      resource = create_or_verify_resource_output["id"]
+      return {"resource": resource}
+"""
+
+
+def _runtime_output_substring_only_yaml() -> str:
+    return """
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: read_resource_table
+    code: |
+      # foo_output appears in prose only.
+      data = {"foo_output": {"id": "fixture"}}
+      literal = "foo_output"
+      return data["foo_output"]
+"""
+
+
 def _satisfied_completion_verification() -> CompletionVerificationResult:
     return CompletionVerificationResult(
         status="evaluated",
         criterion_ids=["c0"],
         verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+    )
+
+
+def _contradictory_completion_verification() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="evidence_contradicts")],
+    )
+
+
+def _structural_abstention_completion_verification() -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="structurally_abstained")],
     )
 
 
@@ -227,6 +320,45 @@ def test_missing_required_output_key_repair_identity_uses_structural_context_onl
     assert contract.diagnosis_result.root_cause_identity.error_class == "code_authoring_missing_required_output_key"
 
 
+def test_runtime_missing_output_dependency_identity_uses_key_and_available_contracts() -> None:
+    base = CodeAuthoringRepairContext(
+        block_label="read_resource_table",
+        reason_code="runtime_missing_output_dependency",
+        missing_output_key="create_resource_output",
+        available_output_keys=["search_output", "verify_output"],
+        current_block_parameter_keys=["create_resource_output"],
+        output_dependency_failure_class="missing_prior_block_output",
+    )
+    reordered = base.model_copy(update={"available_output_keys": ["verify_output", "search_output"]})
+    different_key = base.model_copy(update={"missing_output_key": "verify_resource_output"})
+    different_available = base.model_copy(update={"available_output_keys": ["search_output"]})
+
+    base_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(base),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+    reordered_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(reordered),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+    different_key_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(different_key),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+    different_available_signature = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(different_available),
+        ctx=_ctx(),
+    ).to_trace_data()["root_cause_signature"]
+
+    assert base_signature == reordered_signature
+    assert different_key_signature != base_signature
+    assert different_available_signature != base_signature
+
+
 def test_runtime_authoring_repair_context_identity_includes_bounded_page_state() -> None:
     base = CodeAuthoringRepairContext(
         block_label="search_registry",
@@ -302,6 +434,73 @@ def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes
     assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 1
     assert sandbox_contract.repair_loop_state.ceiling_reached is False
     assert getattr(ctx, "blocker_signal", None) is None
+
+
+def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
+    criterion = CompletionCriterion(id=output_path, outcome="the value is captured", output_path=output_path)
+    return SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+
+
+def _uncovered_output_author_reject(output_path: str) -> RecordedBuildTestOutcome:
+    return recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        block_labels=["extract_order"],
+        structural_payload={
+            "reason_code": "recorded_outcome_missing_output_coverage",
+            "missing_output_paths": [output_path],
+        },
+        missing_requested_output_facts=[{"output_path": output_path, "output_root": output_path.split(".", 1)[0]}],
+    )
+
+
+def _run_repair_loop_state(ctx: CopilotContext) -> RepairLoopState:
+    repair_context = CodeAuthoringRepairContext(
+        block_label="extract_order",
+        reason_code="runtime_block_failure",
+        runtime_failure_reason="output missing",
+    )
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(repair_context),
+        ctx=ctx,
+    )
+    run_execution_module._update_repair_loop_state(ctx, contract)
+    return contract.repair_loop_state
+
+
+def test_uncovered_output_author_reject_reopens_once_then_counts_to_ceiling() -> None:
+    ctx = _ctx()
+    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
+    ctx.latest_recorded_build_test_outcome = _uncovered_output_author_reject("output.document_name")
+
+    first = _run_repair_loop_state(ctx)
+    assert first.consecutive_identical_repair_count == 0
+    assert first.ceiling_reached is False
+    assert ctx.synthesized_block_reopened_for_output_coverage is True
+    assert ctx.consecutive_non_converging_repair_count == 0
+
+    states = [_run_repair_loop_state(ctx) for _ in range(3)]
+    counts = [state.consecutive_identical_repair_count for state in states]
+    assert counts == [1, 2, 3]
+    assert counts[-1] == settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL
+    assert states[-1].ceiling_reached is True
+    assert ctx.blocker_signal is None
+
+
+def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
+    ctx = _ctx()
+    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
+    ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="outcome_not_demonstrated",
+        structural_failure_identity="completion:unsatisfied-output",
+        missing_requested_output_facts=[{"output_path": "output.document_name", "output_root": "output"}],
+    )
+    state = _run_repair_loop_state(ctx)
+    assert state.consecutive_identical_repair_count == 1
+    assert ctx.synthesized_block_reopened_for_output_coverage is False
 
 
 def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:
@@ -411,6 +610,100 @@ def test_failed_run_injects_pending_runtime_authoring_context_before_page_observ
     assert contract.diagnosis_result.root_cause_identity.error_class.startswith("code_authoring_runtime_block_failure")
     assert contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert contract.repair_decision.target_blocks == ["search_registry"]
+
+
+def test_runtime_key_error_for_missing_prior_output_records_typed_authoring_context() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _runtime_output_dependency_yaml(available=False)
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_missing_output",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": "KeyError: 'create_or_verify_resource_output'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    repair_context = ctx.last_code_authoring_repair_context
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.reason_code == "runtime_missing_output_dependency"
+    assert repair_context.block_label == "read_resource_table"
+    assert repair_context.workflow_run_id == "wr_missing_output"
+    assert repair_context.output_dependency_failure_class == "missing_prior_block_output"
+    assert repair_context.missing_output_key == "create_or_verify_resource_output"
+    assert repair_context.available_output_keys == ["create_resource_output"]
+    assert repair_context.current_block_parameter_keys == ["create_or_verify_resource_output"]
+    assert result["data"]["authoring_repair_context"] == repair_context.model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    ("yaml_builder", "run_id", "keyerror_name"),
+    [
+        pytest.param(
+            lambda: _runtime_output_dependency_yaml(available=True),
+            "wr_available_output",
+            "create_or_verify_resource_output",
+            id="available_prior_output",
+        ),
+        pytest.param(
+            _runtime_declared_output_named_input_yaml,
+            "wr_declared_input",
+            "create_or_verify_resource_output",
+            id="declared_workflow_input",
+        ),
+        pytest.param(
+            _runtime_declared_non_string_output_named_input_yaml,
+            "wr_declared_number_input",
+            "create_or_verify_resource_output",
+            id="declared_non_string_workflow_input",
+        ),
+        pytest.param(
+            _runtime_output_substring_only_yaml,
+            "wr_substring_only",
+            "foo_output",
+            id="code_substring_only",
+        ),
+    ],
+)
+def test_runtime_key_error_boundary_keeps_generic_runtime_repair(
+    yaml_builder: Callable[[], str], run_id: str, keyerror_name: str
+) -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = yaml_builder()
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "read_resource_table",
+                    "status": "failed",
+                    "failure_reason": f"KeyError: '{keyerror_name}'",
+                }
+            ],
+        },
+    }
+
+    record_pending_runtime_authoring_repair_context(ctx, result)
+
+    pending_context = ctx.pending_code_authoring_runtime_repair_context
+    assert isinstance(pending_context, CodeAuthoringRepairContext)
+    assert pending_context.reason_code == "runtime_block_failure"
+    assert pending_context.missing_output_key is None
 
 
 def _injected_repair_log(events: list[dict[str, object]]) -> dict[str, object]:
@@ -951,6 +1244,27 @@ def test_clean_run_with_present_unsatisfied_completion_verification_fails_safe(
     assert contract.verification_result.remaining_blocker is not None
 
 
+def test_clean_run_with_structural_abstention_completion_verification_does_not_repair() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = _structural_abstention_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+    ctx.latest_diagnosis_repair_contract = contract
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.repair_decision.next_action != RepairNextAction.REPAIR
+    assert contract.repair_decision.completion_check == "No repair selected; completion remains unverified."
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is False
+
+
 def test_clean_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
     ctx = _ctx()
     ctx.completion_verification_result = _satisfied_completion_verification()
@@ -969,45 +1283,44 @@ def test_clean_run_with_satisfied_completion_verification_has_no_repair_or_block
     assert contract.verification_result.remaining_blocker is None
 
 
-def test_no_change_contracts_do_not_carry_remaining_blocker() -> None:
-    satisfied_ctx = _ctx()
-    satisfied_ctx.completion_verification_result = _satisfied_completion_verification()
-    partial_ctx = _ctx()
-    partial_ctx.completion_verification_result = _satisfied_completion_verification()
+def test_committed_same_run_outcome_satisfies_diagnosis_after_later_contradiction() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_clean"
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_clean")
+    ctx.completion_verification_result = _contradictory_completion_verification()
 
-    contracts = [
-        build_diagnosis_repair_contract(
-            source_tool="update_and_run_blocks",
-            result=_clean_completed_result(),
-            ctx=satisfied_ctx,
-            workflow_updated=True,
-        ),
-        build_diagnosis_repair_contract(
-            source_tool="run_blocks_and_collect_debug",
-            result={"ok": True, "data": {"workflow_run_id": "wr_4", "overall_status": "completed", "blocks": []}},
-            ctx=_ctx(),
-        ),
-        build_diagnosis_repair_contract(
-            source_tool="update_and_run_blocks",
-            result={
-                "ok": False,
-                "error": "Completion verification confirmed the requested outcome despite partial run status.",
-                "data": {
-                    "workflow_run_id": "wr_partial_verified",
-                    "overall_status": "failed",
-                    "frontier_start_label": "extract",
-                    "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
-                    "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "failed"}],
-                },
-            },
-            ctx=partial_ctx,
-            workflow_updated=True,
-        ),
-    ]
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+    ctx.latest_diagnosis_repair_contract = contract
 
-    for contract in contracts:
-        assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
-        assert contract.verification_result.remaining_blocker is None
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is True
+
+
+def test_first_pass_contradiction_does_not_satisfy_latest_diagnosis_contract() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = _contradictory_completion_verification()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_clean_completed_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+    ctx.latest_diagnosis_repair_contract = contract
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is False
 
 
 def test_failed_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
@@ -1478,21 +1791,56 @@ def test_active_run_terminal_evidence_contract_stops_without_marking_workflow_su
     assert "not verified end-to-end" in contract.repair_decision.proposed_change_summary
 
 
-def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> None:
+@pytest.mark.parametrize(
+    ("suspicious", "completion_verification", "anti_bot", "failure_reason", "run_id"),
+    [
+        pytest.param(
+            True,
+            _satisfied_completion_verification(),
+            "Extracted data reported anti-bot blocker: Verify you are human",
+            "Run completed, but extracted data reported a blocker: Verify you are human",
+            "wr_blocked",
+            id="suspicious_success_flag_with_satisfied_verification",
+        ),
+        pytest.param(
+            False,
+            _satisfied_completion_verification(),
+            "Extracted data reported anti-bot blocker: Verify you are human",
+            "Run completed, but extracted data reported a blocker: Verify you are human",
+            "wr_blocked_clean",
+            id="satisfied_completion_verification_only",
+        ),
+        pytest.param(
+            False,
+            None,
+            "Typed run analysis reported an anti-bot challenge.",
+            "Run output reported a blocker: Verify you are human.",
+            "wr_blocked",
+            id="bare_challenge_category",
+        ),
+    ],
+)
+def test_terminal_challenge_preempts_clean_run_ok_contract_stops(
+    suspicious: bool,
+    completion_verification: CompletionVerificationResult | None,
+    anti_bot: str,
+    failure_reason: str,
+    run_id: str,
+) -> None:
     ctx = _ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
-    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
-    ctx.completion_verification_result = _satisfied_completion_verification()
+    ctx.last_test_suspicious_success = suspicious
+    ctx.last_test_anti_bot = anti_bot
+    ctx.last_test_failure_reason = failure_reason
+    ctx.completion_verification_result = completion_verification
 
     contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
         result={
             "ok": True,
             "data": {
-                "workflow_run_id": "wr_blocked",
+                "workflow_run_id": run_id,
                 "overall_status": "completed",
-                "failure_reason": ctx.last_test_failure_reason,
+                "failure_reason": failure_reason,
                 "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
                 "blocks": [
                     {
@@ -1542,67 +1890,6 @@ def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_v
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.completion_contract_satisfied is False
     assert contract.verification_result.remaining_blocker is not None
-
-
-def test_terminal_challenge_preempts_clean_run_even_with_satisfied_completion_verification() -> None:
-    ctx = _ctx()
-    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
-    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
-    ctx.completion_verification_result = _satisfied_completion_verification()
-
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr_blocked_clean",
-                "overall_status": "completed",
-                "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
-                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
-            },
-        },
-        ctx=ctx,
-        workflow_updated=True,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
-    assert contract.repair_decision.next_action == RepairNextAction.STOP
-    assert contract.verification_result.user_goal_satisfied is False
-    assert contract.verification_result.completion_contract_satisfied is False
-    assert contract.verification_result.remaining_blocker is not None
-
-
-def test_challenge_category_preempts_clean_run_ok_contract() -> None:
-    ctx = _ctx()
-    ctx.last_test_anti_bot = "Typed run analysis reported an anti-bot challenge."
-    ctx.last_test_failure_reason = "Run output reported a blocker: Verify you are human."
-
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr_blocked",
-                "overall_status": "completed",
-                "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
-                "blocks": [
-                    {
-                        "label": "extract",
-                        "block_type": "EXTRACTION",
-                        "status": "completed",
-                    }
-                ],
-            },
-        },
-        ctx=ctx,
-        workflow_updated=True,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
-    assert contract.repair_decision.next_action == RepairNextAction.STOP
-    assert contract.verification_result.user_goal_satisfied is False
 
 
 def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contract() -> None:
@@ -2079,7 +2366,7 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_failure_page(
+    await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
     )
 
@@ -2128,7 +2415,7 @@ async def test_failed_seam_capture_neutralizes_non_matching_evidence(
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_failure_page(
+    await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
     )
     assert ctx.composition_page_evidence is None
@@ -2150,7 +2437,7 @@ async def test_failed_seam_capture_preserves_clean_matching_evidence(
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_failure_page(
+    await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
     )
     assert ctx.composition_page_evidence is clean

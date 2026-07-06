@@ -37,6 +37,7 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import export_profile_storage_id
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -210,6 +211,10 @@ async def list_browser_profiles(
         ),
         examples=["my_profile", "production"],
     ),
+    managed: bool | None = Query(
+        None,
+        description="Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.",
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[BrowserProfile]:
     """List all browser profiles for the current organization."""
@@ -221,6 +226,7 @@ async def list_browser_profiles(
         page=page,
         page_size=page_size,
         search_key=search_key,
+        managed=managed,
     )
 
     profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
@@ -229,6 +235,7 @@ async def list_browser_profiles(
         page=page,
         page_size=page_size,
         search_key=search_key,
+        managed=managed,
     )
 
     LOG.info(
@@ -828,15 +835,12 @@ async def _create_profile_from_workflow_run(
     # Poll for a short grace period so that immediate profile-creation requests
     # succeed without forcing clients to implement retry loops.
     poll_attempts = 30  # ~30 s max wait
-    browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
-        workflow=workflow,
-        workflow_run=workflow_run,
-    )
     session_dir: str | None = None
     for attempt in range(poll_attempts):
-        session_dir = await app.STORAGE.retrieve_browser_session(
+        session_dir = await retrieve_persisted_workflow_browser_state_dir(
             organization_id=organization_id,
-            workflow_permanent_id=browser_session_storage_key,
+            workflow=workflow,
+            workflow_run=workflow_run,
         )
         if session_dir:
             break  # session found

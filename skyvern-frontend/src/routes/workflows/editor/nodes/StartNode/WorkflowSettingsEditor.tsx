@@ -20,6 +20,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -33,6 +34,8 @@ import {
 import { Switch } from "@/components/ui/switch";
 
 import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 
 import { placeholders } from "../../helpContent";
 import { useUpdate } from "../../useUpdate";
@@ -86,6 +89,13 @@ function WorkflowSettingsEditorBody({
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const update = useUpdate<StartNode["data"]>({ id: blockId, editable: true });
+  const studioEnabled = useWorkflowStudioEnabled();
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  // Self-healing is restricted to copilot-authored workflows; hide the toggle
+  // elsewhere so it never reads as a switch that silently does nothing.
+  // copilot_authored is lineage-derived server-side — the current version's
+  // created_by/edited_by get re-stamped by user saves and are not durable.
+  const copilotAuthored = workflow?.copilot_authored === true;
 
   const [localWebhookUrl, setLocalWebhookUrl] = useState(
     data.webhookCallbackUrl,
@@ -221,8 +231,8 @@ function WorkflowSettingsEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label>AI Fallback (self-healing)</Label>
-              <HelpTooltip content="If a run with code fails, fallback to AI and regenerate the code." />
+              <Label>AI Fallback (cached scripts)</Label>
+              <HelpTooltip content="If a cached-script run fails, fall back to AI and regenerate the script." />
               <Switch
                 className="ml-auto"
                 checked={data.aiFallback}
@@ -230,6 +240,24 @@ function WorkflowSettingsEditorBody({
               />
             </div>
           </div>
+          {studioEnabled && copilotAuthored && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label>Code Block Self-Healing</Label>
+                <Badge variant="warning" className="px-1.5 py-0.5 text-[10px]">
+                  Beta
+                </Badge>
+                <HelpTooltip content="If a code block fails on a changed page, an AI agent takes over the live browser to finish that block's goal, then the run continues." />
+                <Switch
+                  className="ml-auto"
+                  checked={data.enableSelfHealing}
+                  onCheckedChange={(value) =>
+                    update({ enableSelfHealing: value })
+                  }
+                />
+              </div>
+            </div>
+          )}
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label>Code Key (optional)</Label>

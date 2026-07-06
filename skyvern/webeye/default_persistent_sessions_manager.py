@@ -207,6 +207,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     def can_probe_registered_browser_state(self) -> bool:
         return True
 
+    def supports_evict_and_reconnect(self) -> bool:
+        # ``get_browser_state`` is a pure dict lookup against ``_browser_sessions``; it
+        # does not reconnect after eviction. Callers must not run the evict-and-reconnect
+        # recovery against this manager — the evict closes the only cached BrowserState
+        # and leaves the session uncacheable for the rest of its lifetime, which also
+        # breaks profile/video cleanup at ``close_session``.
+        return False
+
     async def begin_session(
         self,
         *,
@@ -297,6 +305,32 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_session = BrowserSession(browser_state=browser_state)
         self._browser_sessions[session_id] = browser_session
 
+    async def evict_cached_browser_state(
+        self,
+        session_id: str,
+        organization_id: str | None = None,
+        expected: BrowserState | None = None,
+    ) -> None:
+        cached = self._browser_sessions.get(session_id)
+        if cached is None:
+            return
+        if expected is not None and cached.browser_state is not expected:
+            return
+        self._browser_sessions.pop(session_id, None)
+        try:
+            await cached.browser_state.close()
+        except TargetClosedError:
+            LOG.info(
+                "Browser context already closed during evict",
+                session_id=session_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Error while closing evicted browser session",
+                session_id=session_id,
+                exc_info=True,
+            )
+
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
@@ -374,6 +408,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 url=url,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                browser_profile_id=session.browser_profile_id,
             )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",

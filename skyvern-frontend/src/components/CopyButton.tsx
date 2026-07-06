@@ -3,8 +3,15 @@ import { CheckIcon, CopyIcon } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
 import { copyText } from "@/util/copyText";
+import { cn } from "@/util/utils";
 
-function CopyButton({ value }: { value: string }) {
+function CopyButton({
+  value,
+  className,
+}: {
+  value: string;
+  className?: string;
+}) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -17,7 +24,13 @@ function CopyButton({ value }: { value: string }) {
   };
 
   return (
-    <Button size="icon" variant="ghost" onClick={handleCopy}>
+    <Button
+      size="icon"
+      variant="ghost"
+      onClick={handleCopy}
+      className={cn(className)}
+      aria-label="Copy to clipboard"
+    >
       {copied ? <CheckIcon /> : <CopyIcon />}
     </Button>
   );

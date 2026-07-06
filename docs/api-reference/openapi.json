@@ -3645,10 +3645,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
               "title": "Vault Type"
             },
-            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+            "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')"
           },
           {
             "name": "credential_type",
@@ -4016,6 +4016,256 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/custom-llms": {
+      "get": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "List Custom LLMs",
+        "description": "List the custom LLM configurations available to the current organization.",
+        "operationId": "list_custom_llms_v1_custom_llms_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomLLMListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_custom_llms"
+      },
+      "post": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "Create Custom LLM",
+        "description": "Create a custom LLM configuration for the current organization.",
+        "operationId": "create_custom_llm_v1_custom_llms_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomLLMCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomLLMResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_custom_llm"
+      }
+    },
+    "/v1/custom-llms/{custom_llm_id}": {
+      "put": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "Update Custom LLM",
+        "description": "Update a custom LLM configuration for the current organization.",
+        "operationId": "update_custom_llm_v1_custom_llms__custom_llm_id__put",
+        "parameters": [
+          {
+            "name": "custom_llm_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The custom LLM id.",
+              "title": "Custom Llm Id"
+            },
+            "description": "The custom LLM id."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomLLMUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomLLMResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_custom_llm"
+      },
+      "delete": {
+        "tags": [
+          "Custom LLMs"
+        ],
+        "summary": "Delete Custom LLM",
+        "description": "Delete a custom LLM configuration for the current organization.",
+        "operationId": "delete_custom_llm_v1_custom_llms__custom_llm_id__delete",
+        "parameters": [
+          {
+            "name": "custom_llm_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The custom LLM id.",
+              "title": "Custom Llm Id"
+            },
+            "description": "The custom LLM id."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClearOrganizationAuthTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_custom_llm"
       }
     },
     "/v1/run/tasks/login": {
@@ -5558,6 +5808,44 @@
               "title": "Error Code"
             },
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "created_at_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created at or after this UTC timestamp (ISO 8601).",
+              "title": "Created At Start"
+            },
+            "description": "Only include runs created at or after this UTC timestamp (ISO 8601)."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this UTC timestamp (ISO 8601).",
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
             "name": "x-api-key",
@@ -9013,6 +9301,21 @@
         ],
         "title": "BulkCancelRunsResponse"
       },
+      "ClearOrganizationAuthTokenResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success",
+            "description": "Whether the token was cleared successfully"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "title": "ClearOrganizationAuthTokenResponse",
+        "description": "Response model for clearing an organization auth token."
+      },
       "ClickAction": {
         "properties": {
           "type": {
@@ -9964,6 +10267,7 @@
             ],
             "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
             "examples": [
+              "skyvern",
               "custom",
               "azure_vault",
               "bitwarden"
@@ -10285,7 +10589,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')"
+            "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
           "browser_profile_id": {
             "anyOf": [
@@ -10405,6 +10709,7 @@
       "CredentialVaultType": {
         "type": "string",
         "enum": [
+          "skyvern",
           "bitwarden",
           "azure_vault",
           "gcp",
@@ -10565,6 +10870,214 @@
         ],
         "title": "CreditCardCredentialResponse",
         "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,\nbilling fields, or metadata."
+      },
+      "CustomLLM": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "config": {
+            "$ref": "#/components/schemas/CustomLLMConfig"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "title": "Modified At"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "organization_id",
+          "config",
+          "created_at",
+          "modified_at",
+          "valid"
+        ],
+        "title": "CustomLLM"
+      },
+      "CustomLLMConfig": {
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Display Name"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/CustomLLMProvider"
+          },
+          "model_name": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Model Name"
+          },
+          "api_base": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Base"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "api_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Version"
+          },
+          "supports_vision": {
+            "type": "boolean",
+            "title": "Supports Vision",
+            "default": true
+          },
+          "add_assistant_prefix": {
+            "type": "boolean",
+            "title": "Add Assistant Prefix",
+            "default": false
+          },
+          "max_completion_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Completion Tokens"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          }
+        },
+        "type": "object",
+        "required": [
+          "display_name",
+          "provider",
+          "model_name"
+        ],
+        "title": "CustomLLMConfig"
+      },
+      "CustomLLMCreateRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/CustomLLMConfig"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "title": "CustomLLMCreateRequest"
+      },
+      "CustomLLMListResponse": {
+        "properties": {
+          "custom_llms": {
+            "items": {
+              "$ref": "#/components/schemas/CustomLLM"
+            },
+            "type": "array",
+            "title": "Custom Llms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "custom_llms"
+        ],
+        "title": "CustomLLMListResponse"
+      },
+      "CustomLLMProvider": {
+        "type": "string",
+        "enum": [
+          "openai_compatible",
+          "ollama",
+          "openrouter"
+        ],
+        "title": "CustomLLMProvider"
+      },
+      "CustomLLMResponse": {
+        "properties": {
+          "custom_llm": {
+            "$ref": "#/components/schemas/CustomLLM"
+          }
+        },
+        "type": "object",
+        "required": [
+          "custom_llm"
+        ],
+        "title": "CustomLLMResponse"
+      },
+      "CustomLLMUpdateRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/CustomLLMConfig"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "title": "CustomLLMUpdateRequest"
       },
       "DeleteScheduleResponse": {
         "properties": {
@@ -23585,6 +24098,11 @@
             "title": "Adaptive Caching",
             "default": false
           },
+          "enable_self_healing": {
+            "type": "boolean",
+            "title": "Enable Self Healing",
+            "default": false
+          },
           "code_version": {
             "anyOf": [
               {
@@ -23666,6 +24184,11 @@
               }
             ],
             "title": "Edited By"
+          },
+          "copilot_authored": {
+            "type": "boolean",
+            "title": "Copilot Authored",
+            "default": false
           },
           "created_at": {
             "type": "string",
@@ -23908,6 +24431,17 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "enable_self_healing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Self Healing"
           },
           "code_version": {
             "anyOf": [

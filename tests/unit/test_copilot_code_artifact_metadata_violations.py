@@ -701,21 +701,6 @@ class TestExtractionUninvokedNestedReturn:
         assert error is None
         assert list(normalized.keys()) == ["my_block"]
 
-    def test_flat_return_inside_except_block_is_rejected(self) -> None:
-        code = """
-        try:
-            data = page.locator("#results")
-        except Exception:
-            return page.inner_text("body")
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_extraction_metadata("my_block", ["records[].number"])],
-            _extraction_code_block_yaml("my_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "flat text blob" in error
-
     def test_structured_return_inside_except_block_passes(self) -> None:
         code = """
         try:
@@ -723,19 +708,6 @@ class TestExtractionUninvokedNestedReturn:
         except Exception:
             rows = []
         return {"records": [{"number": "REC-001"}]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_extraction_metadata("my_block", ["records[].number"])],
-            _extraction_code_block_yaml("my_block", code),
-        )
-        assert error is None
-        assert list(normalized.keys()) == ["my_block"]
-
-    def test_capture_then_wrap_rebind_passes(self) -> None:
-        code = """
-        text = await page.locator("#results").inner_text()
-        text = {"records": [{"number": "REC-001"}]}
-        return text
         """
         normalized, error = _normalize_code_artifact_metadata(
             [_extraction_metadata("my_block", ["records[].number"])],

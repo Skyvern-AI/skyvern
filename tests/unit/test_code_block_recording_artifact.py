@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -399,3 +400,150 @@ class TestPersistVideoDataFlushesUploads:
             await WorkflowService().persist_video_data(_browser_state([]), workflow, workflow_run)
 
         wait_for_uploads.assert_not_awaited()
+
+
+class TestPersistVideoDataPathFallback:
+    """A recording attached during browser teardown lands as ``VideoArtifact(video_path=...)`` with no
+    ``video_artifact_id`` — the existing ``update_artifact_data`` call no-ops on a falsy id, so the MP4
+    must be promoted to a durable step-scoped RECORDING artifact via ``create_artifact(path=...)``."""
+
+    @pytest.mark.asyncio
+    async def test_creates_recording_from_path_when_id_is_none(self, tmp_path: Path) -> None:
+        mp4 = tmp_path / "session.mp4"
+        mp4.write_bytes(b"mp4-bytes")
+        video_artifacts = [VideoArtifact(video_path=str(mp4))]
+        assert video_artifacts[0].video_artifact_id is None
+
+        last_task = SimpleNamespace(task_id="tsk_1", organization_id="o_1")
+        last_step = SimpleNamespace(task_id="tsk_1", step_id="stp_1", organization_id="o_1")
+        get_video = AsyncMock(return_value=video_artifacts)
+        get_tasks = AsyncMock(return_value=[last_task])
+        get_latest_step = AsyncMock(return_value=last_step)
+        update_data = AsyncMock()
+        create_artifact = AsyncMock(return_value="a_recording_path")
+        wait_for_uploads = AsyncMock()
+        workflow = SimpleNamespace(workflow_id="w_1")
+        workflow_run = SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1")
+
+        with (
+            patch(f"{_SERVICE_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_tasks_by_workflow_run_id", get_tasks),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_latest_step", get_latest_step),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.update_artifact_data", update_data),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.create_artifact", create_artifact),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.wait_for_upload_aiotasks", wait_for_uploads),
+        ):
+            await WorkflowService().persist_video_data(_browser_state(video_artifacts), workflow, workflow_run)
+
+        # The id-less artifact was promoted via path-upload, not data-upload.
+        update_data.assert_not_awaited()
+        create_artifact.assert_awaited_once()
+        kwargs = create_artifact.call_args.kwargs
+        assert kwargs["step"] is last_step
+        assert kwargs["artifact_type"] == ArtifactType.RECORDING
+        assert kwargs["path"] == str(mp4)
+        assert "data" not in kwargs or kwargs.get("data") is None
+        # The new id is stored back so downstream lookups find the row.
+        assert video_artifacts[0].video_artifact_id == "a_recording_path"
+        # The step-scoped upload aiotask must be drained by persist_video_data.
+        wait_for_uploads.assert_awaited_once_with(["tsk_1"])
+
+    @pytest.mark.asyncio
+    async def test_skips_when_video_path_missing_on_disk(self, tmp_path: Path) -> None:
+        # A path that no longer exists (e.g. cleanup raced the download teardown) must not crash
+        # and must not trigger a step lookup or an artifact insert.
+        absent = tmp_path / "missing.mp4"
+        video_artifacts = [VideoArtifact(video_path=str(absent))]
+
+        get_video = AsyncMock(return_value=video_artifacts)
+        get_tasks = AsyncMock()
+        get_latest_step = AsyncMock()
+        update_data = AsyncMock()
+        create_artifact = AsyncMock()
+        wait_for_uploads = AsyncMock()
+        workflow = SimpleNamespace(workflow_id="w_1")
+        workflow_run = SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1")
+
+        with (
+            patch(f"{_SERVICE_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_tasks_by_workflow_run_id", get_tasks),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_latest_step", get_latest_step),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.update_artifact_data", update_data),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.create_artifact", create_artifact),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.wait_for_upload_aiotasks", wait_for_uploads),
+        ):
+            await WorkflowService().persist_video_data(_browser_state(video_artifacts), workflow, workflow_run)
+
+        get_tasks.assert_not_awaited()
+        get_latest_step.assert_not_awaited()
+        create_artifact.assert_not_awaited()
+        update_data.assert_not_awaited()
+        wait_for_uploads.assert_not_awaited()
+        assert video_artifacts[0].video_artifact_id is None
+
+    @pytest.mark.asyncio
+    async def test_path_fallback_noops_when_workflow_run_has_no_tasks(self, tmp_path: Path) -> None:
+        # A workflow with no tasks gives the helper nothing to attach a step-scoped artifact to;
+        # log and skip rather than creating an orphan or crashing.
+        mp4 = tmp_path / "session.mp4"
+        mp4.write_bytes(b"mp4-bytes")
+        video_artifacts = [VideoArtifact(video_path=str(mp4))]
+
+        get_video = AsyncMock(return_value=video_artifacts)
+        get_tasks = AsyncMock(return_value=[])
+        get_latest_step = AsyncMock()
+        update_data = AsyncMock(return_value=None)
+        create_artifact = AsyncMock()
+        wait_for_uploads = AsyncMock()
+        workflow = SimpleNamespace(workflow_id="w_1")
+        workflow_run = SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1")
+
+        with (
+            patch(f"{_SERVICE_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_tasks_by_workflow_run_id", get_tasks),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_latest_step", get_latest_step),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.update_artifact_data", update_data),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.create_artifact", create_artifact),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.wait_for_upload_aiotasks", wait_for_uploads),
+        ):
+            await WorkflowService().persist_video_data(_browser_state(video_artifacts), workflow, workflow_run)
+
+        get_latest_step.assert_not_awaited()
+        create_artifact.assert_not_awaited()
+        wait_for_uploads.assert_not_awaited()
+        assert video_artifacts[0].video_artifact_id is None
+
+    @pytest.mark.asyncio
+    async def test_preserves_update_path_for_pre_registered_artifact(self, tmp_path: Path) -> None:
+        # A code-block recording arrives pre-registered (``_ensure_run_recording_artifact``); the
+        # existing data-update path stays in charge and the new path-upload helper stays idle.
+        video_artifacts = [
+            VideoArtifact(
+                video_path=str(tmp_path / "code-block.webm"),
+                video_artifact_id="a_existing",
+                video_data=b"video",
+            )
+        ]
+
+        get_video = AsyncMock(return_value=video_artifacts)
+        get_tasks = AsyncMock()
+        update_data = AsyncMock(return_value="wrb_1")
+        create_artifact = AsyncMock()
+        wait_for_uploads = AsyncMock()
+        workflow = SimpleNamespace(workflow_id="w_1")
+        workflow_run = SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1")
+
+        with (
+            patch(f"{_SERVICE_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+            patch(f"{_SERVICE_PATH}.DATABASE.tasks.get_tasks_by_workflow_run_id", get_tasks),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.update_artifact_data", update_data),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.create_artifact", create_artifact),
+            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.wait_for_upload_aiotasks", wait_for_uploads),
+        ):
+            await WorkflowService().persist_video_data(_browser_state(video_artifacts), workflow, workflow_run)
+
+        get_tasks.assert_not_awaited()
+        create_artifact.assert_not_awaited()
+        update_data.assert_awaited_once()
+        wait_for_uploads.assert_awaited_once_with(["wrb_1"])
+        assert video_artifacts[0].video_artifact_id == "a_existing"
