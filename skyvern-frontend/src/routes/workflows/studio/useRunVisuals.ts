@@ -20,11 +20,7 @@ import {
   resolveScreenshotBlockId,
 } from "../workflowRun/workflowTimelineUtils";
 import { type HeroSelection } from "./runview/HeroScreenshot";
-import {
-  actionLabel,
-  buildFilmstrip,
-  runOutcomeFromStatus,
-} from "./runProjections";
+import { buildFilmstrip, runOutcomeFromStatus } from "./runProjections";
 
 export type RunVisuals = {
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow | undefined;
@@ -40,7 +36,6 @@ export type RunVisuals = {
   // ?active= pins a specific step (anything but the live-edge "stream" pin).
   scrubbing: boolean;
   heroSelection: HeroSelection | null;
-  heroLabel: string;
 };
 
 function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
@@ -148,14 +143,6 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   const hasScreenshots =
     hasScreenshotFrame || hasScreenshotCandidate(heroSelection);
 
-  const heroLabel = isAction(activeItem)
-    ? actionLabel(activeItem)
-    : isWorkflowRunBlock(activeItem)
-      ? (activeItem.label ?? "Screenshot")
-      : isObserverThought(activeItem)
-        ? (activeItem.thought ?? "Thought")
-        : "Screenshot";
-
   return {
     workflowRun,
     timeline,
@@ -169,6 +156,5 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
     hasScreenshots,
     scrubbing,
     heroSelection,
-    heroLabel,
   };
 }
