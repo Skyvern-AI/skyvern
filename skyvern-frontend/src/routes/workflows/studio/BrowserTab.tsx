@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { ClockIcon, CounterClockwiseClockIcon } from "@radix-ui/react-icons";
+import { ClockIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
@@ -40,8 +40,6 @@ export function BrowserTab() {
     isPaused,
     recordingUrls,
     heroSelection,
-    heroLabel,
-    scrubbing,
   } = visuals;
 
   const onRecordingPlay = useCallback(
@@ -127,17 +125,7 @@ export function BrowserTab() {
             </div>
           )
         ) : heroSelection ? (
-          <>
-            <HeroScreenshot selection={heroSelection} running={running} />
-            {scrubbing ? (
-              <div className="absolute left-3 top-3 flex max-w-[26rem] items-center gap-2 rounded-md bg-black/70 px-3 py-1.5 text-xs text-white backdrop-blur">
-                <CounterClockwiseClockIcon className="h-3.5 w-3.5 shrink-0" />
-                <span className="truncate">
-                  Inspecting · <b>{heroLabel}</b>
-                </span>
-              </div>
-            ) : null}
-          </>
+          <HeroScreenshot selection={heroSelection} running={running} />
         ) : (
           <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
             {visuals.finalized
