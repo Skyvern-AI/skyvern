@@ -58,7 +58,12 @@ import { parseHeaderJson } from "@/util/secretHeaders";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
-import { WorkflowApiResponse, WorkflowParameter } from "./types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  WorkflowBlock,
+  WorkflowParameter,
+  isNestedLoopWorkflowBlock,
+} from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
@@ -67,7 +72,31 @@ import {
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
-import { getLoginBlocksWithoutCredentials } from "./runValidation";
+
+/**
+ * Recursively finds all login blocks that don't have any credential parameters selected.
+ * Checks nested blocks inside for_loop blocks as well.
+ */
+function getLoginBlocksWithoutCredentials(
+  blocks: Array<WorkflowBlock>,
+): Array<{ label: string }> {
+  const result: Array<{ label: string }> = [];
+
+  for (const block of blocks) {
+    if (block.block_type === "login") {
+      // Login block requires at least one parameter (credential) to be selected
+      if (!block.parameters || block.parameters.length === 0) {
+        result.push({ label: block.label });
+      }
+    }
+
+    if (isNestedLoopWorkflowBlock(block) && block.loop_blocks) {
+      result.push(...getLoginBlocksWithoutCredentials(block.loop_blocks));
+    }
+  }
+
+  return result;
+}
 
 /**
  * Validates the workflow for issues that would prevent it from running.

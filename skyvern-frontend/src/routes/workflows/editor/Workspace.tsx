@@ -152,16 +152,6 @@ import {
 } from "./workflowEditorUtils";
 import { replayPersistedCollapseVisibility } from "./collapse/applyDescendantCollapseVisibility";
 import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
-import { useSyncRunValidationStore } from "./runValidation/useSyncRunValidationStore";
-import {
-  RUN_BLOCKING_SURFACE_TOP,
-  RUN_BLOCKING_SURFACE_TOP_VAR,
-  RunBlockingSurface,
-  WORKFLOW_EDITOR_HEADER_HEIGHT,
-  WORKFLOW_EDITOR_HEADER_HEIGHT_VAR,
-  WORKFLOW_EDITOR_HEADER_TOP,
-  WORKFLOW_EDITOR_HEADER_TOP_VAR,
-} from "./runValidation/RunBlockingSurface";
 import {
   BLOCK_SIDEBAR_WIDTH_VAR,
   HEADER_RIGHT_INSET_CLOSED,
@@ -446,7 +436,6 @@ function Workspace({
   const postHog = usePostHog();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  useSyncRunValidationStore(nodes);
   const {
     undo: undoWorkflowEdit,
     redo: redoWorkflowEdit,
@@ -1908,9 +1897,6 @@ function Workspace({
           [BLOCK_SIDEBAR_WIDTH_VAR]: embedded
             ? "0px"
             : `${renderedBlockSidebarWidth}px`,
-          [WORKFLOW_EDITOR_HEADER_TOP_VAR]: WORKFLOW_EDITOR_HEADER_TOP,
-          [WORKFLOW_EDITOR_HEADER_HEIGHT_VAR]: WORKFLOW_EDITOR_HEADER_HEIGHT,
-          [RUN_BLOCKING_SURFACE_TOP_VAR]: RUN_BLOCKING_SURFACE_TOP,
         } as React.CSSProperties
       }
     >
@@ -2000,8 +1986,7 @@ function Workspace({
       {!embedded && (
         <div
           className={cn(
-            "absolute left-6 top-[var(--workflow-editor-header-top)] z-40",
-            "h-[var(--workflow-editor-header-height)] transition-all duration-300 ease-out",
+            "absolute left-6 top-8 z-40 h-20 transition-all duration-300 ease-out",
             headerEffectiveSidebarOpen
               ? HEADER_RIGHT_INSET_OPEN
               : HEADER_RIGHT_INSET_CLOSED,
@@ -2015,8 +2000,6 @@ function Workspace({
           <WorkflowHeader />
         </div>
       )}
-
-      <RunBlockingSurface enabled={!workflowPanelState.data?.showComparison} />
 
       {/* comparison view (takes precedence over both browser and non-browser modes) */}
       {workflowPanelState.data?.showComparison &&
