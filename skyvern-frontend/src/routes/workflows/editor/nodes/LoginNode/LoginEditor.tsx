@@ -176,6 +176,10 @@ function LoginEditorBody({
             onUrlAutoFill={(url) => {
               if (editable) update({ url });
             }}
+            currentInstructions={data.navigationGoal}
+            onInstructionsAutoFill={(navigationGoal) => {
+              if (editable) update({ navigationGoal });
+            }}
           />
         </div>
         {showTwoFactorFields ? (
