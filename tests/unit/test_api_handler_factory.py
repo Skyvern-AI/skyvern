@@ -12,6 +12,7 @@ import pytest  # type: ignore[import-not-found]
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
     EXTRACT_ACTION_PROMPT_NAME,
+    GEMINI_SAFETY_SETTINGS,
     LLMAPIHandlerFactory,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
@@ -864,3 +865,31 @@ async def test_non_speculative_cancelled_error_propagates(monkeypatch: pytest.Mo
     assert isinstance(exc_info.value, CancelledError), (
         f"expected CancelledError to propagate, got {type(exc_info.value).__name__}"
     )
+
+
+def test_get_api_parameters_injects_safety_settings_for_gemini_direct_config() -> None:
+    llm_config = LLMConfig(
+        model_name="vertex_ai/gemini-2.5-flash",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+    assert params["safety_settings"] == GEMINI_SAFETY_SETTINGS
+    assert all(setting["threshold"] == "BLOCK_NONE" for setting in params["safety_settings"])
+
+
+def test_get_api_parameters_injects_safety_settings_for_gemini_router_config() -> None:
+    params = LLMAPIHandlerFactory.get_api_parameters(_gemini_2_5_flash_router())
+    assert params["safety_settings"] == GEMINI_SAFETY_SETTINGS
+
+
+def test_get_api_parameters_omits_safety_settings_for_non_gemini_config() -> None:
+    llm_config = LLMConfig(
+        model_name="gpt-4",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+    assert "safety_settings" not in params
