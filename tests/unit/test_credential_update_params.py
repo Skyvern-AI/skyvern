@@ -431,7 +431,7 @@ async def test_browser_profile_resave_updates_proxy_pin_after_storage_write(monk
     monkeypatch.setattr(
         forge_app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed)),
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed, browser_profile_id=None)),
     )
     monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
@@ -491,7 +491,7 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
     monkeypatch.setattr(
         forge_app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed)),
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed, browser_profile_id=None)),
     )
     monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
@@ -546,7 +546,7 @@ async def test_browser_profile_resave_preserves_different_existing_profile_pin(
     monkeypatch.setattr(
         forge_app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed)),
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed, browser_profile_id=None)),
     )
     monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
@@ -581,6 +581,131 @@ async def test_browser_profile_resave_preserves_different_existing_profile_pin(
     )
 
     assert events == ["store", "touch_profile", "update_credential"]
+
+
+@pytest.mark.asyncio
+async def test_credential_browser_profile_save_reads_managed_profile_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_created"))
+    update_credential = AsyncMock(return_value=SimpleNamespace())
+    store_browser_profile = AsyncMock()
+    retrieve_profile = AsyncMock(return_value="/tmp/managed_profile")
+    retrieve_session = AsyncMock()
+
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status=WorkflowRunStatus.completed,
+                browser_profile_id="bp_managed",
+                workflow_permanent_id="wpid_123",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflows,
+        "get_workflow",
+        AsyncMock(return_value=SimpleNamespace(workflow_permanent_id="wpid_123")),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_123")),
+    )
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile", retrieve_profile)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", retrieve_session)
+    monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(proxy_location=None, proxy_session_id=None)),
+    )
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "create_browser_profile", create_browser_profile)
+
+    await credentials_routes._create_browser_profile_after_workflow(
+        credential_id="cred_123",
+        workflow_run_id="wr_123",
+        workflow_id="wf_123",
+        workflow_permanent_id="wpid_123",
+        organization_id="org_123",
+        credential_name="test",
+        test_url="https://example.com/login",
+    )
+
+    retrieve_profile.assert_awaited_once_with(organization_id="org_123", profile_id="bp_managed")
+    retrieve_session.assert_not_awaited()
+    store_browser_profile.assert_awaited_once_with(
+        organization_id="org_123",
+        profile_id="bp_created",
+        directory="/tmp/managed_profile",
+    )
+    update_credential.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_managed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_created"))
+    update_credential = AsyncMock(return_value=SimpleNamespace())
+    store_browser_profile = AsyncMock()
+    retrieve_profile = AsyncMock(return_value=None)
+    retrieve_session = AsyncMock(return_value="/tmp/legacy_session")
+    get_storage_key = AsyncMock(return_value="wpid_123")
+
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status=WorkflowRunStatus.completed,
+                browser_profile_id="bp_managed",
+                workflow_permanent_id="wpid_123",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflows,
+        "get_workflow",
+        AsyncMock(return_value=SimpleNamespace(workflow_permanent_id="wpid_123")),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_123")),
+    )
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_browser_session_storage_key", get_storage_key)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_profile", retrieve_profile)
+    monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", retrieve_session)
+    monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(proxy_location=None, proxy_session_id=None)),
+    )
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "create_browser_profile", create_browser_profile)
+
+    await credentials_routes._create_browser_profile_after_workflow(
+        credential_id="cred_123",
+        workflow_run_id="wr_123",
+        workflow_id="wf_123",
+        workflow_permanent_id="wpid_123",
+        organization_id="org_123",
+        credential_name="test",
+        test_url="https://example.com/login",
+    )
+
+    retrieve_profile.assert_awaited_once_with(organization_id="org_123", profile_id="bp_managed")
+    retrieve_session.assert_awaited_once_with(organization_id="org_123", workflow_permanent_id="wpid_123")
+    store_browser_profile.assert_awaited_once_with(
+        organization_id="org_123",
+        profile_id="bp_created",
+        directory="/tmp/legacy_session",
+    )
 
 
 def test_credential_route_treats_null_advanced_key_as_no_explicit_identity() -> None:

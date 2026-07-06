@@ -15,6 +15,7 @@ type RecordedBlocksState = {
   blocks: Array<WorkflowBlock> | null;
   parameters: Array<WorkflowParameter> | null;
   insertionPoint: InsertionPoint | null;
+  applicationNonce: number;
 };
 
 type RecordedBlocksStore = RecordedBlocksState & {
@@ -32,11 +33,22 @@ const useRecordedBlocksStore = create<RecordedBlocksStore>((set) => ({
   blocks: null,
   parameters: null,
   insertionPoint: null,
+  applicationNonce: 0,
   setRecordedBlocks: ({ blocks, parameters }, insertionPoint) => {
-    set({ blocks, parameters, insertionPoint });
+    set({
+      blocks,
+      parameters,
+      insertionPoint,
+      applicationNonce: Date.now(),
+    });
   },
   clearRecordedBlocks: () => {
-    set({ blocks: null, insertionPoint: null });
+    set({
+      blocks: null,
+      parameters: null,
+      insertionPoint: null,
+      applicationNonce: 0,
+    });
   },
 }));
 

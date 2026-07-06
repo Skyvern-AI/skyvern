@@ -348,3 +348,43 @@ def loaded_result_composition_evidence_from_page(
 def loaded_result_composition_target_summary(evidence: LoadedResultCompositionEvidence) -> dict[str, object]:
     summary = _summary_with_targets(evidence, [_target_summary(target) for target in evidence.targets])
     return _cap_loaded_result_composition_summary(summary)
+
+
+COVERAGE_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
+_VALUE_BEARING_LIST_KEYS = ("sample_rows", "rows", "items")
+_VALUE_BEARING_TEXT_KEYS = ("content_excerpt", "sample_text", "text", "text_excerpt", "visible_results_evidence")
+
+
+def _result_container_value_tokens(container: Mapping[str, Any]) -> set[str]:
+    parts: list[str] = []
+    for key in _VALUE_BEARING_LIST_KEYS:
+        value = container.get(key)
+        if isinstance(value, list):
+            parts.extend(_sample_row_text(item) for item in value if _is_meaningful_data(item))
+    for key in _VALUE_BEARING_TEXT_KEYS:
+        value = container.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    joined = " ".join(parts).lower()
+    return {token for token in COVERAGE_TOKEN_RE.findall(joined) if not token.isdigit()}
+
+
+def covered_output_paths_in_result_containers(
+    raw_containers: object, coverage_tokens_by_path: Mapping[str, frozenset[str]]
+) -> set[str]:
+    """Credit a requested output path only when one of its identifying tokens appears in a
+    value-bearing surface of a content-bearing container. Selector/row_selector are never
+    consulted, so an empty result shell with matching selector tokens stays uncovered."""
+    if not isinstance(raw_containers, list) or not coverage_tokens_by_path:
+        return set()
+    covered: set[str] = set()
+    for container in raw_containers:
+        if not isinstance(container, Mapping) or not _result_container_has_content(container):
+            continue
+        value_tokens = _result_container_value_tokens(container)
+        if not value_tokens:
+            continue
+        for path, tokens in coverage_tokens_by_path.items():
+            if path not in covered and tokens and (tokens & value_tokens):
+                covered.add(path)
+    return covered

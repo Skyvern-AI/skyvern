@@ -82,6 +82,7 @@ from .browser_profiles import (
     skyvern_browser_profile_list,
     skyvern_browser_profile_update,
 )
+from .code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from .credential import (
     skyvern_credential_delete,
     skyvern_credential_get,
@@ -438,6 +439,8 @@ mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern
 # -- Block discovery + validation (no browser needed) --
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Synthesize Code Block"))(skyvern_code_block_synthesize)
 
 # -- Organization settings (no browser needed) --
 mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
@@ -562,6 +565,8 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    "skyvern_code_block_lint",
+    "skyvern_code_block_synthesize",
     # Organization settings
     "skyvern_org_get",
     "skyvern_org_update",

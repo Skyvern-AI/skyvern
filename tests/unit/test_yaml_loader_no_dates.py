@@ -79,9 +79,11 @@ def test_safe_load_no_dates_preserves_other_implicit_types() -> None:
     assert parsed["a_list"] == [1, 2, 3]
 
 
-def test_process_workflow_yaml_keeps_json_parameter_iso_strings() -> None:
-    workflow = _process_workflow_yaml(
+@pytest.mark.asyncio
+async def test_process_workflow_yaml_keeps_json_parameter_iso_strings() -> None:
+    workflow = await _process_workflow_yaml(
         workflow_id="wf-123",
+        settings_fallback_yaml="enable_self_healing: false",
         workflow_permanent_id="wfp-123",
         organization_id="org-123",
         workflow_yaml="""

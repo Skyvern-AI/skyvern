@@ -1,5 +1,6 @@
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Protocol
 
 import structlog
 
@@ -10,11 +11,14 @@ from skyvern.forge.sdk.copilot.completion_output_grounding import (
     split_requested_output_criteria,
 )
 from skyvern.forge.sdk.copilot.completion_verification import (
+    _FALLBACK_FLOOR_CARRIER_SOURCES,
     _STRUCTURED_RECORD_CRITERION_IDS,
     CompletionVerificationResult,
     CriterionVerdict,
+    EvidenceSourceKind,
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
+    _is_structural_requested_output_abstention,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
@@ -23,6 +27,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_record_semantic_consistency,
     grade_registered_download_criteria,
     grade_structured_record_criteria,
+    grade_terminal_goal_record_corroboration,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
     is_fallback_floor_base_criterion,
@@ -44,7 +49,8 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
     derive_from_block_outputs,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, is_fallback_floor_criterion
+from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -69,7 +75,15 @@ from .blockers import (
 LOG = structlog.get_logger()
 
 _TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+_POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
+_REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
+# Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
+# and observation flag cannot be traversed as observed page content.
+_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
 _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+_AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
+_AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
+_AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
 _VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT = (
     " For validation-only pre-submit Review pages, do not repair by returning only booleans such as "
     "pre_submit_review_reached, submit_control_visible, submit_or_finalize_clicked, or per-field *_verified flags. "
@@ -170,7 +184,112 @@ def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriter
     policy = _completion_request_policy(copilot_ctx)
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
-    return policy.graded_completion_criteria() if policy is not None else []
+    criteria = policy.graded_completion_criteria() if policy is not None else []
+    authored_output_criteria = _authored_output_contract_criteria(copilot_ctx)
+    if authored_output_criteria and (not criteria or all(is_fallback_floor_criterion(c) for c in criteria)):
+        return authored_output_criteria
+    if _accepted_staged_output_contract_missing(copilot_ctx) and (
+        not criteria or all(is_fallback_floor_criterion(c) for c in criteria)
+    ):
+        return [_authored_output_contract_missing_criterion()]
+    return criteria
+
+
+def _authored_output_contract_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
+    paths = _authored_output_contract_paths(copilot_ctx)
+    return [
+        CompletionCriterion(
+            id=f"{_AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX}{path.replace('[]', '_items').replace('.', '_')}",
+            outcome=f"The run output includes the authored output contract path {path}.",
+            implicit=True,
+            level="run",
+            output_path=path,
+        )
+        for path in paths
+    ]
+
+
+def _authored_output_contract_paths(copilot_ctx: Any) -> list[str]:
+    if _accepted_staged_proposal_present(copilot_ctx):
+        return sorted(_authored_output_contract_metadata_paths(_accepted_staged_output_contract_metadata(copilot_ctx)))
+    repair_context_paths = _authored_output_contract_repair_context_paths(copilot_ctx)
+    if repair_context_paths:
+        return sorted(repair_context_paths)
+    return sorted(_authored_output_contract_metadata_paths(_accepted_staged_output_contract_metadata(copilot_ctx)))
+
+
+def _accepted_staged_output_contract_metadata(copilot_ctx: Any) -> object:
+    evidence = getattr(copilot_ctx, "workflow_verification_evidence", None)
+    metadata = getattr(evidence, "code_artifact_metadata", None)
+    if _authored_output_contract_metadata_paths(metadata):
+        return metadata
+    return getattr(copilot_ctx, "code_artifact_metadata", None)
+
+
+def _authored_output_contract_metadata_paths(metadata: object) -> set[str]:
+    paths: set[str] = set()
+    if isinstance(metadata, Mapping):
+        for artifact in metadata.values():
+            if not isinstance(artifact, Mapping):
+                continue
+            for row_group_key in ("claimed_outcomes", "terminal_verifier_expectations"):
+                row_group = artifact.get(row_group_key)
+                if not isinstance(row_group, list):
+                    continue
+                for row in row_group:
+                    if not isinstance(row, Mapping):
+                        continue
+                    paths.update(_authored_output_contract_paths_from_list(row.get("goal_value_paths")))
+    return paths
+
+
+def _accepted_staged_output_contract_missing(copilot_ctx: Any) -> bool:
+    return (
+        _accepted_staged_proposal_present(copilot_ctx)
+        and not _authored_output_contract_paths(copilot_ctx)
+        and bool(_authored_output_contract_repair_context_paths(copilot_ctx))
+    )
+
+
+def _accepted_staged_proposal_present(copilot_ctx: Any) -> bool:
+    return bool(getattr(copilot_ctx, "has_staged_proposal", False) or getattr(copilot_ctx, "staged_workflow", None))
+
+
+def _authored_output_contract_missing_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id=_AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID,
+        outcome="The accepted staged workflow exposes an authored output contract.",
+        implicit=True,
+        level="run",
+        output_path=_AUTHORED_OUTPUT_CONTRACT_MISSING_PATH,
+    )
+
+
+def _authored_output_contract_repair_context_paths(copilot_ctx: Any) -> set[str]:
+    repair_context = getattr(copilot_ctx, "last_code_authoring_repair_context", None)
+    paths: set[str] = set()
+    for attr in ("required_goal_value_paths", "required_extraction_schema_paths", "required_code_return_paths"):
+        paths.update(_authored_output_contract_paths_from_list(getattr(repair_context, attr, None)))
+    return paths
+
+
+def _authored_output_contract_paths_from_list(value: object) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {path for raw_path in value for path in [_authored_output_contract_path(raw_path)] if path}
+
+
+def _authored_output_contract_path(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    path = value.strip()
+    if path == "output." or path == "output":
+        return ""
+    if path.startswith("output."):
+        return path
+    if path.startswith("_") or not path.replace("_", "").isalnum():
+        return ""
+    return f"output.{path}"
 
 
 def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
@@ -241,13 +360,17 @@ def _build_page_observation_evidence_snapshot(
 ) -> RunEvidenceSnapshot:
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     block_outputs: dict[str, Any] = {}
+    block_output_sources: dict[str, EvidenceSourceKind] = {}
     if isinstance(observed_data, dict) and observed_data:
         block_outputs["current_page_observation"] = observed_data
+        block_output_sources["current_page_observation"] = "independent_page_evidence"
     elif observed_data is not None:
         block_outputs["current_page_observation"] = str(observed_data)
+        block_output_sources["current_page_observation"] = "independent_page_evidence"
     return RunEvidenceSnapshot(
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         block_outputs=block_outputs,
+        block_output_sources=block_output_sources,
         current_url=_valid_runtime_anchor_url(url),
         page_title=title if isinstance(title, str) and title.strip() else None,
     )
@@ -613,6 +736,71 @@ def _artifact_health_blocker_from_result(
     return reason, failed_labels, failure_classes
 
 
+class _PostRunPageEvidenceCtx(Protocol):
+    composition_page_evidence: Mapping[str, Any] | None
+
+
+def _same_run_post_run_page_evidence(
+    copilot_ctx: _PostRunPageEvidenceCtx, run_id: str | None
+) -> Mapping[str, Any] | None:
+    """Post-run page evidence stamped for the graded run, admitted only when its own
+    ``workflow_run_id`` matches and it was observed after the run, so a stale pre-run page cannot certify."""
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    evidence = copilot_ctx.composition_page_evidence
+    if not isinstance(evidence, Mapping):
+        return None
+    if evidence.get("observed_after_workflow_run") is not True:
+        return None
+    if evidence.get("workflow_run_id") != run_id:
+        return None
+    return evidence
+
+
+def _bind_independent_post_run_page_evidence(
+    copilot_ctx: _PostRunPageEvidenceCtx,
+    run_id: str | None,
+    block_outputs: dict[str, Any],
+    block_output_sources: dict[str, EvidenceSourceKind],
+) -> None:
+    if _POST_RUN_PAGE_OBSERVATION_LABEL in block_outputs:
+        return
+    evidence = _same_run_post_run_page_evidence(copilot_ctx, run_id)
+    if evidence is None:
+        return
+    block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL] = {
+        key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS
+    }
+    block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
+
+
+def _bind_registered_artifact_evidence(
+    evidence: RegisteredArtifactEvidence | None,
+    run_id: str | None,
+    block_outputs: dict[str, Any],
+    block_output_sources: dict[str, EvidenceSourceKind],
+) -> None:
+    if _REGISTERED_ARTIFACT_OBSERVATION_LABEL in block_outputs:
+        return
+    if not isinstance(run_id, str) or not run_id:
+        return
+    if evidence is None or evidence.workflow_run_id != run_id or not evidence.entries:
+        return
+    block_outputs[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = {
+        "parsed_text": " ".join(entry.parsed_text for entry in evidence.entries),
+        "file_names": [entry.file_name for entry in evidence.entries],
+    }
+    block_output_sources[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = "registered_artifact_content"
+
+
+def _pre_run_page_reference_text(reference: PreRunPageReference | None, run_id: str | None) -> str | None:
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    if reference is None or reference.workflow_run_id != run_id:
+        return None
+    return reference.text or None
+
+
 def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> RunEvidenceSnapshot:
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
@@ -623,6 +811,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     # run satisfy a criterion the current run never re-produced.
     blocks = data.get("blocks")
     block_outputs: dict[str, Any] = {}
+    block_output_sources: dict[str, EvidenceSourceKind] = {}
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
@@ -632,16 +821,20 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             evidence_output = _completion_evidence_payload(output)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
+                block_output_sources[label] = "runtime_output"
             for output_key, output_value in _workflow_output_parameter_payloads(output).items():
                 block_outputs[output_key] = output_value
+                block_output_sources[output_key] = "registered_output_parameter"
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
         block_outputs[output_key] = output_value
+        block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
         registered_output_value = _completion_evidence_payload(registered.get("value"))
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
+            block_output_sources[registered_output_key] = "registered_output_parameter"
         if isinstance(registered_block_label, str) and registered_block_label in current_labels:
             if isinstance(registered_output_key, str) and registered_output_key:
                 existing = block_outputs.get(registered_block_label)
@@ -649,12 +842,25 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
                     existing.setdefault(registered_output_key, registered_output_value)
                 else:
                     block_outputs[registered_block_label] = {registered_output_key: registered_output_value}
+                block_output_sources.setdefault(registered_block_label, "registered_output_parameter")
             else:
                 block_outputs[registered_block_label] = registered_output_value
+                block_output_sources[registered_block_label] = "registered_output_parameter"
+    run_id = data.get("workflow_run_id")
+    _bind_independent_post_run_page_evidence(
+        copilot_ctx, run_id if isinstance(run_id, str) else None, block_outputs, block_output_sources
+    )
+    registered_artifact_evidence = getattr(copilot_ctx, "registered_artifact_evidence", None)
+    pre_run_page_reference = getattr(copilot_ctx, "pre_run_page_reference", None)
+    _bind_registered_artifact_evidence(
+        registered_artifact_evidence if isinstance(registered_artifact_evidence, RegisteredArtifactEvidence) else None,
+        run_id if isinstance(run_id, str) else None,
+        block_outputs,
+        block_output_sources,
+    )
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
-    run_id = data.get("workflow_run_id")
     run_terminal_status = data.get("overall_status")
     failure_reasons = [" ".join(reason.split()) for reason in iter_failure_reasons(result)]
     _artifact_reason, artifact_failed_labels, artifact_failure_classes = _artifact_health_blocker_from_result(
@@ -665,6 +871,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     return RunEvidenceSnapshot(
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         block_outputs=block_outputs,
+        block_output_sources=block_output_sources,
         current_url=_valid_runtime_anchor_url(data.get("current_url")),
         page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
         run_terminal_status=run_terminal_status
@@ -679,6 +886,22 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         failed_block_labels=failed_block_labels,
         failure_classes=artifact_failure_classes,
         failure_reasons=failure_reasons,
+        pre_run_page_reference_text=_pre_run_page_reference_text(
+            pre_run_page_reference if isinstance(pre_run_page_reference, PreRunPageReference) else None,
+            run_id if isinstance(run_id, str) else None,
+        ),
+    )
+
+
+def _carrier_floor_verdicts(
+    requested_output_verdicts: list[CriterionVerdict],
+) -> tuple[CriterionVerdict, ...]:
+    return tuple(
+        verdict
+        for verdict in requested_output_verdicts
+        if verdict.state == "satisfied"
+        and verdict.reason_code == "evidence_confirms"
+        and verdict.evidence_source in _FALLBACK_FLOOR_CARRIER_SOURCES
     )
 
 
@@ -688,6 +911,7 @@ def _apply_present_value_upgrades(
     snapshot: RunEvidenceSnapshot,
     *,
     include_terminal_goal_records: bool = False,
+    carrier_verdicts: tuple[CriterionVerdict, ...] = (),
 ) -> CompletionVerificationResult:
     """Upgrade a ``no_evidence``/``unknown`` run verdict to a deterministic present-value
     ``satisfied``. An ``evidence_contradicts`` verdict is left to the judge, a judge
@@ -706,7 +930,9 @@ def _apply_present_value_upgrades(
         upgrades.update(
             {
                 verdict.criterion_id: verdict
-                for verdict in grade_fallback_floor_reached_end_state_criteria(run_criteria, snapshot)
+                for verdict in grade_fallback_floor_reached_end_state_criteria(
+                    run_criteria, snapshot, carrier_verdicts=carrier_verdicts
+                )
             }
         )
         upgrades.update(
@@ -762,6 +988,15 @@ def _merge_run_verdicts(
         verdicts=[
             verdict_by_id.get(criterion_id, CriterionVerdict(criterion_id, "unknown", "unknown"))
             for criterion_id in criterion_ids
+        ]
+        + [
+            verdict
+            for verdicts in verdict_groups
+            for verdict in verdicts
+            if verdict.criterion_id not in criterion_ids
+            and verdict.state == "satisfied"
+            and verdict.reason_code == "evidence_confirms"
+            and verdict.grounding_mode == "terminal_record"
         ],
         contingent_criterion_ids=contingent_criterion_ids or default_contingent_ids,
         contingent_on_by_criterion_id=contingent_on_by_criterion_id or default_contingent_on_by_id,
@@ -776,14 +1011,17 @@ def _merge_run_verdicts_if_requested_output_exists(
     run_criteria: list[CompletionCriterion],
     requested_output_verdicts: list[CriterionVerdict],
     *verdict_groups: list[CriterionVerdict],
+    snapshot: RunEvidenceSnapshot | None = None,
     structural_unfired_criterion_ids: list[str] | None = None,
 ) -> CompletionVerificationResult | None:
     if not requested_output_verdicts:
         return None
+    extra_verdicts = [grade_terminal_goal_record_corroboration(snapshot)] if snapshot is not None else []
     return _merge_run_verdicts(
         run_criteria,
         requested_output_verdicts,
         *verdict_groups,
+        *extra_verdicts,
         structural_unfired_criterion_ids=structural_unfired_criterion_ids,
     )
 
@@ -828,6 +1066,8 @@ def _run_criteria_for_verdicts(
 def _deterministic_run_verification_result(
     run_criteria: list[CompletionCriterion],
     snapshot: RunEvidenceSnapshot,
+    *,
+    carrier_verdicts: tuple[CriterionVerdict, ...] = (),
 ) -> tuple[CompletionVerificationResult | None, list[CompletionCriterion]]:
     """Return a deterministic run-plane verdict when the typed graders cover it.
 
@@ -859,7 +1099,9 @@ def _deterministic_run_verification_result(
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_structured_record_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
-    for verdict in grade_fallback_floor_reached_end_state_criteria(run_criteria, snapshot):
+    for verdict in grade_fallback_floor_reached_end_state_criteria(
+        run_criteria, snapshot, carrier_verdicts=carrier_verdicts
+    ):
         deterministic_by_id[verdict.criterion_id] = verdict
     for verdict in grade_terminal_goal_record_criteria(run_criteria, snapshot):
         deterministic_by_id[verdict.criterion_id] = verdict
@@ -946,6 +1188,7 @@ async def _maybe_run_completion_verification(
         if requested_output_criteria
         else []
     )
+    carrier_verdicts = _carrier_floor_verdicts(requested_output_verdicts)
     if judgeable_run_criteria and all(
         criterion.id in _STRUCTURED_RECORD_CRITERION_IDS for criterion in judgeable_run_criteria
     ):
@@ -1004,11 +1247,12 @@ async def _maybe_run_completion_verification(
         run_result = _merge_run_verdicts(
             run_criteria,
             requested_output_verdicts,
+            grade_terminal_goal_record_corroboration(snapshot),
             structural_unfired_criterion_ids=run_structural_unfired_ids,
         )
     else:
         deterministic_result, remaining_criteria = _deterministic_run_verification_result(
-            judgeable_run_criteria, snapshot
+            judgeable_run_criteria, snapshot, carrier_verdicts=carrier_verdicts
         )
         if deterministic_result is not None and not remaining_criteria:
             run_result = _merge_run_verdicts(
@@ -1023,6 +1267,7 @@ async def _maybe_run_completion_verification(
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
                     run_criteria,
                     requested_output_verdicts,
+                    snapshot=snapshot,
                     structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 if requested_output_result is not None:
@@ -1052,6 +1297,7 @@ async def _maybe_run_completion_verification(
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
                     run_criteria,
                     requested_output_verdicts,
+                    snapshot=snapshot,
                     structural_unfired_criterion_ids=run_structural_unfired_ids,
                 )
                 if requested_output_result is not None:
@@ -1078,6 +1324,7 @@ async def _maybe_run_completion_verification(
                     _merge_run_verdicts_if_requested_output_exists(
                         run_criteria,
                         requested_output_verdicts,
+                        snapshot=snapshot,
                         structural_unfired_criterion_ids=run_structural_unfired_ids,
                     )
                     or judged_result
@@ -1107,6 +1354,7 @@ async def _maybe_run_completion_verification(
                     judgeable_run_criteria,
                     snapshot,
                     include_terminal_goal_records=True,
+                    carrier_verdicts=carrier_verdicts,
                 )
                 run_result = _merge_run_verdicts(
                     run_criteria,
@@ -1225,7 +1473,10 @@ def _outcome_failure_warrants_repair(
         return True
     # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
     # (absent judge signal, unmappable definition checks) never warrants repair.
-    if not any(verdict.state == "unsatisfied" for verdict in completion_verification.verdicts):
+    if not any(
+        verdict.state == "unsatisfied" and not _is_structural_requested_output_abstention(verdict)
+        for verdict in completion_verification.verdicts
+    ):
         return False
     return _current_workflow_has_evidence_block(copilot_ctx)
 

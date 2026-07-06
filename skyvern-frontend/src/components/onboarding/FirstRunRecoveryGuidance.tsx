@@ -54,7 +54,7 @@ function FirstRunRecoveryGuidance({
     if (id === "edit_workflow") {
       return workflowPermanentId
         ? workflowEditorPath(workflowPermanentId, studioEnabled)
-        : "/workflows";
+        : "/agents";
     }
     return "/credentials";
   }

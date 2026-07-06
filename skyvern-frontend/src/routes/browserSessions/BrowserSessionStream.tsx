@@ -98,6 +98,7 @@ interface Props {
   centered?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
   onUrlChange?: (url: string) => void;
+  onActivity?: () => void;
 }
 
 function BrowserSessionStream({
@@ -107,6 +108,7 @@ function BrowserSessionStream({
   centered = false,
   onReadyChange,
   onUrlChange,
+  onActivity,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
@@ -119,6 +121,7 @@ function BrowserSessionStream({
   const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
+  const onActivityRef = useRef(onActivity);
   const hasFrameRef = useRef(false);
   const reconnectAttemptsRef = useRef(0);
   const terminalStatusSeenRef = useRef(false);
@@ -144,6 +147,18 @@ function BrowserSessionStream({
     viewportWidth,
     viewportHeight,
   });
+
+  useEffect(() => {
+    onActivityRef.current = onActivity;
+  }, [onActivity]);
+
+  // Once control can't be offered (input socket torn down), forget any prior
+  // grab so re-enabling doesn't silently restore control without a new click.
+  useEffect(() => {
+    if (!controllable) {
+      setUserIsControlling(false);
+    }
+  }, [controllable, setUserIsControlling]);
 
   useEffect(() => {
     let cancelled = false;
@@ -188,6 +203,8 @@ function BrowserSessionStream({
       socketRef.current.addEventListener("message", (event) => {
         try {
           const message: StreamMessage = JSON.parse(event.data);
+          const hasActivity =
+            Boolean(message.screenshot) || message.url !== undefined;
           if (message.screenshot) {
             hasFrameRef.current = true;
             reconnectAttemptsRef.current = 0;
@@ -204,6 +221,9 @@ function BrowserSessionStream({
           }
           if (message.url !== undefined) {
             setCurrentUrl(message.url);
+          }
+          if (hasActivity) {
+            onActivityRef.current?.();
           }
           if (!message.screenshot && message.status) {
             setDiagnostic(diagnosticForStatus(message.status));

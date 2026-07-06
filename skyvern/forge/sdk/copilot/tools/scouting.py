@@ -12,6 +12,11 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    record_build_test_outcome,
+    recorded_outcome_from_loaded_result_evidence,
+    recorded_outcome_from_scout_act_observe_hollow,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
@@ -26,6 +31,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    record_scouted_output_coverage,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
 )
@@ -297,6 +303,7 @@ def _record_scouted_interaction(
     source_url: str | None = None,
     value: str = "",
     typed_value: str = "",
+    raw_typed_value: str = "",
     key: str = "",
     typed_length: int = 0,
     role: str = "",
@@ -319,6 +326,8 @@ def _record_scouted_interaction(
         artifact["value"] = value
     if typed_value:
         artifact["typed_value"] = typed_value
+    if raw_typed_value:
+        artifact["raw_typed_value"] = raw_typed_value
     if key:
         artifact["key"] = key
     if typed_length:
@@ -366,34 +375,71 @@ def _record_scouted_interaction(
 _ACT_OBSERVE_TOOLS = frozenset({"click"})
 
 
+def _scout_act_observe_capture_outcome(parsed: dict[str, Any] | None, *, started: float, timeout_seconds: float) -> str:
+    if parsed is None:
+        return "timeout" if time.monotonic() - started >= timeout_seconds else "error"
+    if has_bounded_page_schema(parsed):
+        return "attached"
+    return "hollow"
+
+
+def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: float) -> str:
+    return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
+
+
 async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
     """Run the bounded page-side extractor right after a scout interaction.
 
-    Degrades to None on timeout, error, or a hollow parse so the interaction
-    result is never blocked or failed by capture problems."""
+    Degrades to None on timeout or error so the interaction result is never
+    blocked or failed by capture problems. Hollow packets still return so an
+    interaction-proven hollow page can be recorded as a typed outcome."""
     if getattr(ctx, "discovery_mcp_server", None) is None:
         return None
     timeout_seconds = settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
     started = time.monotonic()
+    ctx.last_scout_act_observe_recapture_attempted = False
+    ctx.last_scout_act_observe_recapture_result = ""
     parsed: dict[str, Any] | None = None
     try:
         parsed = await _composition_get_structured_evidence(
             ctx, inspected_url=url, current_url=url, timeout_seconds=timeout_seconds
         )
-        if parsed is not None and has_bounded_page_schema(parsed):
-            outcome = "attached"
-        elif parsed is not None and has_actionable_steer_content(parsed):
-            # Standalone clickable controls are steer-able grounding but not forward progress:
-            # keep parsed for the steer while the hollow outcome still climbs the no-progress counter.
-            outcome = "hollow"
-        elif parsed is not None:
-            outcome = "hollow"
-            parsed = None
-        else:
-            outcome = "timeout" if time.monotonic() - started >= timeout_seconds else "error"
     except Exception:
         parsed = None
         outcome = "error"
+    else:
+        outcome = _scout_act_observe_capture_outcome(parsed, started=started, timeout_seconds=timeout_seconds)
+        if outcome == "hollow" and parsed is not None:
+            first_hollow = parsed
+            remaining_seconds = timeout_seconds - (time.monotonic() - started)
+            if remaining_seconds <= 0:
+                ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
+            else:
+                ctx.last_scout_act_observe_recapture_attempted = True
+                try:
+                    recaptured = await _composition_get_structured_evidence(
+                        ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
+                    )
+                except Exception:
+                    parsed = first_hollow
+                    outcome = "hollow"
+                    ctx.last_scout_act_observe_recapture_result = (
+                        "timeout" if time.monotonic() - started >= timeout_seconds else "error"
+                    )
+                else:
+                    if recaptured is None:
+                        parsed = first_hollow
+                        outcome = "hollow"
+                        ctx.last_scout_act_observe_recapture_result = _scout_act_observe_no_payload_result(
+                            started=started, timeout_seconds=timeout_seconds
+                        )
+                    else:
+                        recaptured_outcome = _scout_act_observe_capture_outcome(
+                            recaptured, started=started, timeout_seconds=timeout_seconds
+                        )
+                        parsed = recaptured
+                        outcome = recaptured_outcome
+                        ctx.last_scout_act_observe_recapture_result = recaptured_outcome
     ctx.last_scout_act_observe_outcome = outcome
     ctx.last_scout_act_observe_packet = parsed
     LOG.info(
@@ -401,6 +447,8 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
         url=url,
+        recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
+        recapture_result=ctx.last_scout_act_observe_recapture_result,
     )
     return parsed
 
@@ -434,6 +482,19 @@ async def _register_scout_interaction_observation(
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
+        elif parsed is not None and ctx.last_scout_act_observe_outcome == "hollow":
+            record_build_test_outcome(
+                ctx,
+                recorded_outcome_from_scout_act_observe_hollow(
+                    interaction_tool=tool_name,
+                    selector=selector,
+                    current_url=url,
+                    source_url=source_url,
+                    page_evidence=parsed,
+                    recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
+                    recapture_result=ctx.last_scout_act_observe_recapture_result,
+                ),
+            )
     step = _append_flow_evidence(ctx, evidence, reached_via="interaction")
     return step, page_evidence
 
@@ -941,10 +1002,12 @@ async def _maybe_steer_evaluate_to_action(
         if parsed is None or not has_actionable_steer_content(parsed):
             _reset_evaluate_tracker(ctx)
             return False
+        record_scouted_output_coverage(ctx, parsed)
         loaded_results = loaded_result_composition_evidence_from_page(parsed)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
+            record_build_test_outcome(ctx, recorded_outcome_from_loaded_result_evidence(loaded_results))
             data.pop("actionable_targets", None)
             data["composition_targets"] = loaded_result_composition_target_summary(loaded_results)
             data["next_action"] = "compose_extraction"

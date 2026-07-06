@@ -1,20 +1,20 @@
 import { cn } from "@/util/utils";
 import { Outlet, useMatch, useSearchParams } from "react-router-dom";
 
+// Mounted only under /agents (the /workflows alias redirects before this
+// renders), so plain canonical-path matches suffice here.
 function WorkflowsPageLayout() {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
-  const workflowEditMatch = useMatch("/workflows/:workflowPermanentId/edit");
-  const workflowStudioMatch = useMatch(
-    "/workflows/:workflowPermanentId/studio",
-  );
-  const workflowBuildMatch = useMatch("/workflows/:workflowPermanentId/build");
+  const workflowEditMatch = useMatch("/agents/:workflowPermanentId/edit");
+  const workflowStudioMatch = useMatch("/agents/:workflowPermanentId/studio");
+  const workflowBuildMatch = useMatch("/agents/:workflowPermanentId/build");
   const workflowBlockBuildMatch = useMatch(
-    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/build",
+    "/agents/:workflowPermanentId/:workflowRunId/:blockLabel/build",
   );
-  const workflowDebugMatch = useMatch("/workflows/:workflowPermanentId/debug");
+  const workflowDebugMatch = useMatch("/agents/:workflowPermanentId/debug");
   const workflowBlockDebugMatch = useMatch(
-    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/debug",
+    "/agents/:workflowPermanentId/:workflowRunId/:blockLabel/debug",
   );
   const match =
     workflowEditMatch ||

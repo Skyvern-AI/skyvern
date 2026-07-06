@@ -34,8 +34,8 @@ import { useCredentialTestStore } from "@/store/useCredentialTestStore";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
 import { copyText } from "@/util/copyText";
-import { isAxiosError } from "axios";
 import { cn } from "@/util/utils";
+import { getCredentialErrorMessage } from "./authenticatorSaveError";
 
 type Props = {
   credential: CredentialApiResponse;
@@ -120,14 +120,11 @@ function CredentialTotpCodePreview({ credentialId }: { credentialId: string }) {
       if (!isMountedRef.current) {
         return;
       }
-      const detail = isAxiosError(caught)
-        ? (caught.response?.data as { detail?: string } | undefined)?.detail
-        : undefined;
       setTotpCode(null);
       setSecondsRemaining(null);
       setExpiresAt(null);
       setIsCodeVisible(false);
-      setError(detail ?? "Unable to load code");
+      setError(getCredentialErrorMessage(caught) ?? "Unable to load code");
     } finally {
       if (isMountedRef.current) {
         setIsLoading(false);

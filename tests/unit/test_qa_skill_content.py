@@ -13,6 +13,7 @@ from tests.unit.skill_test_helpers import first_nonempty_line_after_h1
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLED_QA_SKILL = ROOT / "skyvern" / "cli" / "skills" / "qa" / "SKILL.md"
 CLAUDE_QA_SKILL = ROOT / ".claude" / "skills" / "qa" / "SKILL.md"
+CLAUDE_QA_EVIDENCE_SKILL = ROOT / ".claude" / "skills" / "qa-evidence" / "SKILL.md"
 
 _needs_cloud_repo = pytest.mark.skipif(
     not CLAUDE_QA_SKILL.exists(),
@@ -113,6 +114,28 @@ def test_qa_pr_evidence_markers_present() -> None:
     assert "Post Evidence to PR" in QA_TEST_CONTENT
     assert ".qa/latest-report.md" in QA_TEST_CONTENT
     assert "gh pr comment" in QA_TEST_CONTENT
+
+
+@pytest.mark.skipif(
+    not CLAUDE_QA_EVIDENCE_SKILL.exists(),
+    reason=".claude/skills/qa-evidence/SKILL.md not present (OSS checkout)",
+)
+def test_qa_evidence_skill_mentions_linear_signed_upload_flow() -> None:
+    skill_text = CLAUDE_QA_EVIDENCE_SKILL.read_text(encoding="utf-8")
+    required_markers = [
+        "GitHub has no public API",
+        "GraphQL `fileUpload`",
+        "public-file-urls-expire-in",
+        "fileUpload(filename: $filename, contentType: $contentType, size: $size)",
+        "commentCreate(input: { issueId: $issueId, body: $body })",
+        "Do **not** embed the unsigned `assetUrl`",
+        "31536000",
+        "`<=3600` seconds",
+        "warm GitHub's camo proxy",
+        "github-pr-screenshot-evidence",
+    ]
+    for marker in required_markers:
+        assert marker in skill_text
 
 
 @_needs_cloud_repo

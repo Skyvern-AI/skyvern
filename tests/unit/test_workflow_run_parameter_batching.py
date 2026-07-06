@@ -47,6 +47,7 @@ def _make_service_with_mocks(
     workflow_parameters: list[WorkflowParameter],
     batch_side_effect: Exception | None = None,
     single_side_effect: Exception | None = None,
+    persist_browser_session: bool = False,
 ) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
     service = WorkflowService()
@@ -59,6 +60,9 @@ def _make_service_with_mocks(
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_profile_id=None,
+        persist_browser_session=persist_browser_session,
+        browser_profile_key=None,
+        title="Workflow",
         max_elapsed_time_minutes=None,
         run_with="agent",
         code_version=None,
@@ -190,6 +194,41 @@ async def test_setup_workflow_run_raises_on_non_string_credential_id() -> None:
             )
 
     service.create_workflow_run_parameters.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_validates_credentials_before_preparing_managed_profile() -> None:
+    cred_param = _make_workflow_parameter(
+        "credential",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+    )
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[cred_param],
+        persist_browser_session=True,
+    )
+    service._validate_credential_ids = AsyncMock(  # type: ignore[method-assign]
+        side_effect=InvalidCredentialId("Credential not found")
+    )
+    service._prepare_persisted_workflow_browser_profile = AsyncMock()  # type: ignore[method-assign]
+
+    request = WorkflowRequestBody(data={"credential": "cred_missing"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        with pytest.raises(InvalidCredentialId):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization)
+    service._prepare_persisted_workflow_browser_profile.assert_not_awaited()
+    service.create_workflow_run_parameters.assert_not_awaited()
+    service.mark_workflow_run_as_failed.assert_awaited_once()
 
 
 @pytest.mark.asyncio

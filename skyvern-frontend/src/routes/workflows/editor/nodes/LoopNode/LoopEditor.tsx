@@ -98,6 +98,7 @@ function LoopEditorBody({
               nodeId={blockId}
               value={loopVariableReference}
               onChange={(v) => update({ loopVariableReference: v })}
+              data-testid="loop-variable-input"
             />
           </div>
 
@@ -163,6 +164,7 @@ function LoopEditorBody({
                     inferBranchCriteriaTypeFromExpression(v),
                 })
               }
+              data-testid="while-condition-input"
             />
           </div>
 

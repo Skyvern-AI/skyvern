@@ -349,6 +349,30 @@ def _collect_banned_block_items(
     return items
 
 
+def _blocks_with_default_labels(blocks: list[Any]) -> list[Any]:
+    normalized_blocks: list[Any] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            normalized_blocks.append(block)
+            continue
+        normalized = dict(block)
+        if not isinstance(normalized.get("label"), str):
+            normalized["label"] = "(unlabeled)"
+        loop_blocks = normalized.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            normalized["loop_blocks"] = _blocks_with_default_labels(loop_blocks)
+        normalized_blocks.append(normalized)
+    return normalized_blocks
+
+
+def collect_code_only_banned_items(blocks: list[Any]) -> list[tuple[str, str]]:
+    """Banned (label, block_type) pairs under code-only browser mode; unlabeled blocks included."""
+    return _collect_banned_block_items(
+        _blocks_with_default_labels(blocks),
+        _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
+    )
+
+
 def _detect_new_banned_blocks(
     submitted_yaml: str,
     prior_workflow_yaml: str | None,

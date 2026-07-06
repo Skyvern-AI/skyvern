@@ -6,7 +6,7 @@ from typing import Any
 import structlog
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, RecoveryHint
+from skyvern.forge.sdk.copilot.blocker_signal import BlockerKind, CopilotToolBlockerSignal, RecoveryHint
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
@@ -573,6 +573,24 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
             user_facing_reason="I'll answer with the information I already have.",
             recovery_hint="report_blocker_to_user",
         )
+    if may_read_run_context:
+        # Mutually exclusive with the blocks_context_read branch above, which requires may_read_run_context False.
+        # The allow-path returned None above, so any reaching tool is denied; deny it without terminating, keeping
+        # the turn alive to diagnose from the run evidence.
+        return _build_turn_intent_signal(
+            tool_name=tool_name,
+            classifier_mode=intent.mode.value,
+            reason_code=reason_code,
+            agent_steering_text=(
+                "You are diagnosing a past run and cannot run blocks, edit the workflow, inspect a live page, or "
+                "fetch additional context in this turn. Diagnose the failure from the run's failure evidence and "
+                "the workflow code already in context, then propose one concrete fix for the user to confirm."
+            ),
+            user_facing_reason="Let me work through what the run shows.",
+            recovery_hint="retry_with_different_tool",
+            blocker_kind="tool_error",
+            renders_final_reply=False,
+        )
     return _build_turn_intent_signal(
         tool_name=tool_name,
         classifier_mode=intent.mode.value,
@@ -596,13 +614,16 @@ def _build_turn_intent_signal(
     user_facing_reason: str,
     recovery_hint: RecoveryHint,
     cleared_by_tools: frozenset[str] = frozenset(),
+    blocker_kind: BlockerKind = "authority_denied",
+    renders_final_reply: bool = True,
 ) -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
-        blocker_kind="authority_denied",
+        blocker_kind=blocker_kind,
         agent_steering_text=agent_steering_text,
         user_facing_reason=user_facing_reason,
         recovery_hint=recovery_hint,
         cleared_by_tools=cleared_by_tools,
+        renders_final_reply=renders_final_reply,
         internal_reason_code=reason_code,
         blocked_tool=tool_name,
         classifier_mode=classifier_mode,

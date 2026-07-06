@@ -144,3 +144,37 @@ describe("BlockDetailHeader iterated-value chip", () => {
     expect(screen.getByText("alpha")).toBeDefined();
   });
 });
+
+describe("BlockDetailHeader two-tier hierarchy", () => {
+  it("keeps title + status in the primary row and demotes the id/label to the meta row", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_531711929286793050",
+      block_type: "http_request",
+      label: "signin",
+      status: Status.Completed,
+    });
+
+    const { container } = render(<BlockDetailHeader block={block} />);
+
+    const primary = container.querySelector(
+      '[data-slot="block-detail-header-primary"]',
+    );
+    const meta = container.querySelector(
+      '[data-slot="block-detail-header-meta"]',
+    );
+    expect(primary).not.toBeNull();
+    expect(meta).not.toBeNull();
+
+    const primaryText = primary?.textContent ?? "";
+    const metaText = meta?.textContent ?? "";
+
+    // Primary row is the glance: identity + outcome only.
+    expect(primaryText).toContain("HTTP Request");
+    expect(primaryText).toContain("Completed");
+
+    // The UUID is debug detail — demoted out of the primary row into meta.
+    expect(primaryText).not.toContain("wrb_531711929286793050");
+    expect(metaText).toContain("wrb_531711929286793050");
+    expect(metaText).toContain("signin");
+  });
+});

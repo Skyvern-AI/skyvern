@@ -71,6 +71,7 @@ def test_list_browser_profiles_default_pagination(monkeypatch: pytest.MonkeyPatc
         page=1,
         page_size=10,
         search_key=None,
+        managed=None,
     )
 
 
@@ -87,6 +88,7 @@ def test_list_browser_profiles_explicit_pagination(monkeypatch: pytest.MonkeyPat
         page=2,
         page_size=10,
         search_key=None,
+        managed=None,
     )
 
 
@@ -121,6 +123,7 @@ def test_list_browser_profiles_alias_trailing_slash(monkeypatch: pytest.MonkeyPa
         page=3,
         page_size=5,
         search_key=None,
+        managed=None,
     )
 
 
@@ -139,6 +142,7 @@ def test_list_browser_profiles_search_key_hit_on_name(monkeypatch: pytest.Monkey
         page=1,
         page_size=10,
         search_key="production",
+        managed=None,
     )
 
 
@@ -157,6 +161,7 @@ def test_list_browser_profiles_search_key_hit_on_description(monkeypatch: pytest
         page=1,
         page_size=10,
         search_key="staging_login",
+        managed=None,
     )
 
 
@@ -174,6 +179,7 @@ def test_list_browser_profiles_search_key_miss(monkeypatch: pytest.MonkeyPatch) 
         page=1,
         page_size=10,
         search_key="no_such_profile",
+        managed=None,
     )
 
 
@@ -190,6 +196,7 @@ def test_list_browser_profiles_search_key_with_pagination(monkeypatch: pytest.Mo
         page=2,
         page_size=5,
         search_key="prod",
+        managed=None,
     )
 
 
@@ -206,4 +213,5 @@ def test_list_browser_profiles_search_key_with_include_deleted(monkeypatch: pyte
         page=1,
         page_size=10,
         search_key="archived",
+        managed=None,
     )

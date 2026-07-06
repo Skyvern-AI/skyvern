@@ -408,6 +408,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 url=url,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                browser_profile_id=session.browser_profile_id,
             )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",

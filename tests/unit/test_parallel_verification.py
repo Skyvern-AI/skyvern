@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.forge.agent import ForgeAgent, SpeculativePlan
+from skyvern.forge.agent import ForgeAgent, SpeculativePlan, StepPromptResult
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -214,7 +214,15 @@ async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
     scraped_page.check_pdf_viewer_embed = MagicMock(return_value=False)
     scraped_page.screenshots = [b"img"]
 
-    build_prompt_mock = AsyncMock(return_value=(scraped_page, "prompt", False, "extract-actions"))
+    build_prompt_mock = AsyncMock(
+        return_value=StepPromptResult(
+            scraped_page=scraped_page,
+            extract_action_prompt="prompt",
+            use_caching=False,
+            prompt_name="extract-actions",
+            without_page_information=False,
+        )
+    )
     monkeypatch.setattr(agent, "build_and_record_step_prompt", build_prompt_mock)
     monkeypatch.setattr(agent, "register_async_operations", AsyncMock())
 
@@ -478,7 +486,15 @@ async def test_agent_step_skips_user_goal_check_when_feature_disabled(monkeypatc
     )
     scraped_page.screenshots = [b"image"]
 
-    agent.build_and_record_step_prompt = AsyncMock(return_value=(scraped_page, "prompt", False, "extract-actions"))
+    agent.build_and_record_step_prompt = AsyncMock(
+        return_value=StepPromptResult(
+            scraped_page=scraped_page,
+            extract_action_prompt="prompt",
+            use_caching=False,
+            prompt_name="extract-actions",
+            without_page_information=False,
+        )
+    )
     json_response: dict[str, object] = {"actions": [{"action_type": "CLICK", "element_id": "node-1"}]}
     agent.handle_potential_OTP_actions = AsyncMock(return_value=(json_response, []))
 
@@ -824,3 +840,130 @@ async def test_persist_scrape_artifacts_bundling_disabled_logs_and_reraises_fail
     )
     full_tree_mock.assert_called_once()
     economy_tree_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_speculative_plan_null_response_does_not_unbind_without_page_information(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation task + speculative plan where llm_json_response is None must
+    not raise UnboundLocalError for without_page_information. The speculative
+    plan does not carry a router result, so the default is page-aware."""
+    from skyvern.forge.sdk.db.enums import TaskType
+
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        task_type=TaskType.validation,
+        navigation_goal=None,
+        complete_criterion="extracted_amount equals invoice_amount",
+    )
+    step = make_step(now, task, step_id="step-spec-fallback", status=StepStatus.created, order=0, output=None)
+
+    browser_state, _, page = make_browser_state()
+    browser_state.must_get_working_page = AsyncMock(return_value=page)
+    browser_state.get_working_page = AsyncMock(return_value=page)
+
+    async def _dummy_cleanup(*_args, **_kwargs) -> list[dict]:
+        return []
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[{"tagName": "div", "children": []}],
+        element_tree_trimmed=[{"tagName": "div", "children": []}],
+        _browser_state=browser_state,
+        _clean_up_func=_dummy_cleanup,
+        _scrape_exclude=None,
+    )
+    scraped_page.html = "<html></html>"
+    scraped_page.screenshots = [b"image"]
+
+    speculative_plan = SpeculativePlan(
+        scraped_page=scraped_page,
+        extract_action_prompt="unused",
+        use_caching=False,
+        llm_json_response=None,
+        llm_metadata=None,
+        prompt_name="extract-actions",
+    )
+
+    llm_handler_mock = AsyncMock(
+        return_value={"actions": [{"action_type": "COMPLETE", "reasoning": "done", "confidence_float": 1.0}]}
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+        lambda *_args, **_kwargs: llm_handler_mock,
+    )
+    monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", AsyncMock(return_value=[ActionSuccess()]))
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.prepare_step_execution", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_action_execution", AsyncMock())
+    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.random.uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", AsyncMock())
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached",
+        AsyncMock(return_value=False),
+    )
+    agent.record_artifacts_after_action = AsyncMock()
+    agent._persist_scrape_artifacts = AsyncMock()
+    agent._is_multi_field_totp_sequence = MagicMock(return_value=False)
+    extract_action = ExtractAction(
+        reasoning="collect",
+        data_extraction_goal=task.data_extraction_goal,
+        data_extraction_schema=task.extracted_information_schema,
+    )
+    extract_action.organization_id = task.organization_id
+    extract_action.workflow_run_id = task.workflow_run_id
+    extract_action.task_id = task.task_id
+    extract_action.step_id = step.step_id
+    extract_action.step_order = step.order
+    extract_action.action_order = 0
+    agent.create_extract_action = AsyncMock(return_value=extract_action)
+
+    async def fake_update_step(
+        step: Step,
+        status: StepStatus | None = None,
+        output=None,
+        is_last: bool | None = None,
+        retry_index: int | None = None,
+        **_kwargs,
+    ) -> Step:
+        if status is not None:
+            step.status = status
+        if output is not None:
+            step.output = output
+        if is_last is not None:
+            step.is_last = is_last
+        if retry_index is not None:
+            step.retry_index = retry_index
+        return step
+
+    agent.update_step = AsyncMock(side_effect=fake_update_step)
+
+    context = SkyvernContext(
+        task_id=task.task_id,
+        step_id=None,
+        organization_id=task.organization_id,
+        workflow_run_id=task.workflow_run_id,
+        tz_info=ZoneInfo("UTC"),
+    )
+    context.speculative_plans[step.step_id] = speculative_plan
+    skyvern_context.set(context)
+    try:
+        await agent.agent_step(
+            task=task,
+            step=step,
+            browser_state=browser_state,
+            organization=organization,
+        )
+    finally:
+        skyvern_context.reset()
+
+    # If we reach here without UnboundLocalError, the regression is fixed.
+    # Validation tasks with speculative plans re-scrape; the key invariant
+    # is that agent_step completes (pass or fail) without raising
+    # UnboundLocalError for without_page_information.
+    assert step.status in (StepStatus.completed, StepStatus.failed)

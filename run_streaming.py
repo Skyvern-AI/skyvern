@@ -34,7 +34,7 @@ async def run() -> None:
 
         try:
             if workflow_run_id:
-                workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id=workflow_run_id)
                 if not workflow_run or workflow_run.status in [
                     WorkflowRunStatus.completed,
                     WorkflowRunStatus.failed,
@@ -44,7 +44,7 @@ async def run() -> None:
                 file_name = f"{workflow_run_id}.png"
 
             elif task_id:
-                task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+                task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
                 if not task or task.status.is_final():
                     continue
                 file_name = f"{task_id}.png"

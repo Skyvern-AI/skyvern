@@ -66,17 +66,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _watchdog_user_failure_reason,
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
-
-
-def _fresh_context() -> CopilotContext:
-    return CopilotContext(
-        organization_id="o",
-        workflow_id="w",
-        workflow_permanent_id="wp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
+from tests.unit.conftest import make_copilot_context as _fresh_context
 
 
 def _budget_trip_result(workflow_run_id: str = "wr_1") -> dict:

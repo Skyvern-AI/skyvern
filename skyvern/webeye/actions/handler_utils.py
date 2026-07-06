@@ -7,6 +7,8 @@ from playwright.async_api import Locator, Page
 from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.forge.sdk.api.files import download_file as download_file_api
+from skyvern.forge.sdk.api.files import resolve_run_download_id, validate_local_file_path
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions.actions import Action, KeypressAction
 
@@ -18,6 +20,10 @@ async def download_file(
     action: dict[str, Any] | None = None,
     organization_id: str | None = None,
 ) -> str | list[str]:
+    if file_url.startswith("/"):
+        run_id = resolve_run_download_id(skyvern_context.current())
+        return validate_local_file_path(file_url, run_id)
+
     try:
         return await download_file_api(file_url, organization_id=organization_id)
     except Exception:

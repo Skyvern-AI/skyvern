@@ -19,19 +19,21 @@ describe("HINT_REGISTRY", () => {
 
   it("matches both the build and edit editor paths", () => {
     const block = HINT_REGISTRY.find((h) => h.id === "add-another-block")!;
+    expect(block.matchRoute("/agents/wpid_123/build")).toBe(true);
+    expect(block.matchRoute("/agents/wpid_123/edit")).toBe(true);
     expect(block.matchRoute("/workflows/wpid_123/build")).toBe(true);
-    expect(block.matchRoute("/workflows/wpid_123/edit")).toBe(true);
-    expect(block.matchRoute("/workflows")).toBe(false);
-    expect(block.matchRoute("/workflows/wpid_123/runs")).toBe(false);
+    expect(block.matchRoute("/agents")).toBe(false);
+    expect(block.matchRoute("/agents/wpid_123/runs")).toBe(false);
   });
 
-  it("matches the runs and workflows list routes exactly", () => {
+  it("matches the runs and agents list routes exactly", () => {
     const run = HINT_REGISTRY.find((h) => h.id === "run-recording")!;
     const tmpl = HINT_REGISTRY.find((h) => h.id === "start-template")!;
     expect(run.matchRoute("/runs")).toBe(true);
     expect(run.matchRoute("/runs/abc")).toBe(false);
+    expect(tmpl.matchRoute("/agents")).toBe(true);
     expect(tmpl.matchRoute("/workflows")).toBe(true);
-    expect(tmpl.matchRoute("/workflows/wpid_1/edit")).toBe(false);
+    expect(tmpl.matchRoute("/agents/wpid_1/edit")).toBe(false);
   });
 
   it("gates the template hint on no first save", () => {

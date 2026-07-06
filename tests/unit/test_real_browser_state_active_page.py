@@ -29,6 +29,18 @@ async def test_no_pin_returns_last_page() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blank_url", ["about:blank", ":"])
+async def test_no_pin_returns_last_blank_page(blank_url: str) -> None:
+    page0 = _mock_page("https://example.test/bills")
+    blank_page = _mock_page(blank_url)
+    state = _make_state()
+    state.list_valid_pages = AsyncMock(return_value=[page0, blank_page])
+    await state.set_working_page(page0)
+
+    assert await state.get_working_page() is blank_page
+
+
+@pytest.mark.asyncio
 async def test_pin_overrides_last_page() -> None:
     page0, page1 = _mock_page(), _mock_page()
     state = _make_state()
@@ -61,6 +73,30 @@ async def test_pin_dropped_when_new_tab_opens() -> None:
     page2 = _mock_page()
     state.list_valid_pages = AsyncMock(return_value=[page0, page1, page2])
     assert await state.get_working_page() is page2
+
+
+@pytest.mark.asyncio
+async def test_pin_dropped_when_about_blank_tab_opens() -> None:
+    page0, page1 = _mock_page(), _mock_page()
+    state = _make_state()
+    state.list_valid_pages = AsyncMock(return_value=[page0, page1])
+    await state.set_active_page(page0)
+
+    blank_page = _mock_page("about:blank")
+    state.list_valid_pages = AsyncMock(return_value=[page0, page1, blank_page])
+    assert await state.get_working_page() is blank_page
+
+
+@pytest.mark.asyncio
+async def test_pin_survives_when_recoverable_blank_marker_opens() -> None:
+    page0, page1 = _mock_page(), _mock_page()
+    state = _make_state()
+    state.list_valid_pages = AsyncMock(return_value=[page0, page1])
+    await state.set_active_page(page0)
+
+    blank_page = _mock_page(":")
+    state.list_valid_pages = AsyncMock(return_value=[page0, page1, blank_page])
+    assert await state.get_working_page() is page0
 
 
 @pytest.mark.asyncio

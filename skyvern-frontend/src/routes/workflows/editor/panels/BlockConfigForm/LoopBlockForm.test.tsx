@@ -35,14 +35,16 @@ vi.mock("@/components/WorkflowBlockInput", () => ({
   WorkflowBlockInput: ({
     value,
     onChange,
+    "data-testid": dataTestId,
   }: {
     value: string;
     onChange: (v: string) => void;
     nodeId: string;
     className?: string;
+    "data-testid"?: string;
   }) => (
     <input
-      data-testid="loop-variable-input"
+      data-testid={dataTestId}
       value={value}
       onChange={(e) => onChange(e.target.value)}
     />
@@ -114,11 +116,15 @@ afterEach(() => {
 function setLoopNode(
   id: string,
   data: Partial<{
+    loopKind: "for_each" | "while";
     loopVariableReference: string;
     dataSchema: string;
     completeIfEmpty: boolean;
     continueOnFailure: boolean;
     nextLoopOnFailure: boolean | undefined;
+    whileConditionExpression: string;
+    whileConditionCriteriaType: "jinja2_template" | "prompt";
+    whileConditionDescription: string | null;
     editable: boolean;
   }> = {},
 ) {
@@ -140,9 +146,11 @@ function setLoopNode(
       // SKY-8771 introduced loopKind / whileCondition* fields. Default the
       // fixture to the for-each branch so the existing test cases continue
       // to exercise the for-each form fields.
-      loopKind: "for_each",
-      whileConditionExpression: "{{ true }}",
-      whileConditionCriteriaType: "jinja2_template",
+      loopKind: data.loopKind ?? "for_each",
+      whileConditionExpression: data.whileConditionExpression ?? "{{ true }}",
+      whileConditionCriteriaType:
+        data.whileConditionCriteriaType ?? "jinja2_template",
+      whileConditionDescription: data.whileConditionDescription ?? null,
     },
   });
 }
@@ -203,6 +211,28 @@ describe("LoopBlockForm (SKY-9361)", () => {
     });
     expect(updateNodeData).toHaveBeenCalledWith("p1", {
       loopVariableReference: "{{ items }}",
+    });
+  });
+
+  test("renders while loop condition and edits propagate via updateNodeData", () => {
+    setLoopNode("p1", {
+      loopKind: "while",
+      whileConditionExpression: "{{ count < 3 }}",
+    });
+    render(<LoopBlockForm blockId="p1" />);
+
+    expect(screen.getByText("Loop Condition")).toBeDefined();
+    expect(
+      (screen.getByTestId("while-condition-input") as HTMLInputElement).value,
+    ).toBe("{{ count < 3 }}");
+
+    fireEvent.change(screen.getByTestId("while-condition-input"), {
+      target: { value: "{{ count < 5 }}" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("p1", {
+      whileConditionExpression: "{{ count < 5 }}",
+      whileConditionCriteriaType: "jinja2_template",
     });
   });
 

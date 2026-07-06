@@ -1,4 +1,5 @@
 import hashlib
+from typing import Any
 
 import structlog
 from fastapi import BackgroundTasks, HTTPException, Request
@@ -8,6 +9,10 @@ from skyvern.config import settings
 from skyvern.exceptions import TaskNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    CustomLLMNotFoundError,
+    ensure_custom_llm_model_registered_for_org,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -17,6 +22,28 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, Tas
 from skyvern.schemas.runs import RunEngine, RunStatus, RunType
 
 LOG = structlog.get_logger()
+
+
+class InvalidTaskV1ModelError(ValueError):
+    pass
+
+
+async def _validate_task_v1_model_for_org(organization: Organization, model: dict[str, Any] | None) -> None:
+    if not model:
+        return
+
+    model_name = model.get("model_name")
+    if not isinstance(model_name, str):
+        return
+
+    try:
+        await ensure_custom_llm_model_registered_for_org(
+            model_name,
+            organization.organization_id,
+            app.DATABASE,
+        )
+    except CustomLLMNotFoundError as e:
+        raise InvalidTaskV1ModelError("Custom LLM model not found for organization") from e
 
 
 async def generate_task(user_prompt: str, organization: Organization) -> TaskGeneration:
@@ -85,6 +112,8 @@ async def run_task(
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
 ) -> Task:
+    await _validate_task_v1_model_for_org(organization, task.model)
+
     created_task = await app.agent.create_task(task, organization.organization_id)
     url_hash = generate_url_hash(task.url)
     run_type = RunType.task_v1

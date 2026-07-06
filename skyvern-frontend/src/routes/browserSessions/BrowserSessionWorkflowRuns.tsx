@@ -101,7 +101,7 @@ function BrowserSessionWorkflowRuns() {
             {runs.map((workflowRun) => {
               const url = env.useNewRunsUrl
                 ? `/runs/${workflowRun.workflow_run_id}`
-                : `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`;
+                : `/agents/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`;
               return (
                 <TableRow
                   key={workflowRun.workflow_run_id}

@@ -5,11 +5,12 @@ import { useCallback } from "react";
 
 import { toast } from "@/components/ui/use-toast";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
-import {
-  useWorkflowHasChangesStore,
-  useWorkflowSave,
-} from "@/store/WorkflowHasChangesStore";
+import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import {
+  commitYamlDraft,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { getWorkflowErrors } from "../workflowEditorUtils";
 import type { AppNode } from "../nodes";
 
@@ -17,13 +18,20 @@ export function useSaveWorkflow(): () => Promise<void> {
   const { workflowPermanentId } = useParams();
   const reactFlow = useReactFlow<AppNode>();
   const saveWorkflow = useWorkflowSave({ status: "published" });
-  const workflowChangesStore = useWorkflowHasChangesStore();
   const setFilter = useCacheKeyValueStore((s) => s.setFilter);
   const queryClient = useQueryClient();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const cacheKey = workflow?.cache_key ?? "";
 
   return useCallback(async () => {
+    // While the YAML editor is open, saving persists the parsed draft directly
+    // rather than the stale pre-edit canvas — committing applies the graph via
+    // async setNodes, so a graph-based save here would race it.
+    if (useWorkflowYamlEditorStore.getState().active) {
+      await commitYamlDraft(true);
+      return;
+    }
+
     const nodes = reactFlow.getNodes();
     const errors = getWorkflowErrors(nodes);
     if (errors.length > 0) {
@@ -41,9 +49,7 @@ export function useSaveWorkflow(): () => Promise<void> {
       return;
     }
 
-    await saveWorkflow.mutateAsync();
-
-    workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+    await saveWorkflow.mutateAsync(undefined);
 
     queryClient.invalidateQueries({
       queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
@@ -53,7 +59,6 @@ export function useSaveWorkflow(): () => Promise<void> {
   }, [
     reactFlow,
     saveWorkflow,
-    workflowChangesStore,
     queryClient,
     workflowPermanentId,
     cacheKey,

@@ -34,7 +34,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import pyotp
 import structlog
@@ -112,7 +112,13 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCrea
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.credentials import normalize_totp_config, parse_totp_config
+from skyvern.forge.sdk.services.credentials import (
+    AuthenticatorTotpErrorCode,
+    AuthenticatorTotpParseResult,
+    normalize_totp_config,
+    parse_totp_config,
+)
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -184,6 +190,31 @@ _TOTP_CODE_PREVIEW_CACHE: dict[tuple[str, str], _TotpCodePreviewCacheEntry] = {}
 # across workers; entries are bounded and expire at the active TOTP window.
 
 
+def _authenticator_totp_error_detail(
+    *,
+    error_code: AuthenticatorTotpErrorCode,
+    message: str,
+    vendor: str | None = None,
+) -> dict[str, str]:
+    detail = {"error_code": error_code.value, "message": message}
+    if vendor:
+        detail["vendor"] = vendor
+    return detail
+
+
+def _raise_authenticator_totp_http_error(
+    *,
+    status_code: int,
+    error_code: AuthenticatorTotpErrorCode,
+    message: str,
+    vendor: str | None = None,
+) -> NoReturn:
+    raise HTTPException(
+        status_code=status_code,
+        detail=_authenticator_totp_error_detail(error_code=error_code, message=message, vendor=vendor),
+    )
+
+
 def _parse_authenticator_totp_config_or_raise(
     totp_secret: str | None,
     *,
@@ -192,12 +223,20 @@ def _parse_authenticator_totp_config_or_raise(
 ) -> tuple[pyotp.TOTP, str]:
     raw_totp_secret = (totp_secret or "").strip()
     if raw_totp_secret == "":
-        raise HTTPException(status_code=400, detail=missing_detail)
+        _raise_authenticator_totp_http_error(
+            status_code=400,
+            error_code=AuthenticatorTotpErrorCode.AUTHENTICATOR_KEY_REQUIRED,
+            message=missing_detail,
+        )
 
     normalized_totp_secret = normalize_totp_config(raw_totp_secret)
     totp = parse_totp_config(normalized_totp_secret)
     if not totp:
-        raise HTTPException(status_code=400, detail=invalid_detail)
+        _raise_authenticator_totp_http_error(
+            status_code=400,
+            error_code=AuthenticatorTotpErrorCode.INVALID_AUTHENTICATOR_KEY,
+            message=invalid_detail,
+        )
     return totp, normalized_totp_secret
 
 
@@ -221,13 +260,18 @@ async def _parse_enterprise_totp_secret_or_raise(
     organization_id: str,
     invalid_detail: str = _AUTHENTICATOR_SECRET_INVALID_DETAIL,
 ) -> str | None:
-    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+    result: AuthenticatorTotpParseResult = await app.AGENT_FUNCTION.parse_enterprise_totp_secret_result(
         totp_secret or "",
         organization_id=organization_id,
     )
-    if enterprise_totp_secret == "":
-        raise HTTPException(status_code=400, detail=invalid_detail)
-    return enterprise_totp_secret
+    if result.error_code is not None:
+        _raise_authenticator_totp_http_error(
+            status_code=400,
+            error_code=result.error_code,
+            message=result.message or invalid_detail,
+            vendor=result.vendor,
+        )
+    return result.secret
 
 
 async def _build_authenticator_totp_for_organization_or_raise(
@@ -283,8 +327,9 @@ async def _normalize_authenticator_totp_for_organization_or_raise(
         organization_id=organization_id,
     )
     if enterprise_totp_secret is not None:
-        # Keep enterprise payloads raw in credential.totp; runtime paths re-parse
-        # them through the cloud parser before generating codes.
+        # The cloud parser has already extracted any vendor QR payload into a
+        # standard TOTP config, so new saves can store the canonical secret.
+        credential.totp = _parse_authenticator_totp_or_raise(enterprise_totp_secret)
         return
 
     _normalize_authenticator_totp_or_raise(credential)
@@ -332,6 +377,8 @@ def _cache_totp_code_preview(
 ) -> None:
     _prune_totp_code_preview_cache(now=now)
     while len(_TOTP_CODE_PREVIEW_CACHE) >= _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES:
+        # Dict iteration order makes this FIFO eviction, which is enough for this
+        # per-process preview cache.
         _TOTP_CODE_PREVIEW_CACHE.pop(next(iter(_TOTP_CODE_PREVIEW_CACHE)))
 
     _TOTP_CODE_PREVIEW_CACHE[(organization_id, credential_id)] = _TotpCodePreviewCacheEntry(
@@ -888,9 +935,10 @@ async def test_login(
             organization_id=organization_id,
         )
         try:
-            await app.DATABASE.credentials.delete_credential(
+            await _delete_temporary_test_login_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
+                reason="workflow setup error",
             )
         except Exception:
             LOG.warning(
@@ -1328,20 +1376,11 @@ async def cancel_credential_test(
     # Only clean up temporary credentials after successful cancellation.
     # The background task may also try to delete — that's fine, it handles NotFound gracefully.
     try:
-        credential = await app.DATABASE.credentials.get_credential(
+        await _delete_temporary_test_login_credential(
             credential_id=credential_id,
             organization_id=organization_id,
+            reason="test cancellation",
         )
-        if credential and credential.name.startswith("_test_login_"):
-            await app.DATABASE.credentials.delete_credential(
-                credential_id=credential_id,
-                organization_id=organization_id,
-            )
-            LOG.info(
-                "Cleaned up temporary credential after test cancellation",
-                credential_id=credential_id,
-                organization_id=organization_id,
-            )
     except Exception:
         LOG.warning(
             "Failed to clean up temporary credential after test cancellation",
@@ -1395,14 +1434,10 @@ async def _create_browser_profile_after_workflow(
                 # Clean up temporary credentials created by test-login
                 if credential_name.startswith("_test_login_"):
                     try:
-                        await app.DATABASE.credentials.delete_credential(
+                        await _delete_temporary_test_login_credential(
                             credential_id=credential_id,
                             organization_id=organization_id,
-                        )
-                        LOG.info(
-                            "Deleted temporary credential after failed test",
-                            credential_id=credential_id,
-                            organization_id=organization_id,
+                            reason="failed test",
                         )
                     except Exception:
                         LOG.warning(
@@ -1427,16 +1462,13 @@ async def _create_browser_profile_after_workflow(
                     workflow_permanent_id=workflow_permanent_id,
                 )
                 return
-            browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
-                workflow=workflow,
-                workflow_run=workflow_run,
-            )
             session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
-                session_dir = await app.STORAGE.retrieve_browser_session(
+                session_dir = await retrieve_persisted_workflow_browser_state_dir(
                     organization_id=organization_id,
-                    workflow_permanent_id=browser_session_storage_key,
+                    workflow=workflow,
+                    workflow_run=workflow_run,
                 )
                 if session_dir:
                     break
@@ -1555,9 +1587,10 @@ async def _create_browser_profile_after_workflow(
         # Clean up temporary credentials on poll timeout
         if credential_name.startswith("_test_login_"):
             try:
-                await app.DATABASE.credentials.delete_credential(
+                await _delete_temporary_test_login_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
+                    reason="poll timeout",
                 )
             except Exception:
                 LOG.warning(
@@ -1574,9 +1607,10 @@ async def _create_browser_profile_after_workflow(
         # Clean up temporary credentials on unexpected error
         if credential_name.startswith("_test_login_"):
             try:
-                await app.DATABASE.credentials.delete_credential(
+                await _delete_temporary_test_login_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
+                    reason="profile persistence error",
                 )
             except Exception:
                 LOG.warning(
@@ -1792,7 +1826,8 @@ async def get_credential_totp_code(
     if cached_response is not None:
         return cached_response
 
-    credential_service = await _get_credential_vault_service(vault_type_override=credential.vault_type)
+    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
     try:
         credential_item = await credential_service.get_credential_item(credential)
     except SkyvernHttpException as e:
@@ -1935,7 +1970,7 @@ async def get_credentials(
     ),
     vault_type: CredentialVaultType | None = Query(
         default=None,
-        description="Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+        description="Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
     ),
     credential_type: CredentialType | None = Query(
         default=None,
@@ -2840,7 +2875,13 @@ async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
 ) -> CredentialVaultService:
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
-    if vault_type == CredentialVaultType.BITWARDEN:
+    if vault_type == CredentialVaultType.SKYVERN:
+        if not settings.is_local_credential_vault_enabled():
+            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not enabled")
+        if not app.SKYVERN_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not configured")
+        return app.SKYVERN_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
@@ -2856,6 +2897,30 @@ async def _get_credential_vault_service(
         return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+
+async def _delete_temporary_test_login_credential(
+    *,
+    credential_id: str,
+    organization_id: str,
+    reason: str,
+) -> None:
+    credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id,
+        organization_id=organization_id,
+    )
+    if not credential or not credential.name.startswith("_test_login_"):
+        return
+
+    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
+    await credential_service.delete_credential(credential)
+    LOG.info(
+        "Deleted temporary credential",
+        credential_id=credential_id,
+        organization_id=organization_id,
+        reason=reason,
+    )
 
 
 def _convert_to_response(credential: Credential) -> CredentialResponse:
