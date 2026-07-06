@@ -735,3 +735,35 @@ class CopilotContext(AgentContext):
     block_ended_at_map: dict[str, str] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+
+    def has_genuine_workflow_attempt(self) -> bool:
+        """This turn persisted a workflow proposal or executed a real build-test run; excludes
+        ``test_after_update_done``, which is stamped for any ``run_blocks_and_collect_debug`` scout
+        probe (including early-return probes that record no run) and so is not a genuine-attempt signal."""
+        if self.update_workflow_called:
+            return True
+        if self.last_update_block_count is not None:
+            return True
+        if self.last_test_ok is not None:
+            return True
+        for run_id in (
+            self.last_run_blocks_workflow_run_id,
+            self.last_successful_run_blocks_workflow_run_id,
+            self.last_outcome_gate_workflow_run_id,
+        ):
+            if run_id is not None and run_id.strip():
+                return True
+        return False
+
+    def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
+        return {
+            "has_genuine_workflow_attempt": self.has_genuine_workflow_attempt(),
+            "update_workflow_called": self.update_workflow_called,
+            "test_after_update_done": self.test_after_update_done,
+            "last_update_block_count": self.last_update_block_count,
+            "last_test_ok": self.last_test_ok,
+            "last_run_blocks_workflow_run_id": self.last_run_blocks_workflow_run_id,
+            "last_successful_run_blocks_workflow_run_id": self.last_successful_run_blocks_workflow_run_id,
+            "last_outcome_gate_workflow_run_id": self.last_outcome_gate_workflow_run_id,
+            "ctx_last_workflow_present": self.last_workflow is not None,
+        }

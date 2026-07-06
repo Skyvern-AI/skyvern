@@ -91,6 +91,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
     artifact_health_blocked,
     outcome_fully_verified,
+    recycle_admits_present_completion_contract_ask,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
@@ -1633,6 +1634,15 @@ def _build_narrative_payload(
     }
 
 
+def _log_output_policy_parity(ctx: CopilotContext, *, has_workflow_proposal: bool, workflow_attempted: bool) -> None:
+    LOG.info(
+        "copilot.output_policy_parity",
+        has_workflow_proposal=has_workflow_proposal,
+        workflow_attempted=workflow_attempted,
+        **ctx.genuine_attempt_parity_fields(),
+    )
+
+
 def _build_exit_result(
     ctx: CopilotContext,
     user_response: str,
@@ -1648,7 +1658,10 @@ def _build_exit_result(
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason or ("cancel" if cancelled else None),
     )
-    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    workflow_attempted = ctx.has_genuine_workflow_attempt()
+    _log_output_policy_parity(
+        ctx, has_workflow_proposal=verified_workflow is not None, workflow_attempted=workflow_attempted
+    )
     output_kind = derive_output_kind(
         response_type="REPLY",
         request_policy=ctx.request_policy,
@@ -3159,7 +3172,10 @@ async def _translate_to_agent_result(
         structured = StructuredContext.from_json_str(llm_context_raw)
     structured.merge_turn_summary(ctx.tool_activity)
     enriched_context = structured.to_json_str()
-    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    workflow_attempted = ctx.has_genuine_workflow_attempt()
+    _log_output_policy_parity(
+        ctx, has_workflow_proposal=last_workflow is not None, workflow_attempted=workflow_attempted
+    )
     if _should_use_built_unverified_completed_reply(
         ctx,
         response_type=resp_type,
@@ -3507,7 +3523,12 @@ def _evaluate_copilot_final_output_policy(
     elif isinstance(getattr(ctx, "last_workflow_yaml", None), str):
         workflow_yaml = ctx.last_workflow_yaml
 
-    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    workflow_attempted = ctx.has_genuine_workflow_attempt()
+    _log_output_policy_parity(
+        ctx,
+        has_workflow_proposal=bool(workflow_yaml or ctx.last_workflow is not None),
+        workflow_attempted=workflow_attempted,
+    )
     surface_untested_draft = _should_surface_untested_draft_despite_question(ctx, response_type)
     policy_response_type = "REPLY" if surface_untested_draft else response_type
     if surface_untested_draft:
@@ -3543,6 +3564,9 @@ def _evaluate_copilot_final_output_policy(
         output_kind=output_kind,
     )
     hard_verdict = hard_block_output_policy_verdict(raw_verdict)
+    deferred_reason_codes = _defer_avoidable_ask_to_recycle(ctx, hard_verdict, response_type)
+    if deferred_reason_codes is not None:
+        hard_verdict = OutputPolicyVerdict(allowed=True, output_kind=hard_verdict.output_kind)
     diagnostics = build_output_policy_diagnostics(
         raw_verdict=raw_verdict,
         final_verdict=hard_verdict,
@@ -3552,7 +3576,29 @@ def _evaluate_copilot_final_output_policy(
         hard_block_reason_codes=list(hard_verdict.reason_codes),
         soft_rewrite_reason_codes=[],
     )
+    if deferred_reason_codes is not None:
+        diagnostics["deferred_to_recycle"] = True
+        diagnostics["deferred_reason_codes"] = [reason.value for reason in deferred_reason_codes]
     return hard_verdict, response_type, diagnostics
+
+
+def _defer_avoidable_ask_to_recycle(
+    ctx: CopilotContext,
+    hard_verdict: OutputPolicyVerdict,
+    response_type: str,
+) -> list[OutputPolicyReason] | None:
+    if hard_verdict.allowed or response_type != "ASK_QUESTION":
+        return None
+    if list(hard_verdict.reason_codes) != [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION]:
+        return None
+    if not recycle_admits_present_completion_contract_ask(ctx):
+        return None
+    LOG.info(
+        "copilot.output_policy_avoidable_deferred_to_recycle",
+        deferred_reason_codes=[reason.value for reason in hard_verdict.reason_codes],
+        **ctx.genuine_attempt_parity_fields(),
+    )
+    return list(hard_verdict.reason_codes)
 
 
 def _build_copilot_input_guardrails(
@@ -3780,7 +3826,7 @@ def _build_output_policy_blocked_result(
             workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
             has_workflow_proposal=preserved_workflow is not None,
             workflow_was_persisted=ctx.workflow_persisted,
-            workflow_attempted=bool(ctx.last_run_blocks_workflow_run_id),
+            workflow_attempted=ctx.has_genuine_workflow_attempt(),
             unvalidated=ctx.last_test_ok is not True,
             output_kind=verdict.output_kind,
         )
