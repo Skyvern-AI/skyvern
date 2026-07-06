@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import tempfile
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -15,7 +17,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_blocker_signal_for_reason_codes,
@@ -41,6 +43,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     code_contains_credential_fill,
     trajectory_has_credential_fill,
 )
+from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
@@ -96,6 +99,9 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -114,6 +120,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -190,6 +197,11 @@ _RUN_ID_UNSET = _RunIdUnset()
 _ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_INTERVAL_SECONDS = 30.0
 _ACTIVE_RUN_TERMINAL_MONITOR_MAX_SAMPLES = 8
+
+_MAX_REGISTERED_ARTIFACTS = 3
+_MAX_REGISTERED_ARTIFACT_BYTES = 5 * 1024 * 1024
+_MAX_REGISTERED_ARTIFACT_TEXT_CHARS = 20_000
+_REGISTERED_ARTIFACT_PARSE_EXTENSIONS = frozenset({".txt", ".csv", ".json"})
 
 _POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
 
@@ -1085,14 +1097,141 @@ async def _attach_registered_output_parameter_values(
     return values_by_label
 
 
-async def _capture_and_store_post_run_failure_page(
+def _pin_pre_run_page_reference(ctx: CopilotContext, run_id: str) -> None:
+    evidence = ctx.composition_page_evidence
+    if not isinstance(evidence, Mapping):
+        return
+    text = page_evidence_prose_text(evidence).strip()
+    if not text:
+        return
+    ctx.pre_run_page_reference = PreRunPageReference(text=text, workflow_run_id=run_id)
+
+
+def _artifact_file_name(artifact: Artifact) -> str:
+    uri = artifact.uri if isinstance(artifact.uri, str) else ""
+    return uri.rsplit("/", 1)[-1] if uri else artifact.artifact_id
+
+
+def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> str | None:
+    suffix = os.path.splitext(file_name)[1].lower()
+    if suffix == ".pdf":
+        temp_file_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file_path = temp_file.name
+                temp_file.write(artifact_bytes)
+            return extract_pdf_file(temp_file_path, file_identifier=file_name) or None
+        except Exception:
+            return None
+        finally:
+            if temp_file_path is not None:
+                try:
+                    os.unlink(temp_file_path)
+                except OSError:
+                    pass
+    if suffix in _REGISTERED_ARTIFACT_PARSE_EXTENSIONS:
+        try:
+            return artifact_bytes.decode("utf-8", errors="ignore") or None
+        except Exception:
+            return None
+    return None
+
+
+def _collect_downloaded_artifact_ids(block_outputs_by_label: Mapping[str, Any]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for output in block_outputs_by_label.values():
+        if not isinstance(output, dict):
+            continue
+        raw = output.get("downloaded_file_artifact_ids")
+        if not isinstance(raw, list):
+            continue
+        for artifact_id in raw:
+            if isinstance(artifact_id, str) and artifact_id and artifact_id not in seen:
+                seen.add(artifact_id)
+                ordered.append(artifact_id)
+    return ordered
+
+
+async def _fetch_registered_download_artifacts(
+    *, run_id: str, organization_id: str, downloaded_artifact_ids: Sequence[str] | None
+) -> list[Artifact]:
+    # The run's own download artifact ids are same-run by construction, so keying off them
+    # avoids depending on the DOWNLOAD row's workflow_run_id stamp across repair-iteration run ids.
+    if downloaded_artifact_ids:
+        artifacts = await app.DATABASE.artifacts.get_artifacts_by_ids(
+            list(dict.fromkeys(downloaded_artifact_ids)),
+            organization_id=organization_id,
+        )
+        by_id = {
+            artifact.artifact_id: artifact for artifact in artifacts if artifact.artifact_type == ArtifactType.DOWNLOAD
+        }
+        return [by_id[artifact_id] for artifact_id in dict.fromkeys(downloaded_artifact_ids) if artifact_id in by_id]
+    result = await app.DATABASE.artifacts.get_artifacts_for_run(
+        run_id,
+        organization_id=organization_id,
+        artifact_types=[ArtifactType.DOWNLOAD],
+    )
+    return result if isinstance(result, list) else []
+
+
+async def _capture_registered_artifact_evidence(
+    ctx: CopilotContext,
+    *,
+    run_id: str,
+    organization_id: str,
+    downloaded_artifact_ids: Sequence[str] | None = None,
+) -> None:
+    try:
+        artifacts = await _fetch_registered_download_artifacts(
+            run_id=run_id,
+            organization_id=organization_id,
+            downloaded_artifact_ids=downloaded_artifact_ids,
+        )
+    except Exception:
+        LOG.debug("Registered-artifact evidence fetch failed", run_id=run_id, exc_info=True)
+        return
+    entries: list[RegisteredArtifactEntry] = []
+    total_chars = 0
+    for artifact in artifacts[:_MAX_REGISTERED_ARTIFACTS]:
+        file_name = _artifact_file_name(artifact)
+        suffix = os.path.splitext(file_name)[1].lower()
+        if suffix != ".pdf" and suffix not in _REGISTERED_ARTIFACT_PARSE_EXTENSIONS:
+            continue
+        file_size = artifact.file_size
+        if isinstance(file_size, int) and file_size > _MAX_REGISTERED_ARTIFACT_BYTES:
+            LOG.debug("Skipping oversize registered artifact", artifact_id=artifact.artifact_id, file_size=file_size)
+            continue
+        try:
+            artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        except Exception:
+            LOG.debug("Registered-artifact retrieve failed", artifact_id=artifact.artifact_id, exc_info=True)
+            continue
+        if not artifact_bytes or len(artifact_bytes) > _MAX_REGISTERED_ARTIFACT_BYTES:
+            continue
+        parsed_text = _parse_registered_artifact_text(file_name, artifact_bytes)
+        if not parsed_text:
+            continue
+        remaining = _MAX_REGISTERED_ARTIFACT_TEXT_CHARS - total_chars
+        if remaining <= 0:
+            break
+        clipped = parsed_text[:remaining]
+        total_chars += len(clipped)
+        entries.append(
+            RegisteredArtifactEntry(artifact_id=artifact.artifact_id, file_name=file_name, parsed_text=clipped)
+        )
+    if entries:
+        ctx.registered_artifact_evidence = RegisteredArtifactEvidence(entries=tuple(entries), workflow_run_id=run_id)
+
+
+async def _capture_and_store_post_run_page(
     ctx: CopilotContext,
     *,
     run_session_id: str,
     run_id: str,
     current_url: str,
 ) -> None:
-    """Observe-only capture of the run-session failure page; the discovery extractor reads
+    """Observe-only capture of the run-session page; the discovery extractor reads
     ctx.browser_session_id per call, so the rebind targets the run session and is restored in a finally.
     A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
@@ -1794,17 +1933,25 @@ async def _run_blocks_and_collect_debug(
 
     if (
         not dispatch_to_worker
-        and not run_ok
         and run_session_id
         and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
         and not ctx.copilot_total_timeout_exceeded
     ):
         # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
-        await _capture_and_store_post_run_failure_page(
+        _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
+        await _capture_and_store_post_run_page(
             ctx,
             run_session_id=run_session_id,
             run_id=workflow_run.workflow_run_id,
             current_url=current_url,
+        )
+
+    if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
+        await _capture_registered_artifact_evidence(
+            ctx,
+            run_id=workflow_run.workflow_run_id,
+            organization_id=ctx.organization_id,
+            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label),
         )
 
     result_data: dict[str, Any] = {
