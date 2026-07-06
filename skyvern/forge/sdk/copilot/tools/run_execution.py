@@ -2345,9 +2345,8 @@ def _terminal_challenge_completion_verification(
     criterion_ids = list(completion_verification.criterion_ids)
     if not criterion_ids:
         return completion_verification
-    return CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=criterion_ids,
+    return replace(
+        completion_verification,
         verdicts=[
             CriterionVerdict(
                 criterion_id=criterion_id,
