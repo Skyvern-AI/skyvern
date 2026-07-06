@@ -1190,11 +1190,14 @@ def test_analyze_text_prompt_all_null_is_empty() -> None:
 def _fresh_ctx_for_record() -> SimpleNamespace:
     """SimpleNamespace shaped for _record_run_blocks_result + update_repeated_failure_state.
 
-    Uses getattr-with-default-compatible defaults so the function under test
-    populates the interesting fields without tripping AttributeError on the
-    downstream update_repeated_failure_state call.
+    Mirrors the AgentContext field defaults the function under test reads directly,
+    so the stub populates the interesting fields without tripping AttributeError on
+    the downstream update_repeated_failure_state call.
     """
     return SimpleNamespace(
+        code_artifact_metadata={},
+        composition_page_evidence=None,
+        unbound_required_parameter_keys=[],
         last_test_ok=True,
         last_test_failure_reason=None,
         last_test_suspicious_success=False,
