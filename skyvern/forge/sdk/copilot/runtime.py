@@ -151,6 +151,9 @@ class ScoutedInteraction(TypedDict):
     typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
+    # Raw scout-typed value for run-scoped test binding, gated at capture by should_reject_type_text_value.
+    # Turn-ephemeral; excluded from every persistence path (default_value promotion, typed identity, YAML).
+    raw_typed_value: NotRequired[str]
     role: NotRequired[str]
     accessible_name: NotRequired[str]
     trajectory_index: NotRequired[int]
@@ -348,6 +351,9 @@ class AgentContext:
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0
+    # Required parameter keys the build-test resolution seam could not bind from a user param,
+    # a non-empty default, or a scout value. Reset per run; read when composing the run outcome.
+    unbound_required_parameter_keys: list[str] = field(default_factory=list)
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_typed_value: str | None = None
