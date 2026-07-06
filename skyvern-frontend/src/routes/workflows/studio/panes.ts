@@ -1,5 +1,18 @@
 export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
 
+// "edit" = no run in URL; "run" = run present, no block label; null = block-iterate (never learned).
+export type StudioLayoutClass = "edit" | "run";
+
+export function layoutClassForSearch(search: string): StudioLayoutClass | null {
+  const params = new URLSearchParams(search);
+  if (params.get("bl") !== null) return null;
+  // Same run test as panesFromDeepLink: ?active= is a run reference too.
+  if (params.get("wr") !== null || params.get("active") !== null) {
+    return "run";
+  }
+  return "edit";
+}
+
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "copilot",
   "editor",
@@ -131,7 +144,8 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
 }
 
 // Deep-link → panes mapping when ?panes= is absent: a block-run link lands on
-// iterate (Editor leads); any other run reference lands on watch-and-review.
+// iterate (Editor leads); a bare run reference restores the learned run layout
+// (or falls back to watch-and-review); ?active= alone always opens watch-and-review.
 export function panesFromDeepLink(
   params: {
     runId: string | null;
@@ -139,11 +153,17 @@ export function panesFromDeepLink(
     blockLabel: string | null;
   },
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+  learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
     return ["editor", "browser", "overview"];
   }
-  if (params.runId || params.active) {
+  if (params.runId) {
+    return learnedRunPanes
+      ? [...learnedRunPanes]
+      : ["copilot", "browser", "overview"];
+  }
+  if (params.active) {
     return ["copilot", "browser", "overview"];
   }
   return [...defaultPanes];
@@ -154,6 +174,7 @@ export function panesFromDeepLink(
 export function resolveOpenPanes(
   search: string,
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+  learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   const params = new URLSearchParams(search);
   const explicit = parsePanesParam(params.get(STUDIO_PANES_PARAM));
@@ -167,6 +188,7 @@ export function resolveOpenPanes(
       blockLabel: params.get("bl"),
     },
     defaultPanes,
+    learnedRunPanes,
   );
 }
 

@@ -77,7 +77,7 @@ export function StudioPaneToggles() {
     if (id === "browser" && !panes.includes("browser")) {
       clearBrowserActivity();
     }
-    togglePane(id);
+    togglePane(id, { learn: true });
   };
 
   const paneBlockedByDeletion = (id: StudioPaneId) =>

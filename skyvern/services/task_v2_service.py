@@ -749,8 +749,10 @@ async def run_task_v2_helper(
 
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
+        url=str(task_v2.url) if task_v2.url else None,
         browser_session_id=browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        navigate=False,
     )
 
     page = await browser_state.get_working_page()

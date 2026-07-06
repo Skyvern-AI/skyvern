@@ -55,89 +55,37 @@ function blockBetween(css: string, openSelector: string): string {
   return "";
 }
 
+const REQUIRED_TOKEN_CASES = [
+  ["--input", ":root"],
+  ["--ring", ":root"],
+  ["--input", ".dark"],
+  ["--ring", ".dark"],
+  ["--success", ":root"],
+  ["--success-foreground", ":root"],
+  ["--warning", ":root"],
+  ["--warning-foreground", ":root"],
+  ["--tertiary", ":root"],
+  ["--tertiary-foreground", ":root"],
+  ["--cta", ":root"],
+  ["--cta-hover", ":root"],
+  ["--cta-foreground", ":root"],
+  ["--success", ".dark"],
+  ["--warning", ".dark"],
+  ["--tertiary", ".dark"],
+  ["--tertiary-foreground", ".dark"],
+  ["--cta", ".dark"],
+  ["--cta-hover", ".dark"],
+  ["--cta-foreground", ".dark"],
+] as const;
+
 describe.each(CSS_FILES)("%s defines DS token vars", (file) => {
   const css = load(file);
   const root = blockBetween(css, ":root");
   const dark = blockBetween(css, ".dark");
 
-  it("defines --input under :root", () => {
-    expect(root).toMatch(/--input:\s*[^;]+;/);
-  });
-
-  it("defines --ring under :root", () => {
-    expect(root).toMatch(/--ring:\s*[^;]+;/);
-  });
-
-  it("defines --input under .dark", () => {
-    expect(dark).toMatch(/--input:\s*[^;]+;/);
-  });
-
-  it("defines --ring under .dark", () => {
-    expect(dark).toMatch(/--ring:\s*[^;]+;/);
-  });
-
-  it("defines --success under :root", () => {
-    expect(root).toMatch(/--success:\s*[^;]+;/);
-  });
-
-  it("defines --success-foreground under :root", () => {
-    expect(root).toMatch(/--success-foreground:\s*[^;]+;/);
-  });
-
-  it("defines --warning under :root", () => {
-    expect(root).toMatch(/--warning:\s*[^;]+;/);
-  });
-
-  it("defines --warning-foreground under :root", () => {
-    expect(root).toMatch(/--warning-foreground:\s*[^;]+;/);
-  });
-
-  it("defines --tertiary under :root", () => {
-    expect(root).toMatch(/--tertiary:\s*[^;]+;/);
-  });
-
-  it("defines --tertiary-foreground under :root", () => {
-    expect(root).toMatch(/--tertiary-foreground:\s*[^;]+;/);
-  });
-
-  it("defines --cta under :root", () => {
-    expect(root).toMatch(/--cta:\s*[^;]+;/);
-  });
-
-  it("defines --cta-hover under :root", () => {
-    expect(root).toMatch(/--cta-hover:\s*[^;]+;/);
-  });
-
-  it("defines --cta-foreground under :root", () => {
-    expect(root).toMatch(/--cta-foreground:\s*[^;]+;/);
-  });
-
-  it("defines --success under .dark", () => {
-    expect(dark).toMatch(/--success:\s*[^;]+;/);
-  });
-
-  it("defines --warning under .dark", () => {
-    expect(dark).toMatch(/--warning:\s*[^;]+;/);
-  });
-
-  it("defines --tertiary under .dark", () => {
-    expect(dark).toMatch(/--tertiary:\s*[^;]+;/);
-  });
-
-  it("defines --tertiary-foreground under .dark", () => {
-    expect(dark).toMatch(/--tertiary-foreground:\s*[^;]+;/);
-  });
-
-  it("defines --cta under .dark", () => {
-    expect(dark).toMatch(/--cta:\s*[^;]+;/);
-  });
-
-  it("defines --cta-hover under .dark", () => {
-    expect(dark).toMatch(/--cta-hover:\s*[^;]+;/);
-  });
-
-  it("defines --cta-foreground under .dark", () => {
-    expect(dark).toMatch(/--cta-foreground:\s*[^;]+;/);
+  it.each(REQUIRED_TOKEN_CASES)("defines %s under %s", (token, selector) => {
+    const block = selector === ":root" ? root : dark;
+    expect(block).toMatch(new RegExp(`${token}:\\s*[^;]+;`));
   });
 });
 
@@ -153,29 +101,19 @@ describe("shared semantic tokens are consistent across cloud/eval/src", () => {
     expect(new Set(values).size).toBe(1);
   }
 
-  it("light-mode --ring is the same value in all 3 entrypoints", () => {
-    expectConsistentToken("--ring", ":root");
-  });
-
-  it("dark-mode --ring is the same value in all 3 entrypoints", () => {
-    expectConsistentToken("--ring", ".dark");
-  });
-
-  it("light-mode --cta is the same value in all 3 entrypoints", () => {
-    expectConsistentToken("--cta", ":root");
-  });
-
-  it("light-mode --cta-hover is the same value in all 3 entrypoints", () => {
-    expectConsistentToken("--cta-hover", ":root");
-  });
-
-  it("dark-mode --cta is the same value in all 3 entrypoints", () => {
-    expectConsistentToken("--cta", ".dark");
-  });
-
-  it("dark-mode --cta-hover is the same value in all 3 entrypoints", () => {
-    expectConsistentToken("--cta-hover", ".dark");
-  });
+  it.each([
+    ["light-mode --ring", "--ring", ":root"],
+    ["dark-mode --ring", "--ring", ".dark"],
+    ["light-mode --cta", "--cta", ":root"],
+    ["light-mode --cta-hover", "--cta-hover", ":root"],
+    ["dark-mode --cta", "--cta", ".dark"],
+    ["dark-mode --cta-hover", "--cta-hover", ".dark"],
+  ] as const)(
+    "%s is the same value in all 3 entrypoints",
+    (_, token, selector) => {
+      expectConsistentToken(token, selector);
+    },
+  );
 });
 
 // The primary CTA must track the DS --primary token, not an independent
@@ -191,27 +129,24 @@ describe("--cta tracks the DS --primary (SKY-10608)", () => {
   describe.each(CSS_FILES)("%s", (file) => {
     const css = load(file);
 
-    it("light-mode --cta equals --primary", () => {
-      expect(tokenValue(css, ":root", "--cta")).toBe(
-        tokenValue(css, ":root", "--primary"),
-      );
-    });
-
-    it("dark-mode --cta equals --primary", () => {
-      expect(tokenValue(css, ".dark", "--cta")).toBe(
-        tokenValue(css, ".dark", "--primary"),
-      );
-    });
-
-    it("light-mode --cta-foreground equals --primary-foreground", () => {
-      expect(tokenValue(css, ":root", "--cta-foreground")).toBe(
-        tokenValue(css, ":root", "--primary-foreground"),
-      );
-    });
-
-    it("dark-mode --cta-foreground equals --primary-foreground", () => {
-      expect(tokenValue(css, ".dark", "--cta-foreground")).toBe(
-        tokenValue(css, ".dark", "--primary-foreground"),
+    it.each([
+      ["light-mode --cta equals --primary", ":root", "--cta", "--primary"],
+      ["dark-mode --cta equals --primary", ".dark", "--cta", "--primary"],
+      [
+        "light-mode --cta-foreground equals --primary-foreground",
+        ":root",
+        "--cta-foreground",
+        "--primary-foreground",
+      ],
+      [
+        "dark-mode --cta-foreground equals --primary-foreground",
+        ".dark",
+        "--cta-foreground",
+        "--primary-foreground",
+      ],
+    ] as const)("%s", (_, selector, ctaToken, primaryToken) => {
+      expect(tokenValue(css, selector, ctaToken)).toBe(
+        tokenValue(css, selector, primaryToken),
       );
     });
   });

@@ -403,10 +403,8 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       if (studioEnabled) {
-        // A full-run start RESETS the layout: land on the bare ?wr= deep link
-        // so the run mapping (copilot, browser, overview) applies exactly as
-        // it does when cold-entering a run — the editor doesn't ride along
-        // into run-watching. Block runs keep their own append path.
+        // A full-run start lands on the bare ?wr= deep link; the learned run
+        // layout (or factory copilot,browser,overview) restores via the fallback.
         navigate(
           `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
         );
