@@ -72,6 +72,54 @@ function buildBlockItem(block: WorkflowRunBlock): WorkflowRunTimelineBlockItem {
   };
 }
 
+function buildAction(
+  overrides: Partial<ActionsApiResponse> = {},
+): ActionsApiResponse {
+  return {
+    action_id: "act_default",
+    action_type: ActionTypes.NullAction,
+    status: Status.Completed,
+    task_id: "tsk_code",
+    step_id: null,
+    step_order: 0,
+    action_order: 0,
+    reasoning: "Recorded code step",
+    description: null,
+    intention: null,
+    response: null,
+    text: null,
+    created_by: null,
+    confidence_float: null,
+    ...overrides,
+  };
+}
+
+function renderActionDiagnosticsHref(
+  activeAction: ActionsApiResponse,
+  actions: Array<ActionsApiResponse>,
+): string | null {
+  const block = buildBlock({
+    block_type: "code",
+    task_id: "tsk_code",
+    actions,
+  });
+
+  render(
+    <MemoryRouter>
+      <WorkflowRunBlockDetail
+        activeItem={activeAction}
+        timeline={[buildBlockItem(block)]}
+      />
+    </MemoryRouter>,
+  );
+
+  return screen
+    .getByRole("link", {
+      name: /diagnostics/i,
+    })
+    .getAttribute("href");
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -215,6 +263,151 @@ describe("WorkflowRunBlockDetail router", () => {
     expect(diagnosticsLink.getAttribute("href")).toBe(
       "/tasks/tsk_123/diagnostics",
     );
+  });
+
+  it("opens diagnostics on the selected action step when the detail panel is focused on an action", () => {
+    const action = buildAction({
+      action_id: "act_code_step",
+      step_id: "stp_code_2",
+      step_order: 2,
+    });
+
+    expect(renderActionDiagnosticsHref(action, [action])).toBe(
+      "/tasks/tsk_code/diagnostics?step_id=stp_code_2&step=2",
+    );
+  });
+
+  it("falls back to a step query when the selected action has no step id", () => {
+    const action = buildAction({
+      action_id: "act_legacy_step",
+      step_order: 2,
+    });
+
+    expect(renderActionDiagnosticsHref(action, [action])).toBe(
+      "/tasks/tsk_code/diagnostics?step=2",
+    );
+  });
+
+  it("uses the selected retry's step index as the diagnostics fallback", () => {
+    const originalAttempt = buildAction({
+      action_id: "act_retry_original",
+      status: Status.Failed,
+      step_id: "stp_code_order_1_original",
+      step_order: 1,
+    });
+    const selectedRetry = buildAction({
+      action_id: "act_retry_selected",
+      step_id: "stp_code_order_1_stale",
+      step_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedRetry, [
+        {
+          ...originalAttempt,
+          action_id: "act_order_0",
+          step_id: "stp_code_order_0",
+          step_order: 0,
+          status: Status.Completed,
+        },
+        originalAttempt,
+        selectedRetry,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step_id=stp_code_order_1_stale&step=2");
+  });
+
+  it("does not count non-contiguous actions from the same step as retries", () => {
+    const stepZeroStart = buildAction({
+      action_id: "act_order_0_start",
+      step_id: "stp_code_order_0",
+      step_order: 0,
+      action_order: 0,
+    });
+    const stepOneStart = buildAction({
+      action_id: "act_order_1_start",
+      step_id: "stp_code_order_1",
+      step_order: 1,
+      action_order: 0,
+    });
+    const stepZeroFollowUp = buildAction({
+      action_id: "act_order_0_follow_up",
+      step_id: "stp_code_order_0",
+      step_order: 0,
+      action_order: 1,
+    });
+    const selectedAction = buildAction({
+      action_id: "act_order_1_selected",
+      step_id: "stp_code_order_1",
+      step_order: 1,
+      action_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedAction, [
+        stepZeroStart,
+        stepOneStart,
+        stepZeroFollowUp,
+        selectedAction,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step_id=stp_code_order_1&step=1");
+  });
+
+  it("ignores later step actions when computing the diagnostics fallback", () => {
+    const stepStart = buildAction({
+      action_id: "act_step_start",
+      step_order: 1,
+      action_order: 0,
+    });
+    const laterStepAction = buildAction({
+      action_id: "act_later_step",
+      step_order: 2,
+      action_order: 0,
+    });
+    const selectedAction = buildAction({
+      action_id: "act_step_selected",
+      step_order: 1,
+      action_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedAction, [
+        buildAction({
+          action_id: "act_order_0",
+          step_order: 0,
+          action_order: 0,
+        }),
+        stepStart,
+        laterStepAction,
+        selectedAction,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step=1");
+  });
+
+  it("uses action ordering for fallback when only one same-step action has a step id", () => {
+    const stepStart = buildAction({
+      action_id: "act_modern_step_start",
+      step_id: "stp_code_order_1",
+      step_order: 1,
+      action_order: 0,
+    });
+    const selectedAction = buildAction({
+      action_id: "act_legacy_step_selected",
+      step_id: null,
+      step_order: 1,
+      action_order: 1,
+    });
+
+    expect(
+      renderActionDiagnosticsHref(selectedAction, [
+        buildAction({
+          action_id: "act_order_0",
+          step_order: 0,
+          action_order: 0,
+        }),
+        stepStart,
+        selectedAction,
+      ]),
+    ).toBe("/tasks/tsk_code/diagnostics?step=1");
   });
 
   it("does not duplicate the timeline with an Actions (N) section", () => {

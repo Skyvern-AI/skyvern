@@ -4,51 +4,15 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import inspection as mcp_inspection
-
-# ═══════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════
-
-
-def _make_mock_page(url: str = "https://example.com") -> MagicMock:
-    page = MagicMock()
-    page.url = url
-    return page
-
-
-def _make_skyvern_page(page: MagicMock) -> MagicMock:
-    wrapper = MagicMock()
-    wrapper.page = page
-    wrapper.url = page.url
-    return wrapper
-
-
-def _make_session_state(**overrides):
-    defaults = {
-        "page_errors": deque(maxlen=1000),
-        "console_messages": deque(maxlen=1000),
-        "network_requests": deque(maxlen=1000),
-        "dialog_events": deque(maxlen=1000),
-        "_hooked_page_ids": set(),
-        "_hooked_handlers_map": {},
-    }
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
-
-
-def _patch_get_page(monkeypatch: pytest.MonkeyPatch, page: MagicMock, ctx: BrowserContext) -> AsyncMock:
-    skyvern_page = _make_skyvern_page(page)
-    mock = AsyncMock(return_value=(skyvern_page, ctx))
-    monkeypatch.setattr(mcp_inspection, "get_page", mock)
-    return mock
-
+from tests.unit._mcp_browser_fakes import make_mock_page as _make_mock_page
+from tests.unit._mcp_browser_fakes import make_session_state as _make_session_state
+from tests.unit._mcp_browser_fakes import patch_get_page
 
 # ═══════════════════════════════════════════════════
 # pageerror hook registration
@@ -123,7 +87,7 @@ def test_register_hooks_registers_pageerror() -> None:
 async def test_get_errors_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
 
     state = _make_session_state()
     monkeypatch.setattr(mcp_inspection, "get_current_session", lambda: state)
@@ -140,7 +104,7 @@ async def test_get_errors_empty(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_get_errors_returns_buffered_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
 
     errors = deque(maxlen=1000)
     errors.append(
@@ -173,7 +137,7 @@ async def test_get_errors_returns_buffered_errors(monkeypatch: pytest.MonkeyPatc
 async def test_get_errors_text_filter(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
 
     errors = deque(maxlen=1000)
     errors.append(
@@ -207,7 +171,7 @@ async def test_get_errors_text_filter(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_get_errors_clear(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
 
     errors = deque(maxlen=1000)
     errors.append({"message": "Error 1", "timestamp": time.time(), "page_url": "https://example.com", "tab_id": "1"})
@@ -227,7 +191,7 @@ async def test_get_errors_clear(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_get_errors_clear_with_filter(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
 
     errors = deque(maxlen=1000)
     errors.append(

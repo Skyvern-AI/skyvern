@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from skyvern.forge.sdk.copilot.agent import _store_turn_context_packet_on_context
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -312,51 +314,38 @@ def test_workflow_change_context_reports_user_edit() -> None:
     assert packet.to_trace_data()["workflow_change_kind"] == "user_modified_since_last_turn"
 
 
-def test_workflow_change_context_omitted_when_unchanged() -> None:
+@pytest.mark.parametrize(
+    ("turn_intent", "workflow_yaml", "prior_workflow_yaml", "user_message"),
+    [
+        pytest.param(_change_intent(), _WORKFLOW_V1, _WORKFLOW_V1, "Still broken, fix it", id="unchanged"),
+        pytest.param(_change_intent(), _WORKFLOW_V1, "", "Build me a workflow", id="first_turn"),
+        pytest.param(
+            TurnIntent(mode=TurnIntentMode.EDIT, required_context=[RequiredContextKey.CURRENT_WORKFLOW]),
+            _WORKFLOW_V2,
+            _WORKFLOW_V1,
+            "Update it",
+            id="not_required",
+        ),
+    ],
+)
+def test_workflow_change_context_is_none(
+    turn_intent: TurnIntent,
+    workflow_yaml: str,
+    prior_workflow_yaml: str,
+    user_message: str,
+) -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=_change_intent(),
+            turn_intent=turn_intent,
             request_policy=RequestPolicy(),
-            user_message="Still broken, fix it",
-            workflow_yaml=_WORKFLOW_V1,
-            prior_workflow_yaml=_WORKFLOW_V1,
+            user_message=user_message,
+            workflow_yaml=workflow_yaml,
+            prior_workflow_yaml=prior_workflow_yaml,
         )
     )
 
     assert packet.workflow_change_context is None
     assert packet.to_trace_data()["workflow_change_kind"] is None
-
-
-def test_workflow_change_context_omitted_on_first_turn() -> None:
-    packet = TurnContextAssembler().assemble(
-        TurnContextInputs(
-            turn_intent=_change_intent(),
-            request_policy=RequestPolicy(),
-            user_message="Build me a workflow",
-            workflow_yaml=_WORKFLOW_V1,
-            prior_workflow_yaml="",
-        )
-    )
-
-    assert packet.workflow_change_context is None
-    assert packet.to_trace_data()["workflow_change_kind"] is None
-
-
-def test_workflow_change_context_skipped_when_not_required() -> None:
-    packet = TurnContextAssembler().assemble(
-        TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.EDIT,
-                required_context=[RequiredContextKey.CURRENT_WORKFLOW],
-            ),
-            request_policy=RequestPolicy(),
-            user_message="Update it",
-            workflow_yaml=_WORKFLOW_V2,
-            prior_workflow_yaml=_WORKFLOW_V1,
-        )
-    )
-
-    assert packet.workflow_change_context is None
 
 
 def test_shadow_attachment_stores_packet_on_copilot_context() -> None:

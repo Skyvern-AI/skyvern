@@ -46,9 +46,9 @@ def _patch_executor(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _patch_cloud_proxy_session_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     agent_function = SimpleNamespace(
-        build_proxy_session_extra_http_headers=lambda proxy_session_id: {"dedicated-ip": proxy_session_id}
-        if proxy_session_id
-        else None
+        build_proxy_session_extra_http_headers=lambda proxy_session_id: (
+            {"dedicated-ip": proxy_session_id} if proxy_session_id else None
+        )
     )
     monkeypatch.setattr(credentials.app, "AGENT_FUNCTION", agent_function)
 

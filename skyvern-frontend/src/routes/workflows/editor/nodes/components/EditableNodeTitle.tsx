@@ -65,7 +65,9 @@ function EditableNodeTitle({
       disabled={!editable}
       size={1}
       autoFocus
-      className={cn("nopan w-min border-0 p-0", inputClassName)}
+      // HorizontallyResizingInput sets an inline pixel width with no
+      // ceiling; max-w-full caps it at the row's allotted space.
+      className={cn("nopan w-min max-w-full border-0 p-0", inputClassName)}
       onBlur={(event) => {
         if (!editable) {
           event.currentTarget.value = value;

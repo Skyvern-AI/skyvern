@@ -1,14 +1,7 @@
-import {
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  Cross2Icon,
-  GearIcon,
-  PlusIcon,
-} from "@radix-ui/react-icons";
+import { Cross2Icon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 
 import {
   BLOCK_SIDEBAR_WIDTH_MAX,
@@ -17,7 +10,6 @@ import {
 } from "@/store/BlockSidebarWidthStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { cn } from "@/util/utils";
 
@@ -37,8 +29,6 @@ import {
 import { BlockConfigForm } from "./BlockConfigForm";
 import { useHasInteractedThisSession } from "./useHasInteractedThisSession";
 import { WorkflowNodeLibraryPanel } from "./WorkflowNodeLibraryPanel";
-import { STUDIO_COPILOT_RAIL_WIDTH } from "../../studio/constants";
-import { useStudioShellContext } from "../../studio/StudioShellContext";
 import type { AddNodeProps } from "../Workspace";
 
 // React Flow node type → backend WorkflowBlockType. The two diverge in
@@ -91,9 +81,6 @@ function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {
 
 const FOOTER_TICK_INTERVAL_MS = 10_000;
 
-// Reuse the Copilot rail width so the two studio rails can't drift apart.
-const SETTINGS_RAIL_WIDTH = STUDIO_COPILOT_RAIL_WIDTH;
-
 type SidebarIdentity = {
   label: string;
   isStart: boolean;
@@ -128,39 +115,6 @@ function SidebarIdentityIcon({
       ) : (
         <GearIcon className="size-4" />
       )}
-    </div>
-  );
-}
-
-// Collapsed settings rail content (slim right-edge controls), mirroring the
-// Copilot rail; the shared shell wrapper owns the card chrome + width animation.
-function SettingsRail({
-  identity,
-  onExpand,
-}: Readonly<{ identity: SidebarIdentity; onExpand: () => void }>) {
-  // Self-contained bordered card filling the rail slot (mirrors CopilotRail) so
-  // its left edge reads as a panel edge; fades in like the Copilot rail.
-  return (
-    <div
-      data-testid="settings-rail"
-      className="flex h-full w-full flex-col items-center gap-3 rounded-xl border border-border bg-slate-elevation2 py-3 shadow-xl duration-300 animate-in fade-in"
-    >
-      <button
-        type="button"
-        onClick={onExpand}
-        title="Show settings"
-        aria-label="Show settings"
-        className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-      >
-        <ChevronLeftIcon className="h-4 w-4" />
-      </button>
-      <SidebarIdentityIcon identity={identity} />
-      <span
-        className="mt-1 max-h-[60%] overflow-hidden text-ellipsis text-xs font-medium tracking-wide text-muted-foreground"
-        style={{ writingMode: "vertical-rl" }}
-      >
-        {identity.label}
-      </span>
     </div>
   );
 }
@@ -279,14 +233,10 @@ function BlockConfigSidebarBody({
   selectedBlockId,
   identity,
   onClose,
-  onCollapse,
 }: Readonly<{
   selectedBlockId: string;
   identity: SidebarIdentity;
   onClose: () => void;
-  // When set (studio shell), the header's close affordance collapses the panel
-  // to a rail instead of deselecting the block.
-  onCollapse?: () => void;
 }>) {
   return (
     <>
@@ -318,28 +268,19 @@ function BlockConfigSidebarBody({
             <SubLabel />
           </div>
         </div>
-        {onCollapse ? (
-          <button
-            type="button"
-            onClick={onCollapse}
-            aria-label="Collapse settings"
-            title="Collapse settings"
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
-          >
-            <ChevronRightIcon className="h-4 w-4" />
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close block configuration"
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
-          >
-            <Cross2Icon className="h-4 w-4" />
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close block configuration"
+          className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
+        >
+          <Cross2Icon className="h-4 w-4" />
+        </button>
       </header>
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div
+        data-testid="block-config-sidebar-body"
+        className="flex-1 overflow-y-auto px-6 py-5"
+      >
         <BlockConfigForm blockId={selectedBlockId} />
       </div>
       <UpdatedAgoFooter blockId={selectedBlockId} />
@@ -379,7 +320,10 @@ function BlockLibrarySidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex min-h-0 flex-1 overflow-hidden px-5 py-4">
+      <div
+        data-testid="block-library-sidebar-body"
+        className="flex min-h-0 flex-1 overflow-hidden px-6 py-5"
+      >
         <WorkflowNodeLibraryPanel onNodeClick={onAddNode} />
       </div>
     </>
@@ -420,13 +364,6 @@ function BlockConfigSidebar({
     (state) => state.closeWorkflowPanel,
   );
   const flushPendingCommit = usePendingCommitsStore((state) => state.flush);
-  const studioSettingsCollapsed = useStudioShellStore(
-    (state) => state.settingsCollapsed,
-  );
-  const setStudioSettingsCollapsed = useStudioShellStore(
-    (state) => state.setSettingsCollapsed,
-  );
-  const { settingsPortalEl, settingsRailPortalEl } = useStudioShellContext();
   const containedWidth = getContainedBlockSidebarWidth(
     width,
     editorShellMetrics.width,
@@ -462,20 +399,14 @@ function BlockConfigSidebar({
   const sidebarVisible =
     showLibrary || (mode !== "build" && selectedBlockId !== null);
 
-  // In the studio shell every settings panel (agent settings + each block) is
-  // collapsible to a rail; the block-library drawer is not.
   const selectedNode =
     !showLibrary && selectedBlockId !== null
       ? (reactFlowInstance.getNode(selectedBlockId) ?? null)
       : null;
-  const isCollapsibleSettings = embedded && selectedNode !== null;
-  const settingsCollapsed = isCollapsibleSettings && studioSettingsCollapsed;
   const selectedIdentity = getSidebarIdentity(selectedNode);
 
   useLayoutEffect(() => {
-    // Legacy overlay only: studio sizes its column in StudioShell, so the
-    // contained-width measurement and rendered-width var are unused there.
-    if (!sidebarVisible || embedded) {
+    if (!sidebarVisible) {
       setEditorShellMetrics({
         gutterPx: getBlockSidebarGutterPx(null),
         width: null,
@@ -518,87 +449,26 @@ function BlockConfigSidebar({
     return () => {
       resizeObserver.disconnect();
     };
-    // Re-measure on collapse toggle: the shell width changes, so the contained
-    // width bounds need refreshing.
-  }, [sidebarVisible, settingsCollapsed, embedded]);
+  }, [sidebarVisible]);
 
   useLayoutEffect(() => {
-    if (!sidebarVisible || embedded) {
+    if (!sidebarVisible) {
       return;
     }
 
-    setRenderedWidth(settingsCollapsed ? SETTINGS_RAIL_WIDTH : containedWidth);
-  }, [
-    settingsCollapsed,
-    containedWidth,
-    setRenderedWidth,
-    sidebarVisible,
-    embedded,
-  ]);
+    setRenderedWidth(containedWidth);
+  }, [containedWidth, setRenderedWidth, sidebarVisible]);
 
-  // In build mode the block-config form is unavailable, but the node library
-  // must still render so users can insert blocks from the canvas.
-  if (mode === "build" && !showLibrary) {
+  // The block-config form only renders when the sidebar shows it directly: build
+  // mode gives each block/start node its own inline editor, and the studio shell
+  // keeps settings inline in the blocks. In both, the sidebar only hosts the
+  // block library (so users can still insert blocks from the canvas).
+  if ((mode === "build" || embedded) && !showLibrary) {
     return null;
   }
 
   if (!showLibrary && selectedBlockId === null) {
     return null;
-  }
-
-  // Studio: the panel is a StudioShell grid column (the shell owns the width,
-  // collapse rail, and resize), so we portal the surface into that column and
-  // fill it. The body stays mounted but inert while collapsed so the shell's
-  // width animation can clip it without it reflowing.
-  if (embedded) {
-    // The expanded panel and the collapsed rail portal into separate StudioShell
-    // slots (the shell owns their sizing/position), mirroring the Copilot's
-    // fixed chat + separate rail overlay. The body stays mounted but inert while
-    // collapsed so the shell's width animation can clip it without reflow.
-    const bodyCard = (
-      <div className="relative h-full w-full overflow-hidden rounded-xl border border-border bg-slate-elevation2 shadow-xl">
-        <aside
-          data-testid="block-config-sidebar"
-          className={cn(
-            "flex h-full w-full flex-col",
-            settingsCollapsed && "pointer-events-none",
-          )}
-        >
-          {showLibrary ? (
-            <BlockLibrarySidebarBody
-              onAddNode={(props) => onAddNode?.(props)}
-              onClose={closeWorkflowPanel}
-            />
-          ) : selectedBlockId !== null ? (
-            <BlockConfigSidebarBody
-              selectedBlockId={selectedBlockId}
-              identity={selectedIdentity}
-              onClose={() => setSelectedBlockId(null)}
-              onCollapse={
-                isCollapsibleSettings
-                  ? () => setStudioSettingsCollapsed(true)
-                  : undefined
-              }
-            />
-          ) : null}
-        </aside>
-      </div>
-    );
-
-    return (
-      <>
-        {settingsPortalEl ? createPortal(bodyCard, settingsPortalEl) : null}
-        {settingsCollapsed && settingsRailPortalEl
-          ? createPortal(
-              <SettingsRail
-                identity={selectedIdentity}
-                onExpand={() => setStudioSettingsCollapsed(false)}
-              />,
-              settingsRailPortalEl,
-            )
-          : null}
-      </>
-    );
   }
 
   return (

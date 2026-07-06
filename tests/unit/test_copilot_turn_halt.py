@@ -177,96 +177,52 @@ def test_page_challenge_signal_records_explicit_terminal_blocker() -> None:
     assert signal.blocked_tool == "update_and_run_blocks"
 
 
-def test_current_page_challenge_signal_does_not_halt_before_bounded_attempt() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "challenge_state": {
-                "detected": True,
-                "kind": "human_verification",
-                "requires_human_verification": True,
-                "gates_submit_controls": True,
-                "gated_submit_controls": [{"text": "Search", "disabled": True}],
-            },
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="update_and_run_blocks",
-    )
-
-    assert signal is None
-
-
-def test_current_page_challenge_signal_does_not_defer_to_empty_result_shell() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "observed_after_workflow_run": True,
-            "challenge_state": {
-                "detected": True,
-                "kind": "human_verification",
-                "requires_human_verification": True,
-                "gates_submit_controls": True,
-                "gated_submit_controls": [{"text": "Search", "disabled": True}],
-            },
-            "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="evaluate",
-    )
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-
-
-def test_current_page_challenge_signal_does_not_defer_to_form_container_text() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "observed_after_workflow_run": True,
-            "challenge_state": {
-                "detected": True,
-                "kind": "captcha",
-                "requires_human_verification": True,
-                "gates_submit_controls": True,
-                "gated_submit_controls": [{"text": "Search", "disabled": True}],
-            },
-            "result_containers": [
-                {
-                    "tag": "form",
-                    "selector": "#record-search",
-                    "text_excerpt": (
-                        "First name Last name Results No records are available because the anti-bot "
-                        "challenge prevented the search from running."
-                    ),
-                }
-            ],
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="update_and_run_blocks",
-    )
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-
-
-def test_current_page_challenge_signal_reads_flow_evidence_packets() -> None:
-    ctx = SimpleNamespace(
-        flow_evidence=[
-            {
-                "observation_step": 1,
-                "evidence": {
+@pytest.mark.parametrize(
+    ("ctx", "blocked_tool", "expect_signal"),
+    [
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
+                    "challenge_state": {
+                        "detected": True,
+                        "kind": "human_verification",
+                        "requires_human_verification": True,
+                        "gates_submit_controls": True,
+                        "gated_submit_controls": [{"text": "Search", "disabled": True}],
+                    },
+                },
+            ),
+            "update_and_run_blocks",
+            False,
+            id="does_not_halt_before_bounded_attempt",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
+                    "observed_after_workflow_run": True,
+                    "challenge_state": {
+                        "detected": True,
+                        "kind": "human_verification",
+                        "requires_human_verification": True,
+                        "gates_submit_controls": True,
+                        "gated_submit_controls": [{"text": "Search", "disabled": True}],
+                    },
+                    "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+                },
+            ),
+            "evaluate",
+            True,
+            id="does_not_defer_to_empty_result_shell",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
                     "observed_after_workflow_run": True,
                     "challenge_state": {
                         "detected": True,
@@ -275,44 +231,79 @@ def test_current_page_challenge_signal_reads_flow_evidence_packets() -> None:
                         "gates_submit_controls": True,
                         "gated_submit_controls": [{"text": "Search", "disabled": True}],
                     },
-                    "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+                    "result_containers": [
+                        {
+                            "tag": "form",
+                            "selector": "#record-search",
+                            "text_excerpt": (
+                                "First name Last name Results No records are available because the anti-bot "
+                                "challenge prevented the search from running."
+                            ),
+                        }
+                    ],
                 },
-            }
-        ],
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-    )
+            ),
+            "update_and_run_blocks",
+            True,
+            id="does_not_defer_to_form_container_text",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                flow_evidence=[
+                    {
+                        "observation_step": 1,
+                        "evidence": {
+                            "observed_after_workflow_run": True,
+                            "challenge_state": {
+                                "detected": True,
+                                "kind": "captcha",
+                                "requires_human_verification": True,
+                                "gates_submit_controls": True,
+                                "gated_submit_controls": [{"text": "Search", "disabled": True}],
+                            },
+                            "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+                        },
+                    }
+                ],
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+            ),
+            "update_and_run_blocks",
+            True,
+            id="reads_flow_evidence_packets",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
+                    "challenge_state": {
+                        "detected": True,
+                        "kind": "human_verification",
+                        "requires_human_verification": False,
+                        "gates_submit_controls": False,
+                    },
+                    "result_containers": [
+                        {"selector": "#results", "row_count": 1, "sample_rows": ["Visible result row"]}
+                    ],
+                },
+            ),
+            "evaluate",
+            False,
+            id="defers_to_populated_result_container_evidence",
+        ),
+    ],
+)
+def test_current_page_challenge_signal_from_current_page_evidence(
+    ctx: SimpleNamespace, blocked_tool: str, expect_signal: bool
+) -> None:
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(ctx, blocked_tool=blocked_tool)
 
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="update_and_run_blocks",
-    )
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-
-
-def test_current_page_challenge_signal_defers_to_populated_result_container_evidence() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "challenge_state": {
-                "detected": True,
-                "kind": "human_verification",
-                "requires_human_verification": False,
-                "gates_submit_controls": False,
-            },
-            "result_containers": [{"selector": "#results", "row_count": 1, "sample_rows": ["Visible result row"]}],
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="evaluate",
-    )
-
-    assert signal is None
+    if expect_signal:
+        assert signal is not None
+        assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    else:
+        assert signal is None
 
 
 def _involuntary_repair_ceiling_signal() -> CopilotToolBlockerSignal:

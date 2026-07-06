@@ -17,6 +17,7 @@ from skyvern.forge.sdk.api.files import (
     get_skyvern_temp_dir,
     make_temp_directory,
     unzip_files,
+    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
@@ -533,6 +534,10 @@ class AzureStorage(BaseStorage):
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         for file in files:
+            fpath = os.path.join(download_dir, file)
+            if not os.path.isfile(fpath):
+                continue
+            file = await wait_for_pending_extension_rename(download_dir, file)
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue

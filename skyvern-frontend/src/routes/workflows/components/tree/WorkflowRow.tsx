@@ -274,7 +274,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                       onClick={(event) => {
                         handleIconClick(
                           event,
-                          `/workflows/${workflow.workflow_permanent_id}/run`,
+                          `/agents/${workflow.workflow_permanent_id}/run`,
                         );
                       }}
                     >

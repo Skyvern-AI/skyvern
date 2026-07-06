@@ -35,7 +35,12 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-    from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+    from skyvern.forge.sdk.copilot.build_test_outcome import (
+        RecordedBuildTestOutcome,
+        RecordedOutcomeBindingConstraint,
+        RecordedOutcomeGroundingRequirement,
+    )
+    from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -119,6 +124,25 @@ class PendingBrowserInteractionObservation:
     url: str = ""
 
 
+@dataclass(frozen=True)
+class PreRunPageReference:
+    text: str
+    workflow_run_id: str
+
+
+@dataclass(frozen=True)
+class RegisteredArtifactEntry:
+    artifact_id: str
+    file_name: str
+    parsed_text: str
+
+
+@dataclass(frozen=True)
+class RegisteredArtifactEvidence:
+    entries: tuple[RegisteredArtifactEntry, ...]
+    workflow_run_id: str
+
+
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
@@ -127,6 +151,9 @@ class ScoutedInteraction(TypedDict):
     typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
+    # Raw scout-typed value for run-scoped test binding, gated at capture by should_reject_type_text_value.
+    # Turn-ephemeral; excluded from every persistence path (default_value promotion, typed identity, YAML).
+    raw_typed_value: NotRequired[str]
     role: NotRequired[str]
     accessible_name: NotRequired[str]
     trajectory_index: NotRequired[int]
@@ -210,6 +237,9 @@ class AgentContext:
     consecutive_no_progress_interaction_count: int = 0
     last_scout_act_observe_outcome: str | None = None
     last_scout_act_observe_packet: dict[str, Any] | None = None
+    last_scout_act_observe_recapture_attempted: bool = False
+    last_scout_act_observe_recapture_result: str = ""
+    ambiguous_bare_selector_rescout_context_key: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
@@ -244,10 +274,19 @@ class AgentContext:
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
+    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
+    consecutive_non_converging_repair_count: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
+    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
+    # Pre-run page state pinned at the run seam before the post-run capture overwrites the slot;
+    # stamped with the graded run id so a stale prior-run pin cannot anchor the absence scan.
+    pre_run_page_reference: PreRunPageReference | None = None
+    # Parsed text of this run's registered download artifacts, stamped with the run id.
+    registered_artifact_evidence: RegisteredArtifactEvidence | None = None
     # Ordered, bounded list of typed page-evidence packets — one per page observed
     # while scouting the goal path, each tagged with how that state was reached.
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
@@ -291,13 +330,30 @@ class AgentContext:
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
+    # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
+    output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
+    output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
+    output_contract_deferral_count_by_signature: dict[str, int] = field(default_factory=dict)
+    runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Armed when a collapsed-spine violation cannot be split; carries split blockers and stage count to the
+    # next authoring prompt, keyed by a composite {signature, label, authored-YAML hash} so a new draft re-arms.
+    output_contract_spine_directive_blockers_by_attempt_key: dict[str, list[str]] = field(default_factory=dict)
+    output_contract_spine_directive_stage_count_by_attempt_key: dict[str, int] = field(default_factory=dict)
+    output_contract_output_owner_directive_candidates_by_signature: dict[str, list[str]] = field(default_factory=dict)
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
     synthesized_block_reopened_after_failed_run: bool = False
+    synthesized_block_reopened_for_output_coverage: bool = False
+    scouted_output_covered_paths: set[str] = field(default_factory=set)
+    uncovered_output_rescout_context_key: str | None = None
+    uncovered_output_rescout_steer_key: str | None = None
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0
+    # Required parameter keys the build-test resolution seam could not bind from a user param,
+    # a non-empty default, or a scout value. Reset per run; read when composing the run outcome.
+    unbound_required_parameter_keys: list[str] = field(default_factory=list)
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_typed_value: str | None = None

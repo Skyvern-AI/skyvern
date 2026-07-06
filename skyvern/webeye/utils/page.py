@@ -918,6 +918,34 @@ class SkyvernFrame:
         js_script = "(element) => element.click()"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
+    async def read_autocomplete_option_identity(self, element: ElementHandle) -> dict[str, Any] | None:
+        js_script = r"""
+        (node) => {
+            const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
+            const attrs = node.getAttributeNames
+                ? Object.fromEntries(node.getAttributeNames().map((name) => [name, node.getAttribute(name)]))
+                : {};
+            const label = normalize(
+                node.textContent ||
+                attrs["aria-label"] ||
+                attrs.title ||
+                attrs["data-value"] ||
+                attrs.value
+            );
+            const parent = node.parentElement;
+            const optionNodes = parent
+                ? Array.from(parent.children).filter((element) => {
+                    const role = (element.getAttribute("role") || "").toLowerCase();
+                    const tag = element.tagName.toLowerCase();
+                    return role === "option" || tag === "li" || element.hasAttribute("data-value");
+                })
+                : [];
+            return { index: optionNodes.indexOf(node), label };
+        }
+        """
+        identity = await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+        return identity if isinstance(identity, dict) else None
+
     async def remove_target_attr(self, element: ElementHandle) -> None:
         js_script = "(element) => element.removeAttribute('target')"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
@@ -1074,6 +1102,9 @@ class SkyvernFrame:
             except (TimeoutError, asyncio.TimeoutError):
                 network_idle_result = "timeout"
                 LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
+            except Exception:
+                network_idle_result = "error"
+                LOG.warning("Failed to check network idle, proceeding", exc_info=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 

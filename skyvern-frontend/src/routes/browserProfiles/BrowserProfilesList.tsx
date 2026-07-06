@@ -49,9 +49,10 @@ import { BrowserProfileItem } from "./BrowserProfileItem";
 
 type Props = {
   searchKey?: string;
+  managed?: boolean;
 };
 
-function BrowserProfilesList({ searchKey }: Props = {}) {
+function BrowserProfilesList({ searchKey, managed }: Props = {}) {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -84,12 +85,14 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
     page,
     page_size: itemsPerPage,
     searchKey,
+    managed,
   });
 
   const { data: nextPageProfiles } = useBrowserProfilesQuery({
     page: page + 1,
     page_size: itemsPerPage,
     searchKey,
+    managed,
     enabled: (profiles?.length ?? 0) === itemsPerPage,
   });
 
@@ -124,7 +127,7 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
   } = useRowSelection({
     items: pageItems,
     getId: (profile) => profile.browser_profile_id,
-    resetKey: JSON.stringify([page, itemsPerPage, searchKey ?? ""]),
+    resetKey: JSON.stringify([page, itemsPerPage, searchKey ?? "", managed]),
   });
 
   async function handleBulkDeleteConfirm() {
@@ -211,6 +214,19 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
       <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-neutral-600 dark:text-slate-300">
         {hasSearch ? (
           <>No browser profiles match &ldquo;{searchKey}&rdquo;.</>
+        ) : managed === true ? (
+          <div className="flex flex-col items-center gap-3 text-center">
+            <BrowserIcon className="size-10 text-neutral-600 dark:text-slate-400" />
+            <div className="space-y-1">
+              <p className="text-base font-medium text-slate-100">
+                No auto-managed profiles yet
+              </p>
+              <p className="mx-auto max-w-md text-sm text-neutral-600 dark:text-slate-400">
+                Run a workflow with Save &amp; Reuse Session enabled and Skyvern
+                creates one automatically.
+              </p>
+            </div>
+          </div>
         ) : (
           <div className="flex flex-col items-center gap-3 text-center">
             <BrowserIcon className="size-10 text-neutral-600 dark:text-slate-400" />

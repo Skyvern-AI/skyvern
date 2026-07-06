@@ -32,67 +32,55 @@ class _FakeBrowserContext:
         self._impl_obj = SimpleNamespace(_close_was_called=closed, _closed=closed)
 
 
-def test_mcp_to_copilot_ok_passthrough() -> None:
-    result = mcp_to_copilot({"ok": True, "data": {"count": 3}})
-    assert result == {"ok": True, "data": {"count": 3}}
-
-
-def test_mcp_to_copilot_defaults_ok_true_when_missing() -> None:
-    result = mcp_to_copilot({"data": "x"})
-    assert result["ok"] is True
-    assert result["data"] == "x"
-
-
-def test_mcp_to_copilot_defaults_ok_false_when_error_present_without_ok() -> None:
-    # Upstream MCP tool returning an error-shaped dict without an explicit
-    # ok field must not produce {"ok": True, "error": "..."}.
-    result = mcp_to_copilot({"error": "tool exploded"})
-    assert result == {"ok": False, "error": "tool exploded"}
-
-
-def test_mcp_to_copilot_error_with_hint_joins_message_and_hint() -> None:
-    result = mcp_to_copilot({"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}})
-    assert result == {"ok": False, "error": "boom. retry later"}
-
-
-def test_mcp_to_copilot_error_without_hint_uses_message_only() -> None:
-    result = mcp_to_copilot({"ok": False, "error": {"code": "E1", "message": "boom"}})
-    assert result == {"ok": False, "error": "boom"}
-
-
-def test_mcp_to_copilot_error_with_empty_hint_uses_message_only() -> None:
-    result = mcp_to_copilot({"ok": False, "error": {"message": "boom", "hint": ""}})
-    assert result == {"ok": False, "error": "boom"}
-
-
-def test_mcp_to_copilot_error_dict_without_message_uses_default() -> None:
-    result = mcp_to_copilot({"ok": False, "error": {"code": "E1"}})
-    assert result == {"ok": False, "error": "Unknown error"}
-
-
-def test_mcp_to_copilot_non_dict_error_coerced_with_str() -> None:
-    result = mcp_to_copilot({"ok": False, "error": ValueError("boom")})
-    assert result == {"ok": False, "error": "boom"}
-
-
-def test_mcp_to_copilot_string_error_passthrough() -> None:
-    result = mcp_to_copilot({"ok": False, "error": "boom"})
-    assert result == {"ok": False, "error": "boom"}
-
-
-def test_mcp_to_copilot_data_none_omitted() -> None:
-    result = mcp_to_copilot({"ok": True, "data": None})
-    assert result == {"ok": True}
-
-
-def test_mcp_to_copilot_warnings_passthrough() -> None:
-    result = mcp_to_copilot({"ok": True, "warnings": ["slow response"]})
-    assert result == {"ok": True, "warnings": ["slow response"]}
-
-
-def test_mcp_to_copilot_empty_warnings_omitted() -> None:
-    result = mcp_to_copilot({"ok": True, "warnings": []})
-    assert "warnings" not in result
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param({"ok": True, "data": {"count": 3}}, {"ok": True, "data": {"count": 3}}, id="ok_passthrough"),
+        pytest.param({"data": "x"}, {"ok": True, "data": "x"}, id="defaults_ok_true_when_missing"),
+        # Upstream MCP tool returning an error-shaped dict without an explicit
+        # ok field must not produce {"ok": True, "error": "..."}.
+        pytest.param(
+            {"error": "tool exploded"},
+            {"ok": False, "error": "tool exploded"},
+            id="defaults_ok_false_when_error_present_without_ok",
+        ),
+        pytest.param(
+            {"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}},
+            {"ok": False, "error": "boom. retry later"},
+            id="error_with_hint_joins_message_and_hint",
+        ),
+        pytest.param(
+            {"ok": False, "error": {"code": "E1", "message": "boom"}},
+            {"ok": False, "error": "boom"},
+            id="error_without_hint_uses_message_only",
+        ),
+        pytest.param(
+            {"ok": False, "error": {"message": "boom", "hint": ""}},
+            {"ok": False, "error": "boom"},
+            id="error_with_empty_hint_uses_message_only",
+        ),
+        pytest.param(
+            {"ok": False, "error": {"code": "E1"}},
+            {"ok": False, "error": "Unknown error"},
+            id="error_dict_without_message_uses_default",
+        ),
+        pytest.param(
+            {"ok": False, "error": ValueError("boom")},
+            {"ok": False, "error": "boom"},
+            id="non_dict_error_coerced_with_str",
+        ),
+        pytest.param({"ok": False, "error": "boom"}, {"ok": False, "error": "boom"}, id="string_error_passthrough"),
+        pytest.param({"ok": True, "data": None}, {"ok": True}, id="data_none_omitted"),
+        pytest.param(
+            {"ok": True, "warnings": ["slow response"]},
+            {"ok": True, "warnings": ["slow response"]},
+            id="warnings_passthrough",
+        ),
+        pytest.param({"ok": True, "warnings": []}, {"ok": True}, id="empty_warnings_omitted"),
+    ],
+)
+def test_mcp_to_copilot(payload: dict[str, Any], expected: dict[str, Any]) -> None:
+    assert mcp_to_copilot(payload) == expected
 
 
 def _make_ctx(*, api_key: str | None = "test-api-key") -> AgentContext:

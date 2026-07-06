@@ -16,6 +16,16 @@ function BrowserProfilesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 250);
+  const [profileType, setProfileType] = useState<"all" | "user" | "managed">(
+    "all",
+  );
+  const managed = profileType === "all" ? undefined : profileType === "managed";
+
+  function resetToFirstPage() {
+    const params = new URLSearchParams(searchParams);
+    params.set("page", "1");
+    setSearchParams(params, { replace: true });
+  }
 
   // Mounted for its side effects: rehydrates an in-progress create from
   // sessionStorage so the toast still fires if the user navigates here from
@@ -34,20 +44,33 @@ function BrowserProfilesPage() {
         </p>
       </div>
       <div className="flex items-center justify-between gap-4">
-        <TableSearchInput
-          value={search}
-          onChange={(value) => {
-            setSearch(value);
-            const params = new URLSearchParams(searchParams);
-            params.set("page", "1");
-            setSearchParams(params, { replace: true });
-          }}
-          placeholder="Search browser profiles..."
-          className="w-48 lg:w-72"
-        />
+        <div className="flex items-center gap-2">
+          <TableSearchInput
+            value={search}
+            onChange={(value) => {
+              setSearch(value);
+              resetToFirstPage();
+            }}
+            placeholder="Search browser profiles..."
+            className="w-48 lg:w-72"
+          />
+          <select
+            aria-label="Filter browser profiles by type"
+            className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+            value={profileType}
+            onChange={(e) => {
+              setProfileType(e.target.value as "all" | "user" | "managed");
+              resetToFirstPage();
+            }}
+          >
+            <option value="all">All</option>
+            <option value="user">User profiles</option>
+            <option value="managed">Auto-managed</option>
+          </select>
+        </div>
         <CreateBrowserProfileButton />
       </div>
-      <BrowserProfilesList searchKey={debouncedSearch} />
+      <BrowserProfilesList searchKey={debouncedSearch} managed={managed} />
     </div>
   );
 }

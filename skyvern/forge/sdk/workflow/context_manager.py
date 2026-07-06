@@ -33,6 +33,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, normalize_totp_config
+from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -237,6 +238,7 @@ class WorkflowRunContext:
         self.browser_session_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
+        self.resolved_credential_parameter_ids: dict[str, str] = {}
 
     def set_workflow(self, workflow: "Workflow") -> None:
         """
@@ -586,6 +588,16 @@ class WorkflowRunContext:
     def generate_random_secret_id() -> str:
         return f"{RANDOM_SECRET_ID_PREFIX}{generate_random_string(length=4)}"
 
+    def register_secret_value(self, secret_value: str, suffix: str | None = None) -> str:
+        while True:
+            secret_id = self.generate_random_secret_id()
+            if suffix:
+                secret_id = f"{secret_id}_{suffix}"
+            if secret_id not in self.secrets:
+                break
+        self.secrets[secret_id] = secret_value
+        return secret_id
+
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
         Extract vault_id and item_id from the credential_id.
@@ -708,7 +720,9 @@ class WorkflowRunContext:
         LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         credential_id = None
-        if parameter.credential_id:
+        if parameter.credential_ids:
+            credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
+        elif parameter.credential_id:
             if self.has_parameter(parameter.credential_id) and self.has_value(parameter.credential_id):
                 credential_id = self.values[parameter.credential_id]
             else:
@@ -719,6 +733,28 @@ class WorkflowRunContext:
             raise CredentialParameterNotFoundError(parameter.credential_id)
 
         await self._register_credential_parameter_value(credential_id, parameter, organization)
+
+    async def resolve_credential_parameter_id(
+        self,
+        parameter: CredentialParameter,
+        organization_id: str,
+    ) -> str:
+        cached = self.resolved_credential_parameter_ids.get(parameter.key)
+        if cached:
+            return cached
+        if not parameter.credential_ids:
+            self.resolved_credential_parameter_ids[parameter.key] = parameter.credential_id
+            return parameter.credential_id
+        credential_id = await select_credential_for_run(
+            workflow_run_id=self.workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=self.workflow_permanent_id,
+            parameter_key=parameter.key,
+            credential_ids=parameter.credential_ids,
+            selection_strategy=parameter.selection_strategy,
+        )
+        self.resolved_credential_parameter_ids[parameter.key] = credential_id
+        return credential_id
 
     async def register_aws_secret_parameter_value(
         self,
@@ -1647,6 +1683,9 @@ class WorkflowContextManager:
     def get_workflow_run_context(self, workflow_run_id: str) -> WorkflowRunContext:
         self._validate_workflow_run_context(workflow_run_id)
         return self.workflow_run_contexts[workflow_run_id]
+
+    def remove_workflow_run_context(self, workflow_run_id: str) -> None:
+        self.workflow_run_contexts.pop(workflow_run_id, None)
 
     async def register_block_parameters_for_workflow_run(
         self,

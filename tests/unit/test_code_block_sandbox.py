@@ -580,6 +580,51 @@ result = stdout.decode()
         assert [match.group(0) for match in re_helper.finditer("a", "aba")] == ["a", "a"]
 
 
+class TestFormatStringEscape:
+    """str.format/format_map perform attribute+key access at runtime, bypassing the
+    AST dunder check. These sandbox-escape payloads must be rejected."""
+
+    def test_format_string_env_escape(self) -> None:
+        """Escape chain: json.dumps.__globals__ -> codecs -> sys -> os.environ."""
+        malicious_code = (
+            'env_str = "{0.__globals__[codecs].open.__globals__[sys].modules[os].environ}".format(json.dumps)'
+        )
+        with pytest.raises(InsecureCodeDetected, match="format"):
+            CodeBlock.is_safe_code(malicious_code)
+
+    def test_format_string_ctypes_so_load(self) -> None:
+        """Variant: same chain reaching ctypes.cdll to load a .so."""
+        malicious_code = (
+            'x = ("{0.__globals__[codecs].open.__globals__[sys].modules[ctypes].cdll[/tmp/x.so]}").format(json.dumps)'
+        )
+        with pytest.raises(InsecureCodeDetected, match="format"):
+            CodeBlock.is_safe_code(malicious_code)
+
+    def test_dynamically_built_format_payload(self) -> None:
+        """A payload assembled at runtime defeats literal scanning but still needs .format."""
+        malicious_code = 's = "{0." + "__globals__" + "[codecs]}"\nx = s.format(json.dumps)'
+        with pytest.raises(InsecureCodeDetected, match="format"):
+            CodeBlock.is_safe_code(malicious_code)
+
+    def test_format_map_escape(self) -> None:
+        malicious_code = 'x = "{0.__globals__}".format_map({0: json.dumps})'
+        with pytest.raises(InsecureCodeDetected, match="format_map"):
+            CodeBlock.is_safe_code(malicious_code)
+
+    def test_str_format_via_class_is_blocked(self) -> None:
+        malicious_code = 'x = str.format("{0.__globals__}", json.dumps)'
+        with pytest.raises(InsecureCodeDetected, match="format"):
+            CodeBlock.is_safe_code(malicious_code)
+
+    def test_fstrings_still_allowed(self) -> None:
+        """f-strings compile to real AST nodes, so the dunder check still guards them —
+        blocking .format must not take the safe formatting idiom with it."""
+        CodeBlock.is_safe_code('name = "world"\nx = f"hello {name}"')
+
+    def test_percent_formatting_still_allowed(self) -> None:
+        CodeBlock.is_safe_code('x = "hello %s" % name')
+
+
 # ---------------------------------------------------------------------------
 # generate_async_user_function — integration tests
 # ---------------------------------------------------------------------------

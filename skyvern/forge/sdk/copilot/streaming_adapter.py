@@ -234,6 +234,7 @@ async def stream_to_sse(
                                 iteration=iteration,
                                 tool_call_id=call_id,
                                 detail=detail,
+                                workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
                             )
                         )
 
@@ -326,6 +327,19 @@ async def _emit_code_repair_progress(
     )
 
 
+_BLOCK_RUNNING_TOOL_NAMES = frozenset({"update_and_run_blocks", "run_blocks_and_collect_debug"})
+
+
+def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str | None:
+    # Only block-running tools create a new run; read-only tools (e.g. get_run_results) echo a prior
+    # run id and would misattribute a stale run to the current turn.
+    if tool_name not in _BLOCK_RUNNING_TOOL_NAMES:
+        return None
+    data = parsed.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    return run_id if isinstance(run_id, str) else None
+
+
 async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: CopilotContext) -> None:
     """Emit the TOOL_RESULT frame for the goal-satisfying tool.
 
@@ -360,6 +374,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
             detail=summarize_tool_result_detail(parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals),
+            workflow_run_id=_tool_result_workflow_run_id(pending.tool_name, parsed),
         )
     )
 
@@ -463,6 +478,8 @@ def _update_enforcement_from_tool(
         ctx.post_update_nudge_count = 0
     if tool_name in ("update_workflow", "update_and_run_blocks") and has_blocks:
         ctx.synthesized_block_reopened_after_failed_run = False
+        ctx.synthesized_block_reopened_for_output_coverage = False
+        ctx.uncovered_output_rescout_steer_key = None
 
     if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks"):
         ctx.test_after_update_done = True

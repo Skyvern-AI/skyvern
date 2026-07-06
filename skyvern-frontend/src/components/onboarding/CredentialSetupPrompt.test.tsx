@@ -50,7 +50,7 @@ describe("CredentialSetupPrompt", () => {
     const cta = screen.getByRole("link", {
       name: /set up credentials in the editor/i,
     });
-    expect(cta.getAttribute("href")).toBe("/workflows/wpid_123/studio");
+    expect(cta.getAttribute("href")).toBe("/agents/wpid_123/studio");
   });
 
   it("routes the CTA to /build when the studio preview is off", () => {
@@ -60,7 +60,7 @@ describe("CredentialSetupPrompt", () => {
     const cta = screen.getByRole("link", {
       name: /set up credentials in the editor/i,
     });
-    expect(cta.getAttribute("href")).toBe("/workflows/wpid_123/build");
+    expect(cta.getAttribute("href")).toBe("/agents/wpid_123/build");
   });
 
   it("fires credentialSetupShown once on mount with the block count", () => {

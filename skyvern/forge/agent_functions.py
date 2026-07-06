@@ -59,6 +59,10 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+# Playwright's always-on ffmpeg VP8 encoder scales CPU with pixel count; 720p is the
+# legibility / CPU tradeoff point that the BROWSER_RECORDING_720P flag opts a run into.
+RECORDING_VIDEO_SIZE_720P: dict[str, int] = {"width": 1280, "height": 720}
+
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
@@ -729,6 +733,21 @@ class AgentFunction:
         """
         return False
 
+    async def resolve_recording_video_size(
+        self,
+        current_size: dict[str, int] | None,
+        *,
+        distinct_id: str | None,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+    ) -> dict[str, int] | None:
+        """Resolve the browser recording resolution for this run.
+
+        Returns ``current_size`` unchanged. Cloud overrides this to opt runs into
+        an elevated resolution behind a feature flag.
+        """
+        return current_size
+
     async def should_keep_code_mode_for_workflow_run(
         self,
         *,
@@ -736,6 +755,13 @@ class AgentFunction:
         workflow_run: "WorkflowRun",
     ) -> bool:
         return True
+
+    async def resolve_mcp_code_only_mode(
+        self,
+        organization_id: str | None,
+        request_override: bool | None,
+    ) -> bool:
+        return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
 
     async def should_use_codeblock_runner(
         self,
@@ -791,6 +817,19 @@ class AgentFunction:
         overrides to dispatch to the runner. Callers must gate on
         should_use_codeblock_runner first.
         """
+        return None
+
+    async def should_dispatch_copilot_block_run_to_worker(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> bool:
+        """Base no-op (copilot runs its block test inline); overridden per deployment."""
+        return False
+
+    def resolve_copilot_dispatch_trigger_type(self) -> "WorkflowRunTriggerType | None":
+        """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:

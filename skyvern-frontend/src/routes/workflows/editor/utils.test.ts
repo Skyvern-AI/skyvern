@@ -41,6 +41,7 @@ const baseWorkflow = {
   run_with: "agent",
   cache_key: null,
   ai_fallback: true,
+  enable_self_healing: false,
   adaptive_caching: null,
   code_version: null,
   run_sequentially: false,

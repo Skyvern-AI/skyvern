@@ -186,11 +186,15 @@ def test_enabled_with_logfire(
     monkeypatch.setattr(tracing_setup, "_patch_agent_span_attributes", lambda: patch_calls.append(None))
 
     tracing_setup.ensure_tracing_initialized()
+    tracing_setup.ensure_tracing_initialized()
 
-    assert len(configure_calls) == 1
-    assert configure_calls[0]["send_to_logfire"] == "if-token-present"
-    assert configure_calls[0]["service_name"] == settings.OTEL_SERVICE_NAME
-    assert configure_calls[0]["environment"] == settings.ENV
+    assert configure_calls == [
+        {
+            "send_to_logfire": "if-token-present",
+            "service_name": settings.OTEL_SERVICE_NAME,
+            "environment": settings.ENV,
+        }
+    ]
     assert instrument_calls == [None]
     assert patch_calls == [None]
     assert processors_calls == [[]]
@@ -243,42 +247,6 @@ class TestTracingSetup:
         from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
 
         assert is_tracing_enabled() is False
-
-    def test_ensure_tracing_initialized_sets_processors_once(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        import skyvern.forge.sdk.copilot.tracing_setup as tracing_setup
-
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
-        monkeypatch.setattr(tracing_setup, "_TRACING_INITIALIZED", False)
-
-        configure_calls: list[dict[str, Any]] = []
-        instrument_calls: list[None] = []
-        # logfire is an optional dependency and may not be installed — inject a
-        # stub module into sys.modules so `import logfire` inside
-        # `ensure_tracing_initialized` resolves to our recorder.
-        monkeypatch.setitem(
-            sys.modules,
-            "logfire",
-            SimpleNamespace(
-                configure=lambda **kw: configure_calls.append(kw),
-                instrument_openai_agents=lambda: instrument_calls.append(None),
-            ),
-        )
-        monkeypatch.setattr(tracing_setup, "_patch_agent_span_attributes", lambda: None)
-
-        tracing_setup.ensure_tracing_initialized()
-        tracing_setup.ensure_tracing_initialized()
-
-        assert configure_calls == [
-            {
-                "send_to_logfire": "if-token-present",
-                "service_name": settings.OTEL_SERVICE_NAME,
-                "environment": settings.ENV,
-            }
-        ]
-        assert instrument_calls == [None]
 
     def test_copilot_span_returns_nullcontext_when_disabled(
         self,

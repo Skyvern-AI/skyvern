@@ -19,6 +19,19 @@ def _response(status_code: int, body: str = "", headers: dict[str, str] | None =
     return httpx.Response(status_code=status_code, content=body.encode("utf-8"), headers=headers or {})
 
 
+async def _deliver_with_mock(deliver: AsyncMock, **kwargs) -> httpx.Response:
+    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
+        return await deliver_webhook_with_retries(
+            url="https://example.com/hook",
+            payload="{}",
+            headers={},
+            timeout_seconds=30.0,
+            organization_id="o_1",
+            run_id="wr_1",
+            **kwargs,
+        )
+
+
 @pytest.fixture
 def fake_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Replace asyncio.sleep with a no-op recorder so tests don't actually wait."""
@@ -40,15 +53,7 @@ def no_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_returns_immediately_on_success(fake_sleep: list[float]) -> None:
     deliver = AsyncMock(return_value=_response(200, "ok"))
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
+    resp = await _deliver_with_mock(deliver)
 
     assert resp.status_code == 200
     assert deliver.await_count == 1
@@ -56,17 +61,18 @@ async def test_returns_immediately_on_success(fake_sleep: list[float]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_retries_on_403_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(side_effect=[_response(403, "forbidden"), _response(200, "ok")])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
+@pytest.mark.parametrize(
+    "status_code",
+    [
+        pytest.param(403, id="403"),
+        pytest.param(429, id="429"),
+        pytest.param(503, id="503"),
+        pytest.param(521, id="521"),
+    ],
+)
+async def test_retryable_status_then_success(status_code: int, fake_sleep: list[float]) -> None:
+    deliver = AsyncMock(side_effect=[_response(status_code), _response(200, "ok")])
+    resp = await _deliver_with_mock(deliver)
 
     assert resp.status_code == 200
     assert deliver.await_count == 2
@@ -74,103 +80,27 @@ async def test_retries_on_403_then_succeeds(fake_sleep: list[float]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_retries_on_5xx_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(side_effect=[_response(503, "unavailable"), _response(200)])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
+@pytest.mark.parametrize(
+    "status_code",
+    [
+        pytest.param(400, id="400"),
+        pytest.param(401, id="401"),
+        pytest.param(404, id="404"),
+    ],
+)
+async def test_non_retryable_status_returns_without_retry(status_code: int, fake_sleep: list[float]) -> None:
+    deliver = AsyncMock(return_value=_response(status_code))
+    resp = await _deliver_with_mock(deliver)
 
-    assert resp.status_code == 200
-    assert deliver.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_retries_on_429_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(side_effect=[_response(429), _response(200)])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 200
-    assert deliver.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_does_not_retry_on_400_bad_request(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(return_value=_response(400, "bad request"))
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 400
+    assert resp.status_code == status_code
     assert deliver.await_count == 1
     assert fake_sleep == []
 
 
 @pytest.mark.asyncio
-async def test_does_not_retry_on_401_unauthorized(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(return_value=_response(401))
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 401
-    assert deliver.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_does_not_retry_on_404(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(return_value=_response(404))
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 404
-    assert deliver.await_count == 1
-
-
-@pytest.mark.asyncio
 async def test_returns_final_failure_when_all_attempts_fail(fake_sleep: list[float]) -> None:
     deliver = AsyncMock(return_value=_response(503, "still down"))
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
+    resp = await _deliver_with_mock(deliver)
 
     assert resp.status_code == 503
     assert deliver.await_count == WEBHOOK_DELIVERY_MAX_ATTEMPTS
@@ -178,56 +108,28 @@ async def test_returns_final_failure_when_all_attempts_fail(fake_sleep: list[flo
 
 
 @pytest.mark.asyncio
-async def test_retries_on_network_error_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(side_effect=[httpx.ConnectError("conn refused"), _response(200)])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 200
-    assert deliver.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_retries_on_timeout_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(side_effect=[httpx.ReadTimeout("slow"), _response(200)])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 200
-    assert deliver.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_retries_on_remote_protocol_error_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(
-        side_effect=[
+@pytest.mark.parametrize(
+    "exception",
+    [
+        pytest.param(httpx.ConnectError("conn refused"), id="ConnectError"),
+        pytest.param(httpx.ReadTimeout("slow"), id="ReadTimeout"),
+        pytest.param(
             httpx.RemoteProtocolError("Server disconnected without sending a response"),
-            _response(200),
-        ],
-    )
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
+            id="RemoteProtocolError",
+        ),
+        pytest.param(
+            httpx.HTTPStatusError(
+                "503",
+                request=httpx.Request("POST", "https://proxy.example/proxy/webhook"),
+                response=_response(503),
+            ),
+            id="HTTPStatusError-retryable",
+        ),
+    ],
+)
+async def test_retryable_exception_then_success(exception: Exception, fake_sleep: list[float]) -> None:
+    deliver = AsyncMock(side_effect=[exception, _response(200)])
+    resp = await _deliver_with_mock(deliver)
 
     assert resp.status_code == 200
     assert deliver.await_count == 2
@@ -275,43 +177,6 @@ def test_is_retryable_status_covers_full_5xx_range_and_curated_4xx() -> None:
         assert is_retryable_status(code)
     for code in (200, 201, 301, 400, 401, 404, 405, 410, 418, 422):
         assert not is_retryable_status(code)
-
-
-@pytest.mark.asyncio
-async def test_retries_on_521_then_succeeds(fake_sleep: list[float]) -> None:
-    deliver = AsyncMock(side_effect=[_response(521, "origin down"), _response(200)])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 200
-    assert deliver.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_retries_on_http_status_error_5xx_then_succeeds(fake_sleep: list[float]) -> None:
-    """NAT proxy client raises HTTPStatusError on proxy-side 5xx via raise_for_status()."""
-    request = httpx.Request("POST", "https://proxy.example/proxy/webhook")
-    err = httpx.HTTPStatusError("503", request=request, response=_response(503))
-    deliver = AsyncMock(side_effect=[err, _response(200)])
-    with patch("skyvern.services.webhook_delivery.app.AGENT_FUNCTION.deliver_webhook", deliver):
-        resp = await deliver_webhook_with_retries(
-            url="https://example.com/hook",
-            payload="{}",
-            headers={},
-            timeout_seconds=30.0,
-            organization_id="o_1",
-            run_id="wr_1",
-        )
-
-    assert resp.status_code == 200
-    assert deliver.await_count == 2
 
 
 @pytest.mark.asyncio

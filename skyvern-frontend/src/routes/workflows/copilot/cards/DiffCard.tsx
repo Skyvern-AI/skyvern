@@ -1,6 +1,7 @@
 import { MagicWandIcon } from "@radix-ui/react-icons";
 
 import { TurnNarrativeState } from "../narrativeState";
+import { getDiffCardTitle } from "./diffCardTitle";
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function shouldShowDiffCard(turn: TurnNarrativeState): boolean {
@@ -13,7 +14,15 @@ export function shouldShowDiffCard(turn: TurnNarrativeState): boolean {
   return turn.draft.blockLabels.length > 0;
 }
 
-export function DiffCard({ turn }: { turn: TurnNarrativeState }) {
+export function DiffCard({
+  pendingProposal = false,
+  rejected = false,
+  turn,
+}: {
+  pendingProposal?: boolean;
+  rejected?: boolean;
+  turn: TurnNarrativeState;
+}) {
   const draft = turn.draft;
   if (!draft) {
     return null;
@@ -27,9 +36,9 @@ export function DiffCard({ turn }: { turn: TurnNarrativeState }) {
 
   return (
     <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
-      <div className="flex items-center gap-2 text-xs font-semibold text-studio-accent-2">
+      <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
         <MagicWandIcon className="h-3.5 w-3.5" />
-        {draft.summary ?? "Proposed changes"}
+        {getDiffCardTitle(turn, { pendingProposal, rejected })}
       </div>
       {draft.blockLabels.length > 0 ? (
         <div className="mt-2">

@@ -37,8 +37,21 @@ def build_workflow_browser_session_storage_key(
     workflow_permanent_id: str,
     rendered_browser_profile_key: str | None,
 ) -> str:
+    digest = build_browser_profile_key_digest(rendered_browser_profile_key)
+    return build_workflow_browser_session_storage_key_from_digest(workflow_permanent_id, digest)
+
+
+def build_workflow_browser_session_storage_key_from_digest(
+    workflow_permanent_id: str,
+    digest: str | None,
+) -> str:
+    if not digest:
+        return workflow_permanent_id
+    return f"{workflow_permanent_id}/{_PROFILE_SEGMENT_PATH}/{digest}"
+
+
+def build_browser_profile_key_digest(rendered_browser_profile_key: str | None) -> str:
     rendered = rendered_browser_profile_key.strip() if rendered_browser_profile_key else ""
     if not rendered:
-        return workflow_permanent_id
-    digest = sha256(rendered.encode("utf-8")).hexdigest()[:_PROFILE_SEGMENT_DIGEST_LENGTH]
-    return f"{workflow_permanent_id}/{_PROFILE_SEGMENT_PATH}/{digest}"
+        return ""
+    return sha256(rendered.encode("utf-8")).hexdigest()[:_PROFILE_SEGMENT_DIGEST_LENGTH]

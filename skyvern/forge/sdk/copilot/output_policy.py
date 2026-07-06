@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
@@ -22,7 +23,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
-    credential_params,
+    credential_param_ids,
     parse_workflow_yaml,
     url_origin,
     workflow_blocks,
@@ -837,7 +838,7 @@ def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request
     if not isinstance(workflow_definition, dict):
         return False
 
-    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return False
 
@@ -861,7 +862,7 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
 
 def _block_broadens_credential_scope(
     block: dict[str, Any],
-    credential_params_by_key: dict[str, str],
+    credential_params_by_key: Mapping[str, str | set[str]],
     approved_origins: dict[str, set[str]],
 ) -> bool:
     credential_ids = block_credential_ids(block, credential_params_by_key)

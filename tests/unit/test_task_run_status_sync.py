@@ -19,7 +19,6 @@ def mock_session():
 def agent_db(mock_session):
     db = AgentDB.__new__(AgentDB)
     db.Session = MagicMock(return_value=mock_session)
-    # Set up tasks repository (sync_task_run_status delegates to self.tasks)
     from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 
     tasks = TasksRepository.__new__(TasksRepository)
@@ -33,7 +32,7 @@ def agent_db(mock_session):
 @pytest.mark.asyncio
 async def test_sync_task_run_status_updates_matching_row(agent_db, mock_session):
     """sync_task_run_status should UPDATE task_runs where run_id matches."""
-    await agent_db.sync_task_run_status(
+    await agent_db.tasks.sync_task_run_status(
         organization_id="org_1",
         run_id="wr_123",
         status="failed",
@@ -51,7 +50,7 @@ async def test_sync_task_run_status_no_raise_on_error(agent_db, mock_session):
     """sync_task_run_status should swallow exceptions (best-effort)."""
     mock_session.execute.side_effect = Exception("DB error")
     # Should NOT raise
-    await agent_db.sync_task_run_status(
+    await agent_db.tasks.sync_task_run_status(
         organization_id="org_1",
         run_id="nonexistent",
         status="failed",

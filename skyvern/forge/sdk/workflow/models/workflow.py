@@ -149,6 +149,7 @@ class Workflow(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
+    enable_self_healing: bool = False
     code_version: int | None = None
     generate_script_on_terminal: bool = False
     run_sequentially: bool | None = None
@@ -157,6 +158,9 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
+    # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
+    copilot_authored: bool = False
 
     @field_validator("run_with", mode="before")
     @classmethod

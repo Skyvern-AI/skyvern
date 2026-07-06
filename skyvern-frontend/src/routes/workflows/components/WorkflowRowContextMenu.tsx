@@ -184,7 +184,7 @@ function WorkflowRowContextMenu({
               </ContextMenuItem>
               <ContextMenuItem
                 onSelect={() =>
-                  onNavigate(`/workflows/${workflow.workflow_permanent_id}/run`)
+                  onNavigate(`/agents/${workflow.workflow_permanent_id}/run`)
                 }
               >
                 <PlayIcon className="mr-2 h-4 w-4" />

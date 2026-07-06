@@ -13,6 +13,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.models import ActionModel, ArtifactModel
 from skyvern.forge.sdk.db.protocols import RunReader
 from skyvern.forge.sdk.db.utils import convert_to_artifact
+from skyvern.forge.sdk.trace import traced
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
@@ -33,6 +34,7 @@ class ArtifactsRepository(BaseRepository):
         super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
         self._run_reader = run_reader
 
+    @traced(name="skyvern.db.create_artifact")
     @db_operation("create_artifact")
     async def create_artifact(
         self,
@@ -75,6 +77,7 @@ class ArtifactsRepository(BaseRepository):
             await session.refresh(new_artifact)
             return convert_to_artifact(new_artifact, self.debug_enabled)
 
+    @traced(name="skyvern.db.bulk_create_artifacts")
     @db_operation("bulk_create_artifacts")
     async def bulk_create_artifacts(
         self,
