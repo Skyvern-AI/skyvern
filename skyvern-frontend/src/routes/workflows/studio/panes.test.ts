@@ -110,6 +110,57 @@ describe("panesFromDeepLink", () => {
       panesFromDeepLink({ runId: null, active: null, blockLabel: null }),
     ).toEqual(["copilot", "browser"]);
   });
+
+  test("a learned run layout restores on a bare ?wr= entry", () => {
+    const learned = ["copilot", "browser", "editor", "overview"] as const;
+    expect(
+      panesFromDeepLink(
+        { runId: "wr_123", active: null, blockLabel: null },
+        DEFAULT_STUDIO_PANES,
+        learned,
+      ),
+    ).toEqual(["copilot", "browser", "editor", "overview"]);
+  });
+
+  test("learned run layout including editor is restored as-is", () => {
+    expect(
+      panesFromDeepLink(
+        { runId: "wr_123", active: null, blockLabel: null },
+        DEFAULT_STUDIO_PANES,
+        ["editor", "overview"],
+      ),
+    ).toEqual(["editor", "overview"]);
+  });
+
+  test("block-iterate (?wr= + ?bl=) ignores the learned run layout", () => {
+    expect(
+      panesFromDeepLink(
+        { runId: "wr_123", active: null, blockLabel: "block_1" },
+        DEFAULT_STUDIO_PANES,
+        ["copilot", "editor"],
+      ),
+    ).toEqual(["editor", "browser", "overview"]);
+  });
+
+  test("?active= alone ignores the learned run layout", () => {
+    expect(
+      panesFromDeepLink(
+        { runId: null, active: "act_1", blockLabel: null },
+        DEFAULT_STUDIO_PANES,
+        ["editor", "overview"],
+      ),
+    ).toEqual(["copilot", "browser", "overview"]);
+  });
+
+  test("null learned layout falls back to factory run panes", () => {
+    expect(
+      panesFromDeepLink(
+        { runId: "wr_123", active: null, blockLabel: null },
+        DEFAULT_STUDIO_PANES,
+        null,
+      ),
+    ).toEqual(["copilot", "browser", "overview"]);
+  });
 });
 
 describe("resolveOpenPanes", () => {
@@ -164,6 +215,34 @@ describe("resolveOpenPanes", () => {
       "copilot",
       "browser",
     ]);
+  });
+
+  test("?wr= with a learned run layout restores it", () => {
+    expect(
+      resolveOpenPanes("?wr=wr_123", DEFAULT_STUDIO_PANES, [
+        "browser",
+        "overview",
+        "editor",
+      ]),
+    ).toEqual(["browser", "overview", "editor"]);
+  });
+
+  test("explicit ?panes= wins over the learned run layout", () => {
+    expect(
+      resolveOpenPanes("?wr=wr_123&panes=copilot", DEFAULT_STUDIO_PANES, [
+        "browser",
+        "overview",
+      ]),
+    ).toEqual(["copilot"]);
+  });
+
+  test("?wr= + ?bl= ignores the learned run layout", () => {
+    expect(
+      resolveOpenPanes("?wr=wr_123&bl=block_1", DEFAULT_STUDIO_PANES, [
+        "copilot",
+        "editor",
+      ]),
+    ).toEqual(["editor", "browser", "overview"]);
   });
 });
 
