@@ -50,6 +50,7 @@ BuildTestOutcomeReasonCode = Literal[
     "metadata_reject",
     "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
+    "required_input_unbound",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
@@ -279,6 +280,29 @@ def authored_block_signatures_from_workflow(
     return signatures
 
 
+def authored_block_parameter_keys_from_workflow(
+    workflow_yaml: str | None,
+    code_artifact_metadata: object = None,
+) -> dict[str, list[str]]:
+    payload = _authored_structure_payload_from_workflow(workflow_yaml, code_artifact_metadata)
+    if payload is None:
+        return {}
+    result: dict[str, list[str]] = {}
+    code_blocks = payload.get("code_blocks")
+    if not isinstance(code_blocks, list):
+        return result
+    for block in code_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        label = _safe_str(block.get("label"))
+        if not label:
+            continue
+        keys = block.get("parameter_keys")
+        if isinstance(keys, list):
+            result[label] = [_safe_str(key) for key in keys if _safe_str(key)]
+    return result
+
+
 def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontierFacet:
     if outcome.reason_code == "scout_act_observe_hollow_after_interaction":
         return "unexecuted_submit"
@@ -286,7 +310,11 @@ def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontie
         return "amend_in_place"
     if outcome.missing_requested_output_facts:
         return "value_shape"
-    if outcome.reason_code in {"sandbox_unresolved_name", "synthesized_parameter_binding_ambiguous"}:
+    if outcome.reason_code in {
+        "sandbox_unresolved_name",
+        "synthesized_parameter_binding_ambiguous",
+        "required_input_unbound",
+    }:
         return "amend_in_place"
     if outcome.reason_code in {"outcome_not_demonstrated", "no_meaningful_output", "runtime_missing_output_dependency"}:
         return "value_shape"
@@ -786,6 +814,48 @@ def recorded_outcome_from_scout_act_observe_hollow(
     )
 
 
+def _required_input_unbound_identity(
+    failed_block: Mapping[str, object] | None,
+    referenced_unbound_keys: Sequence[str],
+) -> str:
+    return "required_input_unbound:" + _stable_hash(
+        {
+            "source": "required_input_unbound",
+            "referenced_unbound_keys": sorted({str(key) for key in referenced_unbound_keys}),
+            "block_label": _safe_str(failed_block.get("label")) if failed_block is not None else "",
+            "block_status": _safe_str(failed_block.get("status")) if failed_block is not None else "",
+        }
+    )
+
+
+def _required_input_unbound_outcome(
+    failed_block: Mapping[str, object] | None,
+    block_labels: list[str],
+    workflow_run_id: str | None,
+    authored_structure_signature: str | None,
+    referenced_unbound_keys: Sequence[str],
+) -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        attempted_block_label=_safe_str(failed_block.get("label")) if failed_block is not None else "",
+        verdict="repairable_failure",
+        reason_code="required_input_unbound",
+        workflow_run_id=workflow_run_id or None,
+        block_labels=block_labels,
+        structural_failure_identity=_required_input_unbound_identity(failed_block, referenced_unbound_keys),
+        authored_structure_signature=authored_structure_signature,
+        observed_evidence_summary=_bounded_text(
+            "unbound required inputs: " + ", ".join(_clean_list(referenced_unbound_keys))
+        ),
+        key_provenance={
+            "structural_failure_identity": (
+                "resolution-seam unbound required parameter keys referenced by the failed block"
+            )
+        },
+    )
+
+
 def recorded_outcome_from_run_blocks_result(
     result: Mapping[str, object],
     *,
@@ -794,12 +864,20 @@ def recorded_outcome_from_run_blocks_result(
     completion_verification: CompletionVerificationResult | None = None,
     authored_structure_signature: str | None = None,
     registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
+    unbound_required_parameter_keys: Sequence[str] | None = None,
+    block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
     failed_block = _first_failed_block(blocks)
     block_labels = [_safe_str(block.get("label")) for block in blocks if _safe_str(block.get("label"))]
+    referenced_unbound_keys = _referenced_unbound_input_keys(
+        result,
+        failed_block,
+        unbound_required_parameter_keys or [],
+        block_parameter_keys or {},
+    )
     page_refs = _page_evidence_refs(page_evidence)
     output_refs = _output_evidence_refs(blocks)
     verification_identity = _completion_verification_identity(completion_verification)
@@ -856,6 +934,14 @@ def recorded_outcome_from_run_blocks_result(
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
             )
+        if referenced_unbound_keys:
+            return _required_input_unbound_outcome(
+                failed_block,
+                block_labels,
+                recorded_run_outcome.workflow_run_id or workflow_run_id or None,
+                authored_structure_signature,
+                referenced_unbound_keys,
+            )
         structural_identity = verification_identity
         evidence_refs = output_refs
         if not structural_identity and not page_refs and not evidence_refs:
@@ -897,6 +983,14 @@ def recorded_outcome_from_run_blocks_result(
     failure_categories = _failure_category_refs(data.get("failure_categories"))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
     runtime_failure_identity = _runtime_failure_identity(failed_block)
+    if referenced_unbound_keys:
+        return _required_input_unbound_outcome(
+            failed_block,
+            block_labels,
+            workflow_run_id or None,
+            authored_structure_signature,
+            referenced_unbound_keys,
+        )
     if not (failure_categories or failure_type or runtime_failure_identity or page_refs or output_refs):
         return None
     structural_identity = (
@@ -1132,6 +1226,22 @@ def _first_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, 
         if _safe_str(block.get("status")).lower() in {"failed", "terminated", "canceled", "timed_out"}:
             return block
     return None
+
+
+def _referenced_unbound_input_keys(
+    result: Mapping[str, object],
+    failed_block: Mapping[str, object] | None,
+    unbound_required_parameter_keys: Sequence[str],
+    block_parameter_keys: Mapping[str, Sequence[str]],
+) -> list[str]:
+    if bool(result.get("ok")) is not False or failed_block is None:
+        return []
+    label = _safe_str(failed_block.get("label"))
+    referenced = block_parameter_keys.get(label) if label else None
+    if not referenced:
+        return []
+    referenced_set = set(referenced)
+    return [key for key in dict.fromkeys(unbound_required_parameter_keys) if key in referenced_set]
 
 
 def _runtime_failure_identity(failed_block: Mapping[str, object] | None) -> str:

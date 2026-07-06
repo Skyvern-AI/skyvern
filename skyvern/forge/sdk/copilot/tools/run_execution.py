@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     RecordedOutcomeGroundingRequirement,
     arm_recorded_outcome_grounding_requirement,
+    authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
     clear_recorded_outcome_grounding_requirement,
     latest_recorded_build_test_outcome_repeated,
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.copilot.code_block_security import (
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     code_contains_credential_fill,
+    synthesize_code_block,
     trajectory_has_credential_fill,
 )
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
@@ -116,12 +118,14 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.typed_value_policy import should_reject_type_text_value
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -1255,6 +1259,96 @@ async def _capture_and_store_post_run_page(
         ctx.composition_page_evidence = None
 
 
+def _scout_ephemeral_values(ctx: CopilotContext, workflow_param_keys: set[str]) -> dict[str, str]:
+    trajectory = list(ctx.scout_trajectory or [])
+    if not trajectory:
+        return {}
+    strict = synthesize_code_block(
+        trajectory,
+        strict_selectors=True,
+        reached_download_target=ctx.reached_download_target,
+    )
+    lenient = synthesize_code_block(
+        trajectory,
+        strict_selectors=False,
+        reached_download_target=ctx.reached_download_target,
+    )
+    if strict is None or lenient is None:
+        return {}
+    lenient_by_index = dict(lenient.diagnostics.typed_param_bindings)
+    agreed_bindings = [
+        (index, key) for index, key in strict.diagnostics.typed_param_bindings if lenient_by_index.get(index) == key
+    ]
+    raw_by_index: dict[int, str] = {}
+    for index, interaction in enumerate(trajectory):
+        raw = interaction.get("raw_typed_value")
+        if not isinstance(raw, str) or not raw:
+            continue
+        selector = interaction.get("selector")
+        intent = " ".join(
+            part for part in (interaction.get("role"), interaction.get("accessible_name")) if isinstance(part, str)
+        )
+        if should_reject_type_text_value(
+            value=raw,
+            selector=selector if isinstance(selector, str) else "",
+            intent=intent,
+        ):
+            continue
+        raw_by_index[index] = raw
+    key_to_values: dict[str, set[str]] = {}
+    value_to_keys: dict[str, set[str]] = {}
+    for index, key in agreed_bindings:
+        raw = raw_by_index.get(index)
+        if not raw or key not in workflow_param_keys:
+            continue
+        key_to_values.setdefault(key, set()).add(raw)
+        value_to_keys.setdefault(raw, set()).add(key)
+    resolved: dict[str, str] = {}
+    for key, values in key_to_values.items():
+        if len(values) != 1:
+            continue
+        raw = next(iter(values))
+        if len(value_to_keys.get(raw, set())) != 1:
+            continue
+        resolved[key] = raw
+    return resolved
+
+
+def _resolve_run_data_and_unbound_keys(
+    all_workflow_params: Sequence[WorkflowParameter],
+    user_params: Mapping[str, Any],
+    scout_ephemeral_values: Mapping[str, str],
+) -> tuple[dict[str, Any], list[str]]:
+    data: dict[str, Any] = {}
+    unbound: list[str] = []
+    for wp in all_workflow_params:
+        if wp.key in user_params:
+            data[wp.key] = user_params[wp.key]
+            continue
+        if wp.default_value is not None and wp.default_value != "":
+            data[wp.key] = wp.default_value
+            continue
+        scout_value = scout_ephemeral_values.get(wp.key)
+        if scout_value:
+            data[wp.key] = scout_value
+            LOG.info(
+                "Bound run-scoped scout value for copilot test run",
+                parameter_key=wp.key,
+                value_length=len(scout_value),
+            )
+            continue
+        placeholder = _placeholder_for_parameter_type(wp.workflow_parameter_type)
+        if placeholder is not None:
+            data[wp.key] = placeholder
+            LOG.info(
+                "Auto-filled missing workflow parameter for copilot test run",
+                parameter_key=wp.key,
+                parameter_type=str(wp.workflow_parameter_type),
+            )
+        unbound.append(wp.key)
+    return data, unbound
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -1399,21 +1493,12 @@ async def _run_blocks_and_collect_debug(
             },
         }
 
-    data: dict[str, Any] = {}
-    for wp in all_workflow_params:
-        if wp.key in user_params:
-            data[wp.key] = user_params[wp.key]
-        elif wp.default_value is not None:
-            data[wp.key] = wp.default_value
-        else:
-            placeholder = _placeholder_for_parameter_type(wp.workflow_parameter_type)
-            if placeholder is not None:
-                data[wp.key] = placeholder
-                LOG.info(
-                    "Auto-filled missing workflow parameter for copilot test run",
-                    parameter_key=wp.key,
-                    parameter_type=str(wp.workflow_parameter_type),
-                )
+    # Multi-word/PII values the persist-time policy withholds from default_value are bound run-scoped
+    # here (WorkflowRequestBody.data, never default_value) so the test run uses the scout-proven value.
+    scout_ephemeral_values = _scout_ephemeral_values(ctx, {wp.key for wp in all_workflow_params})
+    data, ctx.unbound_required_parameter_keys = _resolve_run_data_and_unbound_keys(
+        all_workflow_params, user_params, scout_ephemeral_values
+    )
 
     use_fresh_session = _should_use_fresh_session_for_login_first_replay(ctx, labels_to_execute, workflow)
     # True when the run was threaded into a fresh session rather than the scout's debug session;
@@ -2733,7 +2818,7 @@ def _record_run_blocks_result(
 
 
 def _record_adjudicated_build_test_outcome(
-    copilot_ctx: Any,
+    copilot_ctx: CopilotContext,
     result: dict[str, Any],
     completion_verification: CompletionVerificationResult | None,
     recorded_run_outcome: RecordedRunOutcome | None,
@@ -2744,18 +2829,25 @@ def _record_adjudicated_build_test_outcome(
         if isinstance(result_data, dict) and isinstance(result_data.get("registered_output_parameter_values"), list)
         else None
     )
+    workflow_yaml = copilot_ctx.workflow_yaml
+    code_artifact_metadata = copilot_ctx.code_artifact_metadata
     record_build_test_outcome(
         copilot_ctx,
         recorded_outcome_from_run_blocks_result(
             result,
-            page_evidence=getattr(copilot_ctx, "composition_page_evidence", None),
+            page_evidence=copilot_ctx.composition_page_evidence,
             recorded_run_outcome=recorded_run_outcome,
             completion_verification=completion_verification,
             authored_structure_signature=authored_structure_signature_from_workflow(
-                getattr(copilot_ctx, "workflow_yaml", None),
-                getattr(copilot_ctx, "code_artifact_metadata", None),
+                workflow_yaml,
+                code_artifact_metadata,
             ),
             registered_output_parameter_payloads=registered_output_parameter_payloads,
+            unbound_required_parameter_keys=list(copilot_ctx.unbound_required_parameter_keys),
+            block_parameter_keys=authored_block_parameter_keys_from_workflow(
+                workflow_yaml,
+                code_artifact_metadata,
+            ),
         ),
     )
 
