@@ -61,6 +61,24 @@ def test_truncate_dict_preserves_top_level_keys_and_caps_values() -> None:
     assert count_tokens(json.dumps(result)) <= 400  # small slack for JSON wrapping
 
 
+def test_truncate_dict_under_budget_preserves_nested_list_value() -> None:
+    import json
+
+    from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
+    from skyvern.utils.token_counter import count_tokens
+
+    value = {
+        "results": [{"id": i, "name": f"row{i}"} for i in range(40)],
+        "summary": "ok",
+    }
+    budget = count_tokens(json.dumps(value)) + 50
+
+    result = truncate_previous_extracted_information(value, max_tokens=budget)
+
+    assert result == value
+    assert isinstance(result["results"], list)
+
+
 def test_truncate_dict_preserves_value_types_when_under_per_key_budget() -> None:
     from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
 
