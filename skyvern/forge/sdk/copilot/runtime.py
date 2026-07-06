@@ -306,7 +306,13 @@ class AgentContext:
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
+    output_contract_deferral_count_by_signature: dict[str, int] = field(default_factory=dict)
     runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Armed when a collapsed-spine violation cannot be split; carries split blockers and stage count to the
+    # next authoring prompt, keyed by a composite {signature, label, authored-YAML hash} so a new draft re-arms.
+    output_contract_spine_directive_blockers_by_attempt_key: dict[str, list[str]] = field(default_factory=dict)
+    output_contract_spine_directive_stage_count_by_attempt_key: dict[str, int] = field(default_factory=dict)
+    output_contract_output_owner_directive_candidates_by_signature: dict[str, list[str]] = field(default_factory=dict)
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False

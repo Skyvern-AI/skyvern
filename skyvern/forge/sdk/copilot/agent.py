@@ -72,6 +72,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
+    OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
     AgentResult,
     CodeAuthoringRepairContext,
     CopilotContext,
@@ -739,6 +740,33 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
                 "required_code_return_paths: "
                 f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
             )
+    if repair_context.required_block_structure:
+        lines.append(
+            f"required_block_structure: {_clean_authoring_repair_prompt_atom(repair_context.required_block_structure)}"
+        )
+        if repair_context.spine_stage_count is not None:
+            lines.append(f"spine_stage_count: {repair_context.spine_stage_count}")
+        if repair_context.spine_split_blockers:
+            lines.append(
+                f"spine_split_blockers: {_render_authoring_repair_prompt_list(repair_context.spine_split_blockers)}"
+            )
+        lines.append(
+            "Author one browser-stage code block per scouted mutation stage and a final extraction-only code block "
+            "that returns the required output paths; do not collapse the browser spine into the extraction block."
+        )
+    if repair_context.reason_code == OUTPUT_OWNER_AMBIGUITY_REASON_CODE:
+        lines.append(
+            "output_owner_candidate_labels: "
+            f"{_render_authoring_repair_prompt_list(repair_context.output_owner_candidate_labels)}"
+        )
+        lines.append(
+            "required_output_owner_paths: "
+            f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
+        )
+        lines.append(
+            "Designate exactly one code block as the sole output owner for the required paths and declare its "
+            "code_artifact_metadata; do not leave the requested output split across or absent from the code blocks."
+        )
     selector_alternative_lines = _render_selector_repair_alternatives(repair_context.selector_alternatives)
     if selector_alternative_lines:
         lines.append("same_page_selector_alternatives:")

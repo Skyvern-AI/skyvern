@@ -153,6 +153,9 @@ class LoadedResultTargetContext(BaseModel):
     structure_signature: str = ""
 
 
+OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
+
+
 class CodeAuthoringRepairContext(BaseModel):
     block_label: str
     reason_code: str
@@ -188,6 +191,10 @@ class CodeAuthoringRepairContext(BaseModel):
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
+    required_block_structure: str = ""
+    spine_stage_count: int | None = None
+    spine_split_blockers: list[str] = Field(default_factory=list)
+    output_owner_candidate_labels: list[str] = Field(default_factory=list)
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
