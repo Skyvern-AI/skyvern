@@ -28,7 +28,10 @@ import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
-import { EditorPaneModeToggle } from "./EditorPaneHeader";
+import {
+  EditorPaneBlockSearch,
+  EditorPaneModeToggle,
+} from "./EditorPaneHeader";
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
@@ -761,6 +764,7 @@ function StudioStage(props: StudioWorkspaceProps) {
               <StudioPane
                 {...paneProps("editor")}
                 headerExtras={<EditorPaneModeToggle />}
+                headerActions={<EditorPaneBlockSearch />}
               >
                 {/* The embedded Workspace boots debug sessions, copilot chats
                     and block-script queries against the workflow — none of
