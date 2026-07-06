@@ -131,11 +131,11 @@ function WorkflowPage() {
 
   useEffect(() => {
     if (!isLoading && workflowRuns && workflowRuns.length === 0 && page > 1) {
-      const params = new URLSearchParams();
+      const params = new URLSearchParams(searchParams);
       params.set("page", String(page - 1));
       setSearchParams(params, { replace: true });
     }
-  }, [workflowRuns, isLoading, page, setSearchParams]);
+  }, [workflowRuns, isLoading, page, searchParams, setSearchParams]);
 
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -163,7 +163,10 @@ function WorkflowPage() {
   );
   const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
-  const { workflowAnalyticsPanel: WorkflowAnalyticsPanel } = usePageSlots();
+  const {
+    workflowAnalyticsPanel: WorkflowAnalyticsPanel,
+    workflowRunsFilterControls: WorkflowRunsFilterControls,
+  } = usePageSlots();
 
   if (!workflowPermanentId) {
     return null; // this should never happen
@@ -289,10 +292,15 @@ function WorkflowPage() {
                 placeholder="Search runs by input..."
                 className="w-48 lg:w-72"
               />
-              <StatusFilterDropdown
-                values={statusFilters}
-                onChange={setStatusFilters}
-              />
+              <div className="flex items-center gap-2">
+                {WorkflowRunsFilterControls ? (
+                  <WorkflowRunsFilterControls />
+                ) : null}
+                <StatusFilterDropdown
+                  values={statusFilters}
+                  onChange={setStatusFilters}
+                />
+              </div>
             </div>
             <div className="overflow-hidden rounded-lg border border-border">
               <Table>
