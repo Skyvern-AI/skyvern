@@ -178,6 +178,7 @@ _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
 CriterionKind = Literal["outcome", "terminal_action", "validation_classification"]
 TerminalActionFamily = Literal["request", "application", "form", "order"]
 ClassificationTarget = str | bool
+ExpectedOutputValue = str | bool
 ExpectedOutputShape = Literal[
     "reference_code",
     "numeric_identifier",
@@ -186,6 +187,7 @@ ExpectedOutputShape = Literal[
     "status_label",
     "money_amount",
     "owner_label",
+    "goal_judgment_boolean",
 ]
 RequestedOutputEvidenceSource = Literal[
     "runtime_output",
@@ -257,7 +259,7 @@ class CompletionCriterion:
     # YAML; "run": an end state only a run can evidence. Invalid input coerces to "run".
     level: CriterionLevel = "run"
     output_path: str | None = None
-    expected_output_value: str | None = None
+    expected_output_value: ExpectedOutputValue | None = None
     expected_output_shape: ExpectedOutputShape | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource = "runtime_output"
     kind: CriterionKind = "outcome"
@@ -400,7 +402,25 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
 
 
-def _criterion_grounding_mode(criterion: CompletionCriterion) -> Literal["exact_value", "shape", "missing"]:
+def _is_judgment_boolean_criterion(criterion: CompletionCriterion) -> bool:
+    return (
+        isinstance(criterion.expected_output_value, bool) or criterion.expected_output_shape == "goal_judgment_boolean"
+    )
+
+
+def typed_expected_output_value_key(value: ExpectedOutputValue | None) -> str:
+    if isinstance(value, bool):
+        return f"bool:{value}"
+    if isinstance(value, str):
+        return f"str:{value}"
+    return ""
+
+
+def _criterion_grounding_mode(
+    criterion: CompletionCriterion,
+) -> Literal["exact_value", "shape", "missing", "judgment_boolean"]:
+    if _is_judgment_boolean_criterion(criterion):
+        return "judgment_boolean"
     if criterion.expected_output_value is not None:
         return "exact_value"
     if criterion.expected_output_shape is not None:
@@ -609,6 +629,24 @@ def _coerce_terminal_action_family(value: Any, kind: CriterionKind) -> TerminalA
     return None
 
 
+def _coerce_expected_output_value(value: Any) -> ExpectedOutputValue | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        collapsed = " ".join(value.split())[:_COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS].strip()
+        return collapsed or None
+    return None
+
+
+def _canonical_bool_string(value: str) -> bool | None:
+    collapsed = value.strip().casefold()
+    if collapsed == "true":
+        return True
+    if collapsed == "false":
+        return False
+    return None
+
+
 def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
     if isinstance(value, str) and value in _EXPECTED_OUTPUT_SHAPES:
         return cast(ExpectedOutputShape, value)
@@ -710,7 +748,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     if not isinstance(raw, list):
         return []
     criteria: list[CompletionCriterion] = []
-    seen: set[tuple[str, str, str, str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -722,17 +760,20 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             continue
         output_path_raw = item.get("output_path")
         output_path = output_path_raw.strip() if isinstance(output_path_raw, str) and output_path_raw.strip() else None
-        expected_output_value_raw = item.get("expected_output_value")
-        expected_output_value = (
-            " ".join(expected_output_value_raw.split())[:_COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS].strip()
-            if isinstance(expected_output_value_raw, str)
-            else None
+        expected_output_value: ExpectedOutputValue | None = _coerce_expected_output_value(
+            item.get("expected_output_value")
         )
-        expected_output_value = expected_output_value or None
         expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
         requested_output_evidence_source = _coerce_requested_output_evidence_source(
             item.get("requested_output_evidence_source")
         )
+        if isinstance(expected_output_value, str) and (
+            requested_output_evidence_source == "independent_run_evidence"
+            or expected_output_shape == "goal_judgment_boolean"
+        ):
+            coerced_judgment_bool = _canonical_bool_string(expected_output_value)
+            if coerced_judgment_bool is not None:
+                expected_output_value = coerced_judgment_bool
         contingent_on_raw = item.get("contingent_on")
         contingent_on = (
             " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
@@ -760,6 +801,8 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             expected_output_value = None
             expected_output_shape = None
             requested_output_evidence_source = "runtime_output"
+        elif isinstance(expected_output_value, bool) or expected_output_shape == "goal_judgment_boolean":
+            requested_output_evidence_source = "independent_run_evidence"
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
@@ -767,6 +810,9 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             deliverable_kind or "",
             kind,
             str(expected_classification) if expected_classification is not None else "",
+            typed_expected_output_value_key(expected_output_value),
+            expected_output_shape or "",
+            requested_output_evidence_source,
         )
         if key in seen:
             continue
@@ -1073,8 +1119,8 @@ def _criterion_text_covers_any_requested_output(criterion: CompletionCriterion, 
 def _requested_output_expected_values_from_criteria(
     criteria: list[CompletionCriterion],
     requested_specs: list[tuple[str, str, str]],
-) -> dict[str, str]:
-    values: dict[str, str] = {}
+) -> dict[str, ExpectedOutputValue]:
+    values: dict[str, ExpectedOutputValue] = {}
     for criterion in criteria:
         if criterion.level == "definition" or criterion.method_mandated:
             continue
@@ -1084,7 +1130,7 @@ def _requested_output_expected_values_from_criteria(
             ):
                 continue
             value = criterion.expected_output_value
-            if value:
+            if value is not None:
                 values.setdefault(output_path, value)
     return values
 
@@ -1446,6 +1492,7 @@ def _apply_validation_classification_completion_criteria(policy: RequestPolicy) 
                 output_path=None,
                 expected_output_value=None,
                 expected_output_shape=None,
+                requested_output_evidence_source="runtime_output",
                 deliverable_kind=None,
                 terminal_action_family=None,
                 classification_output_key=output_key,
@@ -1484,7 +1531,7 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["deliverable_kind"] = criterion.deliverable_kind
         if criterion.output_path:
             item["output_path"] = criterion.output_path
-        if criterion.expected_output_value:
+        if criterion.expected_output_value is not None:
             item["expected_output_value"] = criterion.expected_output_value
         if criterion.expected_output_shape:
             item["expected_output_shape"] = criterion.expected_output_shape

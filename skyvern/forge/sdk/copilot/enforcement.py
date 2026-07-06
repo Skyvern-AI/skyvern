@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     author_time_reject_missing_output_paths,
+    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_durable_fallback_entry_target,
@@ -340,7 +341,7 @@ def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
 
 def _needs_repair_ceiling_halt(ctx: Any) -> bool:
     state = _repair_loop_state(ctx)
-    return state is not None and state.ceiling_reached is True
+    return state is not None and state.ceiling_reached is True and run_backed_repair_evidence_exists(ctx)
 
 
 def repair_ceiling_stop_signal(
@@ -991,46 +992,33 @@ def _turn_intent_can_update_and_run_without_user_input(turn_intent: Any) -> bool
     return bool(turn_intent.authority.may_run_blocks)
 
 
-def _has_current_turn_update_or_test_marker(ctx: Any) -> bool:
-    if bool(getattr(ctx, "update_workflow_called", False)):
-        return True
-    if bool(getattr(ctx, "test_after_update_done", False)):
-        return True
-    if getattr(ctx, "last_update_block_count", None) is not None:
-        return True
-    if getattr(ctx, "last_test_ok", None) is not None:
-        return True
-    for field_name in (
-        "last_run_blocks_workflow_run_id",
-        "last_successful_run_blocks_workflow_run_id",
-        "last_outcome_gate_workflow_run_id",
-    ):
-        marker = getattr(ctx, field_name, None)
-        if isinstance(marker, str) and marker.strip():
-            return True
-    return False
+def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
+    request_policy = ctx.request_policy
+    if not isinstance(request_policy, RequestPolicy):
+        return False
+    if not request_policy_has_present_completion_contract(request_policy):
+        return False
+    if request_policy.user_response_policy == "ask_clarification":
+        return False
+    if request_policy.clarification_reason not in (None, "none"):
+        return False
+    if not _turn_intent_can_author_without_user_input(ctx.turn_intent):
+        return False
+    if ctx.has_genuine_workflow_attempt():
+        return False
+    return True
 
 
-def _present_completion_contract_ask_retry(ctx: Any, parsed: dict[str, Any]) -> str | None:
+def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str, Any]) -> str | None:
     if parsed.get("type") != "ASK_QUESTION":
         return None
-    request_policy = getattr(ctx, "request_policy", None)
-    if not isinstance(request_policy, RequestPolicy):
-        return None
-    if not request_policy_has_present_completion_contract(request_policy):
-        return None
-    if request_policy.user_response_policy == "ask_clarification":
-        return None
-    if request_policy.clarification_reason not in (None, "none"):
-        return None
-    if not _turn_intent_can_author_without_user_input(getattr(ctx, "turn_intent", None)):
-        return None
-    if _has_current_turn_update_or_test_marker(ctx):
+    if not recycle_admits_present_completion_contract_ask(ctx):
         return None
     LOG.info(
         "copilot.present_completion_contract_ask_retry",
         reason_code="present_completion_contract_ask_internal_retry",
-        turn_intent_mode=getattr(getattr(ctx, "turn_intent", None), "mode", None),
+        turn_intent_mode=ctx.turn_intent.mode if ctx.turn_intent else None,
+        **ctx.genuine_attempt_parity_fields(),
     )
     return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
 
@@ -1443,7 +1431,7 @@ def _check_enforcement(
     if _needs_repair_ceiling_halt(ctx):
         contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
         state = _repair_loop_state(ctx)
-        # Backstop: the detection-time latch normally raises this above; this catches any increment path that bypassed the latch.
+        # Backstop: detection-time latch normally raises this above; catches a run-backed increment that bypassed it.
         signal = repair_ceiling_stop_signal(ctx, contract, config)
         stash_blocker_signal(ctx, signal)
         stash_repair_ceiling_turn_halt(

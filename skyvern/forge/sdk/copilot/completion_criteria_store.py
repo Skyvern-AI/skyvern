@@ -8,9 +8,11 @@ stays at the route/repository seam; everything here is side-effect free.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
+from skyvern.forge.sdk.copilot.completion_output_grounding import split_requested_output_criteria
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     run_plane_all_no_evidence,
@@ -21,15 +23,18 @@ from skyvern.forge.sdk.copilot.request_policy import (
     ExpectedOutputShape,
     RequestedOutputEvidenceSource,
     TerminalActionFamily,
+    _canonical_bool_string,
     _coerce_classification_output_key,
     _coerce_expected_classification,
     _coerce_expected_output_shape,
+    _coerce_expected_output_value,
     _coerce_requested_output_evidence_source,
     _normalize_contingent_antecedent_output_path,
     _normalize_deliverable_kind,
     is_fallback_floor_criterion,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
+    typed_expected_output_value_key,
 )
 
 ReconcileAction = Literal["create", "adopt_stored", "none"]
@@ -175,17 +180,22 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
         )
         stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
-        stored_expected_output_value = (
-            expected_output_value.strip()
-            if isinstance(expected_output_value, str) and expected_output_value.strip()
-            else None
-        )
+        stored_expected_output_value = _coerce_expected_output_value(expected_output_value)
         stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
+        if isinstance(stored_expected_output_value, str) and (
+            requested_output_evidence_source == "independent_run_evidence"
+            or stored_expected_output_shape == "goal_judgment_boolean"
+        ):
+            coerced_judgment_bool = _canonical_bool_string(stored_expected_output_value)
+            if coerced_judgment_bool is not None:
+                stored_expected_output_value = coerced_judgment_bool
         if kind == "validation_classification":
             stored_output_path = None
             stored_expected_output_value = None
             stored_expected_output_shape = None
             requested_output_evidence_source = "runtime_output"
+        elif isinstance(stored_expected_output_value, bool) or stored_expected_output_shape == "goal_judgment_boolean":
+            requested_output_evidence_source = "independent_run_evidence"
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
@@ -216,7 +226,7 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     deliverable_kind_key = criterion.deliverable_kind or ""
-    expected_output_value_key = criterion.expected_output_value or ""
+    expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
     expected_output_shape_key = criterion.expected_output_shape or ""
     requested_output_evidence_source_key = criterion.requested_output_evidence_source
     classification_output_key = criterion.classification_output_key or ""
@@ -353,6 +363,34 @@ def _fresh_generic_rephrase_lacks_stored_requested_outputs(
         return False
     fresh_tokens = set().union(*(_word_tokens(criterion.outcome) for criterion in fresh))
     return bool(stored_requested_tokens - fresh_tokens)
+
+
+def apply_requested_output_producer_floor(
+    criteria: Iterable[CompletionCriterion],
+) -> tuple[tuple[CompletionCriterion, ...], tuple[str, ...]]:
+    """Re-key presence-only requested-output criteria (no expected value, shape, or deliverable) to a
+    run-plane outcome so the observed-end-state judge grades them instead of failing closed. Typed
+    value/shape criteria, judgment booleans, and typed deliverables are untouched; the transform is idempotent."""
+    criteria = tuple(criteria)
+    requested, _remaining = split_requested_output_criteria(list(criteria))
+    presence_only_ids = {
+        criterion.id
+        for criterion in requested
+        if criterion.expected_output_value is None
+        and criterion.expected_output_shape is None
+        and criterion.deliverable_kind is None
+    }
+    if not presence_only_ids:
+        return criteria, ()
+    floored: list[CompletionCriterion] = []
+    rekeyed_paths: list[str] = []
+    for criterion in criteria:
+        if criterion.id in presence_only_ids:
+            rekeyed_paths.append(criterion.output_path or "")
+            floored.append(replace(criterion, output_path=None, level="run", kind="outcome"))
+        else:
+            floored.append(criterion)
+    return tuple(floored), tuple(rekeyed_paths)
 
 
 def reconcile_completion_criteria(

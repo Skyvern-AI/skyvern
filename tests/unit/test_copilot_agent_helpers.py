@@ -937,7 +937,7 @@ workflow_definition:
         assert "phase: persisted_block_run" in prompt
         assert "reason_code: runtime_block_failure" in prompt
         assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
-        assert "Do not re-emit the same plan against the same structural key" in prompt
+        assert "change the next authored step, selector, extraction, or binding based on" in prompt
 
     def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
         ctx = _ctx(
@@ -965,6 +965,53 @@ workflow_definition:
         assert "output_root=output" in prompt
         assert "Use the exact output_path values in goal_value_paths and returned output" in prompt
         assert "output_root is diagnostic grouping only" in prompt
+
+    def test_recorded_build_test_outcome_prompt_surfaces_observed_page_values(self) -> None:
+        long_value = "Request WTR-1842-DEMO for account 100245 confirmed. " + "detail " * 40
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="scout_evaluate",
+                attempted_tool="scout_interaction",
+                attempted_target="#submit",
+                verdict="repairable_failure",
+                reason_code="scout_act_observe_hollow_after_interaction",
+                structural_failure_identity="scout_act_observe:hollow",
+                page_evidence_refs=["origin:https://example.com"],
+                observed_page_value_excerpt=long_value.strip(),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        value_line = next(line for line in prompt.splitlines() if line.startswith("observed_page_values:"))
+        assert "WTR-1842-DEMO" in value_line
+        assert "100245" in value_line
+        assert len(value_line) > 200
+
+    def test_recorded_build_test_outcome_prompt_binds_observed_values_on_metadata_reject(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="author_time_reject",
+                attempted_tool="update_workflow",
+                verdict="authoring_rejected",
+                reason_code="metadata_reject",
+                structural_failure_identity="author_time:metadata_reject",
+                observed_page_value_excerpt="Request WTR-1842-DEMO for account 100245 confirmed.",
+                missing_requested_output_facts=[
+                    {"output_root": "output", "output_path": "output.confirmation_number"},
+                    {"output_root": "output", "output_path": "output.account_number"},
+                ],
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "OBSERVED PAGE VALUES CONTRACT" in prompt
+        assert "observed_values: Request WTR-1842-DEMO for account 100245 confirmed." in prompt
+        assert "- output.confirmation_number: <observed value>" in prompt
+        assert "- output.account_number: <observed value>" in prompt
 
 
 class TestVerifiedWorkflowOrNone:
@@ -6451,6 +6498,7 @@ class TestDeclaredEqualsGradedCompletionCriteria:
             verified_prefix_labels=[],
             verified_block_outputs={},
             post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
             completion_criteria_turn_state=None,
         )
 
@@ -6691,6 +6739,7 @@ class TestDeclaredEqualsGradedCompletionCriteria:
             verified_prefix_labels=[],
             verified_block_outputs={},
             post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
             completion_criteria_turn_state=None,
         )
 

@@ -1488,6 +1488,13 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
 
     persistence_signal = synthesized_block_persistence_signal(ctx, tool_name)
     if persistence_signal is not None:
+        grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
+        if grounding_signal is not None:
+            LOG.info(
+                "copilot recorded outcome grounding enforced over persistence force",
+                tool_name=tool_name,
+            )
+            return _emit_tool_blocker_signal(ctx, grounding_signal)
         return _emit_tool_blocker_signal(ctx, persistence_signal)
 
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})

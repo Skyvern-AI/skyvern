@@ -155,6 +155,27 @@ def test_composition_parse_html_extracts_labeled_fields_and_submit_controls() ->
     assert parsed["source_tool"] == "inspect_page_for_composition"
 
 
+def test_composition_parse_html_excludes_css_hidden_text_from_visible_excerpt() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <p>Visible submission summary</p>
+          <div style="display: none;">Application submitted successfully</div>
+          <span style="visibility:hidden">Hidden confirmation token XYZ</span>
+          <p hidden>Hidden via attribute</p>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    excerpt = parsed["visible_text_excerpt"]
+    assert "Visible submission summary" in excerpt
+    assert "Application submitted successfully" not in excerpt
+    assert "Hidden confirmation token XYZ" not in excerpt
+    assert "Hidden via attribute" not in excerpt
+
+
 def test_composition_parse_html_extracts_modal_overlay_controls() -> None:
     parsed = parse_composition_html(
         """
