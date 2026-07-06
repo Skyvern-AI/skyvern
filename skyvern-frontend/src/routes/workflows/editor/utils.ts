@@ -159,7 +159,7 @@ const constructCacheKeyValueFromParameters = (opts: {
       continue;
     }
 
-    codeKey = codeKey.replace(`{{${name}}}`, value.toString());
+    codeKey = codeKey.split(`{{${name}}}`).join(value.toString());
   }
 
   if (codeKey.includes("{") || codeKey.includes("}")) {

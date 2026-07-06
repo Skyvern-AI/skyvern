@@ -4,7 +4,10 @@ import {
   type WorkflowApiResponse,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
-import { getInitialParameters } from "./utils";
+import {
+  constructCacheKeyValueFromParameters,
+  getInitialParameters,
+} from "./utils";
 
 const baseWorkflow = {
   workflow_id: "w_test",
@@ -95,5 +98,16 @@ describe("getInitialParameters", () => {
         dataType: WorkflowParameterValueType.CredentialId,
       }),
     ]);
+  });
+});
+
+describe("constructCacheKeyValueFromParameters", () => {
+  test("replaces every occurrence of a repeated parameter placeholder", () => {
+    expect(
+      constructCacheKeyValueFromParameters({
+        codeKey: "{{a}}/{{a}}",
+        parameters: { a: "x" },
+      }),
+    ).toBe("x/x");
   });
 });
