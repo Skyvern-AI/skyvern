@@ -116,6 +116,7 @@ import { ZoomInControl } from "./controls/ZoomInControl";
 import { ZoomOutControl } from "./controls/ZoomOutControl";
 import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import { OPEN_WORKFLOW_SETTINGS_EVENT } from "./nodes/StartNode/types";
+import { useLocateBlockStore } from "./runValidation/useLocateBlockStore";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -635,6 +636,54 @@ function FlowRenderer({
       }
     };
   }, [centerOffsetX, reactFlowInstance]);
+
+  // Locate runs under fitViewInProgressRef so the pan constraint can't clobber the move; read-only canvases ignore it.
+  const locateRequest = useLocateBlockStore((state) => state.request);
+  const clearLocate = useLocateBlockStore((state) => state.clearLocate);
+  const locateGuardTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (readOnly || !locateRequest) {
+      return;
+    }
+    const { nodeId } = locateRequest;
+    if (!reactFlowInstance.getNode(nodeId)) {
+      clearLocate();
+      return;
+    }
+    const LOCATE_PAN_DURATION_MS = 500;
+    const LOCATE_GUARD_BUFFER_MS = 50;
+    setSelectedBlockId(nodeId);
+    fitViewInProgressRef.current = true;
+    reactFlowInstance.fitView({
+      nodes: [{ id: nodeId }],
+      maxZoom: 1,
+      duration: LOCATE_PAN_DURATION_MS,
+    });
+    // Deliberately not cleared in this effect's cleanup: clearLocate() re-runs the effect, which would drop the guard mid-pan.
+    if (locateGuardTimerRef.current !== null) {
+      window.clearTimeout(locateGuardTimerRef.current);
+    }
+    locateGuardTimerRef.current = window.setTimeout(() => {
+      fitViewInProgressRef.current = false;
+      locateGuardTimerRef.current = null;
+    }, LOCATE_PAN_DURATION_MS + LOCATE_GUARD_BUFFER_MS);
+    clearLocate();
+  }, [
+    locateRequest,
+    readOnly,
+    reactFlowInstance,
+    setSelectedBlockId,
+    clearLocate,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (locateGuardTimerRef.current !== null) {
+        window.clearTimeout(locateGuardTimerRef.current);
+      }
+      clearLocate();
+    };
+  }, [clearLocate]);
 
   // Canvas zoom + fit-view keyboard shortcuts. Gated to non-read-only
   // canvases for the same reason as the Escape handler above. Skip when

@@ -61,6 +61,7 @@ import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
+import { withRunValidationHighlight } from "../runValidation/withRunValidationHighlight";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -108,12 +109,18 @@ export type AppNode = UtilityNode | WorkflowBlockNode;
 //   withSortableBlock   - registers `useSortable({ id })`; the inner tree
 //                         must mount in both open and collapsed states so
 //                         drag pickup works on either
+//   withRunValidationHighlight - amber outline + badge around the
+//                         selectable card, inside the drag registration
 //   withSelectableBlock - reads `useSortable.isDragging` to suppress
 //                         selection on drag pickup
 //   withCollapsible     - leaf wrapper for body chrome
 function wrapBlock<P extends NodeProps>(Component: ComponentType<P>) {
   return memo(
-    withSortableBlock(withSelectableBlock(withCollapsible(Component))),
+    withSortableBlock(
+      withRunValidationHighlight(
+        withSelectableBlock(withCollapsible(Component)),
+      ),
+    ),
   );
 }
 
