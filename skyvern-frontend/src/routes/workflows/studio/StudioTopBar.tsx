@@ -22,12 +22,6 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -42,8 +36,6 @@ import { EditorOverflowMenu } from "../editor/header/EditorOverflowMenu";
 import { MakeACopyButton } from "../editor/MakeACopyButton";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
-import { getRunBlockingTooltipText } from "../editor/runValidation/runBlockingCopy";
-import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { runOutcomeFromStatus } from "./runProjections";
@@ -148,8 +140,6 @@ export function RunStopButton() {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
-  const hasBlockingBlocks = blockingBlocks.length > 0;
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     runId ? { workflowRunId: runId } : undefined,
   );
@@ -195,31 +185,6 @@ export function RunStopButton() {
       // form round-trip carries nothing.
       `/agents/${workflowPermanentId}/run`,
     );
-  const runButton = (onClick?: () => void) => (
-    <Button
-      size="default"
-      className="h-8 border border-transparent px-3"
-      disabled={isRecording || hasBlockingBlocks}
-      onClick={onClick}
-    >
-      <PlayIcon className="mr-2 size-4" /> Run agent
-    </Button>
-  );
-  const blockedRunButton = (button: ReactNode) => (
-    <TooltipProvider>
-      <Tooltip>
-        {/* Disabled buttons swallow pointer events; the focusable span keeps the tooltip reachable. */}
-        <TooltipTrigger asChild>
-          <span tabIndex={0} className="inline-flex">
-            {button}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent className="max-w-xs">
-          {getRunBlockingTooltipText(blockingBlocks)}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
 
   if (running && activeRunId) {
     const stopDialog = (
@@ -263,46 +228,51 @@ export function RunStopButton() {
     if (!isBlockRun) {
       return stopDialog;
     }
-    const blockRunButton = runButton();
     return (
       <>
         {stopDialog}
-        {hasBlockingBlocks ? (
-          blockedRunButton(blockRunButton)
-        ) : (
-          <Dialog>
-            <DialogTrigger asChild>{blockRunButton}</DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Start a full run?</DialogTitle>
-                <DialogDescription>
-                  A block run is still executing. It will keep running — you can
-                  watch it in the Browser pane while the Overview pane switches
-                  to the new full run.
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter>
-                <DialogClose asChild>
-                  <Button variant="secondary">Not now</Button>
-                </DialogClose>
-                <DialogClose asChild>
-                  <Button onClick={startFullRun}>Start full run</Button>
-                </DialogClose>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        )}
+        <Dialog>
+          <DialogTrigger asChild>
+            <Button
+              size="default"
+              className="h-8 border border-transparent px-3"
+              disabled={isRecording}
+            >
+              <PlayIcon className="mr-2 size-4" /> Run agent
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Start a full run?</DialogTitle>
+              <DialogDescription>
+                A block run is still executing. It will keep running — you can
+                watch it in the Browser pane while the Overview pane switches to
+                the new full run.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="secondary">Not now</Button>
+              </DialogClose>
+              <DialogClose asChild>
+                <Button onClick={startFullRun}>Start full run</Button>
+              </DialogClose>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </>
     );
   }
-
-  const primaryRunButton = runButton(startFullRun);
-
-  if (!hasBlockingBlocks) {
-    return primaryRunButton;
-  }
-
-  return blockedRunButton(primaryRunButton);
+  return (
+    <Button
+      size="default"
+      className="h-8 border border-transparent px-3"
+      disabled={isRecording}
+      onClick={startFullRun}
+    >
+      <PlayIcon className="mr-2 size-4" /> Run agent
+    </Button>
+  );
 }
 
 export function StudioTopBar() {

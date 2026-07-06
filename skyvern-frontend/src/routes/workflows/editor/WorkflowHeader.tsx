@@ -36,8 +36,6 @@ import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
 import { useIsGeneratingCode } from "./hooks/useIsGeneratingCode";
 import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
-import { getRunBlockingTooltipText } from "./runValidation/runBlockingCopy";
-import { useRunValidationStore } from "./runValidation/useRunValidationStore";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
 
@@ -204,43 +202,17 @@ function RunButton() {
   const { workflowPermanentId } = useParams();
   const closeWorkflowPanel = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const isRecording = useRecordingStore().isRecording;
-  const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
-  const hasBlockingBlocks = blockingBlocks.length > 0;
 
   const handleClick = () => {
     closeWorkflowPanel();
     navigate(`/agents/${workflowPermanentId}/run`);
   };
 
-  const button = (
-    <Button
-      disabled={isRecording || hasBlockingBlocks}
-      size="lg"
-      onClick={handleClick}
-    >
+  return (
+    <Button disabled={isRecording} size="lg" onClick={handleClick}>
       <PlayIcon className="mr-2 h-6 w-6" />
       Run
     </Button>
-  );
-
-  if (!hasBlockingBlocks) {
-    return button;
-  }
-
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        {/* Disabled buttons swallow pointer events; the focusable span keeps the tooltip reachable. */}
-        <TooltipTrigger asChild>
-          <span tabIndex={0} className="inline-flex">
-            {button}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent className="max-w-xs">
-          {getRunBlockingTooltipText(blockingBlocks)}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
   );
 }
 
